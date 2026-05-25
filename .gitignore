@@ -16,3 +16,8 @@ Thumbs.db
 # Local editor state
 .idea/
 .vscode/
+
+# Local Flatpak build output
+flatpak/.flatpak-builder/
+flatpak/builddir/
+flatpak/repo/
