@@ -1,0 +1,18 @@
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+
+# Local Arbit projects and exports
+*.arbit
+*.mid
+*.midi
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.opus
+
+# Local editor state
+.idea/
+.vscode/
