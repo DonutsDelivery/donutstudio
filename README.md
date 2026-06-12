@@ -18,6 +18,7 @@ DSP engines, model integrations, or private product assets.
 - `docs/lua-scripting.md` - scripting overview and install location.
 - `docs/api-reference.md` - current public `arbit` scripting API surface.
 - `examples/` - ready-to-edit scripts grouped by category.
+- `skills/` - agent skills for AI coding tools.
 - `.github/ISSUE_TEMPLATE/` - issue templates for script bugs and API requests.
 
 ## Quick Start
@@ -46,6 +47,16 @@ end
 
 print("Updated " .. #notes .. " notes")
 ```
+
+## Agent Skills
+
+AI coding agents (Claude Code, Cursor, Codex) can drive Arbit directly through
+its MCP server or the port-9900 command server. The
+[`arbit-video-editing` skill](skills/arbit-video-editing/SKILL.md) teaches an
+agent the full video workflow — import, beat-sync, effects, transitions, text
+overlays, automation, export, and verification — with exact tool names and
+parameter tables. See [`skills/README.md`](skills/README.md) for what skills
+are and how to install them.
 
 ## Contributing
 
