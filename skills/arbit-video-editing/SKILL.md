@@ -10,6 +10,12 @@ by calling tools, and you verify by reading state back — the compositor can de
 its own render graph, measure its own frames, and screenshot itself. **Silence is not
 success**: after every mutation, confirm the change landed before moving on.
 
+**Read `knowledge/lessons.md` before starting** — dated, locked field lessons
+(silent no-ops, RPC gotchas, verification tricks) that no agent should re-debug.
+Append new hard-won lessons there when you learn them. For music-synced edits,
+`knowledge/editorial-rules.md` holds the taste rules your edit plan is checked
+against.
+
 ## Prerequisites
 
 1. **Arbit standalone must be running.** It binds a command server on TCP port 9900
@@ -205,6 +211,34 @@ immediately — poll `video_export_progress` until done.
 **12. Verify the export** (see protocol below), then probe the output file with
 `video_probe` to confirm duration/fps/resolution match expectations.
 
+## Plan before you mutate
+
+Don't fire mutations one by one as ideas occur to you. Author the edit as a
+**plan first**: a JSON array of intended edits, each naming the tool, its args,
+a beat-domain anchor, and a one-line `reason` tying it to the music. Then
+self-check the plan against `knowledge/editorial-rules.md` — cuts on the grid,
+pattern-interrupt density matched to section energy, no static visual past the
+visual-beat cap, every effect with a musical reason. Only then apply it via
+tools, and verify (protocol below). The plan doubles as a reviewable,
+re-runnable record of the edit.
+
+```json
+[
+  { "tool": "split_clip", "args": { "trackId": 0, "clipId": 7, "beat": 16 },
+    "anchor": "beat 16 (bar 5, verse → chorus)", "reason": "cut into the chorus on the downbeat" },
+  { "tool": "video_set_transition", "args": { "clipId": 8, "type": 2, "durationBeats": 1 },
+    "anchor": "beat 16", "reason": "1-beat dissolve spans the section boundary" },
+  { "tool": "video_set_effect", "args": { "clipId": 8, "slot": 0, "type": 2, "params": { "amount": 1.3 } },
+    "anchor": "beats 16-32 (chorus)", "reason": "saturation push for the high-energy section" },
+  { "tool": "video_add_automation", "args": { "clipId": 8, "subParam": 1,
+      "points": [ { "beat": 16, "value": 1.0 }, { "beat": 24, "value": 1.15 } ] },
+    "anchor": "beats 16-24", "reason": "slow zoom keeps the 2-bar hold inside the visual-beat cap" },
+  { "tool": "video_set_speed_ramp", "args": { "clipId": 11, "enabled": true, "maintainPitch": true,
+      "keys": [ { "t": 0, "s": 1 }, { "t": 0.5, "s": 0.4, "i": 3 }, { "t": 1, "s": 1 } ] },
+    "anchor": "beat 48 (the drop)", "reason": "the one deliberate slow-down — let the drop breathe" }
+]
+```
+
 ## Verification protocol
 
 Never assume a mutation worked. The verification toolkit:
@@ -235,6 +269,26 @@ Never assume a mutation worked. The verification toolkit:
 Minimum discipline: mutate → `video_graph_describe` → (visual change?) `screenshot`
 → proceed. Before export: `get_clips` + `get_transport` sanity pass. After export:
 `video_export_progress` shows `pluginDone` + `pluginOk`, then `video_probe` the output.
+
+### The verification ladder (cheap → expensive)
+
+Climb only as high as the question requires:
+
+1. **`video_graph_describe`** (instant) — did the params reach the compositor?
+2. **Screenshot at a parked playhead** — `set_playhead` to the beat you care
+   about, then `screenshot { "window": "video" }`. Does that frame look right?
+3. **Scoped export** — `video_export` with a short `startBeat`/`endBeat` range
+   around the edit (pin `libx264` + `interpolation: "none"` if you'll compare
+   hashes). Does the edit render correctly in motion?
+4. **Full export** — only once the scoped range passes.
+
+**After export, re-measure the output — never trust the process.**
+`video_probe` the exported file (duration/fps/resolution/hasAudio), and when
+beat sync matters, re-run beat detection on the exported audio (import the
+export as a clip on a spare track, `video_detect_clip_beats` it, then `undo`
+the import) and confirm the detected grid still lands where the project grid
+says it should. The export finishing without error is not evidence the edit
+survived.
 
 ## Reference tables
 
@@ -331,4 +385,4 @@ Look: `video_set_effect`, `video_set_lut`, `video_set_transition`, `video_set_fa
 Automation: `video_set_param`, `video_add_automation`. Export: `video_export`,
 `video_export_progress`, `video_export_cancel`. Verification: `video_graph_describe`,
 `video_scope_data`, `video_viewport_info`, `screenshot`. Supporting: `ping`,
-`get_transport`, `set_bpm`, `set_playhead`, `play`, `stop`, `export_audio`.
+`get_transport`, `set_bpm`, `set_playhead`, `play`, `stop`, `undo`, `export_audio`.

@@ -13,7 +13,9 @@ worked — so the agent edits reliably instead of guessing.
 
 - `arbit-video-editing/` - end-to-end video editing through Arbit's MCP server
   or the port-9900 JSON-RPC command server: import, beat-sync, effects, LUTs,
-  transitions, text overlays, automation, export, and verification.
+  transitions, text overlays, automation, export, and verification. Ships a
+  `knowledge/` folder of dated, locked field lessons and music-synced editorial
+  rules that agents read first and append to over time.
 
 ## Install
 
