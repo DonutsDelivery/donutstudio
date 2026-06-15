@@ -13,6 +13,10 @@ Thumbs.db
 *.ogg
 *.opus
 
+# Generated skin packs (run a generator in examples/Skins/* to produce these;
+# binary art is not committed — share finished packs through the content store)
+*.arbitskin/
+
 # Local editor state
 .idea/
 .vscode/

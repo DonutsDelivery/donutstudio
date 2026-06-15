@@ -17,7 +17,9 @@ DSP engines, model integrations, or private product assets.
 
 - `docs/lua-scripting.md` - scripting overview and install location.
 - `docs/api-reference.md` - current public `arbit` scripting API surface.
+- `docs/skinning.md` - skin format overview and install location (preview).
 - `examples/` - ready-to-edit scripts grouped by category.
+- `examples/Skins/` - skin pack examples (a generator builds the art locally).
 - `skills/` - agent skills for AI coding tools.
 - `.github/ISSUE_TEMPLATE/` - issue templates for script bugs and API requests.
 
