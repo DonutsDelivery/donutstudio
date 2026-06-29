@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Arbit
+Name=DonutStudio
 Comment=Harmonic composition workstation and MIDI editor
 Exec=arbit
-Icon=online.donutsdelivery.Arbit
+Icon=online.donutsdelivery.DonutStudio
 Categories=AudioVideo;Audio;Midi;Music;
 Terminal=false
 StartupNotify=true

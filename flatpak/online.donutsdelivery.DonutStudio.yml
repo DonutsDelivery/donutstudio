@@ -1,4 +1,4 @@
-app-id: online.donutsdelivery.Arbit
+app-id: online.donutsdelivery.DonutStudio
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
@@ -35,31 +35,35 @@ modules:
     build-commands:
       - install -Dm755 arbit -t /app/bin/
       - install -Dm755 apply_extra -t /app/bin/
-      - install -Dm644 online.donutsdelivery.Arbit.desktop -t /app/share/applications/
-      - install -Dm644 online.donutsdelivery.Arbit.metainfo.xml -t /app/share/metainfo/
-      - install -Dm644 online.donutsdelivery.Arbit.svg -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 online.donutsdelivery.DonutStudio.desktop -t /app/share/applications/
+      - install -Dm644 online.donutsdelivery.DonutStudio.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 online.donutsdelivery.DonutStudio.svg -t /app/share/icons/hicolor/scalable/apps/
     sources:
       - type: extra-data
-        filename: Arbit-x86_64.AppImage
+        filename: DonutStudio-x86_64.AppImage
         only-arches:
           - x86_64
-        url: https://donutsdelivery.online/download-arbit/files/Arbit-x86_64.AppImage
+        url: https://donutsdelivery.online/download-donutstudio/files/DonutStudio-x86_64.AppImage
         sha256: 776f325c643fb4b98b8c9dad7f4ed1561911e45699ae8023ba8c711753cdcf2b
         size: 67107320
       - type: script
         dest-filename: apply_extra
         commands:
-          - tail -c +944633 Arbit-x86_64.AppImage > Arbit.squashfs
-          - unsquashfs -d squashfs-root -quiet -no-progress Arbit.squashfs
+          - tail -c +944633 DonutStudio-x86_64.AppImage > DonutStudio.squashfs
+          - unsquashfs -d squashfs-root -quiet -no-progress DonutStudio.squashfs
           - mv squashfs-root/usr .
-          - rm -rf squashfs-root Arbit-x86_64.AppImage Arbit.squashfs
+          - rm -rf squashfs-root DonutStudio-x86_64.AppImage DonutStudio.squashfs
       - type: script
+        # dest-filename stays "arbit" — the engine binary is still called Arbit
+        # internally; the public name (DonutStudio) is set via the desktop
+        # file's Name= field below. Sandbox command name follows the
+        # dest-filename.
         dest-filename: arbit
         commands:
-          - exec /app/extra/usr/bin/Arbit "$@"
+          - exec /app/extra/usr/bin/DonutStudio "$@"
       - type: file
-        path: online.donutsdelivery.Arbit.desktop
+        path: online.donutsdelivery.DonutStudio.desktop
       - type: file
-        path: online.donutsdelivery.Arbit.metainfo.xml
+        path: online.donutsdelivery.DonutStudio.metainfo.xml
       - type: file
-        path: online.donutsdelivery.Arbit.svg
+        path: online.donutsdelivery.DonutStudio.svg

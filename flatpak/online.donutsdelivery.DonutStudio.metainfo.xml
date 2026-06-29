@@ -1,28 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>online.donutsdelivery.Arbit</id>
+  <id>online.donutsdelivery.DonutStudio</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>LicenseRef-proprietary</project_license>
-  <name>Arbit</name>
+  <name>DonutStudio</name>
   <summary>Harmonic composition workstation and MIDI editor</summary>
   <developer id="online.donutsdelivery">
     <name>Donuts Delivery</name>
   </developer>
-  <launchable type="desktop-id">online.donutsdelivery.Arbit.desktop</launchable>
-  <url type="homepage">https://donutsdelivery.online/arbit</url>
-  <url type="help">https://github.com/DonutsDelivery/arbit-developer-resources</url>
-  <url type="bugtracker">https://github.com/DonutsDelivery/arbit-developer-resources/issues</url>
-  <url type="vcs-browser">https://github.com/DonutsDelivery/arbit-developer-resources</url>
+  <launchable type="desktop-id">online.donutsdelivery.DonutStudio.desktop</launchable>
+  <url type="homepage">https://donutsdelivery.online/donutstudio</url>
+  <url type="help">https://github.com/DonutsDelivery/donutstudio</url>
+  <url type="bugtracker">https://github.com/DonutsDelivery/donutstudio/issues</url>
+  <url type="vcs-browser">https://github.com/DonutsDelivery/donutstudio</url>
   <content_rating type="oars-1.1" />
   <description>
     <p>
-      Arbit is a piano-roll-first composition workstation for harmonic writing,
+      DonutStudio is a piano-roll-first composition workstation for harmonic writing,
       microtonal MIDI, built-in instruments, plugin hosting, and note-based sampling workflows.
     </p>
     <p>
       The free edition includes the harmonic piano roll, SF2 and SFZ instruments,
       VST3 instrument hosting, Airwindows effects, MIDI workflows, and core DAW functionality.
-      Arbit Pro unlocks audio transformation features such as sampling, vocal engines,
+      DonutStudio Pro unlocks audio transformation features such as sampling, vocal engines,
       and audio pitch correction.
     </p>
   </description>
@@ -39,7 +39,7 @@
   <releases>
     <release version="0.2" date="2026-05-25">
       <description>
-        <p>Initial open beta Flatpak packaging for the Arbit standalone app.</p>
+        <p>Initial open beta Flatpak packaging for the DonutStudio standalone app.</p>
       </description>
     </release>
   </releases>
