@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the "Console Knob" Arbit skin pack.
+"""Generate the "Console Knob" DonutStudio skin pack.
 
 Running this script writes a complete, installable skin pack next to itself:
 
@@ -13,7 +13,7 @@ generate it locally with this script. Edit draw_knob() to make your own knob.
 Dependency: pycairo  (pip install pycairo). On Linux you may also need Cairo's
 dev package, e.g. libcairo2-dev, for pycairo to build. Pillow is NOT required.
 
-Pointer-angle convention (must match Arbit, see docs/skinning.md):
+Pointer-angle convention (must match DonutStudio, see docs/skinning.md):
     juceAngle = 225 + 270 * value     # degrees, 0 = straight up, clockwise
     stdAngle  = juceAngle - 90        # screen coords (y points down)
 so value 0 points lower-left (~7:30) and value 1 lower-left->lower-right (~4:30),
@@ -65,7 +65,7 @@ def draw_knob(ctx, value):
     ctx.arc(cx, cy, R - 1.5, math.radians(20), math.radians(160))
     ctx.stroke()
 
-    # Accent pointer — follows Arbit's 225 + 270*value convention
+    # Accent pointer — follows DonutStudio's 225 + 270*value convention
     juce_angle = math.radians(225 + 270 * value)
     std_angle = juce_angle - math.pi / 2.0
     tipx = cx + (R - 4) * math.cos(std_angle)
@@ -129,7 +129,7 @@ def main():
         f.write(manifest)
     print("wrote", manifest_path)
     print("\nPack ready:", PACK)
-    print("Install it by copying that folder into Arbit's Themes folder.")
+    print("Install it by copying that folder into DonutStudio's Themes folder.")
 
 
 if __name__ == "__main__":

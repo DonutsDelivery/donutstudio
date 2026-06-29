@@ -1,11 +1,11 @@
 ---
 name: arbit-video-editing
-description: Drive Arbit's video editor programmatically through its MCP server (or raw JSON-RPC on port 9900). Use when asked to edit video in Arbit — import clips, beat-sync footage to the project tempo, apply effects/LUTs/transitions/fades, add text overlays, automate parameters, and export — with state verification after every step.
+description: Drive DonutStudio's video editor programmatically through its MCP server (or raw JSON-RPC on port 9900). Use when asked to edit video in DonutStudio — import clips, beat-sync footage to the project tempo, apply effects/LUTs/transitions/fades, add text overlays, automate parameters, and export — with state verification after every step.
 ---
 
-# Arbit Video Editing
+# DonutStudio Video Editing
 
-Arbit is a beat-grid video editor coupled to a MIDI/microtonal music engine. You edit
+DonutStudio is a beat-grid video editor coupled to a MIDI/microtonal music engine. You edit
 by calling tools, and you verify by reading state back — the compositor can describe
 its own render graph, measure its own frames, and screenshot itself. **Silence is not
 success**: after every mutation, confirm the change landed before moving on.
@@ -18,10 +18,10 @@ against.
 
 ## Prerequisites
 
-1. **Arbit standalone must be running.** It binds a command server on TCP port 9900
+1. **DonutStudio standalone must be running.** It binds a command server on TCP port 9900
    (override with `ARBIT_PORT`/`ARBIT_HOST`). Verify with the `ping` tool — it should
-   return "pong". If the connection is refused, ask the user to launch Arbit.
-2. **MCP server** (preferred): Arbit ships an MCP server at `mcp-server/index.js`.
+   return "pong". If the connection is refused, ask the user to launch DonutStudio.
+2. **MCP server** (preferred): DonutStudio ships an MCP server at `mcp-server/index.js`.
    Register it once:
 
    ```bash
@@ -190,7 +190,7 @@ video_add_automation {
 Point values are in real parameter units (normalized internally). See the subParam
 packing table below. For text-overlay lanes (subParam 3001-3003) pass `textId`
 instead of `clipId`. For a *live, non-persisted* tweak there is also `video_set_param`
-(paramId grammar below) — it bypasses Arbit's clip state, so prefer
+(paramId grammar below) — it bypasses DonutStudio's clip state, so prefer
 `video_set_effect`/`video_smart_fit`/`video_add_automation` for anything that must
 survive save/export.
 
@@ -246,7 +246,7 @@ Never assume a mutation worked. The verification toolkit:
 - **`video_graph_describe`** — call after **every mutation batch**. Describes the
   helper's live render graph: per-clip nodes with current param values, effects
   `[{slot, type, enabled, params}]`, and text overlays. This is the primary check
-  that your params actually reached the compositor (not just Arbit's UI state).
+  that your params actually reached the compositor (not just DonutStudio's UI state).
 - **`screenshot { "window": "video" }`** — visual check of the Video Editor window
   (it must be open; errors otherwise). Use after layout/look changes to confirm the
   frame looks right, not just that numbers were stored.
@@ -368,7 +368,7 @@ per driver. `libx264` + `none` is bit-stable for the same project on the same me
 
 | symptom | cause | fix |
 |---------|-------|-----|
-| Connection refused on 9900 | Arbit not running | Ask the user to launch the standalone; `ping` to confirm |
+| Connection refused on 9900 | DonutStudio not running | Ask the user to launch the standalone; `ping` to confirm |
 | Video tools error / `video_viewport_info` fails | Video helper sidecar not running | Open the Video Editor window, or `video_import_clip` a file to spin it up |
 | "clip not found" | stale clipId (e.g. after `split_clip`) | Refresh IDs with `get_clips` |
 | Clip plays black / silent | media file moved | Relink: 9900 method `video_media_relink` with `{oldPath, newPath}` (not in the MCP tool list — use the raw TCP fallback) |

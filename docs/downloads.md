@@ -1,18 +1,18 @@
 # Downloads
 
-Use the official Arbit download page for current installers:
+Use the official DonutStudio download page for current installers:
 
-https://donutsdelivery.online/arbit/download
+https://donutsdelivery.online/donutstudio/download
 
 Platform-specific download routes:
 
-- Windows: https://donutsdelivery.online/download-arbit/download/windows
-- macOS: https://donutsdelivery.online/download-arbit/download/macos
-- Linux: https://donutsdelivery.online/download-arbit/download/linux
+- Windows: https://donutsdelivery.online/download-donutstudio/download/windows
+- macOS: https://donutsdelivery.online/download-donutstudio/download/macos
+- Linux: https://donutsdelivery.online/download-donutstudio/download/linux
 
 Upgrade and purchase:
 
-https://donutsdelivery.online/arbit/buy
+https://donutsdelivery.online/donutstudio/buy
 
 The download server may update installers without this repository changing. For
 release notes and scripting compatibility notes, watch this repository.

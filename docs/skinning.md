@@ -1,6 +1,6 @@
 # Skinning
 
-Arbit skins are optional, community-made packs that replace the look of certain
+DonutStudio skins are optional, community-made packs that replace the look of certain
 controls with your own artwork. A skin is a folder named `Something.arbitskin`
 that contains a `skin.json` manifest and, optionally, image assets.
 
@@ -9,7 +9,7 @@ that contains a `skin.json` manifest and, optionally, image assets.
 > The skin engine is an early **preview** feature. Treat this guide as
 > describing an experimental, unstable format.
 >
-> - Requires a build of Arbit that includes the skin engine. It is **not** in an
+> - Requires a build of DonutStudio that includes the skin engine. It is **not** in an
 >   earlier numbered release; if your build cannot list or set skins (see
 >   *Activating a Skin* below), it does not ship the engine yet.
 > - In this preview, **knobs are the only thing a skin can replace.** Panels,
@@ -24,14 +24,14 @@ that contains a `skin.json` manifest and, optionally, image assets.
 
 ## What a Skin Is
 
-Arbit's normal look is drawn from its built-in color and shape system. A skin
+DonutStudio's normal look is drawn from its built-in color and shape system. A skin
 does not throw that away — it **layers on top of the default look**. Anything a
 skin does not provide keeps using the built-in default.
 
 This means a pack can override **just the knob** and leave everything else
-exactly as it ships. If a skin has no usable artwork for a control, Arbit
+exactly as it ships. If a skin has no usable artwork for a control, DonutStudio
 automatically falls back to its built-in vector drawing for that control. There
-is no way to make Arbit "blank" — a missing or broken asset simply means the
+is no way to make DonutStudio "blank" — a missing or broken asset simply means the
 default is used.
 
 A skin that contains only a `skin.json` (and no images) is valid. It loads and
@@ -49,7 +49,7 @@ Console Knob.arbitskin/
 ```
 
 - `skin.json` is the manifest. It is required. Without it the folder is ignored.
-- `assets/` holds the image files the manifest points at. Arbit looks for an
+- `assets/` holds the image files the manifest points at. DonutStudio looks for an
   asset first inside `assets/`, and if it is not there, next to `skin.json` in
   the top of the folder. Keeping art in `assets/` is the recommended layout.
 
@@ -106,7 +106,7 @@ axis.
 - With `orientation: "horizontal"`, the frames run left to right. The image is
   `frameCount` frames wide and one frame tall.
 
-When Arbit draws a knob at a value between 0 (fully down) and 1 (fully up), it
+When DonutStudio draws a knob at a value between 0 (fully down) and 1 (fully up), it
 picks the frame nearest that value. The rule is:
 
 ```text
@@ -123,7 +123,7 @@ Practical tips for the art itself:
   should be a clean multiple of `frameCount`, so every frame is the same size.
   For example, a 64-frame vertical strip that is 128 pixels wide works well at
   `128 x 8192` (64 frames of `128 x 128`).
-- Use a transparent background. Arbit fills behind the knob, so your frames
+- Use a transparent background. DonutStudio fills behind the knob, so your frames
   should be cut out, not on a solid block.
 - Draw the frames in order from minimum to maximum. Frame 0 is the lowest value;
   the last frame is the highest.
@@ -132,29 +132,29 @@ Practical tips for the art itself:
 
 ## Install Location
 
-Skins live in Arbit's **Themes** data folder. Create the folder if it does not
+Skins live in DonutStudio's **Themes** data folder. Create the folder if it does not
 exist, and drop your `Something.arbitskin` folder inside it:
 
 ```text
-Linux:    ~/.local/share/Arbit/Themes/
-macOS:    ~/Library/Application Support/Arbit/Themes/
-Windows:  %APPDATA%\Arbit\Themes\
+Linux:    ~/.local/share/DonutStudio/Themes/
+macOS:    ~/Library/Application Support/DonutStudio/Themes/
+Windows:  %APPDATA%\DonutStudio\Themes\
 ```
 
 So a finished pack ends up like:
 
 ```text
-~/.local/share/Arbit/Themes/Console Knob.arbitskin/skin.json
-~/.local/share/Arbit/Themes/Console Knob.arbitskin/assets/knob.png
+~/.local/share/DonutStudio/Themes/Console Knob.arbitskin/skin.json
+~/.local/share/DonutStudio/Themes/Console Knob.arbitskin/assets/knob.png
 ```
 
-Arbit scans the Themes folder for `*.arbitskin` directories that contain a
+DonutStudio scans the Themes folder for `*.arbitskin` directories that contain a
 `skin.json`.
 
 ## Activating a Skin
 
 There is **no graphical skin picker yet** (a Theme-tab picker is planned). In
-this preview you switch skins through Arbit's command server, which the Arbit
+this preview you switch skins through DonutStudio's command server, which the DonutStudio
 standalone app runs on TCP port `9900` while it is open. This is the same server
 the scripting and agent tooling use.
 
@@ -166,7 +166,7 @@ comfortable talking to that port.
 
 Two methods are available:
 
-- `list_skins` — returns the skins Arbit found in the Themes folder (always
+- `list_skins` — returns the skins DonutStudio found in the Themes folder (always
   including `Default`) and which one is active.
 - `set_skin` — switches to a skin by its `name`. Pass `Default` to return to the
   built-in look. The visible knobs repaint immediately.
@@ -209,7 +209,7 @@ which skin ended up active.
 ## A Note on Sharing Skins
 
 Knob filmstrip images are binary art, not text, so finished skin packs are meant
-to be shared through Arbit's online content store rather than committed into the
+to be shared through DonutStudio's online content store rather than committed into the
 developer-resources repository. When you make a pack to share, use original
 artwork or art you are clearly allowed to redistribute (for example, CC0 or your
 own work), and say so in the pack.
@@ -257,7 +257,7 @@ To use it:
 
 1. Copy the `My First Knob.arbitskin` folder into the Themes folder for your
    platform (see *Install Location*).
-2. With Arbit running, send `list_skins` to confirm `My First Knob` shows up.
+2. With DonutStudio running, send `list_skins` to confirm `My First Knob` shows up.
 3. Send `set_skin` with `name` set to `My First Knob` (see *Activating a Skin*).
    The visible knobs repaint immediately; send `set_skin` with `Default` to
    switch back.

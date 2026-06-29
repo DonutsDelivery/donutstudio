@@ -1,8 +1,8 @@
 # API Reference
 
-Scripts call Arbit through the global `arbit` table.
+Scripts call DonutStudio through the global `arbit` table.
 
-This reference tracks the public scripting surface exposed by Arbit's embedded
+This reference tracks the public scripting surface exposed by DonutStudio's embedded
 Lua engine. Some functions may depend on the current license tier or the current
 platform build.
 
@@ -52,7 +52,7 @@ Parameters:
 ### `arbit.batch_transform(params)`
 
 Runs a batch transform. Pass `noteIds` to target specific notes, or omit it to
-target the active/default selection behavior exposed by Arbit.
+target the active/default selection behavior exposed by DonutStudio.
 
 Common transforms include:
 

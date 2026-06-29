@@ -1,6 +1,6 @@
 # Lessons (dated, locked)
 
-Field lessons from real agent sessions driving Arbit's video editor. Each entry
+Field lessons from real agent sessions driving DonutStudio's video editor. Each entry
 is dated and **locked**: do not re-litigate, re-debug, or "verify whether this
 is still true" — it is, until the underlying behavior changes, at which point
 the entry is updated or removed. When you learn a new hard-won lesson (a silent
@@ -25,9 +25,9 @@ here** with a date and `locked`.
   Hardware encoders (nvenc/VAAPI) and RIFE optical flow vary per GPU and per
   driver. (2026-06-12, locked)
 
-- **MCP clients must restart to pick up new Arbit MCP tools.** The MCP server
+- **MCP clients must restart to pick up new DonutStudio MCP tools.** The MCP server
   is spawned per client session; a tool added to `mcp-server/index.js` (or a
-  new Arbit build exposing a new method) is invisible until the client
+  new DonutStudio build exposing a new method) is invisible until the client
   restarts. If a tool you expect is missing, restart the MCP client before
   concluding it doesn't exist. (2026-06-13, locked)
 
@@ -41,7 +41,7 @@ here** with a date and `locked`.
   (2026-06-12, locked)
 
 - **Video tools error when the helper sidecar isn't running — and `ping` does
-  not prove the helper is alive.** `ping` only proves the Arbit command server
+  not prove the helper is alive.** `ping` only proves the DonutStudio command server
   is up. The video helper starts when the Video Editor window opens or a clip
   is imported; open the Video Editor or `video_import_clip` first.
   (2026-06-12, locked)

@@ -1,7 +1,7 @@
 # Contributing
 
 This repository accepts public documentation, examples, and scripting API
-requests for Arbit.
+requests for DonutStudio.
 
 ## Good Contributions
 
@@ -22,7 +22,7 @@ requests for Arbit.
 
 ## Do Not Submit
 
-- Arbit application source code.
+- DonutStudio application source code.
 - Reverse-engineered private internals.
 - License keys, license-server behavior, or auth bypasses.
 - Proprietary sound libraries, voicebanks, samples, or model files.

@@ -1,6 +1,6 @@
 # Skin Examples
 
-Skin packs are example **looks** for Arbit, the same way the other folders here
+Skin packs are example **looks** for DonutStudio, the same way the other folders here
 hold example scripts:
 
 ```text
@@ -12,7 +12,7 @@ examples/
 ```
 
 A skin is not a script. It is a small folder named `Something.arbitskin` that
-holds a `skin.json` manifest and image artwork. Arbit reads it and draws certain
+holds a `skin.json` manifest and image artwork. DonutStudio reads it and draws certain
 controls from your art instead of its built-in look. See
 [`docs/skinning.md`](../../docs/skinning.md) for the full format.
 
@@ -21,7 +21,7 @@ controls from your art instead of its built-in look. See
 > The skin engine is an early **preview** feature. Treat these examples as
 > describing an experimental, unstable format.
 >
-> - Requires a build of Arbit that includes the skin engine. It is **not** in an
+> - Requires a build of DonutStudio that includes the skin engine. It is **not** in an
 >   earlier numbered release; if your build cannot list or set skins, it does not
 >   ship the engine yet.
 > - In this preview, **knobs are the only thing a skin can replace.** Panels,
@@ -37,7 +37,7 @@ controls from your art instead of its built-in look. See
 ## No Binary Art In This Repo
 
 A knob skin needs an image (a filmstrip). Image files are **not** committed to
-this repository — finished, shareable packs belong in Arbit's online content
+this repository — finished, shareable packs belong in DonutStudio's online content
 store, and committing binary art here is out of scope (see the repo's
 `CONTRIBUTING.md`).
 
@@ -63,16 +63,16 @@ Every example here follows the same three steps:
    python3 make_console_knob.py     # writes console-knob.arbitskin/
    ```
 
-2. **Install it.** Copy the generated `*.arbitskin` folder into Arbit's
+2. **Install it.** Copy the generated `*.arbitskin` folder into DonutStudio's
    **Themes** folder for your platform:
 
    ```text
-   Linux:    ~/.local/share/Arbit/Themes/
-   macOS:    ~/Library/Application Support/Arbit/Themes/
-   Windows:  %APPDATA%\Arbit\Themes\
+   Linux:    ~/.local/share/DonutStudio/Themes/
+   macOS:    ~/Library/Application Support/DonutStudio/Themes/
+   Windows:  %APPDATA%\DonutStudio\Themes\
    ```
 
-3. **Activate it.** There is no in-app picker yet. With Arbit running, switch to
+3. **Activate it.** There is no in-app picker yet. With DonutStudio running, switch to
    the skin over its command server (newline-delimited JSON-RPC on raw TCP port
    `9900` — not HTTP). See [`docs/skinning.md`](../../docs/skinning.md#activating-a-skin)
    for a ready-to-paste client; the short version:
@@ -94,4 +94,4 @@ pointer-angle convention your frames must follow.
 
 Use original artwork or art you are clearly allowed to redistribute (for example
 CC0 or your own work), and say so in the pack. Finished packs are shared through
-Arbit's online content store, not committed here.
+DonutStudio's online content store, not committed here.

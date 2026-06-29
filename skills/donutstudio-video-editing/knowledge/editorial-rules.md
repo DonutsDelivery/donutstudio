@@ -9,7 +9,7 @@ Accumulate new rules and lock them with dates, same convention as
 
 - **Cut on the beat grid.** Cuts land on beats or bars; transitions span
   musical units (1 beat, 2 beats, 1 bar) — never arbitrary frame counts.
-  Arbit's timeline is beat-domain; there is no excuse for an off-grid cut.
+  DonutStudio's timeline is beat-domain; there is no excuse for an off-grid cut.
 - **Visual-beat cap.** No single static visual holds longer than ~2 bars at
   moderate tempi without internal motion (camera move, zoom, automation, or
   in-frame action). A static shot past the cap reads as a stall.

@@ -1,8 +1,8 @@
 # Console Knob
 
-A skin pack that replaces Arbit's knobs with a metallic console-style rotary:
+A skin pack that replaces DonutStudio's knobs with a metallic console-style rotary:
 a solid dished body, a brushed-metal ring, and a bright cyan accent pointer.
-It is deliberately different from Arbit's built-in glass-arc knob, so the swap
+It is deliberately different from DonutStudio's built-in glass-arc knob, so the swap
 is unmistakable. Only knobs change; everything else stays the default look.
 
 > **Preview / Status**
@@ -10,7 +10,7 @@ is unmistakable. Only knobs change; everything else stays the default look.
 > The skin engine is an early **preview** feature. Treat this pack as
 > describing an experimental, unstable format.
 >
-> - Requires a build of Arbit that includes the skin engine. It is **not** in an
+> - Requires a build of DonutStudio that includes the skin engine. It is **not** in an
 >   earlier numbered release; if your build cannot list or set skins, it does not
 >   ship the engine yet.
 > - In this preview, **knobs are the only thing a skin can replace.** Panels,
@@ -76,28 +76,28 @@ example `libcairo2-dev`) for pycairo to build. Pillow is **not** required.
 
 ## 2. Install It
 
-Copy the generated `console-knob.arbitskin` folder into Arbit's **Themes** folder
+Copy the generated `console-knob.arbitskin` folder into DonutStudio's **Themes** folder
 for your platform:
 
 ```text
-Linux:    ~/.local/share/Arbit/Themes/
-macOS:    ~/Library/Application Support/Arbit/Themes/
-Windows:  %APPDATA%\Arbit\Themes\
+Linux:    ~/.local/share/DonutStudio/Themes/
+macOS:    ~/Library/Application Support/DonutStudio/Themes/
+Windows:  %APPDATA%\DonutStudio\Themes\
 ```
 
 So a finished install looks like:
 
 ```text
-~/.local/share/Arbit/Themes/console-knob.arbitskin/skin.json
-~/.local/share/Arbit/Themes/console-knob.arbitskin/assets/knob.png
+~/.local/share/DonutStudio/Themes/console-knob.arbitskin/skin.json
+~/.local/share/DonutStudio/Themes/console-knob.arbitskin/assets/knob.png
 ```
 
-Arbit scans the Themes folder for `*.arbitskin` folders that contain a
+DonutStudio scans the Themes folder for `*.arbitskin` folders that contain a
 `skin.json`.
 
 ## 3. Activate It
 
-There is no in-app picker yet. With Arbit running, switch skins over its command
+There is no in-app picker yet. With DonutStudio running, switch skins over its command
 server. It is **newline-delimited JSON-RPC on raw TCP port `9900`** — not HTTP,
 so `curl` will not work. See
 [`docs/skinning.md`](../../../docs/skinning.md#activating-a-skin) for a
@@ -105,7 +105,7 @@ ready-to-paste Python client. The quick `nc` version (some `nc` builds need
 `-q1` or `-N` to wait for the reply):
 
 ```bash
-# Confirm Arbit found the pack
+# Confirm DonutStudio found the pack
 printf '{"method":"list_skins","id":1}\n' | nc localhost 9900
 
 # Turn it on (the name is the manifest "name", not the folder name)
@@ -115,7 +115,7 @@ printf '{"method":"set_skin","params":{"name":"Console Knob"},"id":1}\n' | nc lo
 printf '{"method":"set_skin","params":{"name":"Default"},"id":1}\n' | nc localhost 9900
 ```
 
-Every knob in Arbit repaints immediately when the skin changes.
+Every knob in DonutStudio repaints immediately when the skin changes.
 
 ## Make Your Own Knob
 
@@ -125,7 +125,7 @@ Every knob in Arbit repaints immediately when the skin changes.
 
 ### The Pointer-Angle Convention (Read This Before Changing the Pointer)
 
-Arbit places a knob's pointer using a fixed angle convention, and your frames
+DonutStudio places a knob's pointer using a fixed angle convention, and your frames
 must match it or the pointer will point the wrong way. The rule (degrees,
 `0` = straight up, increasing clockwise) is:
 
@@ -145,7 +145,7 @@ std_angle  = juce_angle - math.pi / 2.0   # screen coords, y down
 
 Keep this formula when you redraw the pointer. The body, ring, and accent color
 are yours to change freely, but the pointer must follow `225 + 270 * value` so
-it lines up with the value Arbit is showing.
+it lines up with the value DonutStudio is showing.
 
 ### frameCount
 
@@ -158,7 +158,7 @@ agree:
 FRAMES = 64   # change this and both the PNG and skin.json update together
 ```
 
-Arbit chooses a frame from the knob's value with:
+DonutStudio chooses a frame from the knob's value with:
 
 ```text
 frameIndex = round(value * (frameCount - 1))
