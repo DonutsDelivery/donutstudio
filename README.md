@@ -112,6 +112,12 @@ AI coding agents can drive DonutStudio directly through its MCP server or the po
 
 ---
 
+## Video-helper source code (GPL)
+
+The DonutStudio installers bundle a separate sidecar executable, **arbit-video-helper**, which powers video decode, beat detection, GL rendering, and export. Unlike the main application, the helper is free software licensed under the **GPL-2.0-or-later**, and its corresponding source lives in this repository at [`video-helper/`](video-helper/) — build instructions in [`video-helper/README.md`](video-helper/README.md), license text in [`video-helper/COPYING`](video-helper/COPYING), and source pointers for the bundled third-party libraries (FFmpeg, x264/x265, and friends) in [`video-helper/NOTICE.md`](video-helper/NOTICE.md).
+
+---
+
 ## About
 
 DonutStudio is **closed source** — built by one person, in Denmark. This repository contains the public installers (Releases), documentation, examples, and integration resources. It does **not** contain the application source, build system, license server, DSP engines, or model integrations.
@@ -121,4 +127,4 @@ DonutStudio is **closed source** — built by one person, in Denmark. This repos
 
 ## License
 
-Documentation and example scripts in this repository are MIT licensed unless a file states otherwise. The DonutStudio application itself is proprietary; see the in-app EULA.
+Documentation and example scripts in this repository are MIT licensed unless a file states otherwise. The [`video-helper/`](video-helper/) directory is GPL-2.0-or-later (see its `COPYING`). The DonutStudio application itself is proprietary; see the in-app EULA.
