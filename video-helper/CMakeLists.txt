@@ -2248,14 +2248,20 @@ if(APPLE AND ARBIT_WITH_METAL)
             src/gpu_backend/metal_shader_generator.mm
             src/gpu_backend/backend_sokol.mm)
         target_include_directories(arbit-metal-color-transform-runtime-tests PRIVATE
-            src third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+            src third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared
+            ${ARBIT_MVK_SHADER_CONVERTER_INCLUDE}
+            ${ncnn_SOURCE_DIR}/glslang)
         target_compile_definitions(arbit-metal-color-transform-runtime-tests PRIVATE
             ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1 ARBIT_HAVE_METAL_GENERATORS=1)
         target_link_libraries(arbit-metal-color-transform-runtime-tests PRIVATE
             PkgConfig::GLFW3 OpenGL::GL PkgConfig::AV
             "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
             "-framework IOSurface" "-framework Foundation"
-            nlohmann_json::nlohmann_json)
+            nlohmann_json::nlohmann_json
+            glslang SPIRV glslang-default-resource-limits
+            ${ARBIT_MVK_SHADER_CONVERTER_LIBRARY}
+            ${ARBIT_MVK_SPIRV_CROSS_LIBRARY}
+            ${ARBIT_MVK_SPIRV_TOOLS_LIBRARY})
         target_compile_options(arbit-metal-color-transform-runtime-tests PRIVATE
             -Wall -Wextra -Werror)
         add_test(NAME metal_color_transform_runtime
