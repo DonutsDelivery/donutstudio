@@ -2243,6 +2243,8 @@ if(APPLE AND ARBIT_WITH_METAL)
             src/gl_loader.cpp
             src/lut_loader.cpp
             src/native_animation_deformation.cpp
+            src/visual_plan_execution_telemetry.cpp
+            src/visual_renderer_telemetry.cpp
             src/particle_engine.cpp
             src/shader_generator.cpp
             src/gpu_backend/metal_shader_generator.mm
