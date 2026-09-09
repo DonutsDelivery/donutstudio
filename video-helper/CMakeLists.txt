@@ -1275,7 +1275,6 @@ add_executable(arbit-render-pass-output-publication-tests
 target_include_directories(arbit-render-pass-output-publication-tests PRIVATE
     src
     tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
 target_link_libraries(arbit-render-pass-output-publication-tests PRIVATE
     nlohmann_json::nlohmann_json PkgConfig::AV)
@@ -1304,7 +1303,6 @@ add_executable(arbit-aov-inspection-native-executor-tests
 target_include_directories(arbit-aov-inspection-native-executor-tests PRIVATE
     src
     tests
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
 target_link_libraries(arbit-aov-inspection-native-executor-tests PRIVATE
     nlohmann_json::nlohmann_json PkgConfig::AV)
