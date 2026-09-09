@@ -2249,7 +2249,7 @@ if(APPLE AND ARBIT_WITH_METAL)
         target_include_directories(arbit-metal-color-transform-runtime-tests PRIVATE
             src third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
         target_compile_definitions(arbit-metal-color-transform-runtime-tests PRIVATE
-            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1)
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1 ARBIT_HAVE_METAL_GENERATORS=1)
         target_link_libraries(arbit-metal-color-transform-runtime-tests PRIVATE
             PkgConfig::GLFW3 OpenGL::GL PkgConfig::AV
             "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
