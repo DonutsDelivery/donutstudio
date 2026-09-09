@@ -1241,8 +1241,6 @@ add_test(NAME sdf_native_renderer_dispatch
 
 add_executable(arbit-color-transform-contract-tests
     ../plugin/Tests/ColorTransformContractTests.cpp)
-target_include_directories(arbit-color-transform-contract-tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/..)
 if(NOT MSVC)
     target_compile_options(arbit-color-transform-contract-tests PRIVATE -Wall -Wextra -Werror)
 endif()
@@ -1264,8 +1262,6 @@ add_test(NAME color_transform_operation_execution
 
 add_executable(arbit-render-pass-output-contract-tests
     ../plugin/Tests/RenderPassOutputContractTests.cpp)
-target_include_directories(arbit-render-pass-output-contract-tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/..)
 if(NOT MSVC)
     target_compile_options(arbit-render-pass-output-contract-tests PRIVATE -Wall -Wextra -Werror)
 endif()

@@ -129,4 +129,4 @@ directory remains available under GPL-2.0-or-later as declared in
 
 ## Release correspondence
 
-This source corresponds to the video-helper bundled with **DonutStudio v0.8.2**. It was exported from private source commit `dba1336953affac53c40a9dc3f7c3cb2c88c7fe3` with helper-tree SHA-256 `ef58b71a4e1659bf1225a41a786a04589aae061fe702dbda8ca4de253f31f148`. A later app release may reference this same public source commit only when its distributed helper binary and helper-tree receipt are unchanged.
+This source corresponds to the video-helper bundled with **DonutStudio v0.8.2**. It was exported from private source commit `88dcb489fceb17bc357583f5a132283526fdb739` with helper-tree SHA-256 `08ab08df5e45470fcc464986ab953ea04a6c18a8d4ced1bf5c25ddc87affa8be`. A later app release may reference this same public source commit only when its distributed helper binary and helper-tree receipt are unchanged.
