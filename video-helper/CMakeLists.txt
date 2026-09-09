@@ -2245,6 +2245,7 @@ if(APPLE AND ARBIT_WITH_METAL)
             src/native_animation_deformation.cpp
             src/particle_engine.cpp
             src/shader_generator.cpp
+            src/gpu_backend/metal_shader_generator.mm
             src/gpu_backend/backend_sokol.mm)
         target_include_directories(arbit-metal-color-transform-runtime-tests PRIVATE
             src third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
