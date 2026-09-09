@@ -82,6 +82,10 @@ if(NOT nlohmann_json_FOUND)
     FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
+# src headers expose nlohmann::json through visual-plan APIs. Apply the
+# header-only dependency to every helper executable, including independent tests.
+link_libraries(nlohmann_json::nlohmann_json)
+
 # Viewport window (GPU-resident preview): GLFW + OpenGL. Optional — without
 # it the helper builds headless and the viewport_* methods return an error.
 pkg_check_modules(GLFW3 IMPORTED_TARGET glfw3)
