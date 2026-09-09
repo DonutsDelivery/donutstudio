@@ -1780,7 +1780,7 @@ FrameRenderer::FramePublicationCandidatePtr FrameRenderer::beginFramePublication
     const auto& sourceOutputs = predecessor ? predecessor->renderPassOutputs : renderPassOutputs_;
     if (! cloneRenderPassOutputs(sourceOutputs, candidate->renderPassOutputs, error))
         return {};
-    candidate->release = [this](FramePublicationCandidate& value)
+    candidate->release = [](FramePublicationCandidate& value)
     {
         for (auto& item : value.feedbackHistory)
             for (auto& texture : item.second.tex)
