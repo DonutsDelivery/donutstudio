@@ -1249,8 +1249,7 @@ add_test(NAME color_transform_contract COMMAND arbit-color-transform-contract-te
 add_executable(arbit-color-transform-operation-execution-tests
     tests/color_transform_operation_execution_tests.cpp)
 target_include_directories(arbit-color-transform-operation-execution-tests PRIVATE
-    src
-    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    src)
 target_link_libraries(arbit-color-transform-operation-execution-tests PRIVATE
     nlohmann_json::nlohmann_json)
 if(NOT MSVC)
