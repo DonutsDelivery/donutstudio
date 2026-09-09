@@ -515,6 +515,7 @@ public:
     // This is deliberately separate from the compositor/presentation path.
     const std::string& particleBackend() const { return particleBackend_; }
     const std::string& compositorBackend() const { return compositorBackend_; }
+    const std::string& lastError() const { return lastError_; }
     bool queryMetalResourceCapabilities (int& maximumImageDimension,
                                           uint64_t& maximumBufferLengthBytes,
                                           uint64_t& recommendedWorkingSetBytes,

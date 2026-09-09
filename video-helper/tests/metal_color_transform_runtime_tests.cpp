@@ -200,13 +200,13 @@ int main()
     };
 
     auto malformedBackend = plans;
-    malformedBackend[0].operations[1].backend = "opengl";
+    malformedBackend[0].operations[1].backendCapability = "opengl";
     rejectBeforeMetalAllocation(malformedBackend, "malformed backend preflight");
     auto malformedDescriptor = plans;
     malformedDescriptor[0].ports[1].colorSpace = "linearSRGB";
     rejectBeforeMetalAllocation(malformedDescriptor, "malformed descriptor preflight");
     auto malformedPayload = plans;
-    malformedPayload[0].operations[1].payload = "{";
+    malformedPayload[0].operations[1].payloadXml = "{";
     rejectBeforeMetalAllocation(malformedPayload, "malformed payload preflight");
     if (! ok)
         return EXIT_FAILURE;

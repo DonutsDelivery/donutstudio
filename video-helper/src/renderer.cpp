@@ -3733,11 +3733,15 @@ bool FrameRenderer::renderCompositeToIOSurface (
     (activeFrameCandidate_ ? activeFrameCandidate_->frameParity : frameParity_)++;
     if (metalRenderer_ == nullptr || ioSurface == nullptr)
     {
+        lastError_ = metalRenderer_ == nullptr
+            ? "Metal renderer is unavailable"
+            : "Metal IOSurface is unavailable";
         compositorBackend_ = "metal-zero-copy-unavailable";
         return false;
     }
     const bool rendered = metalRenderer_->renderCompositeToIOSurface (
         gl_, ioSurface, width, height, layers, numLayers, overlays, numOverlays);
+    lastError_ = rendered ? std::string() : metalRenderer_->lastError();
     particleBackend_ = metalRenderer_->particleBackend();
     compositorBackend_ = rendered ? "metal-zero-copy" : "metal-zero-copy-rejected";
     return rendered;
