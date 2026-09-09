@@ -1589,6 +1589,7 @@ add_executable(arbit-export-visual-plan-session-tests
     src/visual_plan_execution_telemetry.cpp
     src/visual_renderer_telemetry.cpp)
 target_include_directories(arbit-export-visual-plan-session-tests PRIVATE src)
+target_link_libraries(arbit-export-visual-plan-session-tests PRIVATE nlohmann_json::nlohmann_json)
 if(NOT MSVC)
     target_compile_options(arbit-export-visual-plan-session-tests PRIVATE -Wall -Wextra -Werror)
 endif()
