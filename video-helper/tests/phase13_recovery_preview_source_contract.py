@@ -61,7 +61,7 @@ def main() -> int:
     require("recipe.fragment" not in prepare,
             "caller recipe pixels or graph bytes must not enter canonical preview compilation")
     require("captureVideoRenderSnapshot" in prepare
-            and "compileLegacyLayerPlan" in prepare
+            and "compileLayerPlanThroughProductionHandlers" in prepare
             and "previewClip" in prepare
             and "serializeVisualLayerPlans({ plan })" in prepare,
             "preview must use the production snapshot and compiler plan contract")

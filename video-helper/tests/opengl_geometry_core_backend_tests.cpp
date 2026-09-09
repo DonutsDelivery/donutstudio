@@ -102,15 +102,19 @@ arbitgpu::NativeFixtureSceneRuntimeInputs twoNoteRuntimeInputs() {
 } // namespace
 
 int main() {
-  if (!glfwInit()) return fail("GLFW initialization failed") ? 0 : 1;
+  if (!glfwInit()) {
+    std::cerr << "SKIP: GLFW initialization failed\n";
+    return 77;
+  }
   glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
   auto *window = glfwCreateWindow(64, 64, "geometry-core-pixel", nullptr, nullptr);
   if (!window) {
+    std::cerr << "SKIP: OpenGL 3.3 core context creation failed\n";
     glfwTerminate();
-    return fail("OpenGL 3.3 core context creation failed") ? 0 : 1;
+    return 77;
   }
   glfwMakeContextCurrent(window);
   auto &backend = arbitgpu::nativeFixtureSceneBackend();

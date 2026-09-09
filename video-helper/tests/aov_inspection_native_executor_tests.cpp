@@ -22,7 +22,23 @@ void require (bool condition, const char* message)
 
 videowire::CompiledVisualLayerPlan depthInspectionPlan()
 {
-    const auto fixture = videohelper::fixture3d::makeScene();
+    auto fixture = videohelper::fixture3d::makeScene();
+    fixture.textures[0].magFilter = 9728;
+    fixture.textures[0].minFilter = 9729;
+    fixture.textures[0].wrapS = 33071;
+    fixture.textures[0].wrapT = 33648;
+    fixture.materials[0].metallicRoughnessTexture = fixture.textures[0].id;
+    fixture.materials[0].normalTexture = fixture.textures[0].id;
+    fixture.materials[0].occlusionTexture = fixture.textures[0].id;
+    fixture.materials[0].emissiveTexture = fixture.textures[0].id;
+    fixture.materials[0].normalScale = 0.75f;
+    fixture.materials[0].occlusionStrength = 0.5f;
+    fixture.materials[0].alphaMode = HarmonicMIDI::grid::SceneAlphaMode::Mask;
+    fixture.materials[0].alphaCutoff = 0.25f;
+    fixture.materials[0].doubleSided = true;
+    fixture.lights[0].kind = HarmonicMIDI::grid::SceneLightKind::Spot;
+    fixture.lights[0].innerConeAngle = 0.1f;
+    fixture.lights[0].outerConeAngle = 0.2f;
     sceneaov::Payload scenePayload;
     scenePayload.version = sceneaov::kWireVersion;
     scenePayload.output = renderpassoutput::Output::Depth;
@@ -93,6 +109,19 @@ int main()
              && error.empty() && execution.sceneAovPass.has_value()
              && execution.aovInspectionPass.has_value()
              && execution.sceneAovPass->output == renderpassoutput::Output::Depth
+             && execution.sceneAovPass->scene->textures[0].magFilter == 9728
+             && execution.sceneAovPass->scene->textures[0].minFilter == 9729
+             && execution.sceneAovPass->scene->textures[0].wrapS == 33071
+             && execution.sceneAovPass->scene->textures[0].wrapT == 33648
+             && execution.sceneAovPass->scene->materials[0].normalTexture
+                    == execution.sceneAovPass->scene->textures[0].id
+             && execution.sceneAovPass->scene->materials[0].alphaMode
+                    == HarmonicMIDI::grid::SceneAlphaMode::Mask
+             && execution.sceneAovPass->scene->materials[0].doubleSided
+             && execution.sceneAovPass->scene->lights[0].kind
+                    == HarmonicMIDI::grid::SceneLightKind::Spot
+             && execution.sceneAovPass->scene->lights[0].innerConeAngle == 0.1f
+             && execution.sceneAovPass->scene->lights[0].outerConeAngle == 0.2f
              && execution.aovInspectionPass->source == aovinspection::Source::Depth,
              "the exact scene-AOV-to-inspector schedule must compile for native execution");
 

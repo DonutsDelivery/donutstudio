@@ -270,6 +270,8 @@ public:
         result.stats.indexBytes = scene->indexCount * sizeof (scene->indices[0]);
         result.stats.textureBytes = scene->textureTexelCount > 0
             ? scene->textureTexelCount * sizeof (scene->textureTexels[0]) : 4;
+        result.stats.staticUploadCount = static_cast<std::uint32_t> (scene->objectCount);
+        result.stats.textureUploadCount = static_cast<std::uint32_t> (scene->objectCount);
         return result;
     }
 
@@ -585,9 +587,21 @@ int main()
            "stale, replayed, and mutated product plans fail before backend allocation");
 
     auto changedWeightRequest = diffractionMaterial;
-    changedWeightRequest.lighting.paths[0].incident.radiance[1]
+    // Lighting is frozen to the canonical reference plan, so the anti-aliasing
+    // property is exercised through the grooved microstructure: every revision
+    // input still collides, the admitted digest legitimately differs, and the
+    // program receipt must never alias the original.
+    changedWeightRequest.material.microstructure.grooveDepthNanometres
         = std::nextafter(
-            changedWeightRequest.lighting.paths[0].incident.radiance[1], 0.0f);
+            changedWeightRequest.material.microstructure.grooveDepthNanometres,
+            0.0f);
+    {
+        std::string changedMaterialError;
+        if (const auto admittedChanged = diffractionmaterial::admit (
+                changedWeightRequest.material, changedMaterialError))
+            changedWeightRequest.structuralDigest
+                = admittedChanged->structuralDigest();
+    }
     auto changedWeightBinding = admitDiffractionMaterialBinding(
         diffractionScene, changedWeightRequest,
         videohelper::materialprogram::BackendTarget::Metal, error);
@@ -601,10 +615,8 @@ int main()
                 == diffractionMaterial.structuralRevision
            && changedWeightRequest.evaluationRevision
                 == diffractionMaterial.evaluationRevision
-           && changedWeightRequest.structuralDigest
-                == diffractionMaterial.structuralDigest
            && originalProgram->programIdentity != changedProgram->programIdentity,
-           "one spectral weight changes the receipt when every former identity input collides");
+           "one microstructure change never aliases the program receipt while every revision input collides");
     if (originalProgram != nullptr && changedProgram != nullptr)
     {
         auto replayed = *changedProgram;

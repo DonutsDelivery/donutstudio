@@ -97,14 +97,19 @@ void ImportedScenePayloadExecution::publishStaticPayload(
 {
     synchronizeGenerations(projectGeneration, helperGeneration);
     synchronizeDevice();
+    bool retired = false;
     for (auto found = staticOwners_.begin(); found != staticOwners_.end();)
     {
-        if (found->first.first == clipId
+        if (found->first == clipId
             && found->second.exactPayloadIdentity != exactPayloadIdentity)
+        {
+            retired = true;
             found = staticOwners_.erase(found);
+        }
         else
             ++found;
     }
+    retiredOwnerSinceLastAttempt_ = retired;
 }
 
 void ImportedScenePayloadExecution::evictForInsertion() noexcept
@@ -128,6 +133,11 @@ bool ImportedScenePayloadExecution::execute(
 {
     publishStaticPayload(request.clipId, request.projectGeneration,
                          request.helperGeneration, request.staticPayloadIdentity);
+    // When this attempt retires the clip's previous owner, any frame from the
+    // retired owner is stale: a rejected execution must not leave it visible
+    // through the caller's receipt.
+    if (retiredOwnerSinceLastAttempt_)
+        output = ImportedSceneExecutionReceipt {};
     const bool composedScene = request.sceneSnapshot != nullptr;
     if (composedScene)
     {
@@ -252,7 +262,9 @@ bool ImportedScenePayloadExecution::execute(
 
     }
 
-    const StaticOwnerKey ownerKey { request.clipId, use };
+    // One immutable static owner per clip: preview and export share the exact
+    // prepared scene so an export re-render never re-uploads static resources.
+    const StaticOwnerKey ownerKey = request.clipId;
     auto foundOwner = staticOwners_.find(ownerKey);
     if (foundOwner != staticOwners_.end()
         && ((!composedScene && foundOwner->second.payload != payload)

@@ -100,13 +100,13 @@ int main()
     auto malformed = fourWayPlan();
     malformed.ports[10].dataType = "image";
     check(! videowire::compileVisualLayerExecution(malformed, execution, error)
-          && error == "visual composite Apply Matte requires exact compatible Image and Mask bindings",
+          && error == "bounded visual DAG has an incompatible typed edge",
           "malformed mask port fails closed");
 
     auto multiplyBound = fourWayPlan();
     multiplyBound.edges.push_back({26,0,28,1});
     check(! videowire::compileVisualLayerExecution(multiplyBound, execution, error)
-          && error == "visual composite contains disconnected operations or unsupported fan-in",
+          && error == "bounded visual DAG has a duplicate edge or multiply-bound input port",
           "multiply-bound mask input fails closed");
 
     if (failures != 0)

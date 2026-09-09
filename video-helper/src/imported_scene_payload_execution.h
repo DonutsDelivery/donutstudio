@@ -137,11 +137,12 @@ private:
     Store& store_;
     arbitgpu::NativeFixtureSceneBackend& backend_;
     std::unique_ptr<ImportedAnimatedScenePayloadExecution> deformationExecution_;
-    using StaticOwnerKey = std::pair<int, ImportedSceneUse>;
+    using StaticOwnerKey = int;
     std::map<StaticOwnerKey, StaticOwner> staticOwners_;
     std::uint64_t projectGeneration_ = 0;
     std::uint64_t helperGeneration_ = 0;
     std::uint64_t useSerial_ = 0;
     std::string deviceIdentity_;
+    bool retiredOwnerSinceLastAttempt_ = false;
 };
 } // namespace videohelper::modelpayload

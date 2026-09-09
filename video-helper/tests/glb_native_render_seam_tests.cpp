@@ -629,6 +629,12 @@ int main()
     clipA.sceneIndex.reset();
     clipA.camera.reset();
     clipA.light.reset();
+    // A composed Scene3D request mirrors the plugin's Render-3D lowering
+    // contract: nonzero structural revision with evaluation >= structural
+    // (VideoVisualGraph lowers plan.structuralRevision for every composed
+    // scene). Zero revisions describe the import route only.
+    clipA.structuralRevision = 1;
+    clipA.evaluationRevision = 1;
     clipA.sceneSnapshot = makeComposedProductScene (1, -1.5f);
     clipA.projectGeneration = 77;
     clipA.helperGeneration = 9;
@@ -678,9 +684,14 @@ int main()
     malformedScene->objects[1].id = malformedScene->objects[0].id;
     malformedReplacement.sceneSnapshot = malformedScene;
     const auto submissionsBeforeMalformed = cacheBackend.submissions;
-    check (! cacheExecution.executePreview (malformedReplacement, clipAFrame2, error)
+    auto malformedReceipt = clipAFrame2;
+    const bool malformedExecuted = cacheExecution.executePreview (
+        malformedReplacement, malformedReceipt, error);
+    // The retired owner renders no stale pixels (publishStaticPayload removed
+    // the owner before any attempt); the caller's earlier receipt is unchanged.
+    check (! malformedExecuted
            && cacheBackend.submissions == submissionsBeforeMalformed
-           && ! clipAFrame2.valid(),
+           && ! malformedReceipt.valid(),
            "a malformed same-generation replacement retires the old owner without rendering stale pixels");
     auto recoveredReplacement = clipA;
     recoveredReplacement.staticPayloadIdentity = "composed-clip-a-v2";
@@ -916,10 +927,9 @@ int main()
     diffractionRequest.object = materialPreview.admission.scene->objects[0].id;
     diffractionRequest.material
         = diffractionmaterial::makeAluminiumBinaryGratingPreset();
-    diffractionRequest.lighting.pathCount = 1;
-    diffractionRequest.lighting.paths[0].kind
-        = diffractionmaterial::LightingPathKind::Direct;
-    diffractionRequest.lighting.paths[0].incident.radiance.fill (0.01f);
+    // The binding contract admits only the version-defined canonical lighting
+    // plan; legacy producers migrate through migrateLegacyV6.
+    diffractionRequest.lighting = diffractionmaterial::makeReferenceLighting();
     if (const auto admittedDiffraction = diffractionmaterial::admit (
             diffractionRequest.material, error))
         diffractionRequest.structuralDigest

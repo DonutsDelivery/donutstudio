@@ -1881,6 +1881,7 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
     set_tests_properties(opengl_geometry_core_backend PROPERTIES
         LABELS "native-geometry-core-runtime"
         TIMEOUT 60
+        SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE)
 
     add_executable(arbit-opengl-fixture-scene-backend-tests
@@ -1916,6 +1917,7 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
     set_tests_properties(opengl_fixture_scene_backend PROPERTIES
         LABELS "native-fixture-runtime;native-surface-material-runtime"
         TIMEOUT 60
+        SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE)
 
     add_executable(arbit-opengl-packaged-multi-object-acceptance
@@ -1945,6 +1947,7 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
     set_tests_properties(opengl_packaged_multi_object_acceptance PROPERTIES
         LABELS "native-fixture-runtime;packaged-asset-runtime;physical-opengl"
         TIMEOUT 60
+        SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE)
 
     add_executable(arbit-opengl-animation-deformation-backend-tests
