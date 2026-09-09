@@ -725,7 +725,7 @@ int main (int argc, char** argv)
     matteLayer.matteHeight = height;
     std::string matteError;
     if (! videowire::executeVisualLayerPlan (
-            { mattePlan }, mattePlan.clipId, matteLayer, matteError)
+            { mattePlan }, mattePlan.clipId, matteLayer, matteError, videohelper::geometry::PlanUse::preview)
         || ! matteLayer.matteApply || ! matteLayer.matteInvert
         || matteLayer.matteBlack != 0.2f || matteLayer.matteWhite != 0.8f
         || matteLayer.matteErodeDilate != 1.0f || matteLayer.matteFeather != 1.0f
@@ -777,7 +777,7 @@ int main (int argc, char** argv)
     auto malformedMattePlan = mattePlan;
     malformedMattePlan.edges[2].toPort = 0;
     if (videowire::executeVisualLayerPlan (
-            { malformedMattePlan }, malformedMattePlan.clipId, matteLayer, matteError)
+            { malformedMattePlan }, malformedMattePlan.clipId, matteLayer, matteError, videohelper::geometry::PlanUse::preview)
         || matteError != "typed matte graph has unsupported production topology")
     {
         std::cerr << "Typed matte executor accepted malformed topology\n";
@@ -786,7 +786,7 @@ int main (int argc, char** argv)
     videorender::LayerDesc texturelessMatte = matteLayer;
     texturelessMatte.matteTexture = 0;
     if (videowire::executeVisualLayerPlan (
-            { mattePlan }, mattePlan.clipId, texturelessMatte, matteError)
+            { mattePlan }, mattePlan.clipId, texturelessMatte, matteError, videohelper::geometry::PlanUse::preview)
         || matteError != "typed matte GPU texture is unavailable")
     {
         std::cerr << "Typed matte executor accepted a missing texture\n";
@@ -867,16 +867,22 @@ int main (int argc, char** argv)
     transitionLayer.opacity = 1.0f;
     transitionLayer.fromLayer = &redLayer;
     transitionLayer.transitionProgress = 0.5f;
-    for (int transition = 1;
-         transition < static_cast<int> (videofx::TransitionType::Count); ++transition)
+    for (int blendMode = 0; blendMode < static_cast<int> (videofx::BlendMode::Count);
+         ++blendMode)
     {
-        transitionLayer.transitionType = transition;
-        if (! directRenderer.renderCompositeToIOSurface (
-                nullptr, metalOnlySurface, width, height,
-                &transitionLayer, 1, nullptr, 0))
+        transitionLayer.blendMode = blendMode;
+        for (int transition = 1;
+             transition < static_cast<int> (videofx::TransitionType::Count); ++transition)
         {
-            std::cerr << "Strict Metal rejected transition " << transition << '\n';
-            return 1;
+            transitionLayer.transitionType = transition;
+            if (! directRenderer.renderCompositeToIOSurface (
+                    nullptr, metalOnlySurface, width, height,
+                    &transitionLayer, 1, nullptr, 0))
+            {
+                std::cerr << "Strict Metal rejected transition " << transition
+                          << " with blend mode " << blendMode << '\n';
+                return 1;
+            }
         }
     }
 

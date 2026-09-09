@@ -36,6 +36,9 @@ inline nlohmann::json visualTelemetryJson (const VisualTelemetrySnapshot& value)
             { "measuredTotalNs", node.available ? nlohmann::json(node.measuredTotalNs) : unavailable() },
             { "measuredMovingNs", node.available ? nlohmann::json(node.measuredMovingNs) : unavailable() } });
     const auto maybe = [&](bool observed, auto v) { return observed ? nlohmann::json(v) : unavailable(); };
+    const auto& budget = value.budgetReceipt;
+    const auto& limits = budget.limits;
+    const auto& usage = budget.usage;
     return {
         { "graphEvaluations", value.graphEvaluations }, { "graphMeasuredTotalNs", value.graphMeasuredTotalNs },
         { "graphMeasuredMovingNs", value.graphMeasuredMovingNs },
@@ -81,6 +84,33 @@ inline nlohmann::json visualTelemetryJson (const VisualTelemetrySnapshot& value)
             {"intermediateImagesPeak",maybe(value.resourcesObserved,value.intermediateImagesPeak)},
             {"retainedBytesCurrent",maybe(value.resourcesObserved,value.retainedBytesCurrent)},
             {"retainedBytesPeak",maybe(value.resourcesObserved,value.retainedBytesPeak)}} },
+        { "budget", {{"available",value.budgetObserved},
+            {"backendProfile",maybe(value.budgetObserved,limits.backendProfile)},
+            {"backendDeviceIdentity",maybe(value.budgetObserved,limits.backendDeviceIdentity)},
+            {"canvasWidth",maybe(value.budgetObserved,budget.canvasWidth)},
+            {"canvasHeight",maybe(value.budgetObserved,budget.canvasHeight)},
+            {"limits",{{"descriptors",maybe(value.budgetObserved,limits.descriptors)},
+                {"operations",maybe(value.budgetObserved,limits.operations)},
+                {"sceneRecords",maybe(value.budgetObserved,limits.sceneRecords)},
+                {"frameOutputs",maybe(value.budgetObserved,limits.frameOutputs)},
+                {"liveFrames",maybe(value.budgetObserved,limits.liveFrames)},
+                {"frameSlots",maybe(value.budgetObserved,limits.frameSlots)},
+                {"allocatedFrameBytes",maybe(value.budgetObserved,limits.allocatedFrameBytes)},
+                {"maximumImageDimension",maybe(value.budgetObserved,limits.maximumImageDimension)}}},
+            {"usage",{{"planCount",maybe(value.budgetObserved,usage.planCount)},
+                {"descriptors",maybe(value.budgetObserved,usage.descriptors)},
+                {"operations",maybe(value.budgetObserved,usage.operations)},
+                {"sceneRecords",maybe(value.budgetObserved,usage.sceneRecords)},
+                {"frameOutputs",maybe(value.budgetObserved,usage.frameOutputs)},
+                {"peakLiveFrames",maybe(value.budgetObserved,usage.peakLiveFrames)},
+                {"frameSlots",maybe(value.budgetObserved,usage.frameSlots)},
+                {"allocatedFrameBytes",maybe(value.budgetObserved,usage.allocatedFrameBytes)}}},
+            {"provenance",{{"maximumImageDimension",maybe(value.budgetObserved,limits.maximumImageDimensionSource)},
+                {"frameSlots",maybe(value.budgetObserved,limits.frameSlotSource)},
+                {"allocatedFrameBytes",maybe(value.budgetObserved,limits.allocatedFrameBytesSource)},
+                {"observedCombinedTextureImageUnits",maybe(value.budgetObserved,limits.observedCombinedTextureImageUnits)},
+                {"observedMaximumBufferLengthBytes",maybe(value.budgetObserved,limits.observedMaximumBufferLengthBytes)},
+                {"observedRecommendedWorkingSetBytes",maybe(value.budgetObserved,limits.observedRecommendedWorkingSetBytes)}}}} },
         { "dimensions", {{"available",value.dimensionsObserved},
             {"requestedWidth",maybe(value.dimensionsObserved,value.requestedWidth)},
             {"requestedHeight",maybe(value.dimensionsObserved,value.requestedHeight)},

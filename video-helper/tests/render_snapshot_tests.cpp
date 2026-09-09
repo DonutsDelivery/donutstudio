@@ -112,6 +112,45 @@ int main()
            && previewA->matteFirstFrame == 17 && previewA->matteFrameDigits == 4
            && previewA->matteAssetId == previewB->matteAssetId,
            "full matte identity and naming bind identically to two clips");
+
+    const json runtimeGrant = {
+        { "version", 1 }, { "kind", "shader" }, { "fingerprint", "exact-source" }
+    };
+    json customTransport;
+    customTransport["visualLayerPlans"] = json::array({ {
+        { "clipId", 10 }, { "structuralRevision", 1 }, { "valid", true },
+        { "descriptorCount", 2 }, { "operationCount", 2 }, { "sceneRecordCount", 0 },
+        { "frameOutputCount", 1 }, { "peakLiveFrameCount", 1 },
+        { "allocatedFrameSlotCount", 1 }, { "compileDurationMicros", 1 },
+        { "nodeKinds", json::array({ "visual.shader.custom", "video.out" }) },
+        { "nodeIds", json::array({ 61, 62 }) },
+        { "ports", json::array({
+            { { "nodeId", 61 }, { "port", 0 }, { "channels", 1 }, { "direction", "out" },
+              { "carrier", "frame" }, { "dataType", "image" }, { "pixelFormat", "rgba8" },
+              { "colorSpace", "sRGB" } },
+            { { "nodeId", 62 }, { "port", 0 }, { "channels", 1 }, { "direction", "in" },
+              { "carrier", "frame" }, { "dataType", "image" }, { "pixelFormat", "rgba8" },
+              { "colorSpace", "sRGB" } }
+        }) },
+        { "edges", json::array({ {
+            { "fromNodeId", 61 }, { "fromPort", 0 }, { "toNodeId", 62 }, { "toPort", 0 }
+        } }) },
+        { "operations", json::array({
+            { { "nodeId", 61 }, { "kind", "visual.shader.custom" },
+              { "backendCapability", "native-gpu" }, { "payloadXml", "exact-payload" },
+              { "runtimeGrant", runtimeGrant } },
+            { { "nodeId", 62 }, { "kind", "video.out" },
+              { "backendCapability", "native-gpu" }, { "payloadXml", "" } }
+        }) }
+    } });
+    const bool customTransportAccepted = videowire::parseSnapshotJson(
+        customTransport, noShader, rejected, error);
+    check (customTransportAccepted
+           && rejected.visualLayerPlans.size() == 1
+           && rejected.visualLayerPlans[0].operations.size() == 2
+           && json::parse(rejected.visualLayerPlans[0].operations[0].runtimeGrantJson) == runtimeGrant,
+           "custom shader runtime grant survives processor-to-helper JSON admission");
+
     auto rejectedDepthOperation = wire;
     rejectedDepthOperation["visualLayerPlans"] = json::array({ {
         { "clipId", 10 }, { "operations", json::array({ {
@@ -261,6 +300,76 @@ int main()
     };
     check (videowire::normalizeSnapshot (raw, { typedPlan }, 2, true, rejected, error),
            "typed node, port, and edge bindings are admitted");
+    auto importedScenePlan = typedPlan;
+    importedScenePlan.nodeKinds = {
+        "visual.3d.imported-animation", "visual.surface.constant.vec3",
+        "visual.surface.material", "visual.3d.render"
+    };
+    importedScenePlan.nodeIds = { 201, 203, 204, 202 };
+    importedScenePlan.ports = {
+        { 201, 4, 1, "out", "control", "scene3D", "unspecified", "unspecified" },
+        { 203, 0, 3, "out", "control", "vec3", "unspecified", "unspecified" },
+        { 204, 0, 3, "in", "control", "vec3", "unspecified", "unspecified" },
+        { 204, 10, 1, "out", "control", "surfaceMaterial", "unspecified", "unspecified" },
+        { 202, 0, 1, "in", "control", "scene3D", "unspecified", "unspecified" },
+        { 202, 2, 1, "in", "control", "surfaceMaterial", "unspecified", "unspecified" },
+        { 202, 1, 1, "out", "frame", "image", "rgba8", "linearSRGB" }
+    };
+    importedScenePlan.edges = {
+        { 201, 4, 202, 0 }, { 203, 0, 204, 0 }, { 204, 10, 202, 2 }
+    };
+    importedScenePlan.operations = {
+        { 201, "visual.3d.imported-animation", "source-decode", "" },
+        { 203, "visual.surface.constant.vec3", "control-eval", "" },
+        { 204, "visual.surface.material", "control-eval", "" },
+        { 202, "visual.3d.render", "native-gpu", "" }
+    };
+    const bool importedSceneAdmitted = videowire::normalizeSnapshot (
+        raw, { importedScenePlan }, 2, true, rejected, error);
+    if (! importedSceneAdmitted)
+        std::fprintf(stderr, "imported scene admission: %s\n", error.c_str());
+    check (importedSceneAdmitted,
+           "typed non-frame scene resources admit only through source decode");
+    importedScenePlan.operations[0].backendCapability = "control-eval";
+    check (! videowire::normalizeSnapshot (raw, { importedScenePlan }, 2, true, rejected, error),
+           "typed scene resources reject deterministic control evaluation");
+    auto deformedImportedScenePlan = importedScenePlan;
+    deformedImportedScenePlan.nodeKinds = {
+        "visual.3d.imported-animation", "visual.deformation.imported",
+        "visual.surface.constant.vec3", "visual.surface.material", "visual.3d.render"
+    };
+    deformedImportedScenePlan.nodeIds = { 201, 205, 203, 204, 202 };
+    deformedImportedScenePlan.ports = {
+        { 201, 0, 1, "out", "control", "mesh", "unspecified", "unspecified" },
+        { 201, 4, 1, "out", "control", "scene3D", "unspecified", "unspecified" },
+        { 205, 0, 1, "in", "control", "mesh", "unspecified", "unspecified" },
+        { 205, 4, 1, "out", "control", "mesh", "unspecified", "unspecified" },
+        { 203, 0, 3, "out", "control", "vec3", "unspecified", "unspecified" },
+        { 204, 0, 3, "in", "control", "vec3", "unspecified", "unspecified" },
+        { 204, 10, 1, "out", "control", "surfaceMaterial", "unspecified", "unspecified" },
+        { 202, 0, 1, "in", "control", "scene3D", "unspecified", "unspecified" },
+        { 202, 2, 1, "in", "control", "surfaceMaterial", "unspecified", "unspecified" },
+        { 202, 3, 1, "in", "control", "mesh", "unspecified", "unspecified" },
+        { 202, 1, 1, "out", "frame", "image", "rgba8", "linearSRGB" }
+    };
+    deformedImportedScenePlan.edges = {
+        { 201, 0, 205, 0 }, { 201, 4, 202, 0 }, { 205, 4, 202, 3 },
+        { 203, 0, 204, 0 }, { 204, 10, 202, 2 }
+    };
+    deformedImportedScenePlan.operations = {
+        { 201, "visual.3d.imported-animation", "source-decode", "" },
+        { 205, "visual.deformation.imported", "native-gpu", "" },
+        { 203, "visual.surface.constant.vec3", "control-eval", "" },
+        { 204, "visual.surface.material", "control-eval", "" },
+        { 202, "visual.3d.render", "native-gpu", "" }
+    };
+    check (videowire::normalizeSnapshot (
+               raw, { deformedImportedScenePlan }, 2, true, rejected, error),
+           "native GPU deformation admits as a non-frame control resource");
+    deformedImportedScenePlan.operations[1].backendCapability = "control-eval";
+    check (! videowire::normalizeSnapshot (
+               raw, { deformedImportedScenePlan }, 2, true, rejected, error),
+           "imported deformation rejects CPU control evaluation");
     auto particlePlan = typedPlan;
     particlePlan.nodeKinds = { "visual.particles", "video.out" };
     particlePlan.nodeIds = { 201, 202 };

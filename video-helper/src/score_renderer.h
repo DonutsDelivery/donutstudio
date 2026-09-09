@@ -1,5 +1,6 @@
 #pragma once
 
+#include "canonical_block_c_frame.h"
 #include "mod_defs.h"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <vector>
 
 namespace videorender
@@ -130,11 +132,14 @@ inline void comma(Canvas& canvas, int x, int y, int prime, int exponent,
 }
 } // namespace scoredetail
 
-inline ScoreRenderResult renderScore(const arbitmod::Score& score, const ScoreClock& clock,
+inline ScoreRenderResult renderScore(const std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame>& frame,
+                                     const ScoreClock& clock,
                                      int width, int height,
                                      const std::map<std::string, double>& params)
 {
     ScoreRenderResult result;
+    if (!canonicalblockc::valid(frame))
+        return result;
     if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return result;
     const auto value = [&params](const char* name, double fallback)
     {
@@ -166,18 +171,19 @@ inline ScoreRenderResult renderScore(const arbitmod::Score& score, const ScoreCl
         canvas.line(beatX(static_cast<float>(beat)), pitchY(38), beatX(static_cast<float>(beat)),
                     pitchY(18), {{120,124,145,90}});
 
-    std::vector<const arbitmod::Note*> visible;
-    for (const auto& note : score.notes)
-        if (note.notationVisible && !note.muted
-            && note.startBeat <= clock.beat + lookahead
-            && note.endBeat() >= clock.beat - history)
-            visible.push_back(&note);
-    std::stable_sort(visible.begin(), visible.end(), [](const auto* a, const auto* b)
+    // The score renderer consumes the same immutable canonical Block C rows as
+    // shader, particle, and imported-scene instancing. It never selects notes or
+    // owns an allocator timeline. Sticky holes remain holes, and row order is
+    // stable when notes overlap visually.
+    std::vector<const canonicalblockc::FrozenNotationNote*> visible;
+    for (int row = 0; row < frame->noteRows(); ++row)
     {
-        if (a->startBeat != b->startBeat) return a->startBeat < b->startBeat;
-        if (a->diatonicIndex != b->diatonicIndex) return a->diatonicIndex < b->diatonicIndex;
-        return a->id < b->id;
-    });
+        const auto* note = frame->noteAtRow(row);
+        if (note != nullptr && note->notationVisible && !note->muted
+            && note->startBeat <= clock.beat + lookahead
+            && note->endBeat() >= clock.beat - history)
+            visible.push_back(note);
+    }
 
     const int headW = std::max(7, staffSpace + staffSpace / 3);
     const int headH = std::max(5, staffSpace);

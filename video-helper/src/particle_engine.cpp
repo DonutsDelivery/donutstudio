@@ -4,7 +4,7 @@
 
 #include "particle_engine.h"
 #include "gl_loader.h"
-#include "shader_generator.h"   // ShaderClock, NoteFeatures
+#include "shader_generator.h"   // ShaderClock and canonical Block C frame
 #if defined (__APPLE__) && ARBIT_HAVE_METAL_BACKEND
  #include "gpu_backend/particle_engine_metal.h"
 #endif
@@ -517,7 +517,7 @@ void ParticleEngine::ensureTarget (const arbitgl::GlFuncs* gl, int width, int he
     gl->BindFramebuffer (GL_FRAMEBUFFER, 0);
 }
 
-void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const NoteFeatures* notes)
+void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblockc::CanonicalBlockCFrame* notes)
 {
     (void) gl;
     if (notesTex_ == 0)
@@ -534,11 +534,11 @@ void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const NoteFeatures
     // Only re-upload when there are notes; with uNoteCount 0 the kernel never
     // reads the texture, so a stale allocation is harmless (zero-feed contract).
     if (notes != nullptr
-        && (int) notes->notesTex.size() >= kNoteTexW * kNoteTexH * 4)
+        && (int) notes->noteTexture().size() >= kNoteTexW * kNoteTexH * 4)
     {
         glBindTexture (GL_TEXTURE_2D, notesTex_);
         glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, kNoteTexH, 0,
-                      GL_RGBA, GL_FLOAT, notes->notesTex.data());
+                      GL_RGBA, GL_FLOAT, notes->noteTexture().data());
     }
 }
 
@@ -576,7 +576,7 @@ int ParticleEngine::planSimSteps (const ShaderClock& clock, int& firstFrame)
 
 unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                                  int width, int height, const ParticleParams& params,
-                                 const NoteFeatures* notes)
+                                 const canonicalblockc::CanonicalBlockCFrame* notes)
 {
     // Renderer boundary: unlike older generator code, particles restore every GL
     // state they mutate. This lets callers compose or fail without hidden state
@@ -674,7 +674,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     uploadNotes (gl, notes);
 
     const int noteCount =
-        (notes != nullptr && ! notes->notesTex.empty()) ? notes->noteCount : 0;
+        (notes != nullptr && ! notes->noteTexture().empty()) ? notes->noteRows() : 0;
 
     // 1) Advance the pool (compute) — frame-gated catch-up (audit #7): one pass
     //    per integer timeline frame crossed since the last call, NOT one per
@@ -823,14 +823,14 @@ bool ParticleEngine::ensureFallback (const arbitgl::GlFuncs* gl, int count)
 
 unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                                          int width, int height, const ParticleParams& params,
-                                         const NoteFeatures* notes, int count)
+                                         const canonicalblockc::CanonicalBlockCFrame* notes, int count)
 {
     if (! ensureFallback (gl, count)) return 0;
     ensureTarget (gl, width, height);
     uploadNotes (gl, notes);
 
     const int noteCount =
-        (notes != nullptr && ! notes->notesTex.empty()) ? notes->noteCount : 0;
+        (notes != nullptr && ! notes->noteTexture().empty()) ? notes->noteRows() : 0;
     diagnostics_ = {};
     diagnostics_.noteRows = noteCount;
 

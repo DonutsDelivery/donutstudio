@@ -117,17 +117,21 @@ bool MacMetalViewportSurface::available()
     }
 }
 
-bool MacMetalViewportSurface::initialize (void* glfwWindow, int width, int height,
+bool MacMetalViewportSurface::initialize (void* glfwWindow, void* retainedMetalDevice,
+                                          int width, int height,
                                           bool onscreen, std::string& error)
 {
     @autoreleasepool
     {
-        impl_->device = MTLCreateSystemDefaultDevice();
+        impl_->device = (__bridge id<MTLDevice>) retainedMetalDevice;
         if (impl_->device == nil)
         {
-            error = "Metal returned no default device";
+            error = "renderer returned no retained Metal device";
             return false;
         }
+#if ! __has_feature(objc_arc)
+        [impl_->device retain];
+#endif
         impl_->queue = [impl_->device newCommandQueue];
         if (impl_->queue == nil)
         {

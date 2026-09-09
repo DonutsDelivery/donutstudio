@@ -13,6 +13,14 @@ project(arbit-video-helper VERSION 0.1.0 LANGUAGES C CXX)  # C for vendored Quic
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
     COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_renderer_geometry_closure.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+    RESULT_VARIABLE ARBIT_RENDERER_GEOMETRY_CLOSURE_RESULT)
+if(NOT ARBIT_RENDERER_GEOMETRY_CLOSURE_RESULT EQUAL 0)
+    message(FATAL_ERROR "Renderer Geometry Core source closure contract failed")
+endif()
+execute_process(
+    COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/../tools/generate_shader_catalog_manifest.py
             ${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs
             ${CMAKE_CURRENT_SOURCE_DIR}/../shared/ShaderCatalogManifest.h --check
@@ -88,20 +96,54 @@ add_executable(arbit-video-helper
     src/main.cpp
     src/capture_device.cpp
     src/media.cpp
+    src/gltf_glb.cpp
+    src/animation_clip.cpp
+    src/animation_playback_control.cpp
+    src/deformation_contract.cpp
+    src/animation_deformation_evaluation.cpp
+    src/imported_animation_deformation_consumer.cpp
+    src/native_animation_deformation.cpp
+    src/native_animation_deformation_renderer.cpp
+    src/glb_scene_adapter.cpp
+    src/glb_native_render_seam.cpp
+    src/imported_scene_payload_execution.cpp
+    src/imported_animated_scene_payload_execution.cpp
+    src/fixture_scene_renderer.cpp
+    src/geometry_core_backend.cpp
+    src/sdf_native_renderer.cpp
+    src/optical_flow_native_executor.cpp
+    src/export_visual_plan_session.cpp
+    src/exporter_visual_plan_callbacks.cpp
+    src/visual_plan_execution_telemetry.cpp
+    src/visual_renderer_telemetry.cpp
     src/exporter.cpp
 )
 add_dependencies(arbit-video-helper arbit-shader-catalog-check)
+
+if(APPLE AND ARBIT_WITH_METAL)
+    target_sources(arbit-video-helper PRIVATE src/volume_native_renderer_metal.mm)
+elseif(GLFW3_FOUND AND OpenGL_FOUND AND NOT APPLE)
+    target_sources(arbit-video-helper PRIVATE src/volume_native_renderer_opengl.cpp)
+else()
+    target_sources(arbit-video-helper PRIVATE src/volume_native_renderer_stub.cpp)
+endif()
 
 # Visual-engine P6 foundation: a language-neutral native-backend seam plus a
 # real compute/offscreen-render self-test.  FrameRenderer remains GL-backed
 # until the subsequent migration slices route its passes through this seam.
 if(APPLE AND ARBIT_WITH_METAL)
-    target_sources(arbit-video-helper PRIVATE src/gpu_backend/backend_sokol.mm)
+    target_sources(arbit-video-helper PRIVATE
+        src/gpu_backend/backend_sokol.mm
+        src/diffraction_material_metal.mm)
     target_include_directories(arbit-video-helper PRIVATE third_party/sokol)
     target_link_libraries(arbit-video-helper PRIVATE
         "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
     target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_METAL_BACKEND=1)
     message(STATUS "arbit-video-helper: native sokol_gfx Metal backend enabled")
+elseif(GLFW3_FOUND AND OpenGL_FOUND)
+    target_sources(arbit-video-helper PRIVATE src/gpu_backend/backend_opengl.cpp)
+    target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    message(STATUS "arbit-video-helper: strict native OpenGL SDF backend enabled")
 else()
     target_sources(arbit-video-helper PRIVATE src/gpu_backend/backend_stub.cpp)
 endif()
@@ -110,8 +152,10 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
     target_sources(arbit-video-helper PRIVATE
         src/viewport.cpp
         src/renderer.cpp
+        src/color_transform_gl.cpp
         src/shader_generator.cpp
         src/particle_engine.cpp
+        src/diffraction_material_gl.cpp
         src/gl_loader.cpp
         src/lut_loader.cpp)
     target_link_libraries(arbit-video-helper PRIVATE PkgConfig::GLFW3 OpenGL::GL)
@@ -439,6 +483,8 @@ endif()
 target_include_directories(arbit-video-helper PRIVATE
     # VideoFrameSharedMemory.h is shared with the plugin (dependency-free header)
     ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source
+    # Typed 3D scene contracts are shared by the GLB adapter and renderer seam.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared
 )
 
 target_link_libraries(arbit-video-helper PRIVATE
@@ -590,6 +636,16 @@ endif()
 # (no FFmpeg/GL/Lua), so its unit test builds and runs anywhere — the guard-rail that
 # replaced the old "KEEP IN SYNC" comments across exporter.cpp / viewport.cpp.
 enable_testing()
+add_executable(arbit-geometry-core-tests tests/geometry_core_admission_tests.cpp)
+target_include_directories(arbit-geometry-core-tests PRIVATE src ../shared)
+target_compile_features(arbit-geometry-core-tests PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(arbit-geometry-core-tests PRIVATE /W4 /WX)
+else()
+    target_compile_options(arbit-geometry-core-tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME geometry_core_admission COMMAND arbit-geometry-core-tests)
+
 add_executable(arbit-video-param-tests tests/param_grammar_tests.cpp)
 target_include_directories(arbit-video-param-tests PRIVATE src)
 if(NOT MSVC)
@@ -616,6 +672,13 @@ add_test(NAME video_control_plan COMMAND arbit-video-control-plan-tests)
 
 add_test(NAME depth_primitives_source_contract
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/depth_primitives_source_contract.py)
+add_test(NAME renderer_geometry_closure_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_renderer_geometry_closure.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_test(NAME fixture_scene_culling_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_scene_culling_source_contract.py)
 add_test(NAME bundled_shader_coordinate_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bundled_shader_coordinate_contract.py
@@ -632,12 +695,37 @@ if(NOT MSVC)
 endif()
 add_test(NAME source_binding COMMAND arbit-source-binding-tests)
 
+add_executable(arbit-canonical-block-c-frame-identity-tests
+    tests/canonical_block_c_frame_identity_tests.cpp)
+target_include_directories(arbit-canonical-block-c-frame-identity-tests PRIVATE src)
+target_link_libraries(arbit-canonical-block-c-frame-identity-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+target_compile_features(arbit-canonical-block-c-frame-identity-tests PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(arbit-canonical-block-c-frame-identity-tests PRIVATE /W4 /WX)
+else()
+    target_compile_options(arbit-canonical-block-c-frame-identity-tests PRIVATE
+        -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME canonical_block_c_frame_identity
+    COMMAND arbit-canonical-block-c-frame-identity-tests)
+
 add_executable(arbit-score-renderer-tests tests/score_renderer_tests.cpp)
 target_include_directories(arbit-score-renderer-tests PRIVATE src)
 if(NOT MSVC)
     target_compile_options(arbit-score-renderer-tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME score_renderer COMMAND arbit-score-renderer-tests)
+
+add_executable(arbit-shader-operation-plan-tests tests/shader_operation_plan_tests.cpp)
+target_include_directories(arbit-shader-operation-plan-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-shader-operation-plan-tests PRIVATE nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-shader-operation-plan-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME shader_operation_plan COMMAND arbit-shader-operation-plan-tests)
 
 add_executable(arbit-render-snapshot-tests tests/render_snapshot_tests.cpp)
 target_include_directories(arbit-render-snapshot-tests PRIVATE src)
@@ -646,6 +734,591 @@ if(NOT MSVC)
     target_compile_options(arbit-render-snapshot-tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME render_snapshot COMMAND arbit-render-snapshot-tests)
+
+add_executable(arbit-gltf-glb-tests
+    tests/gltf_glb_tests.cpp
+    src/gltf_glb.cpp
+    src/animation_clip.cpp
+    src/animation_playback_control.cpp
+    src/deformation_contract.cpp
+    src/animation_deformation_evaluation.cpp
+    src/imported_animation_deformation_consumer.cpp)
+target_include_directories(arbit-gltf-glb-tests PRIVATE src)
+target_link_libraries(arbit-gltf-glb-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-gltf-glb-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME gltf_glb_admission COMMAND arbit-gltf-glb-tests)
+
+add_executable(arbit-glb-scene-adapter-tests
+    tests/glb_scene_adapter_tests.cpp
+    src/glb_scene_adapter.cpp)
+target_include_directories(arbit-glb-scene-adapter-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-glb-scene-adapter-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME glb_scene_adapter COMMAND arbit-glb-scene-adapter-tests)
+
+add_executable(arbit-holographic-trading-card-asset-tests
+    tests/holographic_trading_card_asset_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp
+    src/animation_clip.cpp
+    src/animation_playback_control.cpp
+    src/deformation_contract.cpp
+    src/animation_deformation_evaluation.cpp
+    src/imported_animation_deformation_consumer.cpp)
+target_include_directories(arbit-holographic-trading-card-asset-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-holographic-trading-card-asset-tests PRIVATE
+    nlohmann_json::nlohmann_json PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-holographic-trading-card-asset-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME holographic_trading_card_asset
+    COMMAND arbit-holographic-trading-card-asset-tests)
+
+add_executable(arbit-glb-native-render-seam-tests
+    tests/glb_native_render_seam_tests.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp
+    src/glb_native_render_seam.cpp
+    src/imported_scene_payload_execution.cpp
+    src/imported_animated_scene_payload_execution.cpp
+    src/imported_animation_deformation_consumer.cpp
+    src/fixture_scene_renderer.cpp
+    src/animation_clip.cpp
+    src/animation_playback_control.cpp
+    src/animation_deformation_evaluation.cpp
+    src/deformation_contract.cpp
+    src/native_animation_deformation.cpp
+    src/native_animation_deformation_renderer.cpp
+    src/gpu_backend/backend_stub.cpp)
+target_include_directories(arbit-glb-native-render-seam-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-glb-native-render-seam-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-glb-native-render-seam-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME glb_native_render_seam COMMAND arbit-glb-native-render-seam-tests)
+
+add_executable(arbit-model-payload-transport-tests
+    tests/model_payload_transport_tests.cpp)
+target_include_directories(arbit-model-payload-transport-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-model-payload-transport-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME model_payload_transport COMMAND arbit-model-payload-transport-tests)
+
+add_executable(arbit-model-cache-contract-tests
+    tests/model_cache_contract_tests.cpp)
+target_include_directories(arbit-model-cache-contract-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-model-cache-contract-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME model_cache_contract COMMAND arbit-model-cache-contract-tests)
+
+add_executable(arbit-animation-clip-tests
+    tests/animation_clip_tests.cpp
+    src/animation_clip.cpp)
+target_include_directories(arbit-animation-clip-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-animation-clip-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME animation_clip_sampling COMMAND arbit-animation-clip-tests)
+
+add_executable(arbit-animation-mix-tests
+    tests/animation_mix_tests.cpp
+    src/animation_mix.cpp
+    src/animation_clip.cpp)
+target_include_directories(arbit-animation-mix-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-animation-mix-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME animation_crossfade COMMAND arbit-animation-mix-tests)
+
+add_executable(arbit-animation-playback-control-tests
+    tests/animation_playback_control_tests.cpp
+    src/animation_playback_control.cpp
+    src/animation_clip.cpp)
+target_include_directories(arbit-animation-playback-control-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-animation-playback-control-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME animation_playback_control
+    COMMAND arbit-animation-playback-control-tests)
+
+add_executable(arbit-animation-deformation-evaluation-tests
+    tests/animation_deformation_evaluation_tests.cpp
+    src/animation_deformation_evaluation.cpp
+    src/animation_clip.cpp
+    src/deformation_contract.cpp)
+target_include_directories(arbit-animation-deformation-evaluation-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-animation-deformation-evaluation-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME animation_deformation_evaluation
+    COMMAND arbit-animation-deformation-evaluation-tests)
+
+add_executable(arbit-native-animation-deformation-tests
+    tests/native_animation_deformation_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp
+    src/native_animation_deformation.cpp
+    src/native_animation_deformation_renderer.cpp
+    src/animation_deformation_evaluation.cpp
+    src/animation_clip.cpp
+    src/deformation_contract.cpp
+    src/gpu_backend/backend_stub.cpp)
+target_include_directories(arbit-native-animation-deformation-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-native-animation-deformation-tests PRIVATE
+    nlohmann_json::nlohmann_json PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-native-animation-deformation-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME native_animation_deformation
+    COMMAND arbit-native-animation-deformation-tests)
+
+add_executable(arbit-sdf-ir-admission-tests tests/sdf_ir_admission_tests.cpp)
+target_include_directories(arbit-sdf-ir-admission-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_definitions(arbit-sdf-ir-admission-tests PRIVATE
+    SDF_SCENE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs")
+if(NOT MSVC)
+    target_compile_options(arbit-sdf-ir-admission-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME sdf_ir_admission COMMAND arbit-sdf-ir-admission-tests)
+
+add_executable(arbit-sdf-reference-evaluator-tests
+    tests/sdf_reference_evaluator_tests.cpp
+    tests/support/sdf_reference_evaluator.cpp)
+target_include_directories(arbit-sdf-reference-evaluator-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-sdf-reference-evaluator-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME sdf_reference_evaluator COMMAND arbit-sdf-reference-evaluator-tests)
+
+add_executable(arbit-surface-material-admission-tests
+    tests/surface_material_admission_tests.cpp)
+target_include_directories(arbit-surface-material-admission-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-surface-material-admission-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME surface_material_admission COMMAND arbit-surface-material-admission-tests)
+
+add_executable(arbit-material-program-compiler-tests
+    tests/material_program_compiler_tests.cpp)
+target_include_directories(arbit-material-program-compiler-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-material-program-compiler-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME material_program_compiler COMMAND arbit-material-program-compiler-tests)
+
+add_executable(arbit-surface-material-binding-admission-tests
+    tests/surface_material_binding_admission_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp)
+target_include_directories(arbit-surface-material-binding-admission-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-surface-material-binding-admission-tests PRIVATE
+    nlohmann_json::nlohmann_json PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-surface-material-binding-admission-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME surface_material_binding_admission
+    COMMAND arbit-surface-material-binding-admission-tests)
+
+add_executable(arbit-path-mask-contract-tests
+    tests/path_mask_contract_tests.cpp)
+target_include_directories(arbit-path-mask-contract-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-path-mask-contract-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME path_mask_contract COMMAND arbit-path-mask-contract-tests)
+
+add_executable(arbit-diffraction-material-admission-tests
+    tests/diffraction_material_admission_tests.cpp)
+target_include_directories(arbit-diffraction-material-admission-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-diffraction-material-admission-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffraction_material_admission
+    COMMAND arbit-diffraction-material-admission-tests)
+
+add_executable(arbit-diffraction-product-plans-compile-tests
+    tests/diffraction_product_plans_compile_tests.cpp)
+target_include_directories(arbit-diffraction-product-plans-compile-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-diffraction-product-plans-compile-tests PRIVATE cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(arbit-diffraction-product-plans-compile-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffraction_product_plans_compile
+    COMMAND arbit-diffraction-product-plans-compile-tests)
+
+add_executable(arbit-diffraction-material-execution-tests
+    tests/diffraction_material_execution_tests.cpp)
+target_include_directories(arbit-diffraction-material-execution-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-diffraction-material-execution-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffraction_material_execution
+    COMMAND arbit-diffraction-material-execution-tests)
+
+add_executable(arbit-diffraction-order-bsdf-tests
+    tests/diffraction_order_bsdf_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-diffraction-order-bsdf-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-diffraction-order-bsdf-tests PRIVATE cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(arbit-diffraction-order-bsdf-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffraction_order_bsdf
+    COMMAND arbit-diffraction-order-bsdf-tests)
+
+add_test(NAME diffraction_evaluation_backend_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/diffraction_evaluation_backend_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(arbit-diffraction-reference-oracle-tests
+    tests/diffraction_reference_oracle_tests.cpp
+    tests/support/diffraction_reference_oracle.cpp)
+target_include_directories(arbit-diffraction-reference-oracle-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-diffraction-reference-oracle-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffraction_reference_oracle
+    COMMAND arbit-diffraction-reference-oracle-tests)
+add_test(NAME diffraction_wavelength_reference_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/diffraction_wavelength_reference_source_contract.py)
+
+add_executable(arbit-diffraction-published-grating-validation-tests
+    tests/diffraction_published_grating_validation_tests.cpp
+    tests/support/diffraction_reference_oracle.cpp)
+target_include_directories(arbit-diffraction-published-grating-validation-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_definitions(arbit-diffraction-published-grating-validation-tests PRIVATE
+    DIFFRACTION_PUBLISHED_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diffraction/arnold-2025-centered-rectangular.csv"
+    DIFFRACTION_PUBLISHED_METADATA_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diffraction/arnold-2025-centered-rectangular.metadata.json")
+if(NOT MSVC)
+    target_compile_options(arbit-diffraction-published-grating-validation-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffraction_published_grating_validation
+    COMMAND arbit-diffraction-published-grating-validation-tests)
+
+add_executable(arbit-diffractive-foil-tests
+    tests/diffractive_foil_tests.cpp
+    tests/support/diffraction_reference_oracle.cpp)
+target_include_directories(arbit-diffractive-foil-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-diffractive-foil-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffractive_foil
+    COMMAND arbit-diffractive-foil-tests)
+
+if(GLFW3_FOUND AND OpenGL_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(arbit-diffraction-material-gl-tests
+        tests/diffraction_material_gl_tests.cpp
+        tests/support/diffraction_reference_oracle.cpp
+        src/diffraction_material_gl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-diffraction-material-gl-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-diffraction-material-gl-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
+    target_link_libraries(arbit-diffraction-material-gl-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL)
+    target_compile_options(arbit-diffraction-material-gl-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME diffraction_material_gl
+        COMMAND arbit-diffraction-material-gl-tests)
+    set_tests_properties(diffraction_material_gl PROPERTIES
+        LABELS "native-physical-diffraction-runtime"
+        TIMEOUT 600
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+endif()
+
+add_executable(arbit-deformation-contract-tests
+    tests/deformation_contract_tests.cpp
+    src/deformation_contract.cpp)
+target_include_directories(arbit-deformation-contract-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-deformation-contract-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME deformation_contract COMMAND arbit-deformation-contract-tests)
+
+add_executable(arbit-vertex-modifier-ir-admission-tests
+    tests/vertex_modifier_ir_admission_tests.cpp)
+target_include_directories(arbit-vertex-modifier-ir-admission-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-vertex-modifier-ir-admission-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME vertex_modifier_ir_admission COMMAND arbit-vertex-modifier-ir-admission-tests)
+
+add_executable(arbit-temporal-resource-contract-tests
+    tests/temporal_resource_contract_tests.cpp)
+target_include_directories(arbit-temporal-resource-contract-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-temporal-resource-contract-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME temporal_resource_contract COMMAND arbit-temporal-resource-contract-tests)
+
+add_executable(arbit-volume-data-admission-tests
+    tests/volume_data_admission_tests.cpp)
+target_include_directories(arbit-volume-data-admission-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-volume-data-admission-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME volume_data_admission COMMAND arbit-volume-data-admission-tests)
+add_test(NAME metal_volume_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/metal_volume_source_contract.py)
+add_test(NAME metal_static_glb_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/metal_static_glb_source_contract.py)
+
+add_executable(arbit-optical-flow-contract-tests
+    tests/optical_flow_contract_tests.cpp)
+target_include_directories(arbit-optical-flow-contract-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-optical-flow-contract-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME optical_flow_contract COMMAND arbit-optical-flow-contract-tests)
+
+add_executable(arbit-optical-flow-native-executor-tests
+    tests/optical_flow_native_executor_tests.cpp
+    src/optical_flow_native_executor.cpp)
+target_include_directories(arbit-optical-flow-native-executor-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-optical-flow-native-executor-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME optical_flow_native_executor
+    COMMAND arbit-optical-flow-native-executor-tests)
+
+add_executable(arbit-fixture-scene-reference-tests
+    tests/fixture_scene_reference_tests.cpp
+    tests/support/fixture_scene.cpp
+    tests/support/fixture_scene_reference_renderer.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp)
+target_include_directories(arbit-fixture-scene-reference-tests PRIVATE
+    tests/support
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-fixture-scene-reference-tests PRIVATE
+    nlohmann_json::nlohmann_json PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-fixture-scene-reference-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME fixture_scene_reference COMMAND arbit-fixture-scene-reference-tests)
+
+add_executable(arbit-fixture-scene-renderer-tests
+    tests/fixture_scene_renderer_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/fixture_scene_renderer.cpp
+    src/gpu_backend/backend_stub.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp)
+target_include_directories(arbit-fixture-scene-renderer-tests PRIVATE
+    src
+    tests
+    tests/support
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-fixture-scene-renderer-tests PRIVATE
+    nlohmann_json::nlohmann_json PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-fixture-scene-renderer-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME fixture_scene_renderer COMMAND arbit-fixture-scene-renderer-tests)
+
+add_executable(arbit-sdf-native-render-admission-tests
+    tests/sdf_native_render_admission_tests.cpp
+    src/gpu_backend/backend_stub.cpp)
+target_include_directories(arbit-sdf-native-render-admission-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-sdf-native-render-admission-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME sdf_native_render_admission
+    COMMAND arbit-sdf-native-render-admission-tests)
+
+add_executable(arbit-sdf-native-renderer-dispatch-tests
+    tests/sdf_native_renderer_tests.cpp
+    src/sdf_native_renderer.cpp
+    src/gpu_backend/backend_stub.cpp)
+target_include_directories(arbit-sdf-native-renderer-dispatch-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-sdf-native-renderer-dispatch-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME sdf_native_renderer_dispatch
+    COMMAND arbit-sdf-native-renderer-dispatch-tests)
+
+add_executable(arbit-color-transform-contract-tests
+    ../plugin/Tests/ColorTransformContractTests.cpp)
+target_include_directories(arbit-color-transform-contract-tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+if(NOT MSVC)
+    target_compile_options(arbit-color-transform-contract-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME color_transform_contract COMMAND arbit-color-transform-contract-tests)
+
+add_executable(arbit-color-transform-operation-execution-tests
+    tests/color_transform_operation_execution_tests.cpp)
+target_include_directories(arbit-color-transform-operation-execution-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_link_libraries(arbit-color-transform-operation-execution-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-color-transform-operation-execution-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME color_transform_operation_execution
+    COMMAND arbit-color-transform-operation-execution-tests)
+
+add_executable(arbit-render-pass-output-contract-tests
+    ../plugin/Tests/RenderPassOutputContractTests.cpp)
+target_include_directories(arbit-render-pass-output-contract-tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+if(NOT MSVC)
+    target_compile_options(arbit-render-pass-output-contract-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME render_pass_output_contract COMMAND arbit-render-pass-output-contract-tests)
+
+add_executable(arbit-render-pass-output-publication-tests
+    tests/render_pass_output_publication_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/gpu_backend/backend_stub.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp)
+target_include_directories(arbit-render-pass-output-publication-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-render-pass-output-publication-tests PRIVATE
+    nlohmann_json::nlohmann_json PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-render-pass-output-publication-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME render_pass_output_publication COMMAND arbit-render-pass-output-publication-tests)
+
+add_executable(arbit-frame-memory-budget-admission-tests
+    tests/frame_memory_budget_admission_tests.cpp)
+target_include_directories(arbit-frame-memory-budget-admission-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-frame-memory-budget-admission-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME frame_memory_budget_admission COMMAND arbit-frame-memory-budget-admission-tests)
+add_test(NAME frame_memory_backend_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/frame_memory_backend_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(arbit-aov-inspection-native-executor-tests
+    tests/aov_inspection_native_executor_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp)
+target_include_directories(arbit-aov-inspection-native-executor-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-aov-inspection-native-executor-tests PRIVATE
+    nlohmann_json::nlohmann_json PkgConfig::AV)
+if(NOT MSVC)
+    target_compile_options(arbit-aov-inspection-native-executor-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME aov_inspection_native_executor
+         COMMAND arbit-aov-inspection-native-executor-tests)
 
 add_executable(programmable-admission-tests tests/programmable_admission_tests.cpp)
 add_dependencies(programmable-admission-tests arbit-shader-catalog-check)
@@ -700,7 +1373,9 @@ if(EXISTS "${ARBIT_JUCE_SOURCE_DIR}/CMakeLists.txt" AND NOT MINGW)
         ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source)
     target_compile_definitions(programmable-production-lifecycle-tests PRIVATE
         PRIVATE_LIFECYCLE_HELPER="$<TARGET_FILE:arbit-video-helper>"
-        ARBIT_PROGRAMMABLE_TEST_MODE=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+        AUTHORITY_CURATED_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs/arbit-essentials/shaders/aurora_drift.fs"
+        ARBIT_PROGRAMMABLE_TEST_MODE=1 ARBIT_PROGRAMMABLE_AUTHORITY_TEST_SEAM=1
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(programmable-resource-limit-fixture
             tests/resource_limit_fixture.cpp)
@@ -757,6 +1432,36 @@ add_test(NAME depth_cache_windows_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/depth_cache_windows_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME blend_modes_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/blend_modes_source_contract.py)
+add_test(NAME phase13_recovery_preview_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/phase13_recovery_preview_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_test(NAME surface_material_starter_metal_source_gate
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/surface_material_starter_metal_source_gate.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME surface_material_starter_independent_oracle_freshness
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/generate_surface_material_starter_expected.py
+            --check)
+
+add_executable(arbit-surface-material-starter-oracle-tests
+    tests/surface_material_starter_oracle_tests.cpp)
+target_include_directories(arbit-surface-material-starter-oracle-tests PRIVATE src tests)
+target_compile_definitions(arbit-surface-material-starter-oracle-tests PRIVATE
+    SURFACE_MATERIAL_STARTER_ORACLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/surface_material_starter_expected.json")
+target_link_libraries(arbit-surface-material-starter-oracle-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-surface-material-starter-oracle-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME surface_material_starter_oracle_cross_language
+    COMMAND arbit-surface-material-starter-oracle-tests)
 
 add_executable(arbit-composite-probe-contract-tests tests/composite_probe_contract_tests.cpp)
 target_include_directories(arbit-composite-probe-contract-tests PRIVATE src)
@@ -772,6 +1477,76 @@ if(NOT MSVC)
     target_compile_options(arbit-visual-plan-executor-tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME visual_plan_executor COMMAND arbit-visual-plan-executor-tests)
+
+add_executable(arbit-four-way-compositor-tests tests/four_way_compositor_tests.cpp)
+target_include_directories(arbit-four-way-compositor-tests PRIVATE src)
+target_link_libraries(arbit-four-way-compositor-tests PRIVATE nlohmann_json::nlohmann_json)
+target_compile_features(arbit-four-way-compositor-tests PRIVATE cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(arbit-four-way-compositor-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME four_way_compositor COMMAND arbit-four-way-compositor-tests)
+
+add_executable(arbit-imported-animation-visual-plan-execution-tests
+    tests/imported_animation_visual_plan_execution_tests.cpp)
+target_include_directories(arbit-imported-animation-visual-plan-execution-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-imported-animation-visual-plan-execution-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-imported-animation-visual-plan-execution-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME imported_animation_visual_plan_execution
+    COMMAND arbit-imported-animation-visual-plan-execution-tests)
+
+add_executable(arbit-imported-scene-visual-plan-execution-tests
+    tests/imported_scene_visual_plan_execution_tests.cpp)
+target_include_directories(arbit-imported-scene-visual-plan-execution-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-imported-scene-visual-plan-execution-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-imported-scene-visual-plan-execution-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME imported_scene_visual_plan_execution
+    COMMAND arbit-imported-scene-visual-plan-execution-tests)
+add_test(NAME imported_scene_product_route_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/imported_scene_product_route_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_test(NAME sdf_product_route_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/sdf_product_route_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME ordered_shader_authority_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/ordered_shader_authority_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(arbit-visual-plan-resource-budget-tests tests/visual_plan_resource_budget_tests.cpp)
+target_include_directories(arbit-visual-plan-resource-budget-tests PRIVATE src)
+target_link_libraries(arbit-visual-plan-resource-budget-tests PRIVATE nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-visual-plan-resource-budget-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME visual_plan_resource_budget COMMAND arbit-visual-plan-resource-budget-tests)
+
+add_executable(arbit-flat-shader-bridge-tests tests/flat_shader_bridge_tests.cpp)
+add_dependencies(arbit-flat-shader-bridge-tests arbit-shader-catalog-check)
+target_include_directories(arbit-flat-shader-bridge-tests PRIVATE src)
+target_compile_definitions(arbit-flat-shader-bridge-tests PRIVATE
+    SHADER_CATALOG_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs")
+target_link_libraries(arbit-flat-shader-bridge-tests PRIVATE nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-flat-shader-bridge-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME flat_shader_bridge_contract COMMAND arbit-flat-shader-bridge-tests)
+set_tests_properties(flat_shader_bridge_contract PROPERTIES TIMEOUT 30)
 
 if(UNIX AND NOT WIN32)
     add_executable(arbit-tracking-runtime-tests tests/tracking_runtime_tests.cpp)
@@ -813,10 +1588,35 @@ if(NOT MSVC)
     target_compile_options(arbit-export-telemetry-owner-tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME export_telemetry_owner COMMAND arbit-export-telemetry-owner-tests)
+
+add_executable(arbit-export-visual-plan-session-tests
+    tests/export_visual_plan_session_tests.cpp
+    src/export_visual_plan_session.cpp
+    src/exporter_visual_plan_callbacks.cpp
+    src/visual_plan_execution_telemetry.cpp
+    src/visual_renderer_telemetry.cpp)
+target_include_directories(arbit-export-visual-plan-session-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-export-visual-plan-session-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME export_visual_plan_session COMMAND arbit-export-visual-plan-session-tests)
+
 add_test(NAME export_telemetry_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/export_telemetry_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME viewport_backend_budget_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_backend_budget_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(arbit-export-encoder-fallback-tests
+    tests/export_encoder_fallback_tests.cpp)
+target_include_directories(arbit-export-encoder-fallback-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-export-encoder-fallback-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME export_encoder_fallback COMMAND arbit-export-encoder-fallback-tests)
 
 # M7 physical Linux acceptance: drive the production helper/exporter/FrameRenderer
 # and FFmpeg handoff at exact 1080p then 4K. This is intentionally not part of
@@ -852,6 +1652,11 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
         add_executable(arbit-depth-fog-gl-pixel-tests
             tests/depth_fog_gl_pixel_tests.cpp
             src/renderer.cpp
+            src/visual_plan_execution_telemetry.cpp
+            src/visual_renderer_telemetry.cpp
+            src/geometry_core_backend.cpp
+            src/color_transform_gl.cpp
+            src/gpu_backend/backend_stub.cpp
             src/shader_generator.cpp
             src/particle_engine.cpp
             src/gl_loader.cpp
@@ -865,6 +1670,99 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
         add_test(NAME depth_fog_gl_pixels COMMAND arbit-depth-fog-gl-pixel-tests)
         set_tests_properties(depth_fog_gl_pixels PROPERTIES
             LABELS "native-depth-fog-runtime"
+            TIMEOUT 600
+            RUN_SERIAL TRUE)
+
+        add_executable(arbit-temporal-frame-delay-gl-pixel-tests
+            tests/temporal_frame_delay_gl_pixel_tests.cpp
+            src/renderer.cpp
+            src/visual_plan_execution_telemetry.cpp
+            src/visual_renderer_telemetry.cpp
+            src/geometry_core_backend.cpp
+            src/color_transform_gl.cpp
+            src/gpu_backend/backend_stub.cpp
+            src/shader_generator.cpp
+            src/particle_engine.cpp
+            src/gl_loader.cpp
+            src/lut_loader.cpp)
+        target_include_directories(arbit-temporal-frame-delay-gl-pixel-tests PRIVATE src)
+        target_compile_definitions(arbit-temporal-frame-delay-gl-pixel-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
+        target_link_libraries(arbit-temporal-frame-delay-gl-pixel-tests PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+        target_compile_options(arbit-temporal-frame-delay-gl-pixel-tests PRIVATE
+            -Wall -Wextra -Werror)
+        add_test(NAME temporal_frame_delay_gl_pixels
+            COMMAND arbit-temporal-frame-delay-gl-pixel-tests)
+        set_tests_properties(temporal_frame_delay_gl_pixels PROPERTIES
+            LABELS "native-temporal-runtime"
+            TIMEOUT 600
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE)
+
+        add_executable(arbit-motion-blur-gl-pixel-tests
+            tests/motion_blur_gl_pixel_tests.cpp
+            src/renderer.cpp
+            src/visual_plan_execution_telemetry.cpp
+            src/visual_renderer_telemetry.cpp
+            src/geometry_core_backend.cpp
+            src/color_transform_gl.cpp
+            src/gpu_backend/backend_opengl.cpp
+            src/sdf_native_renderer.cpp
+            src/deformation_contract.cpp
+            src/native_animation_deformation.cpp
+            src/shader_generator.cpp
+            src/particle_engine.cpp
+            src/gl_loader.cpp
+            src/lut_loader.cpp)
+        target_include_directories(arbit-motion-blur-gl-pixel-tests PRIVATE
+            src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+        target_compile_definitions(arbit-motion-blur-gl-pixel-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+            ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+        target_link_libraries(arbit-motion-blur-gl-pixel-tests PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+        target_compile_options(arbit-motion-blur-gl-pixel-tests PRIVATE
+            -Wall -Wextra -Werror)
+        add_test(NAME motion_blur_gl_pixels
+            COMMAND arbit-motion-blur-gl-pixel-tests)
+        set_tests_properties(motion_blur_gl_pixels PROPERTIES
+            LABELS "native-temporal-runtime"
+            TIMEOUT 600
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE)
+
+        add_executable(arbit-custom-shader-gl-pixel-tests
+            tests/custom_shader_gl_pixel_tests.cpp
+            src/renderer.cpp
+            src/geometry_core_backend.cpp
+            src/color_transform_gl.cpp
+            src/gpu_backend/backend_opengl.cpp
+            src/sdf_native_renderer.cpp
+            src/deformation_contract.cpp
+            src/native_animation_deformation.cpp
+            src/visual_plan_execution_telemetry.cpp
+            src/visual_renderer_telemetry.cpp
+            src/shader_generator.cpp
+            src/particle_engine.cpp
+            src/gl_loader.cpp
+            src/lut_loader.cpp)
+        target_include_directories(arbit-custom-shader-gl-pixel-tests PRIVATE
+            src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+        target_compile_definitions(arbit-custom-shader-gl-pixel-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+            ARBIT_HAVE_OPENGL_SDF_BACKEND=1
+            ARBIT_SHADER_PACK_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs")
+        target_link_libraries(arbit-custom-shader-gl-pixel-tests PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+        target_compile_options(arbit-custom-shader-gl-pixel-tests PRIVATE
+            -Wall -Wextra -Werror)
+        add_test(NAME custom_shader_gl_pixels
+            COMMAND arbit-custom-shader-gl-pixel-tests)
+        set_tests_properties(custom_shader_gl_pixels PROPERTIES
+            LABELS "native-custom-shader-runtime"
             TIMEOUT 600
             SKIP_RETURN_CODE 77
             RUN_SERIAL TRUE)
@@ -895,14 +1793,425 @@ if(NOT MSVC)
 endif()
 add_test(NAME node_preview_presentation COMMAND arbit-node-preview-presentation-tests)
 
+if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
+    add_executable(arbit-opengl-volume-backend-tests
+        tests/opengl_volume_backend_tests.cpp
+        src/volume_native_renderer_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-opengl-volume-backend-tests PRIVATE
+        src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-volume-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1)
+    target_link_libraries(arbit-opengl-volume-backend-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-volume-backend-tests PRIVATE
+            -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME opengl_volume_backend COMMAND arbit-opengl-volume-backend-tests)
+    set_tests_properties(opengl_volume_backend PROPERTIES
+        LABELS "native-volume-runtime"
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-opengl-sdf-backend-tests
+        tests/opengl_sdf_backend_tests.cpp
+        tests/support/sdf_native_backend_parity.cpp
+        tests/support/sdf_reference_evaluator.cpp
+        src/sdf_native_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-opengl-sdf-backend-tests PRIVATE
+        src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-sdf-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
+    target_link_libraries(arbit-opengl-sdf-backend-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-sdf-backend-tests PRIVATE
+            -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME opengl_sdf_backend COMMAND arbit-opengl-sdf-backend-tests)
+    set_tests_properties(opengl_sdf_backend PROPERTIES
+        LABELS "native-sdf-runtime"
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    # visual_plan_executor.h owns the production Geometry Core path, so its
+    # focused test must link the same native backend it instantiates.
+    target_sources(arbit-visual-plan-executor-tests PRIVATE
+        src/geometry_core_backend.cpp
+        src/visual_plan_execution_telemetry.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-visual-plan-executor-tests PRIVATE
+        tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-visual-plan-executor-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-visual-plan-executor-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL)
+
+    add_executable(arbit-opengl-geometry-core-backend-tests
+        tests/opengl_geometry_core_backend_tests.cpp
+        src/geometry_core_backend.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-opengl-geometry-core-backend-tests PRIVATE
+        src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-geometry-core-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-geometry-core-backend-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL)
+    target_compile_options(arbit-opengl-geometry-core-backend-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME opengl_geometry_core_backend
+        COMMAND arbit-opengl-geometry-core-backend-tests)
+    set_tests_properties(opengl_geometry_core_backend PROPERTIES
+        LABELS "native-geometry-core-runtime"
+        TIMEOUT 60
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-opengl-fixture-scene-backend-tests
+        tests/opengl_fixture_scene_backend_tests.cpp
+        tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-opengl-fixture-scene-backend-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-fixture-scene-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1
+        SURFACE_MATERIAL_STARTER_ORACLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/surface_material_starter_expected.json")
+    target_link_libraries(arbit-opengl-fixture-scene-backend-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-fixture-scene-backend-tests PRIVATE
+            -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME opengl_fixture_scene_backend
+        COMMAND arbit-opengl-fixture-scene-backend-tests)
+    set_tests_properties(opengl_fixture_scene_backend PROPERTIES
+        LABELS "native-fixture-runtime;native-surface-material-runtime"
+        TIMEOUT 60
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-opengl-packaged-multi-object-acceptance
+        tests/opengl_fixture_scene_backend_tests.cpp
+        tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-opengl-packaged-multi-object-acceptance PRIVATE
+        src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-packaged-multi-object-acceptance PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1 ARBIT_STRICT_PACKAGED_ACCEPTANCE=1
+        SURFACE_MATERIAL_STARTER_ORACLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/surface_material_starter_expected.json")
+    target_link_libraries(arbit-opengl-packaged-multi-object-acceptance PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-packaged-multi-object-acceptance PRIVATE
+            -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME opengl_packaged_multi_object_acceptance
+        COMMAND arbit-opengl-packaged-multi-object-acceptance)
+    set_tests_properties(opengl_packaged_multi_object_acceptance PROPERTIES
+        LABELS "native-fixture-runtime;packaged-asset-runtime;physical-opengl"
+        TIMEOUT 60
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-opengl-animation-deformation-backend-tests
+        tests/opengl_animation_deformation_backend_tests.cpp
+        tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/animation_clip.cpp
+        src/animation_deformation_evaluation.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-opengl-animation-deformation-backend-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-animation-deformation-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-animation-deformation-backend-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-animation-deformation-backend-tests PRIVATE
+            -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME opengl_animation_deformation_backend
+        COMMAND arbit-opengl-animation-deformation-backend-tests)
+    set_tests_properties(opengl_animation_deformation_backend PROPERTIES
+        LABELS "native-animation-deformation-runtime"
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+endif()
+
 if(APPLE AND ARBIT_WITH_METAL)
-    add_executable(arbit-metal-backend-tests
-        tests/metal_backend_tests.cpp
+    add_executable(arbit-metal-geometry-core-backend-tests
+        tests/metal_geometry_core_backend_tests.mm
+        src/geometry_core_backend.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
         src/gpu_backend/backend_sokol.mm)
-    target_include_directories(arbit-metal-backend-tests PRIVATE src third_party/sokol)
+    target_include_directories(arbit-metal-geometry-core-backend-tests PRIVATE
+        src tests third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-metal-geometry-core-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1)
+    target_link_libraries(arbit-metal-geometry-core-backend-tests PRIVATE
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-metal-geometry-core-backend-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME metal_geometry_core_backend
+        COMMAND arbit-metal-geometry-core-backend-tests)
+    set_tests_properties(metal_geometry_core_backend PROPERTIES
+        LABELS "native-geometry-core-runtime;physical-apple-silicon"
+        TIMEOUT 600
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-metal-animation-deformation-backend-tests
+        tests/metal_animation_deformation_backend_tests.mm
+        tests/support/fixture_scene.cpp
+        src/animation_clip.cpp
+        src/animation_deformation_evaluation.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-metal-animation-deformation-backend-tests PRIVATE
+        src
+        tests
+        third_party/sokol
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-metal-animation-deformation-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1)
+    target_link_libraries(arbit-metal-animation-deformation-backend-tests PRIVATE
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-metal-animation-deformation-backend-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME metal_animation_deformation_backend
+        COMMAND arbit-metal-animation-deformation-backend-tests)
+    set_tests_properties(metal_animation_deformation_backend PROPERTIES
+        LABELS "native-animation-deformation-runtime;physical-apple-silicon"
+        TIMEOUT 600
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-metal-volume-backend-tests
+        tests/metal_volume_backend_tests.mm
+        src/volume_native_renderer_metal.mm
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-metal-volume-backend-tests PRIVATE
+        src
+        third_party/sokol
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-metal-volume-backend-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1)
+    target_link_libraries(arbit-metal-volume-backend-tests PRIVATE
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-metal-volume-backend-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME metal_volume_backend
+        COMMAND arbit-metal-volume-backend-tests)
+    set_tests_properties(metal_volume_backend PROPERTIES
+        LABELS "native-volume-runtime;physical-apple-silicon"
+        TIMEOUT 600
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-metal-backend-tests
+        tests/metal_backend_tests.mm
+        tests/support/fixture_scene.cpp
+        tests/support/sdf_native_backend_parity.cpp
+        tests/support/sdf_reference_evaluator.cpp
+        src/sdf_native_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-metal-backend-tests PRIVATE
+        src
+        third_party/sokol
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
     target_link_libraries(arbit-metal-backend-tests PRIVATE
         "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
     add_test(NAME metal_backend COMMAND arbit-metal-backend-tests)
+
+    add_executable(arbit-optical-flow-native-metal-tests
+        tests/optical_flow_native_metal_tests.mm
+        src/optical_flow_native_executor.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-optical-flow-native-metal-tests PRIVATE
+        src
+        third_party/sokol
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-optical-flow-native-metal-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1)
+    target_link_libraries(arbit-optical-flow-native-metal-tests PRIVATE
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-optical-flow-native-metal-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME optical_flow_native_metal
+        COMMAND arbit-optical-flow-native-metal-tests)
+    set_tests_properties(optical_flow_native_metal PROPERTIES
+        LABELS "native-optical-flow-runtime"
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-diffraction-material-metal-tests
+        tests/diffraction_material_metal_tests.cpp
+        tests/support/diffraction_reference_oracle.cpp
+        src/diffraction_material_metal.mm
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-diffraction-material-metal-tests PRIVATE
+        src
+        tests
+        third_party/sokol
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-diffraction-material-metal-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1)
+    target_link_libraries(arbit-diffraction-material-metal-tests PRIVATE
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-diffraction-material-metal-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME diffraction_material_metal
+        COMMAND arbit-diffraction-material-metal-tests)
+    set_tests_properties(diffraction_material_metal PROPERTIES
+        LABELS "native-physical-diffraction-runtime"
+        TIMEOUT 600
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+    add_test(NAME diffraction_wavelength_validation_metal_strict
+        COMMAND arbit-diffraction-material-metal-tests --strict)
+    set_tests_properties(diffraction_wavelength_validation_metal_strict PROPERTIES
+        LABELS "native-physical-diffraction-runtime;strict-metal-runtime"
+        TIMEOUT 600
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-metal-fixture-diffraction-tests
+        tests/metal_fixture_scene_backend_tests.mm
+        tests/support/fixture_scene.cpp
+        src/fixture_scene_renderer.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-metal-fixture-diffraction-tests PRIVATE
+        src
+        tests
+        third_party/sokol
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-metal-fixture-diffraction-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1
+        SURFACE_MATERIAL_STARTER_ORACLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/surface_material_starter_expected.json")
+    target_link_libraries(arbit-metal-fixture-diffraction-tests PRIVATE
+        nlohmann_json::nlohmann_json PkgConfig::AV
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-metal-fixture-diffraction-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME metal_fixture_diffraction
+        COMMAND arbit-metal-fixture-diffraction-tests)
+    set_tests_properties(metal_fixture_diffraction PROPERTIES
+        LABELS "native-physical-diffraction-runtime;native-surface-material-runtime;strict-static-glb-runtime;physical-apple-silicon"
+        TIMEOUT 600
+        RUN_SERIAL TRUE)
+
+    add_executable(arbit-metal-rich-static-glb-tests
+        tests/metal_rich_static_glb_backend_tests.mm
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-metal-rich-static-glb-tests PRIVATE
+        src
+        tests
+        third_party/sokol
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-metal-rich-static-glb-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1)
+    target_link_libraries(arbit-metal-rich-static-glb-tests PRIVATE
+        nlohmann_json::nlohmann_json PkgConfig::AV
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-metal-rich-static-glb-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME metal_rich_static_glb
+        COMMAND arbit-metal-rich-static-glb-tests)
+    set_tests_properties(metal_rich_static_glb PROPERTIES
+        LABELS "strict-static-glb-runtime;physical-apple-silicon"
+        TIMEOUT 600
+        RUN_SERIAL TRUE)
+    add_executable(arbit-holographic-trading-card-metal-strict-tests
+        tests/metal_fixture_scene_backend_tests.mm
+        tests/support/fixture_scene.cpp
+        src/fixture_scene_renderer.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_sokol.mm)
+    target_include_directories(arbit-holographic-trading-card-metal-strict-tests PRIVATE
+        src tests third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-holographic-trading-card-metal-strict-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1
+        ARBIT_HOLOGRAPHIC_TRADING_CARD_STRICT=1
+        SURFACE_MATERIAL_STARTER_ORACLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/surface_material_starter_expected.json")
+    target_link_libraries(arbit-holographic-trading-card-metal-strict-tests PRIVATE
+        nlohmann_json::nlohmann_json PkgConfig::AV
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+    target_compile_options(arbit-holographic-trading-card-metal-strict-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME holographic_trading_card_metal_strict
+        COMMAND arbit-holographic-trading-card-metal-strict-tests)
+    set_tests_properties(holographic_trading_card_metal_strict PROPERTIES
+        LABELS "native-physical-diffraction-runtime;strict-metal-card"
+        TIMEOUT 600
+        RUN_SERIAL TRUE)
 
     if(GLFW3_FOUND AND OpenGL_FOUND)
         add_executable(arbit-metal-iosurface-consumer
@@ -922,6 +2231,37 @@ if(APPLE AND ARBIT_WITH_METAL)
             PkgConfig::GLFW3 OpenGL::GL
             "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
             "-framework IOSurface")
+
+        add_executable(arbit-metal-color-transform-runtime-tests
+            tests/metal_color_transform_runtime_tests.cpp
+            src/renderer.cpp
+            src/geometry_core_backend.cpp
+            src/color_transform_gl.cpp
+            src/sdf_native_renderer.cpp
+            src/deformation_contract.cpp
+            src/gl_loader.cpp
+            src/lut_loader.cpp
+            src/native_animation_deformation.cpp
+            src/particle_engine.cpp
+            src/shader_generator.cpp
+            src/gpu_backend/backend_sokol.mm)
+        target_include_directories(arbit-metal-color-transform-runtime-tests PRIVATE
+            src third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+        target_compile_definitions(arbit-metal-color-transform-runtime-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1)
+        target_link_libraries(arbit-metal-color-transform-runtime-tests PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL PkgConfig::AV
+            "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
+            "-framework IOSurface" "-framework Foundation"
+            nlohmann_json::nlohmann_json)
+        target_compile_options(arbit-metal-color-transform-runtime-tests PRIVATE
+            -Wall -Wextra -Werror)
+        add_test(NAME metal_color_transform_runtime
+            COMMAND arbit-metal-color-transform-runtime-tests)
+        set_tests_properties(metal_color_transform_runtime PROPERTIES
+            LABELS "native-color-transform-runtime;physical-apple-silicon"
+            TIMEOUT 600
+            RUN_SERIAL TRUE)
 
         add_executable(arbit-metal-frame-compositor-smoke
             tests/metal_frame_compositor_smoke_tests.cpp
@@ -948,6 +2288,50 @@ if(APPLE AND ARBIT_WITH_METAL)
             arbit-metal-iosurface-consumer)
         add_test(NAME metal_frame_compositor_smoke
                  COMMAND arbit-metal-frame-compositor-smoke)
+
+        add_executable(arbit-custom-shader-metal-pixel-tests
+                tests/custom_shader_gl_pixel_tests.cpp
+                src/renderer.cpp
+                src/geometry_core_backend.cpp
+                src/color_transform_gl.cpp
+                src/gpu_backend/backend_sokol.mm
+                src/gpu_backend/metal_shader_generator.mm
+                src/sdf_native_renderer.cpp
+                src/deformation_contract.cpp
+                src/native_animation_deformation.cpp
+                src/visual_plan_execution_telemetry.cpp
+                src/visual_renderer_telemetry.cpp
+                src/shader_generator.cpp
+                src/particle_engine.cpp
+                src/gl_loader.cpp
+                src/lut_loader.cpp)
+            target_include_directories(arbit-custom-shader-metal-pixel-tests PRIVATE
+                src third_party/sokol
+                ${CMAKE_CURRENT_SOURCE_DIR}/../shared
+                ${ARBIT_MVK_SHADER_CONVERTER_INCLUDE}
+                ${ncnn_SOURCE_DIR}/glslang)
+            target_compile_definitions(arbit-custom-shader-metal-pixel-tests PRIVATE
+                ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1
+                ARBIT_HAVE_METAL_GENERATORS=1 ARBIT_HAVE_OPENGL_SDF_BACKEND=0
+                ARBIT_STRICT_METAL_FIXTURE=1
+                ARBIT_SHADER_PACK_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs")
+            target_link_libraries(arbit-custom-shader-metal-pixel-tests PRIVATE
+                PkgConfig::GLFW3 OpenGL::GL PkgConfig::AV
+                "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
+                "-framework IOSurface" "-framework Foundation"
+                nlohmann_json::nlohmann_json
+                glslang SPIRV glslang-default-resource-limits
+                ${ARBIT_MVK_SHADER_CONVERTER_LIBRARY}
+                ${ARBIT_MVK_SPIRV_CROSS_LIBRARY}
+                ${ARBIT_MVK_SPIRV_TOOLS_LIBRARY})
+            target_compile_options(arbit-custom-shader-metal-pixel-tests PRIVATE
+                -Wall -Wextra -Werror)
+            add_test(NAME custom_shader_metal_pixels
+                COMMAND arbit-custom-shader-metal-pixel-tests)
+        set_tests_properties(custom_shader_metal_pixels PROPERTIES
+            LABELS "native-custom-shader-runtime;strict-metal-runtime"
+            TIMEOUT 600
+            RUN_SERIAL TRUE)
     endif()
 endif()
 

@@ -1,0 +1,263 @@
+{
+  "materials": [
+    {
+      "id": "visual.material.matte-clay",
+      "pbrParameterBlock": [
+        0.55,
+        0.18,
+        0.08,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.82,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.45,
+        0.0,
+        0.0,
+        1,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          155,
+          92,
+          62,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        84,
+        27,
+        12,
+        255
+      ]
+    },
+    {
+      "id": "visual.material.polished-metal",
+      "pbrParameterBlock": [
+        0.72,
+        0.78,
+        0.86,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.18,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.45,
+        0.0,
+        0.0,
+        2,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          202,
+          209,
+          219,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        151,
+        163,
+        180,
+        255
+      ]
+    },
+    {
+      "id": "visual.material.frosted-glass",
+      "pbrParameterBlock": [
+        0.88,
+        0.95,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.28,
+        0.0,
+        0.0,
+        1.0,
+        0.35,
+        0.92,
+        1.5,
+        0.0,
+        0.0,
+        3,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          89
+        ],
+        [
+          229,
+          237,
+          242,
+          89
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        199,
+        215,
+        227,
+        89
+      ]
+    },
+    {
+      "id": "visual.material.clearcoat-plastic",
+      "pbrParameterBlock": [
+        0.04,
+        0.18,
+        0.72,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.32,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.46,
+        1.0,
+        0.0,
+        4,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          52,
+          110,
+          207,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        9,
+        40,
+        159,
+        255
+      ]
+    },
+    {
+      "id": "visual.material.emissive-neon",
+      "pbrParameterBlock": [
+        0.01,
+        0.08,
+        0.12,
+        0.0,
+        0.0,
+        8.0,
+        12.0,
+        0.4,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.45,
+        0.0,
+        0.0,
+        5,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          22,
+          255,
+          255,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        2,
+        255,
+        255,
+        255
+      ]
+    }
+  ],
+  "provenance": {
+    "constants": "Independent authored constants, separate from production module and generated-program tables",
+    "independence": "This Python binary64 model computes JSON pixels without reading native output or production starter definitions.",
+    "model": "Quaternion-rotated fixture normal and directional light, explicit ambient and intensity, metallic/roughness weights, emission, opacity, and linear RGBA8 quantization",
+    "fixture": {
+      "objectRotationXyzw": [
+        -0.16773126,
+        0.254887,
+        0.04494346,
+        0.95125124
+      ],
+      "lightRotationXyzw": [
+        -0.16773126,
+        0.254887,
+        0.04494346,
+        0.95125124
+      ],
+      "ambientRgb": [
+        0.12,
+        0.12,
+        0.12
+      ],
+      "lightColorRgb": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "lightIntensity": 0.88
+    }
+  },
+  "sampledRgba8Fnv1a64": "b24adda5c60d56ea",
+  "sampledRgba8Sha256": "0c7faee9a27cac3929bda0fb36fd72b783ca5ff3c91978a3cb2135ade9251a5e",
+  "schema": 3,
+  "truthBoundary": "The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, quaternion-transformed object normal, and stable material binding. It omits transmission, IOR, and clearcoat scene transport."
+}

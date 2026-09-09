@@ -49,6 +49,17 @@ void queryGpuCaps (const GlFuncs& gl, GpuCaps& caps)
     // and glGetIntegerv resolves at link time (GL 1.1).
     glGetIntegerv (GL_MAJOR_VERSION, &caps.glMajor);
     glGetIntegerv (GL_MINOR_VERSION, &caps.glMinor);
+    glGetIntegerv (GL_MAX_TEXTURE_SIZE, &caps.maxTextureSize);
+    glGetIntegerv (GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS,
+                   &caps.maxCombinedTextureImageUnits);
+    const auto* vendor = reinterpret_cast<const char*> (glGetString (GL_VENDOR));
+    const auto* renderer = reinterpret_cast<const char*> (glGetString (GL_RENDERER));
+    if (vendor != nullptr && renderer != nullptr)
+        caps.deviceIdentity = std::string (vendor) + " | " + renderer;
+    else if (renderer != nullptr)
+        caps.deviceIdentity = renderer;
+    else if (vendor != nullptr)
+        caps.deviceIdentity = vendor;
 
     const bool ver42 = caps.glMajor > 4 || (caps.glMajor == 4 && caps.glMinor >= 2);
     const bool ver43 = caps.glMajor > 4 || (caps.glMajor == 4 && caps.glMinor >= 3);

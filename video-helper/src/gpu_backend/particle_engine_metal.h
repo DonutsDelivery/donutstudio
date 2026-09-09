@@ -8,11 +8,11 @@
 #include <string>
 
 namespace arbitgl { struct GlFuncs; }
+namespace canonicalblockc { class CanonicalBlockCFrame; }
 
 namespace videorender
 {
 
-struct NoteFeatures;
 struct ParticleParams;
 struct ParticleDiagnostics;
 struct ShaderClock;
@@ -31,7 +31,7 @@ public:
 
     unsigned render (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                      int width, int height, const ParticleParams& params,
-                     const NoteFeatures* notes);
+                     const ::canonicalblockc::CanonicalBlockCFrame* notes);
     void shutdown (const arbitgl::GlFuncs* gl);
 
     const std::string& log() const;
@@ -42,12 +42,12 @@ private:
     uint32_t renderMetalViewUnlocked (const ShaderClock& clock,
                                       int width, int height,
                                       const ParticleParams& params,
-                                      const NoteFeatures* notes);
+                                      const ::canonicalblockc::CanonicalBlockCFrame* notes);
     uint32_t renderViewUnlocked (const arbitgl::GlFuncs* gl,
                                  const ShaderClock& clock,
                                  int width, int height,
                                  const ParticleParams& params,
-                                 const NoteFeatures* notes,
+                                 const ::canonicalblockc::CanonicalBlockCFrame* notes,
                                  bool nativeOnly);
     void shutdownUnlocked (const arbitgl::GlFuncs* gl);
 

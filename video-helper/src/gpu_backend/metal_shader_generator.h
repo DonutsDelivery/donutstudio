@@ -9,12 +9,13 @@
 #include <string>
 #include <vector>
 
+namespace canonicalblockc { class CanonicalBlockCFrame; }
+
 namespace videorender
 {
 
 struct AudioFeatures;
 struct GenParam;
-struct NoteFeatures;
 struct ShaderClock;
 
 class MetalShaderGenerator
@@ -30,8 +31,10 @@ public:
                    int width, int height, int strideBytes);
     uint32_t renderViewUnlocked (const ShaderClock& clock, int width, int height,
                                  const AudioFeatures* audio,
-                                 const NoteFeatures* notes,
-                                 const std::map<std::string, double>* genValues);
+                                 const ::canonicalblockc::CanonicalBlockCFrame* notes,
+                                 const std::map<std::string, double>* genValues,
+                                 const std::map<std::string, std::uintptr_t>* nativeImages = nullptr);
+    std::uintptr_t outputTextureHandle() const noexcept;
     void shutdownUnlocked();
 
     bool hasProgram() const;

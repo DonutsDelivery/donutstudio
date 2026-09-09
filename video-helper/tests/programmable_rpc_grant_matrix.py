@@ -100,6 +100,8 @@ with tempfile.TemporaryDirectory() as matte, tempfile.TemporaryDirectory() as de
     subprocess.run(["ffmpeg","-loglevel","error","-f","lavfi","-i","color=c=red:s=16x16:r=1",
                     "-frames:v","1","-pix_fmt","yuv420p",media],check=True,timeout=10)
     plan={"clipId":1,"structuralRevision":1,"identityMode":"authoredGraph","valid":True,
+          "descriptorCount":0,"operationCount":0,"sceneRecordCount":0,"frameOutputCount":0,
+          "peakLiveFrameCount":0,"allocatedFrameSlotCount":0,"compileDurationMicros":0,
           "nodeKinds":["video.legacy.source","video.legacy.retime","video.legacy.transform",
                        "video.legacy.effects","video.out"]}
     common={"segments":[{"sourcePath":media,"sourceKind":"media","clipId":1,"inSec":0.0,

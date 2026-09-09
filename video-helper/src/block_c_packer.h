@@ -31,6 +31,7 @@
 #include "mod_defs.h"
 
 #include <array>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -52,6 +53,12 @@ struct PackResult
     std::vector<float> notesTex;
     // 256 * 4 channels (one texel per link edge).
     std::vector<float> linksTex;
+    // Stable source identities for occupied texture rows. Zero marks a hole.
+    // Link identities align with linksTex rows.
+    std::array<std::int64_t, kMaxNotes> noteIds {};
+    std::array<std::int64_t, kMaxLinks> linkIds {};
+    std::uint64_t scoreRevision = 0;
+    float beat = std::numeric_limits<float>::quiet_NaN();
     int noteCount = 0;   // highest occupied row + 1 (loop bound, see header note)
     int linkCount = 0;   // edges with both endpoints resident
 };
@@ -63,9 +70,14 @@ public:
 
     void reset()
     {
-        rowToNote_.fill (-1);
+        // Projected clip-loop identities are negative. Zero is the only invalid
+        // projected identity and is therefore the allocator's hole sentinel.
+        rowToNote_.fill (0);
         noteToRow_.clear();
+        packCount_ = 0;
     }
+
+    std::uint64_t packCount() const noexcept { return packCount_; }
 
     // Priority: sounding > upcoming > recently ended. Selection applies this
     // before row assignment so lower-priority history cannot starve new notes.
@@ -89,6 +101,7 @@ public:
     PackResult pack (const Score& score, float beat,
                      float historyBeats, float lookaheadBeats)
     {
+        ++packCount_;
         // 1. Select the best bounded resident set. Within a class, sounding and
         // upcoming notes sort by onset; history sorts newest end first.
         struct Candidate { const Note* note; int priority; };
@@ -125,10 +138,10 @@ public:
         for (int row = 0; row < kMaxNotes; ++row)
         {
             const int id = rowToNote_[row];
-            if (id < 0) continue;
+            if (id == 0) continue;
             if (selectedIds.find (id) == selectedIds.end())
             {
-                rowToNote_[row] = -1;
+                rowToNote_[row] = 0;
                 noteToRow_.erase (id);
             }
         }
@@ -141,7 +154,7 @@ public:
                 continue;
             int freeRow = -1;
             for (int row = 0; row < kMaxNotes; ++row)
-                if (rowToNote_[row] < 0) { freeRow = row; break; }
+                if (rowToNote_[row] == 0) { freeRow = row; break; }
             if (freeRow < 0) break;
             rowToNote_[freeRow] = candidate.note->id;
             noteToRow_[candidate.note->id] = freeRow;
@@ -149,6 +162,8 @@ public:
 
         // 4. Emit textures.
         PackResult out;
+        out.scoreRevision = score.scoreRevision;
+        out.beat = beat;
         out.notesTex.assign (static_cast<size_t> (kMaxNotes) * kTexelsPerNote * 4u, 0.0f);
         out.linksTex.assign (static_cast<size_t> (kMaxLinks) * 4u, 0.0f);
 
@@ -156,10 +171,11 @@ public:
         for (int row = 0; row < kMaxNotes; ++row)
         {
             const int id = rowToNote_[row];
-            if (id < 0) continue;
+            if (id == 0) continue;
             const Note* n = score.noteById (id);
             if (n == nullptr) continue;
             maxRow = row;
+            out.noteIds[static_cast<std::size_t> (row)] = n->id;
             writeNote (out.notesTex, row, *n, score, beat);
         }
         out.noteCount = maxRow + 1;
@@ -172,6 +188,7 @@ public:
             if (sRow < 0 || mRow < 0) continue;
             if (out.linkCount >= kMaxLinks) break;
             const size_t off = static_cast<size_t> (out.linkCount++) * 4u;
+            out.linkIds[static_cast<std::size_t> (out.linkCount - 1)] = l.id;
             out.linksTex[off + 0] = static_cast<float> (sRow);
             out.linksTex[off + 1] = static_cast<float> (mRow);
             out.linksTex[off + 2] = static_cast<float> (l.slaveHarmonic);   // num
@@ -197,7 +214,7 @@ private:
         const float bendSemitones = n.freqHz > 0.0f && bentFrequency > 0.0f
             ? 12.0f * std::log2 (bentFrequency / n.freqHz) : 0.0f;
         const float cents = arbitmod::centsFromRoot (bentFrequency, score.rootFreq);
-        const int   masterRow = (n.linkMasterId >= 0) ? rowOf (n.linkMasterId) : -1;
+        const int   masterRow = n.linkMasterId != 0 ? rowOf (n.linkMasterId) : -1;
 
         // texel0: midiNote, velocity/127, ageBeats, remainBeats
         set (tex, row, 0, 0, n.midiNote);
@@ -223,6 +240,7 @@ private:
 
     std::array<int, kMaxNotes> rowToNote_ {};
     std::unordered_map<int, int> noteToRow_;
+    std::uint64_t packCount_ = 0;
 };
 
 // Convenience accessors for tests / consumers reading PackResult texels.

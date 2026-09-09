@@ -62,20 +62,29 @@ namespace arbitgl
     X (PFNGLLINKPROGRAMPROC,             LinkProgram)                \
     X (PFNGLGETPROGRAMIVPROC,            GetProgramiv)               \
     X (PFNGLGETPROGRAMINFOLOGPROC,       GetProgramInfoLog)          \
+    X (PFNGLGETACTIVEUNIFORMPROC,        GetActiveUniform)           \
     X (PFNGLDELETEPROGRAMPROC,           DeleteProgram)              \
     X (PFNGLUSEPROGRAMPROC,              UseProgram)                 \
     X (PFNGLGETUNIFORMLOCATIONPROC,      GetUniformLocation)         \
+    X (PFNGLSAMPLERPARAMETERIPROC,       SamplerParameteri)          \
     X (PFNGLUNIFORM1IPROC,               Uniform1i)                  \
+    X (PFNGLUNIFORM1UIPROC,              Uniform1ui)                 \
     X (PFNGLUNIFORM1FPROC,               Uniform1f)                  \
     X (PFNGLUNIFORM2FPROC,               Uniform2f)                  \
     X (PFNGLUNIFORM3FPROC,               Uniform3f)                  \
     X (PFNGLUNIFORM4FPROC,               Uniform4f)                  \
+    X (PFNGLUNIFORM4FVPROC,              Uniform4fv)                 \
     X (PFNGLUNIFORMMATRIX4FVPROC,        UniformMatrix4fv)           \
     X (PFNGLGENVERTEXARRAYSPROC,         GenVertexArrays)            \
+    X (PFNGLGENSAMPLERSPROC,             GenSamplers)                \
     X (PFNGLBINDVERTEXARRAYPROC,         BindVertexArray)            \
+    X (PFNGLBINDSAMPLERPROC,             BindSampler)                \
     X (PFNGLDELETEVERTEXARRAYSPROC,      DeleteVertexArrays)         \
+    X (PFNGLDELETESAMPLERSPROC,          DeleteSamplers)             \
     X (PFNGLVERTEXATTRIBPOINTERPROC,     VertexAttribPointer)        \
     X (PFNGLENABLEVERTEXATTRIBARRAYPROC, EnableVertexAttribArray)    \
+    X (PFNGLVERTEXATTRIBDIVISORPROC,     VertexAttribDivisor)        \
+    X (PFNGLDRAWELEMENTSINSTANCEDPROC,   DrawElementsInstanced)      \
     X (PFNGLGENFRAMEBUFFERSPROC,         GenFramebuffers)            \
     X (PFNGLBINDFRAMEBUFFERPROC,         BindFramebuffer)            \
     X (PFNGLFRAMEBUFFERTEXTURE2DPROC,    FramebufferTexture2D)       \
@@ -83,6 +92,8 @@ namespace arbitgl
     X (PFNGLDELETEFRAMEBUFFERSPROC,      DeleteFramebuffers)         \
     X (PFNGLBLITFRAMEBUFFERPROC,         BlitFramebuffer)            \
     X (PFNGLDRAWBUFFERSPROC,             DrawBuffers)                \
+    X (PFNGLCLEARBUFFERFVPROC,           ClearBufferfv)              \
+    X (PFNGLCLEARBUFFERUIVPROC,          ClearBufferuiv)             \
     X (PFNGLTEXIMAGE3DPROC,              TexImage3D)
 
 // Optional GL 4.3 entry points for compute / SSBO / image load-store (P1 of

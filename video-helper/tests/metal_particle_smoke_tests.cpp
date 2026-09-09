@@ -55,16 +55,22 @@ PixelStats readTexture (arbitgl::GlFuncs& gl, unsigned texture, int width, int h
     return stats;
 }
 
-videorender::NoteFeatures oneNote()
+std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> oneNote()
 {
-    videorender::NoteFeatures notes;
-    notes.notesTex.resize (128u * 4u * 4u, 0.0f);
-    notes.notesTex[0] = 60.0f;
-    notes.notesTex[1] = 1.0f;
-    notes.notesTex[4] = 261.625565f;
-    notes.notesTex[6] = 0.0f;
-    notes.noteCount = 1;
-    return notes;
+    auto score = std::make_shared<arbitmod::Score>();
+    score->scoreRevision = 1;
+    arbitmod::Note note;
+    note.id = 1; note.midiNote = 60; note.velocity = 127.0f;
+    note.freqHz = 261.625565f; note.startBeat = 0.0f; note.lengthBeats = 4.0f;
+    score->notes.push_back (note);
+    canonicalblockc::FrameKey key;
+    key.projectGeneration = 1; key.sourceGeneration = 1; key.helperGeneration = 1;
+    key.backendGeneration = 1; key.deviceGeneration = 1; key.scoreGeneration = 1;
+    key.beatMapGeneration = 1; key.fpsGeneration = 1; key.loopGeneration = 1;
+    key.seekGeneration = 1; key.frame = 0;
+    key.beat = 0.0; key.fps = 30.0;
+    canonicalblockc::FrameProducer producer;
+    return producer.evaluate (key, std::move (score), 0.0f);
 }
 
 } // namespace
@@ -133,7 +139,7 @@ int main()
     {
         clock.frame = frame;
         clock.timeSec = frame * clock.timeDelta;
-        fallbackTexture = fallback.render (&gl, clock, width, height, params, &notes);
+        fallbackTexture = fallback.render (&gl, clock, width, height, params, notes.get());
     }
     PixelStats fallbackStats;
     if (fallbackTexture != 0)
@@ -148,7 +154,7 @@ int main()
     {
         clock.frame = frame;
         clock.timeSec = frame * clock.timeDelta;
-        metalTexture = metal.render (&gl, clock, width, height, params, &notes);
+        metalTexture = metal.render (&gl, clock, width, height, params, notes.get());
     }
     const std::string metalLog = metal.log();
     PixelStats metalStats;
@@ -160,7 +166,7 @@ int main()
     // A fresh engine rendered directly at frame 15 must replay frames 0..15 and
     // land on the same deterministic image as sequential preview stepping.
     videorender::ParticleEngine metalReplay;
-    const unsigned replayTexture = metalReplay.render (&gl, clock, width, height, params, &notes);
+    const unsigned replayTexture = metalReplay.render (&gl, clock, width, height, params, notes.get());
     const PixelStats replayStats = replayTexture != 0
         ? readTexture (gl, replayTexture, width, height) : PixelStats {};
     const auto replayDiagnostics = metalReplay.diagnostics();

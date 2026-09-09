@@ -23,14 +23,22 @@ uint32_t hashTexture(arbitgl::GlFuncs& gl, unsigned texture, int width, int heig
     return hash;
 }
 
-videorender::NoteFeatures builtInNote()
+std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> oneNote()
 {
-    videorender::NoteFeatures notes;
-    notes.notesTex.resize(128u * 4u * 4u, 0.0f);
-    notes.notesTex[0] = 60.0f; notes.notesTex[1] = 1.0f;
-    notes.notesTex[4] = 261.625565f; notes.notesTex[6] = 0.0f;
-    notes.noteCount = 1;
-    return notes;
+    auto score = std::make_shared<arbitmod::Score>();
+    score->scoreRevision = 1;
+    arbitmod::Note note;
+    note.id = 1; note.midiNote = 60; note.velocity = 127.0f;
+    note.freqHz = 261.625565f; note.startBeat = 0.0f; note.lengthBeats = 4.0f;
+    score->notes.push_back (note);
+    canonicalblockc::FrameKey key;
+    key.projectGeneration = 1; key.sourceGeneration = 1; key.helperGeneration = 1;
+    key.backendGeneration = 1; key.deviceGeneration = 1; key.scoreGeneration = 1;
+    key.beatMapGeneration = 1; key.fpsGeneration = 1; key.loopGeneration = 1;
+    key.seekGeneration = 1; key.frame = 0;
+    key.beat = 0.0; key.fps = 30.0;
+    canonicalblockc::FrameProducer producer;
+    return producer.evaluate (key, std::move (score), 0.0f);
 }
 
 struct GlState
@@ -105,7 +113,7 @@ int main()
     params.count = 256; params.size = 5.0f; params.force = 1.25f;
     params.seed = 77; params.lifetime = 2.5f;
     params.red = 0.1f; params.green = 0.8f; params.blue = 0.4f; params.alpha = 0.75f;
-    const auto notes = builtInNote();
+    const auto notes = oneNote();
 
     videorender::ParticleEngine first, second;
     GLuint sentinelTextures[3] {}, sentinelFbos[2] {}, sentinelVao {}, sentinelSsbo {};
@@ -130,24 +138,24 @@ int main()
     glEnable(GL_PROGRAM_POINT_SIZE);
     gl.BlendFuncSeparate(GL_ONE, GL_ZERO, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     const auto stateBefore = GlState::capture(gl);
-    const auto a = first.render(&gl, clock, width, height, params, &notes);
+    const auto a = first.render(&gl, clock, width, height, params, notes.get());
     const bool successStateRestored = GlState::capture(gl) == stateBefore;
 
     auto failingGl = gl;
     failingGl.CreateShader = [](GLenum) -> GLuint { return 0; };
     videorender::ParticleEngine failing;
-    const auto failedTexture = failing.render(&failingGl, clock, width, height, params, &notes);
+    const auto failedTexture = failing.render(&failingGl, clock, width, height, params, notes.get());
     const bool failureStateRestored = GlState::capture(gl) == stateBefore;
 
-    const auto b = second.render(&gl, clock, width, height, params, &notes);
+    const auto b = second.render(&gl, clock, width, height, params, notes.get());
     const auto hashA = a != 0 ? hashTexture(gl, a, width, height) : 0;
     const auto hashB = b != 0 ? hashTexture(gl, b, width, height) : 0;
 
     videorender::ParticleParams legacy;
     legacy.count = videorender::ParticleEngine::kMaxParticles;
     videorender::ParticleEngine legacyA, legacyB, empty;
-    const auto legacyTexA = legacyA.render(&gl, clock, width, height, legacy, &notes);
-    const auto legacyTexB = legacyB.render(&gl, clock, width, height, legacy, &notes);
+    const auto legacyTexA = legacyA.render(&gl, clock, width, height, legacy, notes.get());
+    const auto legacyTexB = legacyB.render(&gl, clock, width, height, legacy, notes.get());
     const auto emptyTex = empty.render(&gl, clock, width, height, legacy, nullptr);
     const auto legacyHashA = legacyTexA ? hashTexture(gl, legacyTexA, width, height) : 0;
     const auto legacyHashB = legacyTexB ? hashTexture(gl, legacyTexB, width, height) : 0;

@@ -1,4 +1,5 @@
 #include "viewport.h"
+#include "block_c_frame_owner.h"
 #include "media.h"
 #include "lut_loader.h"
 #include "block_c_packer.h" // A2 Block C voice allocator (M5 live score packing)
@@ -8,6 +9,9 @@
 #include "lua_hook.h"         // P2 Scripts-tab live preview (M8 per-frame Lua hook)
 #include "js_hook.h"          // P2 Scripts-tab live preview (JS hook; shares FrameCtx)
 #include "visual_plan_executor.h"
+#include "imported_animation_visual_plan_execution.h"
+#include "imported_scene_visual_plan_execution.h"
+#include "sdf_visual_plan_execution.h"
 #include "depth_texture_runtime.h"
 #include "tracking_runtime.h"
 #include "visual_plan_publication.h"
@@ -33,6 +37,7 @@
 #endif
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -40,6 +45,7 @@
 #include <deque>
 #include <limits>
 #include <set>
+#include <string_view>
 
 #if ARBIT_HAVE_GPU_SHARED
 // Fence fds only exist on the dmabuf transport; give the shared code one
@@ -202,8 +208,7 @@ struct Viewport::Impl
     std::vector<ViewportSegment> segments;
     std::vector<videowire::VisualEventScheduleBinding> visualEventSchedules;
     videowire::VisualPlanTelemetry visualTelemetry;
-    std::shared_ptr<videowire::VisualPlanExecutionSnapshot> visualPlanPublication =
-        std::make_shared<videowire::VisualPlanExecutionSnapshot>();
+    videowire::VisualPlanViewportPublicationOwner visualPlanPublication;
     uint64_t failedPlanLowerings = 0;
     std::string lastPlanLoweringError;
     int inspectionClipId = -1;
@@ -247,8 +252,9 @@ struct Viewport::Impl
     // the render thread re-copies + resets its packer only when the note set
     // actually changes (not every frame). Empty score ⇒ shaders see the
     // zero-feed (uNoteCount 0), identical to never calling setScore.
-    arbitmod::Score score;
+    std::shared_ptr<const arbitmod::Score> scoreSnapshot = std::make_shared<const arbitmod::Score>();
     uint64_t scoreGeneration = 0;
+    canonicalblockc::OwnerIdentity scoreIdentity;
 
     // M6 cross-domain mod matrix (setModMatrix). Routings are evaluated each
     // frame against the live clock + score + audio (the live mix from the Block
@@ -501,11 +507,16 @@ struct Viewport::Impl
         if (slash1 == std::string::npos) return false;
         const auto slash2 = id.find ('/', slash1 + 1);
         if (slash2 == std::string::npos) return false;
-        try { clipId = std::stoi (id.substr (4, slash1 - 4)); }
-        catch (...) { return false; }
+        const auto clipToken = std::string_view(id).substr(4, slash1 - 4);
+        if (clipToken.empty()) return false;
+        const auto parsed = std::from_chars(clipToken.data(),
+            clipToken.data() + clipToken.size(), clipId);
+        if (parsed.ec != std::errc {} || parsed.ptr != clipToken.data() + clipToken.size()
+            || clipId < 0)
+            return false;
         node = id.substr (slash1 + 1, slash2 - slash1 - 1);
         param = id.substr (slash2 + 1);
-        return ! node.empty() && ! param.empty();
+        return ! node.empty() && ! param.empty() && param.find('/') == std::string::npos;
     }
 
     // Parses "text<id>/<param>". Returns false on malformed IDs.
@@ -557,6 +568,12 @@ struct Viewport::Impl
         // grammar, so handled here as the viewport's caller-side glue (mirrors
         // exporter.cpp::applyGraphParam). Stored unclamped; the shader clamps.
         if (node == "gen") { p.genParams[param] = value; return true; }
+        int visualNodeId = 0;
+        if (shadercatalog::parseRuntimeNodeAlias(node, visualNodeId))
+        {
+            p.visualParams[node + "/" + param] = value;
+            return true;
+        }
         return false;
     }
 
@@ -577,11 +594,22 @@ struct Viewport::Impl
             out = it->second;
             return true;
         }
+        int visualNodeId = 0;
+        if (shadercatalog::parseRuntimeNodeAlias(node, visualNodeId))
+        {
+            const auto it = p.visualParams.find(node + "/" + param);
+            if (it == p.visualParams.end()) return false;
+            out = it->second;
+            return true;
+        }
         return false;
     }
 };
 
-Viewport::Viewport() = default;
+Viewport::Viewport(videohelper::modelpayload::Store* modelPayloadStore)
+    : modelPayloadStore_(modelPayloadStore)
+{
+}
 Viewport::~Viewport() { close(); }
 void Viewport::setDepthCacheRoot(std::string root)
 {
@@ -822,6 +850,10 @@ void Viewport::close()
     {
         // The render thread detached this context before returning. Cocoa
         // requires destruction and glfwTerminate on this main RPC thread.
+        glfwMakeContextCurrent (impl_->macPrecreatedWindow);
+        arbitgpu::invalidateNativeSdfExecutionContext (
+            reinterpret_cast<std::uintptr_t> (impl_->macPrecreatedWindow));
+        glfwMakeContextCurrent (nullptr);
         glfwDestroyWindow (impl_->macPrecreatedWindow);
         impl_->macPrecreatedWindow = nullptr;
         glfwTerminate();
@@ -892,19 +924,53 @@ std::string Viewport::setTimeline (std::vector<ViewportSegment> segments,
 
     std::shared_ptr<videowire::VisualPlanExecutionSnapshot> publication;
     std::string diagnostic;
+    const std::unique_lock<std::mutex> canvasLock (canvasMutex_);
+    const CanvasExtent canvas { canvasW_, canvasH_, canvasGeneration_ };
+    arbitgl::GpuCaps gpuCaps;
+    {
+        const std::lock_guard<std::mutex> lock (impl_->mutex);
+        gpuCaps = impl_->gpuCaps;
+    }
+    videowire::VisualBackendResourceLimits::Capabilities resourceCapabilities;
+    resourceCapabilities.backendProfile = gpuCaps.glMajor > 0
+        ? "opengl-" + std::to_string(gpuCaps.glMajor) + "."
+            + std::to_string(gpuCaps.glMinor)
+        : (gpuCaps.maximumBufferLengthBytes > 0
+               || gpuCaps.recommendedWorkingSetBytes > 0
+            ? "metal-renderer-device" : "metal-unqueried");
+    resourceCapabilities.backendDeviceIdentity = gpuCaps.deviceIdentity;
+    resourceCapabilities.maximumImageDimension = gpuCaps.maxTextureSize;
+    resourceCapabilities.combinedTextureImageUnits = gpuCaps.maxCombinedTextureImageUnits;
+    resourceCapabilities.maximumBufferLengthBytes = gpuCaps.maximumBufferLengthBytes;
+    resourceCapabilities.recommendedWorkingSetBytes = gpuCaps.recommendedWorkingSetBytes;
+    resourceCapabilities.maximumImageDimensionQuery = gpuCaps.maxTextureSize > 0
+        ? (gpuCaps.glMajor > 0 ? "OpenGL.GL_MAX_TEXTURE_SIZE"
+                              : "Sokol.sg_query_limits.max_image_size_2d") : "";
+    resourceCapabilities.recommendedWorkingSetQuery = gpuCaps.recommendedWorkingSetBytes > 0
+        ? "Metal.MTLDevice.recommendedMaxWorkingSetSize" : "";
+    const auto backendResourceLimits = videowire::VisualBackendResourceLimits::fromCapabilities(
+        canvas.width, canvas.height, resourceCapabilities);
     if (! videowire::makeVisualPlanExecutionSnapshot(std::move(plans), publication, diagnostic,
-                                                     &impl_->visualTelemetry))
+                                                     nullptr,
+                                                     canvas.width, canvas.height, &backendResourceLimits))
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ++impl_->failedPlanLowerings;
         impl_->lastPlanLoweringError = diagnostic;
+        impl_->visualTelemetry.recordFailedLowering(diagnostic);
         return diagnostic;
     }
 
+    // The prior published plan belongs to a different project snapshot. Drop
+    // its process-owned SDF geometry before publication replaces that identity.
+    videohelper::sdf::nativeSdfRenderer().invalidateCompiledGeometry();
     std::lock_guard<std::mutex> lock (impl_->mutex);
     impl_->segments = std::move (segments);
     impl_->visualEventSchedules = std::move (eventSchedules);
-    impl_->visualPlanPublication = std::move(publication);
+    publication->state.setTelemetryOwner(impl_->visualTelemetry);
+    videowire::publishVisualPlanExecutionSnapshotTelemetry(
+        *publication, impl_->visualTelemetry);
+    impl_->visualPlanPublication.replace(std::move(publication));
     impl_->lastPlanLoweringError.clear();
     ++impl_->timelineGeneration;
     return {};
@@ -1055,11 +1121,20 @@ void Viewport::acceptRuntimeRevision (uint64_t revision) noexcept
                seen, revision, std::memory_order_release, std::memory_order_relaxed)) {}
 }
 
-void Viewport::setScore (arbitmod::Score score)
+void Viewport::setScore (arbitmod::Score score, canonicalblockc::OwnerIdentity identity)
 {
     if (impl_ == nullptr) return;
     std::lock_guard<std::mutex> lock (impl_->mutex);
-    impl_->score = std::move (score);
+    impl_->scoreSnapshot = std::make_shared<const arbitmod::Score>(std::move(score));
+    impl_->scoreIdentity = identity;
+    ++impl_->scoreGeneration;
+}
+
+void Viewport::setBlockCLifecycle (canonicalblockc::OwnerIdentity identity)
+{
+    if (impl_ == nullptr) return;
+    std::lock_guard<std::mutex> lock (impl_->mutex);
+    impl_->scoreIdentity = identity;
     ++impl_->scoreGeneration;
 }
 
@@ -1161,11 +1236,89 @@ void Viewport::setAudioMix (const std::string& wavPath)
 
 std::string Viewport::setCanvas (int width, int height)
 {
-    if (width <= 0 || height <= 0 || width > 8192 || height > 8192)
+    if (width <= 0 || height <= 0 || width > 32768 || height > 32768)
         return "bad canvas size";
-    canvasW_ = width;
-    canvasH_ = height;
-    return {};
+    const std::unique_lock<std::mutex> canvasLock (canvasMutex_);
+    if (canvasW_ == width && canvasH_ == height) return {};
+    if (impl_ == nullptr)
+    {
+        canvasW_ = width;
+        canvasH_ = height;
+        ++canvasGeneration_;
+        return {};
+    }
+
+    for (;;)
+    {
+        std::vector<videowire::CompiledVisualLayerPlan> plans;
+        arbitgl::GpuCaps gpuCaps;
+        uint64_t timelineGeneration = 0;
+        {
+            const std::lock_guard<std::mutex> lock (impl_->mutex);
+            plans = impl_->visualPlanPublication->plans;
+            gpuCaps = impl_->gpuCaps;
+            timelineGeneration = impl_->timelineGeneration;
+        }
+
+        videowire::VisualBackendResourceLimits::Capabilities capabilities;
+        capabilities.backendProfile = gpuCaps.glMajor > 0
+            ? "opengl-" + std::to_string(gpuCaps.glMajor) + "."
+                + std::to_string(gpuCaps.glMinor)
+            : (gpuCaps.maximumBufferLengthBytes > 0
+                   || gpuCaps.recommendedWorkingSetBytes > 0
+                ? "metal-renderer-device" : "metal-unqueried");
+        capabilities.backendDeviceIdentity = gpuCaps.deviceIdentity;
+        capabilities.maximumImageDimension = gpuCaps.maxTextureSize;
+        capabilities.combinedTextureImageUnits = gpuCaps.maxCombinedTextureImageUnits;
+        capabilities.maximumBufferLengthBytes = gpuCaps.maximumBufferLengthBytes;
+        capabilities.recommendedWorkingSetBytes = gpuCaps.recommendedWorkingSetBytes;
+        capabilities.maximumImageDimensionQuery = gpuCaps.maxTextureSize > 0
+            ? (gpuCaps.glMajor > 0 ? "OpenGL.GL_MAX_TEXTURE_SIZE"
+                                  : "Sokol.sg_query_limits.max_image_size_2d") : "";
+        capabilities.recommendedWorkingSetQuery = gpuCaps.recommendedWorkingSetBytes > 0
+            ? "Metal.MTLDevice.recommendedMaxWorkingSetSize" : "";
+        const auto limits = videowire::VisualBackendResourceLimits::fromCapabilities(
+            width, height, capabilities);
+        std::shared_ptr<videowire::VisualPlanExecutionSnapshot> publication;
+        std::string diagnostic;
+        const bool admitted = videowire::makeVisualPlanExecutionSnapshot(
+            std::move(plans), publication, diagnostic, nullptr, width, height, &limits);
+
+        const std::lock_guard<std::mutex> lock (impl_->mutex);
+        const auto& currentCaps = impl_->gpuCaps;
+        if (impl_->timelineGeneration != timelineGeneration
+            || currentCaps.glMajor != gpuCaps.glMajor
+            || currentCaps.glMinor != gpuCaps.glMinor
+            || currentCaps.maxTextureSize != gpuCaps.maxTextureSize
+            || currentCaps.maxCombinedTextureImageUnits
+                != gpuCaps.maxCombinedTextureImageUnits
+            || currentCaps.maximumBufferLengthBytes != gpuCaps.maximumBufferLengthBytes
+            || currentCaps.recommendedWorkingSetBytes != gpuCaps.recommendedWorkingSetBytes
+            || currentCaps.deviceIdentity != gpuCaps.deviceIdentity)
+            continue;
+        if (! admitted)
+        {
+            ++impl_->failedPlanLowerings;
+            impl_->lastPlanLoweringError = diagnostic;
+            impl_->visualTelemetry.recordFailedLowering(diagnostic);
+            return diagnostic;
+        }
+        canvasW_ = width;
+        canvasH_ = height;
+        ++canvasGeneration_;
+        publication->state.setTelemetryOwner(impl_->visualTelemetry);
+        videowire::publishVisualPlanExecutionSnapshotTelemetry(
+            *publication, impl_->visualTelemetry);
+        impl_->visualPlanPublication.replace(std::move(publication));
+        impl_->lastPlanLoweringError.clear();
+        return {};
+    }
+}
+
+Viewport::CanvasExtent Viewport::canvasExtent() const
+{
+    const std::lock_guard<std::mutex> lock (canvasMutex_);
+    return { canvasW_, canvasH_, canvasGeneration_ };
 }
 
 std::string Viewport::setCanvasBackground (double r, double g, double b, double a)
@@ -1197,6 +1350,8 @@ std::string Viewport::setPostFx (double bloomIntensity, double bloomThreshold,
 
 std::string Viewport::setParam (const std::string& paramId, double value, double atBeat)
 {
+    if (!std::isfinite(value) || !std::isfinite(atBeat))
+        return "nonfinite graph parameter value or timestamp: " + paramId;
     // Viewport-only view transform (PROTOCOL.md §Project canvas & view
     // transform). Stored on the Viewport so values survive close/reopen and
     // can be set before the viewport opens. Never timestamped.
@@ -1218,6 +1373,32 @@ std::string Viewport::setParam (const std::string& paramId, double value, double
         return "malformed paramId (expected clip<id>/<node>/<param>, text<id>/<param> or view/<param>): " + paramId;
 
     std::lock_guard<std::mutex> lock (impl_->mutex);
+    if (isClip && node.rfind("visual", 0) == 0)
+    {
+        int visualNodeId = 0;
+        if (!shadercatalog::parseRuntimeNodeAlias(node, visualNodeId))
+            return "malformed visual runtime node: " + paramId;
+        bool known = false;
+        if (const auto* plan = videowire::findVisualLayerPlan(
+                impl_->visualPlanPublication->plans, clipId))
+            if (const auto* execution = impl_->visualPlanPublication->state.compiled(
+                    clipId, plan->structuralRevision))
+                if (execution->shaderOperationPlan != nullptr)
+                    for (const auto& operation : execution->shaderOperationPlan->operations)
+                        if (operation.nodeId == visualNodeId)
+                            if (const auto* catalog = shadercatalog::find(
+                                    operation.payload.catalogPackId,
+                                    operation.payload.catalogProgramId))
+                                known = shadercatalog::hasParameterComponent(*catalog, param);
+        if (!known)
+        {
+            std::map<std::string, double> importedParameters;
+            videohelper::importedscene::seedImportedSceneRuntimeParameters(
+                impl_->visualPlanPublication->plans, clipId, importedParameters);
+            known = importedParameters.find(node + "/" + param) != importedParameters.end();
+        }
+        if (!known) return "unknown param: " + paramId;
+    }
     if (atBeat >= 0.0)
     {
         impl_->pendingParams.push_back ({ paramId, value, atBeat });
@@ -1340,6 +1521,7 @@ std::string Viewport::describeGraph() const
     json visualLayerPlans = json::array();
     arbitgl::GpuCaps caps;
     const auto revisions = revisionState();
+    const auto graphCanvas = canvasExtent();
     if (impl_ != nullptr)
     {
         std::lock_guard<std::mutex> lock (impl_->mutex);
@@ -1364,6 +1546,10 @@ std::string Viewport::describeGraph() const
             });
         for (const auto& plan : impl_->visualPlanPublication->plans)
         {
+            videowire::VisualPlanResourceUsage resourceUsage;
+            std::string resourceError;
+            const bool resourceUsageAvailable = videowire::accountVisualPlanResources(
+                plan, graphCanvas.width, graphCanvas.height, resourceUsage, resourceError);
             json edges = json::array();
             for (const auto& edge : plan.edges)
                 edges.push_back({ { "fromNodeId", edge.fromNodeId }, { "fromPort", edge.fromPort },
@@ -1376,12 +1562,27 @@ std::string Viewport::describeGraph() const
                                   { "pixelFormat", port.pixelFormat }, { "colorSpace", port.colorSpace } });
             json operations = json::array();
             for (const auto& operation : plan.operations)
-                operations.push_back({ { "nodeId", operation.nodeId }, { "kind", operation.kind },
-                                       { "backendCapability", operation.backendCapability },
-                                       { "payloadXml", operation.payloadXml } });
+            {
+                json encodedOperation = {
+                    { "nodeId", operation.nodeId }, { "kind", operation.kind },
+                    { "backendCapability", operation.backendCapability },
+                    { "payloadXml", operation.payloadXml }
+                };
+                operations.push_back(std::move(encodedOperation));
+            }
             visualLayerPlans.push_back ({
                 { "clipId", plan.clipId },
                 { "structuralRevision", plan.structuralRevision },
+                { "descriptorCount", plan.descriptorCount },
+                { "operationCount", plan.operationCount },
+                { "sceneRecordCount", plan.sceneRecordCount },
+                { "frameOutputCount", plan.frameOutputCount },
+                { "peakLiveFrameCount", plan.peakLiveFrameCount },
+                { "allocatedFrameSlotCount", plan.allocatedFrameSlotCount },
+                { "allocatedFrameBytes", resourceUsageAvailable
+                    ? resourceUsage.allocatedFrameBytes : uint64_t { 0 } },
+                { "compileDurationMicros", plan.compileDurationMicros },
+                { "resourceDiagnostic", resourceError },
                 { "nodeKinds", plan.nodeKinds },
                 { "nodeIds", plan.nodeIds },
                 { "edges", std::move(edges) },
@@ -1475,8 +1676,8 @@ std::string Viewport::describeGraph() const
         }
     }
     const json canvas = {
-        { "width", canvasW_.load() },
-        { "height", canvasH_.load() },
+        { "width", graphCanvas.width },
+        { "height", graphCanvas.height },
         { "viewZoom", viewZoom_.load() },
         { "viewPanX", viewPanX_.load() },
         { "viewPanY", viewPanY_.load() },
@@ -1490,6 +1691,8 @@ std::string Viewport::describeGraph() const
         { "particles", caps.particles },
         { "ssbo", caps.ssbo },
         { "imageLoadStore", caps.imageLoadStore },
+        { "maxTextureSize", caps.maxTextureSize },
+        { "maxCombinedTextureImageUnits", caps.maxCombinedTextureImageUnits },
         { "maxComputeWorkGroupCount", { caps.maxComputeWorkGroupCount[0],
                                         caps.maxComputeWorkGroupCount[1],
                                         caps.maxComputeWorkGroupCount[2] } },
@@ -1515,8 +1718,9 @@ std::string Viewport::describeGraph() const
 ViewportInfo Viewport::info() const
 {
     ViewportInfo vi;
-    vi.canvasWidth = canvasW_.load();
-    vi.canvasHeight = canvasH_.load();
+    const auto canvas = canvasExtent();
+    vi.canvasWidth = canvas.width;
+    vi.canvasHeight = canvas.height;
     vi.viewZoom = viewZoom_.load();
     vi.viewPanX = viewPanX_.load();
     vi.viewPanY = viewPanY_.load();
@@ -1733,6 +1937,12 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             glfwMakeContextCurrent (nullptr);
         if (windowOwnedByRenderThread)
         {
+            if (! metalOnly)
+            {
+                glfwMakeContextCurrent (win);
+                arbitgpu::invalidateNativeSdfExecutionContext (
+                    reinterpret_cast<std::uintptr_t> (win));
+            }
             glfwDestroyWindow (win);
             glfwTerminate();
         }
@@ -1787,6 +1997,22 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     };
 
     videorender::FrameRenderer renderer;
+
+    std::unique_ptr<videohelper::modelpayload::ImportedAnimatedScenePayloadExecution>
+        importedAnimationExecution;
+    std::unique_ptr<videohelper::modelpayload::ImportedScenePayloadExecution>
+        importedSceneExecution;
+    videohelper::importedscene::VisualImportedScenePlanCache importedScenePlanCache;
+    if (modelPayloadStore_ != nullptr)
+    {
+        importedAnimationExecution = std::make_unique<
+            videohelper::modelpayload::ImportedAnimatedScenePayloadExecution>(
+                *modelPayloadStore_, arbitgpu::nativeDeformationBackend());
+        importedSceneExecution = std::make_unique<
+            videohelper::modelpayload::ImportedScenePayloadExecution>(
+                *modelPayloadStore_, arbitgpu::nativeFixtureSceneBackend(),
+                arbitgpu::nativeDeformationBackend());
+    }
     int fbW = 0, fbH = 0;
     if (offscreen)
     {
@@ -1799,11 +2025,109 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         glfwGetFramebufferSize (win, &fbW, &fbH);
 
     std::string rendererError;
-    if (! renderer.initialize (metalOnly ? nullptr : &gl,
-                               std::max (fbW, 1), std::max (fbH, 1),
-                               rendererError, metalOnly))
+    std::vector<videowire::CompiledVisualLayerPlan> initialPlans;
+    {
+        std::lock_guard<std::mutex> lock (im.mutex);
+        initialPlans = im.visualPlanPublication->plans;
+    }
+    if (! renderer.initializeForVisualPlans (
+            metalOnly ? nullptr : &gl, std::max (fbW, 1), std::max (fbH, 1),
+            initialPlans, rendererError, metalOnly))
     {
         im.openError = "renderer init failed: " + rendererError;
+        releaseWindow();
+        im.openDone = true;
+        return;
+    }
+    videowire::VisualBackendResourceLimits::Capabilities rendererCapabilities;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly)
+    {
+        rendererCapabilities.backendProfile = "metal-renderer-device";
+        rendererCapabilities.maximumImageDimensionQuery =
+            "Sokol.sg_query_limits.max_image_size_2d";
+        rendererCapabilities.recommendedWorkingSetQuery =
+            "Metal.MTLDevice.recommendedMaxWorkingSetSize";
+        if (! renderer.queryMetalResourceCapabilities(
+                rendererCapabilities.maximumImageDimension,
+                rendererCapabilities.maximumBufferLengthBytes,
+                rendererCapabilities.recommendedWorkingSetBytes,
+                rendererCapabilities.backendDeviceIdentity))
+        {
+            im.openError = "renderer-owned Metal device capability query failed";
+            renderer.shutdown();
+            releaseWindow();
+            im.openDone = true;
+            return;
+        }
+        std::lock_guard<std::mutex> lock (im.mutex);
+        im.gpuCaps.maxTextureSize = rendererCapabilities.maximumImageDimension;
+        im.gpuCaps.maximumBufferLengthBytes = rendererCapabilities.maximumBufferLengthBytes;
+        im.gpuCaps.recommendedWorkingSetBytes = rendererCapabilities.recommendedWorkingSetBytes;
+        im.gpuCaps.deviceIdentity = rendererCapabilities.backendDeviceIdentity;
+    }
+    else
+#endif
+    {
+        arbitgl::GpuCaps contextCaps;
+        {
+            std::lock_guard<std::mutex> lock (im.mutex);
+            contextCaps = im.gpuCaps;
+        }
+        if (contextCaps.deviceIdentity.empty())
+        {
+            im.openError = "renderer-owned OpenGL device identity query failed";
+            renderer.shutdown();
+            releaseWindow();
+            im.openDone = true;
+            return;
+        }
+        rendererCapabilities.backendProfile = "opengl-"
+            + std::to_string(contextCaps.glMajor) + "."
+            + std::to_string(contextCaps.glMinor);
+        rendererCapabilities.backendDeviceIdentity = contextCaps.deviceIdentity;
+        rendererCapabilities.maximumImageDimension = contextCaps.maxTextureSize;
+        rendererCapabilities.combinedTextureImageUnits =
+            contextCaps.maxCombinedTextureImageUnits;
+        rendererCapabilities.maximumImageDimensionQuery = "OpenGL.GL_MAX_TEXTURE_SIZE";
+    }
+
+    for (;;)
+    {
+        std::vector<videowire::CompiledVisualLayerPlan> plansForRendererDevice;
+        uint64_t publicationGeneration = 0;
+        {
+            std::lock_guard<std::mutex> lock (im.mutex);
+            plansForRendererDevice = im.visualPlanPublication->plans;
+            publicationGeneration = im.timelineGeneration;
+        }
+        const auto canvas = canvasExtent();
+        const auto rendererLimits = videowire::VisualBackendResourceLimits::fromCapabilities(
+            canvas.width, canvas.height, rendererCapabilities);
+        std::shared_ptr<videowire::VisualPlanExecutionSnapshot> rendererSnapshot;
+        std::string rendererAdmissionError;
+        const bool admitted = videowire::makeVisualPlanExecutionSnapshot(
+                std::move(plansForRendererDevice), rendererSnapshot, rendererAdmissionError,
+                nullptr, canvas.width, canvas.height, &rendererLimits);
+        {
+            const std::scoped_lock lock (im.mutex, canvasMutex_);
+            if (admitted)
+            {
+                if (! videowire::publishVisualPlanExecutionSnapshotIfCurrent(
+                        publicationGeneration, canvas.generation,
+                        im.timelineGeneration, canvasGeneration_,
+                        std::move(rendererSnapshot), im.visualPlanPublication.publicationRef(),
+                        im.visualTelemetry))
+                    continue;
+                break;
+            }
+            if (im.timelineGeneration != publicationGeneration
+                || canvasGeneration_ != canvas.generation)
+                continue;
+            im.openError = "renderer-owned plan admission failed: "
+                + rendererAdmissionError;
+        }
+        renderer.shutdown();
         releaseWindow();
         im.openDone = true;
         return;
@@ -1832,7 +2156,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     if (metalOnly && ! shared)
     {
         localMetalSurface = std::make_unique<MacMetalViewportSurface>();
-        if (! localMetalSurface->initialize (win, fbW, fbH, ! offscreen, rendererError))
+        if (! localMetalSurface->initialize (win, renderer.retainedMetalDevice(),
+                                             fbW, fbH, ! offscreen, rendererError))
         {
             im.openError = "Metal viewport init failed: " + rendererError;
             renderer.shutdown();
@@ -2013,7 +2338,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     };
     std::map<int, ClipStream> streams; // render-thread only, keyed by clipId
     uint64_t streamsGeneration = ~0ull;
-    auto frameVisualPlans = im.visualPlanPublication; // render-thread frame lease
+    auto frameVisualPlans = im.visualPlanPublication.shared(); // render-thread frame lease
     std::vector<videowire::VisualEventScheduleBinding> frameVisualScheduleBindings;
     videowire::VisualEventTriggerCursor visualEventCursor (false);
 
@@ -2306,14 +2631,23 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         videowire::RenderSegment secondary;
         const bool combined = videowire::visualPlanSecondaryMatte(
             frameVisualPlans->plans, segment.clipId, segment, secondary);
-        if (combined && stream.matteReceiptB != secondary.matteContentReceipt)
+        const bool reusePrimary = combined && videowire::visualPlanReusesPrimaryMatte(
+            frameVisualPlans->plans, segment.clipId);
+        if (reusePrimary)
+        {
+            renderer.deleteTexture(stream.matteTexB); stream.matteTexB = 0;
+            stream.matteMediaB.reset(); stream.matteOpenFailedB = false;
+            stream.matteTexWB = stream.matteTexHB = 0;
+            stream.matteReceiptB.clear();
+        }
+        if (combined && !reusePrimary && stream.matteReceiptB != secondary.matteContentReceipt)
         {
             renderer.deleteTexture(stream.matteTexB); stream.matteTexB = 0;
             stream.matteMediaB.reset(); stream.matteOpenFailedB = false;
             stream.matteTexWB = stream.matteTexHB = 0;
             stream.matteReceiptB = secondary.matteContentReceipt;
         }
-        if (combined && stream.matteMediaB == nullptr && !stream.matteOpenFailedB)
+        if (combined && !reusePrimary && stream.matteMediaB == nullptr && !stream.matteOpenFailedB)
         {
             std::string dir, pattern, error;
             stream.matteMediaB = std::make_unique<MediaContext>();
@@ -2322,7 +2656,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                                              secondary.matteFirstFrame).empty())
             { stream.matteMediaB.reset(); stream.matteOpenFailedB = true; }
         }
-        if (combined && stream.matteMediaB == nullptr) return false;
+        if (combined && !reusePrimary && stream.matteMediaB == nullptr) return false;
         const double fps = segment.matteFps > 0.0 ? segment.matteFps : 1.0;
         if (stream.matteTexW == 0
             || std::abs(sourceSec - stream.matteLastSrcSec) >= 0.5 / fps)
@@ -2338,7 +2672,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             stream.matteTexH = matteFrame.height;
             stream.matteLastSrcSec = matteFrame.ptsSec;
         }
-        if (combined && (stream.matteTexWB == 0
+        if (combined && !reusePrimary && (stream.matteTexWB == 0
             || std::abs(sourceSec - stream.matteLastSrcSecB) >= 0.5 / secondary.matteFps))
         {
             DecodedFrame frame;
@@ -2349,7 +2683,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             stream.matteTexWB = frame.width; stream.matteTexHB = frame.height;
             stream.matteLastSrcSecB = frame.ptsSec;
         }
-        return stream.matteTex != 0 && (!combined || stream.matteTexB != 0);
+        return stream.matteTex != 0 && (!combined || reusePrimary || stream.matteTexB != 0);
     };
 
     // Common per-clip params (everything except the source texture) — shared by
@@ -2410,17 +2744,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     // Persists across frames; refreshed only when a shader (re)compiles.
     std::map<int, std::map<std::string, double>> clipGenDefaults;
 
-    // M5 Block C live score (render-thread owned). The packer is a stateful
-    // voice allocator advanced once per timeline frame; unlike the exporter it
-    // is NOT warmed from frame 0 (a live viewport has no canonical t=0), so row
-    // assignment after a backward scrub may differ from a forward playthrough —
-    // the export path stays the deterministic ground truth. localScore/localGen
-    // mirror the control-plane copy so we only re-copy + reset on a real change.
-    arbitblockc::BlockCPacker scorePacker;
+    // M5 Block C live score producer. It publishes one immutable carrier shared
+    // by shaders, particles, score notation, and imported note instancing.
+    canonicalblockc::FrameOwner scoreFrameOwner;
     arbitmod::Score localScore;
+    std::shared_ptr<const arbitmod::Score> canonicalScoreSource;
     uint64_t scoreGenSeen = ~0ull;
-    long scorePackedFrame = -1;
-    videorender::NoteFeatures cachedNoteFeatures;
+    canonicalblockc::OwnerIdentity scoreIdentity;
+    std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> cachedCanonicalBlockCFrame;
 
     // M6 mod matrix (render-thread owned). localRoutings mirrors the control-
     // plane copy; routingStates carry the one-pole smoothing memory advanced
@@ -2633,6 +2964,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             {
                 localBeatTimeline = im.beatTimeline;
                 beatTimelineGenSeen = im.beatTimelineGeneration;
+                cachedCanonicalBlockCFrame.reset();
+
             }
             for (int attempt = 0; attempt < 3 && ! haveClock; ++attempt)
                 haveClock = im.transport.isOpen() && im.transport.read (tb);
@@ -2861,7 +3194,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 }), pend.end());
 
             timelineGen = im.timelineGeneration;
-            frameVisualPlans = im.visualPlanPublication;
+            frameVisualPlans = im.visualPlanPublication.shared();
             frameVisualScheduleBindings = im.visualEventSchedules;
             if (timelineGen != streamsGeneration)
                 for (const auto& s : im.segments)
@@ -2871,11 +3204,11 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             // note set actually changed (cheap per-frame check vs a vector copy).
             if (im.scoreGeneration != scoreGenSeen)
             {
-                localScore = im.score;
+                canonicalScoreSource = im.scoreSnapshot;
+                localScore = *canonicalScoreSource;
                 scoreGenSeen = im.scoreGeneration;
-                scorePacker.reset();
-                scorePackedFrame = -1;
-                cachedNoteFeatures = videorender::NoteFeatures {};
+                scoreIdentity = im.scoreIdentity;
+                cachedCanonicalBlockCFrame.reset();
             }
 
             // M6: re-copy the routings + reset their smoothing state only when
@@ -3135,6 +3468,16 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 if (const auto dit = clipGenDefaults.find (clipId); dit != clipGenDefaults.end())
                     for (const auto& [k, v] : dit->second)
                         p.genParams.emplace (k, v);
+                if (frameVisualPlans != nullptr)
+                {
+                    videohelper::importedscene::seedImportedSceneRuntimeParameters(
+                        frameVisualPlans->plans, clipId, p.visualParams);
+                    if (const auto* plan = videowire::findVisualLayerPlan(
+                            frameVisualPlans->plans, clipId))
+                        videowire::seedFlatShaderRuntimeParameters(
+                            frameVisualPlans->state.compiled(clipId, plan->structuralRevision),
+                            p.visualParams);
+                }
                 for (size_t ri = 0; ri < localRoutings.size(); ++ri)
                 {
                     const arbitmod::Routing& r = localRoutings[ri];
@@ -3317,6 +3660,16 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                        return a.seg.displayStartSec < b.seg.displayStartSec;
                    });
 
+        // Publication replacement is independent of timeline replacement. Retire
+        // stale native shader owners from the frame snapshot on every frame lease.
+        std::set<int> orderedPlanClips;
+        for (const auto& plan : frameVisualPlans->plans)
+            if (const auto* execution = frameVisualPlans->state.compiled(
+                    plan.clipId, plan.structuralRevision);
+                execution != nullptr && execution->shaderOperationPlan != nullptr)
+                orderedPlanClips.insert(plan.clipId);
+        renderer.retainShaderPlanClips(orderedPlanClips);
+
         // Drop decode streams for clips that left the timeline.
         if (timelineGen != streamsGeneration)
         {
@@ -3363,8 +3716,9 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         // set, fall back to compositing at the window size (legacy, no present
         // target). The composite is byte-identical to the export's because both
         // run renderComposite with output == canvas and a canvas-aspect ref.
-        const int cw = canvasW_.load();
-        const int ch = canvasH_.load();
+        const auto canvas = canvasExtent();
+        const int cw = canvas.width;
+        const int ch = canvas.height;
         if (cw > 0 && ch > 0)
         {
             renderer.setOutputSize (cw, ch);
@@ -3416,8 +3770,16 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         interpTierThisFrame = 0; // decodeLayer raises this to the tier it drew
         std::vector<videorender::LayerDesc> descs;
         std::vector<videorender::LayerDesc> fromDescs;
+        std::vector<videohelper::sdf::NativeSdfRenderedFrame> sdfFrameOwners;
+        std::vector<videohelper::modelpayload::ImportedAnimatedSceneReceipt>
+            importedAnimationFrameOwners;
+        std::vector<videohelper::modelpayload::ImportedSceneExecutionReceipt>
+            importedSceneFrameOwners;
         descs.reserve (act.size());
         fromDescs.reserve (act.size()); // stable: fromLayer pointers held by descs
+        sdfFrameOwners.reserve (act.size());
+        importedAnimationFrameOwners.reserve(act.size());
+        importedSceneFrameOwners.reserve(act.size());
         const videowire::VisualInspectionTarget inspectionTarget {
             im.inspectionClipId, im.inspectionStructuralRevision,
             im.inspectionNodeId, im.inspectionOutputPort };
@@ -3492,43 +3854,56 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 shaderClips.insert (al.seg.clipId);
         }
 
-        // P4: particle clips also read the Block C score (to seed from a track's
-        // notes), so the score must be packed when one is on-screen even with no
-        // shader clip present.
-        bool haveParticleClip = false;
-        bool haveScoreClip = false;
-        for (const auto& al : act)
-        {
-            const auto kind = videowire::resolveSourceKind(
-                al.seg.sourceKind, al.seg.isAdjustment, al.seg.sourcePath);
-            if (kind == videowire::SourceKind::Particles) haveParticleClip = true;
-            else if (kind == videowire::SourceKind::Score) haveScoreClip = true;
-        }
-
-        // M5: pack the live Block C score once per timeline frame (only when a
-        // shader or particle clip is on-screen to read it). The packed beat
+        // M5: pack the live Block C score once per timeline frame for every
+        // consumer, including imported scenes. The packed beat
         // matches makeShaderClock's shared beat timeline; re-packing a held frame is
         // skipped via scorePackedFrame so a paused/repeated frame stays stable.
-        const bool haveScore = (! shaderClips.empty() || haveParticleClip || haveScoreClip)
-                             && ! localScore.notes.empty();
+        const bool haveScore = ! localScore.notes.empty();
         if (haveScore)
         {
             const double clkFps = valueFps;  // project value-grid fps (== export job.fps)
             const long g = (long) std::llround (displaySec * clkFps);
-            if (g != scorePackedFrame)
-            {
-                const arbitblockc::PackResult pr = scorePacker.pack (
-                    localScore, (float) displayBeat);
-                cachedNoteFeatures.notesTex  = pr.notesTex;
-                cachedNoteFeatures.linksTex  = pr.linksTex;
-                cachedNoteFeatures.noteCount = pr.noteCount;
-                cachedNoteFeatures.linkCount = pr.linkCount;
-                cachedNoteFeatures.rootFreq  = localScore.rootFreq;
-                cachedNoteFeatures.historyBeats = localScore.historyBeats;
-                cachedNoteFeatures.lookaheadBeats = localScore.lookaheadBeats;
-                scorePackedFrame = g;
-            }
+            cachedCanonicalBlockCFrame = scoreFrameOwner.frameAt(
+                canonicalblockc::PreviewFrameRequest { scoreIdentity, g, clkFps },
+                canonicalScoreSource,
+                [&] (long frame)
+                {
+                    return activeBeatTimeline.secondsToBeat(
+                        static_cast<double>(frame) / clkFps);
+                });
+            if (cachedCanonicalBlockCFrame == nullptr)
+                continue;
         }
+
+        const videowire::VisualPlanEvaluationContext visualEvaluationContext {
+            videowire::geometryCoreHelperGeneration(),
+            ! playing, visualtemporalsampling::EvaluationMode::preview,
+            timelineGen == 0 ? std::uint64_t{1} : timelineGen,
+            videowire::geometryCoreDeviceGeneration()
+        };
+        videowire::TemporalSamplingCommitTransaction temporalSamplingTransaction;
+        const auto rendererOwner = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(&frameVisualPlans->state));
+        std::string framePublicationError;
+        auto framePublication = renderer.beginFramePublicationCandidate(
+            rendererOwner == 0 ? 1 : rendererOwner,
+            timelineGen == 0 ? std::uint64_t{1} : timelineGen,
+            {}, framePublicationError);
+        if (! framePublication)
+        {
+            std::lock_guard<std::mutex> lock(im.mutex);
+            im.rendererError = framePublicationError;
+            continue;
+        }
+        auto framePublicationHolder = std::make_shared<
+            videorender::FrameRenderer::FramePublicationCandidatePtr>(framePublication);
+        temporalSamplingTransaction.addPublication(
+            [&renderer, framePublicationHolder](std::string& error)
+            { return renderer.validateFramePublicationCandidate(*framePublicationHolder, error); },
+            [&renderer, framePublicationHolder]
+            { renderer.promoteFramePublicationCandidate(*framePublicationHolder); },
+            [&renderer, framePublicationHolder]
+            { renderer.discardFramePublicationCandidate(*framePublicationHolder); });
 
         auto prepareDecodedDesc = [&] (const ViewportSegment& segment,
                                        const ClipGraphParams& params,
@@ -3536,10 +3911,54 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                                        videorender::LayerDesc& desc,
                                        ClipStream*& stream) -> bool
         {
+            std::string planError;
+            fillDescCommon(desc, params, displaySec, segment.clipId);
+            if (haveScore)
+                desc.canonicalBlockCFrame = cachedCanonicalBlockCFrame;
+            const auto importedSceneResult =
+                videohelper::importedscene::prepareVisualImportedSceneLayerAtTime(
+                    frameVisualPlans->plans, segment.clipId,
+                    cw > 0 ? cw : fbW, ch > 0 ? ch : fbH,
+                    sourceSec, valueFps,
+                    videohelper::importedscene::NativeImportedSceneRenderUse::Preview,
+                    importedSceneExecution.get(), &importedScenePlanCache, desc,
+                    importedSceneFrameOwners, planError, &params.visualParams,
+                    { timelineGen, visualEvaluationContext.helperGeneration });
+            if (importedSceneResult == videohelper::importedscene::
+                                           VisualImportedScenePreparation::rendered)
+            {
+                stream = nullptr;
+                return videowire::executeVisualLayerPlanForRenderer(
+                    renderer, frameVisualPlans->plans, segment.clipId, desc, planError,
+                    videohelper::geometry::PlanUse::preview, &temporalSamplingTransaction,
+                    &inspectionTarget, &inspectionResource,
+                    &frameVisualPlans->state, displaySec,
+                    &frameVisualScheduleBindings, &visualEventCursor,
+                    &visualEvaluationContext, &params.visualParams);
+            }
+            if (importedSceneResult == videohelper::importedscene::
+                                           VisualImportedScenePreparation::rejected)
+                return false;
+            const auto importedResult =
+                videohelper::importedanimation::prepareVisualImportedAnimationLayer(
+                    frameVisualPlans->plans, segment.clipId,
+                    cw > 0 ? cw : fbW, ch > 0 ? ch : fbH,
+                    sourceSec, valueFps,
+                    videohelper::importedanimation::NativeImportedAnimationRenderUse::Preview,
+                    importedAnimationExecution.get(), desc,
+                    importedAnimationFrameOwners, planError);
+            if (importedResult == videohelper::importedanimation::
+                                      VisualImportedAnimationPreparation::rendered)
+            {
+                stream = nullptr;
+                return true;
+            }
+            if (importedResult == videohelper::importedanimation::
+                                      VisualImportedAnimationPreparation::rejected)
+                return false;
             stream = decodeLayer(segment, sourceSec);
             if (stream == nullptr) return false;
             fillDesc(desc, params, *stream, displaySec, segment.clipId);
-            std::string planError;
             if (! uploadTypedMatte(segment, *stream, sourceSec))
                 planError = "typed matte asset frame is unavailable";
             else
@@ -3547,24 +3966,40 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 desc.matteTexture = stream->matteTex;
                 desc.matteWidth = stream->matteTexW;
                 desc.matteHeight = stream->matteTexH;
-                desc.matteTextureB = stream->matteTexB;
-                desc.matteWidthB = stream->matteTexWB;
-                desc.matteHeightB = stream->matteTexHB;
-                if (!videohelper::prepareDepthTexture(im.depthCacheRoot, frameVisualPlans->plans,
+                const bool reusePrimaryMatte = videowire::visualPlanReusesPrimaryMatte(
+                    frameVisualPlans->plans, segment.clipId);
+                desc.matteTextureB = reusePrimaryMatte ? stream->matteTex : stream->matteTexB;
+                desc.matteWidthB = reusePrimaryMatte ? stream->matteTexW : stream->matteTexWB;
+                desc.matteHeightB = reusePrimaryMatte ? stream->matteTexH : stream->matteTexHB;
+                const auto sdfResult = videohelper::sdf::prepareVisualSdfLayer(
+                    frameVisualPlans->plans, segment.clipId,
+                    cw > 0 ? cw : fbW, ch > 0 ? ch : fbH,
+                    videohelper::sdf::NativeSdfRenderUse::Preview,
+                    videohelper::sdf::nativeSdfRenderer(), desc, sdfFrameOwners, planError,
+                    { timelineGen, 0,
+                      visualEvaluationContext.helperGeneration, segment.clipId });
+                if (sdfResult == videohelper::sdf::VisualSdfPreparation::rendered)
+                    return true;
+                if (sdfResult == videohelper::sdf::VisualSdfPreparation::notPresent
+                    && !videohelper::prepareDepthTexture(im.depthCacheRoot, frameVisualPlans->plans,
                         segment.clipId, sourceSec, 1, renderer, stream->depth, desc, planError))
                 {
                     // Executable depth is strict; the caller closes the viewport below.
                 }
-                else if (!videohelper::trackingruntime::prepareTracking(im.depthCacheRoot,
+                else if (sdfResult == videohelper::sdf::VisualSdfPreparation::notPresent
+                    && !videohelper::trackingruntime::prepareTracking(im.depthCacheRoot,
                         frameVisualPlans->plans, segment.clipId, sourceSec, desc, planError))
                 {
                     // Tracking receipts are equally strict and never auto-regenerated.
                 }
-                else if (videowire::executeVisualLayerPlan(
-                        frameVisualPlans->plans, segment.clipId, desc, planError,
+                else if (sdfResult == videohelper::sdf::VisualSdfPreparation::notPresent
+                    && videowire::executeVisualLayerPlanForRenderer(
+                        renderer, frameVisualPlans->plans, segment.clipId, desc, planError,
+                        videohelper::geometry::PlanUse::preview, &temporalSamplingTransaction,
                         &inspectionTarget, &inspectionResource,
                         &frameVisualPlans->state, displaySec,
-                        &frameVisualScheduleBindings, &visualEventCursor))
+                        &frameVisualScheduleBindings, &visualEventCursor,
+                        &visualEvaluationContext, &params.visualParams))
                     return true;
             }
             std::fprintf(stderr, "[viewport] visual plan execution rejected: %s\n",
@@ -3609,7 +4044,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 // Shader layer: no media decode; the Block A clock is a pure
                 // function of display time + tempo — the SAME formula the
                 // exporter uses, so preview == export. The Block C score is now
-                // live too (cachedNoteFeatures, set below), and so is Block B
+                // live too (cachedCanonicalBlockCFrame, set below), and so is Block B
                 // audio (cachedAudioFeatures, drained from the live mix ring).
                 const double segDur = (al.seg.outSec - al.seg.inSec)
                                     / std::max (al.seg.rate, 1e-9);
@@ -3625,10 +4060,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     clkFps, playing, frameIdx);
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
-                {
-                    d.noteFeatures = cachedNoteFeatures;
-                    d.notesPresent = true;   // gate renderComposite reads (renderer.cpp:1726)
-                }
+                    d.canonicalBlockCFrame = cachedCanonicalBlockCFrame;
                 if (haveAudio)
                 {
                     d.audioFeatures = cachedAudioFeatures;
@@ -3639,7 +4071,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             {
                 // P4 particle clip: a GPU compute pool, no media decode. Same
                 // Block A clock formula as the exporter ⇒ preview == export; the
-                // live Block C score (cachedNoteFeatures) seeds from the chosen
+                // live Block C score (cachedCanonicalBlockCFrame) seeds from the chosen
                 // spawn track. v1 has no audio reactivity (Block B master-mix only).
                 const double segDur = (al.seg.outSec - al.seg.inSec)
                                     / std::max (al.seg.rate, 1e-9);
@@ -3655,10 +4087,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     clkFps, playing, frameIdx);
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
-                {
-                    d.noteFeatures = cachedNoteFeatures;
-                    d.notesPresent = true;
-                }
+                    d.canonicalBlockCFrame = cachedCanonicalBlockCFrame;
             }
             else if (isScore)
             {
@@ -3671,7 +4100,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     ? al.seg.clockDurationSec : segDur;
                 const int frameIdx = static_cast<int>(std::llround((displaySec - clockStart) * clkFps));
                 d.scoreSource = true;
-                d.score = &localScore;
+                d.canonicalBlockCFrame = cachedCanonicalBlockCFrame;
                 d.shaderClock = videorender::makeShaderClock(
                     displaySec, clockStart, clockDuration, activeBeatTimeline,
                     clkFps, playing, frameIdx);
@@ -3690,11 +4119,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
 
             std::string planError;
-            if (! planExecuted && ! videowire::executeVisualLayerPlan (
-                    frameVisualPlans->plans, al.seg.clipId, d, planError,
-                    &inspectionTarget, &inspectionResource,
-                    &frameVisualPlans->state, displaySec,
-                    &frameVisualScheduleBindings, &visualEventCursor))
+            if (! planExecuted
+                && ! videowire::executeVisualLayerPlanForRenderer (
+                        renderer, frameVisualPlans->plans, al.seg.clipId, d, planError,
+                        videohelper::geometry::PlanUse::preview, &temporalSamplingTransaction,
+                        &inspectionTarget, &inspectionResource,
+                        &frameVisualPlans->state, displaySec,
+                        &frameVisualScheduleBindings, &visualEventCursor,
+                        &visualEvaluationContext, &al.params.visualParams))
             {
                 std::fprintf (stderr, "[viewport] visual plan execution rejected: %s\n",
                               planError.c_str());
@@ -3753,6 +4185,13 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         // IOSurface is the Metal render target itself: no Metal->GL->IOSurface
         // bridge and no fallback copy are permitted on this path.
         bool directMetalFrame = false;
+        bool framePublished = false;
+        if (videowire::consumeTemporalPublicationFailure(
+                videowire::TemporalPublicationFailurePoint::viewportPresentation))
+        {
+            temporalSamplingTransaction.discard();
+            continue;
+        }
         const bool requireDirectMetal =
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
             metalOnly;
@@ -4051,6 +4490,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     continue;
                 }
             }
+            framePublished = true;
         }
 
         // frameHash = async PBO hash of the undecorated composite (canvas-res,
@@ -4140,6 +4580,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                                          rowBytes);
                         slot->generation.fetch_add (1, std::memory_order_acq_rel);
                         im.sharedFramesSent.fetch_add (1);
+                        framePublished = true;
                         viewportTelemetry.readbackCopied (true, rowBytes, ph,
                             fbW, fbH, pw, ph);
                     }
@@ -4185,6 +4626,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                                      static_cast<size_t> (checkedBytes));
                         slot->generation.fetch_add (1, std::memory_order_acq_rel); // even
                         im.sharedFramesSent.fetch_add (1);
+                        framePublished = true;
                         viewportTelemetry.readbackCopied (true,
                             static_cast<size_t> (slot->strideBytes), ph,
                             fbW, fbH, pw, ph);
@@ -4257,6 +4699,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 {
                     target->busy = true;
                     im.sharedFramesSent.fetch_add (1);
+                    framePublished = true;
                 }
                 else
                 {
@@ -4271,6 +4714,19 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
         }
 #endif // ARBIT_HAVE_GPU_SHARED
+        if (framePublished)
+        {
+            std::string commitError;
+            if (! temporalSamplingTransaction.commit(commitError))
+            {
+                std::lock_guard<std::mutex> lock(im.mutex);
+                im.rendererError = commitError;
+                im.wantClose = true;
+                continue;
+            }
+        }
+        else
+            temporalSamplingTransaction.discard();
         im.framesPresented.fetch_add (1);
 
         // Measured fps over a 1 s sliding window.

@@ -1,5 +1,6 @@
 #pragma once
 #include "../../shared/ProgrammableRuntimeGrant.h"
+#include "../../shared/PrivateInheritedPayload.h"
 #include "../../shared/ShaderCatalogManifest.h"
 #include <chrono>
 #include <mutex>
@@ -151,6 +152,25 @@ private:
     std::unordered_set<uint64_t> consumedNonces_;
     bool ready_ = false;
 };
+
+inline bool installPrivateSessionPacket (
+    SessionVerifier& session,
+    std::array<uint8_t, programmableruntime::privatepayload::packetSize>& packet,
+    bool* sourceClearedOut = nullptr)
+{
+    programmableruntime::SessionSecret secret {};
+    std::copy_n(packet.begin(), secret.size(), secret.begin());
+    uint64_t generation = 0;
+    for (size_t index = secret.size(); index < packet.size(); ++index)
+        generation = (generation << 8) | packet[index];
+    session.reset(std::move(secret), generation);
+    if (sourceClearedOut != nullptr)
+        *sourceClearedOut = std::all_of(secret.begin(), secret.end(),
+                                       [] (uint8_t byte) { return byte == 0; });
+    volatile uint8_t* packetBytes = packet.data();
+    for (size_t index = 0; index < packet.size(); ++index) packetBytes[index] = 0;
+    return generation != 0 && (sourceClearedOut == nullptr || *sourceClearedOut);
+}
 
 inline SessionVerifier& verifier() { static SessionVerifier value; return value; }
 inline programmableruntime::PayloadKind identifyCatalogGpuPayload (

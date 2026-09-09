@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -86,7 +87,31 @@ struct CompiledVisualOperation
     std::string kind;
     std::string backendCapability;
     std::string payloadXml;
+    // Exact JSON object received over the live processor/helper transport.
+    // Render snapshots are in-memory products, not project persistence.
+    std::string runtimeGrantJson;
+
+    CompiledVisualOperation() = default;
+    CompiledVisualOperation(int id, std::string operationKind,
+                            std::string capability, std::string payload,
+                            std::string grant = {})
+        : nodeId(id), kind(std::move(operationKind)),
+          backendCapability(std::move(capability)), payloadXml(std::move(payload)),
+          runtimeGrantJson(std::move(grant))
+    {
+    }
 };
+
+inline bool isParameterlessShapeBooleanKind (const std::string& kind) noexcept
+{
+    return kind == "visual.shape.union" || kind == "visual.shape.intersection"
+        || kind == "visual.shape.subtract";
+}
+
+inline bool isParameterlessPathMatteKind (const std::string& kind) noexcept
+{
+    return kind == "visual.shape.invert" || kind == "visual.matte.path";
+}
 
 struct CompiledVisualLayerPlan
 {
@@ -95,12 +120,327 @@ struct CompiledVisualLayerPlan
     std::string identityMode = "authoredGraph";
     bool producerValidated = false;
     std::string error;
+    size_t descriptorCount = 0;
+    size_t operationCount = 0;
+    size_t sceneRecordCount = 0;
+    size_t frameOutputCount = 0;
+    size_t peakLiveFrameCount = 0;
+    size_t allocatedFrameSlotCount = 0;
+    uint64_t compileDurationMicros = 0;
     std::vector<std::string> nodeKinds;
     std::vector<int> nodeIds;
     std::vector<CompiledVisualEdgeBinding> edges;
     std::vector<CompiledVisualPortBinding> ports;
     std::vector<CompiledVisualOperation> operations;
 };
+
+// Select the strictly newest revision for a clip. If revisions are equal,
+// select the first plan. This predicate is the canonical normalization rule.
+inline bool isSelectedVisualLayerPlan (
+    const std::vector<CompiledVisualLayerPlan>& plans, std::size_t index)
+{
+    for (std::size_t candidate = 0; candidate < plans.size(); ++candidate)
+    {
+        if (candidate == index || plans[candidate].clipId != plans[index].clipId)
+            continue;
+        if (plans[candidate].structuralRevision > plans[index].structuralRevision
+            || (plans[candidate].structuralRevision == plans[index].structuralRevision
+                && candidate < index))
+            return false;
+    }
+    return true;
+}
+
+inline std::vector<std::size_t> normalizedVisualLayerPlanIndices (
+    const std::vector<CompiledVisualLayerPlan>& plans)
+{
+    std::vector<std::size_t> selected;
+    selected.reserve(plans.size());
+    for (std::size_t ownerPosition = 0; ownerPosition < plans.size(); ++ownerPosition)
+    {
+        const bool firstOwnerPosition = std::none_of(
+            plans.begin(), plans.begin() + static_cast<std::ptrdiff_t>(ownerPosition),
+            [&] (const auto& prior) { return prior.clipId == plans[ownerPosition].clipId; });
+        if (! firstOwnerPosition)
+            continue;
+        for (std::size_t index = ownerPosition; index < plans.size(); ++index)
+            if (plans[index].clipId == plans[ownerPosition].clipId
+                && isSelectedVisualLayerPlan(plans, index))
+            {
+                selected.push_back(index);
+                break;
+            }
+    }
+    return selected;
+}
+
+inline std::vector<CompiledVisualLayerPlan> normalizedVisualLayerPlans (
+    const std::vector<CompiledVisualLayerPlan>& plans)
+{
+    const auto selected = normalizedVisualLayerPlanIndices(plans);
+    std::vector<CompiledVisualLayerPlan> normalized;
+    normalized.reserve(selected.size());
+    for (const auto index : selected)
+        normalized.push_back(plans[index]);
+    return normalized;
+}
+
+inline const CompiledVisualLayerPlan* findVisualLayerPlan (
+    const std::vector<CompiledVisualLayerPlan>& plans, int clipId)
+{
+    for (std::size_t index = 0; index < plans.size(); ++index)
+        if (plans[index].clipId == clipId && isSelectedVisualLayerPlan(plans, index))
+            return &plans[index];
+    return nullptr;
+}
+
+struct CompiledVisualInputBinding
+{
+    int fromNodeId = 0;
+    int fromPort = 0;
+    int toPort = 0;
+};
+
+struct CompiledVisualScheduledOperation
+{
+    size_t nodeIndex = 0;
+    size_t operationIndex = 0;
+    int nodeId = 0;
+    std::vector<CompiledVisualInputBinding> inputs;
+};
+
+struct CompiledVisualDagSchedule
+{
+    std::vector<CompiledVisualScheduledOperation> operations;
+};
+
+inline bool isExactThreeSourceVisualDag (const std::vector<std::string>& kinds)
+{
+    return kinds.size() == 5
+        && std::count(kinds.begin(), kinds.end(), "video.source") == 1
+        && std::count(kinds.begin(), kinds.end(), "video.text") == 1
+        && std::count(kinds.begin(), kinds.end(), "video.layer.source") == 1
+        && std::count(kinds.begin(), kinds.end(), "video.blend") == 1
+        && std::count(kinds.begin(), kinds.end(), "video.out") == 1;
+}
+
+inline bool isBoundedNativeCompositorDag (const std::vector<std::string>& kinds)
+{
+    return std::count(kinds.begin(), kinds.end(), "video.blend") == 1
+        && std::count(kinds.begin(), kinds.end(), "video.out") == 1;
+}
+
+inline bool admitBoundedNativeImageDescriptors (const CompiledVisualLayerPlan& plan,
+                                                std::string& error)
+{
+    const auto blend = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(), "video.blend");
+    const auto output = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(), "video.out");
+    if (blend == plan.nodeKinds.end() || output == plan.nodeKinds.end()) return true;
+    const int blendId = plan.nodeIds[(size_t) std::distance(plan.nodeKinds.begin(), blend)];
+    const int outputId = plan.nodeIds[(size_t) std::distance(plan.nodeKinds.begin(), output)];
+    std::vector<std::pair<int, int>> imagePorts {
+        { blendId, 0 }, { blendId, 1 }, { blendId, 2 }, { blendId, 3 }, { outputId, 0 }
+    };
+    const auto mark = [&imagePorts] (int nodeId, int port)
+    {
+        const std::pair<int, int> identity { nodeId, port };
+        if (std::find(imagePorts.begin(), imagePorts.end(), identity) == imagePorts.end())
+            imagePorts.push_back(identity);
+    };
+    for (const int blendInput : { 0, 2, 3 })
+    {
+        const auto edge = std::find_if(plan.edges.begin(), plan.edges.end(), [&](const auto& candidate)
+            { return candidate.toNodeId == blendId && candidate.toPort == blendInput; });
+        if (edge != plan.edges.end()) mark(edge->fromNodeId, edge->fromPort);
+    }
+    int successor = blendId;
+    for (size_t depth = 0; depth < plan.nodeIds.size(); ++depth)
+    {
+        const auto edge = std::find_if(plan.edges.begin(), plan.edges.end(), [&](const auto& candidate)
+            { return candidate.toNodeId == successor && candidate.toPort == 0; });
+        if (edge == plan.edges.end()) break;
+        mark(edge->toNodeId, edge->toPort);
+        mark(edge->fromNodeId, edge->fromPort);
+        successor = edge->fromNodeId;
+    }
+    for (const auto& port : plan.ports)
+        if (std::find(imagePorts.begin(), imagePorts.end(),
+                      std::pair<int, int> { port.nodeId, port.port }) != imagePorts.end()
+            && (port.channels != 1 || port.carrier != "frame"
+                || port.dataType != "image" || port.pixelFormat != "rgba8"
+                || port.colorSpace != "sRGB"))
+        {
+            error = "bounded visual DAG requires RGBA8 sRGB Frame<Image> descriptors";
+            return false;
+        }
+    return true;
+}
+
+// Schedule typed native-compositor DAGs independently of serialized document
+// order. Stable node identities break ready-node ties. Destination-port
+// identities determine input routing.
+inline bool compileBoundedVisualDagSchedule (const CompiledVisualLayerPlan& plan,
+                                             CompiledVisualDagSchedule& schedule,
+                                             std::string& error)
+{
+    schedule.operations.clear();
+    const size_t nodeCount = plan.nodeIds.size();
+    const bool exactThreeSource = isExactThreeSourceVisualDag(plan.nodeKinds);
+    if ((! exactThreeSource
+            && ! isBoundedNativeCompositorDag(plan.nodeKinds))
+        || nodeCount != plan.nodeKinds.size() || plan.operations.size() != nodeCount)
+    {
+        error = "bounded visual DAG has incomplete node or operation identities";
+        return false;
+    }
+    if (! admitBoundedNativeImageDescriptors(plan, error)) return false;
+
+    std::vector<size_t> operationForNode(nodeCount, nodeCount);
+    for (size_t nodeIndex = 0; nodeIndex < nodeCount; ++nodeIndex)
+    {
+        if (plan.nodeIds[nodeIndex] <= 0
+            || std::find(plan.nodeIds.begin(), plan.nodeIds.begin()
+                         + static_cast<std::ptrdiff_t>(nodeIndex), plan.nodeIds[nodeIndex])
+                   != plan.nodeIds.begin() + static_cast<std::ptrdiff_t>(nodeIndex))
+        {
+            error = "bounded visual DAG has duplicate or invalid node identity";
+            return false;
+        }
+    }
+    for (size_t operationIndex = 0; operationIndex < plan.operations.size(); ++operationIndex)
+    {
+        const auto& operation = plan.operations[operationIndex];
+        const auto node = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), operation.nodeId);
+        if (node == plan.nodeIds.end())
+        {
+            error = "bounded visual DAG operation references an unknown node";
+            return false;
+        }
+        const size_t nodeIndex = static_cast<size_t>(std::distance(plan.nodeIds.begin(), node));
+        if (operationForNode[nodeIndex] != nodeCount || operation.kind != plan.nodeKinds[nodeIndex])
+        {
+            error = "bounded visual DAG operation identity does not match its node";
+            return false;
+        }
+        if (isParameterlessShapeBooleanKind(operation.kind) && ! operation.payloadXml.empty())
+        {
+            error = "visual Shape Boolean operation payload must be empty";
+            return false;
+        }
+        if (isParameterlessPathMatteKind(operation.kind) && ! operation.payloadXml.empty())
+        {
+            error = "visual path-matte operation payload must be empty";
+            return false;
+        }
+        operationForNode[nodeIndex] = operationIndex;
+    }
+
+    std::map<std::pair<int, int>, const CompiledVisualPortBinding*> ports;
+    for (const auto& port : plan.ports)
+    {
+        if (std::find(plan.nodeIds.begin(), plan.nodeIds.end(), port.nodeId) == plan.nodeIds.end()
+            || port.port < 0 || port.channels <= 0
+            || (port.direction != "in" && port.direction != "out")
+            || port.carrier.empty() || port.dataType.empty()
+            || ! ports.emplace(std::make_pair(port.nodeId, port.port), &port).second)
+        {
+            error = "bounded visual DAG has an invalid or duplicate typed port";
+            return false;
+        }
+    }
+
+    std::vector<std::vector<size_t>> outgoing(nodeCount);
+    std::vector<size_t> indegree(nodeCount, 0);
+    std::vector<std::vector<CompiledVisualInputBinding>> inputs(nodeCount);
+    for (size_t edgeIndex = 0; edgeIndex < plan.edges.size(); ++edgeIndex)
+    {
+        const auto& edge = plan.edges[edgeIndex];
+        const auto fromNode = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), edge.fromNodeId);
+        const auto toNode = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), edge.toNodeId);
+        if (fromNode == plan.nodeIds.end() || toNode == plan.nodeIds.end()
+            || edge.fromNodeId == edge.toNodeId || edge.fromPort < 0 || edge.toPort < 0)
+        {
+            error = "bounded visual DAG edge references an invalid endpoint";
+            return false;
+        }
+        if (std::any_of(plan.edges.begin(), plan.edges.begin()
+                        + static_cast<std::ptrdiff_t>(edgeIndex),
+                        [&edge](const CompiledVisualEdgeBinding& prior)
+                        {
+                            return (prior.fromNodeId == edge.fromNodeId && prior.fromPort == edge.fromPort
+                                    && prior.toNodeId == edge.toNodeId && prior.toPort == edge.toPort)
+                                || (prior.toNodeId == edge.toNodeId && prior.toPort == edge.toPort);
+                        }))
+        {
+            error = "bounded visual DAG has a duplicate edge or multiply-bound input port";
+            return false;
+        }
+        const auto sourcePort = ports.find({ edge.fromNodeId, edge.fromPort });
+        const auto destinationPort = ports.find({ edge.toNodeId, edge.toPort });
+        if (! plan.ports.empty()
+            && (sourcePort == ports.end() || destinationPort == ports.end()
+                || sourcePort->second->direction != "out" || destinationPort->second->direction != "in"
+                || sourcePort->second->carrier != destinationPort->second->carrier
+                || sourcePort->second->dataType != destinationPort->second->dataType
+                || sourcePort->second->channels != destinationPort->second->channels
+                || sourcePort->second->pixelFormat != destinationPort->second->pixelFormat
+                || sourcePort->second->colorSpace != destinationPort->second->colorSpace))
+        {
+            error = "bounded visual DAG has an incompatible typed edge";
+            return false;
+        }
+        const size_t fromIndex = static_cast<size_t>(std::distance(plan.nodeIds.begin(), fromNode));
+        const size_t toIndex = static_cast<size_t>(std::distance(plan.nodeIds.begin(), toNode));
+        outgoing[fromIndex].push_back(toIndex);
+        ++indegree[toIndex];
+        inputs[toIndex].push_back({ edge.fromNodeId, edge.fromPort, edge.toPort });
+    }
+
+    std::vector<bool> emitted(nodeCount, false);
+    schedule.operations.reserve(nodeCount);
+    for (size_t emittedCount = 0; emittedCount < nodeCount; ++emittedCount)
+    {
+        size_t ready = nodeCount;
+        for (size_t nodeIndex = 0; nodeIndex < nodeCount; ++nodeIndex)
+            if (! emitted[nodeIndex] && indegree[nodeIndex] == 0
+                && (ready == nodeCount || plan.nodeIds[nodeIndex] < plan.nodeIds[ready]))
+                ready = nodeIndex;
+        if (ready == nodeCount)
+        {
+            error = "bounded visual DAG contains a cycle";
+            schedule.operations.clear();
+            return false;
+        }
+        emitted[ready] = true;
+        auto orderedInputs = inputs[ready];
+        std::stable_sort(orderedInputs.begin(), orderedInputs.end(),
+            [](const auto& left, const auto& right)
+            {
+                if (left.toPort != right.toPort) return left.toPort < right.toPort;
+                if (left.fromNodeId != right.fromNodeId) return left.fromNodeId < right.fromNodeId;
+                return left.fromPort < right.fromPort;
+            });
+        schedule.operations.push_back(
+            { ready, operationForNode[ready], plan.nodeIds[ready], std::move(orderedInputs) });
+        for (const auto destination : outgoing[ready]) --indegree[destination];
+    }
+
+    const auto outputKind = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(), "video.out");
+    const size_t outputIndex = static_cast<size_t>(std::distance(plan.nodeKinds.begin(), outputKind));
+    std::vector<bool> reachesOutput(nodeCount, false);
+    reachesOutput[outputIndex] = true;
+    for (auto it = schedule.operations.rbegin(); it != schedule.operations.rend(); ++it)
+        for (const auto destination : outgoing[it->nodeIndex])
+            reachesOutput[it->nodeIndex] = reachesOutput[it->nodeIndex] || reachesOutput[destination];
+    if (std::find(reachesOutput.begin(), reachesOutput.end(), false) != reachesOutput.end())
+    {
+        error = "bounded visual DAG contains a disconnected operation";
+        schedule.operations.clear();
+        return false;
+    }
+    error.clear();
+    return true;
+}
 
 struct VisualTriggerBinding
 {
@@ -227,8 +567,24 @@ inline bool validateCompiledVisualLayerPlans (
         }
         const bool hasTypedBindings = ! plan.nodeIds.empty() || ! plan.edges.empty()
                                    || ! plan.ports.empty();
+        const bool exactThreeSourceDag = isExactThreeSourceVisualDag(plan.nodeKinds);
+        const bool scheduledNativeDag = exactThreeSourceDag
+            || isBoundedNativeCompositorDag(plan.nodeKinds);
+        const bool importedSceneDag = std::count(
+                plan.nodeKinds.begin(), plan.nodeKinds.end(),
+                "visual.3d.imported-animation") == 1
+            && std::count(plan.nodeKinds.begin(), plan.nodeKinds.end(),
+                          "visual.3d.render") == 1;
+        const bool nativeSdfPlan = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(),
+            "visual.sdf.raymarch") != plan.nodeKinds.end();
         if (hasTypedBindings)
         {
+            if (scheduledNativeDag)
+            {
+                CompiledVisualDagSchedule schedule;
+                if (! compileBoundedVisualDagSchedule(plan, schedule, error))
+                    return false;
+            }
             if (plan.nodeIds.size() != plan.nodeKinds.size() || plan.ports.empty())
             {
                 error = "visual layer plan has incomplete typed bindings";
@@ -280,13 +636,26 @@ inline bool validateCompiledVisualLayerPlans (
                         [&operation](const CompiledVisualPortBinding& port)
                         { return port.nodeId == operation.nodeId && port.direction == "out"
                               && port.carrier == "frame"; });
+                    const bool isDecodedVisualResource = ! producesFrame
+                        && (operation.kind == "visual.3d.imported-animation"
+                            || operation.kind == "visual.matte.asset"
+                            || operation.kind == "visual.depth.asset");
+                    const bool isNativeGpuControlResource = ! producesFrame
+                        && operation.kind == "visual.deformation.imported";
                     const bool isVisualControl = (operation.kind.rfind("visual.", 0) == 0
-                        || operation.kind.rfind("tracking.", 0) == 0) && ! producesFrame;
+                        || operation.kind.rfind("tracking.", 0) == 0)
+                        && ! producesFrame && ! isDecodedVisualResource
+                        && ! isNativeGpuControlResource;
                     const bool capabilityMatchesSemantics =
                         (! producesFrame || operation.backendCapability != "control-eval")
-                        && (! isVisualControl || operation.backendCapability == "control-eval");
-                    if (operation.nodeId != plan.nodeIds[operationIndex]
-                        || operation.kind != plan.nodeKinds[operationIndex]
+                        && (! isVisualControl || operation.backendCapability == "control-eval")
+                        && (! isDecodedVisualResource
+                            || operation.backendCapability == "source-decode")
+                        && (! isNativeGpuControlResource
+                            || operation.backendCapability == "native-gpu");
+                    if ((! scheduledNativeDag
+                            && (operation.nodeId != plan.nodeIds[operationIndex]
+                                || operation.kind != plan.nodeKinds[operationIndex]))
                         || (operation.backendCapability != "source-decode"
                             && operation.backendCapability != "native-gpu"
                             && operation.backendCapability != "control-eval")
@@ -310,7 +679,9 @@ inline bool validateCompiledVisualLayerPlans (
                 if (from == plan.ports.end() || to == plan.ports.end()
                     || from->direction != "out" || to->direction != "in"
                     || from->carrier != to->carrier || from->dataType != to->dataType
-                    || from->channels != to->channels)
+                    || from->channels != to->channels
+                    || from->pixelFormat != to->pixelFormat
+                    || from->colorSpace != to->colorSpace)
                 {
                     error = "visual layer plan has an incompatible typed edge binding";
                     return false;
@@ -320,7 +691,15 @@ inline bool validateCompiledVisualLayerPlans (
                 "video.legacy.source", "video.legacy.generator", "video.legacy.retime",
                 "video.legacy.transform", "video.legacy.effects", "video.source",
                 "video.transform", "video.effects", "video.mask.shape", "video.text",
-                "video.layer.source", "video.blend", "video.out", "visual.scalar.constant",
+                "video.layer.source", "video.blend", "video.out", "visual.shader.transition",
+                "visual.shader.custom", "visual.shader.filter", "visual.effect.sharpen", "visual.effect.blur",
+                "visual.effect.vignette", "visual.effect.glow", "visual.effect.bloom",
+                "visual.effect.halation", "visual.effect.lens-distortion",
+                "visual.effect.denoise", "visual.effect.directional-blur",
+                "visual.effect.unsharp-mask", "visual.effect.high-pass-sharpen",
+                "visual.color.brightness", "visual.color.contrast",
+                "visual.color.saturation", "visual.color.hue", "visual.color.exposure",
+                "visual.color.gamma", "visual.color.transform", "visual.scalar.constant",
                 "visual.boolean.constant", "visual.scalar.add", "visual.scalar.multiply",
                 "visual.scalar.clamp", "visual.scalar.remap", "visual.vec2.constant",
                 "visual.vec2.add", "visual.vec2.multiply", "visual.vec2.remap",
@@ -330,18 +709,43 @@ inline bool validateCompiledVisualLayerPlans (
                 "visual.points.grid", "visual.points.set-position", "visual.points.set-scale",
                 "visual.points.set-rotation", "visual.points.set-color",
                 "visual.shape.rectangle", "visual.shape.ellipse", "visual.shape.union",
-                "visual.shape.intersection", "visual.shape.subtract", "visual.uv.transform",
+                "visual.shape.intersection", "visual.shape.subtract", "visual.shape.invert",
+                "visual.matte.path", "visual.uv.transform",
                 "visual.uv.remap", "visual.clone-to-points", "visual.draw.shape", "visual.feedback",
-                "visual.matte.asset", "visual.matte.refine", "visual.matte.apply", "visual.depth.asset",
+                "visual.matte.asset", "visual.matte.combine", "visual.matte.refine",
+                "visual.matte.apply", "visual.depth.asset",
                 "visual.particles", "tracking.point.asset", "tracking.planar.asset",
-                "tracking.correction", "tracking.point.apply.transform", "tracking.planar.apply.quad"
+                "tracking.correction", "tracking.point.apply.transform", "tracking.planar.apply.quad",
+                "visual.3d.imported-animation", "visual.deformation.imported",
+                "visual.score.note-collection", "visual.3d.note-instanced-mesh",
+                "visual.3d.render",
+                "visual.surface.constant.scalar", "visual.surface.constant.uint",
+                "visual.surface.constant.vec2", "visual.surface.constant.vec3",
+                "visual.surface.constant.vec4", "visual.surface.texture-sample-2d",
+                "visual.surface.compose.vec2", "visual.surface.compose.vec3",
+                "visual.surface.compose.vec4", "visual.surface.material",
+                "visual.sdf.sphere", "visual.sdf.box", "visual.sdf.rounded-box",
+                "visual.sdf.plane", "visual.sdf.torus", "visual.sdf.capsule",
+                "visual.sdf.cylinder", "visual.sdf.cone", "visual.sdf.gyroid",
+                "visual.sdf.union", "visual.sdf.intersection", "visual.sdf.subtract",
+                "visual.sdf.smooth-union", "visual.sdf.smooth-intersection",
+                "visual.sdf.smooth-subtract", "visual.sdf.translate", "visual.sdf.rotate",
+                "visual.sdf.scale", "visual.sdf.repeat", "visual.sdf.polar-repeat",
+                "visual.sdf.mirror", "visual.sdf.twist", "visual.sdf.bend",
+                "visual.sdf.taper", "visual.sdf.displacement", "visual.sdf.domain-warp",
+                "visual.sdf.raymarch"
             };
             if (plan.nodeKinds.empty()
-                || (plan.nodeKinds.front() != "video.source"
+                || (! scheduledNativeDag
+                    && ! nativeSdfPlan
+                    && ! importedSceneDag
+                    && plan.nodeKinds.front() != "video.source"
                     && plan.nodeKinds.front() != "video.legacy.source"
                     && plan.nodeKinds.front() != "video.legacy.generator"
+                    && plan.nodeKinds.front() != "visual.shader.custom"
                     && plan.nodeKinds.front() != "visual.particles")
-                || plan.nodeKinds.back() != "video.out"
+                || (! scheduledNativeDag && ! importedSceneDag
+                    && plan.nodeKinds.back() != "video.out")
                 || std::any_of(plan.nodeKinds.begin(), plan.nodeKinds.end(),
                     [&supportedKinds](const std::string& kind)
                     { return std::find(supportedKinds.begin(), supportedKinds.end(), kind)
@@ -350,14 +754,17 @@ inline bool validateCompiledVisualLayerPlans (
                 error = "visual layer plan contains an unsupported typed operation";
                 return false;
             }
-            for (const auto& edge : plan.edges)
+            if (! scheduledNativeDag)
             {
-                const auto from = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), edge.fromNodeId);
-                const auto to = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), edge.toNodeId);
-                if (from == plan.nodeIds.end() || to == plan.nodeIds.end() || from >= to)
+                for (const auto& edge : plan.edges)
                 {
-                    error = "visual layer plan is not an ordered acyclic graph";
-                    return false;
+                    const auto from = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), edge.fromNodeId);
+                    const auto to = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), edge.toNodeId);
+                    if (from == plan.nodeIds.end() || to == plan.nodeIds.end() || from >= to)
+                    {
+                        error = "visual layer plan is not an ordered acyclic graph";
+                        return false;
+                    }
                 }
             }
         }
@@ -529,6 +936,7 @@ inline bool normalizeSnapshot (std::vector<RawRenderSegment> raw,
                        return a.trackLayer < b.trackLayer;
                    return a.clipId < b.clipId;
                });
+    plans = normalizedVisualLayerPlans(plans);
     if (! validateCompiledVisualLayerPlans (candidate.segments, plans, requirePlans, error))
         return false;
     if (eventSchedules.size() > 256)

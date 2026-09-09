@@ -16,8 +16,8 @@
 //     3. transition     — when the layer carries a leading-edge transition,
 //        the A side (previous segment or transparent/black) is rendered the
 //        same way and the verbatim transition shader blends A→B
-//     4. composite      — verbatim blendNormal/Add/Multiply/Screen/Overlay +
-//        opacity mix into the ping-pong accumulator
+//     4. composite      — the canonical BlendMode operation plus opacity mix
+//        into the ping-pong accumulator
 //   image overlays (text — WP5) composite last, ordered by zOrder.
 //
 // Coordinate convention: decoded frames upload in raster order (top row
@@ -44,21 +44,42 @@
 #if ARBIT_HAVE_VIEWPORT
 
 #include "gl_loader.h"
+#include "color_transform_gl.h"
 #include "effect_defs.h"
 #include "node_preview_presentation.h"
+#include "render_pass_output_publication.h"
+#include "../../shared/SceneAovOperationContract.h"
+#include "../../shared/VisualTemporalOperationContract.h"
+#include "../../shared/VisualTemporalSamplingContract.h"
 #include "shader_generator.h"   // ShaderGenerator, ShaderClock, GenParam
 #include "particle_engine.h"    // ParticleEngine, ParticleParams (P4)
 #include "score_renderer.h"
+#include "canonical_block_c_frame.h"
+#include "flat_shader_bridge.h"
+#include "shader_transition_admission.h"
+#include "temporal_resource_contract.h"
 #include "visual_plan_telemetry.h"
+#include "gpu_backend/backend.h"
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
 #include "gpu_backend/frame_renderer_metal.h"
 #endif
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
+
+namespace videowire
+{
+struct CompiledVisualLayerPlan;
+struct TemporalResourcePass;
+struct TemporalSamplingExecution;
+using TemporalFeedbackPass = TemporalResourcePass;
+}
 
 namespace videorender
 {
@@ -79,6 +100,29 @@ struct LayerDesc
     unsigned texture = 0;          // RGBA source texture (top row first)
     int texWidth = 0, texHeight = 0;
 
+    // Backend-owned native texture view. SDF execution uses this instead of
+    // narrowing a Metal sg_view into an OpenGL texture name. The compositor
+    // must consume a matching backend directly or reject the frame; it may not
+    // reinterpret this handle on another API or read it back through the CPU.
+    std::string nativeTextureBackend;
+    std::uintptr_t nativeTextureView = 0;
+    arbitgpu::NativeTextureViewDescriptor nativeTextureDescriptor;
+    // Keeps a borrowed native texture alive until this layer has been consumed.
+    // Geometry Core uses this because its bounded execution cache may evict the
+    // frame while an earlier compositor submission still references its view.
+    std::shared_ptr<const void> nativeTextureOwner;
+
+    // Exact admitted graph color transform. Both native compositors execute it
+    // before the ordinary effect rack from this immutable description.
+    bool graphColorTransformActive = false;
+    colortransform::Description graphColorTransform;
+
+    // Exact graph-native motion-blur pass. The motion texture is the native
+    // RG16F Motion AOV publication owned by this renderer.
+    bool graphMotionBlurActive = false;
+    unsigned graphMotionTexture = 0;
+    visualtemporalsampling::Payload graphMotionBlur;
+
     // Stable clip identity (-1 = none). Used to key the cross-frame feedback
     // history texture so each clip's trail is independent across frames, and
     // (when shaderSource) the per-clip ShaderGenerator program.
@@ -92,16 +136,30 @@ struct LayerDesc
     bool shaderSource = false;
     ShaderClock shaderClock;
 
+    // Immutable graph-ordered shader work shared unchanged by preview and export.
+    // Each renderer owns only its compiled programs and bounded intermediate images.
+    bool flatShaderBridge = false;
+    videowire::ImmutableShaderOperationPlan shaderOperationPlan;
+    std::map<int, std::map<std::string, double>> shaderOperationParameters;
+
+    // Curated single-operation dispatch retained beside ordered shader plans.
+    bool flatShaderFilter = false;
+    bool flatShaderIsf = false;
+    bool flatShaderCustom = false;
+    int flatShaderNodeId = 0;
+    std::string flatShaderSource;
+    std::string flatShaderSourceSha256;
+    videowire::ImmutableCuratedShaderTransition curatedShaderTransition;
+
     // Particle-generator source (P4): when true, this layer's pixels come from
     // the clip's compute-driven ParticleEngine (keyed by clipId) rendered with
     // shaderClock — `texture` and `shaderSource` are ignored. The v1 particle
     // params (count/spawnTrack/size/gravity/force) ride `genParams` like a
-    // shader's ISF INPUTs; the spawn-source track's notes (noteFeatures, gated by
-    // notesPresent) seed/colour/force the pool. Composited identically to a
+    // shader's ISF INPUTs; the spawn-source track's notes (canonicalBlockCFrame) seed/colour/force the pool. Composited identically to a
     // shader layer (effects rack, transform, blend all apply).
     bool particleSource = false;
     bool scoreSource = false;
-    const arbitmod::Score* score = nullptr;
+    std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
     bool particleStateReset = false;
     bool particleTriggerConnected = false;
     int particleTriggerCount = 0;
@@ -109,20 +167,45 @@ struct LayerDesc
     // Stable typed-plan identities for operation-local measured telemetry.
     uint64_t visualPlanStructuralRevision = 0;
     bool visualPlanTelemetryHold = false;
+    // Immutable graph-temporal operation. The helper copies this only from a
+    // pre-admitted pass; native backends own all retained images and reject
+    // stale clip/node/revision state rather than reading pixels through the CPU.
+    bool graphTemporalActive = false;
+    int graphTemporalNodeId = 0;
+    visualtemporaloperation::Payload graphTemporalPayload;
     int particleNodeId = 0;
     int drawShapeNodeId = 0;
 
     // Typed visual.draw.shape overlay. The helper executor fills this only for
-    // an admitted rectangle/ellipse -> Draw Shape -> Blend branch. Both native
+    // an admitted primitive or bounded two-primitive Boolean -> Draw Shape -> Blend branch. Both native
     // compositors produce it directly on-GPU; no CPU composition/readback exists.
     bool drawShape = false;
     // Set only by exact plan inspection admission. The compositor retains the
     // native texture produced by this draw pass before Blend consumes it.
     bool inspectionDrawShapeOutput = false;
     bool drawShapeEllipse = false;
+    bool drawShapeHasSecondary = false;
+    bool drawShapeSecondaryEllipse = false;
+    int drawShapeOperation = 0;
     float drawShapeCx = 0.5f, drawShapeCy = 0.5f;
     float drawShapeW = 1.0f, drawShapeH = 1.0f;
+    float drawShape2Cx = 0.5f, drawShape2Cy = 0.5f;
+    float drawShape2W = 0.0f, drawShape2H = 0.0f;
     float drawShapeR = 1.0f, drawShapeG = 1.0f, drawShapeB = 1.0f, drawShapeA = 1.0f;
+
+    // One bounded typed Shape tree applied directly to this layer's alpha.
+    // The admitted tree contains at most two rectangle/ellipse leaves, one
+    // add/intersect/subtract operation, and one optional root inversion.
+    bool pathMatte = false;
+    bool pathMatteEllipse = false;
+    bool pathMatteHasSecondary = false;
+    bool pathMatteSecondaryEllipse = false;
+    bool pathMatteInvert = false;
+    int pathMatteOperation = 0;
+    float pathMatteCx = 0.5f, pathMatteCy = 0.5f;
+    float pathMatteW = 1.0f, pathMatteH = 1.0f;
+    float pathMatte2Cx = 0.5f, pathMatte2Cy = 0.5f;
+    float pathMatte2W = 0.0f, pathMatte2H = 0.0f;
 
     // Block B audio features (M4): when audioPresent, a shader-generator layer
     // uploads these to uRMS/uPeak/uOnset/uOnsetAge + the uAudioBands sampler
@@ -133,15 +216,8 @@ struct LayerDesc
     bool audioPresent = false;
     AudioFeatures audioFeatures;
 
-    // Block C symbolic score (M5): when notesPresent, a shader-generator layer
-    // uploads the packed note/link textures (uNotes/uLinks + uNoteCount/
-    // uLinkCount/uRootFreq) instead of the black defaults. Same plain-copyable
-    // posture as audioFeatures (carried by the `local = layer` copy); the
-    // viewport (live score) and the exporter (packed timeline) both fill it from
-    // the SAME packer ⇒ parity. Ignored unless shaderSource is true.
-    bool notesPresent = false;
-    NoteFeatures noteFeatures;
-
+    // Every score-aware consumer reads this same immutable frame.
+    // A null or invalid frame is the zero-feed contract.
     // ISF INPUTS (M7): per-frame values for this shader layer's generator params
     // ("clip<id>/gen/<name>"), keyed by param name. Filled by the exporter
     // (static + baked + mod matrix) — empty ⇒ every INPUT at its ISF default.
@@ -183,9 +259,14 @@ struct LayerDesc
     float matteBlack = 0.0f, matteWhite = 1.0f;
     float matteErodeDilate = 0.0f, matteFeather = 0.0f, matteChoke = 0.0f;
 
-    // Exact R16 depth resource and native fog pass. The caller owns the texture
-    // for the duration of renderComposite; FrameRenderer never reopens a path.
+    // Exact R32F depth resource and native fog pass. R16 depth-asset samples are
+    // expanded at upload. A native Render 3D frame publishes its existing view
+    // here without a readback or copy. The retained frame receipt owns that view
+    // for the duration of renderComposite.
     unsigned depthTexture = 0;
+    std::string nativeDepthTextureBackend;
+    std::uintptr_t nativeDepthTextureView = 0;
+    arbitgpu::NativeTextureViewDescriptor nativeDepthTextureDescriptor;
     int depthWidth = 0, depthHeight = 0;
     bool depthFog = false;
     int depthEffect = 0; // 0 none, 1 fog, 2 blur, 3 displacement, 4 relighting
@@ -206,8 +287,15 @@ struct LayerDesc
     const EffectSlotState* effects = nullptr;
     int effectCount = 0;
     // Immutable graph payload lowering storage. The pointer above may target
-    // this slot for the production FeedbackTrail pass.
+    // one of these slots for a bounded production graph pass.
     EffectSlotState graphFeedbackEffect;
+    EffectSlotState graphKeyCleanupEffect;
+    EffectSlotState graphCommonEffect;
+    bool graphKeyCleanupActive = false;
+    float graphKeyCleanupChoke = 0.0f, graphKeyCleanupFeather = 0.0f;
+    float graphKeyCleanupEdgeR = 1.0f, graphKeyCleanupEdgeG = 1.0f;
+    float graphKeyCleanupEdgeB = 1.0f, graphKeyCleanupEdgeAmount = 0.0f;
+    bool graphKeyCleanupMatteView = false;
     bool feedbackHistoryReset = false;
     bool feedbackHistoryHold = false;
 
@@ -251,8 +339,11 @@ struct ImageLayerDesc
 class FrameRenderer
 {
 public:
+    struct FramePublicationCandidate;
+    using FramePublicationCandidatePtr = std::shared_ptr<FramePublicationCandidate>;
+
     FrameRenderer() = default;
-    ~FrameRenderer() = default;
+    ~FrameRenderer();
     FrameRenderer (const FrameRenderer&) = delete;
     FrameRenderer& operator= (const FrameRenderer&) = delete;
 
@@ -260,6 +351,11 @@ public:
     // calling thread for this and every other method.
     bool initialize (const arbitgl::GlFuncs* gl, int outWidth, int outHeight,
                      std::string& error, bool metalOnly = false);
+    bool initializeForVisualPlans (
+        const arbitgl::GlFuncs* gl, int outWidth, int outHeight,
+        const std::vector<videowire::CompiledVisualLayerPlan>& plans,
+        std::string& error, bool metalOnly,
+        int clipId = 0, unsigned sourceTexture = 0, LayerDesc* output = nullptr);
     void shutdown();
     bool ready() const
     {
@@ -274,6 +370,62 @@ public:
     void setOutputSize (int outWidth, int outHeight);
     int outputWidth() const  { return outW_; }
     int outputHeight() const { return outH_; }
+
+    // Installs an exact native attachment set for this renderer. Failed
+    // admission retains the last publication. Resize and shutdown release the
+    // renderer's ownership. Both viewport and export use this owner class.
+    bool replaceRenderPassOutputs (const renderpassoutput::Description& description,
+                                   std::string& error);
+    // Allocates and submits one strict native Color AOV clear pass. Failed
+    // execution retains the last immutable publication. The same renderer owner
+    // is used by viewport and export. The two-argument product seam uses the
+    // operation contract's fixed transparent-black clear.
+    bool replaceColorAovPass (const renderpassoutput::Description& description,
+                              std::string& error);
+    bool replaceColorAovPass (const renderpassoutput::Description& description,
+                               const arbitgpu::RenderPassColorAovClear& clear,
+                               std::string& error);
+    // Writes and publishes the exact RG16F Motion attachment. The product seam
+    // uses the fixed zero-displacement initialization signal; the overload is a
+    // narrow backend/publication test seam, not a scene-motion claim.
+    bool replaceMotionAovPass (const renderpassoutput::Description& description,
+                               std::string& error);
+    bool replaceMotionAovPass (const renderpassoutput::Description& description,
+                                const arbitgpu::RenderPassMotionAovClear& clear,
+                                std::string& error);
+    // Exact scene-backed AOVs fail closed until their native raster/publication
+    // owner is available; constants or CPU images are never substituted.
+    bool replaceSceneAovPass (const sceneaov::Payload& payload,
+                              std::string& error);
+    // Maps the processor-owned Depth or Normal attachment into the exact
+    // displayable Color attachment in one native lifecycle. No readback or CPU
+    // image path is admitted.
+    bool replaceAovInspectionPass (const sceneaov::Payload& scenePayload,
+                                   const aovinspection::Payload& payload,
+                                   std::string& error);
+    // A rendered frame owns private temporal/AOV resources until its consumer
+    // accepts it. A predecessor may be an uncommitted export readback; its
+    // immutable state seeds the next pipelined frame without publishing either.
+    FramePublicationCandidatePtr beginFramePublicationCandidate (
+        std::uint64_t owner, std::uint64_t generation,
+        const FramePublicationCandidatePtr& predecessor, std::string& error);
+    bool commitFramePublicationCandidate (const FramePublicationCandidatePtr& candidate,
+                                          std::string& error);
+    bool validateFramePublicationCandidate (const FramePublicationCandidatePtr& candidate,
+                                            std::string& error) const;
+    void promoteFramePublicationCandidate (const FramePublicationCandidatePtr& candidate) noexcept;
+    void discardFramePublicationCandidate (FramePublicationCandidatePtr& candidate) noexcept;
+    void activateFramePublicationCandidate (const FramePublicationCandidatePtr& candidate) noexcept;
+    std::uint64_t publishedFrameGeneration() const noexcept { return publishedFrameGeneration_; }
+    std::size_t liveFramePublicationCandidates() const noexcept;
+    // Product-side admission for graph-native temporal history consumed by
+    // renderComposite. Preview and export both call this before rendering the
+    // layer. Strict Metal and unavailable OpenGL execution fail closed.
+    bool prepareTemporalFeedbackPass (const videowire::TemporalFeedbackPass& pass,
+                                      std::string& error) const;
+    bool prepareMotionBlurPass (const videowire::TemporalSamplingExecution& execution,
+                                LayerDesc& layer, std::string& error) const;
+    const videowire::RenderPassOutputPublicationPtr& renderPassOutputs() const noexcept;
 
     // Project canvas (PROTOCOL.md §Project canvas & view transform): the
     // export-frame coordinate space. 0/0 (default) = follow the output size
@@ -363,6 +515,33 @@ public:
     // This is deliberately separate from the compositor/presentation path.
     const std::string& particleBackend() const { return particleBackend_; }
     const std::string& compositorBackend() const { return compositorBackend_; }
+    bool queryMetalResourceCapabilities (int& maximumImageDimension,
+                                          uint64_t& maximumBufferLengthBytes,
+                                          uint64_t& recommendedWorkingSetBytes,
+                                          std::string& deviceIdentity) const
+    {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+        return metalRenderer_ != nullptr
+            && metalRenderer_->queryResourceCapabilities(maximumImageDimension,
+                                                          maximumBufferLengthBytes,
+                                                          recommendedWorkingSetBytes,
+                                                          deviceIdentity);
+#else
+        (void) maximumImageDimension;
+        (void) maximumBufferLengthBytes;
+        (void) recommendedWorkingSetBytes;
+        (void) deviceIdentity;
+        return false;
+#endif
+    }
+    void* retainedMetalDevice() const
+    {
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+        return metalRenderer_ != nullptr ? metalRenderer_->retainedDevice() : nullptr;
+#else
+        return nullptr;
+#endif
+    }
     void setVisualTelemetryOwner (videowire::VisualPlanTelemetry* owner)
     {
         visualTelemetry_ = owner;
@@ -458,6 +637,9 @@ public:
     bool setClipShader (int clipId, const std::string& source,
                         std::string& logOut, std::vector<GenParam>& paramsOut);
     void clearClipShader (int clipId);
+    void retainShaderPlanClips (const std::set<int>& clipIds);
+    bool prepareFlatShaderBridge (const LayerDesc& layer, std::string& error);
+    bool hasPreparedShaderPlan (int clipId) const;
     bool hasClipShader (int clipId) const;
 
     // Decode-once image for a shader clip's `image`-type ISF INPUT (M7 image
@@ -475,6 +657,11 @@ private:
     struct ProgramSet;
 
     unsigned createOutputTexture() const;
+    unsigned cloneOutputTexture(unsigned source) const;
+    bool cloneRenderPassOutputs(const videowire::RenderPassOutputPublicationPtr& source,
+                                videowire::RenderPassOutputPublicationPtr& destination,
+                                std::string& error) const;
+    unsigned createColorTransformTexture() const;
     // HDR bloom + tonemap over the final composite (increment 2). Returns the
     // post-processed texture (a free accum target) when enabled, or
     // compositeTexture unchanged when neutral. Always leaves FBO 0 bound.
@@ -503,6 +690,14 @@ private:
     bool metalOnly_ = false;
     unsigned nextMetalHandle_ = 0x80000000u;
     int outW_ = 0, outH_ = 0;
+    videowire::RenderPassOutputPublicationPtr renderPassOutputs_;
+    FramePublicationCandidatePtr activeFrameCandidate_;
+    std::uint64_t publishedFrameOwner_ = 0;
+    std::uint64_t publishedFrameGeneration_ = 0;
+    std::uint64_t nextFrameCandidateSerial_ = 1;
+    std::vector<std::weak_ptr<FramePublicationCandidate>> frameCandidates_;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>
+        latestFrameCandidateSerial_;
     int canvasW_ = 0, canvasH_ = 0;     // 0 = follow output (export path)
     float viewZoom_ = 1.0f, viewPanX_ = 0.0f, viewPanY_ = 0.0f;
     // Present (display) target, distinct from the composite size (audit #16):
@@ -528,6 +723,7 @@ private:
     unsigned layerTexA_ = 0;            // transition A frame
     unsigned layerTexB_ = 0;            // per-layer geometry frame
     unsigned fxTex_[2] = { 0, 0 };      // effects/blur ping-pong + transition out
+    unsigned colorTransformTex_ = 0;     // RGBA8 visual.color.transform output
     int transformInspectionClip_ = -1;
     unsigned transformInspectionTex_ = 0;
     bool transformInspectionReady_ = false;
@@ -542,6 +738,19 @@ private:
     // releaseTargets (PINGPONG.md §3 reset rules).
     struct FeedbackHistory { unsigned tex[2] = { 0, 0 }; int w = 0, h = 0; unsigned current = 0; bool ready = false; };
     std::map<int, FeedbackHistory> feedbackHistory_;
+    struct FrameDelayHistory
+    {
+        std::vector<unsigned> ring;
+        unsigned output = 0;
+        uint64_t structuralRevision = 0;
+        int w = 0, h = 0;
+        uint32_t cursor = 0;
+        uint32_t filled = 0;
+        uint64_t lastUseSerial = 0;
+    };
+    static constexpr std::size_t kMaximumFrameDelayHistories = 64;
+    std::map<std::pair<int, int>, FrameDelayHistory> frameDelayHistory_;
+    uint64_t frameDelayHistorySerial_ = 0;
     unsigned frameParity_ = 0;          // advances once per renderComposite (frame)
 
     // Per-clip procedural shader generators (M3). Keyed by clipId; rendered into
@@ -550,9 +759,24 @@ private:
     // and on shutdown.
     unsigned renderClipShaderToTexture (int clipId, const ShaderClock& clock,
                                         const AudioFeatures* audio,
-                                        const NoteFeatures* notes,
+                                        const canonicalblockc::CanonicalBlockCFrame* notes,
                                         const std::map<std::string, double>* genValues = nullptr);
     std::map<int, std::unique_ptr<ShaderGenerator>> shaderGens_;
+    struct FlatShaderKey
+    {
+        int clipId = 0;
+        uint64_t revision = 0;
+        std::string planDigest;
+        int nodeId = 0;
+        std::string sourceSha256;
+        bool operator< (const FlatShaderKey& other) const
+        { return std::tie(clipId, revision, planDigest, nodeId, sourceSha256)
+               < std::tie(other.clipId, other.revision, other.planDigest,
+                          other.nodeId, other.sourceSha256); }
+    };
+    std::map<FlatShaderKey, std::unique_ptr<ShaderGenerator>> flatShaderBridges_;
+    // Ordered plans can belong to decoded clips, not only gen://shader clips.
+    std::set<int> shaderPlanClips_;
 
     // Per-clip compute particle engines (P4). Keyed by clipId; lazily created on
     // first render (no out-of-band compile step — the fixed compute+draw programs
@@ -563,11 +787,13 @@ private:
                                            int stableNodeId, bool telemetryHold,
                                            const ShaderClock& clock,
                                            const ParticleParams& params,
-                                           const NoteFeatures* notes);
+                                           const canonicalblockc::CanonicalBlockCFrame* notes);
     std::map<int, std::unique_ptr<ParticleEngine>> particleGens_;
     std::map<int, unsigned> scoreTextures_;
     std::string particleBackend_ = "none";
     std::string compositorBackend_ = "opengl";
+    std::string lastError_;
+    ColorTransformGl colorTransformGl_;
 
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
     // Production macOS compositor. Backend selection is whole-session: this
@@ -614,20 +840,27 @@ private:
     struct LayerProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uCornerPin = -1, uCorners = -1,
                        uTexture = -1, uOpacity = -1, uBlendMode = -1,
                        uMaskType = -1, uMaskRect = -1, uMaskFeather = -1, uMaskInvert = -1,
+                       uPathRect = -1, uPathRectB = -1, uPathOperation = -1, uPathInvert = -1,
                        uMatteTexture = -1, uMatteTextureB = -1, uMatteApply = -1, uMatteTexel = -1,
                        uMatteCombineMode = -1,
                        uMatteRefine = -1, uMatteChoke = -1, uMatteInvert = -1,
                        uDepthTexture = -1, uDepthFog = -1, uFogRangeDensity = -1,
                        uFogColor = -1; } layer_;
     struct DrawShapeProg { unsigned prog = 0; int uTransform = -1, uCrop = -1,
-                           uRect = -1, uColor = -1; } drawShape_;
+                           uRect = -1, uRectB = -1, uOperation = -1, uColor = -1; } drawShape_;
     struct BlendProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uFrontTex = -1, uBackTex = -1, uOpacity = -1, uBlendMode = -1; } blend_;
     struct PreviewProg { unsigned prog = 0; int uFinal = -1, uPreview = -1, uLayout = -1,
                          uBackground = -1, uZoom = -1, uPan = -1, uSplit = -1; } preview_;
     struct TransProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uFromTex = -1, uToTex = -1, uProgress = -1, uType = -1; } trans_;
-    struct FxProg    { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uTime = -1, uEffectMask = -1; int uValue[40] = {}; } fx_;
+    struct FxProg    { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uTime = -1, uEffectMask = -1; int uValue[48] = {}; } fx_;
     struct BlurProg  { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uTexelStep = -1, uRadius = -1; } blur_;
     struct SharpProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uTexelSize = -1, uAmount = -1; } sharpen_;
+    struct ProductionFilterProg
+    {
+        unsigned prog = 0;
+        int uTransform = -1, uCrop = -1, uTexture = -1;
+        int uResolution = -1, uMode = -1, uValues = -1;
+    } productionFilter_;
     // Geometric/UV effect passes (Jun 2026): one program per effect, indexed by
     // geom_[] is indexed by position in the kGeomEffects table (renderer.cpp),
     // not by EffectType — the stateless geom effects need not be contiguous.
@@ -650,6 +883,9 @@ private:
     struct BloomCombineProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uTexture = -1, uBloomTex = -1,
                               uIntensity = -1, uExposure = -1, uTonemap = -1; } bloomCombine_;
     // Frame Blend (retime tier 1): two-sampler alpha-mix of bracket frames.
+    struct MotionBlurProg { unsigned prog = 0; int uTransform = -1, uCrop = -1,
+                            uTexture = -1, uMotion = -1, uResolution = -1,
+                            uSampleCount = -1, uShutterScale = -1; } motionBlur_;
     struct FrameBlendProg { unsigned prog = 0; int uTransform = -1, uCrop = -1,
                             uTexA = -1, uTexB = -1, uMix = -1; } frameBlend_;
 };

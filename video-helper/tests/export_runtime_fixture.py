@@ -55,6 +55,13 @@ def particle_plan(clip_id, revision):
         "structuralRevision": revision,
         "identityMode": "authoredGraph",
         "valid": True,
+        "descriptorCount": 2,
+        "operationCount": 2,
+        "sceneRecordCount": 0,
+        "frameOutputCount": 1,
+        "peakLiveFrameCount": 1,
+        "allocatedFrameSlotCount": 1,
+        "compileDurationMicros": 0,
         "nodeKinds": ["visual.particles", "video.out"],
         "nodeIds": [node_id, node_id + 1],
         "ports": [
@@ -246,9 +253,14 @@ def assert_success_telemetry(status, width, height, frames, row):
     backend = telemetry["backend"]
     dimensions = telemetry["dimensions"]
     transport = telemetry["transport"]
+    budget = telemetry["budget"]
     require(backend["available"] and backend["initial"] == "opengl"
             and backend["current"] == "opengl", f"{row}: backend is not OpenGL: {backend}")
     require(backend["fallbackCount"] == 0, f"{row}: backend fallback observed")
+    require(budget["available"] and budget["backendProfile"].startswith("opengl-")
+            and budget["backendDeviceIdentity"]
+            and (budget["canvasWidth"], budget["canvasHeight"]) == (width, height),
+            f"{row}: execution budget did not retain backend admission provenance: {budget}")
     require(dimensions["available"] and
             (dimensions["requestedWidth"], dimensions["requestedHeight"]) == (width, height) and
             (dimensions["actualWidth"], dimensions["actualHeight"]) == (width, height),
@@ -272,9 +284,9 @@ def assert_success_telemetry(status, width, height, frames, row):
     resources = telemetry["resources"]
     assert_zero_resources(telemetry, row)
     frame_bytes = width * height * 4
-    require(resources["retainedFramesPeak"] <= 1 and resources["intermediateImagesPeak"] <= 1
-            and resources["retainedBytesPeak"] <= frame_bytes,
-            f"{row}: resource peak exceeded one bounded frame: {resources}")
+    require(resources["retainedFramesPeak"] <= 1 and resources["intermediateImagesPeak"] <= 2
+            and resources["retainedBytesPeak"] <= frame_bytes * 2,
+            f"{row}: resource peak exceeded the two admitted frame slots: {resources}")
     require(telemetry["graphEvaluations"] >= frames * 2,
             f"{row}: two real visual-plan layers were not evaluated per frame: "
             f"graphEvaluations={telemetry['graphEvaluations']}, frames={frames}, "
@@ -332,8 +344,11 @@ def run_success(helper_path, temp, width, height, frames, label):
             raise Failure(f"{label}: export failed: {message}")
         result = response["result"]
         require(result["glCompositing"] is True, f"{label}: helper did not report GL compositing")
-        telemetry = assert_success_telemetry(status, width, height, frames, label)
-        timestamps = ffprobe_verify(output, width, height, frames)
+        render_width = width & ~1
+        render_height = height & ~1
+        telemetry = assert_success_telemetry(
+            status, render_width, render_height, frames, label)
+        timestamps = ffprobe_verify(output, render_width, render_height, frames)
         require(telemetry["particles"]["available"],
                 f"{label}: real particle owner timing was not observed")
         # The production executor measures the particle operators. video.out is
@@ -354,7 +369,7 @@ def run_success(helper_path, temp, width, height, frames, label):
             "requestedFrames": frames,
             "export": {
                 "requestedWidth": width, "requestedHeight": height,
-                "decodedWidth": width, "decodedHeight": height,
+                "decodedWidth": render_width, "decodedHeight": render_height,
                 "decodedFrames": len(timestamps), "decodedFirstPts": timestamps[0],
                 "decodedLastPts": timestamps[-1], "elapsedSeconds": round(elapsed, 6),
                 "throughputFps": round(frames / elapsed, 6),
@@ -403,6 +418,10 @@ def run_cancel(helper_path, temp):
         status, samples, response = poll_export(helper, export_id, cancel_after_frame=1)
         require("error" in response and response["error"].get("message") == "cancelled",
                 f"cancel: expected cancelled error, got {response}")
+        # The deferred export reply is emitted only after the worker publishes
+        # cancelled/done with release ordering. One post-reply status read is a
+        # deterministic completion barrier; elapsed wall time is not acceptance.
+        status = helper.call("export_progress", {"exportId": export_id})
         require(status["cancelled"] is True, f"cancel: status not marked cancelled: {status}")
         require(not output.exists(), "cancel: partial output was not removed")
         telemetry = status["visualTelemetry"]
@@ -477,7 +496,8 @@ def main():
         temp = pathlib.Path(temp_owner.name)
     try:
         rows = [run_success(args.helper, temp, 1920, 1080, 3, "1080p"),
-                run_success(args.helper, temp, 3840, 2160, 2, "4k")]
+                run_success(args.helper, temp, 3840, 2160, 2, "4k"),
+                run_success(args.helper, temp, 641, 361, 2, "odd-size-normalized")]
         run_cancel(args.helper, temp)
         run_encoder_failure(args.helper, temp)
         final = {"schemaVersion": 1, "fixture": "gate-8-native-linux-export-performance",

@@ -128,6 +128,21 @@ bool parseSnapshotJson (const Json& object, ShaderResolver&& resolveShader,
             plan.identityMode = value.value ("identityMode", std::string { "authoredGraph" });
             plan.producerValidated = value.value ("valid", false);
             plan.error = value.value ("error", std::string {});
+            plan.descriptorCount = value.value("descriptorCount", size_t { 0 });
+            plan.operationCount = value.value("operationCount", size_t { 0 });
+            plan.sceneRecordCount = value.value("sceneRecordCount", size_t { 0 });
+            plan.frameOutputCount = value.value("frameOutputCount", size_t { 0 });
+            plan.peakLiveFrameCount = value.value("peakLiveFrameCount", size_t { 0 });
+            plan.allocatedFrameSlotCount = value.value("allocatedFrameSlotCount", size_t { 0 });
+            plan.compileDurationMicros = value.value("compileDurationMicros", uint64_t { 0 });
+            if (! value.contains("descriptorCount") || ! value.contains("operationCount")
+                || ! value.contains("sceneRecordCount") || ! value.contains("frameOutputCount")
+                || ! value.contains("peakLiveFrameCount") || ! value.contains("allocatedFrameSlotCount")
+                || ! value.contains("compileDurationMicros"))
+            {
+                plan.producerValidated = false;
+                plan.error = "compiled visual plan is missing producer resource accounting";
+            }
             if (value.contains ("nodeKinds") && value["nodeKinds"].is_array())
                 for (const auto& kind : value["nodeKinds"])
                     if (kind.is_string()) plan.nodeKinds.push_back(kind.template get<std::string>());
@@ -165,7 +180,9 @@ bool parseSnapshotJson (const Json& object, ShaderResolver&& resolveShader,
                         }
                     }
                     plan.operations.push_back({ operation.value("nodeId", 0), kind,
-                        operation.value("backendCapability", std::string {}), payload });
+                        operation.value("backendCapability", std::string {}), payload,
+                        operation.contains("runtimeGrant") && operation["runtimeGrant"].is_object()
+                            ? operation["runtimeGrant"].dump() : std::string {} });
                 }
             plans.push_back (std::move (plan));
         }

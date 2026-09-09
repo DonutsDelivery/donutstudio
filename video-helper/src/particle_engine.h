@@ -37,12 +37,12 @@
 #include <string>
 
 namespace arbitgl { struct GlFuncs; }
+namespace canonicalblockc { class CanonicalBlockCFrame; }
 
 namespace videorender
 {
 
 struct ShaderClock;    // shader_generator.h (Block A clock; shared formula)
-struct NoteFeatures;   // shader_generator.h (Block C packed score)
 #if defined (__APPLE__) && ARBIT_HAVE_METAL_BACKEND
 class MetalParticleEngine;
 #endif
@@ -103,7 +103,7 @@ public:
     // FBO/viewport; the caller must restore its own afterwards. GL must be current.
     unsigned render (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                      int width, int height, const ParticleParams& params,
-                     const NoteFeatures* notes);
+                     const canonicalblockc::CanonicalBlockCFrame* notes);
 
     // Free every GL object. Call while the context is current (the dtor does NOT
     // touch GL). Safe to call repeatedly.
@@ -117,7 +117,7 @@ private:
     bool ensurePrograms (const arbitgl::GlFuncs* gl);
     void ensurePool (const arbitgl::GlFuncs* gl, int count);
     void ensureTarget (const arbitgl::GlFuncs* gl, int width, int height);
-    void uploadNotes (const arbitgl::GlFuncs* gl, const NoteFeatures* notes);
+    void uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblockc::CanonicalBlockCFrame* notes);
     unsigned compileCompute (const arbitgl::GlFuncs* gl, const char* src, std::string& err) const;
     unsigned compileDraw (const arbitgl::GlFuncs* gl, const char* vs, const char* fs, std::string& err) const;
 
@@ -132,7 +132,7 @@ private:
     bool     ensureFallback (const arbitgl::GlFuncs* gl, int count);
     unsigned renderFallback (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                              int width, int height, const ParticleParams& params,
-                             const NoteFeatures* notes, int count);
+                             const canonicalblockc::CanonicalBlockCFrame* notes, int count);
 
     unsigned simProg_    = 0;          // fragment particle-update program (MRT)
     unsigned drawFbProg_ = 0;          // texelFetch point-sprite program

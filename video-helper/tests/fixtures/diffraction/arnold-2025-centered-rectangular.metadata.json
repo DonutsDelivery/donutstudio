@@ -1,0 +1,18 @@
+{
+  "fixture": "arnold-2025-centered-rectangular.csv",
+  "sha256": "bf7b619b97c65abb3002c284a48bf70cb3dc17fed9258af3348c395db8251c1d",
+  "provenance": {
+    "citation": "Arnold et al., Applied Optics 64(7), 1812-1821 (2025)",
+    "doi": "10.1364/AO.548315",
+    "source": "Equation (1) and Table 2 centred rectangular grating fit"
+  },
+  "calibration": {
+    "normalization": "first-order efficiency divided by measured reflectivity",
+    "fit": { "A": 0.232, "B": -0.187, "C_per_degree_squared": 0.000058, "phi_radians": 1.41 }
+  },
+  "uncertainty": {
+    "model": "published fit residual envelope",
+    "maximum_rms_absolute_efficiency": 0.045,
+    "maximum_point_absolute_efficiency": 0.075
+  }
+}

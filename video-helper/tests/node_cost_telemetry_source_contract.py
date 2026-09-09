@@ -12,7 +12,7 @@ assert "recordNodeEvaluation" in telemetry
 assert "aggregate layer time is never split" in telemetry
 assert "slot->nodeEvaluations[i]" not in telemetry
 assert "particleNodeId = ids[0]" in executor
-assert "drawShapeNodeId = ids[(size_t) drawShapeIndex]" in executor
+assert "drawShapeNodeId = ids[(size_t) terminal]" in executor
 assert "recordNodeEvaluation(use->clipId" in renderer
 assert "recordNodeEvaluation(layer.clipId" in metal
 assert 'TRANS("Node %ID%: Not observed")' in hud

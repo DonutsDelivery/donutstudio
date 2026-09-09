@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include <cstdint>
 
 class MacMetalViewportSurface
 {
@@ -16,7 +17,7 @@ public:
 
     static bool available();
 
-    bool initialize (void* glfwWindow, int width, int height,
+    bool initialize (void* glfwWindow, void* retainedMetalDevice, int width, int height,
                      bool onscreen, std::string& error);
     bool resize (int width, int height, std::string& error);
     bool present (std::string& error);

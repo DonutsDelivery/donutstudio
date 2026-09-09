@@ -1,5 +1,7 @@
 #pragma once
 
+#include "visual_plan_resource_budget.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -12,9 +14,9 @@
 
 namespace videowire
 {
-inline constexpr size_t kMaxTelemetryPlans = 64;
-inline constexpr size_t kMaxCompiledNodesPerGraph = 8;
-inline constexpr size_t kMaxIntermediateImagesPerGraph = 7;
+inline constexpr size_t kMaxTelemetryPlans = 256;
+inline constexpr size_t kMaxCompiledNodesPerGraph = 256;
+inline constexpr size_t kMaxIntermediateImagesPerGraph = 32;
 inline constexpr size_t kMaxTelemetryNodes = kMaxTelemetryPlans * kMaxCompiledNodesPerGraph;
 inline constexpr uint64_t kPlanLoweringBudgetNs = 2'000'000;
 
@@ -31,8 +33,8 @@ struct VisualTelemetryPlanAdmission
     int clipId = -1;
     uint64_t structuralRevision = 0;
     std::array<int, kMaxCompiledNodesPerGraph> stableNodeIds {};
-    uint8_t nodeCount = 0;
-    uint8_t intermediateImageCount = 0;
+    size_t nodeCount = 0;
+    size_t intermediateImageCount = 0;
     size_t executableNodeTotal = 0;
     bool nodesTruncated = false;
 };
@@ -95,6 +97,8 @@ struct VisualTelemetrySnapshot
     bool dimensionsObserved = false;
     int requestedWidth = 0, requestedHeight = 0, actualWidth = 0, actualHeight = 0;
     uint64_t dimensionMismatchCount = 0, halfResolutionMismatchCount = 0, recordingContentionDrops = 0;
+    bool budgetObserved = false;
+    VisualPlanBudgetReceipt budgetReceipt;
     std::vector<VisualTelemetryLayer> layers;
     std::vector<VisualTelemetryNode> nodes;
 };
@@ -230,6 +234,12 @@ public:
         retainedFramesPeak_ = std::max(retainedFramesPeak_, frames); intermediateImagesPeak_ = std::max(intermediateImagesPeak_, images);
         retainedBytesPeak_ = std::max(retainedBytesPeak_, bytes); return true;
     }
+    void recordBudgetReceipt (const VisualPlanBudgetReceipt& receipt)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        budgetObserved_ = true;
+        budgetReceipt_ = receipt;
+    }
     bool recordDimensions (int rw, int rh, int aw, int ah)
     {
         constexpr int maximumDimension = 32768;
@@ -256,7 +266,7 @@ public:
         if (diagnostic != nullptr)
             diagnostic->clear();
         std::lock_guard<std::mutex> lock (mutex_);
-        std::array<Slot, kMaxTelemetryPlans> next {};
+        std::vector<Slot> next(kMaxTelemetryPlans);
         size_t count = 0;
         uint64_t rejected = 0;
         for (const auto& candidate : requested)
@@ -278,13 +288,19 @@ public:
         }
         std::sort(next.begin(), next.begin() + (ptrdiff_t) count,
             [](const Slot& a, const Slot& b) { return a.clipId < b.clipId; });
-        slots_ = next;
-        slotCount_ = count;
         rejectedPlans_ = saturatingAdd(rejectedPlans_, rejected);
+        if (rejected != 0)
+        {
+            if (diagnostic != nullptr)
+                *diagnostic = "visual telemetry admission exceeds fixed plan capacity";
+            return false;
+        }
         requestReset();
-        if (rejected != 0 && diagnostic != nullptr)
-            *diagnostic = "visual telemetry admission exceeds fixed plan capacity";
-        return rejected == 0;
+        appliedGeneration_ = resetGeneration_.load(std::memory_order_acquire);
+        resetUnlocked();
+        std::copy_n(next.begin(), count, slots_.begin());
+        slotCount_ = count;
+        return true;
     }
 
     void resetOwner (int, uint64_t) { requestReset(); }
@@ -300,6 +316,8 @@ public:
         backendObserved_ = false;
         initialBackend_ = currentBackend_ = VisualBackend::openGL;
         fallbackCount_ = 0;
+        budgetObserved_ = false;
+        budgetReceipt_ = {};
         appliedGeneration_ = resetGeneration_.load(std::memory_order_acquire);
     }
 
@@ -413,6 +431,7 @@ public:
         out.retainedFramesCurrent = retainedFramesCurrent_; out.retainedFramesPeak = retainedFramesPeak_; out.intermediateImagesCurrent = intermediateImagesCurrent_; out.intermediateImagesPeak = intermediateImagesPeak_;
         out.retainedBytesCurrent = retainedBytesCurrent_; out.retainedBytesPeak = retainedBytesPeak_; out.dimensionsObserved = dimensionsObserved_; out.requestedWidth = requestedWidth_; out.requestedHeight = requestedHeight_; out.actualWidth = actualWidth_; out.actualHeight = actualHeight_;
         out.dimensionMismatchCount = dimensionMismatchCount_; out.halfResolutionMismatchCount = halfResolutionMismatchCount_; out.recordingContentionDrops = recordingContentionDrops_.load();
+        out.budgetObserved = budgetObserved_; out.budgetReceipt = budgetReceipt_;
         return out;
     }
 
@@ -577,7 +596,7 @@ private:
     }
 
     mutable std::mutex mutex_;
-    std::array<Slot, kMaxTelemetryPlans> slots_ {};
+    std::vector<Slot> slots_ = std::vector<Slot>(kMaxTelemetryPlans);
     size_t slotCount_ = 0;
     uint64_t graphEvaluations_ = 0, graphMeasuredTotalNs_ = 0;
     double graphMeasuredMovingNs_ = 0.0;
@@ -598,6 +617,8 @@ private:
     bool backendObserved_ = false; VisualBackend initialBackend_ = VisualBackend::openGL, currentBackend_ = VisualBackend::openGL; uint64_t fallbackCount_=0;
     bool resourcesObserved_ = false; uint64_t retainedFramesCurrent_=0, retainedFramesPeak_=0, intermediateImagesCurrent_=0, intermediateImagesPeak_=0, retainedBytesCurrent_=0, retainedBytesPeak_=0;
     bool dimensionsObserved_ = false; int requestedWidth_=0, requestedHeight_=0, actualWidth_=0, actualHeight_=0; uint64_t dimensionMismatchCount_=0, halfResolutionMismatchCount_=0;
+    bool budgetObserved_ = false;
+    VisualPlanBudgetReceipt budgetReceipt_;
     std::atomic<uint64_t> recordingContentionDrops_ { 0 };
 };
 } // namespace videowire

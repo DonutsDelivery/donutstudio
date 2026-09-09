@@ -26,12 +26,16 @@
 #include <vector>
 
 #include "mod_defs.h"       // arbitmod::Score — Block C (M5); dependency-free
+#include "canonical_block_c_frame.h"
 #include "beat_timeline.h"  // authoritative tempo/meter mapping; dependency-free
 #include "video_control_plan.h"
 #include "render_snapshot.h"
 #include "visual_plan_telemetry.h"
 
 using ExportSegment = videowire::RenderSegment;
+
+
+namespace videohelper::modelpayload { class Store; }
 
 // One effects-rack slot (mirrors graph_set_effects).
 struct ExportEffectSlot
@@ -137,6 +141,16 @@ struct ExportJob
     std::string outPath;
     uint64_t authoringRevision = 0;
     uint64_t exportableRevision = 0;
+    uint64_t projectGeneration = 0;
+    uint64_t sourceGeneration = 0;
+    uint64_t helperGeneration = 0;
+    uint64_t backendGeneration = 0;
+    uint64_t deviceGeneration = 0;
+    uint64_t scoreGeneration = 0;
+    uint64_t beatMapGeneration = 0;
+    uint64_t fpsGeneration = 0;
+    uint64_t loopGeneration = 0;
+    uint64_t seekGeneration = 0;
     int width = 1920;
     int height = 1080;
     double fps = 30.0;
@@ -297,7 +311,8 @@ struct ExportProgress
 std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
                        bool& glCompositingOut,
                        std::string& interpolationBackendOut,
-                       ExportProgress* progress = nullptr);
+                       ExportProgress* progress = nullptr,
+                       videohelper::modelpayload::Store* modelPayloadStore = nullptr);
 
 struct CompositeFrameResult
 {
@@ -311,7 +326,8 @@ struct CompositeFrameResult
 // Render one exact display-timeline frame through the production offscreen
 // compositor used by export. No output path is accepted or created.
 std::string renderCompositeFrame (const ExportJob& job, double timelineSec,
-                                  CompositeFrameResult& result);
+                                  CompositeFrameResult& result,
+                                  videohelper::modelpayload::Store* modelPayloadStore = nullptr);
 
 // RecorderSession — push-frame video-only encode session, for the live
 // piano-roll recorder (record_open / record_push_frame / record_close RPCs).

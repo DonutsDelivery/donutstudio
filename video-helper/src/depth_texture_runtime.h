@@ -50,11 +50,14 @@ inline bool prepareDepthTexture(const std::string& canonicalRoot,
         if (!frame) { state.clear(renderer); return false; }
         const unsigned uploaded = renderer.uploadR16(frame->pixels().data(), frame->width(), frame->height(),
                                                      state.texture);
-        if (uploaded == 0) { state.clear(renderer); error="native R16 depth upload is unavailable"; return false; }
+        if (uploaded == 0) { state.clear(renderer); error="native R16-to-R32F depth upload is unavailable"; return false; }
         state.texture=uploaded; state.width=frame->width(); state.height=frame->height();
         state.frameIndex=frame->index(); state.receipt=binding.receipt;
     }
-    layer.depthTexture=state.texture; layer.depthWidth=state.width; layer.depthHeight=state.height;
+    layer.depthTexture=state.texture;
+    layer.nativeDepthTextureBackend.clear();
+    layer.nativeDepthTextureView=0;
+    layer.depthWidth=state.width; layer.depthHeight=state.height;
     return true;
 #else
     (void)exactSourcePts; (void)payload; (void)layer;

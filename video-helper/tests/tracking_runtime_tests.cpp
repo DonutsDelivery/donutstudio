@@ -49,7 +49,8 @@ std::string publish(const fs::path& trackingRoot, nlohmann::json asset)
 
 videowire::CompiledVisualLayerPlan plan(int clipId, bool point, const std::string& receipt)
 {
-    videowire::CompiledVisualLayerPlan p; p.clipId = clipId; p.producerValidated = true;
+    videowire::CompiledVisualLayerPlan p; p.clipId = clipId; p.structuralRevision = 2;
+    p.producerValidated = true;
     const std::string sourceKind = point ? "tracking.point.asset" : "tracking.planar.asset";
     const std::string applyKind = point ? "tracking.point.apply.transform" : "tracking.planar.apply.quad";
     p.operations = {
@@ -93,6 +94,19 @@ int main()
     check(videohelper::trackingruntime::prepareTracking(depthRoot, plans, 7, 1.0, secondPoint, error)
           && secondPoint.translateX == point.translateX && secondPoint.translateY == point.translateY,
           "two-layer evaluation remains clip-local and deterministic");
+
+    auto staleDuplicate = plans[0];
+    staleDuplicate.structuralRevision = 1;
+    staleDuplicate.operations[0].payloadXml.replace(
+        staleDuplicate.operations[0].payloadXml.find(pointReceipt), pointReceipt.size(),
+        std::string(64, 'a'));
+    videorender::LayerDesc duplicatePoint;
+    error.clear();
+    check(videohelper::trackingruntime::prepareTracking(
+              depthRoot, { staleDuplicate, plans[0] }, 7, 1.0, duplicatePoint, error)
+          && duplicatePoint.translateX == point.translateX
+          && duplicatePoint.translateY == point.translateY,
+          "tracking execution ignores a stale duplicate in favor of the newest clip revision");
 
     auto stalePlans = plans;
     stalePlans[0].operations[0].payloadXml.replace(stalePlans[0].operations[0].payloadXml.find(pointReceipt), pointReceipt.size(), std::string(64, 'a'));

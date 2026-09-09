@@ -11,7 +11,7 @@
 
 namespace arbitgl { struct GlFuncs; }
 namespace videopreview { struct State; }
-namespace videowire { class VisualPlanTelemetry; }
+namespace videowire { class VisualPlanTelemetry; struct CompiledVisualLayerPlan; }
 
 namespace videorender
 {
@@ -23,6 +23,21 @@ struct GenParam;
 class MetalFrameRenderer
 {
 public:
+    struct AllocationCounters
+    {
+        uint64_t rendererConstructions = 0;
+        uint64_t pipelineAllocations = 0;
+        uint64_t ioSurfaceAllocations = 0;
+        uint64_t textureAllocations = 0;
+        uint64_t targetAllocations = 0;
+        bool empty() const noexcept
+        {
+            return rendererConstructions == 0 && pipelineAllocations == 0
+                && ioSurfaceAllocations == 0 && textureAllocations == 0
+                && targetAllocations == 0;
+        }
+    };
+
     MetalFrameRenderer();
     ~MetalFrameRenderer();
     MetalFrameRenderer (const MetalFrameRenderer&) = delete;
@@ -30,6 +45,9 @@ public:
 
     bool initialize (const arbitgl::GlFuncs* gl, int width, int height,
                      std::string& errorOut, bool directOnly = false);
+
+    static void resetAllocationCountersForTesting() noexcept;
+    static AllocationCounters allocationCountersForTesting() noexcept;
     void shutdown (const arbitgl::GlFuncs* gl);
     void setOutputSize (const arbitgl::GlFuncs* gl, int width, int height);
     void setCanvas (int width, int height);
@@ -53,6 +71,7 @@ public:
     void deleteTexture (unsigned textureHandle);
     bool setClipShader (int clipId, const std::string& source,
                         std::string& logOut, std::vector<GenParam>& paramsOut);
+    bool prepareShaderOperationPlan (const LayerDesc& layer, std::string& errorOut);
     void clearClipShader (int clipId);
     bool hasClipShader (int clipId) const;
     void setClipImage (int clipId, const std::string& name,
@@ -71,6 +90,11 @@ public:
     void clearDirectOutputs();
 
     bool ready() const;
+    bool queryResourceCapabilities (int& maximumImageDimension,
+                                     uint64_t& maximumBufferLengthBytes,
+                                     uint64_t& recommendedWorkingSetBytes,
+                                     std::string& deviceIdentity) const;
+    void* retainedDevice() const;
     const std::string& lastError() const;
     const std::string& particleBackend() const;
     void setVisualTelemetryOwner (videowire::VisualPlanTelemetry* owner);

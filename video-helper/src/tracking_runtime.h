@@ -86,8 +86,8 @@ inline bool prepareTracking (const std::string& depthRoot,
                              int clipId, double exactSourcePts,
                              videorender::LayerDesc& layer, std::string& error)
 {
-    const auto plan=std::find_if(plans.begin(),plans.end(),[&](const auto&p){return p.clipId==clipId;});
-    if(plan==plans.end()) return true;
+    const auto* plan=videowire::findVisualLayerPlan(plans,clipId);
+    if(plan==nullptr) return true;
     const auto apply=std::find_if(plan->operations.begin(),plan->operations.end(),[](const auto&o){return o.kind=="tracking.point.apply.transform"||o.kind=="tracking.planar.apply.quad";});
     if(apply==plan->operations.end()) return true;
     const bool point=apply->kind=="tracking.point.apply.transform"; const int channels=point?2:8;

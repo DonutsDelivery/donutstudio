@@ -21,6 +21,19 @@ constexpr double kNear = 0.0;
 constexpr double kFar = 1.0;
 constexpr double kDensity = 2.0;
 
+int colorTransformOracle(uint8_t encoded)
+{
+    const double value = static_cast<double>(encoded) / 255.0;
+    const double linear = value <= 0.04045 ? value / 12.92
+        : std::pow((value + 0.055) / 1.055, 2.4);
+    const double inputNits = linear * 100.0;
+    const double shoulder = 1.0 / 100.0 - 1.0 / 1000.0;
+    const double mapped = inputNits / (1.0 + shoulder * inputNits) / 100.0;
+    const double output = mapped <= 0.0031308 ? mapped * 12.92
+        : 1.055 * std::pow(mapped, 1.0 / 2.4) - 0.055;
+    return static_cast<int>(std::lround(std::clamp(output, 0.0, 1.0) * 255.0));
+}
+
 std::array<int, 4> oracle(uint16_t rawDepth)
 {
     // Independent specification oracle: normalized UNORM16 depth, Beer-Lambert
@@ -60,7 +73,7 @@ int main()
 {
 #if !defined(__linux__)
     std::cerr << "This acceptance target requires native Linux OpenGL\n";
-    return 77;
+    return 1;
 #else
     glfwSetErrorCallback([](int code, const char* text) {
         std::cerr << "GLFW " << code << ": " << (text != nullptr ? text : "unknown") << '\n';
@@ -68,7 +81,7 @@ int main()
     if (glfwInit() != GLFW_TRUE)
     {
         std::cerr << "BLOCKED: glfwInit failed; no native EGL/GLX display/context available\n";
-        return 77;
+        return 1;
     }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -79,7 +92,7 @@ int main()
     {
         std::cerr << "BLOCKED: GLFW could not create a native Linux GL 4.3 offscreen context\n";
         glfwTerminate();
-        return 77;
+        return 1;
     }
     glfwMakeContextCurrent(window);
 
@@ -90,7 +103,7 @@ int main()
         std::cerr << "BLOCKED: production GL loader missing: " << error << '\n';
         glfwDestroyWindow(window);
         glfwTerminate();
-        return 77;
+        return 1;
     }
 
     // Force production FrameRenderer shader admission to fail, and prove its
@@ -154,6 +167,93 @@ int main()
         && !std::equal(pixels.begin(), pixels.begin() + 4, pixels.begin() + 4)
         && !std::equal(pixels.begin() + 4, pixels.begin() + 8, pixels.begin() + 8);
 
+    std::array<uint8_t, kWidth * kHeight * 4> gray {};
+    for (int x = 0; x < kWidth; ++x)
+    {
+        gray[static_cast<size_t>(x) * 4 + 0] = 188;
+        gray[static_cast<size_t>(x) * 4 + 1] = 188;
+        gray[static_cast<size_t>(x) * 4 + 2] = 188;
+        gray[static_cast<size_t>(x) * 4 + 3] = 255;
+    }
+    renderer.uploadRgba(gray.data(), kWidth, kHeight, kWidth * 4, sourceTexture);
+    layer.depthFog = false;
+    layer.depthTexture = 0;
+    layer.graphColorTransformActive = true;
+    layer.graphColorTransform.version = colortransform::kWireVersion;
+    layer.graphColorTransform.input = {
+        { static_cast<uint32_t>(kWidth), static_cast<uint32_t>(kHeight) },
+        colortransform::PixelFormat::RGBA8, colortransform::ColorSpace::SRGB,
+        colortransform::TransferFunction::SRGB, colortransform::AlphaMode::Straight };
+    layer.graphColorTransform.output = layer.graphColorTransform.input;
+    layer.graphColorTransform.workingColorSpace = colortransform::ColorSpace::LinearSRGB;
+    layer.graphColorTransform.workingFormat = colortransform::PixelFormat::RGBA16F;
+    layer.graphColorTransform.outputIntent = colortransform::OutputIntent::SdrDisplay;
+    layer.graphColorTransform.toneMap = colortransform::ToneMap::None;
+    layer.graphColorTransform.luminance = { 100.0, 100.0, 100.0, 100.0 };
+    std::vector<uint8_t> identityPixels;
+    const bool identityRendered = renderer.renderToPixels(
+        &layer, 1, identityPixels, error);
+    layer.graphColorTransform.toneMap = colortransform::ToneMap::Reinhard;
+    layer.graphColorTransform.luminance.sourcePeakNits = 1000.0;
+    std::vector<uint8_t> mappedPixels;
+    const bool mappedRendered = renderer.renderToPixels(
+        &layer, 1, mappedPixels, error);
+    const int mappedOracle = colorTransformOracle(188);
+    const bool colorTransformPixels = identityRendered && mappedRendered
+        && identityPixels.size() >= 4 && mappedPixels.size() >= 4
+        && std::abs(static_cast<int>(identityPixels[0]) - 188) <= kTolerance
+        && std::abs(static_cast<int>(identityPixels[1]) - 188) <= kTolerance
+        && std::abs(static_cast<int>(identityPixels[2]) - 188) <= kTolerance
+        && std::abs(static_cast<int>(mappedPixels[0]) - mappedOracle) <= kTolerance
+        && std::abs(static_cast<int>(mappedPixels[1]) - mappedOracle) <= kTolerance
+        && std::abs(static_cast<int>(mappedPixels[2]) - mappedOracle) <= kTolerance
+        && mappedPixels[3] == 255 && mappedPixels[0] < identityPixels[0];
+    std::cout << "color-transform actual="
+              << (mappedPixels.empty() ? -1 : static_cast<int>(mappedPixels[0]))
+              << " oracle=" << mappedOracle << '\n';
+
+    videorender::ColorTransformGl stateProbe;
+    std::string stateError;
+    GLuint stateTarget = 0;
+    GLuint priorReadFramebuffer = 0;
+    GLuint priorDrawFramebuffer = 0;
+    glGenTextures(1, &stateTarget);
+    glBindTexture(GL_TEXTURE_2D, stateTarget);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kWidth, kHeight, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    gl.GenFramebuffers(1, &priorReadFramebuffer);
+    gl.GenFramebuffers(1, &priorDrawFramebuffer);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, priorReadFramebuffer);
+    gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, priorDrawFramebuffer);
+    colortransform::AdmissionFailure stateFailure = colortransform::AdmissionFailure::None;
+    const auto stateTransform = colortransform::admit(
+        layer.graphColorTransform, colortransform::BackendCapability::NativeGpu, stateFailure);
+    const bool stateRendered = stateProbe.initialize(&gl, stateError) && stateTransform
+        && stateProbe.render(sourceTexture, stateTarget, kWidth, kHeight,
+                             *stateTransform, stateError);
+    GLint restoredReadFramebuffer = 0;
+    GLint restoredDrawFramebuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &restoredReadFramebuffer);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &restoredDrawFramebuffer);
+    const bool framebufferStatePreserved = stateRendered
+        && restoredReadFramebuffer == static_cast<GLint>(priorReadFramebuffer)
+        && restoredDrawFramebuffer == static_cast<GLint>(priorDrawFramebuffer);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+    stateProbe.shutdown();
+    gl.DeleteFramebuffers(1, &priorReadFramebuffer);
+    gl.DeleteFramebuffers(1, &priorDrawFramebuffer);
+    glDeleteTextures(1, &stateTarget);
+
+    layer.graphColorTransform.toneMap = colortransform::ToneMap::None;
+    std::vector<uint8_t> rejectedPixels { 1, 2, 3, 4 };
+    std::string rejectedRenderError;
+    const bool zeroTextureReadbackRejected = !renderer.renderToPixels(
+        &layer, 1, rejectedPixels, rejectedRenderError)
+        && rejectedPixels.empty()
+        && rejectedRenderError == "color transform admission failed: toneMapRequired";
+
     renderer.deleteTexture(sourceTexture);
     renderer.deleteTexture(depthTexture);
     const bool externalTexturesDeleted = glIsTexture(sourceTexture) == GL_FALSE
@@ -163,19 +263,24 @@ int main()
 
     glfwDestroyWindow(window);
     glfwTerminate();
-    if (!rejectedAdmission || !pixelsPass || !depthChangesOutput
+    if (!rejectedAdmission || !pixelsPass || !depthChangesOutput || !colorTransformPixels
+        || !framebufferStatePreserved
+        || !zeroTextureReadbackRejected
         || !externalTexturesDeleted || !ownerClean)
     {
         std::cerr << "Depth Fog native pixel acceptance FAIL: rendered=" << rendered
                   << " rejectedAdmission=" << rejectedAdmission
                   << " depthChangesOutput=" << depthChangesOutput
+                  << " colorTransformPixels=" << colorTransformPixels
+                  << " framebufferStatePreserved=" << framebufferStatePreserved
+                  << " zeroTextureReadbackRejected=" << zeroTextureReadbackRejected
                   << " texturesDeleted=" << externalTexturesDeleted
                   << " ownerClean=" << ownerClean << " error=" << error
                   << " rejection=" << rejection << '\n';
         return 1;
     }
-    std::cout << "Depth Fog native OpenGL PASS tolerance=+/-" << kTolerance
-              << " channels; production FrameRenderer readback, depth-dependent pixels, "
+    std::cout << "Native OpenGL frame pixels PASS tolerance=+/-" << kTolerance
+              << " channels; Depth Fog and graph color transform production readback, "
                  "shader-failure unwind, and texture cleanup verified\n";
     return 0;
 #endif

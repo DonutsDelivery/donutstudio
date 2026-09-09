@@ -9,6 +9,9 @@
 // this struct and degrade gracefully where they are unavailable.
 #pragma once
 
+#include <cstdint>
+#include <string>
+
 namespace arbitgl
 {
 
@@ -29,6 +32,12 @@ struct GpuCaps
     // on THIS, not computeShaders, so macOS offers particles via the fallback while
     // computeShaders stays an honest "real compute present" signal.
     bool particles      = false;
+
+    int maxTextureSize = 0;
+    int maxCombinedTextureImageUnits = 0;
+    uint64_t maximumBufferLengthBytes = 0;
+    uint64_t recommendedWorkingSetBytes = 0;
+    std::string deviceIdentity;
 
     // Valid only when computeShaders is true (queried via glGetIntegeri_v);
     // left zeroed otherwise.

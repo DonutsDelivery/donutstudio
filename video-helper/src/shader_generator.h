@@ -39,9 +39,13 @@
 #if ARBIT_HAVE_VIEWPORT
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 #include "beat_timeline.h"
+#include "canonical_block_c_frame.h"
+#include "curated_isf_multipass.h"
+#include "shader_dialect.h"
 
 namespace arbitgl { struct GlFuncs; }
 
@@ -136,28 +140,8 @@ struct AudioFeatures
     std::vector<float> bands;     // uAudioBands magnitudes (64 expected; empty = bind black)
 };
 
-// Block C symbolic note/link textures (master-plan §4.3 / M5 — "the visuals
-// read the score") — the packed note/link timeline the generator uploads to
-// the uNotes (4-texel x 128-row RGBA32F) and uLinks (256x1) samplers, plus
-// uNoteCount/uLinkCount/uRootFreq. Produced by the A2 BlockCPacker over the
-// score at the frame's beat: a STATEFUL voice allocator, so the producer packs
-// once per frame in monotonic order (rows stay stable across a note's
-// residency). Pass nullptr to render() to keep the zero-feed contract (samplers
-// black, counts 0) — an audio-only / decoded-media layer behaves as before.
-// Plain copyable data so it rides LayerDesc through the composite (like
-// ShaderClock / AudioFeatures); both render paths fill it from the SAME packer
-// (block_c_packer.h) ⇒ export parity.
-struct NoteFeatures
-{
-    std::vector<float> notesTex;   // 128*4*4 floats, row-major (row,texel,channel); empty = bind black
-    std::vector<float> linksTex;   // 256*4 floats per edge (slaveRow, masterRow, num, den)
-    int   noteCount = 0;           // uNoteCount: highest occupied row + 1 (loop bound, covers holes)
-    int   linkCount = 0;           // uLinkCount: link edges with both endpoints resident
-    float rootFreq  = 261.625565f; // uRootFreq (Hz)
-    float historyBeats = 0.0f;     // uScoreHistoryBeats
-    float lookaheadBeats = 0.0f;   // uScoreLookaheadBeats
-};
-
+// Block C score inputs are read only from CanonicalBlockCFrame. A null pointer
+// keeps the shader score uniforms and textures zero-fed.
 class ShaderGenerator
 {
 public:
@@ -172,6 +156,14 @@ public:
     // log() with the diagnostics, ok()==false — and render() keeps drawing the
     // last good frame. The GL context must be current. Returns ok().
     bool setSource (const arbitgl::GlFuncs* gl, const std::string& rawSource);
+
+    // Strict bridge front door: the declared wire language must agree with the
+    // existing dialect detector. `isf` admits only ISF; `glsl` admits only bare
+    // GLSL or Shadertoy. When requireInputImage is true, compilation also
+    // requires an active sampler2D named exactly `inputImage`.
+    bool setBridgeSource (const arbitgl::GlFuncs* gl, const std::string& rawSource,
+                          arbitshader::Dialect declaredDialect, bool requireInputImage,
+                          const videowire::CuratedIsfPassResources* admittedPassResources = nullptr);
 
     // Render the active program into the owned w*h RGBA8 texture with `clock`,
     // and return that texture (owned; overwritten on the next call). Returns 0
@@ -198,9 +190,10 @@ public:
     // clip), NOT by this generator: render() only binds, never deletes them.
     unsigned render (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                      int width, int height, const AudioFeatures* audio = nullptr,
-                     const NoteFeatures* notes = nullptr,
+                     const canonicalblockc::CanonicalBlockCFrame* notes = nullptr,
                      const std::map<std::string, double>* genValues = nullptr,
-                     const std::map<std::string, unsigned>* genImages = nullptr);
+                     const std::map<std::string, unsigned>* genImages = nullptr,
+                     unsigned inputImageTexture = 0);
 
     // Free every GL object. Call while the context is current (the dtor does
     // NOT touch GL). Safe to call repeatedly.
@@ -210,6 +203,10 @@ public:
     const std::string& log() const { return log_; }
     const std::vector<GenParam>& params() const { return params_; }
     bool hasProgram() const { return program_ != 0; }
+    const videowire::CuratedIsfPassResources& admittedPassResources() const
+    {
+        return admittedPassResources_;
+    }
 
 private:
     // Contract uniform locations, cached after each successful compile.
@@ -252,6 +249,7 @@ private:
     std::string log_;
     std::vector<GenParam> params_;
     std::vector<int> paramLocs_;   // M7: uniform location per params_ entry (-1 = absent/optimized out)
+    int inputImageLoc_ = -1;       // FlatShaderBridge v1 exact filter sampler
     Locs locs_;
 
     unsigned vao_ = 0, vbo_ = 0, fbo_ = 0;
@@ -282,6 +280,7 @@ private:
     unsigned passParity_   = 0;         // flips per frame: swaps persistent read/write
     int      passTargW_ = 0, passTargH_ = 0;   // size the pass targets are allocated at
     bool     multipass_ = false;        // >1 pass OR any persistent target
+    videowire::CuratedIsfPassResources admittedPassResources_;
 };
 
 } // namespace videorender

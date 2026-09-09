@@ -73,4 +73,9 @@ inline std::string sha256Text (const std::string& text)
 {
     Sha256 hash; hash.update(text.data(), text.size()); return hash.finishHex();
 }
+
+inline std::string sha256Bytes (const void* data, std::size_t size)
+{
+    Sha256 hash; hash.update(data, size); return hash.finishHex();
+}
 } // namespace videohelper

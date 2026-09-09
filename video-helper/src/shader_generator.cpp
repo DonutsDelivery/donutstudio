@@ -223,6 +223,85 @@ bool ShaderGenerator::setSource (const arbitgl::GlFuncs* gl, const std::string& 
     return true;
 }
 
+bool ShaderGenerator::setBridgeSource (const arbitgl::GlFuncs* gl,
+                                       const std::string& rawSource,
+                                       arbitshader::Dialect declaredDialect,
+                                       bool requireInputImage,
+                                       const videowire::CuratedIsfPassResources* admittedPassResources)
+{
+    const auto detected = arbitshader::detectDialect(rawSource);
+    const bool dialectMatches = declaredDialect == arbitshader::Dialect::Isf
+        ? detected == arbitshader::Dialect::Isf
+        : declaredDialect == arbitshader::Dialect::BareGlsl
+            && (detected == arbitshader::Dialect::BareGlsl
+                || detected == arbitshader::Dialect::Shadertoy);
+    if (!dialectMatches)
+    {
+        ok_ = false;
+        log_ = "error: FlatShaderBridge declared language disagrees with detected shader dialect\n";
+        return false;
+    }
+    if (!setSource(gl, rawSource)) return false;
+
+    admittedPassResources_ = {};
+    if (admittedPassResources != nullptr)
+    {
+        videowire::CuratedIsfPassResources compiledResources;
+        std::string admissionError;
+        if (declaredDialect != arbitshader::Dialect::Isf
+            || ! videowire::admitCuratedIsfPassResources(rawSource, compiledResources,
+                                                          admissionError)
+            || ! (compiledResources == *admittedPassResources))
+        {
+            gl->DeleteProgram(program_);
+            program_ = 0;
+            releasePassTargets(gl);
+            passes_.clear();
+            targetSamplerLocs_.clear();
+            multipass_ = false;
+            ok_ = false;
+            log_ = "error: curated FlatShaderBridge pass resources disagree with the exact admitted payload";
+            if (! admissionError.empty()) log_ += ": " + admissionError;
+            log_ += "\n";
+            return false;
+        }
+        admittedPassResources_ = compiledResources;
+    }
+
+    inputImageLoc_ = -1;
+    if (requireInputImage)
+    {
+        GLint count = 0;
+        gl->GetProgramiv(program_, GL_ACTIVE_UNIFORMS, &count);
+        bool sampler2D = false;
+        for (GLint index = 0; index < count; ++index)
+        {
+            char name[256] = {};
+            GLsizei length = 0;
+            GLint size = 0;
+            GLenum type = 0;
+            gl->GetActiveUniform(program_, static_cast<GLuint>(index), sizeof(name),
+                                 &length, &size, &type, name);
+            if (std::string_view(name, static_cast<size_t>(length)) == "inputImage")
+            {
+                sampler2D = type == GL_SAMPLER_2D;
+                break;
+            }
+        }
+        inputImageLoc_ = gl->GetUniformLocation(program_, "inputImage");
+        if (!sampler2D || inputImageLoc_ < 0)
+        {
+            gl->DeleteProgram(program_);
+            program_ = 0;
+            inputImageLoc_ = -1;
+            ok_ = false;
+            log_ = "error: FlatShaderBridge filter requires an active sampler2D named inputImage\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 void ShaderGenerator::ensureQuad (const arbitgl::GlFuncs* gl)
 {
     if (vao_ != 0) return;
@@ -405,12 +484,20 @@ void ShaderGenerator::ensurePassTargets (const arbitgl::GlFuncs* gl, int width, 
 
 unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                                   int width, int height, const AudioFeatures* audio,
-                                  const NoteFeatures* notes,
+                                  const canonicalblockc::CanonicalBlockCFrame* notes,
                                   const std::map<std::string, double>* genValues,
-                                  const std::map<std::string, unsigned>* genImages)
+                                  const std::map<std::string, unsigned>* genImages,
+                                  unsigned inputImageTexture)
 {
     if (program_ == 0)
         return 0;
+    if (! admittedPassResources_.passes.empty())
+    {
+        std::string extentError;
+        if (! videowire::admitCuratedIsfPassExtent(admittedPassResources_, width, height,
+                                                    extentError))
+            return 0;
+    }
 
     ensureQuad (gl);
     ensureDefaults (gl);
@@ -450,14 +537,14 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     if (locs_.uOnset        >= 0) gl->Uniform1f (locs_.uOnset, onset);
     if (locs_.uOnsetAge     >= 0) gl->Uniform1f (locs_.uOnsetAge, onsetAge);
     // Block C — symbolic score (live when `notes` present, else zero-fed). M5.
-    const bool haveNotes = notes != nullptr && ! notes->notesTex.empty();
-    if (locs_.uNoteCount    >= 0) gl->Uniform1i (locs_.uNoteCount, haveNotes ? notes->noteCount : 0);
-    if (locs_.uLinkCount    >= 0) gl->Uniform1i (locs_.uLinkCount, haveNotes ? notes->linkCount : 0);
-    if (locs_.uRootFreq     >= 0) gl->Uniform1f (locs_.uRootFreq, haveNotes ? notes->rootFreq : 0.0f);
+    const bool haveNotes = notes != nullptr && ! notes->noteTexture().empty();
+    if (locs_.uNoteCount    >= 0) gl->Uniform1i (locs_.uNoteCount, haveNotes ? notes->noteRows() : 0);
+    if (locs_.uLinkCount    >= 0) gl->Uniform1i (locs_.uLinkCount, haveNotes ? notes->linkRows() : 0);
+    if (locs_.uRootFreq     >= 0) gl->Uniform1f (locs_.uRootFreq, haveNotes ? notes->rootFrequencyHz : 0.0f);
     if (locs_.uScoreHistoryBeats >= 0)
-        gl->Uniform1f (locs_.uScoreHistoryBeats, haveNotes ? notes->historyBeats : 0.0f);
+        gl->Uniform1f (locs_.uScoreHistoryBeats, haveNotes ? notes->historyBeats() : 0.0f);
     if (locs_.uScoreLookaheadBeats >= 0)
-        gl->Uniform1f (locs_.uScoreLookaheadBeats, haveNotes ? notes->lookaheadBeats : 0.0f);
+        gl->Uniform1f (locs_.uScoreLookaheadBeats, haveNotes ? notes->lookaheadBeats() : 0.0f);
     // uLastOnsetBeat / uChord stay reserved (in Locs, not in the v1 prelude) —
     // a later slice can fill them without a contract change.
     if (locs_.uLastOnsetBeat>= 0) gl->Uniform1f (locs_.uLastOnsetBeat, 0.0f);
@@ -581,11 +668,11 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     if (locs_.uNotes >= 0)
     {
         gl->ActiveTexture (GL_TEXTURE2);
-        if (haveNotes && notes->notesTex.size() >= (size_t) (kNoteTexW * kNoteTexH * 4))
+        if (haveNotes && notes->noteTexture().size() >= (size_t) (kNoteTexW * kNoteTexH * 4))
         {
             glBindTexture (GL_TEXTURE_2D, notesTex2D_);
             glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kNoteTexW, kNoteTexH,
-                             GL_RGBA, GL_FLOAT, notes->notesTex.data());
+                             GL_RGBA, GL_FLOAT, notes->noteTexture().data());
         }
         else
         {
@@ -596,11 +683,11 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     if (locs_.uLinks >= 0)
     {
         gl->ActiveTexture (GL_TEXTURE3);
-        if (haveNotes && notes->linksTex.size() >= (size_t) (kLinkTexW * 4))
+        if (haveNotes && notes->linkTexture().size() >= (size_t) (kLinkTexW * 4))
         {
             glBindTexture (GL_TEXTURE_2D, linksTex2D_);
             glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kLinkTexW, 1,
-                             GL_RGBA, GL_FLOAT, notes->linksTex.data());
+                             GL_RGBA, GL_FLOAT, notes->linkTexture().data());
         }
         else
         {
@@ -646,6 +733,15 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
         gl->Uniform1i (loc, nextUnit);
         ++nextUnit;
     }
+    // FlatShaderBridge filter input is borrowed from the frame plan. Binding is
+    // the only operation performed on it; ShaderGenerator never owns or deletes it.
+    if (inputImageLoc_ >= 0 && inputImageTexture != 0)
+    {
+        gl->ActiveTexture (GL_TEXTURE0 + nextUnit);
+        glBindTexture (GL_TEXTURE_2D, inputImageTexture);
+        gl->Uniform1i (inputImageLoc_, nextUnit);
+        ++nextUnit;
+    }
 
     // Single implicit output pass (no PASSES / no PERSISTENT): the pre-M7 fast
     // path — one draw into outTex_, already attached + cleared above.
@@ -664,33 +760,24 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     // bound FBO target, and the per-pass TARGET samplers change below.
     ensurePassTargets (gl, outW_, outH_);
 
-    // Output pass = the last pass with an empty TARGET (ISF convention). If a
-    // shader names every target (unusual), the final pass is shown instead — its
-    // named buffer is bypassed for display, so any cross-frame persistence of THAT
-    // pass is skipped (documented v1 limitation; the common feedback pattern uses
-    // a separate empty output pass and is unaffected).
-    int outputPass = -1;
-    for (size_t pi = 0; pi < passes_.size(); ++pi)
-        if (passes_[pi].target.empty()) outputPass = (int) pi;
-    if (outputPass < 0) outputPass = (int) passes_.size() - 1;
-
     std::set<std::string> written;   // named targets produced so far THIS frame
+    unsigned visibleTexture = outTex_;
     gl->BindVertexArray (vao_);
     for (size_t pi = 0; pi < passes_.size(); ++pi)
     {
         const PassInfo& ps = passes_[pi];
-        const bool toOutput = ps.target.empty() || (int) pi == outputPass;
 
-        // Choose the texture this pass writes. A non-output PERSISTENT target
+        // Choose the texture this pass writes. A PERSISTENT named target
         // writes its BACK buffer (parity^1) so its read sampler (parity) still
         // sees the previous frame in the same pass — no read/write on one texture.
         unsigned writeTex = outTex_;
-        if (! toOutput)
+        if (! ps.target.empty())
         {
             PassTarget& pt = passTargets_[ps.target];
             writeTex = pt.persistent ? pt.tex[(passParity_ + 1) & 1] : pt.tex[0];
             if (writeTex == 0) writeTex = outTex_;   // allocation guard
         }
+        visibleTexture = writeTex;
         gl->FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                   GL_TEXTURE_2D, writeTex, 0);
         glViewport (0, 0, outW_, outH_);
@@ -735,7 +822,7 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     }
     gl->BindVertexArray (0);
     passParity_ ^= 1;   // next frame swaps every persistent target's read/write
-    return outTex_;
+    return visibleTexture;
 }
 
 void ShaderGenerator::shutdown (const arbitgl::GlFuncs* gl)
@@ -759,6 +846,7 @@ void ShaderGenerator::shutdown (const arbitgl::GlFuncs* gl)
     passIndexLoc_ = -1;
     passParity_ = 0;
     multipass_ = false;
+    admittedPassResources_ = {};
     outW_ = outH_ = 0;
     ok_ = false;
 }

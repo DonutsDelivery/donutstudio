@@ -1,0 +1,325 @@
+{
+  "schema": "donutstudio.diffraction-wavelength-validation-scenes.v1",
+  "incident": {
+    "direction": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "material_uv": [
+      0.5,
+      0.5
+    ],
+    "radiance_at_production_wavelengths": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "production_wavelengths_nm": [
+    380,
+    420,
+    460,
+    500,
+    540,
+    580,
+    640,
+    700
+  ],
+  "scenes": [
+    {
+      "name": "aluminium-binary-preset",
+      "lattice": "one-dimensional",
+      "primary_direction_uv": [
+        1.0,
+        0.0
+      ],
+      "primary_period_nm": 1000.0,
+      "secondary_direction_uv": [
+        0.0,
+        0.0
+      ],
+      "secondary_period_nm": 0.0,
+      "profile": "binary-rectangular",
+      "depth_nm": 125.0,
+      "duty_cycle": 0.5,
+      "substrate_nk": [
+        0.17,
+        3.1
+      ],
+      "coating": {
+        "model": "uncoated",
+        "thickness_nm": 0.0,
+        "nk": [
+          0.0,
+          0.0
+        ]
+      },
+      "roughness": {
+        "rms_height_nm": 0.0,
+        "rms_slope": 0.08
+      },
+      "first_order": 1,
+      "last_order": 4,
+      "wire_version": 5,
+      "blaze_angle_degrees": 0.0,
+      "groove_field": {
+        "mode": "constant",
+        "origin_uv": [
+          0.0,
+          0.0
+        ],
+        "axis_uv": [
+          0.0,
+          0.0
+        ],
+        "primary_period_delta_nm_per_unit": 0.0,
+        "secondary_period_delta_nm_per_unit": 0.0,
+        "orientation_degrees_per_unit": 0.0
+      },
+      "integration_model": "cie-1931-xyz",
+      "expected_zero_clamped_linear_srgb": [
+        0.676881912469,
+        0.583821077414,
+        0.649560715142
+      ]
+    },
+    {
+      "name": "sinusoidal-preset",
+      "lattice": "one-dimensional",
+      "primary_direction_uv": [
+        1.0,
+        0.0
+      ],
+      "primary_period_nm": 1000.0,
+      "secondary_direction_uv": [
+        0.0,
+        0.0
+      ],
+      "secondary_period_nm": 0.0,
+      "profile": "sinusoidal",
+      "depth_nm": 180.0,
+      "duty_cycle": 0.5,
+      "substrate_nk": [
+        0.17,
+        3.1
+      ],
+      "coating": {
+        "model": "uncoated",
+        "thickness_nm": 0.0,
+        "nk": [
+          0.0,
+          0.0
+        ]
+      },
+      "roughness": {
+        "rms_height_nm": 6.0,
+        "rms_slope": 0.04
+      },
+      "first_order": 1,
+      "last_order": 4,
+      "wire_version": 5,
+      "blaze_angle_degrees": 0.0,
+      "groove_field": {
+        "mode": "constant",
+        "origin_uv": [
+          0.0,
+          0.0
+        ],
+        "axis_uv": [
+          0.0,
+          0.0
+        ],
+        "primary_period_delta_nm_per_unit": 0.0,
+        "secondary_period_delta_nm_per_unit": 0.0,
+        "orientation_degrees_per_unit": 0.0
+      },
+      "integration_model": "cie-1931-xyz",
+      "expected_zero_clamped_linear_srgb": [
+        0.701870423673,
+        0.519974682472,
+        0.47687609055
+      ]
+    },
+    {
+      "name": "blazed-coated-preset",
+      "lattice": "one-dimensional",
+      "primary_direction_uv": [
+        1.0,
+        0.0
+      ],
+      "primary_period_nm": 1000.0,
+      "secondary_direction_uv": [
+        0.0,
+        0.0
+      ],
+      "secondary_period_nm": 0.0,
+      "profile": "blazed-sawtooth",
+      "depth_nm": 250.0,
+      "duty_cycle": 1.0,
+      "substrate_nk": [
+        0.17,
+        3.1
+      ],
+      "coating": {
+        "model": "incoherent-dielectric",
+        "thickness_nm": 1000.0,
+        "nk": [
+          1.5,
+          0.001
+        ]
+      },
+      "roughness": {
+        "rms_height_nm": 2.0,
+        "rms_slope": 0.02
+      },
+      "first_order": 1,
+      "last_order": 4,
+      "wire_version": 5,
+      "blaze_angle_degrees": 14.036243,
+      "groove_field": {
+        "mode": "constant",
+        "origin_uv": [
+          0.0,
+          0.0
+        ],
+        "axis_uv": [
+          0.0,
+          0.0
+        ],
+        "primary_period_delta_nm_per_unit": 0.0,
+        "secondary_period_delta_nm_per_unit": 0.0,
+        "orientation_degrees_per_unit": 0.0
+      },
+      "integration_model": "cie-1931-xyz",
+      "expected_zero_clamped_linear_srgb": [
+        0.678992092297,
+        0.65793135596,
+        0.720017596322
+      ]
+    },
+    {
+      "name": "crossed-binary-preset",
+      "lattice": "crossed-two-dimensional",
+      "primary_direction_uv": [
+        1.0,
+        0.0
+      ],
+      "primary_period_nm": 1000.0,
+      "secondary_direction_uv": [
+        0.0,
+        1.0
+      ],
+      "secondary_period_nm": 1400.0,
+      "profile": "binary-rectangular",
+      "depth_nm": 125.0,
+      "duty_cycle": 0.5,
+      "substrate_nk": [
+        0.17,
+        3.1
+      ],
+      "coating": {
+        "model": "uncoated",
+        "thickness_nm": 0.0,
+        "nk": [
+          0.0,
+          0.0
+        ]
+      },
+      "roughness": {
+        "rms_height_nm": 0.0,
+        "rms_slope": 0.08
+      },
+      "first_order": 1,
+      "last_order": 4,
+      "wire_version": 5,
+      "blaze_angle_degrees": 0.0,
+      "groove_field": {
+        "mode": "constant",
+        "origin_uv": [
+          0.0,
+          0.0
+        ],
+        "axis_uv": [
+          0.0,
+          0.0
+        ],
+        "primary_period_delta_nm_per_unit": 0.0,
+        "secondary_period_delta_nm_per_unit": 0.0,
+        "orientation_degrees_per_unit": 0.0
+      },
+      "integration_model": "cie-1931-xyz",
+      "expected_zero_clamped_linear_srgb": [
+        0.467680512279,
+        0.409494272436,
+        0.496628099609
+      ]
+    },
+    {
+      "name": "sinusoidal-order-eight",
+      "lattice": "one-dimensional",
+      "primary_direction_uv": [
+        1.0,
+        0.0
+      ],
+      "primary_period_nm": 10000.0,
+      "secondary_direction_uv": [
+        0.0,
+        0.0
+      ],
+      "secondary_period_nm": 0.0,
+      "profile": "sinusoidal",
+      "depth_nm": 180.0,
+      "duty_cycle": 0.5,
+      "substrate_nk": [
+        0.17,
+        3.1
+      ],
+      "coating": {
+        "model": "uncoated",
+        "thickness_nm": 0.0,
+        "nk": [
+          0.0,
+          0.0
+        ]
+      },
+      "roughness": {
+        "rms_height_nm": 0.0,
+        "rms_slope": 0.0
+      },
+      "first_order": 1,
+      "last_order": 8,
+      "wire_version": 5,
+      "blaze_angle_degrees": 0.0,
+      "groove_field": {
+        "mode": "constant",
+        "origin_uv": [
+          0.0,
+          0.0
+        ],
+        "axis_uv": [
+          0.0,
+          0.0
+        ],
+        "primary_period_delta_nm_per_unit": 0.0,
+        "secondary_period_delta_nm_per_unit": 0.0,
+        "orientation_degrees_per_unit": 0.0
+      },
+      "integration_model": "cie-1931-xyz",
+      "expected_zero_clamped_linear_srgb": [
+        1.119717517638,
+        0.884932427684,
+        0.84735636107
+      ]
+    }
+  ],
+  "validation": {
+    "reference_step_nm": 5.0,
+    "maximum_zero_clamped_linear_srgb_channel_error": 0.15
+  }
+}

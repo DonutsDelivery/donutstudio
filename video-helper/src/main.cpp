@@ -12,10 +12,15 @@
 #include "media.h"
 #include "capture_device.h"
 #include "exporter.h"
+
 #include "composite_probe_contract.h"
 #include "bounded_line.h"
 #include "compositor_ownership.h"
 #include "render_snapshot_json.h"
+#include "score_json_parser.h"
+#include "model_payload_transport.h"
+#include "imported_scene_payload_execution.h"
+#include "imported_animated_scene_payload_execution.h"
 #if ARBIT_HAVE_VIEWPORT
 #include "viewport.h"
 #endif
@@ -62,6 +67,7 @@ namespace arbitselftest { using RifeBackend = arbitrife::RifeEngine; }
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -80,6 +86,244 @@ videoshm::Region g_shm;
 uint32_t g_nextSlot = 0;
 std::filesystem::path g_trustedMatteCacheRoot;
 std::filesystem::path g_trustedDepthCacheRoot;
+videohelper::modelpayload::Store g_modelPayloads;
+videohelper::modelpayload::ImportedScenePayloadExecution g_importedScenePayloadExecution(
+    g_modelPayloads, arbitgpu::nativeFixtureSceneBackend());
+videohelper::modelpayload::ImportedAnimatedScenePayloadExecution
+    g_importedAnimatedScenePayloadExecution(
+        g_modelPayloads, arbitgpu::nativeDeformationBackend());
+
+bool readUnsignedInteger(const json& value, std::uint64_t& output) noexcept
+{
+    if (value.is_number_unsigned())
+    {
+        output = value.get<std::uint64_t>();
+        return true;
+    }
+    if (!value.is_number_integer())
+        return false;
+    const auto signedValue = value.get<std::int64_t>();
+    if (signedValue < 0)
+        return false;
+    output = static_cast<std::uint64_t>(signedValue);
+    return true;
+}
+
+bool readModelPayloadTransferId(const json& params,
+                                std::string& transferId,
+                                std::string& error)
+{
+    if (! params.is_object() || ! params.contains("transferId")
+        || ! params["transferId"].is_string())
+    {
+        error = "model payload transferId is missing or invalid";
+        return false;
+    }
+    transferId = params["transferId"].get<std::string>();
+    return true;
+}
+
+bool readModelPayloadKey(const json& params,
+                         visualanimationimport::ExactContentAssetKey& key,
+                         std::string& error)
+{
+    if (! params.is_object()
+        || ! params.contains("assetId") || ! params["assetId"].is_string()
+        || ! params.contains("version")
+        || ! params.contains("contentSha256") || ! params["contentSha256"].is_string()
+        || ! params.contains("sourceMediaType") || ! params["sourceMediaType"].is_string()
+        || ! params.contains("sourceByteSize"))
+    {
+        error = "model payload identity is missing or invalid";
+        return false;
+    }
+    std::uint64_t version = 0;
+    std::uint64_t sourceByteSize = 0;
+    if (!readUnsignedInteger(params["version"], version)
+        || !readUnsignedInteger(params["sourceByteSize"], sourceByteSize)
+        || version == 0 || sourceByteSize == 0)
+    {
+        error = "model payload identity is missing or invalid";
+        return false;
+    }
+    key.id = params["assetId"].get<std::string>();
+    key.version = version;
+    key.contentSha256 = params["contentSha256"].get<std::string>();
+    key.sourceMediaType = params["sourceMediaType"].get<std::string>();
+    key.sourceByteSize = sourceByteSize;
+    return true;
+}
+
+bool readImportedSceneRequest(const json& params,
+                              videohelper::modelpayload::ImportedSceneRequest& request,
+                              std::string& error)
+{
+    if (!readModelPayloadKey(params, request.asset, error))
+        return false;
+    if (!params.contains("width") || !params.contains("height"))
+    {
+        error = "imported scene dimensions are missing or invalid";
+        return false;
+    }
+    std::uint64_t width = 0;
+    std::uint64_t height = 0;
+    if (!readUnsignedInteger(params["width"], width)
+        || !readUnsignedInteger(params["height"], height)
+        || width == 0 || height == 0
+        || width > std::numeric_limits<std::uint32_t>::max()
+        || height > std::numeric_limits<std::uint32_t>::max())
+    {
+        error = "imported scene dimensions are missing or invalid";
+        return false;
+    }
+    request.dimensions = { static_cast<std::uint32_t>(width),
+                           static_cast<std::uint32_t>(height) };
+    if (params.contains("sceneIndex"))
+    {
+        std::uint64_t sceneIndex = 0;
+        if (!readUnsignedInteger(params["sceneIndex"], sceneIndex)
+            || sceneIndex > std::numeric_limits<std::size_t>::max())
+        {
+            error = "imported scene index is invalid";
+            return false;
+        }
+        request.sceneIndex = static_cast<std::size_t>(sceneIndex);
+    }
+    return true;
+}
+
+bool readSignedInteger(const json& value, std::int64_t& output) noexcept
+{
+    if (value.is_number_integer())
+    {
+        output = value.get<std::int64_t>();
+        return true;
+    }
+    if (! value.is_number_unsigned())
+        return false;
+    const auto unsignedValue = value.get<std::uint64_t>();
+    if (unsignedValue > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max()))
+        return false;
+    output = static_cast<std::int64_t>(unsignedValue);
+    return true;
+}
+
+bool readFiniteNumber(const json& object, const char* name, double& output) noexcept
+{
+    if (! object.contains(name) || ! object[name].is_number())
+        return false;
+    output = object[name].get<double>();
+    return std::isfinite(output);
+}
+
+bool readImportedAnimatedSceneRequest(
+    const json& params,
+    videohelper::modelpayload::ImportedAnimatedSceneRequest& request,
+    std::string& error)
+{
+    if (! readModelPayloadKey(params, request.operation.asset, error))
+        return false;
+    if (! params.contains("sourceStableId")
+        || ! params.contains("deformationStableId")
+        || ! params.contains("clipName") || ! params["clipName"].is_string()
+        || ! params.contains("frame") || ! params.contains("rateNumerator")
+        || ! params.contains("rateDenominator")
+        || ! params.contains("structuralRevision")
+        || ! params.contains("width") || ! params.contains("height")
+        || ! params.contains("playback") || ! params["playback"].is_object())
+    {
+        error = "imported animated scene request is missing required fields";
+        return false;
+    }
+
+    std::uint64_t sourceStableId = 0, deformationStableId = 0;
+    std::uint64_t rateNumerator = 0, rateDenominator = 0;
+    std::uint64_t structuralRevision = 0, width = 0, height = 0;
+    std::int64_t frame = 0;
+    if (! readUnsignedInteger(params["sourceStableId"], sourceStableId)
+        || ! readUnsignedInteger(params["deformationStableId"], deformationStableId)
+        || ! readSignedInteger(params["frame"], frame)
+        || ! readUnsignedInteger(params["rateNumerator"], rateNumerator)
+        || ! readUnsignedInteger(params["rateDenominator"], rateDenominator)
+        || ! readUnsignedInteger(params["structuralRevision"], structuralRevision)
+        || ! readUnsignedInteger(params["width"], width)
+        || ! readUnsignedInteger(params["height"], height)
+        || sourceStableId == 0 || deformationStableId == 0
+        || rateNumerator == 0 || rateDenominator == 0 || structuralRevision == 0
+        || rateNumerator > std::numeric_limits<std::uint32_t>::max()
+        || rateDenominator > std::numeric_limits<std::uint32_t>::max()
+        || width == 0 || height == 0
+        || width > std::numeric_limits<std::uint32_t>::max()
+        || height > std::numeric_limits<std::uint32_t>::max())
+    {
+        error = "imported animated scene numeric identity is invalid";
+        return false;
+    }
+
+    const auto& playback = params["playback"];
+    if (! playback.contains("timeSource") || ! playback["timeSource"].is_string()
+        || ! playback.contains("mode") || ! playback["mode"].is_string()
+        || ! readFiniteNumber(playback, "timelineSeconds",
+                              request.operation.playback.timelineSeconds)
+        || ! readFiniteNumber(playback, "clipStartTimelineSeconds",
+                              request.operation.playback.clipStartTimelineSeconds)
+        || ! readFiniteNumber(playback, "timelineBeat",
+                              request.operation.playback.timelineBeat)
+        || ! readFiniteNumber(playback, "clipStartBeat",
+                              request.operation.playback.clipStartBeat)
+        || ! readFiniteNumber(playback, "beatsPerLoop",
+                              request.operation.playback.beatsPerLoop)
+        || ! readFiniteNumber(playback, "speed", request.operation.playback.speed)
+        || ! readFiniteNumber(playback, "offsetSeconds",
+                              request.operation.playback.offsetSeconds)
+        || ! readFiniteNumber(playback, "weight", request.operation.playback.weight))
+    {
+        error = "imported animated scene playback control is invalid";
+        return false;
+    }
+    const auto timeSource = playback["timeSource"].get<std::string>();
+    const auto mode = playback["mode"].get<std::string>();
+    if (timeSource == "timeline")
+        request.operation.playback.timeSource = visualanimation::TimeSource::Timeline;
+    else if (timeSource == "beat-sync")
+        request.operation.playback.timeSource = visualanimation::TimeSource::BeatSync;
+    else
+    {
+        error = "imported animated scene playback time source is invalid";
+        return false;
+    }
+    if (mode == "clamp")
+        request.operation.playback.playback = visualanimation::Playback::Clamp;
+    else if (mode == "loop")
+        request.operation.playback.playback = visualanimation::Playback::Loop;
+    else
+    {
+        error = "imported animated scene playback mode is invalid";
+        return false;
+    }
+
+    request.operation.sourceStableId = sourceStableId;
+    request.operation.deformationStableId = deformationStableId;
+    request.operation.schedule = {sourceStableId, deformationStableId};
+    request.operation.clipName = params["clipName"].get<std::string>();
+    request.frame = {frame, static_cast<std::uint32_t>(rateNumerator),
+                     static_cast<std::uint32_t>(rateDenominator)};
+    request.structuralRevision = structuralRevision;
+    request.width = static_cast<std::uint32_t>(width);
+    request.height = static_cast<std::uint32_t>(height);
+    return true;
+}
+
+bool acceptModelPayloadResult(const videohelper::modelpayload::Result& result,
+                              std::string& error)
+{
+    if (result)
+        return true;
+    error = "model payload transfer rejected: "
+        + std::string(videohelper::modelpayload::token(result.failure));
+    return false;
+}
 
 // Recorder sessions are independent: each owns the Arbit-provided shared-memory
 // ring and its encoder. A close/cancel moves one entry out of the map before
@@ -137,7 +381,7 @@ void cancelAllRecorderSessions()
     }
 }
 #if ARBIT_HAVE_VIEWPORT
-Viewport g_viewport;
+Viewport g_viewport(&g_modelPayloads);
 bool g_testRejectNextSnapshot = false;
 bool g_testDeferNextSnapshot = false;
 std::optional<videowire::ResolvedVisualSnapshot> g_testDeferredSnapshot;
@@ -345,95 +589,6 @@ static arbitmod::LFOShape parseLfoShape (const std::string& s)
     return arbitmod::LFOShape::Sine;
 }
 
-// Parse a `score` object (M5 Block C wire schema, documented at the top of
-// parseExportJob) into an arbitmod::Score. Shared by the export job
-// parser and the viewport_set_score RPC so the export and live-preview paths
-// can never disagree on the note/link schema.
-static void parseScoreJson (const json& sc, arbitmod::Score& score)
-{
-    score.notationVersion = sc.value("notationVersion", 1);
-    score.scoreRevision = sc.value("scoreRevision", uint64_t { 0 });
-    score.edoStepsPerOctave = std::max(1, sc.value("edoStepsPerOctave", 12));
-    score.rootFreq = sc.value ("rootFreq", 261.625565f);
-    score.historyBeats = std::max (0.0f, sc.value (
-        "historyBeats", arbitmod::kDefaultScoreHistoryBeats));
-    score.lookaheadBeats = std::max (0.0f, sc.value (
-        "lookaheadBeats", arbitmod::kDefaultScoreLookaheadBeats));
-    if (sc.contains ("notes"))
-        for (const auto& n : sc["notes"])
-        {
-            arbitmod::Note nt;
-            nt.id           = n.value ("id", 0);
-            nt.trackId      = n.value ("trackId", 0);
-            nt.startBeat    = n.value ("startBeat", 0.0f);
-            nt.lengthBeats  = n.value ("lengthBeats", 1.0f);
-            nt.midiNote     = n.value ("midiNote", 60.0f);
-            nt.velocity     = n.value ("velocity", 100.0f);
-            nt.freqHz       = n.value ("freqHz", 261.625565f);
-            nt.durationSeconds = n.value ("durationSeconds", 0.0f);
-            if (n.contains ("pitchBendPoints") && n["pitchBendPoints"].is_array())
-                for (const auto& point : n["pitchBendPoints"])
-                {
-                    arbitmod::PitchBendPoint bend;
-                    bend.position = point.value ("position", 0.0f);
-                    bend.semitones = point.value ("semitones", 0.0f);
-                    bend.tension = point.value ("tension", 0.0f);
-                    bend.sCurve = point.value ("sCurve", 0.0f);
-                    bend.vibratoDepthCents = point.value ("vibratoDepthCents", 0.0f);
-                    bend.vibratoRateHz = point.value ("vibratoRateHz", 0.0f);
-                    bend.vibratoWaveform = point.value ("vibratoWaveform", 0);
-                    bend.vibratoFadeIn = point.value ("vibratoFadeIn", 0.0f);
-                    bend.vibratoFadeOut = point.value ("vibratoFadeOut", 0.0f);
-                    nt.pitchBendPoints.push_back (bend);
-                }
-            if (n.contains ("pitchAnchors") && n["pitchAnchors"].is_array())
-                for (const auto& anchor : n["pitchAnchors"])
-                    nt.pitchAnchors.push_back ({
-                        anchor.value ("id", -1),
-                        anchor.value ("position", 0.0f),
-                        anchor.value ("frequency", 0.0f) });
-            nt.ratioNum     = n.value ("ratioNum", 1);
-            nt.ratioDen     = n.value ("ratioDen", 1);
-            nt.linkMasterId = n.value ("linkMasterId", -1);
-            nt.isRoot       = n.value ("isRoot", false);
-            nt.centsOffset = n.value("centsOffset", 0.0f);
-            nt.edoStep = n.value("edoStep", -1);
-            nt.muted = n.value("muted", false);
-            nt.notationVisible = n.value("notationVisible", ! nt.muted);
-            nt.diatonicIndex = n.value("diatonicIndex", 28);
-            nt.baseAccidental = n.value("baseAccidental", 0);
-            nt.linked = n.value("linked", false);
-            nt.hasUnmappedPrime = n.value("hasUnmappedPrime", false);
-            nt.edoActive = n.value("edoActive", false);
-            nt.edoInflection = n.value("edoInflection", 0);
-            nt.edoDegree = n.value("edoDegree", 0);
-            if (n.contains("commas") && n["commas"].is_array())
-                for (const auto& comma : n["commas"])
-                {
-                    if (nt.commaCount >= static_cast<int>(nt.commas.size())) break;
-                    nt.commas[static_cast<size_t>(nt.commaCount++)] = {
-                        comma.value("prime", 0), comma.value("exponent", 0) };
-                }
-            if (n.contains ("primes") && n["primes"].is_array())
-                for (size_t i = 0; i < n["primes"].size() && i < 6; ++i)
-                    if (n["primes"][i].is_number())
-                        nt.primes[i] = n["primes"][i].get<float>();
-            score.notes.push_back (nt);
-        }
-    if (sc.contains ("links"))
-        for (const auto& l : sc["links"])
-        {
-            arbitmod::Link lk;
-            lk.id              = l.value ("id", 0);
-            lk.slaveNoteId     = l.value ("slaveNoteId", 0);
-            lk.masterNoteId    = l.value ("masterNoteId", 0);
-            lk.slaveHarmonic   = l.value ("slaveHarmonic", 1);
-            lk.masterHarmonic  = l.value ("masterHarmonic", 1);
-            lk.octaveTranspose = l.value ("octaveTranspose", 0);
-            score.links.push_back (lk);
-        }
-}
-
 // Parse a `modMatrix` array (M6 routing wire schema) into arbitmod::Routings.
 // Shared by the export job parser and the viewport_set_mod_matrix RPC so the
 // export and live-preview paths can never disagree on the routing schema.
@@ -458,7 +613,7 @@ static void parseRoutingsJson (const json& arr, std::vector<arbitmod::Routing>& 
             ms.pitchHi    = sj.value ("pitchHi", 127.0f);
             ms.primeIndex = sj.value ("primeIndex", 1);
             ms.axis       = sj.value ("axis", 0);
-            ms.linkId     = sj.value ("linkId", -1);
+            ms.linkId     = sj.value ("linkId", 0);
             ms.band       = sj.value ("band", 0);
             ms.lissajousK = sj.value ("lissajousK", 7);
             ms.triggerDecayBeats = sj.value ("triggerDecayBeats", 0.5f);
@@ -582,7 +737,7 @@ static bool parseVideoControlPlanJson(const json& value, videocontrol::Plan& pla
             operation.source.pitchHi = parameter(2, 127.0f);
             operation.source.primeIndex = static_cast<int>(std::lround(parameter(3, 1.0f)));
             operation.source.axis = static_cast<int>(std::lround(parameter(4, 0.0f)));
-            operation.source.linkId = static_cast<int>(std::lround(parameter(5, -1.0f)));
+            operation.source.linkId = static_cast<int>(std::lround(parameter(5, 0.0f)));
             operation.source.band = static_cast<int>(std::lround(parameter(6, 0.0f)));
             operation.source.lissajousK = static_cast<int>(std::lround(parameter(7, 7.0f)));
             operation.source.triggerDecayBeats = parameter(8, 0.5f);
@@ -791,6 +946,17 @@ std::string parseExportJob (const json& params, ExportJob& job)
         return snapshotError;
     job.authoringRevision = snapshot.authoringRevision;
     job.exportableRevision = params.value ("exportableRevision", job.authoringRevision);
+    job.projectGeneration = params.value("projectGeneration", uint64_t { 0 });
+    job.sourceGeneration = params.value("sourceGeneration", uint64_t { 0 });
+    job.helperGeneration = params.value("helperGeneration", uint64_t { 0 });
+    job.backendGeneration = params.value("backendGeneration", uint64_t { 0 });
+    job.deviceGeneration = params.value("deviceGeneration", uint64_t { 0 });
+    job.scoreGeneration = params.value("scoreGeneration", uint64_t { 0 });
+    job.beatMapGeneration = params.value("beatMapGeneration", uint64_t { 0 });
+    job.fpsGeneration = params.value("fpsGeneration", uint64_t { 0 });
+    job.loopGeneration = params.value("loopGeneration", uint64_t { 0 });
+    job.seekGeneration = params.value("seekGeneration", uint64_t { 0 });
+
     if (job.authoringRevision != 0
         && job.exportableRevision != job.authoringRevision)
         return "current authoring revision is not exportable";
@@ -866,7 +1032,11 @@ std::string parseExportJob (const json& params, ExportJob& job)
     // Block C symbolic score (M5). Parsed unconditionally (the GL frame loop is
     // the only consumer); mod_defs.h is plain C++17, no GL/GPL.
     if (params.contains ("score") && params["score"].is_object())
-        parseScoreJson (params["score"], job.score);
+    {
+        std::string scoreError;
+        if (!videohelper::scorejson::parseScoreJson(params["score"], job.score, scoreError))
+            return scoreError;
+    }
 
     // Cross-domain modulation matrix (M6). Each routing maps a musical source
     // (Block A clock / Block B audio / Block C score) onto a render-graph clip
@@ -1025,7 +1195,7 @@ void handleExportAsync (const json& idVal, const json& params)
 #endif
         const std::string error = runExport (*job, usedEncoder, glCompositing,
                                              interpolationBackend,
-                                             &g_export.progress);
+                                             &g_export.progress, &g_modelPayloads);
         json result;
         if (error.empty())
             result = { { "outPath", job->outPath }, { "encoder", usedEncoder },
@@ -1196,7 +1366,7 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
 #endif
         std::string error = runExport (*job, usedEncoder, glCompositing,
                                        interpolationBackend,
-                                       &g_renderCache.progress);
+                                       &g_renderCache.progress, &g_modelPayloads);
 #if ARBIT_HAVE_VIEWPORT
         g_viewport.setInterpolationSuspended (false);
 #endif
@@ -1262,6 +1432,181 @@ json handle (const std::string& method, const json& params, std::string& error)
 #else
                       { "beatDetection", false } };
 #endif
+
+    if (method == "model_payload_begin")
+    {
+        std::string transferId;
+        visualanimationimport::ExactContentAssetKey key;
+        if (! readModelPayloadTransferId(params, transferId, error)
+            || ! readModelPayloadKey(params, key, error))
+            return {};
+        const auto result = g_modelPayloads.begin(transferId, key);
+        if (! acceptModelPayloadResult(result, error))
+            return {};
+        return json { { "acceptedBytes", key.sourceByteSize } };
+    }
+
+    if (method == "model_payload_chunk")
+    {
+        std::string transferId;
+        if (! readModelPayloadTransferId(params, transferId, error)
+            || ! params.contains("offset") || ! params["offset"].is_number_integer()
+            || ! params.contains("data") || ! params["data"].is_string())
+        {
+            if (error.empty()) error = "model payload chunk is missing or invalid";
+            return {};
+        }
+        const auto offset = params["offset"].get<std::int64_t>();
+        if (offset < 0)
+        {
+            error = "model payload chunk is missing or invalid";
+            return {};
+        }
+        const auto result = g_modelPayloads.appendBase64(
+            transferId, static_cast<std::uint64_t>(offset),
+            params["data"].get<std::string>());
+        if (! acceptModelPayloadResult(result, error))
+            return {};
+        return json { { "receivedBytes", result.receivedBytes } };
+    }
+
+    if (method == "model_payload_commit")
+    {
+        std::string transferId;
+        if (! readModelPayloadTransferId(params, transferId, error))
+            return {};
+        const auto result = g_modelPayloads.commit(transferId);
+        if (! acceptModelPayloadResult(result, error) || ! result.payload)
+            return {};
+        const auto& key = result.payload->key();
+        return json { { "assetId", key.id }, { "version", key.version },
+                      { "contentSha256", key.contentSha256 },
+                      { "sourceMediaType", key.sourceMediaType },
+                      { "sourceByteSize", key.sourceByteSize } };
+    }
+
+    if (method == "model_payload_animation_compatibility")
+    {
+        visualanimationimport::ExactContentAssetKey key;
+        if (!readModelPayloadKey(params, key, error))
+            return {};
+        std::optional<std::size_t> sceneIndex;
+        if (params.contains("sceneIndex") && !params["sceneIndex"].is_null())
+        {
+            std::uint64_t requestedScene = 0;
+            if (!readUnsignedInteger(params["sceneIndex"], requestedScene)
+                || requestedScene > std::numeric_limits<std::size_t>::max())
+            {
+                error = "model payload animation compatibility scene is invalid";
+                return {};
+            }
+            sceneIndex = static_cast<std::size_t>(requestedScene);
+        }
+
+        const auto payload = g_modelPayloads.resolvePreview(key);
+        if (!payload)
+        {
+            error = "model payload animation compatibility bytes are unavailable";
+            return {};
+        }
+        videohelper::modelpayload::ImportedAnimatedSceneCompatibility compatibility;
+        const auto inspected
+            = videohelper::modelpayload::ImportedAnimatedScenePayloadExecution::inspectCompatibility(
+                payload, sceneIndex, compatibility, error);
+        if (!inspected)
+            return {};
+
+        // Compatibility inspection and preview/export share the same exact-content
+        // owner. Removing it here can invalidate a request that resolves the key
+        // immediately after this RPC. The bounded store evicts only payloads with no
+        // active preview/export owner when a later commit needs capacity.
+
+        json clips = json::array();
+        for (const auto& clip : compatibility.clips)
+            clips.push_back({
+                { "stableId", clip.stableId },
+                { "name", clip.name },
+                { "compatibleMeshStableIds", clip.compatibleMeshStableIds }
+            });
+        return json { { "clips", std::move(clips) } };
+    }
+
+    if (method == "model_payload_abort")
+    {
+        std::string transferId;
+        if (! readModelPayloadTransferId(params, transferId, error))
+            return {};
+        const auto result = g_modelPayloads.abort(transferId);
+        if (! acceptModelPayloadResult(result, error))
+            return {};
+        return json { { "aborted", true }, { "receivedBytes", result.receivedBytes } };
+    }
+
+    if (method == "model_payload_preview" || method == "model_payload_export")
+    {
+        videohelper::modelpayload::ImportedSceneRequest request;
+        if (!readImportedSceneRequest(params, request, error))
+            return {};
+
+        videohelper::modelpayload::ImportedSceneExecutionReceipt receipt;
+        const auto executed = method == "model_payload_preview"
+            ? g_importedScenePayloadExecution.executePreview(request, receipt, error)
+            : g_importedScenePayloadExecution.executeExport(request, receipt, error);
+        if (!executed)
+            return {};
+
+        const auto& frame = receipt.frame.rendered;
+        const auto& stats = frame.stats;
+        return json {
+            { "rendered", true },
+            { "use", method == "model_payload_preview" ? "preview" : "export" },
+            { "assetId", receipt.payload->key().id },
+            { "version", receipt.payload->key().version },
+            { "contentSha256", receipt.payload->key().contentSha256 },
+            { "sourceByteSize", receipt.admission.sourceBytes },
+            { "selectedScene", receipt.admission.selectedScene },
+            { "width", frame.dimensions.width },
+            { "height", frame.dimensions.height },
+            { "backend", frame.nativeFrame->backend() },
+            { "drawCount", stats.drawCount },
+            { "ordinaryDrawCount", stats.ordinaryDrawCount },
+            { "instancedDrawCount", stats.instancedDrawCount },
+            { "instanceBufferUploadCount", stats.instanceBufferUploadCount },
+            { "submittedInstanceCount", stats.submittedInstanceCount },
+            { "noteInstanceDrawCount", stats.noteInstanceDrawCount },
+            { "noteInstanceTransformUploadCount", stats.noteInstanceTransformUploadCount },
+            { "submittedNoteInstanceCount", stats.submittedNoteInstanceCount },
+            { "staticUploadCount", stats.staticUploadCount },
+            { "reusedStaticResources", stats.reusedStaticResources },
+            { "supportedSubset", receipt.frame.supportedSubset },
+            { "downstreamHandoffComplete", receipt.frame.downstreamHandoffComplete }
+        };
+    }
+
+    if (method == "model_payload_animation_preview"
+        || method == "model_payload_animation_export")
+    {
+        videohelper::modelpayload::ImportedAnimatedSceneRequest request;
+        if (! readImportedAnimatedSceneRequest(params, request, error))
+            return {};
+        videohelper::modelpayload::ImportedAnimatedSceneReceipt receipt;
+        const bool preview = method == "model_payload_animation_preview";
+        const bool executed = preview
+            ? g_importedAnimatedScenePayloadExecution.executePreview(request, receipt, error)
+            : g_importedAnimatedScenePayloadExecution.executeExport(request, receipt, error);
+        if (! executed)
+            return {};
+        return json {
+            { "rendered", true },
+            { "use", preview ? "preview" : "export" },
+            { "assetId", receipt.payload->key().id },
+            { "sourceStableId", receipt.source->sourceStableId },
+            { "deformationStableId", receipt.source->deformationStableId },
+            { "backend", receipt.frame.nativeFrame->backend() },
+            { "dispatchCount", receipt.frame.stats.dispatchCount },
+            { "drawCount", receipt.frame.stats.drawCount }
+        };
+    }
 
     if (method == "gpu_backend_info" || method == "gpu_backend_selftest")
     {
@@ -1680,7 +2025,9 @@ json handle (const std::string& method, const json& params, std::string& error)
 
     if (method == "recipe_preview")
     {
-        if (g_export.active.load() || g_renderCache.active.load())
+        auto compositorLease = g_compositorOwnership.tryClaim (
+            videohelper::CompositorOwnershipGate::Owner::recipePreview);
+        if (! compositorLease)
         {
             error = "production GPU compositor is busy";
             return {};
@@ -1696,39 +2043,20 @@ json handle (const std::string& method, const json& params, std::string& error)
             error = "recipe preview dimensions are outside the bounded GPU preview size";
             return {};
         }
-        job.durationSec = 1.0 / std::max(1.0, job.fps);
-        job.startSec = 0.0;
-        job.endSec = job.durationSec;
-        job.encoder = "software";
-        job.codec = "h264";
-        std::string encoder, interpolation;
-        bool gpuComposited = false;
-        error = runExport(job, encoder, gpuComposited, interpolation, nullptr);
+        CompositeFrameResult frame;
+        error = renderCompositeFrame(job, 0.0, frame, &g_modelPayloads);
         if (! error.empty()) return {};
-        if (! gpuComposited)
-        {
-            std::filesystem::remove(job.outPath);
-            error = "recipe preview requires the production GPU compositor";
+        if (! videohelper::validateRecipePreviewPixels(
+                frame.width, frame.height, frame.rgba.size(),
+                frame.compositorBackend, error))
             return {};
-        }
-        MediaContext rendered;
-        if (auto openError = rendered.open(job.outPath, false); ! openError.empty())
-        {
-            std::filesystem::remove(job.outPath);
-            error = openError;
-            return {};
-        }
-        std::vector<std::string> paths;
-        error = rendered.writeThumbnails({ 0.0 }, job.width, job.height,
-            params.value("previewDirectory", std::string {}),
-            params.value("previewBaseName", std::string { "visual-recipe" }), paths);
-        std::filesystem::remove(job.outPath);
-        if (! error.empty() || paths.empty())
-        {
-            if (error.empty()) error = "recipe preview produced no rendered image";
-            return {};
-        }
-        return json { { "path", paths.front() }, { "gpuComposited", true } };
+        return json {
+            { "width", frame.width }, { "height", frame.height },
+            { "format", "rgba8" }, { "rgbaBase64", base64Encode(frame.rgba) },
+            { "compositorBackend", frame.compositorBackend },
+            { "presentationBackend", frame.presentationBackend },
+            { "gpuComposited", true }
+        };
     }
 
     if (method == "thumbnails")
@@ -1793,7 +2121,7 @@ json handle (const std::string& method, const json& params, std::string& error)
                 job.visualLayerPlans, identityRecords, error))
             return {};
         CompositeFrameResult frame;
-        error = renderCompositeFrame (job, timelineSec, frame);
+        error = renderCompositeFrame (job, timelineSec, frame, &g_modelPayloads);
         if (! error.empty()) return {};
         return json {
             { "width", frame.width }, { "height", frame.height },
@@ -2247,11 +2575,36 @@ json handle (const std::string& method, const json& params, std::string& error)
         // M5 Block C live score: same wire schema as the export jobSpec's
         // `score`. Empty/absent ⇒ clears the live score (shaders zero-feed).
         arbitmod::Score score;
+        std::string scoreError;
         if (params.contains ("score") && params["score"].is_object())
-            parseScoreJson (params["score"], score);
+        {
+            if (!videohelper::scorejson::parseScoreJson(params["score"], score, scoreError))
+            {
+                error = scoreError;
+                return {};
+            }
+        }
         else if (params.contains ("notes") || params.contains ("rootFreq"))
-            parseScoreJson (params, score); // flat form
-        g_viewport.setScore (std::move (score));
+        {
+            if (!videohelper::scorejson::parseScoreJson(params, score, scoreError))
+            {
+                error = scoreError;
+                return {};
+            }
+        }
+        const canonicalblockc::OwnerIdentity identity {
+            params.value("projectGeneration", uint64_t { 0 }),
+            params.value("sourceGeneration", uint64_t { 0 }),
+            params.value("helperGeneration", uint64_t { 0 }),
+            params.value("backendGeneration", uint64_t { 0 }),
+            params.value("deviceGeneration", uint64_t { 0 }),
+            params.value("scoreGeneration", uint64_t { 0 }),
+            params.value("beatMapGeneration", uint64_t { 0 }),
+            params.value("fpsGeneration", uint64_t { 0 }),
+            params.value("loopGeneration", uint64_t { 0 }),
+            params.value("seekGeneration", uint64_t { 0 })
+        };
+        g_viewport.setScore (std::move (score), identity);
         return json { { "ok", true } };
     }
 
@@ -2259,6 +2612,22 @@ json handle (const std::string& method, const json& params, std::string& error)
     {
         g_viewport.setBeatTimeline(parseBeatTimelineJson(
             params, params.value("bpm", 120.0), params.value("beatsPerBar", 4.0)));
+        return json { { "ok", true } };
+    }
+
+    if (method == "viewport_set_block_c_lifecycle")
+    {
+        g_viewport.setBlockCLifecycle ({
+            params.value("projectGeneration", uint64_t { 0 }),
+            params.value("sourceGeneration", uint64_t { 0 }),
+            params.value("helperGeneration", uint64_t { 0 }),
+            params.value("backendGeneration", uint64_t { 0 }),
+            params.value("deviceGeneration", uint64_t { 0 }),
+            params.value("scoreGeneration", uint64_t { 0 }),
+            params.value("beatMapGeneration", uint64_t { 0 }),
+            params.value("fpsGeneration", uint64_t { 0 }),
+            params.value("loopGeneration", uint64_t { 0 }),
+            params.value("seekGeneration", uint64_t { 0 }) });
         return json { { "ok", true } };
     }
 
@@ -2704,6 +3073,8 @@ json handle (const std::string& method, const json& params, std::string& error)
         }
         closeAllCaptureSessions();
         cancelAllRecorderSessions();
+        g_importedScenePayloadExecution.reset();
+        g_modelPayloads.reset();
 #if ARBIT_HAVE_VIEWPORT
         g_viewport.close();
 #endif
@@ -2743,22 +3114,22 @@ int main (int argc, char** argv)
         std::fprintf(stderr, "missing private programmable-runtime session secret\n");
         return 2;
     }
-    programmableruntime::SessionSecret sessionSecret {};
-    std::copy_n(sessionPacket.begin(), sessionSecret.size(), sessionSecret.begin());
-    uint64_t sessionGeneration = 0;
-    for (size_t i = sessionSecret.size(); i < sessionPacket.size(); ++i)
-        sessionGeneration = (sessionGeneration << 8) | sessionPacket[i];
-    programmableadmission::verifier().reset(std::move(sessionSecret), sessionGeneration);
-    volatile uint8_t* packetBytes = sessionPacket.data();
-    for (size_t i = 0; i < sessionPacket.size(); ++i) packetBytes[i] = 0;
+    bool privateSourceCleared = false;
+    if (! programmableadmission::installPrivateSessionPacket(
+            programmableadmission::verifier(), sessionPacket, &privateSourceCleared))
+    {
+        std::fprintf(stderr, "invalid private programmable-runtime session material\n");
+        return 2;
+    }
 #if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
+    testSourceZero = privateSourceCleared;
 #if defined(_WIN32)
     testPrivateFdClosed = true;
 #else
     testPrivateFdClosed = fcntl(3, F_GETFD) == -1 && errno == EBADF;
 #endif
     testPacketZero = std::all_of(sessionPacket.begin(), sessionPacket.end(), [](uint8_t b) { return b == 0; });
-    testSourceZero = std::all_of(sessionSecret.begin(), sessionSecret.end(), [](uint8_t b) { return b == 0; });
+
     const std::string marker = "M6_PRIVATE_CHANNEL_MARKER";
     for (int i = 0; i < argc; ++i) testMarkerInArgvOrEnv |= std::string(argv[i]).find(marker) != std::string::npos;
 #if ! defined(_WIN32)
@@ -2951,6 +3322,8 @@ int main (int argc, char** argv)
     }
     closeAllCaptureSessions();
     cancelAllRecorderSessions();
+    g_importedScenePayloadExecution.reset();
+    g_modelPayloads.reset();
 #if ARBIT_HAVE_VIEWPORT
     g_viewport.close();
 #endif

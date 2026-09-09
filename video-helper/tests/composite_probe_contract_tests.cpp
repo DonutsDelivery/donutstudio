@@ -88,11 +88,33 @@ int main()
     videohelper::CompositorOwnershipGate gate;
     auto exportLease = gate.tryClaim(videohelper::CompositorOwnershipGate::Owner::exportJob);
     check (exportLease && ! gate.tryClaim(videohelper::CompositorOwnershipGate::Owner::frameProbe)
-               && ! gate.tryClaim(videohelper::CompositorOwnershipGate::Owner::renderCache),
-           "one atomic gate deterministically excludes probe and cache during export");
+               && ! gate.tryClaim(videohelper::CompositorOwnershipGate::Owner::renderCache)
+               && ! gate.tryClaim(videohelper::CompositorOwnershipGate::Owner::recipePreview),
+           "one atomic gate deterministically excludes preview, probe, and cache during export");
     exportLease.reset();
     check (gate.tryClaim(videohelper::CompositorOwnershipGate::Owner::frameProbe) != nullptr,
            "RAII completion releases compositor ownership");
+
+    videohelper::CompositorOwnershipGate previewGate;
+    auto previewLease = previewGate.tryClaim(
+        videohelper::CompositorOwnershipGate::Owner::recipePreview);
+    check (previewLease
+               && ! previewGate.tryClaim(videohelper::CompositorOwnershipGate::Owner::exportJob)
+               && ! previewGate.tryClaim(videohelper::CompositorOwnershipGate::Owner::frameProbe),
+           "recipe preview exclusively owns the shared production compositor");
+
+    std::string previewError;
+    check (videohelper::validateRecipePreviewPixels(
+               320, 180, 320u * 180u * 4u, "opengl", previewError),
+           "recipe preview admits complete production GPU pixels");
+    check (! videohelper::validateRecipePreviewPixels(
+               320, 180, 0, "opengl", previewError)
+               && previewError == "recipe preview produced incomplete production GPU pixels",
+           "recipe preview fails closed on absent rendered pixels");
+    check (! videohelper::validateRecipePreviewPixels(
+               320, 180, 320u * 180u * 4u, {}, previewError)
+               && previewError == "recipe preview produced no production GPU backend receipt",
+           "recipe preview fails closed without a production backend receipt");
 
     videohelper::CompositorOwnershipGate allocationFailureGate;
     bool sawBadAlloc = false;

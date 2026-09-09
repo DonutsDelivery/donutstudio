@@ -352,7 +352,7 @@ struct MetalShaderGenerator::Impl
 
     void encode (id<MTLCommandBuffer> command, MetalTarget& target, int passIndex,
                  const ShaderClock& clock, const AudioFeatures* audio,
-                 const NoteFeatures* notes,
+                 const ::canonicalblockc::CanonicalBlockCFrame* notes,
                  const std::map<std::string, double>* values,
                  const std::map<std::string, id<MTLTexture>>& targetReads)
     {
@@ -387,10 +387,10 @@ struct MetalShaderGenerator::Impl
             put (bytes, "uPeak", audio ? audio->peak : 0.0f);
             put (bytes, "uOnset", audio ? audio->onset : 0.0f);
             put (bytes, "uOnsetAge", audio ? audio->onsetAge : 0.0f);
-            const bool haveNotes = notes != nullptr && ! notes->notesTex.empty();
-            put (bytes, "uNoteCount", haveNotes ? notes->noteCount : 0);
-            put (bytes, "uLinkCount", haveNotes ? notes->linkCount : 0);
-            put (bytes, "uRootFreq", haveNotes ? notes->rootFreq : 0.0f);
+            const bool haveNotes = notes != nullptr && ! notes->noteTexture().empty();
+            put (bytes, "uNoteCount", haveNotes ? notes->noteRows() : 0);
+            put (bytes, "uLinkCount", haveNotes ? notes->linkRows() : 0);
+            put (bytes, "uRootFreq", haveNotes ? notes->rootFrequencyHz : 0.0f);
             auto value = [values] (const char* name, float fallback)
             {
                 if (values != nullptr)
@@ -437,7 +437,7 @@ struct MetalShaderGenerator::Impl
         const bool haveBands = audio != nullptr && ! audio->bands.empty();
         bindTexture (encoder, "uAudioBands", haveBands ? bands1D : black1D);
         bindTexture (encoder, "uAudioBands2D", haveBands ? bands2D : black2D);
-        const bool haveNotes = notes != nullptr && ! notes->notesTex.empty();
+        const bool haveNotes = notes != nullptr && ! notes->noteTexture().empty();
         bindTexture (encoder, "uNotes", haveNotes ? notesTexture : black2D);
         bindTexture (encoder, "uLinks", haveNotes ? linksTexture : black2D);
         for (const auto& param : params)
@@ -571,7 +571,9 @@ void MetalShaderGenerator::setImage (const std::string& name, const uint8_t* rgb
 
 uint32_t MetalShaderGenerator::renderViewUnlocked (
     const ShaderClock& clock, int width, int height, const AudioFeatures* audio,
-    const NoteFeatures* notes, const std::map<std::string, double>* genValues)
+    const ::canonicalblockc::CanonicalBlockCFrame* notes,
+    const std::map<std::string, double>* genValues,
+    const std::map<std::string, std::uintptr_t>* nativeImages)
 {
     if (impl_->pipeline == nil || ! impl_->ensureDefaults()
         || ! impl_->ensureRenderTargets (width, height)) return 0;
@@ -593,7 +595,7 @@ uint32_t MetalShaderGenerator::renderViewUnlocked (
         [impl_->bands2D replaceRegion:MTLRegionMake2D (0, 0, count, 1) mipmapLevel:0
                             withBytes:audio->bands.data() bytesPerRow:count * sizeof (float)];
     }
-    const bool haveNotes = notes != nullptr && ! notes->notesTex.empty();
+    const bool haveNotes = notes != nullptr && ! notes->noteTexture().empty();
     if (haveNotes)
     {
         if (impl_->notesTexture == nil)
@@ -602,19 +604,25 @@ uint32_t MetalShaderGenerator::renderViewUnlocked (
         if (impl_->linksTexture == nil)
             impl_->linksTexture = makeTexture (impl_->device, MTLPixelFormatRGBA32Float,
                                                 MTLTextureType2D, 256, 1);
-        if (notes->notesTex.size() >= 4u * 128u * 4u)
+        if (notes->noteTexture().size() >= 4u * 128u * 4u)
             [impl_->notesTexture replaceRegion:MTLRegionMake2D (0, 0, 4, 128) mipmapLevel:0
-                                       withBytes:notes->notesTex.data() bytesPerRow:4 * 4 * sizeof (float)];
-        if (notes->linksTex.size() >= 256u * 4u)
+                                       withBytes:notes->noteTexture().data() bytesPerRow:4 * 4 * sizeof (float)];
+        if (notes->linkTexture().size() >= 256u * 4u)
             [impl_->linksTexture replaceRegion:MTLRegionMake2D (0, 0, 256, 1) mipmapLevel:0
-                                       withBytes:notes->linksTex.data() bytesPerRow:256 * 4 * sizeof (float)];
+                                       withBytes:notes->linkTexture().data() bytesPerRow:256 * 4 * sizeof (float)];
     }
 
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) sg_mtl_command_queue();
     id<MTLCommandBuffer> command = [queue commandBuffer];
     if (! impl_->multipass)
     {
-        impl_->encode (command, impl_->output, 0, clock, audio, notes, genValues, {});
+        std::map<std::string, id<MTLTexture>> reads;
+        if (nativeImages != nullptr)
+            for (const auto& image : *nativeImages)
+                if (image.second != 0)
+                    reads.emplace(image.first, (__bridge id<MTLTexture>)
+                        reinterpret_cast<void*>(image.second));
+        impl_->encode (command, impl_->output, 0, clock, audio, notes, genValues, reads);
     }
     else
     {
@@ -630,6 +638,11 @@ uint32_t MetalShaderGenerator::renderViewUnlocked (
             MetalTarget& write = toOutput ? impl_->output
                 : impl_->passTargets[pass.persistent ? ((impl_->parity + 1) & 1) : 0][pass.target];
             std::map<std::string, id<MTLTexture>> reads;
+            if (nativeImages != nullptr)
+                for (const auto& image : *nativeImages)
+                    if (image.second != 0)
+                        reads.emplace(image.first, (__bridge id<MTLTexture>)
+                            reinterpret_cast<void*>(image.second));
             for (const auto& candidate : impl_->passes)
             {
                 if (candidate.target.empty()) continue;
@@ -653,6 +666,11 @@ uint32_t MetalShaderGenerator::renderViewUnlocked (
     }
     [command commit];
     return impl_->output.view.id;
+}
+
+std::uintptr_t MetalShaderGenerator::outputTextureHandle() const noexcept
+{
+    return reinterpret_cast<std::uintptr_t>((__bridge void*) impl_->output.texture);
 }
 
 void MetalShaderGenerator::shutdownUnlocked()

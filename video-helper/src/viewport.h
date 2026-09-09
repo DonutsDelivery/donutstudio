@@ -26,6 +26,7 @@
 #include "renderer.h" // videorender::EffectSlotState (GL-gated, like this file)
 #include "gpu_caps.h" // arbitgl::GpuCaps (P1 capability layer; dependency-free)
 #include "mod_defs.h" // arbitmod::Score (M5 Block C live score push); plain C++17
+#include "block_c_frame_owner.h"
 #include "beat_timeline.h"
 #include "video_control_plan.h"
 #include "render_snapshot.h"
@@ -42,6 +43,8 @@
 #include <vector>
 
 using ViewportSegment = videowire::RenderSegment;
+
+namespace videohelper::modelpayload { class Store; }
 
 // Per-clip graph parameters (Transform2D + Source compositing + effects).
 // Vocabulary mirrors the original editor's CompositorLayer/keyframe model.
@@ -70,6 +73,7 @@ struct ClipGraphParams
     // .genParams so the live viewport drives the shader's uniforms identically.
     // Keys absent here fall back to the shader's own ISF default at upload time.
     std::map<std::string, double> genParams;
+    std::map<std::string, double> visualParams;
 };
 
 // One slot description for graph_set_effects (bulk rack configuration).
@@ -150,7 +154,7 @@ struct ViewportInfo
 class Viewport
 {
 public:
-    Viewport();
+    explicit Viewport(videohelper::modelpayload::Store* modelPayloadStore = nullptr);
     void setDepthCacheRoot(std::string root);
     ~Viewport(); // ctor/dtor out-of-line: Impl is incomplete here
 
@@ -257,7 +261,8 @@ public:
     // BlockCPacker (audio-tier note features are zero until the Block B live shm
     // lands). Empty score = the zero-feed (uNoteCount 0), byte-identical to
     // never calling this.
-    void setScore (arbitmod::Score score);
+    void setScore (arbitmod::Score score, canonicalblockc::OwnerIdentity identity);
+    void setBlockCLifecycle (canonicalblockc::OwnerIdentity identity);
 
     // M6 mod-matrix live preview: the owned cross-domain routings (clock/score/
     // audio → clip param). Mirrors the export jobSpec's `modMatrix`; Arbit pushes
@@ -394,11 +399,14 @@ public:
     std::string scopeDataJson() const;
 
 private:
+    struct CanvasExtent { int width = 0, height = 0; uint64_t generation = 0; };
     void renderLoop (int width, int height, int x, int y, bool alwaysOnTop,
                      double targetFps);
+    CanvasExtent canvasExtent() const;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    videohelper::modelpayload::Store* modelPayloadStore_ = nullptr;
     std::string depthCacheRoot_;
     std::thread thread_;
     std::atomic<bool> running_ { false };
@@ -411,7 +419,9 @@ private:
     // Project canvas + viewport-only view transform ("view/zoom|panX|panY"
     // params). On the Viewport (not Impl) so they survive close/reopen; the
     // render loop reads them every frame.
-    std::atomic<int> canvasW_ { 0 }, canvasH_ { 0 };
+    mutable std::mutex canvasMutex_;
+    int canvasW_ = 0, canvasH_ = 0;
+    uint64_t canvasGeneration_ = 0;
     std::atomic<bool> canvasFrameEnabled_ { true };
     std::atomic<double> viewZoom_ { 1.0 }, viewPanX_ { 0.0 }, viewPanY_ { 0.0 };
 

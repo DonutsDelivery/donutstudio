@@ -3,6 +3,7 @@
 #include "render_snapshot.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -82,6 +83,30 @@ inline bool validateCompositeProbeContract (
             error = "current authored clip plan is invalid or not exportable in this snapshot";
             return false;
         }
+    return true;
+}
+
+inline bool validateRecipePreviewPixels (int width, int height,
+                                         size_t rgbaBytes,
+                                         const std::string& compositorBackend,
+                                         std::string& error)
+{
+    error.clear();
+    if (width < 1 || height < 1 || width > 640 || height > 360)
+    {
+        error = "recipe preview dimensions are outside the bounded GPU preview size";
+        return false;
+    }
+    if (compositorBackend.empty())
+    {
+        error = "recipe preview produced no production GPU backend receipt";
+        return false;
+    }
+    if (rgbaBytes != static_cast<size_t>(width) * static_cast<size_t>(height) * 4)
+    {
+        error = "recipe preview produced incomplete production GPU pixels";
+        return false;
+    }
     return true;
 }
 } // namespace videohelper

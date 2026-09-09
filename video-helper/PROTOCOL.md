@@ -225,7 +225,7 @@ Every parameter has a stable string ID `clip<id>/<node>/<param>`:
 
 | node | params | meaning |
 |---|---|---|
-| `source` | `opacity` (0–1), `visible` (0/1), `zOrder`, `blendMode` (0 normal, 1 add, 2 multiply, 3 screen, 4 overlay) | compositing controls; vocabulary mirrors the original editor's `CompositorLayer` |
+| `source` | `opacity` (0–1), `visible` (0/1), `zOrder`, `blendMode` (0 normal, 1 add, 2 multiply, 3 screen, 4 overlay, 5 difference, 6 exclusion, 7 darken, 8 lighten, 9 color dodge, 10 color burn, 11 soft light, 12 hard light) | compositing controls; values are append-only because projects and automation persist the integer wire value |
 | `transform2d` | `scale`, `translateX`, `translateY` (NDC, −2..2), `rotation` (deg), `cropLeft`, `cropRight`, `cropTop`, `cropBottom` (0–1 fraction removed) | crop remaps texture coordinates before the letterbox fit + transform |
 | `effect<slot>` | `type` (videofx::EffectType, −1 empty), `enabled` (0/1), then per-effect params by wire name (see `src/effect_defs.h`, e.g. `clip7/effect2/radius`) | ordered rack, slots 0–7; single uber-shader pass keyed by effect bitmask, blur/sharpen as a neighborhood pass |
 | `mask` | `type` (0 none, 1 rect, 2 ellipse), `cx`, `cy` (shape centre), `w`, `h` (full extents), `feather`, `invert` (0/1) | per-clip shape mask (Jun 2026): multiplies the layer alpha in the geometry pass, so the masked alpha feeds the blend/composite. Coordinates are normalized 0..1 over the clip's **displayed (post-crop) frame**, origin top-left, +y down — the mask travels with the clip through translate/rotate/scale. `feather` is an edge-soften width in the same units (rect: inward from the edge; ellipse: scaled by the mean extent so it visually matches). cx/cy/w/h/feather are automatable; type/invert are static. |
@@ -668,6 +668,12 @@ encoder/interpolation/audioPath/durationSec/startSec/endSec):
   — the symbolic note/link timeline for shader generators' **Block C**
   (§Shader generators). The exporter runs the A2 packer over it once per frame
   to fill `uNotes`/`uLinks`/`uNoteCount`/`uLinkCount`/`uRootFreq` and the score
+  identity textures. `score.schemaVersion` selects identity semantics. Writers
+  emit version 2. Version 1, including payloads without the field, maps the old
+  `linkMasterId == -1` absence value to zero. Version 2 reserves only zero for no
+  master, so negative nonzero projected identities remain valid. Malformed and
+  unknown versions are rejected. Note, link, endpoint, and pitch-anchor
+  identities may be negative; zero is invalid.
   window uniforms. `historyBeats` defaults to 8 and `lookaheadBeats` to 16.
   Omitted or `notes: []` ⇒ Block C stays zero-fed. GL path only.
 - `modMatrix: [{source: {type, trackId?, pitchLo?, pitchHi?, primeIndex?, axis?,

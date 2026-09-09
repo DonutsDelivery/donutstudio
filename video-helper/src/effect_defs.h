@@ -60,6 +60,16 @@ enum class EffectType : int
     PolarSwirl,
     DisplaceRgb,
     Pixelate,
+    // Native production filter passes. These intentionally have no color
+    // uber-shader mask bits and execute as ordered, bounded ping-pong passes.
+    Glow,
+    Bloom,
+    Halation,
+    LensDistortion,
+    Denoise,
+    DirectionalBlur,
+    UnsharpMask,
+    HighPassSharpen,
     Count
 };
 
@@ -98,6 +108,14 @@ static constexpr int kEffectBits[kEffectTypeCount] = {
     67108864,  // PolarSwirl
     134217728, // DisplaceRgb
     268435456, // Pixelate
+    0, // Glow (ordered native filter pass)
+    0, // Bloom (ordered native filter pass)
+    0, // Halation (ordered native filter pass)
+    0, // LensDistortion (ordered native filter pass)
+    0, // Denoise (ordered native filter pass)
+    0, // DirectionalBlur (ordered native filter pass)
+    0, // UnsharpMask (ordered native filter pass)
+    0, // HighPassSharpen (ordered native filter pass)
 };
 
 // Max parameters any single effect exposes (ColorWheels has 9: lift/gamma/
@@ -239,6 +257,36 @@ static constexpr EffectDef kEffectDefs[kEffectTypeCount] = {
     // Mosaic: snap UVs to a coarse grid; `size` is the block edge in px.
     { EffectType::Pixelate, "pixelate", "Pixelate", "Geometry", 268435456,
       1, { { "size", "Size", 8.0f, 1.0f, 128.0f, 1.0f, "px" } } },
+    // ---- Common production filters (Phase 5 item 10). Append-only. Their
+    // parameters are the exact graph payload and renderer rack contract.
+    { EffectType::Glow, "glow", "Glow", "Filters", 0,
+      2, { { "intensity", "Intensity", 0.5f, 0.0f, 3.0f, 0.01f, "" },
+           { "radius", "Radius", 6.0f, 0.0f, 20.0f, 0.5f, "px" } } },
+    { EffectType::Bloom, "bloom", "Bloom", "Filters", 0,
+      3, { { "threshold", "Threshold", 0.8f, 0.0f, 2.0f, 0.01f, "" },
+           { "intensity", "Intensity", 0.5f, 0.0f, 3.0f, 0.01f, "" },
+           { "radius", "Radius", 6.0f, 0.0f, 20.0f, 0.5f, "px" } } },
+    { EffectType::Halation, "halation", "Halation", "Filters", 0,
+      3, { { "threshold", "Threshold", 0.7f, 0.0f, 2.0f, 0.01f, "" },
+           { "radius", "Radius", 8.0f, 0.0f, 20.0f, 0.5f, "px" },
+           { "intensity", "Intensity", 0.35f, 0.0f, 2.0f, 0.01f, "" } } },
+    { EffectType::LensDistortion, "lens_distortion", "Lens Distortion", "Geometry", 0,
+      2, { { "distortion", "Distortion", 0.0f, -1.0f, 1.0f, 0.01f, "" },
+           { "chromaticAberration", "Chromatic Aberration", 0.0f, 0.0f, 0.05f,
+             0.001f, "" } } },
+    { EffectType::Denoise, "denoise", "Denoise", "Filters", 0,
+      2, { { "strength", "Strength", 0.5f, 0.0f, 1.0f, 0.01f, "" },
+           { "radius", "Radius", 2.0f, 1.0f, 4.0f, 1.0f, "px" } } },
+    { EffectType::DirectionalBlur, "directional_blur", "Directional Blur", "Filters", 0,
+      2, { { "radius", "Radius", 6.0f, 0.0f, 20.0f, 0.5f, "px" },
+           { "angle", "Angle", 0.0f, -180.0f, 180.0f, 1.0f, "deg" } } },
+    { EffectType::UnsharpMask, "unsharp_mask", "Unsharp Mask", "Filters", 0,
+      3, { { "amount", "Amount", 1.0f, 0.0f, 5.0f, 0.1f, "" },
+           { "radius", "Radius", 1.5f, 0.5f, 10.0f, 0.5f, "px" },
+           { "threshold", "Threshold", 0.0f, 0.0f, 1.0f, 0.01f, "" } } },
+    { EffectType::HighPassSharpen, "high_pass_sharpen", "High-Pass Sharpen", "Filters", 0,
+      2, { { "amount", "Amount", 1.0f, 0.0f, 5.0f, 0.1f, "" },
+           { "radius", "Radius", 2.0f, 0.5f, 10.0f, 0.5f, "px" } } },
 };
 
 inline const EffectDef* effectDefFor(int type)
@@ -270,15 +318,25 @@ inline int effectParamIndex(int type, const char* paramName)
 enum class BlendMode : int
 {
     Normal = 0,
-    Add,
-    Multiply,
-    Screen,
-    Overlay,
-    Count
+    Add = 1,
+    Multiply = 2,
+    Screen = 3,
+    Overlay = 4,
+    Difference = 5,
+    Exclusion = 6,
+    Darken = 7,
+    Lighten = 8,
+    ColorDodge = 9,
+    ColorBurn = 10,
+    SoftLight = 11,
+    HardLight = 12,
+    Count = 13
 };
 
 static constexpr const char* kBlendModeNames[static_cast<int>(BlendMode::Count)] = {
-    "Normal", "Add", "Multiply", "Screen", "Overlay",
+    "Normal", "Add", "Multiply", "Screen", "Overlay", "Difference",
+    "Exclusion", "Darken", "Lighten", "Color Dodge", "Color Burn",
+    "Soft Light", "Hard Light",
 };
 
 // Transition types — values match the reference editor's TransitionType enum

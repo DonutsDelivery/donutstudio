@@ -1,10 +1,15 @@
 #include "../../plugin/Source/SidecarProcessManager.h"
 #include "../../plugin/Source/ProgrammableRuntimeAuthority.h"
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <mutex>
 #include <thread>
 #if ! JUCE_WINDOWS
 #include <cerrno>
@@ -45,6 +50,223 @@ static SidecarProcessManager::Config configFor(const juce::File& helper,
     return config;
 }
 
+class MutexBoundaryBlock
+{
+public:
+    using Authority = HarmonicMIDI::ProgrammableRuntimeAuthority;
+    using Operation = Authority::MutexOperation;
+
+    explicit MutexBoundaryBlock (Operation operation)
+        : operation_(operation), deadline_(std::chrono::steady_clock::now() + timeout) {}
+
+    static void callback (Operation operation, void* context)
+    {
+        auto& block = *static_cast<MutexBoundaryBlock*>(context);
+        if (operation != block.operation_)
+            return;
+
+        std::unique_lock<std::mutex> lock(block.mutex_);
+        block.arrived_ = true;
+        block.condition_.notify_all();
+        if (!block.condition_.wait_until(lock, block.deadline_, [&] { return block.released_; }))
+            block.timedOut_ = true;
+    }
+
+    bool waitUntilArrived()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_until(lock, deadline_, [&] { return arrived_; });
+    }
+
+    void release()
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        condition_.notify_all();
+    }
+
+    bool timedOut() const
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return timedOut_;
+    }
+
+private:
+    static constexpr auto timeout = std::chrono::seconds(5);
+    const Operation operation_;
+    const std::chrono::steady_clock::time_point deadline_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    bool arrived_ = false;
+    bool released_ = false;
+    bool timedOut_ = false;
+};
+
+class ThreadCompletion
+{
+public:
+    void signal()
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        done_ = true;
+        condition_.notify_all();
+    }
+
+    bool wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(5), [&] { return done_; });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool done_ = false;
+};
+
+[[noreturn]] static void failBoundedConcurrencyTest()
+{
+    std::abort();
+}
+
+template <typename Contender, typename Winner>
+static void forceMutexOrder (HarmonicMIDI::ProgrammableRuntimeAuthority& authority,
+                             HarmonicMIDI::ProgrammableRuntimeAuthority::MutexOperation blockedOperation,
+                             Contender contender, Winner winner)
+{
+    MutexBoundaryBlock boundary(blockedOperation);
+    ThreadCompletion completion;
+    authority.setMutexBoundaryCallbackForTest(&MutexBoundaryBlock::callback, &boundary);
+    std::thread thread([&]
+    {
+        contender();
+        completion.signal();
+    });
+
+    if (!boundary.waitUntilArrived())
+    {
+        boundary.release();
+        if (!completion.wait()) failBoundedConcurrencyTest();
+        thread.join();
+        failBoundedConcurrencyTest();
+    }
+
+    winner();
+    boundary.release();
+    if (!completion.wait()) failBoundedConcurrencyTest();
+    thread.join();
+    authority.setMutexBoundaryCallbackForTest(nullptr, nullptr);
+    if (boundary.timedOut()) failBoundedConcurrencyTest();
+}
+
+static void proveAuthorityRollover()
+{
+    using Authority = HarmonicMIDI::ProgrammableRuntimeAuthority;
+    using Kind = programmableruntime::PayloadKind;
+    using Operation = Authority::MutexOperation;
+    std::ifstream sourceStream(AUTHORITY_CURATED_SOURCE, std::ios::binary);
+    const juce::String curated(std::string(std::istreambuf_iterator<char>(sourceStream), {}));
+    const juce::String ordinary("function frame(ctx) return 1 end");
+    assert(curated.isNotEmpty());
+
+    Authority authority;
+    programmableruntime::SessionSecret firstSecret {}; firstSecret.fill(0x31);
+    programmableruntime::SessionSecret secondSecret {}; secondSecret.fill(0x42);
+    authority.beginHelperSession(firstSecret, 100);
+    authority.approve(Kind::lua, ordinary);
+    authority.approveVerifiedBundledCurated(Kind::shader, curated,
+        "arbit-essentials-shaders-v1", "aurora_drift");
+    assert(authority.project(Kind::lua, ordinary, true).nonce == 1);
+    const auto oldCurated = authority.project(Kind::shader, curated, false);
+    assert(oldCurated.approved && oldCurated.nonce == 2);
+    assert(oldCurated.verifiedBundledCurated);
+    assert(oldCurated.catalogPackId == "arbit-essentials-shaders-v1");
+    assert(oldCurated.catalogProgramId == "aurora_drift");
+
+    authority.beginHelperSession(secondSecret, 101);
+    assert(!authority.isApproved(Kind::lua, ordinary));
+    assert(!authority.isVerifiedBundledCurated(Kind::shader, curated));
+    assert(!authority.project(Kind::lua, ordinary, true).approved);
+    assert(!authority.project(Kind::shader, curated, false).approved);
+
+    // Ordinary reapproval must not inherit the previous session's catalog identity.
+    authority.approve(Kind::shader, curated);
+    const auto ordinaryCuratedSource = authority.project(Kind::shader, curated, true);
+    assert(ordinaryCuratedSource.approved && ordinaryCuratedSource.nonce == 1);
+    assert(ordinaryCuratedSource.sessionGeneration == 101);
+    assert(!ordinaryCuratedSource.verifiedBundledCurated);
+    assert(ordinaryCuratedSource.catalogPackId.empty());
+    assert(ordinaryCuratedSource.catalogProgramId.empty());
+
+    authority.approveVerifiedBundledCurated(Kind::shader, curated,
+        "arbit-essentials-shaders-v1", "aurora_drift");
+    const auto restoredCurated = authority.project(Kind::shader, curated, false);
+    assert(restoredCurated.approved && restoredCurated.nonce == 2);
+    assert(restoredCurated.sessionGeneration == 101);
+    assert(restoredCurated.verifiedBundledCurated);
+    assert(restoredCurated.catalogPackId == "arbit-essentials-shaders-v1");
+    assert(restoredCurated.catalogProgramId == "aurora_drift");
+
+    // Approval completes before endHelperSession enters the authority mutex.
+    authority.clear();
+    forceMutexOrder(authority, Operation::endHelperSession,
+        [&] { authority.endHelperSession(); },
+        [&]
+        {
+            authority.approve(Kind::lua, ordinary);
+            assert(authority.isApproved(Kind::lua, ordinary));
+        });
+    assert(!authority.isApproved(Kind::lua, ordinary));
+    assert(!authority.project(Kind::lua, ordinary, true).approved);
+
+    // Projection completes before endHelperSession enters the authority mutex.
+    authority.beginHelperSession(secondSecret, 101);
+    authority.approve(Kind::lua, ordinary);
+    programmableruntime::Grant projectedBeforeEnd;
+    forceMutexOrder(authority, Operation::endHelperSession,
+        [&] { authority.endHelperSession(); },
+        [&] { projectedBeforeEnd = authority.project(Kind::lua, ordinary, true); });
+    assert(projectedBeforeEnd.approved && projectedBeforeEnd.nonce == 1);
+    assert(projectedBeforeEnd.sessionGeneration == 101);
+    assert(!authority.project(Kind::lua, ordinary, true).approved);
+
+    // endHelperSession completes before the attempted approval enters the mutex.
+    authority.beginHelperSession(secondSecret, 101);
+    forceMutexOrder(authority, Operation::approve,
+        [&] { authority.approve(Kind::lua, ordinary); },
+        [&] { authority.endHelperSession(); });
+    assert(authority.isApproved(Kind::lua, ordinary));
+    const auto approvedAfterEnd = authority.project(Kind::lua, ordinary, true);
+    assert(!approvedAfterEnd.approved && approvedAfterEnd.nonce == 0);
+    assert(approvedAfterEnd.sessionGeneration == 0);
+
+    // endHelperSession completes before the attempted projection enters the mutex.
+    authority.beginHelperSession(secondSecret, 101);
+    authority.approve(Kind::lua, ordinary);
+    programmableruntime::Grant projectedAfterEnd;
+    forceMutexOrder(authority, Operation::project,
+        [&] { projectedAfterEnd = authority.project(Kind::lua, ordinary, true); },
+        [&] { authority.endHelperSession(); });
+    assert(!projectedAfterEnd.approved && projectedAfterEnd.nonce == 0);
+    assert(projectedAfterEnd.sessionGeneration == 0);
+
+    authority.approveVerifiedBundledCurated(Kind::shader, curated,
+        "arbit-essentials-shaders-v1", "aurora_drift");
+    assert(!authority.project(Kind::shader, curated, false).approved);
+    authority.beginHelperSession(firstSecret, 102);
+    assert(!authority.isApproved(Kind::lua, ordinary));
+    assert(!authority.isVerifiedBundledCurated(Kind::shader, curated));
+    assert(!authority.project(Kind::lua, ordinary, true).approved);
+    assert(!authority.project(Kind::shader, curated, false).approved);
+    authority.approve(Kind::lua, ordinary);
+    const auto reapproved = authority.project(Kind::lua, ordinary, true);
+    assert(reapproved.approved && reapproved.nonce == 1 && reapproved.sessionGeneration == 102);
+
+    std::array<uint8_t, 32> wipeProbe {}; wipeProbe.fill(0xa5);
+    programmableruntime::detail::secureErase(wipeProbe.data(), wipeProbe.size());
+    assert(std::all_of(wipeProbe.begin(), wipeProbe.end(), [] (uint8_t byte) { return byte == 0; }));
+}
+
 #if defined(__linux__)
 static void proveMeasuredResourceLimit(SidecarProcessManager& manager, const char* mode)
 {
@@ -83,9 +305,16 @@ static void proveMeasuredResourceLimit(SidecarProcessManager& manager, const cha
 }
 #endif
 
-int main()
+int main (int argc, char** argv)
 {
     juce::MessageManager::getInstance();
+    proveAuthorityRollover();
+    if (argc == 2 && juce::String(argv[1]) == "--authority-only")
+    {
+        juce::MessageManager::deleteInstance();
+        return 0;
+    }
+
     const juce::File helper(PRIVATE_LIFECYCLE_HELPER);
     const auto matte = std::filesystem::temp_directory_path() /
         ("arbit-private-lifecycle-" + std::to_string(juce::Time::getHighResolutionTicks()));
@@ -181,6 +410,10 @@ int main()
     assert(error.containsIgnoreCase("session") || error.containsIgnoreCase("authentication"));
     programmableruntime::SessionSecret secretB {}; secretB.fill(0x77);
     authority.beginHelperSession(secretB, 16);
+    assert(!authority.isApproved(programmableruntime::PayloadKind::lua, source));
+    const auto unapprovedReplacementGrant =
+        authority.project(programmableruntime::PayloadKind::lua, source, true);
+    assert(!unapprovedReplacementGrant.approved && unapprovedReplacementGrant.nonce == 0);
     authority.approve(programmableruntime::PayloadKind::lua, source);
     const auto freshGrant = authority.project(programmableruntime::PayloadKind::lua, source, true);
     error.clear(); result = manager.sendRequestSync("viewport_set_script", makeScriptParams(freshGrant), 2000, error);

@@ -90,7 +90,7 @@ struct PitchBendPoint
 
 struct PitchAnchor
 {
-    int id = -1;
+    int id = 0;
     float position = 0.0f;
     float frequency = 0.0f;
 };
@@ -99,6 +99,14 @@ struct Note
 {
     struct NotationComma { int prime = 0; int exponent = 0; };
     int   id          = 0;
+    // Identity from the processor-owned timeline projection. durableKind 1 is a
+    // freeform note owned by durableNoteId. durableKind 2 is one projected clip
+    // note instance owned by clipId/clipNoteId and selected by repeatIndex.
+    int   durableKind = 0;
+    int   durableNoteId = -1;
+    int   clipId = -1;
+    int   clipNoteId = -1;
+    int   repeatIndex = -1;
     int   trackId     = 0;
     float startBeat   = 0.0f;
     float lengthBeats = 1.0f;
@@ -111,7 +119,7 @@ struct Note
     int   ratioNum    = 1;          // reduced interval vs root
     int   ratioDen    = 1;
     float primes[6]   = {0,0,0,0,0,0};  // exponents of 2,3,5,7,11,13
-    int   linkMasterId = -1;        // master note id, or -1
+    int   linkMasterId = 0;         // master note id, or zero when absent
     bool  isRoot      = false;
     float centsOffset = 0.0f;
     int edoStep = -1;
@@ -557,7 +565,7 @@ struct ModSource
     float pitchHi      = 127.0f;
     int   primeIndex   = 1;        // PrimeEnergy: INDEX not prime number (0=2,1=3,2=5,3=7,4=11,5=13)
     int   axis         = 0;        // Lissajous axis (0=num,1=den)
-    int   linkId       = -1;       // HarmLinkRatio / HarmBeatingRate target
+    int   linkId       = 0;        // HarmLinkRatio / HarmBeatingRate target; zero = aggregate/absent
     int   band         = 0;        // AudioBand index
     int   lissajousK   = 7;        // Lissajous octave slowdown
     float triggerDecayBeats = 0.5f;// NoteTrigger / RootTrigger exp decay
@@ -653,7 +661,7 @@ inline float evaluateSource (const ModSource& s, const Score& score,
         }
         case SourceType::HarmBeatingRate:
         {
-            if (s.linkId >= 0) { const Link* l = score.linkById (s.linkId); return l ? beatingRate (*l, score) : 0.0f; }
+            if (s.linkId != 0) { const Link* l = score.linkById (s.linkId); return l ? beatingRate (*l, score) : 0.0f; }
             // track variant: max beating rate over links whose slave is on the track
             float maxB = 0.0f;
             for (const auto& l : score.links)

@@ -9,7 +9,7 @@ namespace videohelper
 class CompositorOwnershipGate
 {
 public:
-    enum class Owner : uint8_t { none, exportJob, renderCache, frameProbe };
+    enum class Owner : uint8_t { none, exportJob, renderCache, frameProbe, recipePreview };
 
     class Lease
     {
