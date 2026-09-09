@@ -157,7 +157,7 @@ bool compileSpirv (const std::string& source, std::vector<uint32_t>& words,
         GLSLANG_SOURCE_GLSL, GLSLANG_STAGE_FRAGMENT, GLSLANG_CLIENT_VULKAN,
         GLSLANG_TARGET_VULKAN_1_2, GLSLANG_TARGET_SPV, GLSLANG_TARGET_SPV_1_5,
         source.c_str(), 450, GLSLANG_CORE_PROFILE, false, false,
-        GLSLANG_MSG_DEFAULT_BIT, glslang_default_resource()
+        GLSLANG_MSG_DEFAULT_BIT, glslang_default_resource(), {}, nullptr
     };
     glslang_shader_t* shader = glslang_shader_create (&input);
     if (shader == nullptr) { error = "glslang shader allocation failed"; return false; }
