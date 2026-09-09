@@ -2263,7 +2263,7 @@ if(APPLE AND ARBIT_WITH_METAL)
             ${ARBIT_MVK_SPIRV_CROSS_LIBRARY}
             ${ARBIT_MVK_SPIRV_TOOLS_LIBRARY})
         target_compile_options(arbit-metal-color-transform-runtime-tests PRIVATE
-            -Wall -Wextra -Werror)
+            -Wall -Wextra -Werror -Wno-deprecated-declarations)
         add_test(NAME metal_color_transform_runtime
             COMMAND arbit-metal-color-transform-runtime-tests)
         set_tests_properties(metal_color_transform_runtime PROPERTIES
@@ -2333,7 +2333,7 @@ if(APPLE AND ARBIT_WITH_METAL)
                 ${ARBIT_MVK_SPIRV_CROSS_LIBRARY}
                 ${ARBIT_MVK_SPIRV_TOOLS_LIBRARY})
             target_compile_options(arbit-custom-shader-metal-pixel-tests PRIVATE
-                -Wall -Wextra -Werror)
+                -Wall -Wextra -Werror -Wno-deprecated-declarations)
             add_test(NAME custom_shader_metal_pixels
                 COMMAND arbit-custom-shader-metal-pixel-tests)
         set_tests_properties(custom_shader_metal_pixels PROPERTIES
