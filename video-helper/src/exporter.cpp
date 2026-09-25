@@ -1675,7 +1675,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     // rows as if all active notes entered at once). Catch-up is CPU-only (pack, no
     // GL), so spanning the whole pre-range is cheap. An empty score supplies the
     // zero-feed. See exporter.h §score.
-    const bool haveScore = ! job.score.notes.empty();
+    // A published empty score still needs a zero-row frame for note-instanced scenes.
+    const bool haveScore = ! job.score.notes.empty() || job.score.scoreRevision != 0;
     canonicalblockc::FrameOwner scoreFrameOwner;
     const auto canonicalScoreSource = haveScore
         ? std::shared_ptr<const arbitmod::Score>(&job.score, [] (const arbitmod::Score*) {})
@@ -2623,8 +2624,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             std::string diagnostic;
             canonicalblockc::explainAdmissibility(
                 key, canonicalScoreSource, rejectedBeat, diagnostic);
-            error = diagnostic.empty() ? "invalid non-empty Block C frame"
-                                       : "invalid non-empty Block C frame: " + diagnostic;
+            error = diagnostic.empty() ? "invalid Block C frame"
+                                       : "invalid Block C frame: " + diagnostic;
             return;
         }
 

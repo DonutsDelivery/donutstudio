@@ -11,13 +11,43 @@ payload_execution = (root / "src/imported_scene_payload_execution.cpp").read_tex
 helper_main = (root / "src/main.cpp").read_text()
 wire_contract = (root / "../shared/VisualImportedSceneRenderOperationContract.h").read_text()
 
-# Preview and export enter the same exact-payload/native-frame seam.
-assert viewport.count("prepareVisualImportedSceneLayerAtTime(") == 1
-assert exporter.count("prepareVisualImportedSceneLayerAtTime(") == 1
-assert "sourceSec, valueFps," in viewport
-assert "sourceSec, job.fps," in exporter
-assert "NativeImportedSceneRenderUse::Preview" in viewport
-assert "NativeImportedSceneRenderUse::Export" in exporter
+# Ordinary imported scenes and imported particle overlays use the same
+# exact-payload/native-frame seam at their own preview and export times.
+prepare_call = "prepareVisualImportedSceneLayerAtTime("
+assert viewport.count(prepare_call) == 2
+assert exporter.count(prepare_call) == 2
+viewport_scene = viewport.partition("const auto importedSceneResult =")[2].partition("const auto importedResult =")[0]
+viewport_particles = viewport.partition("if (videowire::isImportedParticleOverlayPlan(frameVisualPlans->plans, al.seg.clipId))")[2].partition("else if (isScore)")[0]
+export_scene = exporter.partition("const auto importedSceneResult =")[2].partition("const auto importedResult =")[0]
+export_particles = exporter.partition("if (videowire::isImportedParticleOverlayPlan(visualLayerPlans, al.seg->clipId))")[2].partition("else if (sourceKind == videowire::SourceKind::Score)")[0]
+assert all(route.count(prepare_call) == 1 for route in
+           (viewport_scene, viewport_particles, export_scene, export_particles))
+assert "sourceSec, valueFps," in viewport_scene
+assert "NativeImportedSceneRenderUse::Preview" in viewport_scene
+assert "&materialFrameResolver" in viewport_scene
+assert "VisualImportedScenePreparation::notApplicable" in viewport_scene
+assert "sceneSeconds, valueFps," in viewport_particles
+assert "sceneSeconds = al.seg.inSec" in viewport_particles
+assert "(displaySec - al.seg.displayStartSec) * al.seg.rate" in viewport_particles
+assert "NativeImportedSceneRenderUse::Preview" in viewport_particles
+assert "&al.params.visualParams" in viewport_particles
+assert "prepared != videohelper::importedscene::VisualImportedScenePreparation::rendered" in viewport_particles
+assert "im.rendererError = sceneError" in viewport_particles
+assert "sourceSec, job.fps," in export_scene
+assert "NativeImportedSceneRenderUse::Export" in export_scene
+assert "&materialFrameResolver" in export_scene
+assert "glctx.hdrProfile != nullptr" in export_scene
+assert "sceneSeconds, job.fps," in export_particles
+assert "sceneSeconds = al.seg->inSec" in export_particles
+assert "(t - al.seg->displayStartSec) * al.seg->rate" in export_particles
+assert "NativeImportedSceneRenderUse::Export" in export_particles
+assert "&al.params.visualParams" in export_particles
+assert "VisualImportedScenePreparation::rendered)" in export_particles
+assert "glctx.hdrProfile != nullptr" in export_particles
+assert all("importedSceneFrameOwners" in route for route in
+           (viewport_scene, viewport_particles, export_scene, export_particles))
+assert all("importedScenePlanCache" in route for route in
+           (viewport_scene, viewport_particles, export_scene, export_particles))
 assert "ImportedScenePayloadExecution" in viewport
 assert "ImportedScenePayloadExecution" in exporter
 assert "nativeFixtureSceneBackend()" in viewport

@@ -3978,7 +3978,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         // consumer, including imported scenes. The packed beat
         // matches makeShaderClock's shared beat timeline; re-packing a held frame is
         // skipped via scorePackedFrame so a paused/repeated frame stays stable.
-        const bool haveScore = ! localScore.notes.empty();
+        // A published empty score still needs a zero-row frame for note-instanced scenes.
+        const bool haveScore = ! localScore.notes.empty() || localScore.scoreRevision != 0;
         if (haveScore)
         {
             const double clkFps = valueFps;  // project value-grid fps (== export job.fps)
@@ -4003,8 +4004,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 std::string diagnostic;
                 canonicalblockc::explainAdmissibility(
                     key, canonicalScoreSource, rejectedBeat, diagnostic);
-                const std::string failure = diagnostic.empty() ? "invalid non-empty Block C frame"
-                    : "invalid non-empty Block C frame: " + diagnostic;
+                const std::string failure = diagnostic.empty() ? "invalid Block C frame"
+                    : "invalid Block C frame: " + diagnostic;
                 if (scoreFrameError != failure)
                 {
                     scoreFrameError = failure;

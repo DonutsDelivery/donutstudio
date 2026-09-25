@@ -2347,7 +2347,7 @@ int main()
                   320, 180, 0.5, 30.0, NativeImportedSceneRenderUse::Export,
                   &extentExecution, &extentCache, wrongExtentLayer, wrongExtentOwners, error)
                   == VisualImportedScenePreparation::rejected
-                  && error == "imported scene native frame dimensions do not match the layer",
+                  && error == "imported scene native frame dimensions do not match the declared render extent",
               "diagnostic rendering cannot relabel an equal-byte-count native frame of the wrong shape");
     }
     for (const auto& hdrPlan : { importedScenePlan(), composedScenePlan() })
@@ -3400,6 +3400,8 @@ int main()
         frameKey.fps = 60.0;
         canonicalblockc::FrameProducer frameProducer;
         const auto noteFrame = frameProducer.evaluate(frameKey, score, 0.0f);
+        check(canonicalblockc::valid(noteFrame) && noteFrame->noteRows() == 0,
+              "an empty score produces a valid zero-row canonical frame");
         FakeExecution notesExecution;
         FakeLayer notesLayer;
         notesLayer.canonicalBlockCFrame = noteFrame;
@@ -3416,7 +3418,17 @@ int main()
                       && notesExecution.lastRequest.runtimeInputs.canonicalBlockCFrame == noteFrame
                       && notesLayer.canonicalBlockCFrame == noteFrame,
                   "preview and export retain the same mapping and canonical frame owner");
+            const auto batch = arbitgpu::prepareNativeNoteInstances(notesExecution.lastRequest.runtimeInputs);
+            check(batch.admitted && batch.count == 0,
+                  "the empty canonical frame renders zero note instances");
         }
+        FakeLayer missingFrameLayer;
+        check(prepareVisualImportedSceneLayer({ notesPlan }, 7, 640, 360,
+                  NativeImportedSceneRenderUse::Preview, &notesExecution,
+                  missingFrameLayer, notesOwners, error)
+                  == VisualImportedScenePreparation::rejected
+                  && error == "note-instanced imported scene requires one canonical Block C frame",
+              "a note-instanced scene still rejects a missing canonical frame");
         notesPlan.operations[2].payloadXml += "0\n";
         check(!videowire::compileVisualLayerExecution(notesPlan, notesCompiled, error),
               "malformed note appearance is rejected before native submission");

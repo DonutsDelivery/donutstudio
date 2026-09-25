@@ -21,7 +21,7 @@ class BlockCNoteInstancingSourceContract(unittest.TestCase):
         self.assertIn("request.runtimeInputs.canonicalBlockCFrame = canonicalBlockCFrame", preparation)
         self.assertIn("request.runtimeInputs.noteInstanceMapping = compiled->noteInstanceMapping", preparation)
         self.assertIn("auto sceneInputs = request.runtimeInputs", execution)
-        self.assertIn("deformationRequest.runtimeInputs = request.runtimeInputs", execution)
+        self.assertIn("deformationRequest.runtimeInputs = sceneInputs", execution)
         self.assertIn("receipt.canonicalBlockCFrame = request.runtimeInputs.canonicalBlockCFrame", execution)
         self.assertIn("if (compiled->importedParticleOverlay) layer = inputLayer", preparation)
         self.assertIn(
@@ -119,6 +119,20 @@ class BlockCNoteInstancingSourceContract(unittest.TestCase):
         self.assertIn("continue;", paced_retry)
         self.assertNotIn("im.wantClose", rejected)
         self.assertIn("if (im.rendererError == scoreFrameError) im.rendererError.clear()", score_path)
+
+    def test_published_empty_score_reaches_preview_and_export_instancing(self) -> None:
+        viewport = source("video-helper/src/viewport.cpp")
+        exporter = source("video-helper/src/exporter.cpp")
+        self.assertIn(
+            "const bool haveScore = ! localScore.notes.empty() || localScore.scoreRevision != 0;",
+            viewport,
+        )
+        self.assertIn(
+            "const bool haveScore = ! job.score.notes.empty() || job.score.scoreRevision != 0;",
+            exporter,
+        )
+        self.assertIn("if (haveScore)\n                desc.canonicalBlockCFrame = cachedCanonicalBlockCFrame;", viewport)
+        self.assertIn("const auto frameNotes = haveScore ? notesForFrame (t) : nullptr;", exporter)
 
 
 if __name__ == "__main__":
