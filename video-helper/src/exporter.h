@@ -24,6 +24,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "../../shared/HdrImageOutputContract.h"
 
 #include "mod_defs.h"       // arbitmod::Score — Block C (M5); dependency-free
 #include "canonical_block_c_frame.h"
@@ -31,6 +32,7 @@
 #include "video_control_plan.h"
 #include "render_snapshot.h"
 #include "visual_plan_telemetry.h"
+#include "mix_analyze.h"
 
 using ExportSegment = videowire::RenderSegment;
 
@@ -156,9 +158,12 @@ struct ExportJob
     double fps = 30.0;
     std::string codec = "h264";          // h264 | h265 | vp9 | prores | ffv1
     std::string proresProfile = "hq";    // when codec==prores: hq (422 HQ) | 4444 | 4444xq
+    std::string hdrImageProfile = "off"; // float image sidecar + SDR reference video, never HDR video
     std::string encoder = "auto";        // auto | software | nvenc | videotoolbox
     std::string interpolation = "none";  // none | minterpolate | rife | auto
     std::string audioPath;               // master mix WAV ("" = no audio track)
+    std::string projectSpectrumAnalysisPath; // full-project mix for range-stable spectrum and vertex audio
+    std::vector<videohelper::AnalysisSourcePath> spectrumAnalysisSources;
     double durationSec = 0.0;            // display timeline length
 
     // Loudness normalization target in LUFS (ITU-R BS.1770). 0 = off. A negative

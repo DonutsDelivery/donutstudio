@@ -47,6 +47,7 @@ Visual3DScene makeScene() noexcept
     scene.vertexCount = vertices.size();
     scene.indexCount = indices.size();
 
+    scene.textureTexels.resize (4);
     scene.textureTexels[0] = { 255, 236, 176, 255 };
     scene.textureTexels[1] = { 48, 92, 220, 255 };
     scene.textureTexels[2] = { 28, 168, 118, 255 };

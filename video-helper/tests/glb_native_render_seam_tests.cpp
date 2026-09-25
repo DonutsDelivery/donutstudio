@@ -3,9 +3,11 @@
 #include "../../shared/DiffractionMaterialPresets.h"
 #include "../src/surface_material_admission.h"
 #include "../../shared/VisualStarterModelAssets.h"
+#include "reactive_surface_fixture.h"
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -95,6 +97,34 @@ std::vector<std::uint8_t> withoutStarterLightBinding (
         bytes.begin() + binHeader + 8u,
         bytes.begin() + binHeader + 8u + binSize);
     return makeGlb (std::move (root), std::move (bin));
+}
+
+std::vector<std::uint8_t> nestedAnimatedStarter()
+{
+    const auto& bytes = visualstartermodel::kAnimatedTriangleGlb;
+    const auto jsonSize = readU32(bytes.data() + 12u);
+    auto root = nlohmann::json::parse(
+        bytes.begin() + 20u, bytes.begin() + 20u + jsonSize);
+    auto& nodes = root["nodes"];
+    const auto meshNodeIndex = nodes.size();
+    auto mesh = nodes[0];
+    mesh["translation"] = {0.1, 0.0, 0.0};
+    mesh["scale"] = {0.75, 0.5, 1.0};
+    nodes.push_back(std::move(mesh));
+    const auto parentIndex = nodes.size();
+    nodes.push_back({{"children", {meshNodeIndex}},
+                     {"translation", {0.4, 0.2, 0.0}}, {"scale", {2.0, 2.0, 2.0}}});
+    nodes[0] = {{"children", {parentIndex}}, {"translation", {0.2, -0.1, 0.0}},
+                {"rotation", {0.0, 0.0, std::sqrt(0.5), std::sqrt(0.5)}},
+                {"scale", {0.5, 0.5, 0.5}}};
+    for (auto& animation : root["animations"])
+        for (auto& channel : animation["channels"])
+            if (channel["target"]["node"] == 0)
+                channel["target"]["node"] = meshNodeIndex;
+    const auto binHeader = 20u + jsonSize;
+    const auto binSize = readU32(bytes.data() + binHeader);
+    return makeGlb(std::move(root), {bytes.begin() + binHeader + 8u,
+                                   bytes.begin() + binHeader + 8u + binSize});
 }
 
 std::string encodeBase64 (const std::vector<std::uint8_t>& bytes)
@@ -265,6 +295,12 @@ public:
     std::uintptr_t colorTextureViewHandle() const noexcept override { return handle_ + 1000; }
     std::uintptr_t depthImageHandle() const noexcept override { return handle_ + 2000; }
     std::uintptr_t depthTextureViewHandle() const noexcept override { return handle_ + 3000; }
+    arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    {
+        return { backend_, arbitgpu::NativeTextureViewKind::Texture2D,
+            arbitgpu::NativeTexturePixelFormat::Rgba8Unorm, colorImageHandle(), colorTextureViewHandle(),
+            width_, height_, 1, true, 77, 1 };
+    }
 
 private:
     std::string backend_;
@@ -531,19 +567,218 @@ int main()
            "the downstream-rejection fixture publishes exact bytes");
     auto rejectedAnimatedRequest = animatedRequest;
     rejectedAnimatedRequest.operation.asset = noLightKey;
-    const auto rejectedAnimatedExecuted = animatedExecution.executePreview (
+    const auto ambientAnimatedExecuted = animatedExecution.executePreview (
         rejectedAnimatedRequest, animatedReceipt, error);
-    if (rejectedAnimatedExecuted
-        || error != "imported animated scene is outside the single-draw native subset")
-        std::fprintf (stderr, "downstream candidate result: executed=%d error=%s\n",
-                      rejectedAnimatedExecuted ? 1 : 0, error.c_str());
-    check (! rejectedAnimatedExecuted
-           && error == "imported animated scene is outside the single-draw native subset"
-           && animatedBackend.submissions == 1,
-           "a candidate rejected after animation decode does not render");
+    if (!ambientAnimatedExecuted)
+        std::fprintf (stderr, "ambient animated scene rejected: %s\n", error.c_str());
+    check (ambientAnimatedExecuted && error.empty() && animatedBackend.submissions == 2,
+           "animated scenes preserve native ambient-only lighting without a single-light restriction");
     check (animatedExecution.executePreview (animatedRequest, animatedReceipt, error)
-           && animatedReceipt.valid() && animatedBackend.submissions == 2,
-           "downstream candidate rejection preserves the previous admitted consumer and cache identity");
+           && animatedReceipt.valid() && animatedBackend.submissions == 3,
+           "switching scene resources preserves exact animation request identity");
+
+    {
+        // An authored YZ triangle has no NORMAL or indices and rotates around Z.
+        // Its generated +X normal must survive admission and the skin palette.
+        auto root = triangleRoot();
+        auto bin = triangleBin();
+        const std::array<float, 9> positions {{0, 0, 0, 0, 1, 0, 0, 0, 1}};
+        std::memcpy(bin.data(), positions.data(), sizeof(positions));
+        root["meshes"][0]["primitives"][0]["attributes"].erase("NORMAL");
+        root["meshes"][0]["primitives"][0].erase("indices");
+        bin.resize(104, 0);
+        const auto appendAccessor = [&](std::size_t offset, std::size_t bytes, int component,
+                                        const char* type, std::size_t count, bool vertex)
+        {
+            auto view = nlohmann::json{{"buffer", 0}, {"byteOffset", offset}, {"byteLength", bytes}};
+            if (vertex) view["target"] = 34962;
+            const auto viewIndex = root["bufferViews"].size();
+            root["bufferViews"].push_back(std::move(view));
+            const auto index = root["accessors"].size();
+            root["accessors"].push_back({{"bufferView", viewIndex}, {"componentType", component},
+                                        {"count", count}, {"type", type}});
+            return index;
+        };
+        auto offset = bin.size();
+        bin.insert(bin.end(), 12, 0);
+        const auto joints = appendAccessor(offset, 12, 5121, "VEC4", 3, true);
+        offset = bin.size();
+        for (int vertex = 0; vertex < 3; ++vertex)
+            for (const auto value : {1.0f, 0.0f, 0.0f, 0.0f}) appendFloat(bin, value);
+        const auto weights = appendAccessor(offset, 48, 5126, "VEC4", 3, true);
+        offset = bin.size();
+        appendFloat(bin, 0.0f); appendFloat(bin, 1.0f);
+        const auto times = appendAccessor(offset, 8, 5126, "SCALAR", 2, false);
+        offset = bin.size();
+        for (const auto value : {0.0f, 0.0f, 0.0f, 1.0f,
+                                 0.0f, 0.0f, std::sqrt(0.5f), std::sqrt(0.5f)})
+            appendFloat(bin, value);
+        const auto rotations = appendAccessor(offset, 32, 5126, "VEC4", 2, false);
+        root["buffers"][0]["byteLength"] = bin.size();
+        auto& attributes = root["meshes"][0]["primitives"][0]["attributes"];
+        attributes["JOINTS_0"] = joints;
+        attributes["WEIGHTS_0"] = weights;
+        root["nodes"][0]["skin"] = 0;
+        root["nodes"].push_back({{"name", "Turn joint"}});
+        for (auto& selectedScene : root["scenes"]) selectedScene["nodes"].push_back(3);
+        root["skins"] = nlohmann::json::array({{{"joints", {3}}}});
+        root["animations"] = nlohmann::json::array({{
+            {"name", "Flat turn"},
+            {"samplers", nlohmann::json::array({{{"input", times}, {"output", rotations},
+                                                {"interpolation", "LINEAR"}}})},
+            {"channels", nlohmann::json::array({{{"sampler", 0},
+                {"target", {{"node", 3}, {"path", "rotation"}}}}})}
+        }});
+        const auto bytes = makeGlb(root, bin);
+        const auto key = exactKey("flat-normal-skinned-triangle", bytes);
+        check(publish(payloads, "flat-normal-skin-transfer", key, bytes),
+              "missing-normal skinned triangle publishes its exact authored bytes");
+        videohelper::modelpayload::ImportedAnimatedSceneCompatibility compatibility;
+        check(videohelper::modelpayload::ImportedAnimatedScenePayloadExecution::inspectCompatibility(
+                  payloads.resolvePreview(key), 0u, compatibility, error)
+              && compatibility.clips.size() == 1 && compatibility.clips[0].name == "Flat turn"
+              && compatibility.clips[0].compatibleMeshStableIds == std::vector<visualanimationimport::StableId>{1},
+              "missing-normal skin is renderable through the production import compatibility route");
+        FakeDeformationBackend flatBackend;
+        videohelper::modelpayload::ImportedAnimatedScenePayloadExecution flatExecution(payloads, flatBackend);
+        auto request = animatedRequest;
+        request.operation.asset = key;
+        request.operation.clipName = "Flat turn";
+        request.operation.playback.timelineSeconds = 1.0;
+        request.frame = {24, 24, 1};
+        videohelper::modelpayload::ImportedAnimatedSceneReceipt preview, exported;
+        const auto previewOk = flatExecution.executePreview(request, preview, error);
+        const auto exportOk = flatExecution.executeExport(request, exported, error);
+        check(previewOk && exportOk && preview.source == exported.source,
+              "preview and export share the same generated-normal deformation source");
+        if (previewOk && exportOk)
+        {
+            const auto& vertices = preview.source->scene->vertices;
+            arbitgpu::NativeDeformationFrameData data, exportData;
+            check(vertices[0].normal.x == 1.0f && vertices[1].normal.x == 1.0f
+                  && vertices[2].normal.x == 1.0f && vertices[2].normal.z == 0.0f
+                  && arbitgpu::prepareNativeDeformationFrame(*preview.source,
+                      *preview.evaluation.deformation, data, error)
+                  && arbitgpu::prepareNativeDeformationFrame(*exported.source,
+                      *exported.evaluation.deformation, exportData, error)
+                  && data.vertexCount == 3 && data.jointCount == 1
+                  && std::abs(data.jointPalette[0]) < 0.0001f
+                  && std::abs(data.jointPalette[1] - 1.0f) < 0.0001f
+                  && data.jointPalette == exportData.jointPalette,
+                  "generated +X normals and the +Y-rotating palette reach native upload contracts unchanged");
+        }
+    }
+
+    {
+        const auto nestedBytes = nestedAnimatedStarter();
+        const auto nestedKey = exactKey("nested-animated-starter", nestedBytes);
+        check(publish(payloads, "nested-animated-transfer", nestedKey, nestedBytes),
+              "nested animated GLB publishes exact source bytes");
+        videohelper::modelpayload::ImportedAnimatedSceneCompatibility compatibility;
+        check(videohelper::modelpayload::ImportedAnimatedScenePayloadExecution::inspectCompatibility(
+                  payloads.resolvePreview(nestedKey), 0u, compatibility, error)
+              && compatibility.clips.size() == 1
+              && compatibility.clips[0].compatibleMeshStableIds
+                  == std::vector<visualanimationimport::StableId> {1},
+              "animated mesh under two transform-only parents is authoring-compatible");
+
+        FakeDeformationBackend nestedBackend;
+        videohelper::modelpayload::ImportedAnimatedScenePayloadExecution nestedExecution(
+            payloads, nestedBackend);
+        auto request = animatedRequest;
+        request.operation.asset = nestedKey;
+        request.operation.playback.timelineSeconds = 0.5;
+        request.frame = {12, 24, 1};
+        videohelper::modelpayload::ImportedAnimatedSceneReceipt preview, exported;
+        const bool previewOk = nestedExecution.executePreview(request, preview, error);
+        if (!previewOk) std::fprintf(stderr, "nested animated preview: %s\n", error.c_str());
+        const bool exportOk = nestedExecution.executeExport(request, exported, error);
+        if (!exportOk) std::fprintf(stderr, "nested animated export: %s\n", error.c_str());
+        check(previewOk && exportOk && preview.valid() && exported.valid()
+              && preview.source == exported.source && nestedBackend.preparations == 1,
+              "nested preview and export retain one immutable native draw owner");
+        if (previewOk && exportOk)
+        {
+            const auto& scene = *preview.source->scene;
+            const auto& draw = scene.objects[0];
+            check(scene.objectCount == 1 && draw.id.value == 196609u
+                  && preview.source->mesh.value == 1u && !draw.parent.isValid()
+                  && std::abs(draw.transform.translation.x - 0.1f) < 0.0001f
+                  && std::abs(draw.transform.translation.y - 0.2f) < 0.0001f
+                  && std::abs(draw.transform.rotation.z - std::sqrt(0.5f)) < 0.0001f
+                  && std::abs(draw.transform.rotation.w - std::sqrt(0.5f)) < 0.0001f
+                  && std::abs(draw.transform.scale.x - 0.75f) < 0.0001f
+                  && std::abs(draw.transform.scale.y - 0.5f) < 0.0001f,
+                  "the admitted GPU draw carries the composed parent world TRS and exact object identity");
+            check(preview.payload->bytes() == nestedBytes
+                  && preview.evaluation.deformation->sampleTimeSeconds()
+                      == exported.evaluation.deformation->sampleTimeSeconds()
+                  && preview.evaluation.deformation->morphWeights().size() == 1
+                  && exported.evaluation.deformation->morphWeights().size() == 1,
+                  "hierarchy adaptation retains exact asset bytes and preview/export animation time");
+            auto referenceRequest = request;
+            referenceRequest.operation.asset = starterKey;
+            videohelper::modelpayload::ImportedAnimatedSceneReceipt reference;
+            const bool referenceOk = animatedExecution.executePreview(referenceRequest, reference, error);
+            check(referenceOk, "the root-level animation supplies a matching reference sample");
+            if (referenceOk && preview.evaluation.deformation->morphWeights().size() == 1
+                && exported.evaluation.deformation->morphWeights().size() == 1
+                && reference.evaluation.deformation->morphWeights().size() == 1)
+                check(preview.evaluation.deformation->morphWeights()[0].values()
+                          == reference.evaluation.deformation->morphWeights()[0].values()
+                      && preview.evaluation.deformation->morphWeights()[0].values()
+                          == exported.evaluation.deformation->morphWeights()[0].values(),
+                      "parent adaptation preserves the original morph animation samples");
+        }
+    }
+
+    {
+        auto controlled = animatedRequest;
+        controlled.operation.playback.timelineSeconds = 0.5;
+        controlled.operation.playback.weight = 0.25;
+        controlled.frame = {12, 24, 1};
+        controlled.operation.pose.meshStableId = 1;
+        controlled.operation.pose.morphEnabled = true;
+        controlled.operation.pose.morphTargetStableId = 1;
+        controlled.operation.pose.morphWeight = 0.8;
+        videohelper::modelpayload::ImportedAnimatedSceneReceipt preview, exported;
+        const bool previewOk = animatedExecution.executePreview(controlled, preview, error);
+        const bool exportOk = animatedExecution.executeExport(controlled, exported, error);
+        check(previewOk && exportOk, "selected morph override reaches exact GLB preview and export");
+        if (previewOk && exportOk)
+        {
+            arbitgpu::NativeDeformationFrameData previewData, exportData;
+            check(arbitgpu::prepareNativeDeformationFrame(*preview.source,
+                      *preview.evaluation.deformation, previewData, error)
+                  && arbitgpu::prepareNativeDeformationFrame(*exported.source,
+                      *exported.evaluation.deformation, exportData, error)
+                  && std::abs(previewData.morphWeights[0] - 0.8f) < 0.0001f
+                  && previewData.morphWeights == exportData.morphWeights
+                  && preview.runtimeInputs.morphWeight == 1.0f
+                  && exported.runtimeInputs.morphWeight == 1.0f
+                  && preview.evaluation.deformation->time() == controlled.frame
+                  && exported.evaluation.deformation->time() == controlled.frame,
+                  "preview and export use the selected weight at the same presentation frame");
+        }
+        auto invalid = controlled;
+        invalid.operation.pose.morphTargetIndex = 1;
+        check(!animatedExecution.executePreview(invalid, preview, error)
+              && error.find("selected morph target") != std::string::npos,
+              "a missing morph target is rejected even when model bytes are already admitted");
+        invalid = controlled;
+        invalid.operation.pose.morphTargetStableId = 2;
+        check(!animatedExecution.executeExport(invalid, exported, error)
+              && error.find("catalog identity") != std::string::npos,
+              "a mismatched named morph identity is rejected by export");
+        invalid = controlled;
+        invalid.operation.pose.boneEnabled = true;
+        invalid.operation.pose.boneStableId = 1;
+        check(!animatedExecution.executePreview(invalid, preview, error)
+              && error.find("selected bone") != std::string::npos,
+              "selected bone controls reject an unskinned imported mesh");
+        check(animatedExecution.executePreview(controlled, preview, error),
+              "invalid pose selection preserves the admitted model for a valid edit");
+    }
 
     videohelper::modelpayload::ImportedSceneRequest productRequest;
     productRequest.asset = productKey;
@@ -594,6 +829,7 @@ int main()
         value.materialCount = 2;
         value.textureCount = 1;
         value.textureTexelCount = 2;
+        value.textureTexels.resize (value.textureTexelCount);
         value.textures[0].id.value = 1100u + identityOffset;
         value.textures[0].width = 2;
         value.textures[0].height = 1;
@@ -644,6 +880,31 @@ int main()
     clipB.sceneSnapshot = makeComposedProductScene (20, 1.5f);
     clipB.clipId = 102;
     clipB.staticPayloadIdentity = "composed-clip-b-v1";
+    {
+        auto full = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*clipA.sceneSnapshot);
+        full->textures[0].width = full->textures[0].height = 1024;
+        full->textureTexelCount = 1024u * 1024u;
+        full->textureTexels.resize(full->textureTexelCount, {17, 29, 43, 255});
+        visualimportedscenerender::Request request;
+        request.sourceStableId = full->id.value;
+        request.renderStableId = request.sourceStableId + 1;
+        request.structuralRevision = request.evaluationRevision = 1;
+        request.sceneSnapshot = std::move(full);
+        const auto wire = visualimportedscenerender::encode(request);
+        visualimportedscenerender::Request restored;
+        check(wire.size() > 8u * 1024u * 1024u
+              && wire.size() <= visualimportedscenerender::kMaximumV8EncodedBytes
+              && visualimportedscenerender::decode(wire, restored)
+              && restored.sceneSnapshot
+              && restored.sceneSnapshot->textureTexels.size() == 1024u * 1024u
+              && restored.sceneSnapshot->textureTexels.back().red == 17,
+              "composed scene wire carries a full admitted texture within an explicit bound");
+        request.imageOutput = renderpassoutput::Output::Depth;
+        const auto aovWire = visualimportedscenerender::encode(request);
+        check(!aovWire.empty() && visualimportedscenerender::decode(aovWire, restored)
+              && restored.imageOutput == renderpassoutput::Output::Depth,
+              "the AOV request envelope retains the full bounded scene snapshot");
+    }
     FakeBackend cacheBackend;
     cacheBackend.backendInfo.backend = "opengl";
     videohelper::modelpayload::Store cacheStore;
@@ -856,6 +1117,24 @@ int main()
         ? admittedMaterial->structuralDigest() : std::string (64, '0');
     materialRequest.binding.surfaceMaterialRevision = 1;
     productRequest.material = materialRequest;
+    {
+        FakeDeformationBackend nestedBackend;
+        videohelper::modelpayload::ImportedAnimatedScenePayloadExecution nestedExecution(
+            payloads, nestedBackend);
+        auto request = animatedRequest;
+        request.operation.asset = exactKey("nested-animated-starter", nestedAnimatedStarter());
+        request.material = materialRequest;
+        request.material->scene.value = 1u;
+        request.material->binding.object.value = 196609u;
+        videohelper::modelpayload::ImportedAnimatedSceneReceipt preview, exported;
+        const bool previewOk = nestedExecution.executePreview(request, preview, error);
+        if (!previewOk) std::fprintf(stderr, "nested animated material preview: %s\n", error.c_str());
+        const bool exportOk = nestedExecution.executeExport(request, exported, error);
+        if (!exportOk) std::fprintf(stderr, "nested animated material export: %s\n", error.c_str());
+        check(previewOk && exportOk && preview.valid() && exported.valid()
+              && preview.source == exported.source && nestedBackend.preparations == 1,
+              "the nested mesh accepts its exact surface-material binding in preview and export");
+    }
     videohelper::modelpayload::ImportedSceneExecutionReceipt materialPreview;
     videohelper::modelpayload::ImportedSceneExecutionReceipt materialExport;
     const bool materialPreviewOk
@@ -874,6 +1153,33 @@ int main()
            && materialExport.frame.rendered.stats.materialProgramUploadCount == 0
            && materialExport.frame.rendered.stats.reusedMaterialProgram,
            "the imported scene product shares one admitted native material across preview and export");
+
+    {
+        auto frameRequest = productRequest;
+        frameRequest.material->version = surfacematerialbinding::kGraphFrameWireVersion;
+        frameRequest.material->program.textureSlotCount = 1;
+        surfacematerialbinding::TextureSlotBinding texture;
+        texture.source = surfacematerialbinding::TextureSourceKind::GraphFrame;
+        texture.graphFrame = surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint { 91, 0 };
+        frameRequest.material->binding.textures = { texture };
+        const auto submissionsBefore = productBackend.submissions;
+        videohelper::modelpayload::ImportedSceneExecutionReceipt rejected;
+        check(!execution.executePreview(frameRequest, rejected, error)
+                  && !rejected.valid() && productBackend.submissions == submissionsBefore,
+              "a Frame material cannot submit without its owned dependency");
+        frameRequest.runtimeInputs.materialFrameTexture = std::make_shared<FakeFrame>("opengl", 64, 64, 400);
+        check(!execution.executePreview(frameRequest, rejected, error)
+                  && !error.empty()
+                  && !rejected.valid() && productBackend.submissions == submissionsBefore,
+              "a malformed constant program with an unused Frame slot cannot reuse a last-good preview material");
+        check(!execution.executeExport(frameRequest, rejected, error)
+                  && !rejected.valid() && productBackend.submissions == submissionsBefore,
+              "a malformed Frame material also rejects export");
+        frameRequest.material = productRequest.material;
+        check(!execution.executePreview(frameRequest, rejected, error)
+                  && !rejected.valid() && productBackend.submissions == submissionsBefore,
+              "unrequested Frame owner cannot be injected into an imported-texture material");
+    }
 
     productRequest.material->evaluationRevision = 2;
     productRequest.material->program.operations[static_cast<std::size_t> (
@@ -1097,6 +1403,56 @@ int main()
            && error == "native GLB render rejected: native GPU backend not compiled in"
            && stubFrame.rendered.nativeFrame == nullptr,
            "stub builds report native rendering as unavailable without CPU fallback");
+
+    {
+        const auto authored=retainedSurfaceFixture(error);
+        check(authored.has_value(),"retained Surface product fixture is canonical");
+        if (authored) {
+            FakeBackend surfaceBackend; surfaceBackend.backendInfo.backend="opengl";
+            videohelper::modelpayload::Store surfaceStore;
+            videohelper::modelpayload::ImportedScenePayloadExecution surfaceExecution(surfaceStore,surfaceBackend);
+            videohelper::modelpayload::ImportedSceneRequest request;
+            request.sceneSnapshot=authored->sceneSnapshot; request.surfacePrograms=authored->surfacePrograms;
+            request.structuralRevision=request.evaluationRevision=request.projectGeneration=request.helperGeneration=1;
+            request.clipId=200; request.dimensions={64,64}; request.frame={0,30,1};
+            request.staticPayloadIdentity=visualimportedscenerender::encode(*authored);
+            request.runtimeInputs.canonicalBlockCFrame=scoreFieldFrame();
+            videohelper::modelpayload::ImportedSceneExecutionReceipt receipt;
+            check(surfaceExecution.executePreview(request,receipt,error)
+                && surfaceExecution.executePreview(request,receipt,error) && surfaceBackend.preparations==1,
+                "retained Surface product publication reuses identical sampled native resources");
+            check(canonicalblockc::valid(request.runtimeInputs.canonicalBlockCFrame)
+                && receipt.canonicalBlockCFrame==request.runtimeInputs.canonicalBlockCFrame
+                && !surfaceBackend.lastRuntimeInputs.canonicalBlockCFrame
+                && !surfaceBackend.lastRuntimeInputs.noteInstanceMapping
+                && arbitgpu::validFixtureRuntimeInputs(surfaceBackend.lastRuntimeInputs),
+                "material evaluation retains its score owner without authorizing native note instancing");
+            request.frame.frame=90;
+            check(surfaceExecution.executePreview(request,receipt,error)
+                && surfaceExecution.executeExport(request,receipt,error) && surfaceBackend.preparations==2
+                && receipt.canonicalBlockCFrame==request.runtimeInputs.canonicalBlockCFrame
+                && arbitgpu::validFixtureRuntimeInputs(surfaceBackend.lastRuntimeInputs),
+                "timeline Material Fields update the draw program once and export shares that exact result");
+            request.frame.frame=0;
+            check(surfaceExecution.executePreview(request,receipt,error) && surfaceBackend.preparations==3,
+                "backward seeks re-evaluate retained material fields without historical state");
+            check(!arbitgpu::validFixtureRuntimeInputs(request.runtimeInputs),
+                "a material score lease alone remains invalid at the native note-instance boundary");
+            request.runtimeInputs.noteInstanceMapping.emplace();
+            check(surfaceExecution.executePreview(request,receipt,error)
+                && surfaceExecution.executeExport(request,receipt,error)
+                && surfaceBackend.lastRuntimeInputs.canonicalBlockCFrame==request.runtimeInputs.canonicalBlockCFrame
+                && surfaceBackend.lastRuntimeInputs.noteInstanceMapping.has_value()
+                && arbitgpu::validFixtureRuntimeInputs(surfaceBackend.lastRuntimeInputs)
+                && arbitgpu::prepareNativeNoteInstances(surfaceBackend.lastRuntimeInputs).admitted,
+                "an explicit note-instance mapping preserves the same score owner through preview and export");
+            request.runtimeInputs.noteInstanceMapping.reset();
+            const auto submissions=surfaceBackend.submissions;
+            request.surfacePrograms.front().program.fields.front().sample.gain=0.8;
+            check(!surfaceExecution.executePreview(request,receipt,error) && surfaceBackend.submissions==submissions,
+                "changed authored Surface fields cannot reuse an existing immutable owner or draw last-good fallback");
+        }
+    }
 
     std::printf ("glb-native-render-seam: %d/%d checks passed; submissions=%d\n",
                  checks - failures, checks, backend.submissions);

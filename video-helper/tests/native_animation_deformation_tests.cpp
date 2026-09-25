@@ -79,6 +79,7 @@ struct Fixture
         sceneValue.materials[0].baseColorTexture = {};
         sceneValue.textureCount = 0;
         sceneValue.textureTexelCount = 0;
+        sceneValue.textureTexels.clear();
         sceneValue.objects[0].transform = {};
         scene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (sceneValue);
 
@@ -267,6 +268,96 @@ void testFramePreparation()
            "sampled joint transform becomes the native joint palette");
     check (near (output.morphWeights[0], 0.25f),
            "sampled morph weight replaces the imported base weight");
+
+    auto matrixSource = *fixture.source;
+    auto matrix = identityMatrix();
+    matrix[13] = 0.75f;
+    matrixSource.jointBaseTransforms[0].matrix = matrix;
+    arbitgpu::NativeDeformationFrameData matrixOutput;
+    check(arbitgpu::prepareNativeDeformationFrame(matrixSource, *fixture.snapshot, matrixOutput, error)
+          && near(matrixOutput.jointPalette[12], 1.0f)
+          && near(matrixOutput.jointPalette[13], 0.75f),
+          "retained matrix ancestors compose with sampled joint transforms");
+
+    auto batchSource = *fixture.source;
+    auto batchMember = std::make_shared<arbitgpu::NativeDeformationScene>(*fixture.source);
+    batchMember->batchMember = true;
+    batchSource.draws = {batchMember};
+    check(arbitgpu::prepareNativeDeformationFrame(batchSource, *fixture.snapshot, matrixOutput, error),
+          "scene batches admit a topology-stable owned mesh range");
+    batchSource.draws.push_back(batchMember);
+    check(!arbitgpu::prepareNativeDeformationFrame(batchSource, *fixture.snapshot, matrixOutput, error)
+          && error == "native deformation scene batch overlaps mesh topology",
+          "scene batches reject overlapping compute output ranges before submission");
+
+    AnimationDeformationRequest poseRequest;
+    poseRequest.time = { 15, 30, 1 };
+    poseRequest.revision = 77;
+    poseRequest.pose.meshStableId = 501;
+    poseRequest.pose.boneStableId = 301;
+    poseRequest.pose.boneEnabled = true;
+    poseRequest.pose.translation = { 0.5, 0.25, 0.0 };
+    poseRequest.pose.rotationDegrees[2] = 90.0;
+    poseRequest.pose.scale[0] = 2.0;
+    poseRequest.pose.morphEnabled = true;
+    poseRequest.pose.morphTargetStableId = 1;
+    poseRequest.pose.morphWeight = 0.8;
+    const auto poseSnapshot = evaluateAnimationDeformation(
+        *fixture.asset, *fixture.clip, fixture.bindings, poseRequest, {}, error);
+    arbitgpu::NativeDeformationFrameData poseOutput;
+    check(poseSnapshot && arbitgpu::prepareNativeDeformationFrame(
+              *fixture.source, *poseSnapshot, poseOutput, error)
+          && near(poseOutput.jointPalette[12], 1.5f)
+          && near(poseOutput.jointPalette[13], 0.25f)
+          && near(poseOutput.jointPalette[0], 0.0f)
+          && near(poseOutput.jointPalette[1], 2.0f)
+          && near(poseOutput.jointPalette[4], -1.0f)
+          && near(poseOutput.morphWeights[0], 0.8f),
+          "selected bone TRS adjusts the baked pose and only the selected morph weight is overridden");
+    for (const auto missingBone : {false, true})
+    {
+        auto invalidPose = poseRequest;
+        if (missingBone) invalidPose.pose.boneStableId = 302;
+        else invalidPose.pose.morphTargetIndex = 1;
+        const auto invalidSnapshot = evaluateAnimationDeformation(
+            *fixture.asset, *fixture.clip, fixture.bindings, invalidPose, {}, error);
+        poseOutput.vertexCount = 999;
+        check(invalidSnapshot && !arbitgpu::prepareNativeDeformationFrame(
+                  *fixture.source, *invalidSnapshot, poseOutput, error)
+              && poseOutput.vertexCount == 999,
+              "invalid selected bone or morph identity leaves native frame output unchanged");
+    }
+    {
+        std::array<MorphTargetView, 2> targets {fixture.morphTarget, fixture.morphTarget};
+        targets[1].id = {602};
+        auto mesh = fixture.meshView;
+        mesh.morphTargets = targets.data();
+        mesh.morphTargetCount = targets.size();
+        const auto asset = DeformationAsset::create({&fixture.skinView, 1, &mesh, 1}, {}, error);
+        const std::array<float, 4> values {0.0f, 0.5f, 0.5f, 0.75f};
+        auto tracks = fixture.tracks;
+        tracks[1].values = values.data();
+        tracks[1].valueCount = values.size();
+        tracks[1].morphWeightCount = 2;
+        const auto clip = animation::Clip::create({fixture.clip->id(), 1.0, tracks.data(), tracks.size()}, {}, error);
+        auto source = *fixture.source;
+        source.deformation = asset;
+        source.morphBaseWeights = {0.125f, 0.25f};
+        const std::array<MorphTargetId, 2> targetIds {{{601}, {602}}};
+        const MorphAnimationBindingView morph {
+            fixture.morphBindings[0].animationTarget, mesh.id, targetIds.data(), targetIds.size()};
+        const AnimationDeformationBindingView bindings {fixture.jointBindings.data(), 1, &morph, 1};
+        auto request = poseRequest;
+        request.combinationWeight = 0.25;
+        request.pose.morphTargetStableId = 2;
+        request.pose.morphTargetIndex = 1;
+        const auto snapshot = asset && clip
+            ? evaluateAnimationDeformation(*asset, *clip, bindings, request, {}, error) : nullptr;
+        check(snapshot && arbitgpu::prepareNativeDeformationFrame(source, *snapshot, poseOutput, error)
+              && near(poseOutput.morphWeights[0], 0.0625f)
+              && near(poseOutput.morphWeights[1], 0.8f),
+              "independent named morph override preserves the other target's animated playback gain");
+    }
 
     AnimationDeformationRequest weightedRequest;
     weightedRequest.time = { 15, 30, 1 };

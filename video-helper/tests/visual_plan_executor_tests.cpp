@@ -1,5 +1,9 @@
 #include "../src/visual_plan_executor.h"
 #include "../src/visual_plan_telemetry_json.h"
+#include "../src/particle_body_replay.h"
+#include "particle_geometry_fixture.h"
+#include "solid_body_fixture.h"
+#include "../src/visual_parameter_history.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -10,6 +14,9 @@
 #include <new>
 #include <string>
 #include <thread>
+
+static_assert(sizeof(videowire::VisualPlanExecutionState) < 4096u,
+              "visual plan execution state must keep its plan table off the thread stack");
 
 namespace
 {
@@ -33,9 +40,469 @@ void check (bool condition, const char* message)
     if (! condition) { ++failures; std::fprintf (stderr, "FAIL: %s\n", message); }
 }
 
+void checkVisualParameterHistory()
+{
+    using namespace videorender;
+    std::string error;
+    auto score=std::make_shared<const arbitmod::Score>();
+    videotime::BeatTimeline timeline;
+    timeline.reset(120,4);
+    arbitmod::Routing route;
+    route.destination="clip4/visual7/gravityZ"; route.source.type=arbitmod::SourceType::Lfo;
+    route.source.lfo.periodBeats=4; route.smoothingBeats=.2f; route.mode=arbitmod::Mode::Replace;
+    videocontrol::Plan plan; plan.numSlots=1;
+    videocontrol::Operation constant; constant.nodeId=1; constant.kind="control.const";
+    constant.outputSlots={0}; constant.params={0.75f}; plan.operations.push_back(constant);
+    videocontrol::Operation sink; sink.nodeId=2; sink.kind="sink"; sink.inputs={{0}};
+    sink.destination="clip4/visual7/drag"; sink.mode=arbitmod::Mode::Replace;
+    plan.operations.push_back(sink);
+    VisualParameterHistory history;
+    check(history.bind({route},plan,score,timeline,30,{route.destination,sink.destination},error),
+          "history binds existing routing and Patch Bay control identities");
+    double gravity=0,drag=0;
+    check(history.sample(route.destination,1,gravity,{},error)
+        && history.sample(sink.destination,1,drag,{},error) && drag==0.75,
+        "history evaluates routed and graph-authored controls without live UI state");
+    arbitmod::RoutingState state;
+    for (int frame=0;frame<=30;++frame)
+    {
+        const double seconds=double(frame)/30;
+        arbitmod::Clock clock {static_cast<float>(timeline.secondsToBeat(seconds)),120,4};
+        arbitmod::evaluateRouting(route,state,0,*score,clock,{},2.0f/30);
+    }
+    check(std::abs(gravity-state.smoothed)<1.0e-6,
+          "historical smoothing uses the canonical project value-grid evaluator");
+    double later=0,again=0,capturedDrag=0;
+    route.depth=0; plan.operations[0].params[0]=0.25f;
+    check(history.sample(route.destination,2,later,{},error)
+        && history.sample(route.destination,1,again,{},error) && again==gravity
+        && history.sample(sink.destination,2,capturedDrag,{},error) && capturedDrag==drag,
+        "captured history survives backward seek and mutation of its authoring inputs");
+    check(!history.sample(route.destination,100000,later,{},error),
+          "over-cap historical warmup fails closed");
+    error.clear();
+    auto values=std::make_shared<VisualParameterTimeline>();
+    check(values->bind({{"clip4/visual7/gravityZ",0,.4},{"clip4/visual7/gravityZ",.25,-.2}},error),
+          "bounded automation samples admit with exact destination identities");
+    double held=0; values->sample("clip4/visual7/gravityZ",.249,held);
+    check(held==.4,"fixed-step automation does not smear a discrete knot into earlier history");
+    auto p=solidBodyFixture(); p.historyClipId=4; p.historyNodeId=7;
+    auto source=std::make_shared<ParticleHistorySource>(*p.history);
+    source->parameterAt=[values](const auto& destination,double time,double& value,std::string&)
+    { values->sample(destination,time,value); return true; };
+    p.history=source;
+    const auto expected=sampleSolidBodyFixture(p,.5,error);
+    sampleSolidBodyFixture(p,.9,error); sampleSolidBodyFixture(p,.125,error);
+    check(error.empty() && sameSolidBodies(expected,sampleSolidBodyFixture(p,.5,error)),
+          "automated forces replay identically for direct export, sequential preview and backward seeks");
+    auto unmodulated=solidBodyFixture();
+    check(!sameSolidBodies(expected,sampleSolidBodyFixture(unmodulated,.5,error)),
+          "historical force changes affect the solid trajectory");
+    source->parameterAt=[](const std::string& destination,double time,double& value,std::string&)
+    {
+        if (destination=="clip4/visual7/emissionRate") value=4;
+        if (destination=="clip4/visual7/reset") value=time>=.4 && time<.41 ? 1:0;
+        return true;
+    };
+    check(sampleSolidBodyFixture(p,.26,error).count==1
+        && sampleSolidBodyFixture(p,.42,error).count==0
+        && sampleSolidBodyFixture(p,.7,error).count==1,
+        "historical rate and reset edges govern bounded source births");
+    check(!values->bind({{"same",0,1},{"same",0,2}},error),
+          "duplicate historical sample times cannot create an ambiguous snapshot");
+    visualtemporaloperation::Payload resetPayload,decoded;
+    const auto legacy=visualtemporaloperation::serialize(resetPayload);
+    resetPayload.reset=1;
+    const auto extended=visualtemporaloperation::serialize(resetPayload);
+    check(legacy.rfind("temporal-v1",0)==0 && extended.rfind("temporal-v2",0)==0
+        && visualtemporaloperation::parse(extended,decoded,&error) && decoded.reset==1
+        && visualtemporaloperation::parse(legacy,decoded,&error) && decoded.reset==0,
+        "temporal reset persistence preserves legacy payload bytes and clears absent reset state");
+}
+
+void checkSolidBodyReplay()
+{
+    using namespace videorender;
+    std::string error;
+    auto p=solidBodyFixture();
+    const auto first=sampleSolidBodyFixture(p,0,error),golden=sampleSolidBodyFixture(p,0.5,error);
+    check(error.empty() && golden.count==2 && golden.bodies[0].z>first.bodies[0].z
+        && golden.bodies[0].orientation!=first.bodies[0].orientation
+        && golden.bodies[0].geometryIdentity==9007199254740001ull,
+        "solid replay retains exact source IDs and integrates depth and quaternion orientation");
+    const auto& q=golden.bodies[0].orientation;
+    check(std::abs(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]-1)<1.0e-6f,
+        "solid orientation remains a normalized quaternion");
+    for (int frame=0;frame<=30;++frame) sampleSolidBodyFixture(p,double(frame)/60,error);
+    sampleSolidBodyFixture(p,10000,error); sampleSolidBodyFixture(p,0.1,error);
+    check(sameSolidBodies(golden,sampleSolidBodyFixture(p,0.5,error))
+        && sameSolidBodies(golden,sampleSolidBodyFixture(p,2.5,error)),
+        "solid sequential playback, direct seek and lifetime loop replay the same state");
+    p.resetTime=0.25f;
+    check(sameSolidBodies(golden,sampleSolidBodyFixture(p,0.75,error))
+        && sampleSolidBodyFixture(p,0.1,error).count==0,"solid reset shifts replay and clears pre-reset bodies");
+    p.resetTime=0; p.resetMode=1;
+    const auto held=sampleSolidBodyFixture(p,2,error);
+    check(sameSolidBodies(held,sampleSolidBodyFixture(p,10000,error)),"solid hold freezes after lifetime");
+    p=solidBodyFixture(); p.impulseZ=0; p.gravityZ=1; p.gravityX=0.3f; p.angularDrag=2;
+    const auto gravity=sampleSolidBodyFixture(p,0.5,error);
+    check(gravity.bodies[0].z>first.bodies[0].z && gravity.bodies[0].x>first.bodies[0].x
+        && gravity.bodies[0].angular[1]<first.bodies[0].angular[1],"solid vector gravity and angular drag are effective");
+    p=solidBodyFixture(); p.impulseZ=0; p.attraction=3; p.geometryDepths[0][1]=0.9f;
+    check(sampleSolidBodyFixture(p,0.5,error).bodies[0].z>first.bodies[0].z,"solid point attraction acts in depth");
+    p=solidBodyFixture(); p.force=0.5f;
+    const auto square=sampleSolidBodyFixture(p,0.5,error);
+    p.preparedSolids.reset(); p.preparedBodies.reset();
+    ParticleSolidState wide;
+    replayParticleBodies(p,0.5,2,nullptr,&error,&wide);
+    check(sameSolidBodies(square,wide),"solid world-space dynamics do not depend on preview/export aspect ratio");
+
+    auto score=std::make_shared<arbitmod::Score>(); score->scoreRevision=1;
+    arbitmod::Note note; note.id=-101; note.midiNote=60; note.freqHz=261.625565f;
+    note.velocity=127; note.startBeat=0; note.lengthBeats=8; score->notes.push_back(note);
+    note.id=202; note.midiNote=72; note.freqHz*=2; note.startBeat=0.2f; note.lengthBeats=0.01f; score->notes.push_back(note);
+    score->links.push_back({-301,-101,202,3,2,0});
+    auto history=std::make_shared<ParticleHistorySource>(); history->score=score;
+    auto& key=history->key;
+    key.projectGeneration=key.sourceGeneration=key.helperGeneration=key.backendGeneration=key.deviceGeneration=1;
+    key.scoreGeneration=key.beatMapGeneration=key.fpsGeneration=key.loopGeneration=key.seekGeneration=1;
+    p=solidBodyFixture(); p.geometryCount=0; p.history=history; p.linkSpring=5; p.linkRestScale=0.5f;
+    const auto linked=sampleSolidBodyFixture(p,0.5,error);
+    p.linkSpring=0;
+    const auto unlinked=sampleSolidBodyFixture(p,0.5,error);
+    check(error.empty() && linked.count==1 && linked.bodies[0].identity==-101
+        && linked.bodies[0].x!=unlinked.bodies[0].x,
+        "solid replay resolves canonical signed link endpoints and short-lived note history");
+    std::vector<arbitblockb::FeatureFrame> audio(50);
+    for (std::size_t i=0;i<audio.size();++i) {
+        audio[i].sampleIndex=static_cast<std::int64_t>(i+1)*arbitblockb::kHop;
+        audio[i].rms=0.2f;
+        if (i>=10) { audio[i].onset=1; audio[i].onsetAge=float(i-10)*arbitblockb::kHop/48000; }
+    }
+    history->audioFrames=&audio; history->audioSampleRate=48000;
+    p.rmsGain=1; p.onsetGain=0.3f;
+    const auto excited=sampleSolidBodyFixture(p,0.5,error);
+    check(excited.bodies[0].y>unlinked.bodies[0].y
+        && sameSolidBodies(excited,sampleSolidBodyFixture(p,0.5,error)),
+        "solid audio RMS and onset impulses replay from canonical baked project history");
+
+    ParticleRigidBody a,b; p=solidBodyFixture(); p.restitution=1; p.friction=0.5f;
+    a.x=0.5f; a.y=0.5f; a.z=0.48f; a.vz=1; a.vx=0.2f;
+    b.x=0.5f; b.y=0.5f; b.z=0.52f; b.vz=-1;
+    solidSphereContact(a,&b,solidPosition(b),p.bodyRadius,{},p);
+    check(b.z-a.z>=0.1799f && a.vz<0 && b.vz>0 && a.angular[1]!=0,
+        "solid sphere contacts resolve in Z, bounce and transfer tangential impulse to spin");
+    a={}; b={}; a.z=1; a.vz=32; b.z=0; b.vz=-32;
+    solidSphereSweep(a,&b,{0,0,0},{0,0,1},{0,0,0},p.bodyRadius,{},p);
+    check(a.z<b.z && a.vz<0 && b.vz>0,"swept solid sphere contacts prevent high-speed tunnelling");
+    ParticleGeometryFrame collider; collider.meshIdentity=9007199254740011ull;
+    collider.minimum={0.2f,0.2f,0.45f}; collider.maximum={0.8f,0.8f,0.55f};
+    a={}; a.x=a.y=0.5f; a.z=0.8f; a.vz=32;
+    auto before=a; before.z=0.1f;
+    solidGeometryContact(a,before,collider,collider,1.0f/120,p);
+    check(a.z<=0.36001f && a.vz<0,"solid Geometry AABB contact is swept in depth");
+    ParticleSolidState state=golden; state.colliders=collider;
+    const auto scene=particleSolidScene(p,state,9,error);
+    check(scene && scene->objectCount==3 && scene->objects[0].transform.rotation.y!=0,
+        "native solid scene contains pose-driven bodies and the filled mesh bound");
+    state.count=64;
+    check(!particleSolidScene(p,state,9,error) && error.find("64")!=std::string::npos,
+        "solid native object capacity fails closed before allocation");
+
+    ParticleParams admitted;
+    const std::string payload="<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"8\" simulationSpace=\"1\" "
+        "spawnZ=\"0.3\" impulseZ=\"0.4\" gravityX=\"0.1\" gravityZ=\"-0.2\" orientationY=\"45\" angularX=\"2\" angularDrag=\"0.7\"/>";
+    check(videowire::admitParticleParameters(payload,admitted,error) && admitted.simulationSpace==1
+        && admitted.orientationDegrees[1]==45 && admitted.angularVelocity[0]==2 && admitted.impulseZ==0.4f,
+        "solid graph controls admit into the existing particle transport");
+    for (const auto* bad:{"<NodeParams simulationSpace=\"1\"/>",
+        "<NodeParams motionMode=\"2\" count=\"8\" simulationSpace=\"1\"/>",
+        "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"8\" simulationSpace=\"1\" bodyShape=\"1\"/>",
+        "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"8\" simulationSpace=\"1.5\"/>",
+        "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"8\" simulationSpace=\"1\" angularZ=\"nan\"/>"})
+        check(!videowire::admitParticleParameters(bad,admitted,error),"invalid solid transport fails closed");
+    check(videowire::admitParticleParameters("<NodeParams/>",admitted,error) && admitted.simulationSpace==0,
+        "legacy particle payloads retain planar defaults");
+
+    using namespace videowire::geometry;
+    PortContract contract; contract.carrier=CarrierKind::geometry3D; contract.maxVertices=256; contract.maxIndices=384;
+    auto mesh=lowerGrid(4400,4400,1,2,2,0.5f,contract,error);
+    auto retained=mesh ? admitValue(*mesh,contract,error):std::nullopt;
+    check(retained.has_value(),"solid generated geometry fixture admits");
+    if (retained) {
+        const auto encoded=encodeLoweredPlanText(lowerRuntimePlan(contract,*retained));
+        auto geometryPayload=payload;
+        geometryPayload.insert(geometryPayload.size()-2," bodyGeometryPlan=\""+encoded+"\" colliderGeometryPlan=\""+encoded+"\"");
+        check(videowire::admitParticleParameters(geometryPayload,admitted,error) && admitted.geometryBinding
+            && admitted.geometryBinding->body && admitted.geometryBinding->mesh,
+            "generated or retained imported Geometry uses the same bounded body and collider transport");
+        admitted.history=p.history;
+        const auto sampled=sampleSolidBodyFixture(admitted,0.5,error);
+        check(error.empty() && sampled.colliders.meshIdentity==4400,
+            "solid mesh sampling retains exact Geometry identity");
+        auto animated=particleGeometryFixture(true,error);
+        const auto moving=animated ? admitValue(*animated->geometryBinding->mesh,contract,error):std::nullopt;
+        check(moving.has_value(),"animated solid shape fixture admits its Geometry plan");
+        if (moving) {
+            auto rejected=payload;
+            rejected.insert(rejected.size()-2," bodyGeometryPlan=\""+encodeLoweredPlanText(lowerRuntimePlan(contract,*moving))+"\"");
+            check(!videowire::admitParticleParameters(rejected,admitted,error) && error.find("static")!=std::string::npos,
+                "animated rigid appearance fails closed rather than changing body shape during replay");
+        }
+    }
+}
+
+void checkCoupledBodyReplay()
+{
+    videorender::ParticleParams p;
+    p.motionMode = 2; p.count = 2; p.lifetime = 4; p.force = 0;
+    p.geometryCount = 2; p.collisionMode = 2; p.bodyRadius = 0.06f;
+    p.geometryAnchors[0] = {0.48f, 0.5f, 0.48f, 0.5f};
+    p.geometryAnchors[1] = {0.52f, 0.54f, 0.52f, 0.54f};
+    const auto circle = videorender::replayParticleBodies(p, 0.5, 1, nullptr);
+    check(std::hypot(circle[1][0] - circle[0][0], circle[1][1] - circle[0][1]) >= 0.1199f,
+          "coupled circle bodies resolve pair overlap");
+    check(circle == videorender::replayParticleBodies(p, 4.5, 1, nullptr),
+          "coupled repeat returns the exact earlier state at a loop");
+    p.bodyShape = 1;
+    const auto box = videorender::replayParticleBodies(p, 0.5, 1, nullptr);
+    check(box != circle && (std::abs(box[1][0] - box[0][0]) >= 0.1199f
+                        || std::abs(box[1][1] - box[0][1]) >= 0.1199f),
+          "axis-aligned box contacts use their own separation shape");
+    p.resetTime = 0.25f;
+    check(videorender::replayParticleBodies(p, 0.75, 1, nullptr) == box
+          && videorender::replayParticleBodies(p, 0.2, 1, nullptr)[0][2] == 0,
+          "reset time shifts deterministic replay and suppresses earlier bodies");
+    p.resetTime = 0; p.resetMode = 1; p.impulseX = 0.4f;
+    check(videorender::replayParticleBodies(p, 4, 1, nullptr)
+          == videorender::replayParticleBodies(p, 10000, 1, nullptr),
+          "hold-after-lifetime is bounded and independent of a distant seek");
+    p.collisionMode = 0;
+    const auto light = videorender::replayParticleBodies(p, 0.5, 1, nullptr);
+    p.bodyMass = 2;
+    const auto heavy = videorender::replayParticleBodies(p, 0.5, 1, nullptr);
+    check(light[0][0] > heavy[0][0], "mass changes the response to an authored impulse");
+    p.impulseX = 0; p.attraction = 3; p.geometryAnchors[0][2] = 0.8f;
+    const auto attracted = videorender::replayParticleBodies(p, 0.5, 1, nullptr);
+    check(attracted[0][0] > p.geometryAnchors[0][0], "typed point attractors excite coupled bodies");
+
+    const auto scoreFrame = [](bool reverse, int numerator)
+    {
+        auto score = std::make_shared<arbitmod::Score>();
+        score->scoreRevision = 1;
+        arbitmod::Note a; a.id = -101; a.midiNote = 60; a.velocity = 100;
+        a.freqHz = 261.625565f; a.startBeat = 0; a.lengthBeats = 4;
+        arbitmod::Note b = a; b.id = 202; b.midiNote = 72; b.freqHz *= 2;
+        score->notes = reverse ? std::vector<arbitmod::Note>{b, a} : std::vector<arbitmod::Note>{a, b};
+        score->links.push_back({-301, -101, 202, numerator, 2, 0});
+        canonicalblockc::FrameKey key;
+        key.projectGeneration = key.sourceGeneration = key.helperGeneration = key.backendGeneration = 1;
+        key.deviceGeneration = key.scoreGeneration = key.beatMapGeneration = key.fpsGeneration = 1;
+        key.loopGeneration = key.seekGeneration = 1; key.fps = 30;
+        canonicalblockc::FrameProducer producer;
+        return producer.evaluate(key, score, 0);
+    };
+    const auto score = scoreFrame(false, 3), reordered = scoreFrame(true, 3), ratio = scoreFrame(false, 7);
+    check(score && reordered && ratio, "canonical signed note/link fixture admits");
+    if (!score || !reordered || !ratio) return;
+    p = {}; p.motionMode = 2; p.count = 2; p.lifetime = 4; p.force = 0;
+    p.linkSpring = 3; p.linkRestScale = 0.5f;
+    const auto originalNotes = score->noteTextureValues;
+    const auto originalLinks = score->linkTextureValues;
+    const auto spring = videorender::replayParticleBodies(p, 0.5, 1, score.get());
+    check(spring == videorender::replayParticleBodies(p, 0.5, 1, reordered.get())
+          && originalNotes == score->noteTextureValues && originalLinks == score->linkTextureValues,
+          "coupled endpoints use canonical IDs independent of packing and do not mutate Block C");
+    check(spring != videorender::replayParticleBodies(p, 0.5, 1, ratio.get()),
+          "canonical link ratio weights dynamic spring force");
+    p.linkConstraint = 1;
+    const auto strut = videorender::replayParticleBodies(p, 0.5, 1, score.get());
+    check(std::abs(std::hypot(strut[1][0] - strut[0][0], strut[1][1] - strut[0][1]) - 0.08f) < 1.0e-5f,
+          "canonical harmonic strut constrains moving endpoint distance");
+    p.linkSpring = 0;
+    check(strut != videorender::replayParticleBodies(p, 0.5, 1, score.get()),
+          "zero link strength disconnects the physical constraint");
+}
+
+void checkHistoricalBodyReplay()
+{
+    auto score = std::make_shared<arbitmod::Score>();
+    score->scoreRevision = 1;
+    arbitmod::Note a;
+    a.id = -101; a.midiNote = 60; a.freqHz = 261.625565f; a.velocity = 127;
+    a.startBeat = 0; a.lengthBeats = 8;
+    score->notes.push_back(a);
+    auto history = std::make_shared<videorender::ParticleHistorySource>();
+    history->score = score;
+    history->key.projectGeneration = history->key.sourceGeneration = history->key.helperGeneration = 1;
+    history->key.backendGeneration = history->key.deviceGeneration = history->key.scoreGeneration = 1;
+    history->key.beatMapGeneration = history->key.fpsGeneration = history->key.loopGeneration = history->key.seekGeneration = 1;
+    videorender::ParticleParams p;
+    p.motionMode = 2; p.historicalReplay = true; p.history = history; p.count = 64;
+    p.lifetime = 2; p.force = 0; p.impulseX = 0.2f;
+    const auto render = [&](double seconds, double origin = 0)
+    {
+        p.historyProjectSeconds = origin + seconds;
+        return videorender::replayParticleBodies(p, seconds, 1, nullptr);
+    };
+    const auto golden = render(0.25);
+    check(std::abs(golden[0][0] - 0.47f) < 1.0e-5f && golden[0][2] == 1 && golden[1][2] == 0,
+          "historical note impulse has the expected constant-velocity trajectory");
+    for (int frame = 0; frame <= 15; ++frame) render(double(frame) / 60);
+    check(render(0.25) == golden, "historical sequential preview equals direct rational-time seek");
+    render(10000); render(0.9); render(0.05);
+    check(render(0.25) == golden, "historical state survives arbitrary seek ordering");
+    p.resetTime = 0.125f;
+    check(render(0.375) == golden && render(0.1)[0][2] == 0,
+          "historical reset origin shifts physical time without a prior frame dependency");
+    p.resetTime = 0; p.lifetime = 0.5f;
+    check(render(0.75) == golden, "repeat restarts bodies using the following cycle's score");
+    p.resetMode = 1;
+    check(render(10000) == render(0.5), "hold stops input sampling and physical time after lifetime");
+    p.resetMode = 0; p.lifetime = 2; p.impulseX = 0;
+    auto notes = std::make_shared<arbitmod::Score>(*score);
+    auto b = a; b.id = 202; b.midiNote = 72; b.freqHz *= 2;
+    b.startBeat = 0.2f; b.lengthBeats = 0.01f;
+    notes->notes.push_back(b);
+    notes->links.push_back({-301, -101, 202, 3, 2, 0});
+    history->score = notes;
+    p.linkSpring = 5; p.linkRestScale = 0.5f;
+    const auto afterRelease = render(0.5);
+    check(afterRelease[0][0] > 0.42f && afterRelease[1][2] == 0,
+          "a note shorter than one simulation step changes its linked body before note-off");
+    const auto before = render(0.09);
+    check(std::abs(before[0][0] - 0.42f) < 1.0e-6f && before[1][2] == 0,
+          "upcoming notes do not create historical bodies or link forces early");
+    check(render(0.5) == afterRelease, "canonical endpoint history replays identically after seeking backwards");
+    auto changed = std::make_shared<arbitmod::Score>(*notes);
+    changed->links.clear(); history->score = changed;
+    check(render(0.5) != afterRelease, "editing canonical links invalidates their reconstructed trajectory");
+    history->score = notes;
+    auto shifted = std::make_shared<arbitmod::Score>(*notes);
+    for (auto& note : shifted->notes) note.startBeat += 8;
+    history->score = shifted;
+    const auto range = render(0.5, 4);
+    p.resetTime = 4;
+    check(render(4.5) == range,
+          "a clip and export range use project-time history rather than range-relative score time");
+    p.resetTime = 0;
+
+    auto tempoScore = std::make_shared<arbitmod::Score>(*score);
+    tempoScore->notes[0].startBeat = 1;
+    history->score = tempoScore;
+    history->timeline.set({{0, 60, false}, {4, 180, true}}, {});
+    const double startsAt = history->timeline.beatToSeconds(1);
+    check(render(startsAt - 0.01)[0][2] == 0 && render(startsAt + 0.01)[0][2] == 1,
+          "historical note events follow the canonical tempo ramp rather than constant BPM");
+    history->timeline.reset(120, 4);
+
+    // Two onsets and a varying envelope must both influence the final body.
+    history->score = std::make_shared<const arbitmod::Score>();
+    std::vector<arbitblockb::FeatureFrame> frames(120);
+    for (std::size_t index = 0; index < frames.size(); ++index)
+    {
+        auto& f = frames[index]; f.frameIndex = static_cast<std::int64_t>(index);
+        f.sampleIndex = static_cast<std::int64_t>(index + 1) * arbitblockb::kHop;
+        f.rms = index < 30 ? 0.8f : 0.1f;
+        if (index >= 10)
+        {
+            const auto onset = index >= 40 ? 40 : 10;
+            f.onset = 1; f.onsetAge = float(index - onset) * float(arbitblockb::kHop) / 48000;
+        }
+    }
+    history->audioFrames = &frames; history->audioSampleRate = 48000;
+    p.geometryCount = 1; p.geometryAnchors[0] = {0.5f,0.2f,0.5f,0.2f};
+    p.onsetGain = 0.2f; p.rmsGain = 0.1f; p.linkSpring = 0;
+    const auto both = render(1);
+    auto once = frames;
+    for (std::size_t index = 40; index < once.size(); ++index)
+        once[index].onsetAge = float(index - 10) * float(arbitblockb::kHop) / 48000;
+    history->audioFrames = &once;
+    const auto one = render(1);
+    check(both[0][1] > one[0][1], "all historical audio onsets contribute separate impulses");
+    history->audioFrames = &frames;
+    check(render(1) == both && render(0.25) != both,
+          "baked audio history is stable across direct range and sequential frame requests");
+    const float resetOnset = float(11 * arbitblockb::kHop) / 48000;
+    p.resetTime = resetOnset;
+    const auto exactReset = render(double(resetOnset) + 0.1);
+    p.onsetGain = 0;
+    check(exactReset[0][1] > render(double(resetOnset) + 0.1)[0][1],
+          "an onset exactly on the reset boundary excites newly reset bodies once");
+    p.onsetGain = 0.2f; p.resetTime = 0;
+    auto dense = frames;
+    dense.resize(600);
+    for (std::size_t i = 0; i < dense.size(); ++i)
+    { dense[i].sampleIndex = std::int64_t(i + 1) * arbitblockb::kHop; dense[i].onset = 1; dense[i].onsetAge = 0; }
+    history->audioFrames = &dense;
+    p.lifetime = 10; p.historyProjectSeconds = 9;
+    std::string error;
+    check(!videorender::particleHistoryReady(p, error, 9) && error.find("512") != std::string::npos,
+          "over-cap event histories are diagnosed rather than silently truncating replay");
+    history->audioFrames = nullptr;
+    check(!videorender::particleHistoryReady(p, error) && error.find("baked project audio") != std::string::npos,
+          "missing history diagnoses the required project bake instead of substituting live audio");
+}
+
+void checkAnimatedGeometryBodies()
+{
+    std::string error;
+    auto fixture=particleGeometryFixture(true,error),stationary=particleGeometryFixture(false,error);
+    check(fixture.has_value() && stationary.has_value(),error.c_str());
+    if (!fixture || !stationary) return;
+    auto p=*fixture;
+    const auto render=[&](double time) { p.historyProjectSeconds=time; return videorender::replayParticleBodies(p,time,1,nullptr,&error); };
+    const auto moved=render(0.5);
+    check(error.empty() && moved[0][2]==1,"animated projected mesh barriers retain a live body");
+    stationary->historyProjectSeconds=0.5;
+    const auto fixed=videorender::replayParticleBodies(*stationary,0.5,1,nullptr,&error);
+    auto free=p; free.geometryBinding.reset();
+    check(moved!=fixed && moved!=videorender::replayParticleBodies(free,0.5,1,nullptr),
+          "timeline-driven mesh barriers alter contact motion independently of static barriers");
+    render(3.7); render(0.1);
+    check(render(0.5)==moved,"animated collider replay is independent of seek order");
+    for (int frame=0;frame<=15;++frame) render(double(frame)/30);
+    check(render(0.5)==moved,"sequential collider preview matches a direct seek");
+    const auto looped=render(1.5);
+    p.resetTime=1;
+    check(render(1.5)==looped && looped!=moved,
+          "repeat and explicit reset share a new cycle using current project geometry");
+    p.resetTime=0; p.historyProjectSeconds=1.5;
+    check(videorender::replayParticleBodies(p,0.5,1,nullptr,&error)==looped,
+          "range-relative clip time preserves project-time collider history");
+    p.resetMode=1;
+    check(render(100)==render(1),"hold freezes geometry sampling as well as body integration");
+    p.resetMode=0;
+    render(1000.5);
+    check(error.find("coordinate limit")!=std::string::npos,
+          "unbounded timeline projection stops with a diagnostic");
+    error.clear();
+    videowire::geometry::MaterializedInstancePlan excessive;
+    excessive.points[1].points.resize(65);
+    check(!videowire::geometry::particleGeometryIntermediatesFit(excessive,error),
+          "particle geometry rejects over-cap intermediate point sources");
+    error.clear();
+    auto binding=std::make_shared<videorender::ParticleGeometryBinding>(*p.geometryBinding);
+    videowire::geometry::PortContract pointsContract; pointsContract.carrier=videowire::geometry::CarrierKind::points3D; pointsContract.maxPoints=64;
+    const auto points=videowire::geometry::lowerPointsFromVertices(*binding->mesh,9810,pointsContract,error);
+    check(points.has_value(),error.c_str());
+    if (points)
+    {
+        binding->emitters=std::make_shared<const videowire::geometry::ValueDescriptor>(*points);
+        binding->attractors=binding->emitters; binding->points=binding->emitters; binding->mesh.reset();
+        p.geometryBinding=binding; p.count=4;
+        videorender::ParticleGeometryFrame a,b;
+        check(videorender::sampleParticleGeometry(p,0,a,error),error.c_str());
+        const auto start=p.geometryAnchors;
+        check(videorender::sampleParticleGeometry(p,videorender::kParticleReplayTicksPerSecond/2,b,error)
+            && p.geometryCount==4 && b.count==4 && start!=p.geometryAnchors,
+            "animated point emission, attraction and disc contacts share one geometry evaluation");
+    }
+}
+
 struct FakeLayer
 {
-    struct Clock { double time = 0.0, timeDelta = 0.0, beat = 0.0; int frame = 0; bool playing = false; };
+    struct Clock { double time = 0.0, timeSec = 0.0, timeDelta = 0.0, beat = 0.0; int frame = 0; bool playing = false; };
     struct Effect { bool enabled = false; int type = -1; float params[9] {}; };
     Clock shaderClock;
     std::map<std::string, double> genParams;
@@ -45,13 +512,23 @@ struct FakeLayer
     std::uintptr_t nativeTextureView = 0;
     arbitgpu::NativeTextureViewDescriptor nativeTextureDescriptor;
     std::shared_ptr<const void> nativeTextureOwner;
+    std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
+    int shaderTransitionFromClipId = 0;
     bool shaderSource = false;
+    bool scoreSource = false;
+    bool isAdjustment = false;
     bool flatShaderBridge = false;
     videowire::ImmutableShaderOperationPlan shaderOperationPlan;
     std::map<int, std::map<std::string, double>> shaderOperationParameters;
     bool particleSource = false;
+    bool importedParticleOverlay = false;
     bool particleStateReset = false;
     bool particleTriggerConnected = false;
+    videorender::ParticleParams particleParameters;
+    std::shared_ptr<const videorender::ParticleHistorySource> particleHistory;
+    double particleProjectSeconds = 0.0;
+    bool audioPresent = false;
+    struct Audio { float rms = 0.0f, onset = 0.0f, onsetAge = 0.0f; } audioFeatures;
     int particleTriggerCount = 0;
     float particleTriggerStrength = 0.0f;
     std::uint64_t visualPlanStructuralRevision = 0;
@@ -122,16 +599,13 @@ struct FakeLayer
 struct FakeProductRenderer
 {
     int colorAovExecutions = 0;
-    int motionAovExecutions = 0;
     int motionBlurPreparations = 0;
     int temporalFeedbackPreparations = 0;
     int bridgePreparations = 0;
     bool rejectColorAov = false;
-    bool rejectMotionAov = false;
     bool rejectTemporalFeedback = false;
     bool rejectFlatShaderBridge = false;
     renderpassoutput::Description publishedColorAov;
-    renderpassoutput::Description publishedMotionAov;
     std::optional<videowire::TemporalFeedbackPass> preparedTemporalFeedback;
     std::optional<videowire::TemporalSamplingExecution> preparedMotionBlur;
 
@@ -161,19 +635,6 @@ struct FakeProductRenderer
             return false;
         }
         publishedColorAov = description;
-        return true;
-    }
-
-    bool replaceMotionAovPass (const renderpassoutput::Description& description,
-                               std::string& error)
-    {
-        ++motionAovExecutions;
-        if (rejectMotionAov)
-        {
-            error = "native Motion AOV backend is unsupported";
-            return false;
-        }
-        publishedMotionAov = description;
         return true;
     }
 
@@ -236,6 +697,7 @@ videowire::CompiledVisualLayerPlan motionAovPlan()
 {
     videowire::CompiledVisualLayerPlan plan;
     plan.clipId = 92;
+    plan.structuralRevision = 4;
     plan.producerValidated = true;
     plan.nodeKinds = { std::string (opticalflowoperation::kOperationKind) };
     plan.nodeIds = { 812 };
@@ -464,6 +926,11 @@ videowire::CompiledVisualLayerPlan depthPlan()
 
 int main()
 {
+    checkCoupledBodyReplay();
+    checkHistoricalBodyReplay();
+    checkVisualParameterHistory();
+    checkSolidBodyReplay();
+    checkAnimatedGeometryBodies();
     std::string error;
     error.reserve(256);
     videowire::CompiledVisualLayerPlan multipleGeometry;
@@ -481,6 +948,137 @@ int main()
               && allocations.load(std::memory_order_relaxed) == beforeMultiGeometry
               && error == "multiple Geometry Core image outputs require an explicit compositor",
           "multiple Geometry Core outputs reject before decode or native allocation");
+    {
+        videowire::CompiledVisualLayerPlan harmonic;
+        harmonic.clipId = 17;
+        harmonic.structuralRevision = 2;
+        harmonic.nodeKinds = {visualharmonicgeometry::kOperationKind};
+        harmonic.nodeIds = {71};
+        harmonic.ports = {{71, 1, 1, "out", "frame", "image", "rgba8", "sRGB"}};
+        visualharmonicgeometry::Mapping mapping;
+        mapping.stableId = 72;
+        harmonic.operations = {{71, visualharmonicgeometry::kOperationKind, "native-gpu",
+                                 visualharmonicgeometry::encode(mapping)}};
+        videowire::VisualLayerExecution execution;
+        check(videowire::compileVisualLayerExecution(harmonic, execution, error),
+              "harmonic ribbon operation must be admitted before native execution");
+        FakeLayer emptyScore;
+        check(videowire::admitGeometryCoreOperations(harmonic,
+                  videohelper::geometry::PlanUse::preview, &geometryContext, 64, 64, emptyScore, error)
+                  && emptyScore.opacity == 0 && !emptyScore.nativeTextureOwner,
+              "an empty score produces a transparent layer without GPU allocation");
+        harmonic.operations[0].payloadXml += "trailing";
+        check(!videowire::compileVisualLayerExecution(harmonic, execution, error),
+              "harmonic ribbon malformed payload must fail admission");
+        harmonic.operations[0].payloadXml = visualharmonicgeometry::encode(mapping);
+        harmonic.ports[0].dataType = "depth";
+        check(!videowire::compileVisualLayerExecution(harmonic, execution, error),
+              "harmonic ribbon output cannot be relabeled as Depth");
+    }
+    {
+        using namespace videowire::geometry;
+        PortContract contract;
+        contract.carrier=CarrierKind::geometry3D;
+        contract.maxVertices=4; contract.maxIndices=6;
+        auto mesh=lowerGrid(901,901,1,2,2,1,contract,error);
+        check(mesh.has_value(),"spectrum ordered-plan fixture lowers");
+        if (mesh)
+        {
+            spectrum::Binding binding;
+            binding.fieldStableId=902; binding.sourceGeometryStableId=901;
+            binding.consumerGeometryStableId=903;
+            binding.coordinates={0.0f,0.25f,0.75f,1.0f};
+            mesh->spectrumFields.push_back(binding);
+            mesh->operations.push_back({902,OperationCode::evaluateField,902,902,{}});
+            mesh->operations.push_back({903,OperationCode::transform,901,903,{}});
+            mesh->stableId=903; mesh->dispatchCount=3;
+            auto admitted=admitValue(*mesh,contract,error);
+            check(admitted.has_value(),"spectrum ordered-plan value admits");
+            if (admitted)
+            {
+                videowire::CompiledVisualLayerPlan plan;
+                plan.clipId=18; plan.structuralRevision=3;
+                plan.nodeKinds={"geometry.core.runtime"}; plan.nodeIds={71};
+                plan.ports={{71,1,1,"out","frame","image","rgba8","sRGB"}};
+                plan.operations={{71,"geometry.core.runtime","native-gpu",
+                    encodeLoweredPlanText(lowerRuntimePlan(contract,*admitted))}};
+                videowire::VisualLayerExecution execution;
+                check(videowire::compileVisualLayerExecution(plan,execution,error),
+                      "spectrum geometry is admitted by the actual ordered production compiler");
+                check(videowire::isGeometryCoreRenderPlan({plan},18),
+                      "geometry source bypasses decoded video in preview and export");
+                plan.ports[0].dataType="depth";
+                check(!videowire::compileVisualLayerExecution(plan,execution,error),
+                      "geometry image output cannot claim a different AOV");
+                plan.ports[0].dataType="image";
+                plan.operations[0].payloadXml+="00";
+                check(!videowire::compileVisualLayerExecution(plan,execution,error),
+                      "malformed spectrum transport fails before native allocation");
+            }
+        }
+    }
+    {
+        using namespace videowire::geometry;
+        PortContract meshContract;
+        meshContract.carrier=CarrierKind::geometry3D;
+        meshContract.maxVertices=4; meshContract.maxIndices=6;
+        PortContract contract;
+        contract.carrier=CarrierKind::instances3D; contract.maxInstances=64;
+        auto mesh=lowerGrid(911,911,1,2,2,1,meshContract,error);
+        spectrum::Binding binding;
+        binding.firstBand=4; binding.lastBand=15;
+        auto instances=mesh ? lowerSpectrumInstancer(*mesh,912,binding,{1,3,3,4},contract,error) : std::nullopt;
+        auto admitted=instances ? admitValue(*instances,contract,error) : std::nullopt;
+        check(admitted.has_value(),"Spectrum Instancer production-plan fixture admits");
+        if (admitted)
+        {
+            videowire::CompiledVisualLayerPlan plan;
+            plan.clipId=19; plan.structuralRevision=3;
+            plan.nodeKinds={"geometry.core.runtime"}; plan.nodeIds={72};
+            plan.ports={{72,1,1,"out","frame","image","rgba8","sRGB"}};
+            plan.operations={{72,"geometry.core.runtime","native-gpu",
+                encodeLoweredPlanText(lowerRuntimePlan(contract,*admitted))}};
+            videowire::VisualLayerExecution execution;
+            check(videowire::compileVisualLayerExecution(plan,execution,error),
+                  "Spectrum Instancer enters the production ordered native render schedule");
+            check(videowire::isGeometryCoreRenderPlan({plan},19),
+                  "Spectrum Instancer preview and export bypass decoded-media and dummy-frame paths");
+        }
+    }
+    {
+        using namespace videowire::geometry;
+        PortContract contract;
+        contract.carrier=CarrierKind::geometry3D; contract.maxVertices=4; contract.maxIndices=6;
+        auto mesh=lowerGrid(961,961,1,2,2,1,contract,error);
+        check(mesh.has_value(),"Score Field production fixture lowers");
+        if (mesh) {
+            scorefield::Binding binding;
+            binding.fieldStableId=962; binding.sourceGeometryStableId=961;
+            binding.consumerGeometryStableId=963; binding.scoreSourceStableId=964;
+            binding.elementIds=std::get<GeometryData>(mesh->data).vertexIds;
+            for (const auto& p : std::get<GeometryData>(mesh->data).positions)
+                binding.positions.push_back({p.x,p.y,p.z});
+            mesh->scoreFields.push_back(binding);
+            mesh->operations.push_back({962,OperationCode::evaluateField,962,962,{}});
+            mesh->operations.push_back({963,OperationCode::transformTRS,961,963,{}});
+            mesh->stableId=963; mesh->dispatchCount=3;
+            const auto admitted=admitValue(*mesh,contract,error);
+            check(admitted.has_value(),"Score Field typed transport admits");
+            if (admitted) {
+                videowire::CompiledVisualLayerPlan plan;
+                plan.clipId=20; plan.structuralRevision=4;
+                plan.nodeKinds={"geometry.core.runtime"}; plan.nodeIds={73};
+                plan.ports={{73,1,1,"out","frame","image","rgba8","sRGB"}};
+                plan.operations={{73,"geometry.core.runtime","native-gpu",
+                    encodeLoweredPlanText(lowerRuntimePlan(contract,*admitted))}};
+                videowire::VisualLayerExecution execution;
+                check(videowire::compileVisualLayerExecution(plan,execution,error),
+                      "Score Field enters the production native render schedule");
+                check(videowire::isGeometryCoreRenderPlan({plan},20),
+                      "Score Field preview/export requires no dummy video source");
+            }
+        }
+    }
     videowire::VisualEventScheduleBinding eventSchedule;
     eventSchedule.clipId = 7;
     eventSchedule.nodeId = 70;
@@ -550,44 +1148,40 @@ int main()
 
     const auto motionAov = motionAovPlan();
     const std::vector<videowire::CompiledVisualLayerPlan> motionAovPlans { motionAov };
-    FakeLayer viewportMotionLayer;
-    FakeLayer exportMotionLayer;
-    FakeProductRenderer viewportMotionRenderer;
-    FakeProductRenderer exportMotionRenderer;
-    check (videowire::executeVisualLayerPlanForRenderer (
-               viewportMotionRenderer, motionAovPlans, motionAov.clipId,
-               viewportMotionLayer, error, videohelper::geometry::PlanUse::preview, nullptr)
-           && videowire::executeVisualLayerPlanForRenderer (
-               exportMotionRenderer, motionAovPlans, motionAov.clipId,
-               exportMotionLayer, error, videohelper::geometry::PlanUse::preview, nullptr)
-           && viewportMotionRenderer.motionAovExecutions == 1
-           && viewportMotionRenderer.bridgePreparations == 1
-           && exportMotionRenderer.motionAovExecutions == 1
-           && exportMotionRenderer.bridgePreparations == 1
-           && viewportMotionRenderer.publishedMotionAov.extent
-                == renderpassoutput::Extent { 640, 360 }
-           && exportMotionRenderer.publishedMotionAov.extent
-                == viewportMotionRenderer.publishedMotionAov.extent
-           && viewportMotionRenderer.publishedMotionAov.attachments.size() == 1
-           && exportMotionRenderer.publishedMotionAov.attachments.size() == 1
-           && viewportMotionRenderer.publishedMotionAov.attachments.front().output
-                == renderpassoutput::Output::Motion
-           && viewportMotionRenderer.publishedMotionAov.attachments.front().format
-                == renderpassoutput::PixelFormat::RG16Float
-           && viewportMotionRenderer.publishedMotionAov.attachments.front().colorSpace
-                == renderpassoutput::ColorSpace::Data,
-           "viewport and export execute and publish the same typed Motion AOV description");
-    FakeLayer unsupportedMotionLayer;
-    FakeProductRenderer unsupportedMotionRenderer;
-    unsupportedMotionRenderer.rejectMotionAov = true;
+    for (const auto use : { videohelper::geometry::PlanUse::preview,
+                            videohelper::geometry::PlanUse::exportRender })
+    {
+        FakeLayer unboundMotionLayer;
+        unboundMotionLayer.texture = 73;
+        FakeProductRenderer unboundMotionRenderer;
+        error.clear();
+        check (! videowire::executeVisualLayerPlanForRenderer (
+                   unboundMotionRenderer, motionAovPlans, motionAov.clipId,
+                   unboundMotionLayer, error, use, nullptr)
+               && error == "Render Passes Motion has no two-frame optical-flow source"
+               && unboundMotionRenderer.colorAovExecutions == 0
+               && unboundMotionRenderer.motionBlurPreparations == 0
+               && unboundMotionRenderer.bridgePreparations == 0
+               && unboundMotionLayer.texture == 73
+               && ! unboundMotionLayer.graphMotionBlurActive,
+               "preview and export reject extent-only Motion before compositor publication");
+    }
+    auto retainedColor = colorAov;
+    retainedColor.clipId = motionAov.clipId;
+    retainedColor.structuralRevision = motionAov.structuralRevision - 1;
+    auto motionAdmission = std::make_unique<videowire::VisualPlanExecutionState>();
+    check (motionAdmission->admitPlans ({ retainedColor }, &error, 640, 360),
+           "a prior Color plan admits before the unsupported Motion replacement");
+    const auto retainedReceipt = motionAdmission->resourceReceipt();
     error.clear();
-    check (! videowire::executeVisualLayerPlanForRenderer (
-               unsupportedMotionRenderer, motionAovPlans, motionAov.clipId,
-               unsupportedMotionLayer, error, videohelper::geometry::PlanUse::preview, nullptr)
-           && unsupportedMotionRenderer.motionAovExecutions == 1
-           && unsupportedMotionRenderer.bridgePreparations == 0
-           && error == "native Motion AOV backend is unsupported",
-           "product execution fails closed when native Motion AOV submission is unsupported");
+    check (! motionAdmission->admitPlans (motionAovPlans, &error, 640, 360)
+           && error == "Render Passes Motion has no two-frame optical-flow source"
+           && motionAdmission->compiled (retainedColor.clipId,
+                                         retainedColor.structuralRevision) != nullptr
+           && motionAdmission->compiled (motionAov.clipId,
+                                         motionAov.structuralRevision) == nullptr
+           && motionAdmission->resourceReceipt() == retainedReceipt,
+           "unbound optical-flow admission retains the previous plan and resource receipt");
     auto direct = directPlan();
     FakeLayer layer;
     videowire::VisualLayerExecution execution;
@@ -813,10 +1407,19 @@ int main()
         { 51, "visual.particles", "native-gpu", "<NodeParams seed=\"70000\" count=\"9000\" lifetime=\"20\" size=\"0\" speed=\"9\" red=\"-1\" green=\"2\" blue=\"0.4\" alpha=\"2\"/>" },
         { 12, "video.out", "native-gpu", "" }
     };
+    particles.ports = {
+        { 51, 0, 1, "in", "event", "unspecified", "unspecified", "unspecified" },
+        { 51, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 12, 0, 1, "in", "frame", "image", "rgba8", "sRGB" }
+    };
+    check (videowire::validateCompiledVisualLayerPlans({}, { particles }, false, error),
+           "snapshot admission accepts the producer's descriptorless particle trigger port");
+    auto forgedDescriptorlessPort = particles;
+    forgedDescriptorlessPort.ports[0].nodeId = 12;
+    check (! videowire::validateCompiledVisualLayerPlans({}, { forgedDescriptorlessPort }, false, error)
+           && error == "visual layer plan has invalid typed port descriptors",
+           "descriptorless event admission remains scoped to the exact particle trigger port");
     FakeLayer particleLayer;
-    for (const char* key : { "nativeBuiltin", "seed", "count", "lifetime", "size",
-                             "speed", "red", "green", "blue", "alpha" })
-        particleLayer.genParams.emplace(key, 0.0);
     particleLayer.shaderClock.time = 1.25;
     particleLayer.shaderClock.frame = 30;
     particleLayer.shaderClock.timeDelta = 1.0 / 24.0;
@@ -824,14 +1427,14 @@ int main()
     check (videowire::executeVisualLayerPlan({ particles }, 7, particleLayer, error,videohelper::geometry::PlanUse::preview,
                                              nullptr, nullptr, nullptr, 2.5)
            && particleLayer.particleSource && ! particleLayer.shaderSource
-           && particleLayer.genParams["nativeBuiltin"] == 1.0
-           && particleLayer.genParams["seed"] == 65535.0
-           && particleLayer.genParams["count"] == 4096.0
-           && particleLayer.genParams["lifetime"] == 10.0
-           && particleLayer.genParams["size"] == 1.0
-           && particleLayer.genParams["speed"] == 4.0
-           && particleLayer.genParams["red"] == 0.0
-           && particleLayer.genParams["green"] == 1.0
+           && particleLayer.genParams.empty()
+           && particleLayer.particleParameters.seed == 65535
+           && particleLayer.particleParameters.count == 4096
+           && particleLayer.particleParameters.lifetime == 10.0f
+           && particleLayer.particleParameters.size == 1.0f
+           && particleLayer.particleParameters.force == 4.0f
+           && particleLayer.particleParameters.red == 0.0f
+           && particleLayer.particleParameters.green == 1.0f
            && particleLayer.shaderClock.time == 1.25
            && particleLayer.shaderClock.frame == 30
            && particleLayer.shaderClock.timeDelta == 1.0 / 24.0
@@ -846,8 +1449,181 @@ int main()
                                              nullptr, nullptr, particleState.get(), 3.0)
            && particleLayer.genParams.size() == particleMapSize
            && allocations.load(std::memory_order_relaxed) == particleAllocations,
-           "typed particle render updates only pre-existing parameters without allocation or insertion");
+           "typed particle render carries admitted values without map allocation or insertion");
+    auto reactiveParticles = particles;
+    reactiveParticles.operations[0].payloadXml =
+        "<NodeParams motionMode=\"1\" spawnTrack=\"9\" seed=\"71\" count=\"1024\" "
+        "gravity=\"0.4\" drag=\"2\" attraction=\"3\" linkSpring=\"2.5\" linkRatioInfluence=\"0.75\" "
+        "collisionMode=\"1\" bodyRadius=\"0.025\" restitution=\"0.85\" "
+        "rmsGain=\"4\" onsetGain=\"5\" resetTime=\"2.5\"/>";
+    FakeLayer reactiveLayer;
+    check(videowire::isTypedParticlePlan({ reactiveParticles }, 7),
+          "typed particles select a source without probing dummy media");
+    check(videowire::executeVisualLayerPlan({ reactiveParticles }, 7, reactiveLayer, error,
+              videohelper::geometry::PlanUse::preview),
+          "timeline reactive particles execute through the production plan");
+    reactiveLayer.audioPresent = true;
+    reactiveLayer.audioFeatures = { 0.25f, 0.75f, 0.5f };
+    const auto nativeParameters = videorender::particleParamsForLayer(reactiveLayer);
+    check(nativeParameters.motionMode == 1 && nativeParameters.spawnTrack == 9
+          && nativeParameters.seed == 71 && nativeParameters.count == 1024
+          && nativeParameters.drag == 2.0f && nativeParameters.attraction == 3.0f
+          && nativeParameters.linkSpring == 2.5f && nativeParameters.linkRatioInfluence == 0.75f
+          && nativeParameters.collisionMode == 1 && nativeParameters.bodyRadius == 0.025f
+          && nativeParameters.restitution == 0.85f
+          && nativeParameters.rmsGain == 4.0f && nativeParameters.onsetGain == 5.0f
+          && nativeParameters.resetTime == 2.5f && nativeParameters.rms == 0.25f
+          && nativeParameters.onset == 0.75f && nativeParameters.onsetAge == 0.5f,
+          "native particles consume graph settings and canonical Block B without generator map keys");
+    FakeLayer exportParticles;
+    check(videowire::executeVisualLayerPlan({ reactiveParticles }, 7, exportParticles, error,
+              videohelper::geometry::PlanUse::exportRender)
+          && exportParticles.particleParameters.linkSpring == nativeParameters.linkSpring
+          && exportParticles.particleParameters.collisionMode == nativeParameters.collisionMode
+          && exportParticles.particleParameters.bodyRadius == nativeParameters.bodyRadius
+          && exportParticles.particleParameters.restitution == nativeParameters.restitution
+          && exportParticles.particleParameters.linkRatioInfluence == nativeParameters.linkRatioInfluence,
+          "offline export admits the same harmonic-link spring controls as preview");
+    auto coupledParticles = reactiveParticles;
+    coupledParticles.operations[0].payloadXml =
+        "<NodeParams motionMode=\"2\" count=\"64\" collisionMode=\"2\" bodyShape=\"1\" "
+        "bodyMass=\"2\" friction=\"0.5\" linkConstraint=\"1\" linkSpring=\"3\" "
+        "linkRestScale=\"0.75\" impulseX=\"-0.2\" impulseY=\"0.4\" resetMode=\"1\" historicalReplay=\"1\"/>";
+    FakeLayer coupledPreview, coupledExport;
+    auto coupledHistory=std::make_shared<videorender::ParticleHistorySource>();
+    coupledHistory->score=std::make_shared<const arbitmod::Score>();
+    coupledPreview.particleHistory=coupledExport.particleHistory=coupledHistory;
+    FakeProductRenderer coupledPreviewRenderer,coupledExportRenderer;
+    check(videowire::executeVisualLayerPlanForRenderer(coupledPreviewRenderer,{coupledParticles},7,coupledPreview,error,
+              videohelper::geometry::PlanUse::preview,nullptr)
+          && videowire::executeVisualLayerPlanForRenderer(coupledExportRenderer,{coupledParticles},7,coupledExport,error,
+              videohelper::geometry::PlanUse::exportRender,nullptr),
+          "coupled bodies admit through preview and export");
+    const auto& cp = coupledPreview.particleParameters;
+    const auto& ce = coupledExport.particleParameters;
+    check(cp.motionMode == 2 && cp.count == 64 && cp.collisionMode == 2 && cp.bodyShape == 1
+          && cp.bodyMass == 2 && cp.friction == 0.5f && cp.linkConstraint == 1
+          && cp.linkRestScale == 0.75f && cp.impulseX == -0.2f && cp.impulseY == 0.4f
+          && cp.resetMode == 1 && cp.historicalReplay && ce.historicalReplay
+          && ce.motionMode == cp.motionMode && ce.bodyMass == cp.bodyMass
+          && ce.linkConstraint == cp.linkConstraint && ce.resetMode == cp.resetMode,
+          "physical authoring parameters retain exact values across native plan paths");
+    for (const auto* xml : { "<NodeParams motionMode=\"2\" count=\"65\"/>",
+                            "<NodeParams motionMode=\"2\" count=\"1.5\"/>",
+                            "<NodeParams motionMode=\"2\" count=\"64\" bodyMass=\"0\"/>",
+                            "<NodeParams motionMode=\"2\" count=\"64\" bodyShape=\"2\"/>",
+                            "<NodeParams motionMode=\"2\" count=\"64\" friction=\"nan\"/>",
+                            "<NodeParams motionMode=\"2\" count=\"64\" historicalReplay=\"0.5\"/>",
+                            "<NodeParams motionMode=\"1\" historicalReplay=\"1\"/>",
+                            "<NodeParams motionMode=\"1\" collisionMode=\"2\"/>",
+                            "<NodeParams motionMode=\"1\" linkConstraint=\"1\"/>" })
+    {
+        videorender::ParticleParams rejected;
+        check(!videowire::admitParticleParameters(xml, rejected, error),
+              "unsupported coupled-body capacities and motion combinations fail closed");
+    }
+    {
+        using namespace videowire::geometry;
+        PortContract meshContract; meshContract.carrier=CarrierKind::geometry3D;
+        meshContract.maxVertices=4; meshContract.maxIndices=6;
+        auto mesh=lowerGrid(9700,9700,1,2,2,1,meshContract,error);
+        PortContract pointsContract; pointsContract.carrier=CarrierKind::points3D; pointsContract.maxPoints=64;
+        auto points=mesh ? lowerPointsFromVertices(*mesh,9701,pointsContract,error) : std::nullopt;
+        auto admitted=points ? admitValue(*points,pointsContract,error) : std::nullopt;
+        check(admitted.has_value(),"particle geometry fixture admits its exact point provenance");
+        if (admitted) {
+            const auto encoded=encodeLoweredPlanText(lowerRuntimePlan(pointsContract,*admitted));
+            auto geometryParticles=particles;
+            geometryParticles.operations[0].payloadXml="<NodeParams motionMode=\"1\" geometryScale=\"0.5\" emitterGeometryPlan=\""+encoded
+                +"\" attractorGeometryPlan=\""+encoded+"\"/>";
+            FakeLayer previewGeometry,exportGeometry;
+            check(videowire::executeVisualLayerPlan({geometryParticles},7,previewGeometry,error,videohelper::geometry::PlanUse::preview)
+                && videowire::executeVisualLayerPlan({geometryParticles},7,exportGeometry,error,videohelper::geometry::PlanUse::exportRender)
+                && previewGeometry.particleParameters.geometryCount==4
+                && previewGeometry.particleParameters.geometryAnchors==exportGeometry.particleParameters.geometryAnchors
+                && previewGeometry.particleParameters.geometryAnchors[0][0]==0.25f,
+                "typed geometry emitters and attractors use identical bounded projected positions for preview and export");
+            geometryParticles.operations[0].payloadXml="<NodeParams motionMode=\"2\" count=\"64\" collisionMode=\"2\" emitterGeometryPlan=\""+encoded
+                +"\" attractorGeometryPlan=\""+encoded+"\"/>";
+            check(videowire::executeVisualLayerPlan({geometryParticles},7,previewGeometry,error,videohelper::geometry::PlanUse::preview)
+                && videowire::executeVisualLayerPlan({geometryParticles},7,exportGeometry,error,videohelper::geometry::PlanUse::exportRender)
+                && previewGeometry.particleParameters.motionMode==2
+                && previewGeometry.particleParameters.geometryAnchors==exportGeometry.particleParameters.geometryAnchors,
+                "coupled bodies reuse the typed Geometry Core emitter and attractor plans");
+            const auto colliderMesh=admitValue(*mesh,meshContract,error);
+            check(colliderMesh.has_value(),error.c_str());
+            if (colliderMesh)
+            {
+                const auto collider=encodeLoweredPlanText(lowerRuntimePlan(meshContract,*colliderMesh));
+                geometryParticles.operations[0].payloadXml="<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"4\" "
+                    "speed=\"0\" emitterGeometryPlan=\""+encoded+"\" colliderGeometryPlan=\""+collider+"\"/>";
+                auto history=std::make_shared<videorender::ParticleHistorySource>(); history->score=std::make_shared<const arbitmod::Score>();
+                previewGeometry.particleHistory=history; exportGeometry.particleHistory=history;
+                previewGeometry.particleProjectSeconds=exportGeometry.particleProjectSeconds=0.5;
+                previewGeometry.shaderClock.timeSec=exportGeometry.shaderClock.timeSec=0.5;
+                FakeProductRenderer previewBackend,exportBackend;
+                check(videowire::executeVisualLayerPlanForRenderer(previewBackend,{geometryParticles},7,previewGeometry,error,
+                          videohelper::geometry::PlanUse::preview,nullptr)
+                    && videowire::executeVisualLayerPlanForRenderer(exportBackend,{geometryParticles},7,exportGeometry,error,
+                          videohelper::geometry::PlanUse::exportRender,nullptr)
+                    && previewGeometry.particleParameters.preparedBodies && exportGeometry.particleParameters.preparedBodies
+                    && *previewGeometry.particleParameters.preparedBodies==*exportGeometry.particleParameters.preparedBodies,
+                    "preview and export prepare identical collision states before entering native compositor passes");
+            }
+            auto removed=previewGeometry.particleParameters;
+            check(videowire::admitParticleParameters("<NodeParams motionMode=\"1\"/>",removed,error)
+                && removed.geometryCount==0 && !removed.geometryBinding && !removed.preparedBodies,
+                "removing geometry inputs clears previously admitted particle anchors");
+            for (const auto& xml : {
+                "<NodeParams motionMode=\"0\" emitterGeometryPlan=\""+encoded+"\"/>",
+                "<NodeParams motionMode=\"1\" attractorGeometryPlan=\""+encoded+"\"/>",
+                "<NodeParams motionMode=\"1\" geometryProjection=\"3\" emitterGeometryPlan=\""+encoded+"\"/>",
+                std::string("<NodeParams motionMode=\"1\" emitterGeometryPlan=\"invalid\"/>")}) {
+                videorender::ParticleParams rejected;
+                check(!videowire::admitParticleParameters(xml,rejected,error),
+                    "malformed particle geometry, missing emitter and unsupported projection fail closed");
+            }
+        }
+    }
+    for (const auto* payload : { "<NodeParams motionMode=\"3\"/>",
+                                "<NodeParams drag=\"nan\"/>",
+                                "<NodeParams attraction=\"11\"/>",
+                                "<NodeParams collisionMode=\"1.5\"/>",
+                                "<NodeParams bodyRadius=\"0\"/>",
+                                "<NodeParams restitution=\"nan\"/>",
+                                "<NodeParams linkSpring=\"11\"/>",
+                                "<NodeParams linkRatioInfluence=\"nan\"/>",
+                                "<NodeParams linkRatioInfluence=\"1.5\"/>",
+                                "<NodeParams spawnTrack=\"1.5\"/>",
+                                "<NodeParams resetTime=\"-1\"/>" })
+    {
+        auto invalidMotion = reactiveParticles;
+        invalidMotion.operations[0].payloadXml = payload;
+        videowire::VisualLayerExecution rejected;
+        check(!videowire::compileVisualLayerExecution(invalidMotion, rejected, error)
+              && error.find("particle motion controls") != std::string::npos,
+              "invalid particle motion parameters fail with a bounded diagnostic");
+    }
+    for (const auto* payload : { "<NodeParams linkSpring=\"1\"/>",
+                                "<NodeParams motionMode=\"1\" linkSpring=\"1\" count=\"4097\"/>" })
+    {
+        auto invalidSpring = reactiveParticles;
+        invalidSpring.operations[0].payloadXml = payload;
+        videowire::VisualLayerExecution rejected;
+        check(!videowire::compileVisualLayerExecution(invalidSpring, rejected, error)
+              && error.find("128") != std::string::npos
+              && error.find("256") != std::string::npos,
+              "unsupported harmonic spring motion and particle capacity report score bounds");
+    }
     auto particleSchedule = eventSchedule;
+    {
+        auto invalidBodies = reactiveParticles;
+        invalidBodies.operations[0].payloadXml = "<NodeParams collisionMode=\"1\"/>";
+        videowire::VisualLayerExecution rejected;
+        check(!videowire::compileVisualLayerExecution(invalidBodies, rejected, error)
+            && error.find("imported mesh topology") != std::string::npos,
+            "body collision mode requires absolute timeline replay and states its collider limit");
+    }
     particleSchedule.nodeId = 51;
     const std::vector<videowire::VisualEventScheduleBinding> particleSchedules { particleSchedule };
     videowire::VisualEventTriggerCursor particleCursor (true);
@@ -1206,6 +1982,32 @@ int main()
     };
     check (videowire::validateCompiledVisualLayerPlans({}, { threeSource }, false, error),
            "three-source composite satisfies the complete typed snapshot contract");
+    auto sceneComposite = threeSource;
+    sceneComposite.nodeKinds = { "visual.3d.imported-animation", "visual.3d.render", "video.blend", "video.out" };
+    sceneComposite.nodeIds = { 70, 71, 24, 12 };
+    sceneComposite.operations = {
+        { 70, "visual.3d.imported-animation", "source-decode", "" },
+        { 71, "visual.3d.render", "native-gpu", "" },
+        { 24, "video.blend", "native-gpu", "" }, { 12, "video.out", "native-gpu", "" }
+    };
+    sceneComposite.ports = {
+        { 70, 4, 1, "out", "control", "scene3D", "unspecified", "unspecified" },
+        { 71, 0, 1, "in", "control", "scene3D", "unspecified", "unspecified" },
+        { 71, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 24, 0, 1, "in", "frame", "image", "rgba8", "sRGB" },
+        { 24, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 24, 2, 1, "in", "frame", "image", "rgba8", "sRGB" },
+        { 24, 3, 1, "in", "frame", "image", "rgba8", "sRGB" },
+        { 12, 0, 1, "in", "frame", "image", "rgba8", "sRGB" }
+    };
+    sceneComposite.edges = { { 70, 4, 71, 0 }, { 71, 1, 24, 0 }, { 24, 1, 12, 0 } };
+    check (videowire::validateCompiledVisualLayerPlans({}, { sceneComposite }, false, error),
+           "bounded image admission stops at a native scene control boundary");
+    auto wrongSceneImage = sceneComposite;
+    wrongSceneImage.ports[2].pixelFormat = "rgba16f";
+    check (! videowire::validateCompiledVisualLayerPlans({}, { wrongSceneImage }, false, error)
+               && error == "bounded visual DAG requires RGBA8 sRGB Frame<Image> descriptors",
+           "native scene compositor still rejects a non-RGBA8 image boundary");
     check (videowire::compileVisualLayerExecution(threeSource, execution, error)
            && execution.compositeInputCount == 3
            && execution.compositeSourceNodeIds[0] == 11
@@ -2269,6 +3071,20 @@ int main()
            "viewport and export invoke the same pre-admitted native feedback pass");
 
     FakeProductRenderer missingFeedbackRenderer;
+    auto resetHistory=std::make_shared<videorender::ParticleHistorySource>();
+    resetHistory->parameterAt=[](const auto&,double seconds,double& value,std::string&)
+    { value=seconds>=1.01 && seconds<1.02 ? 1:0; return true; };
+    viewportFeedbackLayer.particleHistory=resetHistory;
+    viewportFeedbackLayer.particleProjectSeconds=1.0+1.0/30;
+    viewportFeedbackLayer.shaderClock.timeDelta=1.0/30;
+    check(videowire::executeVisualLayerPlanForRenderer(viewportFeedbackRenderer,{feedback},7,
+        viewportFeedbackLayer,error,videohelper::geometry::PlanUse::preview,nullptr,nullptr,nullptr,
+        viewportFeedbackState.get(),1.0+1.0/30) && viewportFeedbackLayer.feedbackHistoryReset,
+        "temporal reset detects a fixed-step pulse shorter than the display frame");
+    check(videowire::executeVisualLayerPlanForRenderer(viewportFeedbackRenderer,{feedback},7,
+        viewportFeedbackLayer,error,videohelper::geometry::PlanUse::preview,nullptr,nullptr,nullptr,
+        viewportFeedbackState.get(),1.0+1.0/30) && !viewportFeedbackLayer.feedbackHistoryReset,
+        "repeating a held temporal frame does not consume its reset twice");
     FakeLayer missingFeedbackLayer;
     error.clear();
     check (! videowire::executeVisualLayerPlanForRenderer(
@@ -2595,7 +3411,6 @@ int main()
               connectedMotionLayer, error, videohelper::geometry::PlanUse::preview,
               &previewMotionTransaction, nullptr, nullptr, motionState.get(), 1.0,
               nullptr, nullptr, &previewMotionContext)
-          && connectedMotionRenderer.motionAovExecutions == 0
           && connectedMotionRenderer.motionBlurPreparations == 1
           && connectedMotionRenderer.preparedMotionBlur.has_value()
           && connectedMotionRenderer.preparedMotionBlur->point.helperGeneration == 7

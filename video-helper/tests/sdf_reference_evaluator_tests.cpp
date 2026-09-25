@@ -1,11 +1,14 @@
 #include "../src/sdf_scene_modules.h"
 #include "support/sdf_reference_evaluator.h"
+#include "support/sdf_output_test_scenes.h"
+#include "../src/sdf_native_program.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -185,6 +188,11 @@ int main()
         check (close (actual, golden.expected),
                std::string (videowire::sdfOperationWireToken (golden.operation))
                    + " point-distance golden changed");
+        const auto sample = videohelper::sdf::reference::evaluateSample (geometry, golden.point);
+        check (close (sample.distance, golden.expected)
+                   && std::any_of (geometry.records().begin(), geometry.records().end(),
+                       [&] (const auto& r) { return r.stableId == sample.primitiveId && r.inputCount == 0; }),
+               "all 26 operations retain an actual primitive contributor and unchanged distance");
     }
     check (covered.size() == 26, "goldens cover every Phase 10 operation exactly once");
     const auto subtraction = fixtureFor (SdfOperation::subtraction);
@@ -276,6 +284,134 @@ int main()
         gyroid, { operationPoint.x + period, operationPoint.y, operationPoint.z });
     check (close (first, repeated),
            "gyroid cellScale is the normative reciprocal cell scale on a 2*pi/cellScale period");
+
+    using namespace videohelper::sdf;
+    using namespace videohelper::sdf::reference;
+    using namespace videohelper::sdf::test;
+    NativeSdfRenderControls controls;
+    controls.maximumDistance = 12;
+    controls.shadowQuality = arbitgpu::NativeSdfQuality::ultra;
+    const auto plane = outputTestGeometry (OutputScene::Plane,error);
+    const auto sphere = outputTestGeometry (OutputScene::Sphere,error);
+    const auto corner = outputTestGeometry (OutputScene::Corner,error);
+    const auto blocked = outputTestGeometry (OutputScene::OccludedPlane,error);
+    const auto carved = outputTestGeometry (OutputScene::CarvedBox,error);
+    const auto pair = outputTestGeometry (OutputScene::Pair,error);
+    const auto cube = outputTestGeometry (OutputScene::Box,error);
+    check (plane && sphere && corner && blocked && carved && pair && cube, "utility oracle scenes admit");
+    if (!plane || !sphere || !corner || !blocked || !carved || !pair || !cube) return EXIT_FAILURE;
+    const auto flat = evaluateSurface (*plane,{0,0,0},controls);
+    const auto convex = evaluateSurface (*sphere,{0,0,1},controls);
+    const auto concave = evaluateSurface (*carved,{0,0,0.1},controls);
+    check (std::abs (flat.meanCurvature) < 1.0e-10
+               && std::abs (convex.meanCurvature - 1.0) < 0.002
+               && std::abs (concave.meanCurvature + 2.0) < 0.005,
+           "mean curvature is zero on a plane, +1/R on a sphere and -1/R in a spherical cut");
+    check (flat.ambientVisibility > 0.999
+               && evaluateSurface (*corner,{0,0,0},controls).ambientVisibility < 0.85
+               && evaluateSurface (*corner,{-1,0,0},controls).ambientVisibility > 0.999,
+           "AO darkens the nearby corner and returns to open-plane visibility beyond its radius");
+    check (flat.lightVisibility > 0.999
+               && evaluateSurface (*blocked,{0,0,0},controls).lightVisibility < 0.01
+               && evaluateSurface (*blocked,{1,0,0},controls).lightVisibility > 0.999
+               && evaluateSurface (*sphere,{0,0,-1},controls).lightVisibility == 0.0,
+           "directional shadow follows a separate occluder while an unblocked plane remains lit");
+    check (evaluateSample (*pair,{-0.65,0,0.45}).primitiveId == kLeftPrimitive
+               && evaluateSample (*pair,{0.65,0,0.45}).primitiveId == kRightPrimitive
+               && evaluateSample (*carved,{0,0,0.1}).primitiveId == kLeftPrimitive
+               && evaluateSample (*carved,{0.7,0,0.6}).primitiveId == 111,
+           "translated lobes and subtraction cuts retain the winning primitive's full identity");
+    check (nativeSdfMaterialColorCode (17) == 0x3c71beu
+               && nativeSdfMaterialColorCode (kLeftPrimitive) == 0x307c62u
+               && nativeSdfMaterialColorCode (kRightPrimitive) == 0x30a274u
+               && nativeSdfMaterialColorCode (UINT64_MAX) == 0xebbd7bu,
+           "fixed material visualization goldens include high ID bits and the uint64 maximum");
+    const auto compiled = compileNativeSdfProgram (outputTestSource (OutputScene::Pair),error);
+    check (compiled && validateNativeSdfProgram (*compiled,outputTestSource (OutputScene::Pair),error)
+               && std::any_of (compiled->records().begin(),compiled->records().end(),
+                   [] (const auto& r) { return r.stableId == kRightPrimitive; }),
+           "native compiled records preserve full primitive identities alongside source admission");
+    if (compiled)
+    {
+        auto changed = outputTestSource (OutputScene::Pair);
+        changed.records[0].stableId += 1;
+        changed.records[1].inputs[0] += 1;
+        check (!validateNativeSdfProgram (*compiled,changed,error), "compiled identity cannot be reused for renamed geometry");
+    }
+    // Analytic silhouette locations are independent of the raymarch oracle.
+    controls.output = arbitgpu::NativeSdfOutput::edgeDistance;
+    const auto centerEdge = evaluateOutputPixel (*sphere,controls,33,33,16,16)[0]*8.0;
+    const auto nearEdge = evaluateOutputPixel (*sphere,controls,33,33,26,16)[0]*8.0;
+    const double projectedSphereRadius = 16.5*1.8/std::sqrt (8.0);
+    check (centerEdge == 8.0 && nearEdge >= projectedSphereRadius-10.0
+               && nearEdge <= projectedSphereRadius-10.0+0.6,
+           "sphere silhouette distance is in pixels with bounded half-pixel refinement");
+    check (evaluateOutputPixel (*cube,controls,33,33,16,16)[0] > 0.99
+               && evaluateOutputPixel (*cube,controls,33,33,25,16)[0] < 0.2
+               && evaluateOutputPixel (*plane,controls,33,33,0,0)[0] == 1.0,
+           "edge distance varies over a flat box face and does not invent a viewport edge on an infinite plane");
+    check (evaluateOutputPixel (*sphere,controls,17,17,8,8)[0] < 0.8,
+           "resizing changes silhouette pixel distance rather than reusing normalized depth");
+    // All hard and smooth Boolean variants have deterministic ownership.
+    for (auto op : {SdfOperation::unionOp,SdfOperation::intersection,SdfOperation::subtraction,
+                    SdfOperation::smoothUnion,SdfOperation::smoothIntersection,SdfOperation::smoothSubtraction})
+    {
+        SdfIr source;
+        source.rootId = 3;
+        source.records = {record (kLeftPrimitive,SdfOperation::sphere,{}, {1}),
+                          record (kRightPrimitive,SdfOperation::sphere,{}, {0.5})};
+        const auto isSmooth = static_cast<unsigned> (op) >= static_cast<unsigned> (SdfOperation::smoothUnion);
+        auto operation = record (3,op,{kLeftPrimitive,kRightPrimitive},{});
+        if (isSmooth) { operation.parameterCount = 1; operation.parameters[0] = 0.1; }
+        source.records.push_back (operation);
+        const auto admitted = admitSdfIr (source,{},error);
+        const bool isUnion = op == SdfOperation::unionOp || op == SdfOperation::smoothUnion;
+        check (admitted && evaluateSample (*admitted,{0,0,0.5}).primitiveId
+                   == (isUnion ? kLeftPrimitive : kRightPrimitive),
+               "hard and smooth Boolean ownership agrees with the dominant signed distance");
+        source.records[1].parameters[0] = 1;
+        const auto tied = admitSdfIr (source,{},error);
+        check (tied && evaluateSample (*tied,{0,0,1}).primitiveId == kLeftPrimitive,
+               "ordered A wins an equal-weight tie in every hard and smooth Boolean");
+        std::swap (source.records.back().inputs[0],source.records.back().inputs[1]);
+        const auto reversedTie = admitSdfIr (source,{},error);
+        check (reversedTie && evaluateSample (*reversedTie,{0,0,1}).primitiveId == kRightPrimitive,
+               "reversing Boolean inputs reverses tied ownership without sorting primitive IDs");
+        // Distances differ by less than the smooth radius. The larger blend
+        // weight must select a leaf even when both leaves affect the field.
+        std::swap (source.records.back().inputs[0],source.records.back().inputs[1]);
+        source.records[1].parameters[0] = 0.96;
+        const auto blended = admitSdfIr (source,{},error);
+        const bool cut = op == SdfOperation::subtraction || op == SdfOperation::smoothSubtraction;
+        check (blended && evaluateSample (*blended,{0,0,0.99}).primitiveId
+                   == (isUnion || cut ? kLeftPrimitive : kRightPrimitive)
+                   && evaluateSample (*blended,{0,0,0.97}).primitiveId
+                   == (isUnion ? kLeftPrimitive : kRightPrimitive),
+               "Boolean contributors follow dominant weights inside the smooth blend band");
+    }
+
+    for (const auto invalidOutput : {static_cast<arbitgpu::NativeSdfOutput> (-1),
+                                     arbitgpu::NativeSdfOutput::count,
+                                     static_cast<arbitgpu::NativeSdfOutput> (9)})
+    {
+        auto invalid = controls;
+        invalid.output = invalidOutput;
+        bool rejected = false;
+        try { evaluateOutputPixel (*sphere,invalid,33,33,16,16); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check (rejected,"the scalar output oracle rejects invalid output selections");
+    }
+    for (unsigned badControl = 0; badControl < 3; ++badControl)
+    {
+        auto invalid = controls;
+        if (badControl == 0) invalid.normalQuality = static_cast<arbitgpu::NativeSdfQuality> (-1);
+        if (badControl == 1) invalid.shadowQuality = arbitgpu::NativeSdfQuality::count;
+        if (badControl == 2) invalid.epsilon = std::numeric_limits<double>::quiet_NaN();
+        bool rejected = false;
+        try { evaluateSurface (*sphere,{0,0,1},invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check (rejected,"the scalar surface oracle bounds quality indexing and rejects nonfinite controls");
+    }
 
     if (failures != 0) return EXIT_FAILURE;
     std::cout << "SDF reference oracle checks passed\n";

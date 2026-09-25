@@ -4,6 +4,7 @@
 
 #include "../shader_dialect.h"
 #include "../shader_generator.h"
+#include "metal_shader_source.h"
 
 #import <Metal/Metal.h>
 
@@ -16,7 +17,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
-#include <sstream>
 #include <unordered_map>
 
 #define SOKOL_METAL
@@ -74,78 +74,6 @@ bool makeTarget (id<MTLDevice> device, MetalTarget& target, int width, int heigh
     target.height = height;
     return sg_query_image_state (target.image) == SG_RESOURCESTATE_VALID
         && sg_query_view_state (target.view) == SG_RESOURCESTATE_VALID;
-}
-
-std::string trim (std::string value)
-{
-    const auto first = value.find_first_not_of (" \t\r");
-    if (first == std::string::npos) return {};
-    const auto last = value.find_last_not_of (" \t\r");
-    return value.substr (first, last - first + 1);
-}
-
-// Vulkan GLSL requires ordinary uniforms to live in a block and every opaque
-// resource to have an explicit binding. Keep the public dialect unchanged and
-// mechanically adapt only its generated prelude before glslang sees it.
-std::string metalGlsl (const std::string& wrapped)
-{
-    struct Uniform { std::string type, name; };
-    std::vector<Uniform> values;
-    std::vector<std::string> body;
-    int samplerBinding = 1;
-    bool inPrelude = true;
-
-    std::istringstream input (wrapped);
-    std::string line;
-    while (std::getline (input, line))
-    {
-        const std::string clean = trim (line);
-        if (clean.rfind ("#version", 0) == 0)
-        {
-            body.push_back ("#version 450");
-            continue;
-        }
-        if (clean == "// --- user shader ---") inPrelude = false;
-        if (inPrelude && clean.rfind ("uniform ", 0) == 0)
-        {
-            std::istringstream declaration (clean.substr (8));
-            Uniform uniform;
-            declaration >> uniform.type >> uniform.name;
-            if (! uniform.name.empty() && uniform.name.back() == ';') uniform.name.pop_back();
-            if (uniform.type.rfind ("sampler", 0) == 0)
-                body.push_back ("layout(set=0,binding=" + std::to_string (samplerBinding++)
-                                + ") uniform " + uniform.type + " " + uniform.name + ";");
-            else
-                values.push_back (uniform);
-            continue;
-        }
-        if (inPrelude && clean == "out vec4 fragColor;")
-        {
-            body.push_back ("layout(location=0) out vec4 fragColor;");
-            continue;
-        }
-        body.push_back (line);
-    }
-
-    std::ostringstream output;
-    bool emitted = false;
-    for (const auto& current : body)
-    {
-        if (! emitted && trim (current) == "// --- Arbit uniform contract (auto-prepended) ---")
-        {
-            output << current << '\n';
-            output << "layout(std140,set=0,binding=0) uniform ArbitUniformBlock {\n";
-            for (const auto& uniform : values)
-                output << "    " << uniform.type << ' ' << uniform.name << ";\n";
-            output << "} arbitUniforms;\n";
-            for (const auto& uniform : values)
-                output << "#define " << uniform.name << " arbitUniforms." << uniform.name << '\n';
-            emitted = true;
-        }
-        else
-            output << current << '\n';
-    }
-    return output.str();
 }
 
 bool compileSpirv (const std::string& source, std::vector<uint32_t>& words,
@@ -406,6 +334,11 @@ struct MetalShaderGenerator::Impl
             put (bytes, "uCamNear", value ("uCamNear", 0.05f));
             put (bytes, "uCamFar", value ("uCamFar", 60));
             put (bytes, "PASSINDEX", passIndex);
+            // Bare transition uniforms have no ISF INPUT metadata. Reflection
+            // supplies the same member offset used for generated parameters.
+            if (MTLStructMember* progress = uniformMember (@"progress"))
+                if (progress.dataType == MTLDataTypeFloat)
+                    put (bytes, "progress", value ("progress", 0.0f));
             for (const auto& param : params)
             {
                 const int count = genParamComponentCount (param.type);
@@ -475,7 +408,7 @@ bool MetalShaderGenerator::setSource (const std::string& rawSource)
 
     std::vector<uint32_t> spirv;
     std::string compilerLog;
-    if (! compileSpirv (metalGlsl (wrap.glsl), spirv, compilerLog))
+    if (! compileSpirv (arbitshader::metalGlsl (wrap), spirv, compilerLog))
     {
         impl_->log = diagnostics + "error: " + compilerLog;
         return false;

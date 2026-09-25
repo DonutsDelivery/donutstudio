@@ -23,7 +23,12 @@ class BlockCNoteInstancingSourceContract(unittest.TestCase):
         self.assertIn("auto sceneInputs = request.runtimeInputs", execution)
         self.assertIn("deformationRequest.runtimeInputs = request.runtimeInputs", execution)
         self.assertIn("receipt.canonicalBlockCFrame = request.runtimeInputs.canonicalBlockCFrame", execution)
-        self.assertIn("layer.canonicalBlockCFrame = receipt.canonicalBlockCFrame", preparation)
+        self.assertIn("if (compiled->importedParticleOverlay) layer = inputLayer", preparation)
+        self.assertIn(
+            "layer.canonicalBlockCFrame = compiled->importedParticleOverlay\n"
+            "        ? canonicalBlockCFrame : receipt.canonicalBlockCFrame;",
+            preparation,
+        )
         self.assertNotIn("frameOwners.clear()", preparation)
 
     def test_malformed_mapping_fails_closed(self) -> None:
@@ -93,6 +98,27 @@ class BlockCNoteInstancingSourceContract(unittest.TestCase):
             videorender = header.index("namespace videorender")
             declaration = header.index("namespace canonicalblockc")
             self.assertLess(declaration, videorender)
+
+    def test_rejected_score_reports_and_paces_before_frame_publication(self) -> None:
+        viewport = source("video-helper/src/viewport.cpp")
+        score_path = viewport.split("// M5: pack the live Block C score", 1)[1].split(
+            "const videowire::VisualPlanEvaluationContext", 1)[0]
+        rejected = score_path.split("if (cachedCanonicalBlockCFrame == nullptr)", 1)[1].split(
+            "if (!scoreFrameError.empty())", 1)[0]
+        self.assertIn("canonicalblockc::explainAdmissibility(", rejected)
+        self.assertIn("key.beat = static_cast<double>(rejectedBeat)", rejected)
+        self.assertIn("if (scoreFrameError != failure)", rejected)
+        self.assertIn("im.rendererError = scoreFrameError", rejected)
+        # The state mutex is released before the retry delay; this branch must
+        # not close the viewport or present a stale/empty score as a valid frame.
+        published_error, paced_retry = rejected.split("im.rendererError = scoreFrameError;", 1)
+        self.assertIn("std::lock_guard<std::mutex> lock(im.mutex)", published_error)
+        self.assertTrue(paced_retry.lstrip().startswith("}"))
+        self.assertIn("std::this_thread::sleep_for(std::chrono::milliseconds(50))", paced_retry)
+        self.assertIn("nextTickNs = nowNs()", paced_retry)
+        self.assertIn("continue;", paced_retry)
+        self.assertNotIn("im.wantClose", rejected)
+        self.assertIn("if (im.rendererError == scoreFrameError) im.rendererError.clear()", score_path)
 
 
 if __name__ == "__main__":

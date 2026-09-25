@@ -40,6 +40,14 @@ bool lowercaseSha256 (const std::string& value) noexcept
 bool validateRequestIdentity (const visualanimationimport::Request& request,
                               std::string& error)
 {
+    if (!visualanimation::validPoseControls(request.pose)
+        || ((request.pose.boneEnabled || request.pose.morphEnabled)
+            && request.pose.meshStableId != request.meshStableId
+            && !(request.meshStableId == 0 && request.pose.nodeStableId != 0)))
+    {
+        error = "imported animation controls are malformed or out of bounds";
+        return false;
+    }
     if (request.sourceStableId == 0 || request.deformationStableId == 0
         || request.schedule != std::array<visualanimationimport::StableId, 2> {
                request.sourceStableId, request.deformationStableId })
@@ -126,10 +134,8 @@ bool hasSelectedMesh(const gltf::GlbAnimationDocument& document,
                      std::string& error)
 {
     if (request.meshStableId == 0) return true;
-    const auto found = std::any_of(
-        document.renderBindings.begin(), document.renderBindings.end(),
-        [&request] (const auto& binding)
-        { return binding.mesh.value == request.meshStableId; });
+    const auto found = std::any_of(document.nodeMeshes.begin(), document.nodeMeshes.end(),
+        [&request] (const auto& mesh) { return mesh.value == request.meshStableId; });
     if (!found)
         error = "imported animation/deformation mesh selector is unavailable";
     return found;
@@ -148,6 +154,69 @@ bool selectedClipDrivesMesh(const gltf::GlbAnimationDocument& document,
         error = "imported animation/deformation clip does not drive selected mesh";
     return driven;
 }
+
+bool validateSelectedPose(const gltf::GlbAnimationDocument& document,
+                          const visualanimationimport::Request& request,
+                          std::string& error,
+                          visualanimation::PoseControls* resolved = nullptr)
+{
+    const auto& pose = request.pose;
+    if (resolved != nullptr) *resolved = pose;
+    if (pose.nodeStableId != 0 && (pose.nodeStableId > document.nodeMeshes.size()
+        || document.nodeMeshes[pose.nodeStableId - 1u].value != pose.meshStableId
+        || (request.meshStableId != 0 && request.meshStableId != pose.meshStableId)))
+    { error = "selected pose object does not belong to the imported mesh selection"; return false; }
+    if (!pose.boneEnabled && !pose.morphEnabled) return true;
+    const auto* mesh = document.deformation
+        ? document.deformation->findMesh({pose.meshStableId}) : nullptr;
+    if (mesh == nullptr || (request.meshStableId != 0 && pose.meshStableId != request.meshStableId))
+    {
+        error = "selected pose controls do not belong to the imported mesh";
+        return false;
+    }
+    const gltf::GlbDeformationRenderBinding* selected = nullptr;
+    for (const auto& binding : document.renderBindings)
+        if (binding.mesh == mesh->id()
+            && (pose.nodeStableId == 0 || binding.nodeIndex + 1u == pose.nodeStableId))
+        {
+            if (selected != nullptr)
+            { error = "selected pose mesh has multiple objects; select an exact object node ID"; return false; }
+            selected = &binding;
+        }
+    if (!selected) { error = "selected pose object has no deformation binding"; return false; }
+    if (resolved != nullptr) resolved->nodeStableId = selected->nodeIndex + 1u;
+    const auto* skin = document.deformation->findSkin(selected->skin);
+    if (pose.boneEnabled && (skin == nullptr
+        || std::none_of(skin->joints().begin(), skin->joints().end(),
+            [&pose] (const auto& joint) { return joint.id().value == pose.boneStableId; })))
+    {
+        error = "selected bone does not belong to the imported mesh skin";
+        return false;
+    }
+    const bool unresolved = pose.morphTargetIndex == visualanimation::kUnresolvedMorphTargetIndex;
+    if (pose.morphEnabled && !unresolved && pose.morphTargetIndex >= mesh->morphTargets().size())
+    {
+        error = "selected morph target does not belong to the imported mesh";
+        return false;
+    }
+    if (pose.morphEnabled)
+    {
+        std::size_t firstCatalogId = 1u;
+        for (const auto& preceding : document.deformation->meshes())
+            if (preceding.id().value < mesh->id().value)
+                firstCatalogId += preceding.morphTargets().size();
+        if (pose.morphTargetStableId < firstCatalogId
+            || pose.morphTargetStableId - firstCatalogId >= mesh->morphTargets().size()
+            || (!unresolved && firstCatalogId + pose.morphTargetIndex != pose.morphTargetStableId))
+        {
+            error = "selected morph catalog identity and mesh target disagree";
+            return false;
+        }
+        if (resolved != nullptr)
+            resolved->morphTargetIndex = static_cast<std::uint32_t>(pose.morphTargetStableId - firstCatalogId);
+    }
+    return true;
+}
 } // namespace
 
 gltf::GlbAnimationDecodeOptions nativeImportedAnimationDecodeOptions(
@@ -163,12 +232,15 @@ gltf::GlbAnimationDecodeOptions nativeImportedAnimationDecodeOptions(
     options.admission.limits.maxSamplers = HarmonicMIDI::grid::Visual3DScene::kMaxTextures;
     options.admission.limits.maxEmbeddedImageBytes
         = HarmonicMIDI::grid::Visual3DScene::kMaxTextureTexels * 4u;
-    options.admission.limits.maxImageWidth = 8192;
-    options.admission.limits.maxImageHeight = 8192;
+    options.admission.limits.maxImageWidth
+        = HarmonicMIDI::grid::Visual3DScene::kMaxTextureDimension;
+    options.admission.limits.maxImageHeight
+        = HarmonicMIDI::grid::Visual3DScene::kMaxTextureDimension;
     options.admission.limits.maxDecodedImageBytes
         = HarmonicMIDI::grid::Visual3DScene::kMaxTextureTexels * 4u;
     options.admission.supportedRequiredExtensions = {"KHR_lights_punctual"};
     options.admission.sceneIndex = sceneIndex;
+    options.retainGeometryHierarchy = true;
     return options;
 }
 
@@ -177,6 +249,8 @@ std::vector<visualanimationimport::StableId> importedAnimationCompatibleMeshStab
     const gltf::GlbNamedAnimationClip& clip)
 {
     std::vector<visualanimationimport::StableId> compatible;
+    if (!clip.sceneTransformTargets.empty())
+        for (const auto mesh : document.sceneMeshes) compatible.push_back(mesh.value);
     compatible.reserve(document.renderBindings.size());
     for (const auto& renderBinding : document.renderBindings)
     {
@@ -205,10 +279,12 @@ bool ImportedAnimationDeformationConsumer::admit (
     const visualanimationimport::Request& request,
     const std::uint8_t* bytes,
     std::size_t size,
-    std::string& error)
+    std::string& error, bool geometryExtraction)
 {
     error.clear();
     if (! validateRequestIdentity(request, error)) return false;
+    if (geometryExtraction && request.meshStableId == 0)
+    { error = "Animated Geometry3D requires one selected mesh"; return false; }
     if (bytes == nullptr || size != request.asset.sourceByteSize)
     {
         error = "imported animation/deformation bytes do not match exact-content size";
@@ -230,10 +306,43 @@ bool ImportedAnimationDeformationConsumer::admit (
         error = "imported animation/deformation decode rejected: " + error;
         return false;
     }
+    if (request.meshStableId != 0)
+    {
+        if (!hasSelectedMesh(*decoded, request, error)) return false;
+        for (auto& named : decoded->clips)
+        {
+            named.jointBindings.erase(std::remove_if(named.jointBindings.begin(),named.jointBindings.end(),
+                [&](const auto& binding) {
+                    return std::none_of(decoded->renderBindings.begin(), decoded->renderBindings.end(),
+                        [&](const auto& draw) { return draw.mesh.value == request.meshStableId && draw.skin == binding.skin; });
+                }),named.jointBindings.end());
+            named.morphBindings.erase(std::remove_if(named.morphBindings.begin(),named.morphBindings.end(),
+                [&](const auto& binding) { return binding.mesh.value != request.meshStableId; }),named.morphBindings.end());
+            std::vector<visualanimation::TrackView> tracks;
+            for (const auto& track : named.clip->tracks())
+            {
+                const bool selected = track.channel()==visualanimation::Channel::MorphWeights
+                    ? std::any_of(named.morphBindings.begin(),named.morphBindings.end(),[&](const auto& b) { return b.animationTarget==track.target(); })
+                    : std::any_of(named.jointBindings.begin(),named.jointBindings.end(),[&](const auto& b) { return b.animationTarget==track.target(); });
+                const bool sceneTransform = track.channel()!=visualanimation::Channel::MorphWeights
+                    && std::find(named.sceneTransformTargets.begin(),named.sceneTransformTargets.end(),track.target())
+                        != named.sceneTransformTargets.end();
+                if (selected || sceneTransform) tracks.push_back({track.id(),track.target(),track.channel(),track.interpolation(),
+                    track.keyTimesSeconds().data(),track.values().data(),track.keyCount(),track.values().size(),
+                    track.channel()==visualanimation::Channel::MorphWeights ? track.valueWidth() : 0});
+            }
+            if (tracks.empty()) continue;
+            const visualanimation::ClipView view{named.clip->id(),named.clip->durationSeconds(),tracks.data(),tracks.size()};
+            auto filtered=visualanimation::Clip::create(view,{},error);
+            if (!filtered) return false;
+            named.clip=std::move(filtered);
+        }
+    }
     const auto* selectedClip = findSelectedClip(*decoded, request, error);
     if (selectedClip == nullptr) return false;
     if (!hasSelectedMesh(*decoded, request, error)) return false;
     if (!selectedClipDrivesMesh(*decoded, *selectedClip, request, error)) return false;
+    if (!validateSelectedPose(*decoded, request, error)) return false;
 
     auto admitted = std::make_shared<gltf::GlbAnimationDocument>(std::move(*decoded));
     asset_ = request.asset;
@@ -284,9 +393,13 @@ bool ImportedAnimationDeformationConsumer::evaluate (
         error = "imported animation/deformation structural revision is missing";
         return false;
     }
+    if (frame.rateNumerator==0 || frame.rateDenominator==0)
+    { error="imported animation frame rate is missing"; return false; }
 
     const auto* named = findSelectedClip(*document_, request, error);
-    if (named == nullptr || ! named->clip || ! document_->deformation) return false;
+    if (named == nullptr || !named->clip) return false;
+    visualanimation::PoseControls resolvedPose;
+    if (!validateSelectedPose(*document_, request, error, &resolvedPose)) return false;
 
     const auto playback = visualanimation::resolvePlaybackControl(
         *named->clip, request.playback, {}, error);
@@ -311,12 +424,28 @@ bool ImportedAnimationDeformationConsumer::evaluate (
     evaluationRequest.sampleRangeEndSeconds = playback->sample.rangeEndSeconds;
     evaluationRequest.combinationMode = request.combinationMode;
     evaluationRequest.combinationWeight = playback->weight;
+    evaluationRequest.pose = resolvedPose;
+    evaluationRequest.allowNodeTransformAndMorph = true;
     const visualdeformation::AnimationDeformationBindingView bindings {
-        joints.data(), joints.size(), morphs.data(), morphs.size()
+        joints.data(), joints.size(), morphs.data(), morphs.size(),
+        named->sceneTransformTargets.data(), named->sceneTransformTargets.size()
     };
-    auto deformation = visualdeformation::evaluateAnimationDeformation(
-        *document_->deformation, *named->clip, bindings, evaluationRequest, {}, error);
-    if (! deformation) return false;
+    std::shared_ptr<const visualdeformation::AnimationDeformationSnapshot> deformation;
+    if (document_->deformation)
+    {
+        deformation = visualdeformation::evaluateAnimationDeformation(
+            *document_->deformation, *named->clip, bindings, evaluationRequest, {}, error);
+        if (!deformation) return false;
+    }
+    std::shared_ptr<const visualanimation::Sample> sceneAnimation;
+    if (!named->sceneTransformTargets.empty())
+    {
+        auto sampled = visualanimation::sample(*named->clip, playback->sample, error);
+        if (!sampled) return false;
+        sceneAnimation = std::make_shared<const visualanimation::Sample>(std::move(*sampled));
+    }
+    if (!deformation && !sceneAnimation)
+    { error = "imported animation has no supported mesh, camera or light targets"; return false; }
 
     ImportedAnimationDeformationEvaluation candidate;
     candidate.owner = owner;
@@ -324,6 +453,7 @@ bool ImportedAnimationDeformationConsumer::evaluate (
     candidate.deformationStableId = request.deformationStableId;
     candidate.playback = *playback;
     candidate.deformation = std::move(deformation);
+    candidate.sceneAnimation = std::move(sceneAnimation);
     destination = std::move(candidate);
     error.clear();
     return true;

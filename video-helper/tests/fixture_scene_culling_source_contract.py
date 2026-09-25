@@ -8,7 +8,9 @@ required = {
     "back-face culling": "winding == 0 ? SG_CULLMODE_NONE : SG_CULLMODE_BACK",
     "ordinary winding": "winding == 2 ? SG_FACEWINDING_CW",
     "mirrored winding": "metalFixtureDeterminant3x3 (objectMatrix) < 0.0f ? 2u : 1u",
-    "pipeline selection": "resources->pipelines[blend * 3u + winding]",
+    "SDR/HDR pipeline offset": "runtimeInputs.linearColor ? resources->pipelines.size() / 2u : 0u",
+    "SDR/HDR pipeline selection": "resources->pipelines[colorPipelineOffset + blend * 3u + winding]",
+    "SDR/HDR diffraction winding": "resources->pipelines[colorPipelineOffset + winding]",
 }
 missing = [name for name, token in required.items() if token not in text]
 if missing:

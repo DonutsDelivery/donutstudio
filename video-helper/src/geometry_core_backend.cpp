@@ -1,4 +1,8 @@
 #include "geometry_core_backend.h"
+#include "../../shared/GeometryAudioDeformer.h"
+#include "../../shared/GeometryMaterialTable.h"
+#include "geometry_score_field.h"
+#include "fixture_scene_renderer.h"
 
 #include <cmath>
 
@@ -39,23 +43,116 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
                       const RuntimeAdmission &admission, std::uint32_t width,
                       std::uint32_t height, std::string &error,
                       bool diagnosticInstanceIdentityColors,
-                      arbitgpu::NativeFixtureSceneRuntimeInputs runtimeInputs) {
+                      arbitgpu::NativeFixtureSceneRuntimeInputs runtimeInputs,
+                      SpectrumEvaluation* spectrumEvaluation,
+                      const ImportedGeometryEvaluator& importedGeometry,
+                      double timelineTimeSeconds) {
   using namespace HarmonicMIDI::grid;
   error.clear();
   if (!admission.plan || width == 0 || height == 0) {
     error = "Geometry Core native execution requires a plan and non-zero extent";
     return std::nullopt;
   }
-  const auto &descriptor = admission.plan->value().descriptor();
+  const auto& authored = admission.plan->value().descriptor();
+  std::optional<videowire::geometry::ValueDescriptor> animated;
+  for (const auto& operation : authored.operations)
+    if (operation.retainedMesh && !operation.retainedMesh->importedAnimation.empty()) {
+      if (!importedGeometry) { error="Animated Geometry3D has no frame evaluator"; return std::nullopt; }
+      if (!animated) animated=authored;
+      const auto index=static_cast<std::size_t>(&operation-authored.operations.data());
+      auto source=std::make_shared<videowire::geometry::RetainedMeshData>(*operation.retainedMesh);
+      if (!importedGeometry(*source,error)) return std::nullopt;
+      if (source->geometry.vertexIds!=operation.retainedMesh->geometry.vertexIds
+          || source->geometry.indices!=operation.retainedMesh->geometry.indices
+          || source->geometry.positions.size()!=operation.retainedMesh->geometry.positions.size()) {
+        error="Animated Geometry3D changed its admitted topology"; return std::nullopt;
+      }
+      animated->operations[index].retainedMesh=std::move(source);
+    }
+  if (animated) {
+    videowire::geometry::ValueDescriptor replayed;
+    if (!videowire::geometry::validateOperationPlan(*animated,{},nullptr,error,&replayed)) return std::nullopt;
+    const auto& limits=admission.plan->receipt().effectiveLimits;
+    videowire::geometry::PortContract contract;
+    contract.carrier=replayed.carrier;
+    if (replayed.carrier==videowire::geometry::CarrierKind::geometry3D) {
+      contract.maxVertices=limits.maxVertices; contract.maxIndices=limits.maxIndices;
+    } else if (replayed.carrier==videowire::geometry::CarrierKind::instances3D) {
+      contract.maxInstances=limits.maxInstances;
+    } else { error="Animated geometry render requires Geometry3D or Instances3D"; return std::nullopt; }
+    contract.maxAttributes=limits.maxAttributes;
+    if (!videowire::geometry::admitValue(replayed,
+        videowire::geometry::withAttributeContract(contract,replayed),limits,{},error)) return std::nullopt;
+    animated=std::move(replayed);
+  }
+  const auto &descriptor = animated ? *animated : authored;
   const videowire::geometry::GeometryData *mesh = nullptr;
   const videowire::geometry::InstancesData *instances = nullptr;
+  const std::vector<videowire::geometry::AttributeData>* meshAttributes=&descriptor.attributes;
+  videowire::geometry::GeometryData deformedMesh;
   videowire::geometry::MaterializedInstancePlan materialized;
+  const bool runtimeFields=videowire::geometry::hasRuntimeFields(descriptor);
+  videowire::geometry::RuntimeFieldEvaluation evaluation;
+  evaluation.timelineSeconds=timelineTimeSeconds;
+  evaluation.scoreAt=[&](const auto& operation,const auto& positions,auto& result,auto& diagnostic) {
+    return scorefield::evaluateSampleField(operation,positions,runtimeInputs.canonicalBlockCFrame,result,diagnostic);
+  };
+  const auto spectrumInput=[&](const videowire::geometry::spectrum::Binding& binding,
+      videowire::geometry::spectrum::Bands& bands,
+      videowire::geometry::spectrum::FeaturesAt& featuresAt,
+      videowire::geometry::spectrum::FeaturesAt& historyAt,std::string& failure) {
+    if (!spectrumEvaluation) { failure="Spectrum geometry requires the shared frame analysis"; return false; }
+    bands=spectrumEvaluation->bands;
+    featuresAt=spectrumEvaluation->featuresAt;
+    historyAt=spectrumEvaluation->historyFeaturesAt;
+    if (binding.source==videowire::geometry::spectrum::Source::master) return true;
+    const auto& sourceAt=spectrumEvaluation->sourceFeaturesAt;
+    if (!sourceAt || !sourceAt(binding.source,binding.sourceTrackId,spectrumEvaluation->timeSeconds,bands)) {
+      failure="Selected track/group spectrum is unavailable. Check the saved source ID, use the standalone app and refresh project audio analysis.";
+      return false;
+    }
+    featuresAt=[sourceAt,source=binding.source,track=binding.sourceTrackId](double seconds) {
+      videowire::geometry::spectrum::Bands selected{};
+      sourceAt(source,track,seconds,selected);
+      return selected;
+    };
+    historyAt=featuresAt;
+    return true;
+  };
+  const bool orderedAudio=std::any_of(descriptor.spectrumFields.begin(),descriptor.spectrumFields.end(),
+      [](const auto& binding) { return binding.target==videowire::geometry::spectrum::Target::geometryDeformation; });
+  std::function<bool(videowire::geometry::GeometryData&,const videowire::geometry::spectrum::Binding&,
+                     std::string&)> deform;
+  if (orderedAudio) {
+    if (!spectrumEvaluation) { error="Audio geometry replay requires the shared frame analysis"; return std::nullopt; }
+    spectrumEvaluation->followers.resize(descriptor.spectrumFields.size());
+    deform=[&](auto& geometry,const auto& binding,std::string& failure) {
+      const auto index=static_cast<std::size_t>(&binding-descriptor.spectrumFields.data());
+      videowire::geometry::spectrum::Bands bands{},followed{};
+      videowire::geometry::spectrum::FeaturesAt featuresAt,historyAt;
+      return spectrumInput(binding,bands,featuresAt,historyAt,failure)
+          && videowire::geometry::spectrum::evaluate(binding,bands,
+          spectrumEvaluation->timeSeconds,featuresAt,
+          spectrumEvaluation->followers[index],followed,failure)
+          && videowire::geometry::applyAudioDeformer(geometry,binding,followed,spectrumEvaluation->timeSeconds,failure);
+    };
+  }
+  // One ordered replay combines timeline/score fields and audio deformation.
+  // Distribution and queries therefore see the same evaluated source frame.
+  if (!videowire::geometry::validateOperationPlan(descriptor,{},&materialized,error,nullptr,
+      runtimeFields ? &evaluation : nullptr,deform)) return std::nullopt;
   if (descriptor.carrier == videowire::geometry::CarrierKind::geometry3D) {
-    mesh = &std::get<videowire::geometry::GeometryData>(descriptor.data);
+    if (orderedAudio || runtimeFields) {
+      const auto terminal=materialized.geometries.find(descriptor.stableId);
+      if (terminal==materialized.geometries.end()) {
+        error="Reactive geometry replay requires a retained terminal mesh; this operation combination is unavailable";
+        return std::nullopt;
+      }
+      mesh=&terminal->second;
+    } else mesh=&std::get<videowire::geometry::GeometryData>(descriptor.data);
+    if (orderedAudio || runtimeFields) meshAttributes=&materialized.terminalAttributes;
   } else if (descriptor.carrier == videowire::geometry::CarrierKind::instances3D) {
     if (!admission.plan->capabilities().gpuInstancingWithoutMeshExpansion ||
-        !videowire::geometry::validateOperationPlan(
-            descriptor, {}, &materialized, error) ||
         materialized.instances.instances.empty()) {
       if (error.empty())
         error = "native Geometry Core instancing lacks retained operation results";
@@ -76,9 +173,103 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
       return std::nullopt;
     }
     mesh = &source->second;
+    const auto attributes=materialized.geometryAttributes.find(sourceId);
+    meshAttributes=attributes==materialized.geometryAttributes.end() ? nullptr : &attributes->second;
   } else {
     error = "native Geometry Core execution does not advertise this carrier";
     return std::nullopt;
+  }
+  if (!descriptor.spectrumFields.empty()) {
+    if (mesh->positions.size() > Visual3DScene::kMaxVertices
+        || mesh->indices.size() > Visual3DScene::kMaxIndices) {
+      error = "Audio Spectrum Field mesh exceeds the native retained-scene bounds";
+      return std::nullopt;
+    }
+    if (spectrumEvaluation == nullptr) {
+      error = "Spectrum geometry requires the frame's shared master analysis";
+      return std::nullopt;
+    }
+    if (instances == nullptr) deformedMesh = *mesh;
+    spectrumEvaluation->followers.resize(descriptor.spectrumFields.size());
+    for (std::size_t index = 0; index < descriptor.spectrumFields.size(); ++index) {
+      const auto& binding = descriptor.spectrumFields[index];
+      if (orderedAudio && binding.target==videowire::geometry::spectrum::Target::geometryDeformation) continue;
+      videowire::geometry::spectrum::Bands currentBands{};
+      videowire::geometry::spectrum::FeaturesAt featuresAt,historyAt;
+      if (!spectrumInput(binding,currentBands,featuresAt,historyAt,error)) return std::nullopt;
+      videowire::geometry::spectrum::Bands followed {};
+      if (binding.history.enabled) {
+        std::vector<videowire::geometry::spectrum::Bands> rows;
+        if (instances != nullptr || !videowire::geometry::spectrum::evaluateHistory(binding,
+              currentBands, spectrumEvaluation->timeSeconds, historyAt,
+              spectrumEvaluation->liveFrameAvailable, admission.use == PlanUse::exportRender,
+              spectrumEvaluation->followers[index], rows, error,
+              spectrumEvaluation->seekGeneration, spectrumEvaluation->loopGeneration)) return std::nullopt;
+        for (std::size_t vertex = 0; vertex < deformedMesh.positions.size(); ++vertex) {
+          const auto amount = videowire::geometry::spectrum::sampleHistory(binding, rows, vertex);
+          auto& position = deformedMesh.positions[vertex];
+          position.x += amount * binding.direction[0];
+          position.y += amount * binding.direction[1];
+          position.z += amount * binding.direction[2];
+        }
+        continue;
+      }
+      if (!videowire::geometry::spectrum::evaluate(binding, currentBands,
+            spectrumEvaluation->timeSeconds, featuresAt,
+            spectrumEvaluation->followers[index], followed, error)) return std::nullopt;
+      if (binding.target == videowire::geometry::spectrum::Target::instanceTransform) {
+        if (instances == nullptr || binding.coordinates.size() != materialized.instances.instances.size()) {
+          error = "Spectrum Instancer has no matching native instance set";
+          return std::nullopt;
+        }
+        for (std::size_t index = 0; index < materialized.instances.instances.size(); ++index) {
+          const auto amount = videowire::geometry::spectrum::sample(binding, followed, binding.coordinates[index]);
+          auto& transform = materialized.instances.instances[index].transform;
+          transform.translation.x += amount * binding.direction[0];
+          transform.translation.y += amount * binding.direction[1];
+          transform.translation.z += amount * binding.direction[2];
+          const auto scale = [&](std::size_t axis, float base) {
+            return std::clamp(base * (1.0f + amount * binding.scaleResponse[axis]), 0.000001f, 1000.0f);
+          };
+          transform.scale = {scale(0, transform.scale.x), scale(1, transform.scale.y), scale(2, transform.scale.z)};
+        }
+        continue;
+      }
+      if (instances != nullptr) {
+        error = "Audio Spectrum Field requires a Geometry3D draw";
+        return std::nullopt;
+      }
+      if (binding.target == videowire::geometry::spectrum::Target::geometryDeformation) {
+        if (!videowire::geometry::applyAudioDeformer(deformedMesh,binding,followed,
+              spectrumEvaluation->timeSeconds,error)) return std::nullopt;
+        continue;
+      }
+      for (std::size_t vertex = 0; vertex < deformedMesh.positions.size(); ++vertex) {
+        const auto amount = videowire::geometry::spectrum::sample(binding, followed,
+                                                                 binding.coordinates[vertex]);
+        auto& position = deformedMesh.positions[vertex];
+        position.x += amount * binding.direction[0];
+        position.y += amount * binding.direction[1];
+        position.z += amount * binding.direction[2];
+      }
+    }
+    if (instances == nullptr) mesh = &deformedMesh;
+  }
+  if (!descriptor.scoreFields.empty()) {
+    if (instances != nullptr) {
+      error = "Score Field requires a Geometry3D draw"; return std::nullopt;
+    }
+    if (deformedMesh.positions.empty()) deformedMesh=*mesh;
+    for (const auto& binding : descriptor.scoreFields) {
+      scorefield::Evaluation evaluated;
+      if (!scorefield::evaluate(binding,runtimeInputs.canonicalBlockCFrame,evaluated,error))
+        return std::nullopt;
+      for (std::size_t index=0;index<deformedMesh.positions.size();++index) {
+        auto& p=deformedMesh.positions[index]; const auto& offset=evaluated.offsets[index];
+        p.x+=offset[0]; p.y+=offset[1]; p.z+=offset[2];
+      }
+    }
+    mesh=&deformedMesh;
   }
   if (mesh->positions.empty() || mesh->indices.empty() ||
       mesh->vertexIds.size() != mesh->positions.size() ||
@@ -106,10 +297,8 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
       return std::nullopt;
     }
   }
-  videowire::geometry::StableId materialId = 1;
-  for (const auto &operation : descriptor.operations)
-    if (operation.code == videowire::geometry::OperationCode::setMaterial)
-      materialId = operation.stableId;
+  const auto materialId = instances != nullptr ? materialized.materialStableId
+      : videowire::geometry::retainedMaterialIdentity(descriptor);
   auto scene = std::make_shared<Visual3DScene>();
   scene->id = {1};
   scene->activeCamera = {1};
@@ -146,6 +335,37 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     } else normal = {0.0f, 0.0f, 1.0f};
   }
   scene->materials[0].id = {1};
+  if (meshAttributes!=nullptr)
+    for (const auto* name : {"uv","color"})
+      if (const auto* attribute=videowire::geometry::findNamedAttribute(*meshAttributes,name)) {
+        const bool color=std::string(name)=="color";
+        if (attribute->descriptor.domain!=videowire::geometry::Domain::vertex
+            || attribute->descriptor.valueType!=(color ? videowire::geometry::ValueType::color
+                                                     : videowire::geometry::ValueType::vector)
+            || attribute->elements.size()!=mesh->positions.size()) {
+          error="Imported vertex attributes do not match native geometry"; return std::nullopt;
+        }
+        for (std::size_t i=0;i<attribute->elements.size();++i) {
+          const auto& value=attribute->elements[i].components;
+          if (color) scene->vertices[i].color={static_cast<float>(value[0]),static_cast<float>(value[1]),
+              static_cast<float>(value[2]),static_cast<float>(value[3])};
+          else scene->vertices[i].uv={static_cast<float>(value[0]),static_cast<float>(value[1])};
+        }
+      }
+  if (meshAttributes!=nullptr)
+    if (const auto* authored=videowire::geometry::findNamedAttribute(*meshAttributes,"normal")) {
+      if (authored->descriptor.domain!=videowire::geometry::Domain::vertex
+          || authored->descriptor.valueType!=videowire::geometry::ValueType::vector
+          || authored->elements.size()!=mesh->positions.size()) {
+        error="Authored normals do not match native geometry"; return std::nullopt;
+      }
+      for (std::size_t i=0;i<authored->elements.size();++i) {
+        const auto& n=authored->elements[i].components;
+        const auto length=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+        if (!std::isfinite(length) || length==0) { error="Authored normal is invalid"; return std::nullopt; }
+        scene->vertices[i].normal={static_cast<float>(n[0]/length),static_cast<float>(n[1]/length),static_cast<float>(n[2]/length)};
+      }
+    }
   // Set Material is part of the immutable lowered value. Map its stable identity
   // to a bounded native color so the operation changes both GL and Metal draw.
   const auto channel = [materialId](unsigned shift) {
@@ -194,10 +414,83 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   scene->cameras[0].nearPlane = 0.1f;
   scene->cameras[0].farPlane = 1000.0f;
   scene->cameraCount = 1;
-  auto prepared = instances != nullptr
-      ? backend.prepareGeometryInstances(scene, {}, admission.plan,
-                                         diagnosticInstanceIdentityColors)
-      : backend.prepare(scene);
+  auto frameDescriptor=descriptor;
+  if (orderedAudio || runtimeFields) frameDescriptor.attributes=materialized.terminalAttributes;
+  geometrysurfacematerial::ProgramSet authoredSurfaces;
+  if (!admission.surfaceMaterial.empty()) {
+    const auto decoded=geometrysurfacematerial::decodeSet(admission.surfaceMaterial,error);
+    if (!decoded) return std::nullopt;
+    authoredSurfaces=*decoded;
+  }
+  const bool hasTable=videowire::geometry::hasMaterialTable(descriptor,materialized);
+  const bool overrideSurface=!authoredSurfaces.empty() && authoredSurfaces.front().sourceMaterial==0;
+  if (overrideSurface && hasTable) {
+    error = "Reactive Surface overrides do not replace material-table bindings"; return std::nullopt;
+  }
+  if (!authoredSurfaces.empty() && !overrideSurface && !hasTable) {
+    error = "Geometry Surface table programs require their material table"; return std::nullopt;
+  }
+  std::map<videowire::geometry::StableId,SceneMaterialId> surfaceIds;
+  for (const auto& program : authoredSurfaces) if (program.sourceMaterial)
+    surfaceIds.emplace(program.sourceMaterial,SceneMaterialId{geometrysurfacematerial::materialId(program.material)});
+  if (overrideSurface) {
+    const SceneMaterialId id{geometrysurfacematerial::materialId(authoredSurfaces.front().material)};
+    scene->materials[0].id=id;
+    for (std::size_t index=0;index<scene->objectCount;++index) scene->objects[index].material=id;
+  }
+  std::vector<videowire::geometry::MaterialTableDrawBinding> drawBindings;
+  if (!videowire::geometry::applyGeometryMaterialTable(frameDescriptor,materialized,meshAttributes,
+        *scene,0,objectCount,error,&surfaceIds,&drawBindings)) return std::nullopt;
+  std::shared_ptr<arbitgpu::NativeFixtureSurfaceMaterialProgram> surfaceProgram;
+  if (!authoredSurfaces.empty()) {
+    const auto nativeBackend = backend.info().backend;
+    const auto target = nativeBackend == "opengl" ? materialprogram::BackendTarget::OpenGl
+        : nativeBackend == "metal" ? materialprogram::BackendTarget::Metal : materialprogram::BackendTarget::Invalid;
+    for (std::size_t index = 0; index < scene->objectCount; ++index) {
+      const auto& object = scene->objects[index];
+      if (object.indexCount == 0) continue;
+      const auto receipt=std::find_if(drawBindings.begin(),drawBindings.end(),
+          [&](const auto& draw){return draw.object==object.id.value;});
+      const auto source=overrideSurface ? 0 : receipt!=drawBindings.end() ? receipt->sourceMaterial : 0;
+      const auto authoredSurface=std::find_if(authoredSurfaces.begin(),authoredSurfaces.end(),
+          [source](const auto& program){return program.sourceMaterial==source;});
+      if (authoredSurface==authoredSurfaces.end()) continue;
+      const auto instanceIndex=receipt!=drawBindings.end() ? receipt->instanceIndex : index;
+      auto request = authoredSurface->material;
+      request.sceneSnapshot = scene;
+      request.binding.object = object.id;
+      const auto binding = videorender::fixture3d::admitSurfaceMaterialBinding(scene, request, target, error);
+      if (!binding) return std::nullopt;
+      auto native=std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*binding->nativeProgram());
+      for (const auto& field : authoredSurface->fields)
+        if (!surfacematerialfield::evaluate(field,evaluation,instanceIndex,native->parameters,native->timeMixEndColor,error))
+          return std::nullopt;
+      // Table batching uses ordinary retained-scene draws; apply the same
+      // canonical instance appearance once, after material Field modulation.
+      if (hasTable && instances) {
+        const auto appearance=videowire::geometry::instanceAppearance(frameDescriptor.attributes,instanceIndex);
+        for (std::size_t channel=0;channel<3;++channel) {
+          native->parameters.baseColorMetallic[channel]*=appearance.color[channel];
+          native->timeMixEndColor[channel]*=appearance.color[channel];
+          native->parameters.emissionRoughness[channel]+=appearance.emission[channel];
+        }
+        native->parameters.normalOpacity[3]*=appearance.color[3];
+        if (appearance.metallic>=0) native->parameters.baseColorMetallic[3]=appearance.metallic;
+        if (appearance.roughness>=0) native->parameters.emissionRoughness[3]=appearance.roughness;
+      }
+      if (!surfaceProgram) surfaceProgram=std::move(native);
+      else surfaceProgram->objectPrograms.push_back(std::move(native));
+    }
+    if (!std::isfinite(timelineTimeSeconds) || std::abs(timelineTimeSeconds) > std::numeric_limits<float>::max()) {
+      error = "Geometry Surface requires finite native frame time"; return std::nullopt;
+    }
+    runtimeInputs.timeSeconds = static_cast<float>(timelineTimeSeconds);
+  }
+  auto prepared = instances != nullptr && !videowire::geometry::hasMaterialTable(descriptor,materialized)
+      ? backend.prepareGeometryInstances(scene, surfaceProgram, admission.plan,
+                                         diagnosticInstanceIdentityColors,
+                                         (orderedAudio || runtimeFields) ? &materialized.terminalAttributes : nullptr)
+      : backend.prepare(scene, surfaceProgram);
   if (!prepared.prepared || !prepared.resources) {
     error = prepared.error.empty() ? "Geometry Core native resource preparation failed"
                                    : prepared.error;
@@ -207,6 +500,10 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     std::lock_guard<std::mutex> lock(admission.nativeResources->mutex);
     admission.nativeResources->value = prepared.resources;
   }
+  // Score fields consume the frame above. A note-instance mapping separately
+  // opts the draw into polyphonic copies of the resulting mesh.
+  if (!runtimeInputs.noteInstanceMapping)
+    runtimeInputs.canonicalBlockCFrame.reset();
   auto rendered = backend.render(scene, prepared.resources, width, height,
                                  std::move(runtimeInputs));
   if (!rendered.rendered || !rendered.frame) {

@@ -176,6 +176,8 @@ bool ShaderGenerator::setSource (const arbitgl::GlFuncs* gl, const std::string& 
         gl->DeleteProgram (program_);
     program_ = prog;
     cacheLocs (gl, program_);
+    inputImageLoc_ = -1;
+    bridgeStartImageLoc_ = bridgeEndImageLoc_ = bridgeProgressLoc_ = -1;
 
     params_.clear();
     params_.reserve (wrap.params.size());
@@ -269,35 +271,39 @@ bool ShaderGenerator::setBridgeSource (const arbitgl::GlFuncs* gl,
     }
 
     inputImageLoc_ = -1;
-    if (requireInputImage)
+    GLint count = 0;
+    gl->GetProgramiv(program_, GL_ACTIVE_UNIFORMS, &count);
+    for (GLint index = 0; index < count; ++index)
     {
-        GLint count = 0;
-        gl->GetProgramiv(program_, GL_ACTIVE_UNIFORMS, &count);
-        bool sampler2D = false;
-        for (GLint index = 0; index < count; ++index)
+        char name[256] = {};
+        GLsizei length = 0;
+        GLint size = 0;
+        GLenum type = 0;
+        gl->GetActiveUniform(program_, static_cast<GLuint>(index), sizeof(name),
+                             &length, &size, &type, name);
+        const std::string_view uniform(name, static_cast<size_t>(length));
+        if (size != 1) continue;
+        if (requireInputImage && uniform == "inputImage" && type == GL_SAMPLER_2D)
+            inputImageLoc_ = gl->GetUniformLocation(program_, name);
+        // ISF INPUTS already carry these bindings in params_. Bare GLSL bridge
+        // uniforms have no INPUT metadata, so cache the operation contract here.
+        if (declaredDialect == arbitshader::Dialect::BareGlsl)
         {
-            char name[256] = {};
-            GLsizei length = 0;
-            GLint size = 0;
-            GLenum type = 0;
-            gl->GetActiveUniform(program_, static_cast<GLuint>(index), sizeof(name),
-                                 &length, &size, &type, name);
-            if (std::string_view(name, static_cast<size_t>(length)) == "inputImage")
-            {
-                sampler2D = type == GL_SAMPLER_2D;
-                break;
-            }
+            if (uniform == "startImage" && type == GL_SAMPLER_2D)
+                bridgeStartImageLoc_ = gl->GetUniformLocation(program_, name);
+            if (uniform == "endImage" && type == GL_SAMPLER_2D)
+                bridgeEndImageLoc_ = gl->GetUniformLocation(program_, name);
+            if (uniform == "progress" && type == GL_FLOAT)
+                bridgeProgressLoc_ = gl->GetUniformLocation(program_, name);
         }
-        inputImageLoc_ = gl->GetUniformLocation(program_, "inputImage");
-        if (!sampler2D || inputImageLoc_ < 0)
-        {
-            gl->DeleteProgram(program_);
-            program_ = 0;
-            inputImageLoc_ = -1;
-            ok_ = false;
-            log_ = "error: FlatShaderBridge filter requires an active sampler2D named inputImage\n";
-            return false;
-        }
+    }
+    if (requireInputImage && inputImageLoc_ < 0)
+    {
+        gl->DeleteProgram(program_);
+        program_ = 0;
+        ok_ = false;
+        log_ = "error: FlatShaderBridge filter requires an active sampler2D named inputImage\n";
+        return false;
     }
     return true;
 }
@@ -607,6 +613,14 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
         else if (n == 2) gl->Uniform2f (loc, comp[0], comp[1]);
         else if (n == 4) gl->Uniform4f (loc, comp[0], comp[1], comp[2], comp[3]);
     }
+    if (bridgeProgressLoc_ >= 0)
+    {
+        float progress = 0.0f;
+        if (genValues != nullptr)
+            if (const auto value = genValues->find("progress"); value != genValues->end())
+                progress = static_cast<float>(value->second);
+        gl->Uniform1f(bridgeProgressLoc_, progress);
+    }
 
     // Bind the contract samplers on distinct units (two samplers of different
     // types must never share a unit). Block B audio bands feed the float band
@@ -733,15 +747,21 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
         gl->Uniform1i (loc, nextUnit);
         ++nextUnit;
     }
-    // FlatShaderBridge filter input is borrowed from the frame plan. Binding is
-    // the only operation performed on it; ShaderGenerator never owns or deletes it.
-    if (inputImageLoc_ >= 0 && inputImageTexture != 0)
-    {
+    // Operation images are borrowed from the frame plan. Bare GLSL has no ISF
+    // INPUT metadata; bind its exact named images instead of inheriting unit 0.
+    const auto bindBridgeImage = [&](int location, const char* name, unsigned texture = 0) {
+        if (location < 0) return;
+        if (texture == 0 && genImages != nullptr)
+            if (const auto found = genImages->find(name); found != genImages->end())
+                texture = found->second;
         gl->ActiveTexture (GL_TEXTURE0 + nextUnit);
-        glBindTexture (GL_TEXTURE_2D, inputImageTexture);
-        gl->Uniform1i (inputImageLoc_, nextUnit);
+        glBindTexture (GL_TEXTURE_2D, texture != 0 ? texture : blackTex2D_);
+        gl->Uniform1i (location, nextUnit);
         ++nextUnit;
-    }
+    };
+    bindBridgeImage(inputImageLoc_, "inputImage", inputImageTexture);
+    bindBridgeImage(bridgeStartImageLoc_, "startImage");
+    bindBridgeImage(bridgeEndImageLoc_, "endImage");
 
     // Single implicit output pass (no PASSES / no PERSISTENT): the pre-M7 fast
     // path — one draw into outTex_, already attached + cleared above.
@@ -847,6 +867,8 @@ void ShaderGenerator::shutdown (const arbitgl::GlFuncs* gl)
     passParity_ = 0;
     multipass_ = false;
     admittedPassResources_ = {};
+    inputImageLoc_ = -1;
+    bridgeStartImageLoc_ = bridgeEndImageLoc_ = bridgeProgressLoc_ = -1;
     outW_ = outH_ = 0;
     ok_ = false;
 }

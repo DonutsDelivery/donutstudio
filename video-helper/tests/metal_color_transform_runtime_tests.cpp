@@ -1,6 +1,7 @@
 #include "gpu_backend/frame_renderer_metal.h"
 #include "renderer.h"
 #include "visual_plan_executor.h"
+#include "support/frame_texture_lease_cases.h"
 #include "../../shared/ColorTransformOperationContract.h"
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -265,6 +266,32 @@ int main()
     }
 
     std::vector<std::uint8_t> actual;
+    ok &= videohelper::tests::frameTextureLeaseCases(renderer, kWidth, kHeight,
+        [&](const auto& frame)
+        {
+            videorender::LayerDesc layer;
+            layer.nativeTextureBackend = frame->backend();
+            layer.nativeTextureView = frame->colorTextureViewHandle();
+            layer.nativeTextureDescriptor = frame->colorTextureDescriptor();
+            layer.nativeTextureOwner = frame;
+            layer.texWidth = kWidth; layer.texHeight = kHeight;
+            std::vector<std::uint8_t> pixels;
+            if (!renderer.renderCompositeToIOSurface(surface, kWidth, kHeight, &layer, 1))
+                return pixels;
+            pixels.resize(kWidth * kHeight * 4);
+            IOSurfaceLock(surface, kIOSurfaceLockReadOnly, nullptr);
+            const auto* bytes = static_cast<const std::uint8_t*>(IOSurfaceGetBaseAddress(surface));
+            const auto stride = IOSurfaceGetBytesPerRow(surface);
+            for (int y = 0; y < kHeight; ++y)
+                for (int x = 0; x < kWidth; ++x)
+                {
+                    const auto* bgra = bytes + y * stride + x * 4;
+                    auto* rgba = pixels.data() + (y * kWidth + x) * 4;
+                    rgba[0] = bgra[2]; rgba[1] = bgra[1]; rgba[2] = bgra[0]; rgba[3] = bgra[3];
+                }
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, nullptr);
+            return pixels;
+        });
     for (int frame = 0; frame < 3; ++frame)
     {
         const bool rendered = renderer.renderCompositeToIOSurface(

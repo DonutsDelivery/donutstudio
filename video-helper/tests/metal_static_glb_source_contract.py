@@ -77,10 +77,15 @@ class MetalStaticGlbSourceContractTests(unittest.TestCase):
 
     def test_fixture_metal_uses_current_layout_and_resource_collections(self):
         for token in (
-            "sizeof (FixtureUniforms) == 4160",
+            "offsetof (FixtureUniforms, diffractionEnvironment) == 4224",
+            "sizeof (FixtureUniforms) == 5680",
+            "offsetof (FixtureUniforms, imageOutput) == 4208",
             "offsetof (FixtureUniforms, diffractionEvaluationSchedule) == 2080",
             "offsetof (FixtureUniforms, noteInstanceTransforms) == 2096",
             "offsetof (FixtureUniforms, geometryInstanceControl) == 4144",
+            "offsetof (FixtureUniforms, noteAppearanceLow) == 4160",
+            "offsetof (FixtureUniforms, noteAppearanceHigh) == 4176",
+            "offsetof (FixtureUniforms, noteMeshScale) == 4192",
         ):
             self.assertIn(token, self.source)
         for token in (

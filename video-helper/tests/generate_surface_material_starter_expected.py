@@ -71,12 +71,21 @@ def generate() -> bytes:
     samples = bytearray()
     for index, material in enumerate(MATERIALS, start=1):
         identifier, base, metallic, emission, roughness, normal_slot, opacity, transmission, ior, clearcoat, texture_slot = material
-        diffuse = (1.0 - metallic) * (1.0 - 0.5 * roughness)
-        specular = (0.04 + 0.96 * metallic) * (1.0 - roughness)
+        dielectric = ((ior - 1.0) / (ior + 1.0)) ** 2
+        coverage = 1.0 - transmission * (1.0 - dielectric)
+        coat = 0.04 * clearcoat
+        diffuse = (1.0 - metallic) * (1.0 - 0.5 * roughness) * (1.0 - transmission)
+        specular = (dielectric + (1.0 - dielectric) * metallic) * (1.0 - roughness)
         weight = diffuse + specular
-        linear = tuple(base[i] * lighting[i] * weight + emission[i] for i in range(3))
-        rgba = [*(unorm8(channel) for channel in linear), unorm8(opacity)]
-        wrong_transfer = [*(unorm8(srgb(min(max(channel, 0.0), 1.0))) for channel in linear), unorm8(opacity)]
+        linear = tuple((base[i] * lighting[i] * weight * (1.0 - coat)
+                        + lighting[i] * coat + emission[i]) / max(coverage, 0.000001) for i in range(3))
+        alpha = opacity * coverage
+        if opacity < 1.0 or transmission > 0.0:
+            background = (7 / 255, 10 / 255, 18 / 255)
+            linear = tuple(min(max(linear[i], 0.0), 1.0) * alpha
+                           + background[i] * (1.0 - alpha) for i in range(3))
+        rgba = [*(unorm8(channel) for channel in linear), 255]
+        wrong_transfer = [*(unorm8(srgb(min(max(channel, 0.0), 1.0))) for channel in linear), 255]
         pbr = [*base, metallic, *emission, roughness, *normal_slot, opacity,
                transmission, ior, clearcoat, float(texture_slot), index, 0, 0, 0]
         rows.append({
@@ -91,7 +100,7 @@ def generate() -> bytes:
         "provenance": {
             "constants": "Independent authored constants, separate from production module and generated-program tables",
             "independence": "This Python binary64 model computes JSON pixels without reading native output or production starter definitions.",
-            "model": "Quaternion-rotated fixture normal and directional light, explicit ambient and intensity, metallic/roughness weights, emission, opacity, and linear RGBA8 quantization",
+            "model": "Quaternion-rotated fixture normal and directional light, ambient, metallic/roughness weights, normal-incidence IOR Fresnel, thin transmission coverage, clearcoat energy layering, emission, straight-alpha blending over the opaque fixture background, and linear RGBA8 quantization",
             "fixture": {
                 "objectRotationXyzw": list(OBJECT_ROTATION),
                 "lightRotationXyzw": list(LIGHT_ROTATION),
@@ -103,7 +112,7 @@ def generate() -> bytes:
         "sampledRgba8Fnv1a64": fnv1a64(samples),
         "sampledRgba8Sha256": hashlib.sha256(samples).hexdigest(),
         "schema": 3,
-        "truthBoundary": "The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, quaternion-transformed object normal, and stable material binding. It omits transmission, IOR, and clearcoat scene transport.",
+        "truthBoundary": "The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, transmission, IOR and clearcoat. The native surface model uses normal-incidence Fresnel and thin alpha transmission, not volumetric refraction, screen-space distortion, absorption or multilayer path tracing.",
     }
     return (json.dumps(document, indent=2) + "\n").encode()
 

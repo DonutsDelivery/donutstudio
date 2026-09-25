@@ -264,7 +264,7 @@ bool readMotion (id<MTLDevice> device, std::uintptr_t outputHandle,
     [buffer release];
     [queue release];
 #endif
-    return true;
+    return std::isfinite (dx) && std::isfinite (dy);
 }
 } // namespace
 
@@ -351,6 +351,8 @@ int main()
             || previewResult->receipt().motionVectors().identity
                    == exportResult->receipt().motionVectors().identity
             || ! readMotion (device, previewResult->imageHandle(), 5, 5, dx, dy)
+            || std::abs (dx - 1.0f) > 0.01f || std::abs (dy) > 0.01f
+            || ! readMotion (device, exportResult->imageHandle(), 5, 5, dx, dy)
             || std::abs (dx - 1.0f) > 0.01f || std::abs (dy) > 0.01f)
         {
             std::fprintf (stderr,
@@ -380,10 +382,53 @@ int main()
             return 6;
         }
 
+        // Start independent runs for the stationary pair. The retained results
+        // must keep both translated outputs readable after their owners reset.
+        preview.reset();
+        exportRun.reset();
+        if (! readMotion (device, previewResult->imageHandle(), 5, 5, dx, dy)
+            || std::abs (dx - 1.0f) > 0.01f || std::abs (dy) > 0.01f
+            || ! readMotion (device, exportResult->imageHandle(), 5, 5, dx, dy)
+            || std::abs (dx - 1.0f) > 0.01f || std::abs (dy) > 0.01f)
+        {
+            std::fprintf (stderr, "retained Metal publications were invalidated by owner reset\n");
+            return 7;
+        }
+        auto stationaryDescription = description;
+        stationaryDescription.second.identity.content = stationaryDescription.first.identity.content;
+        const auto stationaryRequest = videoopticalflow::admit (
+            stationaryDescription, capabilities, admissionFailure);
+        if (! stationaryRequest) return 8;
+        id<MTLTexture> stationaryTexture = makeFixtureTexture (device, 0);
+        if (stationaryTexture == nil) return 9;
+        const auto stationary = makeSource (
+            stationaryTexture, stationaryRequest->second(), 0x33, capabilities);
+#if ! __has_feature(objc_arc)
+        [stationaryTexture release];
+#endif
+        if (! preview.execute (operation, *stationaryRequest, first, stationary,
+                               previewContext, error, &failure)
+            || ! exportRun.execute (operation, *stationaryRequest, first, stationary,
+                                    offlineContext, error, &failure))
+        {
+            std::fprintf (stderr, "stationary native execution failed: %s\n", error.c_str());
+            return 10;
+        }
+        if (! readMotion (device, preview.publication()->imageHandle(), 5, 5, dx, dy)
+            || std::abs (dx) > 0.01f || std::abs (dy) > 0.01f
+            || ! readMotion (device, exportRun.publication()->imageHandle(), 5, 5, dx, dy)
+            || std::abs (dx) > 0.01f || std::abs (dy) > 0.01f)
+        {
+            std::fprintf (stderr, "stationary Metal optical-flow mismatch dx=%g dy=%g\n",
+                          static_cast<double> (dx), static_cast<double> (dy));
+            return 11;
+        }
+
         std::printf (
-            "optical-flow-metal PASS backend=metal extent=%ux%u vector=%g,%g "
-            "preview_export_isolated=yes aliased_input_rejected=yes\n",
-            kWidth, kHeight, static_cast<double> (dx), static_cast<double> (dy));
+            "optical-flow-metal PASS backend=metal extent=%ux%u translated=1,0 stationary=0,0 "
+            "preview_export_pixels=yes preview_export_isolated=yes finite_readback=yes "
+            "retained_publications=yes aliased_input_rejected=yes\n",
+            kWidth, kHeight);
         return 0;
     }
 }

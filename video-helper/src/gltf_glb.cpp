@@ -1431,6 +1431,54 @@ bool addDecodedAllocation(std::size_t vertices,
     return true;
 }
 
+bool flatTriangleNormal(const std::array<std::array<double, 3>, 3>& positions,
+                        std::array<float, 3>& normal, std::string& error)
+{
+    for (const auto& point : positions)
+        for (const auto value : point)
+            if (!std::isfinite(value))
+                return fail(error, "cannot generate flat glTF normals from non-finite positions");
+    std::array<double, 3> ab {}, ac {};
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        ab[axis] = positions[1][axis] - positions[0][axis];
+        ac[axis] = positions[2][axis] - positions[0][axis];
+    }
+    const std::array<double, 3> cross {{
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0] }};
+    const auto length = std::hypot(cross[0], cross[1], cross[2]);
+    if (!std::isfinite(length) || length <= 0.0)
+        return fail(error, "cannot generate flat glTF normals for a degenerate triangle");
+    for (std::size_t axis = 0; axis < 3; ++axis)
+        normal[axis] = static_cast<float>(cross[axis] / length);
+    return true;
+}
+
+bool generateFlatNormals(GlbPrimitiveRecord& primitive, std::string& error)
+{
+    if (primitive.positions.empty() || primitive.positions.size() % 9 != 0)
+        return fail(error, "flat glTF normals require consecutive triangle corners");
+    // parseMeshes charged these elements to the decoded-byte budget before
+    // reading positions. Double intermediates keep finite float cross products
+    // from overflowing or underflowing during normalization.
+    primitive.normals.resize(primitive.positions.size());
+    for (std::size_t first = 0; first < primitive.positions.size(); first += 9)
+    {
+        std::array<std::array<double, 3>, 3> positions {};
+        for (std::size_t corner = 0; corner < 3; ++corner)
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                positions[corner][axis] = primitive.positions[first + corner * 3 + axis];
+        std::array<float, 3> normal {};
+        if (!flatTriangleNormal(positions, normal, error)) return false;
+        for (std::size_t corner = 0; corner < 3; ++corner)
+            std::copy(normal.begin(), normal.end(), primitive.normals.begin() + first + corner * 3);
+    }
+    primitive.generatedFlatNormals = true;
+    return true;
+}
+
 bool parseMeshes(const Json& root,
                  const std::uint8_t* binBytes,
                  const GlbAdmissionOptions& options,
@@ -1495,7 +1543,9 @@ bool parseMeshes(const Json& root,
                 std::size_t index = 0;
                 if (!readIndex(*tangent, document.accessors.size(), index))
                     return fail(error, "glTF mesh primitive TANGENT accessor is out of range");
-                primitive.tangentAccessor = index;
+                // glTF 2.0 section 3.7.2.4 ignores supplied tangents when NORMAL
+                // is absent. The reference itself must still name an accessor.
+                if (primitive.normalAccessor) primitive.tangentAccessor = index;
             }
             const auto texCoord = attributes->find("TEXCOORD_0");
             if (texCoord != attributes->end())
@@ -1514,9 +1564,13 @@ bool parseMeshes(const Json& root,
                 primitive.color0Accessor = index;
             }
             const auto indices = primitiveValue.find("indices");
-            if (indices == primitiveValue.end()
-                || !readIndex(*indices, document.accessors.size(), primitive.indexAccessor))
-                return fail(error, "static GLB triangle primitives require an in-range indices accessor");
+            if (indices != primitiveValue.end())
+            {
+                std::size_t index = 0;
+                if (!readIndex(*indices, document.accessors.size(), index))
+                    return fail(error, "glTF triangle indices accessor is out of range");
+                primitive.indexAccessor = index;
+            }
             const auto material = primitiveValue.find("material");
             if (material != primitiveValue.end())
             {
@@ -1534,18 +1588,27 @@ bool parseMeshes(const Json& root,
                 target && *target != 34962)
                 return fail(error, "glTF POSITION bufferView target must be ARRAY_BUFFER");
             const auto vertexCount = positionAccessor.count;
-            const auto& indexAccessor = document.accessors[primitive.indexAccessor];
-            const auto indexCount = indexAccessor.count;
-            const auto& indexView = document.bufferViews[indexAccessor.bufferView];
-            if (indexView.byteStride)
-                return fail(error, "glTF index accessors must be tightly packed");
-            if (indexView.target && *indexView.target != 34963)
-                return fail(error, "glTF index bufferView target must be ELEMENT_ARRAY_BUFFER");
-            if (indexAccessor.type != GlbAccessorType::Scalar || indexAccessor.normalized
-                || (indexAccessor.componentType != 5121 && indexAccessor.componentType != 5123
-                    && indexAccessor.componentType != 5125)
-                || indexCount % 3 != 0)
-                return fail(error, "glTF triangle indices must be unsigned scalar triples");
+            std::size_t indexCount = vertexCount;
+            if (primitive.indexAccessor)
+            {
+                const auto& indexAccessor = document.accessors[*primitive.indexAccessor];
+                indexCount = indexAccessor.count;
+                const auto& indexView = document.bufferViews[indexAccessor.bufferView];
+                if (indexView.byteStride)
+                    return fail(error, "glTF index accessors must be tightly packed");
+                if (indexView.target && *indexView.target != 34963)
+                    return fail(error, "glTF index bufferView target must be ELEMENT_ARRAY_BUFFER");
+                if (indexAccessor.type != GlbAccessorType::Scalar || indexAccessor.normalized
+                    || (indexAccessor.componentType != 5121 && indexAccessor.componentType != 5123
+                        && indexAccessor.componentType != 5125)
+                    || indexCount == 0 || indexCount % 3 != 0)
+                    return fail(error, "glTF triangle indices must be unsigned scalar triples");
+            }
+            else if (vertexCount == 0 || vertexCount % 3 != 0
+                     || vertexCount > std::numeric_limits<std::uint32_t>::max())
+                return fail(error, "non-indexed glTF TRIANGLES require a non-empty uint32 vertex count divisible by three");
+            if (!primitive.normalAccessor && primitive.indexAccessor)
+                return fail(error, "flat glTF normals for indexed TRIANGLES require unsupported corner expansion");
 
             std::size_t floatValues = 0;
             if (!checkedMultiply(vertexCount, 3, floatValues))
@@ -1569,6 +1632,8 @@ bool parseMeshes(const Json& root,
                 if (!addAttributeValues(3))
                     return fail(error, "decoded glTF attribute count overflows");
             }
+            else if (!addAttributeValues(3))
+                return fail(error, "generated flat glTF normal count overflows");
             if (primitive.tangentAccessor)
             {
                 const auto& accessor = document.accessors[*primitive.tangentAccessor];
@@ -1630,6 +1695,8 @@ bool parseMeshes(const Json& root,
                                          document.accessors[*primitive.normalAccessor],
                                          GlbAccessorType::Vec3, primitive.normals, error))
                 return false;
+            if (!primitive.normalAccessor && !generateFlatNormals(primitive, error))
+                return false;
             if (primitive.tangentAccessor
                 && !decodeFloatAttribute(document, binBytes,
                                          document.accessors[*primitive.tangentAccessor],
@@ -1645,9 +1712,18 @@ bool parseMeshes(const Json& root,
                                  document.accessors[*primitive.color0Accessor],
                                  primitive.colors0, error))
                 return false;
-            if (!decodeIndices(document, binBytes, indexAccessor,
-                               vertexCount, primitive.indices, error))
-                return false;
+            if (primitive.indexAccessor)
+            {
+                if (!decodeIndices(document, binBytes, document.accessors[*primitive.indexAccessor],
+                                   vertexCount, primitive.indices, error))
+                    return false;
+            }
+            else
+            {
+                primitive.indices.resize(indexCount);
+                for (std::size_t index = 0; index < indexCount; ++index)
+                    primitive.indices[index] = static_cast<std::uint32_t>(index);
+            }
             mesh.primitives.push_back(std::move(primitive));
         }
         document.meshes.push_back(std::move(mesh));
@@ -1914,7 +1990,7 @@ bool parseNodesAndScenes(const Json& root,
                     return fail(error, "glTF node camera index is out of range");
                 node.camera = index;
             }
-            if (value.find("skin") != value.end())
+            if (value.find("skin") != value.end() && !options.admitSkins)
                 return fail(error, "static GLB decode does not admit skinned nodes");
 
             const auto nodeExtensions = value.find("extensions");
@@ -2262,6 +2338,7 @@ struct AnimationNodeRecord
     std::optional<std::size_t> mesh;
     std::optional<std::size_t> skin;
     bool hasMatrix = false;
+    std::optional<std::array<float, 16>> matrix;
     std::array<float, 3> translation {0.0f, 0.0f, 0.0f};
     std::array<float, 4> rotation {0.0f, 0.0f, 0.0f, 1.0f};
     std::array<float, 3> scale {1.0f, 1.0f, 1.0f};
@@ -2686,6 +2763,7 @@ bool parseAnimationNodes(const Json& root,
             std::array<float, 16> matrix {};
             if (!readFloatArray(value, "matrix", matrix.size(), matrix.data(), error))
                 return false;
+            node.matrix = matrix;
         }
         else
         {
@@ -2733,6 +2811,7 @@ bool parseSkins(const Json& root,
                 const visualdeformation::Limits& limits,
                 DecodeByteBudget& budget,
                 std::vector<OwnedSkin>& skins,
+                bool retainGeometryHierarchy,
                 std::string& error)
 {
     const auto found = root.find("skins");
@@ -2821,6 +2900,30 @@ bool parseSkins(const Json& root,
                                         skin.inverseBindMatrices, budget, error))
                 return false;
         }
+        if (retainGeometryHierarchy)
+        {
+            // Append ancestors after the glTF joint array. JOINTS_n keeps its
+            // original indices, while palette evaluation sees the full chain.
+            for (std::size_t index = 0; index < skin.jointNodes.size(); ++index)
+                if (const auto parent = nodes[skin.jointNodes[index]].parent)
+                    if (unique.insert(*parent).second)
+                    {
+                        if (skin.jointNodes.size() >= limits.maxJointsPerSkin
+                            || totalJoints >= limits.maxTotalJoints)
+                            return fail(error, "skin transform ancestors exceed the joint capacity");
+                        if (!budget.add(16, sizeof(float), error)) return false;
+                        ++totalJoints;
+                        skin.jointNodes.push_back(*parent);
+                        skin.joints.push_back({ { oneBasedId(*parent) }, {} });
+                        const auto offset = skin.inverseBindMatrices.size();
+                        skin.inverseBindMatrices.resize(offset + 16, 0.0f);
+                        for (std::size_t diagonal = 0; diagonal < 4; ++diagonal)
+                            skin.inverseBindMatrices[offset + diagonal * 5] = 1.0f;
+                    }
+            for (std::size_t index = 0; index < skin.jointNodes.size(); ++index)
+                if (const auto parent = nodes[skin.jointNodes[index]].parent)
+                    skin.joints[index].parent = { oneBasedId(*parent) };
+        }
         skins.push_back(std::move(skin));
     }
     return true;
@@ -2892,6 +2995,51 @@ bool appendOptionalMorphAccessor(const Json& target,
     }
     return appendFloatAccessor(storage, binBytes, accessor, 3, magnitude,
                                destination, budget, error);
+}
+
+bool appendFlatMorphNormals(const GlbStaticMeshDocument& storage,
+                            const GlbAccessorRecord& baseAccessor,
+                            const std::uint8_t* binBytes,
+                            std::size_t priorVertices, std::size_t vertexCount,
+                            const std::vector<float>& positionDeltas,
+                            std::vector<float>& normalDeltas,
+                            float magnitude, DecodeByteBudget& budget, std::string& error)
+{
+    std::size_t first = 0, values = 0, total = 0;
+    if (vertexCount == 0 || vertexCount % 3 != 0
+        || !checkedMultiply(priorVertices, 3, first)
+        || !checkedMultiply(vertexCount, 3, values)
+        || !checkedAdd(first, values, total)
+        || positionDeltas.size() != total
+        || (!normalDeltas.empty() && normalDeltas.size() != first))
+        return fail(error, "generated flat glTF morph normal cardinality is invalid");
+    if (!budget.add(total - normalDeltas.size(), sizeof(float), error)) return false;
+    normalDeltas.resize(total, 0.0f);
+    const auto* source = accessorData(storage, binBytes, baseAccessor);
+    const auto stride = accessorStride(storage, baseAccessor);
+    for (std::size_t vertex = 0; vertex < vertexCount; vertex += 3)
+    {
+        std::array<std::array<double, 3>, 3> base {}, morphed {};
+        for (std::size_t corner = 0; corner < 3; ++corner)
+            for (std::size_t axis = 0; axis < 3; ++axis)
+            {
+                base[corner][axis] = readFloat(source + (vertex + corner) * stride + axis * sizeof(float));
+                morphed[corner][axis] = base[corner][axis]
+                    + static_cast<double>(positionDeltas[first + (vertex + corner) * 3 + axis]);
+            }
+        std::array<float, 3> baseNormal {}, targetNormal {};
+        if (!flatTriangleNormal(base, baseNormal, error)
+            || !flatTriangleNormal(morphed, targetNormal, error)) return false;
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            const auto delta = targetNormal[axis] - baseNormal[axis];
+            if (std::abs(delta) > magnitude)
+                return fail(error, "generated flat glTF morph normal exceeds the magnitude bound");
+            for (std::size_t corner = 0; corner < 3; ++corner)
+                normalDeltas[first + (vertex + corner) * 3 + axis] = delta;
+        }
+    }
+    return true;
 }
 
 bool parseDeformationMeshes(const Json& root,
@@ -2976,6 +3124,14 @@ bool parseDeformationMeshes(const Json& root,
                 || totalVertices > limits.maxTotalVertices
                 || vertexCount > limits.maxTotalVertices - totalVertices)
                 return fail(error, "deformed mesh vertex capacity exceeded");
+            const bool generateMorphNormals = attributes->find("NORMAL") == attributes->end();
+            if (generateMorphNormals && targetCount != 0)
+            {
+                std::size_t mode = 4;
+                if (!readOptionalSize(primitive, "mode", 4, mode, error)) return false;
+                if (mode != 4 || primitive.find("indices") != primitive.end() || vertexCount % 3 != 0)
+                    return fail(error, "flat glTF morph normals require non-indexed TRIANGLES");
+            }
             const auto priorVertices = mesh.vertexCount;
             mesh.vertexCount += vertexCount;
             totalVertices += vertexCount;
@@ -3059,8 +3215,31 @@ bool parseDeformationMeshes(const Json& root,
                                            error)
                     || !appendFloatAccessor(storage, binBytes, deltaAccessor, 3,
                                             limits.maxMorphDeltaMagnitude,
-                                            output.positions, budget, error)
-                    || !appendOptionalMorphAccessor(target, "NORMAL", priorVertices,
+                                            output.positions, budget, error))
+                    return false;
+                if (generateMorphNormals)
+                {
+                    // Morph deltas are applied before skinning. Generate each
+                    // target's flat normal, then encode its difference from the
+                    // base normal for the existing native deformation buffers.
+                    if (target.find("NORMAL") != target.end())
+                        return fail(error, "glTF morph NORMAL requires a base NORMAL attribute");
+                    if (const auto tangent = target.find("TANGENT"); tangent != target.end())
+                    {
+                        std::size_t ignored = 0;
+                        if (!readIndex(*tangent, storage.accessors.size(), ignored))
+                            return fail(error, "glTF morph TANGENT accessor index is out of range");
+                    }
+                    if (!appendFlatMorphNormals(storage, positionAccessor, binBytes,
+                            priorVertices, vertexCount, output.positions, output.normals,
+                            limits.maxMorphDeltaMagnitude, budget, error)) return false;
+                    // Earlier primitives may have tangent deltas. Preserve their
+                    // correspondence by appending zeros for these ignored ones.
+                    if (!appendOptionalMorphAccessor(Json::object(), "TANGENT", priorVertices,
+                            vertexCount, storage, binBytes, limits.maxMorphDeltaMagnitude,
+                            output.tangents, budget, error)) return false;
+                }
+                else if (!appendOptionalMorphAccessor(target, "NORMAL", priorVertices,
                                                     vertexCount, storage, binBytes,
                                                     limits.maxMorphDeltaMagnitude,
                                                     output.normals, budget, error)
@@ -3458,7 +3637,7 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
 
         std::vector<OwnedSkin> skins;
         if (!parseSkins(root, storage, binBytes, nodes, options.deformationLimits,
-                        budget, skins, error))
+                        budget, skins, options.retainGeometryHierarchy, error))
             return std::nullopt;
         std::vector<OwnedDeformationMesh> meshes;
         std::vector<std::size_t> meshTargetCounts;
@@ -3466,6 +3645,16 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
                                     options.deformationLimits, budget, meshes,
                                     meshTargetCounts, error))
             return std::nullopt;
+        if (options.retainGeometryHierarchy)
+            for (const auto& mesh : meshes)
+                if (mesh.skin.isValid())
+                {
+                    const auto originalCount=root["skins"][mesh.skin.value-1u]["joints"].size();
+                    for (const auto& set : mesh.jointWeightSets)
+                        if (std::any_of(set.joints.begin(),set.joints.end(),
+                            [originalCount](auto index) { return index>=originalCount; }))
+                            return fail(error,"joint accessor index is outside the original glTF skin"),std::nullopt;
+                }
 
         std::vector<std::string> names;
         std::vector<std::vector<OwnedAnimationTrack>> ownedClips;
@@ -3475,6 +3664,88 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
                              options.deformationLimits.maxMorphWeightMagnitude,
                              budget, names, ownedClips, durations, error))
             return std::nullopt;
+        std::vector<visualdeformation::SkinId> nodeRenderSkins(nodes.size());
+        for (std::size_t index = 0; index < nodes.size(); ++index)
+            if (nodes[index].skin) nodeRenderSkins[index] = {oneBasedId(*nodes[index].skin)};
+        if (options.retainGeometryHierarchy)
+        {
+            std::unordered_set<std::uint64_t> animatedNodes;
+            for (const auto& tracks : ownedClips)
+                for (const auto& track : tracks)
+                    if (track.channel != visualanimation::Channel::MorphWeights)
+                        animatedNodes.insert(track.target.value);
+            std::unordered_set<std::size_t> animatedRigidMeshes;
+            for (std::size_t index = 0; index < nodes.size(); ++index)
+                if (nodes[index].mesh && !nodes[index].skin)
+                    for (std::optional<std::size_t> ancestor = index; ancestor;
+                         ancestor = nodes[*ancestor].parent)
+                        if (animatedNodes.count(oneBasedId(*ancestor)) != 0)
+                            animatedRigidMeshes.insert(*nodes[index].mesh);
+            const auto meshValues = root.find("meshes");
+            for (std::size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex)
+            {
+                const auto& node = nodes[nodeIndex];
+                if (!node.mesh || node.skin || animatedRigidMeshes.count(*node.mesh) == 0) continue;
+                std::vector<std::size_t> chain;
+                for (std::optional<std::size_t> ancestor = nodeIndex; ancestor;
+                     ancestor = nodes[*ancestor].parent)
+                {
+                    chain.push_back(*ancestor);
+                }
+                if (skins.size() >= options.deformationLimits.maxSkins
+                    || chain.size() > options.deformationLimits.maxJointsPerSkin)
+                    return fail(error, "animated Geometry3D transform hierarchy exceeds the skin capacity"), std::nullopt;
+                auto mesh = std::find_if(meshes.begin(), meshes.end(), [&](const auto& candidate)
+                    { return candidate.id.value == oneBasedId(*node.mesh); });
+                if (mesh == meshes.end())
+                {
+                    OwnedDeformationMesh rigid;
+                    rigid.id = { oneBasedId(*node.mesh) };
+                    const auto& primitives = (*meshValues)[*node.mesh]["primitives"];
+                    for (const auto& primitive : primitives)
+                    {
+                        std::size_t accessor = 0;
+                        if (!readIndex(primitive["attributes"]["POSITION"], storage.accessors.size(), accessor))
+                            return fail(error, "animated Geometry3D position accessor is invalid"), std::nullopt;
+                        rigid.vertexCount += storage.accessors[accessor].count;
+                    }
+                    if (rigid.vertexCount > options.deformationLimits.maxVerticesPerMesh)
+                        return fail(error, "animated Geometry3D vertex capacity exceeded"), std::nullopt;
+                    meshes.push_back(std::move(rigid));
+                    mesh = std::prev(meshes.end());
+                }
+                OwnedSkin rigidSkin;
+                rigidSkin.id = { oneBasedId(skins.size()) };
+                rigidSkin.jointNodes = chain;
+                if (!budget.add(chain.size() * 16, sizeof(float), error)
+                    || (!mesh->skin.isValid() && !budget.add(
+                        mesh->vertexCount * 4, sizeof(float) + sizeof(std::uint32_t), error)))
+                    return std::nullopt;
+                rigidSkin.inverseBindMatrices.resize(chain.size() * 16, 0.0f);
+                for (std::size_t index = 0; index < chain.size(); ++index)
+                {
+                    rigidSkin.joints.push_back({ { oneBasedId(chain[index]) },
+                        index + 1 < chain.size() ? visualdeformation::JointId{oneBasedId(chain[index + 1])}
+                                                : visualdeformation::JointId{} });
+                    for (std::size_t diagonal = 0; diagonal < 4; ++diagonal)
+                        rigidSkin.inverseBindMatrices[index * 16 + diagonal * 5] = 1.0f;
+                }
+                nodeRenderSkins[nodeIndex] = rigidSkin.id;
+                if (!mesh->skin.isValid())
+                {
+                    mesh->skin = rigidSkin.id;
+                    OwnedJointWeightSet weights;
+                    weights.joints.resize(mesh->vertexCount * 4, 0);
+                    weights.weights.resize(mesh->vertexCount * 4, 0.0f);
+                    for (std::size_t vertex = 0; vertex < mesh->vertexCount; ++vertex)
+                        weights.weights[vertex * 4] = 1.0f;
+                    mesh->jointWeightSets.push_back(std::move(weights));
+                }
+                skins.push_back(std::move(rigidSkin));
+            }
+            std::sort(meshes.begin(), meshes.end(), [](const auto& a, const auto& b)
+                { return a.id.value < b.id.value; });
+        }
         if (ownedClips.empty() && meshes.empty())
         {
             fail(error, skins.empty()
@@ -3485,6 +3756,37 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
 
         GlbAnimationDocument result;
         result.metadata = *metadata;
+        for (const auto& node : nodes)
+            result.nodeMeshes.push_back(node.mesh ? visualdeformation::MeshId{oneBasedId(*node.mesh)}
+                                                : visualdeformation::MeshId{});
+        std::unordered_set<std::uint64_t> sceneTransformNodes;
+        if (options.retainGeometryHierarchy)
+        {
+            const auto selectedScene = options.admission.sceneIndex.value_or(metadata->defaultScene.value_or(0));
+            std::vector<std::size_t> pending;
+            const auto& selected = root["scenes"][selectedScene];
+            if (selected.contains("nodes"))
+                for (const auto& node : selected["nodes"]) pending.push_back(node.get<std::size_t>());
+            while (!pending.empty())
+            {
+                const auto index = pending.back(); pending.pop_back();
+                const auto& value = root["nodes"][index];
+                if (nodes[index].mesh)
+                {
+                    const visualdeformation::MeshId mesh {oneBasedId(*nodes[index].mesh)};
+                    if (std::find(result.sceneMeshes.begin(), result.sceneMeshes.end(), mesh) == result.sceneMeshes.end())
+                        result.sceneMeshes.push_back(mesh);
+                }
+                const bool light = value.contains("extensions") && value["extensions"].contains("KHR_lights_punctual");
+                if (value.contains("camera") || light)
+                    for (std::optional<std::size_t> ancestor = index; ancestor; ancestor = nodes[*ancestor].parent)
+                        sceneTransformNodes.insert(oneBasedId(*ancestor));
+                if (value.contains("children"))
+                    for (const auto& child : value["children"]) pending.push_back(child.get<std::size_t>());
+            }
+            std::sort(result.sceneMeshes.begin(), result.sceneMeshes.end(),
+                [](const auto& a, const auto& b) { return a.value < b.value; });
+        }
         if (!meshes.empty())
         {
             std::vector<visualdeformation::SkinView> skinViews;
@@ -3510,46 +3812,40 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
             for (const auto& mesh : meshes)
             {
                 const auto meshIndex = static_cast<std::size_t>(mesh.id.value - 1u);
-                std::optional<std::size_t> nodeIndex;
-                for (std::size_t index = 0; index < nodes.size(); ++index)
-                    if (nodes[index].mesh == meshIndex)
-                    {
-                        if (nodeIndex) { nodeIndex.reset(); break; }
-                        nodeIndex = index;
-                    }
-                if (!nodeIndex || nodes[*nodeIndex].hasMatrix) continue;
-
-                GlbDeformationRenderBinding binding;
-                binding.mesh = mesh.id;
-                binding.nodeIndex = *nodeIndex;
-                const auto copyWeights = [&] (const Json& value)
+                for (std::size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex)
                 {
-                    const auto weights = value.find("weights");
-                    if (weights == value.end()) return;
-                    binding.morphBaseWeights.clear();
-                    for (const auto& item : *weights)
-                        binding.morphBaseWeights.push_back(static_cast<float>(item.get<double>()));
-                };
-                if (meshValues != root.end()) copyWeights((*meshValues)[meshIndex]);
-                if (nodeValues != root.end()) copyWeights((*nodeValues)[*nodeIndex]);
+                    if (nodes[nodeIndex].mesh != meshIndex) continue;
 
-                if (mesh.skin.isValid())
-                {
-                    const auto skinIndex = static_cast<std::size_t>(mesh.skin.value - 1u);
-                    if (skinIndex >= skins.size()) continue;
-                    bool supported = true;
-                    for (std::size_t joint = 0; joint < skins[skinIndex].joints.size(); ++joint)
+                    GlbDeformationRenderBinding binding;
+                    binding.mesh = mesh.id;
+                    binding.nodeIndex = nodeIndex;
+                    binding.skin = nodeRenderSkins[nodeIndex];
+                    const auto copyWeights = [&] (const Json& value)
                     {
-                        const auto baseNode = skins[skinIndex].jointNodes[joint];
-                        if (nodes[baseNode].hasMatrix) { supported = false; break; }
-                        binding.jointBaseTransforms.push_back({
-                            skins[skinIndex].id, skins[skinIndex].joints[joint].id,
-                            nodes[baseNode].translation, nodes[baseNode].rotation,
-                            nodes[baseNode].scale });
+                        const auto weights = value.find("weights");
+                        if (weights == value.end()) return;
+                        binding.morphBaseWeights.clear();
+                        for (const auto& item : *weights)
+                            binding.morphBaseWeights.push_back(static_cast<float>(item.get<double>()));
+                    };
+                    if (meshValues != root.end()) copyWeights((*meshValues)[meshIndex]);
+                    if (nodeValues != root.end()) copyWeights((*nodeValues)[nodeIndex]);
+
+                    if (binding.skin.isValid())
+                    {
+                        const auto skinIndex = static_cast<std::size_t>(binding.skin.value - 1u);
+                        if (skinIndex >= skins.size()) continue;
+                        for (std::size_t joint = 0; joint < skins[skinIndex].joints.size(); ++joint)
+                        {
+                            const auto baseNode = skins[skinIndex].jointNodes[joint];
+                            binding.jointBaseTransforms.push_back({
+                                skins[skinIndex].id, skins[skinIndex].joints[joint].id,
+                                nodes[baseNode].translation, nodes[baseNode].rotation,
+                                nodes[baseNode].scale, nodes[baseNode].matrix });
+                        }
                     }
-                    if (!supported) continue;
+                    result.renderBindings.push_back(std::move(binding));
                 }
-                result.renderBindings.push_back(std::move(binding));
             }
         }
 
@@ -3589,7 +3885,8 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
                     const auto nodeIndex = static_cast<std::size_t>(track.target.value - 1u);
                     const auto meshIndex = *nodes[nodeIndex].mesh;
                     if (!morphTargets.insert(track.target.value).second
-                        || !morphMeshes.insert(oneBasedId(meshIndex)).second)
+                        || (!morphMeshes.insert(oneBasedId(meshIndex)).second
+                            && !options.retainGeometryHierarchy))
                     {
                         fail(error, "glTF animation binds one morph target or deformation mesh more than once");
                         return std::nullopt;
@@ -3604,30 +3901,34 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
                 }
                 else
                 {
-                    std::optional<GlbJointAnimationBinding> binding;
+                    if (sceneTransformNodes.count(track.target.value) != 0
+                        && std::find(named.sceneTransformTargets.begin(), named.sceneTransformTargets.end(), track.target)
+                            == named.sceneTransformTargets.end())
+                        named.sceneTransformTargets.push_back(track.target);
+                    bool bound = false;
                     for (const auto& skin : skins)
                         for (const auto& joint : skin.joints)
                             if (joint.id.value == track.target.value)
                             {
-                                if (binding)
+                                if (bound && !options.retainGeometryHierarchy)
                                 {
                                     fail(error, "glTF animated joint belongs to more than one decoded skin");
                                     return std::nullopt;
                                 }
-                                binding = GlbJointAnimationBinding {
+                                const auto binding = GlbJointAnimationBinding {
                                     track.target, skin.id, joint.id
                                 };
+                                bound = true;
+                                if (std::none_of(named.jointBindings.begin(), named.jointBindings.end(),
+                                    [&](const auto& existing) { return existing.animationTarget == track.target
+                                        && existing.skin == skin.id; }))
+                                    named.jointBindings.push_back(binding);
+                                jointBindings.emplace(track.target.value, binding);
                             }
-                    if (binding)
-                    {
-                        const auto inserted = jointBindings.emplace(track.target.value, *binding);
-                        if (inserted.second)
-                            named.jointBindings.push_back(*binding);
-                    }
                 }
             }
             for (const auto target : morphTargets)
-                if (jointBindings.count(target) != 0)
+                if (jointBindings.count(target) != 0 && !options.retainGeometryHierarchy)
                 {
                     fail(error, "glTF animation target cannot own both joint and morph deformation bindings");
                     return std::nullopt;

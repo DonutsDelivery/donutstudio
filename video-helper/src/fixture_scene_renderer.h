@@ -4,6 +4,7 @@
 #include "diffraction_material_binding_admission.h"
 #include "material_program_compiler.h"
 #include "../../shared/SurfaceMaterialBindingContract.h"
+#include "../../shared/SurfaceMaterialProgramBinding.h"
 #include "../../shared/DiffractionProductPlans.h"
 
 #include <cstdint>
@@ -66,6 +67,10 @@ private:
         videohelper::materialprogram::BackendTarget,
         std::string&);
     friend class FixtureSceneRenderer;
+    friend std::shared_ptr<const AdmittedSurfaceMaterialBinding> admitSurfaceMaterialCollection (
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>&,
+        const geometrysurfacematerial::ObjectPrograms&, const videowire::geometry::RuntimeFieldEvaluation&,
+        videohelper::materialprogram::BackendTarget, std::string&);
 
     AdmittedSurfaceMaterialBinding (
         HarmonicMIDI::grid::Scene3DId scene,
@@ -103,6 +108,12 @@ admitSurfaceMaterialBinding (
     const surfacematerialbinding::ImportedSceneMaterialRequest& request,
     videohelper::materialprogram::BackendTarget target,
     std::string& error);
+
+std::shared_ptr<const AdmittedSurfaceMaterialBinding> admitSurfaceMaterialCollection (
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+    const geometrysurfacematerial::ObjectPrograms& programs,
+    const videowire::geometry::RuntimeFieldEvaluation& evaluation,
+    videohelper::materialprogram::BackendTarget target, std::string& error);
 
 class AdmittedDiffractionMaterialBinding final
 {
@@ -149,7 +160,8 @@ private:
         std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> sceneSnapshot,
         std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> nativeProgram,
         std::shared_ptr<const diffractionmaterial::ImmutableDiffractionScenePlan> productPlan = {},
-        std::string productDigest = {})
+        std::string productDigest = {},
+        std::optional<diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest> authoredRequest = {})
         : scene_ (admitted.scene()), object_ (admitted.object()),
           sceneRevision_ (admitted.sceneRevision()),
           structuralRevision_ (admitted.structuralRevision()),
@@ -158,7 +170,7 @@ private:
           bindingDigest_ (std::move (bindingDigest)),
           sceneSnapshot_ (std::move (sceneSnapshot)),
           nativeProgram_ (std::move (nativeProgram)), productPlan_ (std::move (productPlan)),
-          productDigest_ (std::move (productDigest))
+          productDigest_ (std::move (productDigest)), authoredRequest_ (std::move(authoredRequest))
     {
     }
 
@@ -173,7 +185,7 @@ private:
           materialRevision_ (admitted.materialRevision_),
           bindingDigest_ (admitted.bindingDigest_), sceneSnapshot_ (admitted.sceneSnapshot_),
           nativeProgram_ (admitted.nativeProgram_), productPlan_ (std::move (productPlan)),
-          productDigest_ (std::move (productDigest))
+          productDigest_ (std::move (productDigest)), authoredRequest_ (admitted.authoredRequest_)
     {
     }
 
@@ -187,7 +199,7 @@ private:
           materialRevision_ (admitted.materialRevision_),
           bindingDigest_ (admitted.bindingDigest_), sceneSnapshot_ (admitted.sceneSnapshot_),
           nativeProgram_ (std::move (nativeProgram)), productPlan_ (admitted.productPlan_),
-          productDigest_ (admitted.productDigest_)
+          productDigest_ (admitted.productDigest_), authoredRequest_ (admitted.authoredRequest_)
     {
     }
 
@@ -202,6 +214,7 @@ private:
     const std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> nativeProgram_;
     const std::shared_ptr<const diffractionmaterial::ImmutableDiffractionScenePlan> productPlan_;
     const std::string productDigest_;
+    const std::optional<diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest> authoredRequest_;
 };
 
 std::shared_ptr<const AdmittedDiffractionMaterialBinding>

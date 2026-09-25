@@ -1,5 +1,8 @@
 #include "../src/fixture_scene_renderer.h"
 #include "support/fixture_scene.h"
+#include "support/vertex_modifier_fixture.h"
+#include "../src/gpu_backend/fixture_vertex_modifier_shader.h"
+#include "../src/gpu_backend/fixture_texture_upload.h"
 #include "../../shared/DiffractionMaterialPresets.h"
 #include "../../shared/DiffractionProductPlans.h"
 
@@ -7,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <initializer_list>
 #include <limits>
@@ -35,6 +39,168 @@ void check (bool value, const char* message)
         ++failures;
         std::fprintf (stderr, "FAIL: %s\n", message);
     }
+}
+
+void checkFixtureTextureUploads()
+{
+    using namespace arbitgpu::fixturetexture;
+    struct LayoutCase { std::uint32_t width, height; std::size_t levels, bytes; };
+    for (const auto value : { LayoutCase { 8, 4, 4, 172 }, { 5, 3, 3, 72 },
+                              { 1, 9, 4, 64 }, { 9, 1, 4, 64 }, { 1, 1, 1, 4 },
+                              { 1024, 1024, 11, 5592404 } })
+    {
+        MipLayout layout;
+        check (mipLayout (value.width, value.height, 9987, 16384, layout)
+                   && layout.levelCount == value.levels && layout.bytes == value.bytes,
+               "mip layout counts power-of-two, odd and one-axis extents exactly");
+        std::size_t offset = 0;
+        for (std::size_t level = 0; level < layout.levelCount; ++level)
+        {
+            const auto& mip = layout.levels[level];
+            check (mip.width == std::max (1u, value.width >> level)
+                       && mip.height == std::max (1u, value.height >> level)
+                       && mip.offsetBytes == offset
+                       && mip.bytes == static_cast<std::size_t> (mip.width) * mip.height * 4,
+                   "every mip matches native floor-halving dimensions and contiguous bytes");
+            offset += mip.bytes;
+        }
+    }
+    struct FilterCase { std::uint32_t filter; bool linear, mipmapped, linearMipmap; };
+    for (const auto value : { FilterCase { 9728, false, false, false },
+            { 9729, true, false, false }, { 9984, false, true, false },
+            { 9985, true, true, false }, { 9986, false, true, true }, { 9987, true, true, true } })
+    {
+        Minification sampling;
+        MipLayout layout;
+        check (minification (value.filter, sampling) && sampling.linear == value.linear
+                   && sampling.mipmapped == value.mipmapped && sampling.linearMipmap == value.linearMipmap
+                   && mipLayout (8, 4, value.filter, 16384, layout)
+                   && layout.levelCount == (value.mipmapped ? 4u : 1u),
+               "glTF minification separates texel filtering from mip filtering");
+    }
+    MipLayout fox;
+    check (mipLayout (1024, 1024, 9987, 16384, fox), "original Fox extent admits eleven mip levels");
+    std::size_t bytes = 4;
+    check (accountBytes (fox, 1, kMaximumTextureBytes, bytes) && bytes == 5592408,
+           "GL charges every Fox mip and one white fallback");
+    bytes = 4;
+    check (accountBytes (fox, 2, 11184812, bytes) && bytes == 11184812,
+           "Metal charges both Fox role copies and one white fallback at the exact budget");
+    bytes = 4;
+    check (! accountBytes (fox, 2, 11184811, bytes) && bytes == 4
+               && ! accountBytes (fox, 0, kMaximumTextureBytes, bytes)
+               && ! accountBytes (fox, std::numeric_limits<std::size_t>::max(), kMaximumTextureBytes, bytes)
+               && ! accountBytes (fox, 1, 0, bytes)
+               && ! accountBytes (fox, 1, kMaximumTextureBytes + 1, bytes),
+           "invalid budgets and copy counts fail without changing allocation accounting");
+    MipLayout importedFallback;
+    check (mipLayout (2, 2, 9728, 16384, importedFallback), "imported material fallback has one level");
+    bytes = 0;
+    check (accountBytes (importedFallback, 1, kMaximumTextureBytes, bytes) && bytes == 16,
+           "an imported fallback replaces the white allocation without charging phantom texels");
+    mipLayout (1024, 1024, 9728, 16384, importedFallback);
+    bytes = 0;
+    check (accountBytes (importedFallback, 1, kMaximumTextureBytes, bytes)
+               && accountBytes (fox, 2, kMaximumTextureBytes, bytes) && bytes == 15379112,
+           "both Fox role chains and an owned full-size imported fallback fit the retained budget");
+    MipLayout rejected;
+    check (! mipLayout (0, 1, 9987, 16384, rejected)
+               && ! mipLayout (1, 0, 9987, 16384, rejected)
+               && ! mipLayout (1024, 1025, 9987, 16384, rejected)
+               && ! mipLayout (1024, 1024, 9987, 512, rejected)
+               && ! mipLayout (1, 1, 9987, 0, rejected)
+               && ! mipLayout (65536, 1, 9987, 65536, rejected)
+               && ! mipLayout (UINT32_MAX, UINT32_MAX, 9987, UINT32_MAX, rejected)
+               && ! mipLayout (1, 1, 9988, 16384, rejected)
+               && rejected.levelCount == 0,
+           "zero, overflow, source-cap, device-cap, mip-count and filter violations are rejected");
+
+    auto scene = std::make_unique<Visual3DScene>();
+    scene->textureTexels = { SceneTexelRgba8 {}, {}, {}, {} };
+    scene->textureTexelCount = 4;
+    scene->textureCount = 2;
+    scene->textures[0].width = scene->textures[0].height = 2;
+    scene->textures[1] = scene->textures[0];
+    SceneMipLayouts layouts;
+    bytes = 4;
+    check (sceneMipLayouts (*scene, 2, 16384, 84, bytes, layouts) && bytes == 84,
+           "aliased texture records charge separate uploads while preserving shared source storage");
+    bytes = 4;
+    check (! sceneMipLayouts (*scene, 2, 16384, 83, bytes, layouts) && bytes == 4,
+           "whole-scene preflight fails atomically when the final copy exceeds budget");
+    scene->textures[1].magFilter = 9987;
+    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+           "mipmap modes are invalid magnification filters");
+    scene->textures[1].magFilter = 9729;
+    scene->textures[1].wrapS = 0;
+    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+           "invalid horizontal wrapping is rejected before upload");
+    scene->textures[1].wrapS = 10497;
+    scene->textures[1].wrapT = 0;
+    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+           "invalid vertical wrapping is rejected before upload");
+    scene->textures[1].wrapT = 10497;
+    scene->textures[1].firstTexel = 1;
+    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+           "source range must fit the populated texels before upload");
+    scene->textures[1].firstTexel = 0;
+    scene->textureTexelCount = kMaximumSourceTexels + 1;
+    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+           "aggregate source storage cannot exceed one million RGBA8 texels");
+    scene->textureTexelCount = 4;
+    scene->textureCount = Visual3DScene::kMaxTextures + 1;
+    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+           "texture record count is checked before reading records");
+
+    const std::array<SceneTexelRgba8, 4> image {{
+        { 0, 0, 0, 0 }, { 255, 255, 255, 255 }, { 255, 255, 255, 255 }, { 0, 0, 0, 0 }
+    }};
+    const auto original = image;
+    MipLayout layout;
+    mipLayout (2, 2, 9987, 16384, layout);
+    std::vector<SceneTexelRgba8> linear, color;
+    const bool generated = mipTexels (image.data(), image.size(), layout, false, linear)
+        && mipTexels (image.data(), image.size(), layout, true, color);
+    check (generated && linear.size() == 5 && color.size() == 5
+               && linear.back().red == 128 && color.back().red == 188
+               && linear.back().green == 128 && color.back().green == 188
+               && linear.back().blue == 128 && color.back().blue == 188
+               && linear.back().alpha == 128 && color.back().alpha == 128,
+           "color mips average RGB in linear light and keep alpha and data channels linear");
+    check (generated && std::memcmp (image.data(), original.data(), sizeof (image)) == 0
+               && std::memcmp (linear.data(), image.data(), sizeof (image)) == 0
+               && std::memcmp (color.data(), image.data(), sizeof (image)) == 0,
+           "source and both uploaded level-zero images remain byte-identical");
+    std::vector<SceneTexelRgba8> odd (15);
+    odd.back() = { 255, 255, 255, 255 };
+    mipLayout (5, 3, 9987, 16384, layout);
+    check (mipTexels (odd.data(), odd.size(), layout, false, linear)
+               && linear.size() == 18 && linear[16].red == 34 && linear.back().red == 17,
+           "odd-size mip footprints include the final row and column");
+    const std::array<SceneTexelRgba8, 5> strip {{
+        { 0, 0, 0, 255 }, { 10, 10, 10, 255 }, { 20, 20, 20, 255 },
+        { 30, 30, 30, 255 }, { 40, 40, 40, 255 }
+    }};
+    for (const auto width : { 1u, 5u })
+    {
+        mipLayout (width, 6u - width, 9987, 16384, layout);
+        check (mipTexels (strip.data(), strip.size(), layout, false, linear)
+                   && linear.size() == 8 && linear[5].red == 8
+                   && linear[6].red == 32 && linear.back().red == 20,
+               "one-axis mips retain all samples and stop at one texel");
+    }
+    mipLayout (2, 2, 9729, 16384, layout);
+    check (mipTexels (image.data(), image.size(), layout, true, color)
+               && color.size() == 4 && std::memcmp (color.data(), image.data(), sizeof (image)) == 0,
+           "non-mipmapped images retain only the unchanged source level");
+    const auto retainedSize = color.size();
+    check (! mipTexels (nullptr, image.size(), layout, false, color)
+               && ! mipTexels (image.data(), image.size() - 1, layout, false, color),
+           "missing and truncated source data fail before mip allocation");
+    layout.levels[0].offsetBytes = 4;
+    check (! mipTexels (image.data(), image.size(), layout, false, color)
+               && color.size() == retainedSize,
+           "forged mip offsets fail without replacing existing output");
 }
 
 bool near (float actual, float expected) noexcept
@@ -317,8 +483,29 @@ public:
 
 int main()
 {
+    checkFixtureTextureUploads();
     using namespace HarmonicMIDI::grid;
     using namespace videorender::fixture3d;
+
+    {
+        using Texture = arbitgpu::NativeFixtureSurfaceMaterialProgram::ImportedSrgbTexture;
+        static_assert(sizeof(Texture) < 1024, "native texture records must keep pixels off the stack");
+        Texture texture;
+        check(!texture.valid(), "empty native texture storage is not an admitted image");
+        texture.width = texture.height = 1024;
+        texture.texelCount = 1024u * 1024u;
+        check(!texture.valid(), "native texture counts require actual owned pixels");
+        texture.texels.resize(texture.texelCount);
+        check(texture.valid(), "native material storage admits a full 4 MiB texture");
+        texture.texels.pop_back();
+        check(!texture.valid(), "native texture upload rejects truncated storage");
+        texture.texels.resize(texture.texelCount);
+        texture.width = Visual3DScene::kMaxTextureDimension + 1;
+        check(!texture.valid(), "native texture upload rejects excessive dimensions");
+        texture.width = 1024;
+        ++texture.texelCount;
+        check(!texture.valid(), "native texture upload rejects excessive declared texels");
+    }
 
     auto scene = std::make_shared<const Visual3DScene> (videohelper::fixture3d::makeScene());
     FakeBackend backend;
@@ -363,6 +550,7 @@ int main()
     auto materialSceneValue = videohelper::fixture3d::makeScene();
     materialSceneValue.textureCount = 0;
     materialSceneValue.textureTexelCount = 0;
+    materialSceneValue.textureTexels.clear();
     materialSceneValue.materials[0].baseColorTexture = {};
     auto materialScene = std::make_shared<const Visual3DScene> (materialSceneValue);
     const auto materialDescription = constantSurfaceProgram (
@@ -411,6 +599,57 @@ int main()
            && materialExport.stats.reusedMaterialProgram
            && materialBackend.preparations == 1,
            "preview and export retain one immutable program and pipeline preparation");
+
+    auto vertexRequest = constantRequest;
+    vertexRequest.vertexModifier = videohelper::test::audioNormalDisplacement();
+    const auto vertexBinding = admitSurfaceMaterialBinding(materialScene, vertexRequest,
+        videohelper::materialprogram::BackendTarget::Metal, error);
+    check(vertexBinding && vertexBinding->nativeProgram()->vertexProgram
+          && vertexBinding->bindingDigest() != materialBinding->bindingDigest(),
+          "native material admission retains the vertex stage in the exact binding identity");
+    if (vertexBinding)
+    {
+        const auto shader = arbitgpu::fixtureVertexModifierShader("// ARBIT_VERTEX_MODIFIER",
+            vertexBinding->nativeProgram()->vertexProgram.get(),
+            videohelper::materialprogram::BackendTarget::Metal, error);
+        check(shader.find("u.vertexSpectrum[1][2]") != std::string::npos
+              && shader.find("modifiedPosition = vertexValue6") != std::string::npos,
+              "the Metal shader executes the requested audio band and bounded displacement output");
+        auto altered = vertexRequest;
+        altered.vertexModifier->records[3].parameters[0] = 0.125;
+        const auto alteredBinding = admitSurfaceMaterialBinding(materialScene, altered,
+            videohelper::materialprogram::BackendTarget::Metal, error);
+        check(alteredBinding && alteredBinding->bindingDigest() != vertexBinding->bindingDigest(),
+              "changed vertex parameters cannot reuse a previous material binding");
+    }
+    auto unsupportedVertex = vertexRequest;
+    unsupportedVertex.vertexModifier->records[2].operation = videowire::VertexModifierOperation::controlParameter;
+    check(!admitSurfaceMaterialBinding(materialScene, unsupportedVertex,
+              videohelper::materialprogram::BackendTarget::Metal, error)
+          && error.find("control banks") != std::string::npos,
+          "unavailable vertex control banks reject before native preparation");
+    unsupportedVertex = vertexRequest;
+    auto& noise = unsupportedVertex.vertexModifier->records[2];
+    noise.operation = videowire::VertexModifierOperation::scalarNoise3d;
+    noise.inputCount = 1;
+    noise.inputs[0] = 1;
+    noise.parameterCount = 2;
+    noise.parameters[0] = 1.0;
+    check(!admitSurfaceMaterialBinding(materialScene, unsupportedVertex,
+              videohelper::materialprogram::BackendTarget::Metal, error)
+          && error.find("noise") != std::string::npos,
+          "unavailable vertex noise rejects before native preparation");
+    unsupportedVertex = vertexRequest;
+    auto& remap = unsupportedVertex.vertexModifier->records[3];
+    remap.operation = videowire::VertexModifierOperation::scalarRemap;
+    remap.inputCount = 1;
+    remap.inputs[0] = 3;
+    remap.parameterCount = 5;
+    remap.parameters = {0.0, std::numeric_limits<double>::min(), 0.0, 1.0, 1.0, 0.0};
+    check(!admitSurfaceMaterialBinding(materialScene, unsupportedVertex,
+              videohelper::materialprogram::BackendTarget::Metal, error)
+          && error.find("representable") != std::string::npos,
+          "unrepresentable remap ranges reject before native division");
 
     auto noLightSceneValue = materialSceneValue;
     noLightSceneValue.lightCount = 0;
@@ -619,6 +858,39 @@ int main()
            "one microstructure change never aliases the program receipt while every revision input collides");
     if (originalProgram != nullptr && changedProgram != nullptr)
     {
+        auto sourceOwner = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*originalProgram);
+        const auto preparedSnapshot = arbitgpu::snapshotNativeSurfaceProgram(sourceOwner);
+        arbitgpu::NativeFixtureSceneRuntimeInputs modulated;
+        modulated.diffractionParameters = {{"grooveDepthNanometres",
+            changedWeightRequest.material.microstructure.grooveDepthNanometres}};
+        modulated.diffractionSourceProgram = sourceOwner;
+        modulated.diffractionEvaluatedProgram = changedProgram;
+        std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> resolved;
+        check (preparedSnapshot != sourceOwner
+               && arbitgpu::resolveDiffractionRuntimeProgram(preparedSnapshot, sourceOwner,
+                   modulated, resolved, error) && resolved == changedProgram,
+               "frame-local modulation retains its exact source authority across immutable preparation");
+
+        // A mutable caller alias cannot change the prepared layout, even though
+        // the original owner still authorizes scalar modulation.
+        sourceOwner->baseColorSource = arbitgpu::NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture;
+        check (arbitgpu::resolveDiffractionRuntimeProgram(preparedSnapshot, sourceOwner,
+                   modulated, resolved, error) && resolved == changedProgram
+               && arbitgpu::resolveDiffractionRuntimeProgram(preparedSnapshot, sourceOwner,
+                   {}, resolved, error) && resolved == preparedSnapshot,
+               "caller alias mutation cannot replace the prepared material or its modulation layout");
+        auto changedLayout = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*changedProgram);
+        changedLayout->baseColorSource = sourceOwner->baseColorSource;
+        modulated.diffractionEvaluatedProgram = changedLayout;
+        check (!arbitgpu::resolveDiffractionRuntimeProgram(preparedSnapshot, sourceOwner,
+                   modulated, resolved, error),
+               "a changed Frame layout cannot inherit authority from a mutated caller alias");
+        modulated.diffractionEvaluatedProgram = changedProgram;
+        modulated.diffractionSourceProgram = std::make_shared<const arbitgpu::NativeFixtureSurfaceMaterialProgram>(*sourceOwner);
+        check (!arbitgpu::resolveDiffractionRuntimeProgram(preparedSnapshot, sourceOwner,
+                   modulated, resolved, error),
+               "a copied material owner cannot replay another preparation's scalar admission");
+
         auto replayed = *changedProgram;
         replayed.programIdentity = originalProgram->programIdentity;
         const bool metalAccepted = arbitgpu::validNativeFixtureDiffractionProgram(
@@ -663,17 +935,27 @@ int main()
     if (diffractionBackend.preparedMaterial != nullptr)
     {
         const auto& crossedWorkload = *diffractionBackend.preparedMaterial;
-        check (arbitgpu::nativeFixtureDimensionsWithinBounds (1920, 1080)
+        check (crossedWorkload.diffractionLightingAdmission != nullptr
+               && crossedWorkload.diffractionLightingAdmission->description().version == 2,
+               "crossed workload uses the physical environment integration contract");
+        // Nine reciprocal-order pairs, eight wavelengths and eleven lighting
+        // evaluations: one direct plus five environment and five indirect.
+        check (arbitgpu::nativeFixtureDimensionsWithinBounds (960, 540)
                && arbitgpu::nativeFixtureDiffractionWorkWithinBudget (
+                   crossedWorkload, 960, 540)
+               && arbitgpu::nativeFixtureDiffractionLobeEvaluations (
+                   crossedWorkload, 960, 540) == 410'572'800ull,
+               "physical crossed diffraction admits a bounded 540p workload before dispatch");
+        check (! arbitgpu::nativeFixtureDiffractionWorkWithinBudget (
                    crossedWorkload, 1920, 1080)
                && arbitgpu::nativeFixtureDiffractionLobeEvaluations (
-                   crossedWorkload, 1920, 1080) == 447'897'600ull,
-               "crossed diffraction admits a bounded 1080p workload before dispatch");
+                   crossedWorkload, 1920, 1080) == 1'642'291'200ull,
+               "physical crossed diffraction accounts for environment integration at 1080p");
         check (arbitgpu::nativeFixtureDimensionsWithinBounds (3840, 2160)
                && ! arbitgpu::nativeFixtureDiffractionWorkWithinBudget (
                    crossedWorkload, 3840, 2160)
                && arbitgpu::nativeFixtureDiffractionLobeEvaluations (
-                   crossedWorkload, 3840, 2160) == 1'791'590'400ull,
+                   crossedWorkload, 3840, 2160) == 6'569'164'800ull,
                "crossed diffraction rejects an unsafe 4K workload before dispatch");
 
         auto malformedWorkload = crossedWorkload;
@@ -712,8 +994,23 @@ int main()
     auto coloredLightScene = std::make_shared<const Visual3DScene> (coloredLightValue);
     check (admitDiffractionMaterialBinding (
                coloredLightScene, diffractionMaterial,
+               videohelper::materialprogram::BackendTarget::Metal, error) == nullptr
+           && error.find("one white Directional Light") != std::string::npos,
+           "physical direct lighting rejects an undeclared RGB-to-spectrum interpretation");
+    auto environmentOnly = diffractionMaterial;
+    environmentOnly.version = diffractionmaterialbinding::kEnvironmentWireVersion;
+    environmentOnly.lighting.paths[0].incident.radiance.fill(0.0f);
+    check (admitDiffractionMaterialBinding (
+               coloredLightScene, environmentOnly,
                videohelper::materialprogram::BackendTarget::Metal, error) != nullptr,
-           "production diffraction uses the admitted spectral plan rather than RGB scene-light metadata");
+           "environment-only spectral lighting is independent of unused RGB scene-light metadata");
+    auto legacyEnvironment = environmentOnly;
+    legacyEnvironment.version = diffractionmaterialbinding::kWireVersion;
+    check (admitDiffractionMaterialBinding (
+               coloredLightScene, legacyEnvironment,
+               videohelper::materialprogram::BackendTarget::Metal, error) == nullptr
+           && error == "imported diffraction lighting does not match the version-defined canonical plan",
+           "legacy diffraction transport cannot override its fixed reference lighting");
 
     auto degenerateUvValue = diffractionSceneValue;
     degenerateUvValue.vertices[2].uv = degenerateUvValue.vertices[0].uv;
@@ -906,6 +1203,26 @@ int main()
 
     auto texturedRequest = materialRequest (
         scene, importedTextureSurfaceProgram (scene->materials[0].id.value));
+    auto authoredFrameRequest = texturedRequest;
+    authoredFrameRequest.version = surfacematerialbinding::kGraphFrameWireVersion;
+    authoredFrameRequest.binding.textures[0].source = surfacematerialbinding::TextureSourceKind::GraphFrame;
+    authoredFrameRequest.binding.textures[0].graphFrame
+        = surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint { 24, 0 };
+    for (const auto target : { videohelper::materialprogram::BackendTarget::OpenGl,
+                               videohelper::materialprogram::BackendTarget::Metal })
+    {
+        const auto binding = admitSurfaceMaterialBinding(scene, authoredFrameRequest, target, error);
+        FakeBackend backend;
+        FixtureSceneRenderer renderer(backend);
+        RenderedFrame frame;
+        check(binding != nullptr,
+              "both native backends admit an exact authored Frame endpoint without requiring an imported texture");
+        check(binding && !renderer.renderPreview(scene, binding, { 64, 64 },
+                  kNativeGpuCapability, frame, error)
+                  && error == "Native material Frame draw requires its exact owned texture"
+                  && backend.preparations == 0 && backend.submissions == 0,
+              "a Frame material without a resolved lease fails before GPU preparation and never samples the imported texture");
+    }
     auto texturedBinding = admitSurfaceMaterialBinding (
         scene, texturedRequest,
         videohelper::materialprogram::BackendTarget::Metal, error);

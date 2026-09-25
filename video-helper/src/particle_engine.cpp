@@ -3,6 +3,7 @@
 #if ARBIT_HAVE_VIEWPORT
 
 #include "particle_engine.h"
+#include "particle_body_replay.h"
 #include "gl_loader.h"
 #include "shader_generator.h"   // ShaderClock and canonical Block C frame
 #if defined (__APPLE__) && ARBIT_HAVE_METAL_BACKEND
@@ -65,6 +66,10 @@ uniform int   uNoteCount;
 uniform float uAspect;        // width/height, keeps motion isotropic
 uniform sampler2D uNotes;     // 4 x 128 RGBA32F
 
+)GLSL"
+#include "particle_timeline_glsl.inc"
+R"GLSL(
+
 float hash11 (uint n)
 {
     n = (n << 13U) ^ n;
@@ -78,6 +83,14 @@ void main()
     if (i >= uint(uCount)) return;
 
     Particle pt = p[i];
+    if (uMotionMode != 0)
+    {
+        vec4 value = timelineParticle(i);
+        pt.pos = value.xy; pt.vel = vec2(0.0); pt.life = value.z;
+        pt.maxLife = max(uLifetime, 0.1); pt.hue = value.w; pt.pad = 0.0;
+        p[i] = pt;
+        return;
+    }
     pt.life -= uDt / max(pt.maxLife, 1e-3);
 
     if (pt.life <= 0.0)
@@ -228,6 +241,10 @@ uniform int   uStateW;        // state-grid width (index = y*uStateW + x)
 layout(location = 0) out vec4 outPosVel;
 layout(location = 1) out vec4 outLife;
 
+)GLSL"
+#include "particle_timeline_glsl.inc"
+R"GLSL(
+
 float hash11 (uint n)
 {
     n = (n << 13U) ^ n;
@@ -245,6 +262,14 @@ void main()
     float life = lf.x; float maxLife = lf.y; float hue = lf.z;
 
     if (i >= uint(uCount)) { outPosVel = vec4(-10.0, -10.0, 0.0, 0.0); outLife = vec4(0.0); return; }
+
+    if (uMotionMode != 0)
+    {
+        vec4 value = timelineParticle(i);
+        outPosVel = vec4(value.xy, 0.0, 0.0);
+        outLife = vec4(value.z, max(uLifetime, 0.1), value.w, 0.0);
+        return;
+    }
 
     life -= uDt / max(maxLife, 1e-3);
 
@@ -470,6 +495,7 @@ bool ParticleEngine::ensurePrograms (const arbitgl::GlFuncs* gl)
     uGravity_    = gl->GetUniformLocation (computeProg_, "uGravity");
     uForce_      = gl->GetUniformLocation (computeProg_, "uForce");
     uLifetime_   = gl->GetUniformLocation (computeProg_, "uLifetime");
+    cacheTimelineUniforms(gl, computeProg_);
     uDt_         = gl->GetUniformLocation (computeProg_, "uDt");
     uFrame_      = gl->GetUniformLocation (computeProg_, "uFrame");
     uNoteCount_  = gl->GetUniformLocation (computeProg_, "uNoteCount");
@@ -517,7 +543,8 @@ void ParticleEngine::ensureTarget (const arbitgl::GlFuncs* gl, int width, int he
     gl->BindFramebuffer (GL_FRAMEBUFFER, 0);
 }
 
-void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblockc::CanonicalBlockCFrame* notes)
+void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblockc::CanonicalBlockCFrame* notes,
+                                  const ParticleParams& params)
 {
     (void) gl;
     if (notesTex_ == 0)
@@ -537,8 +564,9 @@ void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblo
         && (int) notes->noteTexture().size() >= kNoteTexW * kNoteTexH * 4)
     {
         glBindTexture (GL_TEXTURE_2D, notesTex_);
+        const auto data = particleNoteUpload(notes, params.motionMode == 1, params.linkRatioInfluence);
         glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, kNoteTexH, 0,
-                      GL_RGBA, GL_FLOAT, notes->noteTexture().data());
+                      GL_RGBA, GL_FLOAT, data.data());
     }
 }
 
@@ -548,6 +576,43 @@ void ParticleEngine::resetSimulation (const arbitgl::GlFuncs* gl)
     // structural revision) and guarantees all GL/Metal/fallback pools restart
     // from their documented zero/dead state rather than partially rewinding.
     shutdown(gl);
+}
+
+void ParticleEngine::cacheTimelineUniforms(const arbitgl::GlFuncs* gl, unsigned program)
+{
+    uMotionMode_ = gl->GetUniformLocation(program, "uMotionMode");
+    uSeed_ = gl->GetUniformLocation(program, "uSeed");
+    uElapsed_ = gl->GetUniformLocation(program, "uElapsed");
+    uDrag_ = gl->GetUniformLocation(program, "uDrag");
+    uAttraction_ = gl->GetUniformLocation(program, "uAttraction");
+    uAudioMotion_ = gl->GetUniformLocation(program, "uAudioMotion");
+    uCollision_ = gl->GetUniformLocation(program, "uCollision");
+    uGeometryCount_ = gl->GetUniformLocation(program, "uGeometryCount");
+    uGeometryAnchors_ = gl->GetUniformLocation(program, "uGeometryAnchors[0]");
+    uBodyReplay_ = gl->GetUniformLocation(program, "uBodyReplay[0]");
+}
+
+void ParticleEngine::uploadTimelineUniforms(const arbitgl::GlFuncs* gl,
+                                           const ShaderClock& clock, const ParticleParams& params,
+                                           float aspect, const canonicalblockc::CanonicalBlockCFrame* notes)
+{
+    gl->Uniform1i(uMotionMode_, params.motionMode);
+    gl->Uniform1i(uSeed_, params.seed);
+    gl->Uniform1f(uElapsed_, static_cast<float>(clock.timeSec - params.resetTime));
+    gl->Uniform1f(uDrag_, params.drag);
+    gl->Uniform1f(uAttraction_, params.attraction);
+    gl->Uniform4f(uAudioMotion_, params.rmsGain * params.rms,
+        params.onsetGain * params.onset, params.onsetAge, params.linkSpring);
+    gl->Uniform3f(uCollision_, static_cast<float>(params.collisionMode),
+        params.bodyRadius, params.restitution);
+    gl->Uniform1i(uGeometryCount_,params.geometryCount);
+    if (params.geometryCount>0)
+        gl->Uniform4fv(uGeometryAnchors_,params.geometryCount,params.geometryAnchors[0].data());
+    if (params.motionMode == 2)
+    {
+        const auto bodies = replayParticleBodies(params, clock.timeSec, aspect, notes);
+        gl->Uniform4fv(uBodyReplay_, 64, bodies[0].data());
+    }
 }
 
 int ParticleEngine::planSimSteps (const ShaderClock& clock, int& firstFrame)
@@ -641,7 +706,12 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     } boundary(gl);
     if (! computeAvailable (gl)) return 0;
     if (width <= 0 || height <= 0) return 0;
-    if (simSeeded_ && clock.frame < lastSimFrame_)
+    if (params.simulationSpace!=0)
+    { log_="Solid 3D must be submitted through the native retained-scene renderer"; return 0; }
+    if (params.geometryBinding && !params.preparedBodies)
+    { log_="Particle geometry requires replay preparation before native rendering"; return 0; }
+    if (!particleHistoryReady(params, log_, clock.timeSec)) return 0;
+    if (params.motionMode == 0 && simSeeded_ && clock.frame < lastSimFrame_)
         resetSimulation(gl);
 
     int count = params.count;
@@ -671,7 +741,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     if (! ensurePrograms (gl)) return 0;
     ensurePool (gl, count);
     ensureTarget (gl, width, height);
-    uploadNotes (gl, notes);
+    uploadNotes (gl, notes, params);
 
     const int noteCount =
         (notes != nullptr && ! notes->noteTexture().empty()) ? notes->noteRows() : 0;
@@ -681,7 +751,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     //    render(). A single render() at 60Hz over a 30fps project would otherwise
     //    double-step the sim vs the export (which runs one pass per frame).
     int firstFrame = clock.frame;
-    const int simSteps = planSimSteps (clock, firstFrame);
+    const int simSteps = params.motionMode != 0 ? 1 : planSimSteps (clock, firstFrame);
     if (simSteps < 0) { log_ = "particle replay exceeds deterministic bound"; return 0; }
     gl->UseProgram (computeProg_);
     gl->Uniform1i (uCount_, count);
@@ -689,6 +759,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     gl->Uniform1f (uGravity_, params.gravity);
     gl->Uniform1f (uForce_, params.force > 0.0f ? params.force : 0.0f);
     gl->Uniform1f (uLifetime_, params.lifetime);
+    uploadTimelineUniforms(gl, clock, params, float(width) / float(height), notes);
     gl->Uniform1f (uDt_, clock.playing ? (float) clock.timeDelta : 0.0f);
     gl->Uniform1i (uNoteCount_, noteCount);
     gl->Uniform1f (uAspect_, height > 0 ? (float) width / (float) height : 1.0f);
@@ -699,7 +770,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     gl->BindBufferBase (GL_SHADER_STORAGE_BUFFER, 0, ssbo_);
     for (int s = 0; s < simSteps; ++s)   // simSteps==0 ⇒ hold the pool, rasterise as-is
     {
-        gl->Uniform1i (uFrame_, firstFrame + s + params.seed);
+        gl->Uniform1i (uFrame_, params.motionMode == 1 ? params.seed : firstFrame + s + params.seed);
         gl->DispatchCompute ((unsigned) ((count + 255) / 256), 1, 1);
         gl->MemoryBarrier (GL_SHADER_STORAGE_BARRIER_BIT);
     }
@@ -748,6 +819,7 @@ bool ParticleEngine::ensureFallback (const arbitgl::GlFuncs* gl, int count)
         sUGravity_    = gl->GetUniformLocation (simProg_, "uGravity");
         sUForce_      = gl->GetUniformLocation (simProg_, "uForce");
         sULifetime_   = gl->GetUniformLocation (simProg_, "uLifetime");
+        cacheTimelineUniforms(gl, simProg_);
         sUDt_         = gl->GetUniformLocation (simProg_, "uDt");
         sUFrame_      = gl->GetUniformLocation (simProg_, "uFrame");
         sUNoteCount_  = gl->GetUniformLocation (simProg_, "uNoteCount");
@@ -827,7 +899,7 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
 {
     if (! ensureFallback (gl, count)) return 0;
     ensureTarget (gl, width, height);
-    uploadNotes (gl, notes);
+    uploadNotes (gl, notes, params);
 
     const int noteCount =
         (notes != nullptr && ! notes->noteTexture().empty()) ? notes->noteRows() : 0;
@@ -840,13 +912,15 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
     //    60Hz preview reproduces the export's per-frame sequence. simSteps==0 ⇒
     //    hold the pool and rasterise the current state.
     int firstFrame = clock.frame;
-    const int simSteps = planSimSteps (clock, firstFrame);
+    const int simSteps = params.motionMode != 0 ? 1 : planSimSteps (clock, firstFrame);
+    if (simSteps < 0) { log_ = "particle replay exceeds deterministic bound"; return 0; }
     gl->UseProgram (simProg_);
     gl->Uniform1i (sUCount_, count);
     gl->Uniform1i (sUSpawnTrack_, params.spawnTrack);
     gl->Uniform1f (sUGravity_, params.gravity);
     gl->Uniform1f (sUForce_, params.force > 0.0f ? params.force : 0.0f);
     gl->Uniform1f (sULifetime_, params.lifetime);
+    uploadTimelineUniforms(gl, clock, params, float(width) / float(height), notes);
     gl->Uniform1f (sUDt_, clock.playing ? (float) clock.timeDelta : 0.0f);
     gl->Uniform1i (sUNoteCount_, noteCount);
     gl->Uniform1f (sUAspect_, height > 0 ? (float) width / (float) height : 1.0f);
@@ -862,7 +936,7 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
     for (int s = 0; s < simSteps; ++s)
     {
         const int writeIdx = 1 - fbRead_;
-        gl->Uniform1i (sUFrame_, firstFrame + s + params.seed);
+        gl->Uniform1i (sUFrame_, params.motionMode == 1 ? params.seed : firstFrame + s + params.seed);
         gl->ActiveTexture (GL_TEXTURE1);
         glBindTexture (GL_TEXTURE_2D, posVelTex_[fbRead_]);
         gl->ActiveTexture (GL_TEXTURE2);

@@ -70,7 +70,7 @@ int main()
            && Visual3DScene::kMaxObjects == 64
            && Visual3DScene::kMaxMaterials == 32
            && Visual3DScene::kMaxTextures == 16
-           && Visual3DScene::kMaxTextureTexels == 16384
+           && Visual3DScene::kMaxTextureTexels == 1024u * 1024u
            && Visual3DScene::kMaxLights == 16
            && Visual3DScene::kMaxCameras == 8,
            "scene record capacities are fixed");

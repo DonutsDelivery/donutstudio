@@ -163,6 +163,35 @@ bool prepareNativeDeformationFrame (
     using namespace visualdeformation;
     error.clear();
     NativeDeformationFrameData candidate;
+    if (!source.draws.empty())
+    {
+        if (!source.scene || !HarmonicMIDI::grid::validateVisual3DScene(*source.scene).valid()
+            || source.draws.size() > HarmonicMIDI::grid::Visual3DScene::kMaxObjects
+            || source.batchMember)
+        { error = "native deformation scene batch exceeds its bounds"; return false; }
+        std::vector<bool> occupied(source.scene->vertexCount, false);
+        for (const auto& draw : source.draws)
+        {
+            if (!draw || !draw->draws.empty() || !draw->batchMember
+                || draw->scene != source.scene || draw->deformation != source.deformation
+                || draw->retainDeformedGeometry != source.retainDeformedGeometry
+                || draw->sourceStableId != source.sourceStableId
+                || draw->deformationStableId != source.deformationStableId
+                || draw->structuralRevision != source.structuralRevision || draw->clip != source.clip)
+            { error = "native deformation scene batch has a foreign draw owner"; return false; }
+            NativeDeformationFrameData value;
+            if (!prepareNativeDeformationFrame(*draw, snapshot, value, error)) return false;
+            const auto* object = findObject(*source.scene, draw->object);
+            for (std::size_t index = object->firstVertex; index < object->firstVertex + value.vertexCount; ++index)
+            {
+                if (occupied[index])
+                { error = "native deformation scene batch overlaps mesh topology"; return false; }
+                occupied[index] = true;
+            }
+        }
+        output = candidate;
+        return true;
+    }
     if ((snapshot.combinationMode() != visualanimation::CombinationMode::Replace
          && snapshot.combinationMode() != visualanimation::CombinationMode::WeightedBlend
          && snapshot.combinationMode() != visualanimation::CombinationMode::Add
@@ -200,26 +229,28 @@ bool prepareNativeDeformationFrame (
         error = "native deformation scene validation failed";
         return false;
     }
-    if (source.scene->objectCount != 1 || source.scene->materialCount != 1
-        || source.scene->lightCount != 1 || source.scene->cameraCount != 1)
+    if (!source.batchMember && (source.scene->objectCount != 1 || source.scene->materialCount != 1
+        || source.scene->lightCount != 1 || source.scene->cameraCount != 1))
     {
         error = "native deformation admits one object, material, light, and camera";
         return false;
     }
     const auto* object = findObject (*source.scene, source.object);
     const auto* mesh = source.deformation->findMesh (source.mesh);
-    if (object == nullptr || mesh == nullptr || object != &source.scene->objects[0]
-        || object->parent.isValid() || object->firstVertex != 0
-        || object->vertexCount != source.scene->vertexCount
-        || mesh->vertexCount() != object->vertexCount
+    if (object == nullptr || mesh == nullptr || object->parent.isValid()
+        || (!source.batchMember && (object != &source.scene->objects[0]
+            || object->firstVertex != 0 || object->vertexCount != source.scene->vertexCount
+            || mesh->vertexCount() != object->vertexCount))
+        || object->firstVertex > source.scene->vertexCount
+        || mesh->vertexCount() > source.scene->vertexCount - object->firstVertex
         || mesh->vertexCount() == 0 || mesh->vertexCount() > kNativeDeformationMaxVertices)
     {
         error = "native deformation object and mesh ranges are incompatible";
         return false;
     }
-    if (source.scene->materials[0].opacity != 1.0f
+    if (!source.batchMember && (source.scene->materials[0].opacity != 1.0f
         || source.scene->lights[0].kind
-            != HarmonicMIDI::grid::SceneLightKind::Directional)
+            != HarmonicMIDI::grid::SceneLightKind::Directional))
     {
         error = "native deformation scene is outside the opaque fixture subset";
         return false;
@@ -238,6 +269,18 @@ bool prepareNativeDeformationFrame (
         }
     candidate.vertexCount = static_cast<std::uint32_t> (mesh->vertexCount());
     candidate.morphTargetCount = static_cast<std::uint32_t> (mesh->morphTargets().size());
+    const auto skinId = source.skin.value_or(mesh->skin());
+    auto pose = snapshot.pose();
+    if (source.batchMember && (pose.meshStableId != mesh->id().value
+        || (pose.nodeStableId != 0 && pose.nodeStableId != source.animationNodeStableId))) pose = {};
+    if (!visualanimation::validPoseControls(pose)
+        || ((pose.boneEnabled || pose.morphEnabled) && pose.meshStableId != mesh->id().value)
+        || (pose.morphEnabled && pose.morphTargetIndex >= mesh->morphTargets().size())
+        || (pose.boneEnabled && !skinId.isValid()))
+    {
+        error = "native deformation selected bone or morph target is incompatible";
+        return false;
+    }
     if (! source.morphBaseWeights.empty()
         && source.morphBaseWeights.size() != mesh->morphTargets().size())
     {
@@ -256,9 +299,9 @@ bool prepareNativeDeformationFrame (
     }
 
     const Skin* skin = nullptr;
-    if (mesh->skin().isValid())
+    if (skinId.isValid())
     {
-        skin = source.deformation->findSkin (mesh->skin());
+        skin = source.deformation->findSkin (skinId);
         if (skin == nullptr || skin->joints().empty()
             || skin->joints().size() > kNativeDeformationMaxJoints
             || mesh->jointWeightSets().size() != 1
@@ -292,6 +335,7 @@ bool prepareNativeDeformationFrame (
             if (base.skin != skin->id() || base.joint != joint.id()
                 || ! finiteArray (base.translation) || ! finiteArray (base.rotation)
                 || ! finiteArray (base.scale)
+                || (base.matrix && !finiteArray(*base.matrix))
                 || base.scale[0] == 0.0f || base.scale[1] == 0.0f || base.scale[2] == 0.0f)
             {
                 error = "native deformation base pose does not preserve exact joint identity";
@@ -316,6 +360,7 @@ bool prepareNativeDeformationFrame (
         {
             if (evaluation.skin() != skin->id())
             {
+                if (source.batchMember) continue;
                 error = "native deformation snapshot contains a different skin identity";
                 return false;
             }
@@ -384,6 +429,29 @@ bool prepareNativeDeformationFrame (
                 else scales[found->second] = evaluation.scale();
             }
         }
+        if (pose.boneEnabled)
+        {
+            const auto found = indices.find(pose.boneStableId);
+            if (found == indices.end())
+            {
+                error = "native deformation selected bone is not in this mesh skin";
+                return false;
+            }
+            const auto index = found->second;
+            std::array<float, 4> delta { 0.0f, 0.0f, 0.0f, 1.0f };
+            constexpr double halfRadiansPerDegree = 0.0087266462599716478846;
+            for (std::size_t axis = 0; axis < 3; ++axis)
+            {
+                translations[index][axis] += static_cast<float>(pose.translation[axis]);
+                scales[index][axis] *= static_cast<float>(pose.scale[axis]);
+                const auto angle = pose.rotationDegrees[axis] * halfRadiansPerDegree;
+                std::array<float, 4> rotation { 0.0f, 0.0f, 0.0f,
+                                               static_cast<float>(std::cos(angle)) };
+                rotation[axis] = static_cast<float>(std::sin(angle));
+                delta = multiplyRotation(rotation, delta);
+            }
+            rotations[index] = multiplyRotation(rotations[index], delta);
+        }
         for (std::size_t index = 0; index < skin->joints().size(); ++index)
         {
             const auto& translation = translations[index];
@@ -410,7 +478,9 @@ bool prepareNativeDeformationFrame (
             if (state[index] == 2) return true;
             if (state[index] == 1) return false;
             state[index] = 1;
-            const auto local = compose (translations[index], rotations[index], scales[index]);
+            auto local = compose (translations[index], rotations[index], scales[index]);
+            if (source.jointBaseTransforms[index].matrix)
+                local = multiply(*source.jointBaseTransforms[index].matrix, local);
             const auto parent = skin->joints()[index].parent();
             if (parent.isValid())
             {
@@ -442,6 +512,9 @@ bool prepareNativeDeformationFrame (
     bool sampledMorph = false;
     for (const auto& evaluation : snapshot.morphWeights())
     {
+        if (source.animationNodeStableId != 0
+            && evaluation.animationTarget().value != source.animationNodeStableId) continue;
+        if (source.batchMember && evaluation.mesh() != mesh->id()) continue;
         if (evaluation.mesh() != mesh->id() || sampledMorph
             || evaluation.targets().size() != mesh->morphTargets().size()
             || evaluation.values().size() != mesh->morphTargets().size())
@@ -475,6 +548,15 @@ bool prepareNativeDeformationFrame (
         }
     }
 
+    if (pose.morphEnabled)
+    {
+        // Imported playback's legacy global morph gain still applies to the
+        // other targets. The selected target owns its independent final weight.
+        if (combinationMode != visualanimation::CombinationMode::WeightedBlend)
+            for (std::size_t index = 0; index < mesh->morphTargets().size(); ++index)
+                candidate.morphWeights[index] *= combinationWeight;
+        candidate.morphWeights[pose.morphTargetIndex] = static_cast<float>(pose.morphWeight);
+    }
     output = candidate;
     return true;
 }

@@ -314,6 +314,18 @@ int main()
         }
     }
 
+    if (! videohelper::sdf::test::verifyNativeUtilityOutputs (
+            [] (const auto& frame)
+            {
+                std::vector<float> pixels;
+                if (!frame.readColorFloatPixels (pixels)) pixels.clear();
+                return pixels;
+            }, parityError))
+    {
+        std::fprintf (stderr, "Metal SDF utility semantic pixels failed: %s\n", parityError.c_str());
+        return 10;
+    }
+
     auto fixtureScene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (
         videohelper::fixture3d::makeScene());
     auto& fixtureBackend = arbitgpu::nativeFixtureSceneBackend();
@@ -337,6 +349,19 @@ int main()
     }
 
     const auto fixturePixels = readBgra8 (fixtureFrame.frame);
+    fixtureInputs.lightOverride->intensity = 0;
+    const auto unlitFrame = fixtureBackend.render(
+        fixtureScene, fixturePreparation.resources, 64, 64, fixtureInputs);
+    fixtureInputs.lightOverride->intensity = 8;
+    const auto replayLightFrame = fixtureBackend.render(
+        fixtureScene, fixturePreparation.resources, 64, 64, fixtureInputs);
+    if (!unlitFrame.frame || !replayLightFrame.frame
+        || readBgra8(unlitFrame.frame) == fixturePixels
+        || readBgra8(replayLightFrame.frame) != fixturePixels)
+    {
+        std::fprintf(stderr, "Metal per-frame light override pixels or replay failed\n");
+        return 6;
+    }
     auto composedSceneValue = *fixtureScene;
     composedSceneValue.objectCount = 2;
     composedSceneValue.materialCount = 2;
@@ -393,7 +418,9 @@ int main()
         || objectZeroFrame.stats.drawCount != 1
         || ! composedPreparation.prepared || ! composedFrame.rendered
         || ! composedExport.rendered
-        || composedPreparation.stats.staticUploadCount != 2
+        || composedPreparation.stats.staticUploadCount != 1
+        || composedPreparation.stats.vertexBytes != objectZeroPreparation.stats.vertexBytes
+        || composedPreparation.stats.indexBytes != objectZeroPreparation.stats.indexBytes
         || composedFrame.stats.drawCount != 2
         || ! composedFrame.stats.reusedStaticResources
         || ! composedExport.stats.reusedStaticResources
@@ -406,15 +433,15 @@ int main()
         return 7;
     }
 
-    auto transparentSceneValue = *fixtureScene;
-    transparentSceneValue.materials[0].opacity = 0.5f;
-    const auto transparentPreparation = fixtureBackend.prepare (
-        std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (transparentSceneValue),
+    auto invalidOpacitySceneValue = *fixtureScene;
+    invalidOpacitySceneValue.materials[0].opacity = 1.5f;
+    const auto invalidOpacityPreparation = fixtureBackend.prepare (
+        std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (invalidOpacitySceneValue),
         nullptr);
-    if (transparentPreparation.prepared || transparentPreparation.resources != nullptr
-        || transparentPreparation.stats.staticUploadCount != 0)
+    if (invalidOpacityPreparation.prepared || invalidOpacityPreparation.resources != nullptr
+        || invalidOpacityPreparation.stats.staticUploadCount != 0)
     {
-        std::fprintf (stderr, "Metal accepted unsupported opacity before GPU upload\n");
+        std::fprintf (stderr, "Metal accepted out-of-range opacity before GPU upload\n");
         return 8;
     }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mod_defs.h"
+#include "video_control_window.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +26,7 @@ struct Operation
     std::vector<std::vector<int>> inputs;
     std::vector<float> params;
     std::vector<int> outputSlots;
+    std::vector<float> frameValues;
     arbitmod::ModSource source;
 
     std::string destination;
@@ -43,6 +45,7 @@ struct Plan
     int version = 1;
     int numSlots = 0;
     std::vector<Operation> operations;
+    SignalWindow signalWindow;
 };
 
 struct SinkValue
@@ -55,7 +58,7 @@ struct SinkValue
 
 inline bool supportedKind(const std::string& kind)
 {
-    return kind == "source" || kind == "sink" || kind == "control.const"
+    return kind == "signal.window" || kind == "source" || kind == "sink" || kind == "control.const"
         || kind == "control.random.step" || kind == "score.root.freq"
         || kind == "control.curve" || kind == "control.math" || kind == "control.mix"
         || kind == "control.slew" || kind == "control.history"
@@ -68,7 +71,7 @@ inline bool supportedKind(const std::string& kind)
 
 inline bool validatePlan(const Plan& plan, std::string& error)
 {
-    if (plan.version != 1)
+    if (plan.version != 1 && plan.version != 2)
     {
         error = "unsupported video control plan version";
         return false;
@@ -84,6 +87,14 @@ inline bool validatePlan(const Plan& plan, std::string& error)
         return false;
     }
 
+    if ((plan.version == 2 && !plan.signalWindow.valid())
+        || (plan.version == 1 && plan.signalWindow.present()))
+    {
+        error = "video Signal window identity is missing or invalid";
+        return false;
+    }
+    std::size_t frameValues = 0;
+    std::size_t windowOperations = 0;
     std::size_t sinks = 0;
     std::vector<bool> produced(static_cast<std::size_t>(plan.numSlots), false);
     for (const auto& op : plan.operations)
@@ -91,6 +102,33 @@ inline bool validatePlan(const Plan& plan, std::string& error)
         if (!supportedKind(op.kind))
         {
             error = "unsupported video control operation kind";
+            return false;
+        }
+        frameValues += op.frameValues.size();
+        if (frameValues > kMaxSignalFrameValues)
+        {
+            error = "video Signal frame-value capacity exceeded";
+            return false;
+        }
+        if (op.kind == "signal.window")
+        {
+            ++windowOperations;
+            if (plan.version != 2 || !op.inputs.empty() || op.outputSlots.size() != 1
+                || op.frameValues.size() != static_cast<std::size_t>(plan.signalWindow.frameCount))
+            {
+                error = "video Signal operation requires one complete frame-value column";
+                return false;
+            }
+            for (const float value : op.frameValues)
+                if (!std::isfinite(value))
+                {
+                    error = "video Signal frame value is not finite";
+                    return false;
+                }
+        }
+        else if (!op.frameValues.empty())
+        {
+            error = "frame values require a video Signal window operation";
             return false;
         }
         if (op.inputs.size() > kMaxInputsPerOperation
@@ -160,6 +198,11 @@ inline bool validatePlan(const Plan& plan, std::string& error)
             return false;
         }
     }
+    if (plan.version == 2 && windowOperations == 0)
+    {
+        error = "video Signal window has no value columns";
+        return false;
+    }
     return true;
 }
 
@@ -172,6 +215,7 @@ public:
             return false;
         plan_ = plan;
         slots_.assign(static_cast<std::size_t>(plan_.numSlots), 0.0f);
+        available_.assign(static_cast<std::size_t>(plan_.numSlots), false);
         states_.assign(plan_.operations.size(), {});
         results_.reserve(kMaxSinks);
         reset();
@@ -186,14 +230,24 @@ public:
     }
 
     bool empty() const noexcept { return plan_.operations.empty(); }
+    bool signalWindowAvailable(std::int64_t frame, double fps) const noexcept
+    {
+        return !plan_.signalWindow.present()
+            || (frame >= 0 && frame < plan_.signalWindow.frameCount && fps == plan_.signalWindow.fps);
+    }
 
     const std::vector<SinkValue>& evaluate(const arbitmod::Score& score,
                                            const arbitmod::Clock& clock,
                                            const arbitmod::Audio& audio,
-                                           float dtBeats, float dtSeconds)
+                                           float dtBeats, float dtSeconds,
+                                           std::int64_t frame = -1, double fps = 0.0)
     {
         results_.clear();
+        // Consumers supply the absolute timeline frame, including export range
+        // warm-up. No interpolation or stale last-frame fallback is permitted.
+        const bool haveWindow = signalWindowAvailable(frame, fps);
         std::fill(slots_.begin(), slots_.end(), 0.0f);
+        std::fill(available_.begin(), available_.end(), false);
 
         for (std::size_t index = 0; index < plan_.operations.size(); ++index)
         {
@@ -201,9 +255,16 @@ public:
             auto& state = states_[index];
             float in[16] = {};
             const std::size_t inputCount = std::min<std::size_t>(op.inputs.size(), 16);
+            bool available = op.kind != "signal.window" || haveWindow;
             for (std::size_t input = 0; input < inputCount; ++input)
                 for (const int slot : op.inputs[input])
+                {
+                    available = available && available_[static_cast<std::size_t>(slot)];
                     in[input] += slots_[static_cast<std::size_t>(slot)];
+                }
+            // Missing windows invalidate only downstream consumers. Summing a
+            // partial input or retaining an old reducer value would change the route.
+            if (!available) continue;
 
             const auto param = [&op](std::size_t i, float fallback = 0.0f)
             {
@@ -211,9 +272,60 @@ public:
             };
             float value = 0.0f;
 
-            if (op.kind == "source")
+            if (op.kind == "signal.window")
+                value = op.frameValues[static_cast<std::size_t>(frame)];
+            else if (op.kind == "source")
             {
-                value = arbitmod::evaluateSource(op.source, score, clock, audio);
+                const bool legacy = param(21) >= 0.5f;
+                if (legacy && op.source.type == arbitmod::SourceType::Lfo)
+                {
+                    // Match LFONode's unipolar, beat-locked modulation inputs.
+                    const double rate = std::clamp(static_cast<double>(std::max(param(22), 0.0f))
+                        * std::exp2(static_cast<double>(in[0]) * 4.0), 0.0, 32.0);
+                    const float depth = arbitmod::clamp01(param(24) + in[1]);
+                    double phase = static_cast<double>(clock.beat) * rate
+                        + static_cast<double>(param(25)) + static_cast<double>(in[2]);
+                    phase -= std::floor(phase);
+                    float wave;
+                    switch (static_cast<int>(std::lround(param(23))))
+                    {
+                        case 1: wave = 1.0f - 4.0f * static_cast<float>(std::abs(phase - 0.5)); break;
+                        case 2: wave = static_cast<float>(2.0 * phase - 1.0); break;
+                        case 3: wave = phase < 0.5 ? 1.0f : -1.0f; break;
+                        default: wave = static_cast<float>(std::sin(phase * 6.283185307179586)); break;
+                    }
+                    if (!std::isfinite(wave)) wave = 0.0f;
+                    value = arbitmod::clamp01(0.5f + 0.5f * depth * wave);
+                }
+                else if (legacy && op.source.type == arbitmod::SourceType::Env)
+                {
+                    // EnvNode advances from playhead deltas at the current BPM.
+                    // Backward seeks and repeated frames hold; forward jumps cap at one second.
+                    const double beat = clock.beat;
+                    const double bpm = clock.bpm > 1.0f ? clock.bpm : 120.0;
+                    const double delta = beat - state.lastBeats;
+                    const double dt = state.primed && delta > 0.0
+                        ? std::min(delta * 60.0 / bpm, 1.0) : 0.0;
+                    state.lastBeats = beat;
+                    state.primed = true;
+                    const double attack = static_cast<double>(std::max(param(22), 0.0f)) * 0.001;
+                    const double hold = static_cast<double>(std::max(param(23), 0.0f)) * 0.001;
+                    const double release = static_cast<double>(std::max(param(24), 0.0f)) * 0.001;
+                    if (in[0] > 1.0e-4f)
+                    {
+                        state.holdRemaining = hold;
+                        state.value = attack <= 0.0 ? 1.0f
+                            : std::min(1.0f, state.value + static_cast<float>(dt / attack));
+                    }
+                    else if (state.holdRemaining > 0.0)
+                        state.holdRemaining -= dt;
+                    else
+                        state.value = release <= 0.0 ? 0.0f
+                            : std::max(0.0f, state.value - static_cast<float>(dt / release));
+                    value = arbitmod::clamp01(state.value);
+                }
+                else
+                    value = arbitmod::evaluateSource(op.source, score, clock, audio);
             }
             else if (op.kind == "control.const")
             {
@@ -385,7 +497,10 @@ public:
 
             if (!std::isfinite(value)) value = 0.0f;
             for (const int slot : op.outputSlots)
+            {
                 slots_[static_cast<std::size_t>(slot)] = value;
+                available_[static_cast<std::size_t>(slot)] = true;
+            }
         }
         return results_;
     }
@@ -397,10 +512,13 @@ private:
         bool primed = false;
         bool flag = false;
         int count = 0;
+        double lastBeats = 0.0;
+        double holdRemaining = 0.0;
     };
 
     Plan plan_;
     std::vector<float> slots_;
+    std::vector<bool> available_;
     std::vector<OperationState> states_;
     std::vector<SinkValue> results_;
 };

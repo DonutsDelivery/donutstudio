@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace
@@ -191,6 +192,36 @@ int main()
     check (! admitNativeSdfRender (geometry, { 320, 180 }, controls, noDepth, error)
            && error == "native GPU SDF backend does not support output curvature",
            "reference utility outputs retain an exact native-backend rejection");
+
+    auto allOutputs = capabilities;
+    allOutputs.supportedOutputs.fill (true);
+    for (unsigned raw = 0; raw < static_cast<unsigned> (arbitgpu::NativeSdfOutput::count); ++raw)
+    {
+        controls.output = static_cast<arbitgpu::NativeSdfOutput> (raw);
+        const auto accepted = admitNativeSdfRender (geometry,{320,180},controls,allOutputs,error);
+        check (accepted && error.empty() && accepted->controls().output == controls.output,
+               "every implemented native output retains its exact selection through admission");
+        auto missingOutput = allOutputs;
+        missingOutput.supportedOutputs[raw] = false;
+        check (!admitNativeSdfRender (geometry,{320,180},controls,missingOutput,error)
+                   && error == std::string ("native GPU SDF backend does not support output ")
+                        + arbitgpu::nativeSdfOutputToken (controls.output),
+               "each output still rejects when that backend lacks its implementation");
+    }
+    for (const auto invalid : {static_cast<arbitgpu::NativeSdfOutput> (-1),
+                              arbitgpu::NativeSdfOutput::count,
+                              static_cast<arbitgpu::NativeSdfOutput> (9)})
+    {
+        controls.output = invalid;
+        check (!allOutputs.supports (invalid)
+                   && !admitNativeSdfRender (geometry,{320,180},controls,allOutputs,error),
+               "out-of-range output enums cannot pass all-output capability admission");
+    }
+    controls = {};
+    controls.output = arbitgpu::NativeSdfOutput::ambientOcclusion;
+    controls.epsilon = std::numeric_limits<double>::quiet_NaN();
+    check (!admitNativeSdfRender (geometry,{320,180},controls,allOutputs,error),
+           "utility maps reject nonfinite epsilon before native evaluation");
 
     controls = {};
     controls.maximumSteps = capabilities.maxSteps + 1;

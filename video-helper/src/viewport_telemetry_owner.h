@@ -122,7 +122,10 @@ public:
         if (! blitSucceeded) { telemetry_.recordDrop (VisualDropReason::blitFailure); return false; }
         if (! fenceSucceeded) { telemetry_.recordDrop (VisualDropReason::fenceFailure); return false; }
         if (! socketSucceeded) { telemetry_.recordDrop (VisualDropReason::socketFailure); return false; }
-        return telemetry_.recordTransportHandoff (VisualTransportMode::zeroCopy);
+        // The consumer owns the frame once the socket send succeeds. Telemetry
+        // contention may drop its sample, but cannot revoke that handoff.
+        telemetry_.recordTransportHandoff (VisualTransportMode::zeroCopy);
+        return true;
     }
 
     void noFreeExportedBuffer() { telemetry_.recordDrop (VisualDropReason::noBuffer); }

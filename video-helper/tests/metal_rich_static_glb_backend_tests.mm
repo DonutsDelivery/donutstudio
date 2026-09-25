@@ -164,6 +164,7 @@ int main()
         const auto firstRoleTexel = textured.textureTexelCount++;
         const auto secondRoleTexel = textured.textureTexelCount++;
         const auto normalTexel = textured.textureTexelCount++;
+        textured.textureTexels.resize(textured.textureTexelCount);
         textured.textures[firstRoleTexture].id = SceneTextureId {9001};
         textured.textures[firstRoleTexture].firstTexel = static_cast<std::uint32_t>(firstRoleTexel);
         textured.textures[firstRoleTexture].width = 1;

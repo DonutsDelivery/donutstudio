@@ -138,6 +138,16 @@ bool NativeSdfRenderer::render (
         error = "native GPU SDF backend returned an incompatible frame";
         return false;
     }
+    const auto descriptor = submission.frame->colorTextureDescriptor();
+    if (!arbitgpu::isLinearSceneColor(descriptor)
+        || descriptor.backend != submission.frame->backend()
+        || descriptor.imageHandle != submission.frame->colorImageHandle()
+        || descriptor.textureViewHandle != submission.frame->colorTextureViewHandle()
+        || descriptor.width != dimensions.width || descriptor.height != dimensions.height)
+    {
+        error = "native GPU SDF backend returned an incompatible texture descriptor";
+        return false;
+    }
 
     NativeSdfRenderedFrame rendered;
     rendered.use = use;

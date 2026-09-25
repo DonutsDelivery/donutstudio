@@ -184,8 +184,13 @@ struct GlbPrimitiveRecord
     std::optional<std::size_t> tangentAccessor;
     std::optional<std::size_t> texCoord0Accessor;
     std::optional<std::size_t> color0Accessor;
-    std::size_t indexAccessor = 0;
+    // Absent for non-indexed TRIANGLES; indices still owns the bounded explicit
+    // sequential list consumed by the geometry adapters and renderers.
+    std::optional<std::size_t> indexAccessor;
     std::optional<std::size_t> material;
+    // Generated only for non-indexed triangles. All three corners carry the
+    // same face normal, without changing skin, morph, UV or color indexing.
+    bool generatedFlatNormals = false;
     std::vector<float> positions;
     std::vector<float> normals;
     std::vector<float> tangents;
@@ -339,6 +344,9 @@ struct GlbAnimationDecodeOptions
     GlbAnimationDecodeLimits limits;
     visualanimation::Limits animationLimits;
     visualdeformation::Limits deformationLimits;
+    // Native scene rendering and geometry extraction retain transform ancestors
+    // and rigid animated meshes as skins. Original JOINTS_n indices stay intact.
+    bool retainGeometryHierarchy = false;
 };
 
 struct GlbJointAnimationBinding
@@ -364,6 +372,7 @@ struct GlbJointBaseTransform
     std::array<float, 3> translation {0.0f, 0.0f, 0.0f};
     std::array<float, 4> rotation {0.0f, 0.0f, 0.0f, 1.0f};
     std::array<float, 3> scale {1.0f, 1.0f, 1.0f};
+    std::optional<std::array<float, 16>> matrix = std::nullopt;
 };
 
 struct GlbDeformationRenderBinding
@@ -372,6 +381,7 @@ struct GlbDeformationRenderBinding
     std::size_t nodeIndex = 0;
     std::vector<GlbJointBaseTransform> jointBaseTransforms;
     std::vector<float> morphBaseWeights;
+    visualdeformation::SkinId skin;
 };
 
 struct GlbNamedAnimationClip
@@ -380,6 +390,8 @@ struct GlbNamedAnimationClip
     std::shared_ptr<const visualanimation::Clip> clip;
     std::vector<GlbJointAnimationBinding> jointBindings;
     std::vector<GlbMorphAnimationBinding> morphBindings;
+    // Original node IDs driving cameras/lights or their ancestors in this scene.
+    std::vector<visualanimation::TargetId> sceneTransformTargets;
 };
 
 struct GlbAnimationDocument
@@ -388,6 +400,8 @@ struct GlbAnimationDocument
     std::vector<GlbNamedAnimationClip> clips;
     std::shared_ptr<const visualdeformation::DeformationAsset> deformation;
     std::vector<GlbDeformationRenderBinding> renderBindings;
+    std::vector<visualdeformation::MeshId> nodeMeshes;
+    std::vector<visualdeformation::MeshId> sceneMeshes;
 };
 
 namespace detail

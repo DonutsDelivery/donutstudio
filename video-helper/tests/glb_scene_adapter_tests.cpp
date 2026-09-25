@@ -1,4 +1,8 @@
 #include "../src/glb_scene_adapter.h"
+#include "imported_geometry_fixture.h"
+#include "../../shared/VideoScreenAsset.h"
+#include "../../shared/ReactiveCharacterAsset.h"
+#include "../../shared/SceneAovOperationContract.h"
 
 #include <cmath>
 #include <cstdio>
@@ -111,6 +115,37 @@ GlbStaticMeshDocument makeTriangleAsset()
 
 GlbStaticMeshDocument makeAggregateTranslationOverflowDocument()
 {
+    {
+        using namespace videowire::geometry;
+        auto repeated=makeTriangleAsset();
+        repeated.nodes.push_back(repeated.nodes[0]);
+        repeated.nodes[3].localTransform=translation(-2,0,1);
+        repeated.nodes[3].worldTransform=repeated.nodes[3].localTransform;
+        repeated.scenes[0].rootNodes.push_back(3);
+        std::string diagnostic;
+        const auto joined=adaptGlbObjectsToGeometryCore(repeated,0,0,81,80,1,diagnostic);
+        check(joined.has_value(),"Scene Objects extracts repeated mesh nodes as joined Geometry3D");
+        if (joined) {
+            const auto& value=joined->descriptor(); const auto& mesh=std::get<GeometryData>(value.data);
+            check(mesh.positions.size()==6 && near(mesh.positions[0].x,1) && near(mesh.positions[3].x,-2)
+                && mesh.vertexIds[0]==65537 && mesh.vertexIds[3]==262145
+                && mesh.indices==std::vector<std::uint32_t>{0,1,2,3,4,5},
+                "joined geometry bakes per-node world transforms without merging vertex identities");
+            check(value.attributes.size()==6 && value.attributes[4].elements[0].components[0]==1
+                && value.attributes[4].elements[1].components[0]==196609
+                && value.attributes[5].elements[3].components[0]==4,
+                "joined geometry retains imported draw IDs and node IDs as fields");
+            const auto restored=decodeRuntimeValue(encodeRuntimeValue(*joined),
+                withAttributeContract(importedGeometryContract(),value),{}, {},diagnostic);
+            check(restored && equalAttributes(restored->descriptor().attributes,value.attributes),
+                "joined imported attributes survive immutable transport");
+        }
+        const auto selected=adaptGlbObjectsToGeometryCore(repeated,0,4,82,80,1,diagnostic);
+        check(selected && std::get<GeometryData>(selected->descriptor().data).positions.size()==3,
+            "Pose Object geometry selects one exact repeated node");
+        check(!adaptGlbObjectsToGeometryCore(repeated,0,2,83,80,1,diagnostic)
+            && diagnostic.find("not drawn")!=std::string::npos,"non-mesh node geometry selection fails closed");
+    }
     auto asset = makeTriangleAsset();
     asset.nodes.resize(5);
     asset.nodes[3].children = {4};
@@ -138,6 +173,123 @@ bool rejectedExactly(GlbStaticMeshDocument asset, const char* diagnostic)
 
 int main()
 {
+    {
+        auto asset = makeTriangleAsset();
+        auto& primitive = asset.meshes[0].primitives[0];
+        primitive.normalAccessor.reset();
+        primitive.indexAccessor.reset();
+        primitive.generatedFlatNormals = true;
+        primitive.positions = {0, 0, 0, 0, 1, 0, 0, 0, 1};
+        primitive.normals = {1, 0, 0, 1, 0, 0, 1, 0, 0};
+        std::string error;
+        const auto scene = adaptStaticGlbToVisual3DScene(asset, error);
+        check(scene && error.empty() && scene->vertexCount == 3 && scene->indexCount == 3
+              && scene->vertices[0].normal.x == 1 && scene->vertices[2].normal.x == 1
+              && scene->vertices[2].uv.y == 1 && scene->indices[2] == 2,
+              "generated non-indexed flat normals reach native vertices without changing UV or topology");
+        auto malformed = asset;
+        malformed.meshes[0].primitives[0].indices = {0, 2, 1};
+        check(rejectedExactly(std::move(malformed),
+                              "generated flat GLB normals require sequential triangle indices"),
+              "generated-normal provenance cannot hide changed triangle corner order");
+        malformed = asset;
+        malformed.meshes[0].primitives[0].normalAccessor = 1;
+        check(rejectedExactly(std::move(malformed),
+                              "generated flat GLB normals require non-indexed triangle corners"),
+              "generated normals cannot also claim an authored NORMAL accessor");
+        malformed = asset;
+        malformed.meshes[0].primitives[0].indexAccessor = 3;
+        check(rejectedExactly(std::move(malformed),
+                              "flat GLB normals for indexed TRIANGLES require unsupported corner expansion"),
+              "native adaptation explicitly rejects indexed missing-normal geometry");
+    }
+    {
+        auto asset = makeTriangleAsset();
+        asset.nodes[1].camera.reset();
+        asset.cameras.clear();
+        std::string error;
+        const auto framed = adaptStaticGlbToVisual3DScene(asset, error);
+        check(framed && framed->cameraCount == 1
+            && near(framed->cameras[0].transform.translation.x, 1.5f)
+            && near(framed->cameras[0].transform.translation.y, 2.5f)
+            && framed->cameras[0].transform.translation.z > 3.0f
+            && framed->activeCamera == framed->cameras[0].id,
+            "mesh-only imports receive a deterministic camera around selected world-space geometry");
+        GlbAdmissionOptions options;
+        options.admitAnimations = true;
+        options.admitSkins = true;
+        options.sceneIndex = 0;
+        const auto character = decodeAnimatedGlbBaseScene(
+            std::vector<std::uint8_t>(reactivecharacter::kGlb.begin(), reactivecharacter::kGlb.end()),
+            options, error);
+        const auto scene = character ? adaptAnimatedGlbMeshToVisual3DScene(*character, error, 0, true)
+                                     : std::nullopt;
+        check(scene && scene->cameraCount == 1 && scene->vertexCount > 3,
+            "bundled skinned character without an embedded camera reaches native scene admission");
+    }
+    {
+        std::string error;
+        const auto asset = decodeStaticGlb(videoscreen::kGlb.data(), videoscreen::kGlb.size(), {}, error);
+        check(asset.has_value(), "screen starter GLB decodes through the production static asset path");
+        const auto screen = asset ? adaptStaticGlbToVisual3DScene(*asset, error) : std::nullopt;
+        check(screen.has_value(), "screen starter UV mesh and embedded camera admit as a native scene");
+        if (asset && screen)
+        {
+            const auto& mesh = asset->meshes.front().primitives.front();
+            check(mesh.positions.size() == 12 && mesh.indices.size() == 6
+                      && near(mesh.positions[3] - mesh.positions[0], 1.6f)
+                      && near(mesh.positions[7] - mesh.positions[1], 0.9f),
+                  "screen starter keeps exact 16:9 geometry without imported texture bytes");
+            check(mesh.texCoords0 == std::vector<float> {0, 1, 1, 1, 1, 0, 0, 0},
+                  "screen UVs address the first decoded video row at the top on GL and Metal");
+            check(screen->textureCount == 0 && screen->objectCount == 1,
+                  "screen has one authored material target and no silent imported texture fallback");
+        }
+    }
+    {
+        using namespace videowire::geometry;
+        auto selected=importedGeometryFixture();
+        std::string diagnostic;
+        auto extracted=adaptGlbMeshToGeometryCore(selected,1,71,70,3,diagnostic);
+        check(extracted.has_value(),"selected nonzero GLB mesh extracts into admitted Geometry3D");
+        if (extracted) {
+            const auto& value=extracted->descriptor();
+            const auto& mesh=std::get<GeometryData>(value.data);
+            check(mesh.positions.size()==3 && mesh.vertexIds==std::vector<StableId>{131073,131074,131075}
+                && mesh.indices==std::vector<std::uint32_t>{0,1,2},"imported topology and stable mesh vertex IDs are retained");
+            check(value.attributes.size()==4 && value.attributes[1].elements[2].components[1]==1
+                && value.attributes[3].elements[0].components[0]==1,"UV, color, normal and face material attributes survive extraction");
+            const auto contract=withAttributeContract(importedGeometryContract(),value);
+            const auto bytes=encodeRuntimeValue(*extracted);
+            const auto restored=decodeRuntimeValue(bytes,contract,{}, {},diagnostic);
+            check(restored && equal(std::get<GeometryData>(restored->descriptor().data),mesh)
+                && equalAttributes(restored->descriptor().attributes,value.attributes),"imported source replays through the immutable transport");
+            auto tampered=value; std::get<GeometryData>(tampered.data).positions[0].x+=1;
+            check(!admitValue(tampered,contract,diagnostic),"retained source rejects a forged terminal mesh");
+            auto aliased=value;
+            auto mutableSource=std::make_shared<RetainedMeshData>(*value.operations.front().retainedMesh);
+            aliased.operations.front().retainedMesh=mutableSource;
+            auto owned=admitValue(aliased,contract,diagnostic);
+            mutableSource->geometry.positions[0].x+=10;
+            check(owned && equal(owned->descriptor().operations.front().retainedMesh->geometry,mesh),
+                "admission copies producer aliases before publishing immutable imported geometry");
+            Transform transform; transform.translation={1,2,3}; transform.scale={2,1,1};
+            auto moved=lowerTransformGeometry(value,72,transform,contract,diagnostic);
+            auto material=moved ? lowerAssignMaterial(*moved,73,19,contract,diagnostic) : std::nullopt;
+            check(material && admitValue(*material,contract,diagnostic),"imported source supports retained transforms and material assignment");
+            PortContract pointsContract; pointsContract.carrier=CarrierKind::points3D; pointsContract.maxPoints=4096;
+            auto points=lowerPointsFromVertices(value,74,pointsContract,diagnostic);
+            PortContract instancesContract; instancesContract.carrier=CarrierKind::instances3D; instancesContract.maxInstances=4096;
+            auto instances=points ? lowerInstanceOnPoints(*points,value.stableId,75,instancesContract,diagnostic) : std::nullopt;
+            check(instances && admitValue(*instances,instancesContract,diagnostic),"imported vertices can instance their retained mesh without duplicate sources");
+        }
+        check(!adaptGlbMeshToGeometryCore(selected,0,71,70,3,diagnostic),"mesh selection outside the selected scene is rejected");
+        selected.metadata.animations=1;
+        check(!adaptGlbMeshToGeometryCore(selected,1,71,70,3,diagnostic)
+            && diagnostic.find("animated")!=std::string::npos,"animated extraction has an explicit diagnostic");
+        selected=importedGeometryFixture(); selected.meshes[1].primitives[0].indices[2]=99;
+        check(!adaptGlbMeshToGeometryCore(selected,1,71,70,3,diagnostic),"out-of-range imported indices are rejected");
+    }
     auto asset = makeTriangleAsset();
     std::string error;
     const auto scene = adaptStaticGlbToVisual3DScene(asset, error);
@@ -228,6 +380,17 @@ int main()
               && nestedScene->objects[2].parent == SceneObjectId {65536}
               && near(nestedScene->objects[1].transform.translation.x, 10.0f),
               "transform-only parents and mesh-node transforms remain distinct hierarchy records");
+        const auto animatedScene = adaptAnimatedGlbMeshToVisual3DScene(nested, nestedError, 0);
+        check(animatedScene && nestedError.empty() && animatedScene->objectCount == 1
+              && animatedScene->objects[0].id == SceneObjectId {1}
+              && !animatedScene->objects[0].parent.isValid()
+              && near(animatedScene->objects[0].transform.translation.x, 11.0f)
+              && near(animatedScene->objects[0].transform.translation.y, 2.0f)
+              && near(animatedScene->objects[0].transform.translation.z, 3.0f),
+              "the animated draw retains its mesh identity and composed parent translation");
+        check(nested.nodes[0].parent == std::optional<std::size_t> {3}
+              && near(nested.nodes[0].localTransform[12], 1.0f),
+              "single-draw adaptation leaves the imported source hierarchy intact");
     }
     {
         auto nested = makeTriangleAsset();
@@ -248,6 +411,9 @@ int main()
               && nestedScene->objects[3].parent == SceneObjectId {262144}
               && near(nestedScene->objects[1].transform.translation.x, 2.0f),
               "mesh-node hierarchy retains stable parent identity and a local child transform");
+        check(!adaptAnimatedGlbMeshToVisual3DScene(nested, nestedError, 0)
+              && nestedError == "imported animated scene requires one renderable mesh primitive",
+              "single-draw adaptation rejects a second renderable object");
     }
     {
         auto nested = makeTriangleAsset();
@@ -270,6 +436,16 @@ int main()
               && nestedScene->objects[1].parent == nestedScene->objects[0].id
               && nestedScene->objects[2].parent == nestedScene->objects[1].id,
               "a non-uniform transform-only parent remains valid when its composed child transform is TRS");
+        const auto animatedScene = adaptAnimatedGlbMeshToVisual3DScene(nested, nestedError, 0);
+        check(animatedScene && nestedError.empty()
+              && animatedScene->objects[0].id == SceneObjectId {262145}
+              && near(animatedScene->objects[0].transform.translation.x, 0.649519026f)
+              && near(animatedScene->objects[0].transform.translation.y, 0.375f)
+              && near(animatedScene->objects[0].transform.rotation.z, 0.258819045f)
+              && near(animatedScene->objects[0].transform.rotation.w, 0.965925826f)
+              && near(animatedScene->objects[0].transform.scale.x, 0.75f)
+              && near(animatedScene->objects[0].transform.scale.y, 1.25f),
+              "animated adaptation composes parent rotation and non-uniform scale");
         if (nestedScene)
         {
             auto shearedHierarchy = *nestedScene;
@@ -451,6 +627,122 @@ int main()
         check(rejectedExactly(std::move(malformed),
                               "GLB decoded image texels are malformed or exceed Visual3DScene dimensions"),
               "malformed decoded image texels are rejected before scene publication");
+    }
+    {
+        static_assert(sizeof(Visual3DScene) < 512u * 1024u,
+                      "texture capacity must not become an inline multi-MiB scene array");
+        auto textured = makeTriangleAsset();
+        textured.images.emplace_back();
+        auto& image = textured.images[0];
+        image.width = 1024;
+        image.height = 1024;
+        image.decodedRgba8.resize(1024u * 1024u * 4u);
+        for (std::size_t texel = 0; texel < 1024u * 1024u; ++texel)
+        {
+            image.decodedRgba8[texel * 4] = static_cast<std::uint8_t>(texel % 251);
+            image.decodedRgba8[texel * 4 + 1] = 20;
+            image.decodedRgba8[texel * 4 + 2] = 30;
+            image.decodedRgba8[texel * 4 + 3] = 255;
+        }
+        textured.samplers.emplace_back();
+        textured.textures.emplace_back();
+        textured.textures[0].source = 0;
+        textured.textures[0].sampler = 0;
+        textured.materials[0].baseColorTexture = GlbTextureInfo {0, 0};
+        std::string textureError;
+        auto full = adaptStaticGlbToVisual3DScene(textured, textureError);
+        check(full && textureError.empty() && full->textureTexelCount == 1024u * 1024u
+              && full->textureTexels.size() == full->textureTexelCount
+              && full->textures[0].width == 1024 && full->textures[0].height == 1024
+              && full->textures[0].minFilter == 9987 && full->textures[0].wrapS == 10497,
+              "a full 4 MiB texture adapts without changing pixels, dimensions or sampler");
+        if (full)
+        {
+            textured.images.clear();
+            check(full->textureTexels.front().green == 20
+                  && full->textureTexels.back().red == (1024u * 1024u - 1u) % 251,
+                  "the adapted scene owns all texels after decoded images are released");
+            const auto encoded = sceneaov::detail::encodeScene(*full);
+            Visual3DScene decoded;
+            check(!encoded.empty() && sceneaov::detail::decodeScene(encoded, decoded)
+                  && sceneaov::detail::encodeScene(decoded) == encoded,
+                  "full-capacity scene wire round trips all texture bytes and sampler fields");
+            if (!decoded.textureTexels.empty()) decoded.textureTexels.front().green = 99;
+            check(!decoded.textureTexels.empty() && full->textureTexels.front().green == 20,
+                  "scene copies have independent texture ownership");
+
+            sceneaov::Payload payload;
+            payload.output = renderpassoutput::Output::Depth;
+            payload.extent = {64, 64};
+            payload.scene = std::make_shared<const Visual3DScene>(std::move(*full));
+            const auto xml = sceneaov::serialize(payload);
+            sceneaov::Payload parsed;
+            check(!xml.empty() && sceneaov::parse(xml, parsed)
+                  && parsed.scene->textureTexels.size() == 1024u * 1024u,
+                  "SceneAov XML admits a bounded full-resolution scene snapshot");
+
+            auto malformed = *payload.scene;
+            malformed.textureTexels.pop_back();
+            check(!validateVisual3DScene(malformed).valid(),
+                  "texture counts cannot read beyond allocated scene storage");
+            malformed = *payload.scene;
+            ++malformed.textureTexelCount;
+            check(!validateVisual3DScene(malformed).valid(),
+                  "scene texel count cannot exceed the fixed aggregate cap");
+            malformed = *payload.scene;
+            malformed.textureCount = 2;
+            malformed.textures[1] = malformed.textures[0];
+            malformed.textures[1].id.value = 2;
+            check(validateVisual3DScene(malformed).code
+                      == Visual3DSceneValidationCode::TextureTexelCapacityExceeded,
+                  "overlapping texture records cannot multiply the admitted upload budget");
+            malformed = *payload.scene;
+            malformed.textures[0].width = std::numeric_limits<std::uint32_t>::max();
+            check(!validateVisual3DScene(malformed).valid(),
+                  "huge dimensions fail before texture pointer arithmetic");
+
+            const auto writeCount = [](std::vector<std::uint8_t>& bytes,
+                                       std::size_t index, std::uint32_t count)
+            {
+                for (unsigned byte = 0; byte < 4; ++byte)
+                    bytes[24 + index * 4 + byte] = static_cast<std::uint8_t>(count >> (byte * 8));
+            };
+            for (std::size_t countIndex = 0; countIndex < 8; ++countIndex)
+            {
+                std::vector<std::uint8_t> header(encoded.begin(), encoded.begin() + 56);
+                writeCount(header, countIndex, static_cast<std::uint32_t>(
+                    sceneaov::detail::kSceneCountLimits[countIndex] + 1));
+                Visual3DScene rejected;
+                check(!sceneaov::detail::decodeScene(header, rejected)
+                      && rejected.textureTexels.empty(),
+                      "every forged scene count is rejected before texture allocation");
+            }
+            auto truncated = encoded;
+            truncated.pop_back();
+            Visual3DScene rejected;
+            check(!sceneaov::detail::decodeScene(truncated, rejected)
+                  && rejected.textureTexels.empty(),
+                  "truncated texture payload is rejected before allocating declared texels");
+            truncated = encoded;
+            truncated.push_back(0);
+            check(!sceneaov::detail::decodeScene(truncated, rejected)
+                  && rejected.textureTexels.empty(),
+                  "trailing scene bytes cannot hide a mismatched array payload");
+            std::vector<std::uint8_t> hexOutput;
+            check(!sceneaov::detail::unhex(std::string(
+                      sceneaov::detail::kMaximumSceneBytes * 2 + 2, '0'), hexOutput)
+                  && hexOutput.empty(),
+                  "oversized hex input is rejected before the decoded wire allocation");
+        }
+        // A second texture record needs its own upload budget even with the same image.
+        textured.images.emplace_back();
+        textured.images[0].width = 1024;
+        textured.images[0].height = 1024;
+        textured.images[0].decodedRgba8.resize(1024u * 1024u * 4u);
+        textured.textures.push_back(textured.textures[0]);
+        textured.materials[0].normalTexture = GlbTextureInfo {1, 0};
+        check(rejectedExactly(std::move(textured), "GLB decoded image texels exceed Visual3DScene capacity"),
+              "adapter texture capacity is aggregate across material texture records");
     }
     {
         auto malformed = makeTriangleAsset();

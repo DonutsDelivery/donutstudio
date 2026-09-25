@@ -2,6 +2,8 @@
 #include "../src/gl_loader.h"
 #include "../src/gpu_backend/backend.h"
 #include "support/fixture_scene.h"
+#include "animated_geometry_fixture.h"
+#include "multiobject_animation_fixture.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -85,6 +87,7 @@ struct Fixture final
         mutableSource->scene = scene;
         mutableSource->deformation = asset;
         mutableSource->morphBaseWeights = { 0.0f };
+        mutableSource->retainDeformedGeometry = true;
         source = std::move(mutableSource);
     }
 
@@ -221,6 +224,30 @@ int main()
     glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &callerGenericBinding);
 
     auto& backend = arbitgpu::nativeDeformationBackend();
+    std::string extractionError;
+    const bool extracted=verifyAnimatedGeometryExtraction(extractionError);
+    if (!extracted) std::cerr << extractionError << '\n';
+    ok &= expect(extracted,"imported animation reaches retained Geometry3D through the native GPU path");
+    const bool multiobject = multiobjectanimationfixture::verify(backend,
+        [&](const auto& frame) { return readRgba8(gl, frame); }, extractionError);
+    if (!multiobject) std::cerr << extractionError << '\n';
+    ok &= expect(multiobject, "multi-object imported animation preserves GPU preview, export and seek");
+    const bool rigidScene = multiobjectanimationfixture::verify(backend,
+        [&](const auto& frame) { return readRgba8(gl, frame); }, extractionError, true);
+    if (!rigidScene) std::cerr << extractionError << '\n';
+    ok &= expect(rigidScene, "rigid-only parent animation is selectable and rendered on OpenGL");
+    for (const bool rigid : {false, true}) {
+        const bool repeated = multiobjectanimationfixture::verify(backend,
+            [&](const auto& frame) { return readRgba8(gl, frame); }, extractionError, rigid, true);
+        if (!repeated) std::cerr << extractionError << '\n';
+        ok &= expect(repeated, "repeated imported nodes retain independent whole-scene poses on OpenGL");
+    }
+    for (unsigned target : {1u,2u}) {
+        const bool sceneOnly=multiobjectanimationfixture::verifySceneOnly(backend,
+            [&](const auto& frame) { return readRgba8(gl,frame); },target,extractionError);
+        if (!sceneOnly) std::cerr << extractionError << '\n';
+        ok &= expect(sceneOnly,"camera/light-only clips render without mesh deformation on OpenGL");
+    }
     const auto info = backend.info();
     ok &= expect(info.available && info.compute && info.backend == "opengl",
                  "the production deformation backend must report live OpenGL compute");
@@ -242,6 +269,22 @@ int main()
                                    preparation.resources, 96, 96);
     auto moved = backend.render(fixture.source, movedSnapshot,
                                 preparation.resources, 96, 96);
+    ok &= expect(first.deformedVertices.size()==24u*8u
+                 && first.deformedVertices==repeated.deformedVertices
+                 && moved.deformedVertices.size()==first.deformedVertices.size(),
+                 "GPU geometry extraction retains topology and repeats the same frame exactly");
+    if (first.deformedVertices.size()==24u*8u && moved.deformedVertices.size()==24u*8u)
+        for (std::size_t vertex=0;vertex<24;++vertex)
+        {
+            ok &= expect(std::abs(moved.deformedVertices[vertex*8]-first.deformedVertices[vertex*8]-0.75f)<0.00001f,
+                         "retained geometry contains the GPU evaluated morph displacement");
+            ok &= expect(first.deformedVertices[vertex*8+6]==fixture.sceneValue.vertices[vertex].uv.x
+                         && first.deformedVertices[vertex*8+7]==fixture.sceneValue.vertices[vertex].uv.y,
+                         "GPU extraction uses the full tangent and color vertex stride without corrupting UVs");
+        }
+    auto sought=backend.render(fixture.source,firstSnapshot,preparation.resources,96,96);
+    ok &= expect(sought.deformedVertices==first.deformedVertices,
+                 "seeking backwards resets extracted geometry to the exact original GPU frame");
     arbitgpu::NativeDeformationRuntimeInputs mutedMorphInputs;
     mutedMorphInputs.timeSeconds = 0.0f;
     mutedMorphInputs.morphWeight = 0.0f;

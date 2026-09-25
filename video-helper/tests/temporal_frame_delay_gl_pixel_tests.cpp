@@ -1,6 +1,7 @@
 #include "gl_loader.h"
 #include "renderer.h"
 #include "visual_plan_executor.h"
+#include "support/hdr_image_readback_checks.h"
 #include <GLFW/glfw3.h>
 #include <array>
 #include <cstdlib>
@@ -97,6 +98,14 @@ int main()
         return 1;
     }
     renderer.setBackgroundColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+    if (!hdrimagechecks::readback(renderer, [&] { return renderer.renderComposite(nullptr, 0) != 0; }, error)
+        || !hdrimagechecks::sceneComposite(renderer, [&](const auto* layers, int count)
+            { return renderer.renderComposite(layers, count) != 0; }, error))
+    {
+        std::cerr << error << '\n';
+        renderer.shutdown(); glfwDestroyWindow(window); glfwTerminate(); return 1;
+    }
 
     const Pixel black { 0, 0, 0, 255 };
     const Pixel red { 255, 0, 0, 255 };

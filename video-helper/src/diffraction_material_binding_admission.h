@@ -91,7 +91,11 @@ inline std::optional<AdmittedImportedSceneDiffractionMaterial> admit(
     const ImportedSceneDiffractionMaterialRequest& request,
     std::string& error)
 {
-    if (request.version != kWireVersion || ! request.scene.isValid()
+    if ((request.version != kWireVersion && request.version != kEnvironmentWireVersion
+         && request.version != kGraphFrameWireVersion)
+        || (request.graphFrame.has_value() != (request.version == kGraphFrameWireVersion))
+        || (request.graphFrame && (request.graphFrame->node < 0 || request.graphFrame->port != 0))
+        || ! request.scene.isValid()
         || ! request.object.isValid() || request.sceneRevision == 0
         || request.structuralRevision == 0 || request.evaluationRevision == 0
         || request.materialRevision == 0
@@ -135,8 +139,13 @@ inline std::optional<AdmittedImportedSceneDiffractionMaterial> admit(
         error = "imported diffraction lighting admission rejected: " + lightingError;
         return std::nullopt;
     }
-    if (!diffractionmaterial::sameLightingDescription(
+    if ((request.version == kWireVersion
+         && !diffractionmaterial::sameLightingDescription(
             request.lighting, diffractionmaterial::makeReferenceLighting()))
+        || (request.version == kEnvironmentWireVersion && request.lighting.version != 2)
+        || (request.version == kGraphFrameWireVersion && request.lighting.version != 2
+            && !diffractionmaterial::sameLightingDescription(
+                request.lighting, diffractionmaterial::makeReferenceLighting())))
     {
         error = "imported diffraction lighting does not match the version-defined canonical plan";
         return std::nullopt;

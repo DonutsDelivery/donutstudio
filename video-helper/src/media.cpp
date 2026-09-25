@@ -498,6 +498,34 @@ std::string MediaContext::decodeForwardUntil (double targetSec, AVFrame* frame, 
 
 std::string MediaContext::scaleToRgba (AVFrame* frame, int maxW, int maxH, DecodedFrame& out)
 {
+    const auto primaries = frame->color_primaries == AVCOL_PRI_UNSPECIFIED
+        ? videoDec_->color_primaries : frame->color_primaries;
+    const auto transfer = frame->color_trc == AVCOL_TRC_UNSPECIFIED
+        ? videoDec_->color_trc : frame->color_trc;
+    decodedframecolor::Declaration decodedColor;
+    using Space = colortransform::ColorSpace;
+    using Transfer = colortransform::TransferFunction;
+    if (primaries == AVCOL_PRI_BT709) decodedColor.primaries = Space::Rec709;
+    else if (primaries == AVCOL_PRI_BT2020) decodedColor.primaries = Space::Rec2020;
+    else if (primaries == AVCOL_PRI_SMPTE432) decodedColor.primaries = Space::DisplayP3;
+    if (transfer == AVCOL_TRC_IEC61966_2_1) {
+        decodedColor.transfer = Transfer::SRGB;
+        if (primaries == AVCOL_PRI_BT709) decodedColor.primaries = Space::SRGB;
+    }
+    else if (transfer == AVCOL_TRC_BT709) decodedColor.transfer = Transfer::Rec709;
+    else if (transfer == AVCOL_TRC_GAMMA22) decodedColor.transfer = Transfer::Gamma22;
+    else if (transfer == AVCOL_TRC_LINEAR) {
+        decodedColor.transfer = Transfer::Linear;
+        if (primaries == AVCOL_PRI_BT709) decodedColor.primaries = Space::LinearSRGB;
+    }
+    else if (transfer == AVCOL_TRC_SMPTE2084) decodedColor.transfer = Transfer::PQ;
+    else if (transfer == AVCOL_TRC_ARIB_STD_B67) decodedColor.transfer = Transfer::HLG;
+    out.color = decodedColor;
+    if (colortransform::isHdrTransfer(out.color.transfer))
+    {
+        out.rgba.clear(); out.width = out.height = out.strideBytes = 0;
+        return "PQ/HLG decoded video requires a float HDR decode and display/output path; RGBA8 conversion is unavailable";
+    }
     int dstW = frame->width;
     int dstH = frame->height;
     if (maxW > 0 && maxH > 0 && (dstW > maxW || dstH > maxH))
@@ -512,6 +540,13 @@ std::string MediaContext::scaleToRgba (AVFrame* frame, int maxW, int maxH, Decod
                                  dstW, dstH, AV_PIX_FMT_RGBA,
                                  SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (sws_ == nullptr) return "swscale context failed";
+    const auto matrix = frame->colorspace == AVCOL_SPC_UNSPECIFIED ? videoDec_->colorspace : frame->colorspace;
+    const int coefficients = matrix == AVCOL_SPC_BT709 ? SWS_CS_ITU709
+        : matrix == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : SWS_CS_DEFAULT;
+    const auto range = frame->color_range == AVCOL_RANGE_UNSPECIFIED ? videoDec_->color_range : frame->color_range;
+    if (sws_setColorspaceDetails(sws_,sws_getCoefficients(coefficients),range == AVCOL_RANGE_JPEG,
+        sws_getCoefficients(coefficients),1,0,1 << 16,1 << 16) < 0)
+        return "Decoded Frame color matrix/range declaration is unavailable";
 
     out.width = dstW;
     out.height = dstH;

@@ -7,8 +7,12 @@
 #include "renderer.h"
 #include "visual_renderer_telemetry.h"
 #include "visual_plan_executor.h"
+#include "native_texture_rows_gl.h"
 
 #include <algorithm>
+#include <atomic>
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -44,6 +48,104 @@ struct FrameRenderer::FramePublicationCandidate
 
 namespace
 {
+
+class DecodedOpenGlFrame final : public arbitgpu::NativeFixtureSceneFrame
+{
+public:
+    ~DecodedOpenGlFrame() override
+    {
+        if (texture == 0) return;
+        auto* previous = glfwGetCurrentContext();
+        if (previous != context) glfwMakeContextCurrent(context);
+        if (glfwGetCurrentContext() == context) glDeleteTextures(1, &texture);
+        if (previous != context) glfwMakeContextCurrent(previous);
+    }
+    const std::string& backend() const noexcept override { return api; }
+    std::uint32_t width() const noexcept override { return frameWidth; }
+    std::uint32_t height() const noexcept override { return frameHeight; }
+    std::uintptr_t colorImageHandle() const noexcept override { return texture; }
+    std::uintptr_t colorTextureViewHandle() const noexcept override { return texture; }
+    arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    {
+        return { api, arbitgpu::NativeTextureViewKind::Texture2D,
+            arbitgpu::NativeTexturePixelFormat::Rgba8Unorm, texture, texture,
+            frameWidth, frameHeight, 1, true, reinterpret_cast<std::uintptr_t>(context), generation };
+    }
+    std::string api = "opengl";
+    GLFWwindow* context = nullptr;
+    unsigned texture = 0;
+    std::uint32_t frameWidth = 0, frameHeight = 0;
+    std::uint64_t generation = 0;
+};
+
+// Normalize only borrowed native scene inputs, before effects, transitions,
+// particle overlays or shader filters consume them. Offscreen compositor rows
+// and decoded textures keep their established top-first convention.
+struct TopFirstNativeLayers
+{
+    std::vector<LayerDesc> layers;
+    std::vector<std::unique_ptr<LayerDesc>> transitionInputs;
+    std::vector<std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>> textures;
+
+    static bool needsCopy(const LayerDesc& layer)
+    {
+        const auto bottom = arbitgpu::NativeTextureRowOrder::BottomFirst;
+        return (layer.nativeTextureBackend == "opengl" && layer.nativeTextureDescriptor.rowOrder == bottom)
+            || ((layer.depthFog || layer.depthEffect != 0) && layer.nativeDepthTextureBackend == "opengl"
+                && layer.nativeDepthTextureDescriptor.rowOrder == bottom);
+    }
+
+    bool normalize(const arbitgl::GlFuncs& gl, const LayerDesc& source, LayerDesc& target, std::string& error)
+    {
+        if (source.effects == &source.graphFeedbackEffect) target.effects = &target.graphFeedbackEffect;
+        const auto copy = [&](const auto& descriptor) {
+            auto frame = copyTopFirstOpenGlTexture(gl, descriptor, error);
+            if (frame) textures.push_back(frame);
+            return frame;
+        };
+        if (source.nativeTextureBackend == "opengl"
+            && source.nativeTextureDescriptor.rowOrder == arbitgpu::NativeTextureRowOrder::BottomFirst)
+        {
+            auto frame = copy(source.nativeTextureDescriptor);
+            if (!frame) return false;
+            target.texture = static_cast<unsigned>(frame->colorTextureViewHandle());
+            target.nativeTextureView = frame->colorTextureViewHandle();
+            target.nativeTextureDescriptor = frame->colorTextureDescriptor();
+            target.nativeTextureOwner = std::move(frame);
+        }
+        if ((source.depthFog || source.depthEffect != 0) && source.nativeDepthTextureBackend == "opengl"
+            && source.nativeDepthTextureDescriptor.rowOrder == arbitgpu::NativeTextureRowOrder::BottomFirst)
+        {
+            auto frame = copy(source.nativeDepthTextureDescriptor);
+            if (!frame) return false;
+            target.depthTexture = static_cast<unsigned>(frame->colorTextureViewHandle());
+            target.nativeDepthTextureView = frame->colorTextureViewHandle();
+            target.nativeDepthTextureDescriptor = frame->colorTextureDescriptor();
+        }
+        return true;
+    }
+
+    bool prepare(const arbitgl::GlFuncs& gl, const LayerDesc* source, int count, std::string& error)
+    {
+        bool needed = false;
+        for (int i = 0; i < count; ++i)
+            needed |= needsCopy(source[i]) || (source[i].fromLayer && needsCopy(*source[i].fromLayer));
+        if (!needed) return true;
+        layers.assign(source, source + count);
+        for (int i = 0; i < count; ++i)
+        {
+            if (!normalize(gl, source[i], layers[i], error)) return false;
+            if (source[i].fromLayer)
+            {
+                auto input = std::make_unique<LayerDesc>(*source[i].fromLayer);
+                if (!normalize(gl, *source[i].fromLayer, *input, error)) return false;
+                layers[i].fromLayer = input.get();
+                transitionInputs.push_back(std::move(input));
+            }
+        }
+        return true;
+    }
+};
 
 uint64_t fnv1a (const uint8_t* data, size_t n)
 {
@@ -893,7 +995,7 @@ void main() {
 // HDR combine + tonemap (increment 2): final = tonemap((composite + bloom *
 // intensity) * exposure). tonemap 0 = hard clamp (linear; identical to the
 // old readback behaviour for in-range content), 1 = Reinhard, 2 = ACES filmic
-// (Narkowicz approximation). Writes opaque LDR ready for the 8-bit readback.
+// (Narkowicz approximation). Internal mode -1 preserves linear HDR image capture.
 const char* kBloomCombineFragment = R"GLSL(#version 330 core
 in vec2 TexCoord;
 out vec4 FragColor;
@@ -911,7 +1013,8 @@ void main() {
     vec3 bloom = texture(uBloomTex, TexCoord).rgb;
     vec3 hdr = (base + bloom * uIntensity) * uExposure;
     vec3 ldr;
-    if (uTonemap == 1)      ldr = hdr / (hdr + vec3(1.0));
+    if (uTonemap == -1)     ldr = hdr; // float image capture, before display transform
+    else if (uTonemap == 1) ldr = hdr / (hdr + vec3(1.0));
     else if (uTonemap == 2) ldr = aces(hdr);
     else                    ldr = clamp(hdr, 0.0, 1.0);
     FragColor = vec4(ldr, 1.0);
@@ -1994,6 +2097,7 @@ void FrameRenderer::releaseTargets()
 
 void FrameRenderer::setOutputSize (int outWidth, int outHeight)
 {
+    lastCompositeFloatTexture_ = 0;
     outWidth = std::max (outWidth, 1);
     outHeight = std::max (outHeight, 1);
     if (outWidth != outW_ || outHeight != outH_)
@@ -2227,13 +2331,6 @@ bool FrameRenderer::replaceColorAovPass (
 }
 
 bool FrameRenderer::replaceMotionAovPass (
-    const renderpassoutput::Description& description, std::string& error)
-{
-    return replaceMotionAovPass (
-        description, arbitgpu::RenderPassMotionAovClear {}, error);
-}
-
-bool FrameRenderer::replaceMotionAovPass (
     const renderpassoutput::Description& description,
     const arbitgpu::RenderPassMotionAovClear& clear,
     std::string& error)
@@ -2398,6 +2495,9 @@ void FrameRenderer::viewMap (float& zx, float& zy, float& cx, float& cy) const
 
 void FrameRenderer::shutdown()
 {
+    volumeRenderCache_.clear(); // Native leases must die before either context is destroyed.
+    lastCompositeFloatTexture_ = 0;
+    hdrImageCapture_ = false;
     renderPassOutputs_.reset();
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
     if (metalRenderer_ != nullptr)
@@ -2558,6 +2658,66 @@ void FrameRenderer::deleteTexture (unsigned texture)
         GLuint t = texture;
         glDeleteTextures (1, &t);
     }
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseRgbaTexture(
+    unsigned texture, int width, int height, std::string& error)
+{
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+        return metalRenderer_->leaseRgbaTexture(texture, width, height, error);
+#endif
+    error.clear();
+    if (gl_ == nullptr || glfwGetCurrentContext() == nullptr || texture == 0
+        || !arbitgpu::nativeFixtureDimensionsWithinBounds(width, height) || !glIsTexture(texture))
+    { error = "Frame texture lease requires a live bounded OpenGL source"; return {}; }
+    GLint previousTexture = 0, previousRead = 0, previousDraw = 0, previousUnpack = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousRead);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousDraw);
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &previousUnpack);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    GLint sourceWidth = 0, sourceHeight = 0, sourceFormat = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &sourceWidth);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &sourceHeight);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &sourceFormat);
+    glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(previousTexture));
+    if (sourceWidth != width || sourceHeight != height
+        || (sourceFormat != GL_RGBA8 && sourceFormat != GL_RGBA16F))
+    { error = "Frame texture lease source dimensions or format changed"; return {}; }
+
+    static std::atomic<std::uint64_t> generations { 0 };
+    auto frame = std::make_shared<DecodedOpenGlFrame>();
+    frame->context = glfwGetCurrentContext();
+    frame->frameWidth = width; frame->frameHeight = height;
+    frame->generation = ++generations;
+    unsigned read = 0;
+    gl_->GenFramebuffers(1, &read);
+    gl_->BindFramebuffer(GL_READ_FRAMEBUFFER, read);
+    gl_->FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    const bool readable = read != 0
+        && gl_->CheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (readable)
+    {
+        glGenTextures(1, &frame->texture);
+        glBindTexture(GL_TEXTURE_2D, frame->texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl_->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &sourceWidth);
+    }
+    gl_->BindBuffer(GL_PIXEL_UNPACK_BUFFER, static_cast<unsigned>(previousUnpack));
+    glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(previousTexture));
+    gl_->BindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<unsigned>(previousRead));
+    gl_->BindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<unsigned>(previousDraw));
+    if (read != 0) gl_->DeleteFramebuffers(1, &read);
+    if (!readable || frame->texture == 0 || sourceWidth != width)
+    { error = "Frame texture lease GPU copy failed"; return {}; }
+    return frame;
 }
 
 unsigned FrameRenderer::uploadLut3D (const float* rgbTriples, int size,
@@ -3102,7 +3262,147 @@ void FrameRenderer::drawLayerGeometry (unsigned sourceTexture, const LayerDesc& 
     drawQuad();
 }
 
-unsigned FrameRenderer::buildLayerFrame (const LayerDesc& layer, float& blendOpacityOut)
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseShaderFrame(
+    const LayerDesc& layer, std::string& error)
+{
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+        return metalRenderer_->leaseShaderFrame(layer,error);
+#endif
+    if (!prepareFlatShaderBridge(layer,error) || gl_ == nullptr) return {};
+    TopFirstNativeLayers inputs;
+    if (!inputs.prepare(*gl_, &layer, 1, error)) return {};
+    const auto texture = renderShaderOperationFrame(inputs.layers.empty() ? layer : inputs.layers.front());
+    if (texture == 0) { error = "Material shader Frame execution produced no image"; return {}; }
+    auto result = leaseRgbaTexture(texture,outW_,outH_,error);
+    const bool declared = (!layer.nativeTextureOwner || arbitgpu::materialFrameIsSrgb(layer.nativeTextureDescriptor))
+        && (!layer.fromLayer || !layer.fromLayer->nativeTextureOwner || arbitgpu::materialFrameIsSrgb(layer.fromLayer->nativeTextureDescriptor));
+    return declared ? arbitgpu::declaredSrgbMaterialFrame(std::move(result)) : result;
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseDecodedFrame(
+    unsigned texture, int width, int height, decodedframecolor::Declaration color, std::string& error)
+{
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+        return metalRenderer_->leaseDecodedFrame(texture,width,height,color,error);
+#endif
+    if (color.primaries == colortransform::ColorSpace::Unspecified
+        && color.transfer == colortransform::TransferFunction::Unspecified)
+        return leaseRgbaTexture(texture,width,height,error); // Legacy SDR only; linear Scene3D rejects undeclared colour.
+    colortransform::AdmissionFailure failure;
+    const auto admitted = decodedframecolor::toMaterialSrgb(color,
+        {static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height)},failure);
+    if (!admitted) {
+        error = "Decoded Surface Frame needs declared SDR primaries/transfer; PQ/HLG requires an unavailable float decode path: ";
+        error += colortransform::token(failure); return {};
+    }
+    auto target = leaseRgbaTexture(texture,width,height,error);
+    if (!target || !colorTransformGl_.render(texture,static_cast<unsigned>(target->colorImageHandle()),
+        width,height,*admitted,error)) return {};
+    return arbitgpu::declaredSrgbMaterialFrame(std::move(target));
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseLinearImageForDisplay(
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error)
+{
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (frame && frame->backend() == "metal" && metalRenderer_ != nullptr)
+        return metalRenderer_->leaseLinearImageForDisplay(frame, error);
+#endif
+    error.clear();
+    if (!frame || gl_ == nullptr) { error = "Linear image conversion requires a native frame"; return {}; }
+    const auto descriptor = frame->colorTextureDescriptor();
+    if (!arbitgpu::isLinearSceneColor(descriptor) || descriptor.backend != "opengl"
+        || descriptor.imageHandle != frame->colorImageHandle()
+        || descriptor.textureViewHandle != frame->colorTextureViewHandle()
+        || descriptor.imageHandle != descriptor.textureViewHandle
+        || descriptor.imageHandle > std::numeric_limits<unsigned>::max()
+        || descriptor.width != frame->width() || descriptor.height != frame->height()
+        || descriptor.deviceOrContextIdentity != reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext())
+        || !arbitgpu::nativeFixtureDimensionsWithinBounds(descriptor.width, descriptor.height)
+        || !glIsTexture(static_cast<unsigned>(descriptor.imageHandle)))
+    { error = "Linear image conversion requires a live exact RGBA16F source on this OpenGL context"; return {}; }
+    GLint previous = 0, width = 0, height = 0, format = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+    glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(descriptor.imageHandle));
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+    glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(previous));
+    if (width != static_cast<int>(descriptor.width) || height != static_cast<int>(descriptor.height)
+        || format != GL_RGBA16F)
+    { error = "Linear image storage does not match its native descriptor"; return {}; }
+    auto source = descriptor.rowOrder == arbitgpu::NativeTextureRowOrder::BottomFirst
+        ? copyTopFirstOpenGlTexture(*gl_, descriptor, error) : frame;
+    if (!source) return {};
+    colortransform::AdmissionFailure failure;
+    const auto transform = nativeLinearImageToSrgb({descriptor.width, descriptor.height}, failure);
+    if (!transform)
+    { error = "Linear image display transform was rejected: " + std::string(colortransform::token(failure)); return {}; }
+    const auto view = static_cast<unsigned>(source->colorTextureViewHandle());
+    auto display = leaseRgbaTexture(view, width, height, error);
+    if (!display || !colorTransformGl_.render(view, static_cast<unsigned>(display->colorTextureViewHandle()),
+            width, height, *transform, error)) return {};
+    return arbitgpu::declaredSrgbMaterialFrame(std::move(display));
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseTemporalFrame(
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& current,
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& previous,
+    const visualtemporaloperation::Payload& payload, float mix, std::string& error)
+{
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+        return metalRenderer_->leaseTemporalFrame(current,previous,payload,mix,error);
+#endif
+    const auto valid = [&](const auto& frame) {
+        if (!arbitgpu::validMaterialFrameTexture(frame) || frame->backend() != "opengl") return false;
+        const auto view = frame->colorTextureDescriptor();
+        return view.deviceOrContextIdentity == reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext())
+            && glIsTexture(static_cast<unsigned>(view.imageHandle));
+    };
+    if (!gl_ || !valid(current) || (previous && !valid(previous))
+        || !visualtemporaloperation::validate(payload,&error) || !std::isfinite(mix) || mix < 0 || mix > 1)
+    { if (error.empty()) error = "Temporal Frame requires owned images on the active OpenGL device"; return {}; }
+    const auto normalize = [&](const auto& frame) {
+        return arbitgpu::materialFrameIsBottomFirst(frame)
+            ? copyTopFirstOpenGlTexture(*gl_, frame->colorTextureDescriptor(), error) : frame;
+    };
+    const auto currentInput = normalize(current), previousInput = normalize(previous);
+    if (!currentInput || (previous && !previousInput)) return {};
+    const auto target = createOutputTexture();
+    if (target == 0) { error = "Temporal Frame target allocation failed"; return {}; }
+    gl_->BindFramebuffer(GL_FRAMEBUFFER,fbo_); attachTarget(target);
+    glViewport(0,0,outW_,outH_); glDisable(GL_BLEND);
+    glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+    if (previous)
+    {
+        if (payload.mode == visualtemporaloperation::Mode::feedback)
+        {
+            gl_->UseProgram(feedback_.prog); setPassthrough(feedback_.uTransform,feedback_.uCrop);
+            bindTexture(0,static_cast<unsigned>(currentInput->colorTextureViewHandle()),feedback_.uTexture);
+            bindTexture(1,static_cast<unsigned>(previousInput->colorTextureViewHandle()),feedback_.uFeedbackTex);
+            gl_->Uniform1f(feedback_.uParam[0],payload.decay);
+            gl_->Uniform1f(feedback_.uParam[1],payload.zoom);
+            gl_->Uniform1f(feedback_.uParam[2],payload.swirl);
+        }
+        else
+        {
+            gl_->UseProgram(frameBlend_.prog); setPassthrough(frameBlend_.uTransform,frameBlend_.uCrop);
+            bindTexture(0,static_cast<unsigned>(currentInput->colorTextureViewHandle()),frameBlend_.uTexA);
+            bindTexture(1,static_cast<unsigned>(previousInput->colorTextureViewHandle()),frameBlend_.uTexB);
+            gl_->Uniform1f(frameBlend_.uMix,mix);
+        }
+        drawQuad();
+    }
+    auto leased = leaseRgbaTexture(target,outW_,outH_,error);
+    glDeleteTextures(1,&target);
+    return arbitgpu::materialFrameIsSrgb(current) && (!previous || arbitgpu::materialFrameIsSrgb(previous))
+        ? arbitgpu::declaredSrgbMaterialFrame(std::move(leased)) : leased;
+}
+
+unsigned FrameRenderer::renderShaderOperationFrame(const LayerDesc& layer)
 {
     if (layer.shaderOperationPlan != nullptr && !layer.shaderOperationPlan->operations.empty())
     {
@@ -3116,6 +3416,26 @@ unsigned FrameRenderer::buildLayerFrame (const LayerDesc& layer, float& blendOpa
                         ? layer.fromLayer : &layer;
                     if (source != nullptr && source->texture != 0)
                         resources[operation.inputNodeIds[input]] = source->texture;
+                    else if (source != nullptr && source->nativeTextureOwner
+                        && source->nativeTextureBackend == "opengl"
+                        && source->nativeTextureDescriptor.complete()
+                        && source->nativeTextureDescriptor.deviceOrContextIdentity
+                            == reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext())
+                        && source->nativeTextureView <= std::numeric_limits<unsigned>::max())
+                        resources[operation.inputNodeIds[input]] = static_cast<unsigned>(source->nativeTextureView);
+                    else if (source != nullptr && source->shaderSource
+                        && source->clipId > 0 && source->clipId != layer.clipId)
+                    {
+                        const unsigned generated = renderClipShaderToTexture(
+                            source->clipId, source->shaderClock,
+                            source->audioPresent ? &source->audioFeatures : nullptr,
+                            canonicalblockc::valid(source->canonicalBlockCFrame)
+                                ? source->canonicalBlockCFrame.get() : nullptr,
+                            source->genParams.empty() ? nullptr : &source->genParams);
+                        gl_->BindFramebuffer(GL_FRAMEBUFFER, fbo_);
+                        glViewport(0, 0, outW_, outH_);
+                        if (generated != 0) resources[operation.inputNodeIds[input]] = generated;
+                    }
                 }
         unsigned result = 0;
         const bool executed = videowire::visitOrderedShaderOperationsOnce(
@@ -3126,7 +3446,12 @@ unsigned FrameRenderer::buildLayerFrame (const LayerDesc& layer, float& blendOpa
                                       layer.shaderOperationPlan->digest,
                                       operation.nodeId, operation.payload.sourceSha256 };
             const auto bridge = flatShaderBridges_.find(key);
-            if (bridge == flatShaderBridges_.end() || bridge->second == nullptr) return false;
+            if (bridge == flatShaderBridges_.end() || bridge->second == nullptr)
+            {
+                lastError_ = "shader operation " + std::to_string(operation.nodeId)
+                    + " has no prepared program for clip " + std::to_string(layer.clipId);
+                return false;
+            }
             std::map<std::string, unsigned> images;
             if (operation.kind == videowire::ShaderOperationKind::filter)
                 images["inputImage"] = resources[operation.inputNodeIds[0]];
@@ -3135,20 +3460,49 @@ unsigned FrameRenderer::buildLayerFrame (const LayerDesc& layer, float& blendOpa
                 images["startImage"] = resources[operation.inputNodeIds[0]];
                 images["endImage"] = resources[operation.inputNodeIds[1]];
             }
-            if (std::any_of(images.begin(), images.end(),
-                            [] (const auto& image) { return image.second == 0; }))
-                return false;
+            for (const auto& image : images)
+                if (image.second == 0)
+                {
+                    const bool from = image.first == "startImage";
+                    const int sourceClip = from
+                        ? (layer.fromLayer ? layer.fromLayer->clipId : layer.shaderTransitionFromClipId)
+                        : layer.clipId;
+                    lastError_ = "shader operation " + std::to_string(operation.nodeId)
+                        + " " + image.first + " has no prepared frame from clip "
+                        + std::to_string(sourceClip);
+                    return false;
+                }
             result = bridge->second->render(gl_, layer.shaderClock, outW_, outH_,
                 layer.audioPresent ? &layer.audioFeatures : nullptr,
                 canonicalblockc::valid(layer.canonicalBlockCFrame)
                     ? layer.canonicalBlockCFrame.get() : nullptr,
                 &values, &images);
-            if (result == 0) return false;
+            if (result == 0)
+            {
+                lastError_ = "shader operation " + std::to_string(operation.nodeId)
+                    + " produced no frame for clip " + std::to_string(layer.clipId);
+                return false;
+            }
             resources[operation.nodeId] = result;
             resources[operation.outputNodeId] = result;
             return true;
         });
         if (!executed) return 0;
+        // ShaderGenerator owns its FBO. Restore ours before geometry/effect
+        // passes attach compositor targets or a material Frame is leased.
+        gl_->BindFramebuffer(GL_FRAMEBUFFER, fbo_);
+        glViewport(0, 0, outW_, outH_);
+        return result;
+    }
+    return 0;
+}
+
+unsigned FrameRenderer::buildLayerFrame (const LayerDesc& layer, float& blendOpacityOut)
+{
+    if (layer.shaderOperationPlan != nullptr && !layer.shaderOperationPlan->operations.empty())
+    {
+        const auto result = renderShaderOperationFrame(layer);
+        if (result == 0) return 0;
         drawLayerGeometry(result, layer, layerTexB_, 1.0f);
         blendOpacityOut = layer.opacity;
         return layerTexB_;
@@ -3332,7 +3686,15 @@ void FrameRenderer::drawImageOverlay (const ImageLayerDesc& overlay, unsigned ta
 unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
                                          const ImageLayerDesc* overlays, int numOverlays)
 {
+    lastCompositeFloatTexture_ = 0;
     lastError_.clear();
+    SdrNativeImageLayers displayInputs;
+    if (!displayInputs.prepare(layers, numLayers, hdrImageCapture_,
+            [&](const auto& frame, auto& error) { return leaseLinearImageForDisplay(frame, error); }, lastError_))
+        return 0;
+    if (!displayInputs.layers.empty()) layers = displayInputs.layers.data();
+    if (!validateLinearSceneComposite(layers, numLayers, numOverlays, hdrImageCapture_, lastError_))
+        return 0;
     particleBackend_ = "none";
     for (int i = 0; i < numLayers; ++i)
         if (layers[i].shaderOperationPlan != nullptr || layers[i].flatShaderBridge
@@ -3398,12 +3760,30 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
         const auto& layer = layers[i];
         if (layer.nativeTextureBackend == "opengl"
             && (!exactNativeDescriptor(layer.nativeTextureDescriptor, "opengl",
-                                       arbitgpu::NativeTexturePixelFormat::Rgba8Unorm,
+                                       arbitgpu::isLinearSceneColor(layer.nativeTextureDescriptor)
+                                           ? arbitgpu::NativeTexturePixelFormat::Rgba16Float
+                                           : arbitgpu::NativeTexturePixelFormat::Rgba8Unorm,
                                        layer.nativeTextureView, layer.texWidth, layer.texHeight)
                 || layer.texture != layer.nativeTextureView || !glIsTexture(layer.texture)))
         {
             lastError_ = "OpenGL native color descriptor is stale or incompatible";
             return 0;
+        }
+        if (layer.nativeTextureBackend == "opengl")
+        {
+            if (layer.nativeTextureDescriptor.deviceOrContextIdentity
+                    != reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext()))
+            { lastError_ = "OpenGL native color belongs to another context"; return 0; }
+            GLint previous = 0, width = 0, height = 0, format = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+            glBindTexture(GL_TEXTURE_2D, layer.texture);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(previous));
+            if (width != layer.texWidth || height != layer.texHeight
+                || format != (arbitgpu::isLinearSceneColor(layer.nativeTextureDescriptor) ? GL_RGBA16F : GL_RGBA8))
+            { lastError_ = "OpenGL native color storage does not match its descriptor"; return 0; }
         }
         if ((layer.depthFog || layer.depthEffect != 0)
             && layer.nativeDepthTextureBackend == "opengl"
@@ -3445,6 +3825,9 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
         compositorBackend_ = "metal-rejected";
         return 0;
     }
+    TopFirstNativeLayers nativeInputs;
+    if (!nativeInputs.prepare(*gl_, layers, numLayers, lastError_)) return 0;
+    if (!nativeInputs.layers.empty()) layers = nativeInputs.layers.data();
     compositorBackend_ = "opengl";
     gl_->BindFramebuffer (GL_FRAMEBUFFER, fbo_);
     glViewport (0, 0, outW_, outH_);
@@ -3577,32 +3960,12 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
             // pool into a layer texture, then run the SAME effects/transform/blend
             // chain as a shader/decoded layer. v1 params ride genParams; the
             // spawn-track's notes in the canonical frame seed the pool.
-            ParticleParams pp;
+            const ParticleParams pp = particleParamsForLayer(layer);
             if (layer.particleStateReset)
             {
                 const auto existing = particleGens_.find(layer.clipId);
                 if (existing != particleGens_.end())
                     existing->second->resetSimulation(gl_);
-            }
-            auto gp = [&layer] (const char* k, double dflt) -> double {
-                const auto it = layer.genParams.find (k);
-                return it != layer.genParams.end() ? it->second : dflt;
-            };
-            pp.count      = (int) (gp ("count", 512.0) + 0.5);
-            pp.spawnTrack = (int) (gp ("spawnTrack", 0.0) + 0.5);
-            pp.size       = (float) gp ("size", 2.0);
-            pp.gravity    = (float) gp ("gravity", 0.0);
-            pp.force      = (float) gp ("force", 1.0);
-            const bool nativeBuiltin = gp ("nativeBuiltin", 0.0) >= 0.5;
-            pp.seed       = (int) gp ("seed", 0.0);
-            pp.lifetime   = (float) gp ("lifetime", 0.0);
-            if (nativeBuiltin)
-            {
-                pp.force = (float) gp ("speed", 1.0);
-                pp.red = (float) gp ("red", 0.2);
-                pp.green = (float) gp ("green", 0.7);
-                pp.blue = (float) gp ("blue", 1.0);
-                pp.alpha = (float) gp ("alpha", 1.0);
             }
             const canonicalblockc::CanonicalBlockCFrame* particleNotes =
                 canonicalblockc::valid(layer.canonicalBlockCFrame)
@@ -3615,13 +3978,22 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
             gl_->BindFramebuffer (GL_FRAMEBUFFER, fbo_);
             glViewport (0, 0, outW_, outH_);
             if (gtex == 0)
+            {
+                if (layer.importedParticleOverlay) return 0;
                 continue;          // compute unavailable → render nothing
+            }
             local = layer;
             if (layer.effects == &layer.graphFeedbackEffect)
                 local.effects = &local.graphFeedbackEffect;
             local.texture = gtex;
             local.texWidth = outW_;
             local.texHeight = outH_;
+            if (layer.importedParticleOverlay)
+            {
+                if (layer.texture == 0) return 0;
+                blendOnto(gtex, layer.texture, layerTexA_, 1.0f, 0);
+                local.texture = layerTexA_;
+            }
             use = &local;
         }
 
@@ -3707,7 +4079,8 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
     // default ⇒ returns accumTex_[read] unchanged (and leaves FBO 0 bound), so
     // the export/viewport readback path is untouched until a caller opts in via
     // setPostFx. preview==export by construction: both paths call renderComposite.
-    return applyPostFx (accumTex_[read]);
+    lastCompositeFloatTexture_ = applyPostFx (accumTex_[read]);
+    return lastCompositeFloatTexture_;
 }
 
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
@@ -4233,7 +4606,7 @@ unsigned FrameRenderer::applyPostFx (unsigned compositeTexture)
     bindTexture (1, bloomOn ? fxTex_[0] : compositeTexture, bloomCombine_.uBloomTex);
     gl_->Uniform1f (bloomCombine_.uIntensity, bloomOn ? bloomIntensity_ : 0.0f);
     gl_->Uniform1f (bloomCombine_.uExposure, exposure_);
-    gl_->Uniform1i (bloomCombine_.uTonemap, tonemapMode_);
+    gl_->Uniform1i (bloomCombine_.uTonemap, hdrImageCapture_ ? -1 : tonemapMode_);
     drawQuad();
 
     gl_->BindFramebuffer (GL_FRAMEBUFFER, 0);
@@ -4315,6 +4688,63 @@ bool FrameRenderer::presentToWindow (unsigned compositeTexture, int fbWidth, int
     bindTexture (0, compositeTexture, blit_.uTexture);
     drawQuad();
     return glGetError() == GL_NO_ERROR;
+}
+
+void FrameRenderer::setHdrImageCapture(bool enabled)
+{
+    hdrImageCapture_ = enabled;
+    lastCompositeFloatTexture_ = 0;
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalRenderer_ != nullptr) metalRenderer_->setHdrImageCapture(enabled);
+#endif
+}
+
+bool FrameRenderer::readLastCompositeFloat(std::vector<float>& rgba, std::string& error)
+{
+    rgba.clear();
+#if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
+    if (metalOnly_ && metalRenderer_ != nullptr)
+        return metalRenderer_->readLastCompositeFloat(rgba, error);
+#endif
+    if (gl_ == nullptr || lastCompositeFloatTexture_ == 0 || !glIsTexture(lastCompositeFloatTexture_)
+        || !arbitgpu::nativeFixtureDimensionsWithinBounds(outW_, outH_))
+    { error = "HDR readback requires the current live compositor result"; return false; }
+    GLint texture = 0, packBuffer = 0, alignment = 0, rowLength = 0, skipRows = 0, skipPixels = 0, swapBytes = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &rowLength);
+    glGetIntegerv(GL_PACK_SKIP_ROWS, &skipRows);
+    glGetIntegerv(GL_PACK_SKIP_PIXELS, &skipPixels);
+    glGetIntegerv(GL_PACK_SWAP_BYTES, &swapBytes);
+    glBindTexture(GL_TEXTURE_2D, lastCompositeFloatTexture_);
+    GLint format = 0, width = 0, height = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+    bool ok = format == GL_RGBA16F && width == outW_ && height == outH_;
+    if (ok)
+    {
+        gl_->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+        glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+        glPixelStorei(GL_PACK_SWAP_BYTES, GL_FALSE);
+        rgba.resize(static_cast<std::size_t>(outW_) * outH_ * 4);
+        // The compositor stores image top in row zero, unlike native scene MRTs.
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, rgba.data());
+        ok = glGetError() == GL_NO_ERROR;
+    }
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture));
+    gl_->BindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(packBuffer));
+    glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+    glPixelStorei(GL_PACK_ROW_LENGTH, rowLength);
+    glPixelStorei(GL_PACK_SKIP_ROWS, skipRows);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, skipPixels);
+    glPixelStorei(GL_PACK_SWAP_BYTES, swapBytes);
+    if (!ok) { rgba.clear(); error = "HDR compositor readback requires a valid RGBA16F target"; return false; }
+    error.clear(); return true;
 }
 
 bool FrameRenderer::renderToPixels (const LayerDesc* layers, int numLayers,

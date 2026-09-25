@@ -40,11 +40,13 @@
 // and draws only (no shader recompiles).
 
 #pragma once
+#include "../../shared/DecodedFrameColorContract.h"
 
 #if ARBIT_HAVE_VIEWPORT
 
 #include "gl_loader.h"
 #include "color_transform_gl.h"
+#include "volume_visual_cache.h"
 #include "effect_defs.h"
 #include "node_preview_presentation.h"
 #include "render_pass_output_publication.h"
@@ -111,6 +113,15 @@ struct LayerDesc
     // Geometry Core uses this because its bounded execution cache may evict the
     // frame while an earlier compositor submission still references its view.
     std::shared_ptr<const void> nativeTextureOwner;
+    // An explicitly linear image output. Ordinary SDR composition converts a
+    // GPU copy to sRGB; HDR capture keeps this original half-float frame.
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> nativeLinearImage;
+    // Export borrows this exact scene frame before clip compositing. Preview never reads it back.
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> rawExportFrame;
+    std::uint32_t rawExportMask = 0;
+    int rawExportClipId = -1;
+    std::uint32_t rawExportRenderId = 0;
+    renderpassoutput::Output rawExportImageOutput = renderpassoutput::Output::Color;
 
     // Exact admitted graph color transform. Both native compositors execute it
     // before the ordinary effect rack from this immutable description.
@@ -158,10 +169,16 @@ struct LayerDesc
     // shader's ISF INPUTs; the spawn-source track's notes (canonicalBlockCFrame) seed/colour/force the pool. Composited identically to a
     // shader layer (effects rack, transform, blend all apply).
     bool particleSource = false;
+    // The imported scene remains the background of this exact image overlay.
+    // Particles use their existing screen-space coordinates, without depth tests.
+    bool importedParticleOverlay = false;
     bool scoreSource = false;
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
     bool particleStateReset = false;
     bool particleTriggerConnected = false;
+    ParticleParams particleParameters;
+    std::shared_ptr<const ParticleHistorySource> particleHistory;
+    double particleProjectSeconds = 0.0;
     int particleTriggerCount = 0;
     float particleTriggerStrength = 0.0f;
     // Stable typed-plan identities for operation-local measured telemetry.
@@ -212,9 +229,18 @@ struct LayerDesc
     // instead of the zeroed defaults. Plain copyable data carried by the same
     // `local = layer` copy that carries shaderClock; the viewport (live shm) and
     // the exporter (mix-WAV analysis) both fill it from block_b_defs.h ⇒ parity.
-    // Ignored unless shaderSource is true.
+    // Shader and Geometry Core consumers read the same frame values.
     bool audioPresent = false;
     AudioFeatures audioFeatures;
+    // A read-only sampler of the already analyzed master mix. The callback is
+    // used during this frame only and is never retained by the geometry plan.
+    videowire::geometry::spectrum::FeaturesAt spectrumFeaturesAt;
+    videowire::geometry::spectrum::FeaturesAt spectrumHistoryFeaturesAt;
+    videowire::geometry::spectrum::SourceFeaturesAt spectrumSourceFeaturesAt;
+    // Synchronous immutable project sampling for temporal Surface dependencies.
+    // The callback must reject unavailable historical modulation, never reuse it.
+    std::function<bool(double, LayerDesc&, std::map<std::string,double>&, std::string&)> materialInputsAt;
+    double materialFrameStartSeconds = 0;
 
     // Every score-aware consumer reads this same immutable frame.
     // A null or invalid frame is the zero-feed contract.
@@ -318,6 +344,7 @@ struct LayerDesc
     int transitionType = 0;        // videofx::TransitionType wire value
     float transitionProgress = 0.0f; // 0..1 across the transition window
     const LayerDesc* fromLayer = nullptr; // A side (must not itself transition)
+    int shaderTransitionFromClipId = 0; // exact Visual Graph Layer Source identity
 };
 
 // Generic image overlay (WP5 text overlays feed this; nothing does yet).
@@ -336,8 +363,124 @@ struct ImageLayerDesc
     int ownerClipId = -1;
 };
 
+// The ordinary graph describes SDR preview frames. A native linear Scene3D
+// export borrows higher precision from the same renderer, never from a relabelled
+// byte texture. Until other layer/effect authorities declare their working space,
+// combining them with this explicit representation must fail before drawing.
+inline std::optional<colortransform::AdmittedTransform> nativeLinearImageToSrgb(
+    colortransform::Extent extent, colortransform::AdmissionFailure& failure)
+{
+    colortransform::Description description;
+    description.input = {extent, colortransform::PixelFormat::RGBA16F, colortransform::ColorSpace::LinearSRGB,
+        colortransform::TransferFunction::Linear, colortransform::AlphaMode::Straight};
+    description.output = {extent, colortransform::PixelFormat::RGBA8, colortransform::ColorSpace::SRGB,
+        colortransform::TransferFunction::SRGB, colortransform::AlphaMode::Straight};
+    return colortransform::admit(description, colortransform::BackendCapability::NativeGpu, failure);
+}
+
+// Converted copies live through the compositor call. Authored frames, raw HDR
+// output and caller-owned layer descriptors remain unchanged.
+struct SdrNativeImageLayers
+{
+    std::vector<LayerDesc> layers;
+    std::vector<std::unique_ptr<LayerDesc>> transitionInputs;
+
+    template <typename Convert>
+    bool prepare(const LayerDesc* input, int count, bool hdrCapture, Convert&& convert, std::string& error)
+    {
+        bool present = false;
+        for (int i = 0; i < count; ++i)
+            present |= input[i].nativeLinearImage != nullptr
+                || (input[i].fromLayer && input[i].fromLayer->nativeLinearImage);
+        if (!present) return true;
+        layers.assign(input, input + count);
+        const auto prepareOne = [&](const LayerDesc& source, LayerDesc& target)
+        {
+            if (source.effects == &source.graphFeedbackEffect) target.effects = &target.graphFeedbackEffect;
+            if (!source.nativeLinearImage) return true;
+            const auto& frame = source.nativeLinearImage;
+            const auto actual = frame->colorTextureDescriptor();
+            const auto& declared = source.nativeTextureDescriptor;
+            if (!source.nativeTextureOwner || !arbitgpu::isLinearSceneColor(actual)
+                || !arbitgpu::isLinearSceneColor(declared)
+                || actual.backend != source.nativeTextureBackend || actual.backend != frame->backend()
+                || actual.imageHandle != frame->colorImageHandle()
+                || actual.textureViewHandle != frame->colorTextureViewHandle()
+                || actual.textureViewHandle != source.nativeTextureView
+                || actual.width != frame->width() || actual.height != frame->height()
+                || actual.width != static_cast<std::uint32_t>(source.texWidth)
+                || actual.height != static_cast<std::uint32_t>(source.texHeight)
+                || actual.imageHandle != declared.imageHandle || actual.textureViewHandle != declared.textureViewHandle
+                || actual.backend != declared.backend || actual.width != declared.width || actual.height != declared.height
+                || actual.deviceOrContextIdentity != declared.deviceOrContextIdentity
+                || actual.rendererGeneration != declared.rendererGeneration || actual.rowOrder != declared.rowOrder
+                || (actual.backend == "opengl" && source.texture != actual.textureViewHandle)
+                || (actual.backend == "metal" && source.texture != 0))
+            { error = "Linear image layer does not match its retained native frame descriptor"; return false; }
+            if (hdrCapture) return true;
+            auto display = convert(frame, error);
+            if (!display) return false;
+            if (!arbitgpu::materialFrameIsSrgb(display) || display->width() != actual.width
+                || display->height() != actual.height || display->backend() != actual.backend
+                || display->colorTextureDescriptor().rowOrder != arbitgpu::NativeTextureRowOrder::TopFirst)
+            { error = "Linear image display conversion did not return an owned top-first sRGB texture"; return false; }
+            target.nativeTextureDescriptor = display->colorTextureDescriptor();
+            target.nativeTextureView = display->colorTextureViewHandle();
+            target.texture = actual.backend == "opengl" ? static_cast<unsigned>(target.nativeTextureView) : 0;
+            target.nativeTextureOwner = std::move(display);
+            target.nativeLinearImage.reset();
+            return true;
+        };
+        for (int i = 0; i < count; ++i)
+        {
+            if (!prepareOne(input[i], layers[i])) return false;
+            if (input[i].fromLayer)
+            {
+                auto source = std::make_unique<LayerDesc>(*input[i].fromLayer);
+                if (!prepareOne(*input[i].fromLayer, *source)) return false;
+                layers[i].fromLayer = source.get();
+                transitionInputs.push_back(std::move(source));
+            }
+        }
+        return true;
+    }
+};
+
+inline bool validateLinearSceneComposite(const LayerDesc* layers, int count,
+                                        int overlayCount, bool hdrCapture, std::string& error)
+{
+    bool linearScene = false;
+    for (int i = 0; i < count; ++i)
+    {
+        const bool linear = arbitgpu::isLinearSceneColor(layers[i].nativeTextureDescriptor);
+        linearScene |= linear;
+        if (hdrCapture && !layers[i].nativeTextureBackend.empty() && !linear)
+        { error = "HDR Scene3D requires a declared linear RGBA16F native color attachment"; return false; }
+    }
+    if (!linearScene) return true;
+    if (!hdrCapture || overlayCount != 0)
+    { error = "Linear Scene3D is available only in HDR image capture without undeclared overlays"; return false; }
+    for (int i = 0; i < count; ++i)
+    {
+        const auto& layer = layers[i];
+        if (!arbitgpu::isLinearSceneColor(layer.nativeTextureDescriptor)
+            || layer.isAdjustment || layer.shaderSource || layer.particleSource || layer.scoreSource
+            || layer.importedParticleOverlay || layer.drawShape || layer.transitionType != 0 || layer.fromLayer
+            || layer.graphColorTransformActive || layer.graphMotionBlurActive || layer.graphTemporalActive
+            || layer.flatShaderBridge || layer.flatShaderFilter || layer.flatShaderIsf || layer.flatShaderCustom
+            || layer.shaderOperationPlan || layer.curatedShaderTransition || layer.lutTexture != 0
+            || layer.depthFog || layer.depthEffect != 0 || layer.graphKeyCleanupActive || layer.blendMode != 0)
+        { error = "Linear Scene3D cannot mix undeclared transfers, SDR effects, transitions or blend modes"; return false; }
+        for (int effect = 0; layer.effects && effect < layer.effectCount; ++effect)
+            if (layer.effects[effect].enabled)
+            { error = "Linear Scene3D requires effects with an explicit linear working-space contract"; return false; }
+    }
+    return true;
+}
+
 class FrameRenderer
 {
+    videohelper::volume::VisualVolumeRenderCache volumeRenderCache_;
 public:
     struct FramePublicationCandidate;
     using FramePublicationCandidatePtr = std::shared_ptr<FramePublicationCandidate>;
@@ -357,6 +500,7 @@ public:
         std::string& error, bool metalOnly,
         int clipId = 0, unsigned sourceTexture = 0, LayerDesc* output = nullptr);
     void shutdown();
+    videohelper::volume::VisualVolumeRenderCache& volumeRenderCache() noexcept { return volumeRenderCache_; }
     bool ready() const
     {
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
@@ -385,11 +529,8 @@ public:
     bool replaceColorAovPass (const renderpassoutput::Description& description,
                                const arbitgpu::RenderPassColorAovClear& clear,
                                std::string& error);
-    // Writes and publishes the exact RG16F Motion attachment. The product seam
-    // uses the fixed zero-displacement initialization signal; the overload is a
-    // narrow backend/publication test seam, not a scene-motion claim.
-    bool replaceMotionAovPass (const renderpassoutput::Description& description,
-                               std::string& error);
+    // Explicit clear seam for native attachment and motion-blur tests. Computed
+    // optical flow requires an admitted pair and its native worker publication.
     bool replaceMotionAovPass (const renderpassoutput::Description& description,
                                 const arbitgpu::RenderPassMotionAovClear& clear,
                                 std::string& error);
@@ -481,6 +622,20 @@ public:
     unsigned uploadR16 (const uint16_t* pixels, int width, int height,
                         unsigned existingTexture);
     void deleteTexture (unsigned texture);
+    // Freeze a decoded/retimed source before another decode overwrites it.
+    // The lease owns a GPU copy and must be released before context shutdown.
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseRgbaTexture(
+        unsigned texture, int width, int height, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseDecodedFrame(
+        unsigned texture, int width, int height, decodedframecolor::Declaration color, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseLinearImageForDisplay(
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseShaderFrame(
+        const LayerDesc& layer, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseTemporalFrame(
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& current,
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& previous,
+        const visualtemporaloperation::Payload& payload, float mix, std::string& error);
 
     // Frame Blend (retime tier 1): alpha-mix two equally-sized bracket frames
     // (mix 0=texA, 1=texB) into outTex and return it. Binds fbo_ + sets its own
@@ -600,6 +755,12 @@ public:
                               int numOverlays = 0);
     bool drainAsyncReadback (std::vector<uint8_t>& rgbaOut);
 
+    // Exact current final RGBA16F compositor result, before 8-bit presentation.
+    // Synchronous, top row first. Does not draw or advance temporal state.
+    bool readLastCompositeFloat(std::vector<float>& rgba, std::string& error);
+    void setHdrImageCapture(bool enabled);
+    bool hdrImageCaptureEnabled() const noexcept { return hdrImageCapture_; }
+
     // Asynchronous composite hash (double-buffered PBO readback of the first
     // ~1 MB of the composited frame). Each call issues a new readback and
     // hashes the previously issued one, so the returned hash lags by one
@@ -675,6 +836,7 @@ private:
     void drawLayerGeometry (unsigned sourceTexture, const LayerDesc& layer,
                             unsigned targetTexture, float opacity);
     unsigned buildLayerFrame (const LayerDesc& layer, float& blendOpacityOut);
+    unsigned renderShaderOperationFrame(const LayerDesc& layer);
     void blendOnto (unsigned frontTexture, unsigned backTexture,
                     unsigned targetTexture, float opacity, int blendMode);
     void drawImageOverlay (const ImageLayerDesc& overlay, unsigned targetTexture);
@@ -691,6 +853,8 @@ private:
     bool metalOnly_ = false;
     unsigned nextMetalHandle_ = 0x80000000u;
     int outW_ = 0, outH_ = 0;
+    unsigned lastCompositeFloatTexture_ = 0;
+    bool hdrImageCapture_ = false;
     videowire::RenderPassOutputPublicationPtr renderPassOutputs_;
     FramePublicationCandidatePtr activeFrameCandidate_;
     std::uint64_t publishedFrameOwner_ = 0;

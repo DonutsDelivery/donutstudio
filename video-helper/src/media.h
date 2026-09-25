@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "../../shared/DecodedFrameColorContract.h"
 
 extern "C"
 {
@@ -46,6 +47,7 @@ struct DecodedFrame
     int height = 0;
     int strideBytes = 0;
     double ptsSec = 0.0;
+    decodedframecolor::Declaration color;
 };
 
 // Progress/abort shared between the async proxy job (main.cpp) and the

@@ -117,18 +117,20 @@ public:
         const auto limits = boundedLimits(requestedLimits);
         if (clip.tracks().size() > limits.maxSampledTracks
             || bindings.jointCount > limits.maxJointTransforms
-            || bindings.morphCount > limits.maxMorphMeshes)
+            || bindings.morphCount > limits.maxMorphMeshes
+            || bindings.sceneTransformCount > limits.maxSampledTracks)
         {
             error = "animation deformation sample capacity exceeded";
             return {};
         }
         if ((bindings.jointCount != 0 && bindings.joints == nullptr)
-            || (bindings.morphCount != 0 && bindings.morphs == nullptr))
+            || (bindings.morphCount != 0 && bindings.morphs == nullptr)
+            || (bindings.sceneTransformCount != 0 && bindings.sceneTransforms == nullptr))
         {
             error = "animation deformation binding storage is missing";
             return {};
         }
-        if (bindings.jointCount == 0 && bindings.morphCount == 0)
+        if (bindings.jointCount == 0 && bindings.morphCount == 0 && bindings.sceneTransformCount == 0)
         {
             error = "animation deformation bindings are missing";
             return {};
@@ -136,6 +138,17 @@ public:
 
         try
         {
+            std::vector<visualanimation::TargetId> sceneTargets;
+            if (bindings.sceneTransformCount != 0)
+                sceneTargets.assign(bindings.sceneTransforms, bindings.sceneTransforms + bindings.sceneTransformCount);
+            std::sort(sceneTargets.begin(), sceneTargets.end());
+            if (std::any_of(sceneTargets.begin(), sceneTargets.end(), [](auto id) { return !id.isValid(); })
+                || std::adjacent_find(sceneTargets.begin(), sceneTargets.end()) != sceneTargets.end())
+            { error = "scene animation bindings have invalid or duplicate node identities"; return {}; }
+            const auto sceneTransform = [&](const auto& track) {
+                return track.channel() != visualanimation::Channel::MorphWeights
+                    && std::binary_search(sceneTargets.begin(), sceneTargets.end(), track.target());
+            };
             std::size_t totalScalarValues = 0;
             std::size_t totalMorphWeights = 0;
             if (! addProductWithin(bindings.jointCount, 10, totalScalarValues,
@@ -150,7 +163,12 @@ public:
                 jointBindings.assign(bindings.joints, bindings.joints + bindings.jointCount);
             std::sort(jointBindings.begin(), jointBindings.end(),
                       [] (const auto& left, const auto& right)
-                      { return targetLess(left, right); });
+                      {
+                          if (left.animationTarget != right.animationTarget)
+                              return left.animationTarget < right.animationTarget;
+                          if (left.skin != right.skin) return left.skin.value < right.skin.value;
+                          return left.joint.value < right.joint.value;
+                      });
 
             std::vector<std::pair<std::uint64_t, std::uint64_t>> boundJoints;
             boundJoints.reserve(jointBindings.size());
@@ -164,7 +182,8 @@ public:
                     return {};
                 }
                 if (index != 0
-                    && binding.animationTarget == jointBindings[index - 1].animationTarget)
+                    && binding.animationTarget == jointBindings[index - 1].animationTarget
+                    && !request.allowNodeTransformAndMorph)
                 {
                     error = "animation deformation bindings duplicate an animation target identity";
                     return {};
@@ -207,7 +226,8 @@ public:
                     error = "animation deformation bindings duplicate an animation target identity";
                     return {};
                 }
-                if (std::binary_search(jointBindings.begin(), jointBindings.end(),
+                if (!request.allowNodeTransformAndMorph
+                    && std::binary_search(jointBindings.begin(), jointBindings.end(),
                                        JointAnimationBindingView { binding.animationTarget, {}, {} },
                                        [] (const auto& left, const auto& right)
                                        { return targetLess(left, right); }))
@@ -263,7 +283,8 @@ public:
                 boundMeshes.push_back(binding.mesh.value);
             }
             std::sort(boundMeshes.begin(), boundMeshes.end());
-            if (std::adjacent_find(boundMeshes.begin(), boundMeshes.end()) != boundMeshes.end())
+            if (std::adjacent_find(boundMeshes.begin(), boundMeshes.end()) != boundMeshes.end()
+                && !request.allowNodeTransformAndMorph)
             {
                 error = "animation deformation bindings duplicate a morph mesh target";
                 return {};
@@ -286,6 +307,11 @@ public:
                 const auto isMorph = morphFound != morphBindings.end()
                                   && morphFound->animationTarget == track.target();
 
+                if (!isJoint && sceneTransform(track)) {
+                    if (!addProductWithin(1,track.valueWidth(),totalScalarValues,limits.maxTotalScalarValues))
+                    { error="scene animation scalar sample capacity exceeded"; return {}; }
+                    continue;
+                }
                 if (! isJoint && ! isMorph)
                 {
                     error = "sampled animation target has no deformation binding";
@@ -306,7 +332,7 @@ public:
                 }
                 else
                 {
-                    if (! isJoint || isMorph)
+                    if (! isJoint || (isMorph && !request.allowNodeTransformAndMorph))
                     {
                         error = "sampled transform channel does not match its deformation target";
                         return {};
@@ -374,6 +400,12 @@ public:
             result->playback_ = request.playback;
             result->combinationMode_ = request.combinationMode;
             result->combinationWeight_ = request.combinationWeight;
+            if (!visualanimation::validPoseControls(request.pose))
+            {
+                error = "selected bone or morph controls are malformed or out of bounds";
+                return {};
+            }
+            result->pose_ = request.pose;
             result->jointTransforms_.reserve(jointBindings.size());
             for (const auto& binding : jointBindings)
             {
@@ -405,6 +437,7 @@ public:
                 const auto isMorph = morphFound != morphBindings.end()
                                   && morphFound->animationTarget == track.target();
 
+                if (!isJoint && sceneTransform(track)) continue;
                 if (! isJoint && ! isMorph)
                 {
                     error = "sampled animation target has no deformation binding";
@@ -438,7 +471,7 @@ public:
                     result->morphWeights_[index].sample_ = std::move(morphSample);
                     continue;
                 }
-                if (! isJoint || isMorph)
+                if (! isJoint || (isMorph && !request.allowNodeTransformAndMorph))
                 {
                     error = "sampled transform channel does not match its deformation target";
                     return {};
@@ -449,41 +482,45 @@ public:
                     return {};
                 }
 
-                auto& output = *jointFound;
-                switch (track.channel())
+                for (auto current = jointFound; current != result->jointTransforms_.end()
+                     && current->animationTarget() == track.target(); ++current)
                 {
-                    case visualanimation::Channel::Translation:
-                        if (output.translationTrack_.isValid())
-                        {
-                            error = "sampled animation target duplicates a translation channel";
-                            return {};
-                        }
-                        output.translationTrack_ = track.track();
-                        std::copy(track.values().begin(), track.values().end(),
-                                  output.translation_.begin());
-                        break;
-                    case visualanimation::Channel::Rotation:
-                        if (output.rotationTrack_.isValid())
-                        {
-                            error = "sampled animation target duplicates a rotation channel";
-                            return {};
-                        }
-                        output.rotationTrack_ = track.track();
-                        std::copy(track.values().begin(), track.values().end(),
-                                  output.rotation_.begin());
-                        break;
-                    case visualanimation::Channel::Scale:
-                        if (output.scaleTrack_.isValid())
-                        {
-                            error = "sampled animation target duplicates a scale channel";
-                            return {};
-                        }
-                        output.scaleTrack_ = track.track();
-                        std::copy(track.values().begin(), track.values().end(),
-                                  output.scale_.begin());
-                        break;
-                    case visualanimation::Channel::MorphWeights:
-                        break;
+                    auto& output = *current;
+                    switch (track.channel())
+                    {
+                        case visualanimation::Channel::Translation:
+                            if (output.translationTrack_.isValid())
+                            {
+                                error = "sampled animation target duplicates a translation channel";
+                                return {};
+                            }
+                            output.translationTrack_ = track.track();
+                            std::copy(track.values().begin(), track.values().end(),
+                                      output.translation_.begin());
+                            break;
+                        case visualanimation::Channel::Rotation:
+                            if (output.rotationTrack_.isValid())
+                            {
+                                error = "sampled animation target duplicates a rotation channel";
+                                return {};
+                            }
+                            output.rotationTrack_ = track.track();
+                            std::copy(track.values().begin(), track.values().end(),
+                                      output.rotation_.begin());
+                            break;
+                        case visualanimation::Channel::Scale:
+                            if (output.scaleTrack_.isValid())
+                            {
+                                error = "sampled animation target duplicates a scale channel";
+                                return {};
+                            }
+                            output.scaleTrack_ = track.track();
+                            std::copy(track.values().begin(), track.values().end(),
+                                      output.scale_.begin());
+                            break;
+                        case visualanimation::Channel::MorphWeights:
+                            break;
+                    }
                 }
             }
 

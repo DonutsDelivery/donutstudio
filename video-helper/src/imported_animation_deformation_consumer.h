@@ -35,6 +35,7 @@ struct ImportedAnimationDeformationEvaluation final
     visualanimationimport::StableId deformationStableId = 0;
     visualanimation::ResolvedPlaybackControl playback;
     std::shared_ptr<const visualdeformation::AnimationDeformationSnapshot> deformation;
+    std::shared_ptr<const visualanimation::Sample> sceneAnimation;
 };
 
 // Production admission/evaluation seam for graph-lowered imported-animation
@@ -47,7 +48,7 @@ public:
     bool admit (const visualanimationimport::Request& request,
                 const std::uint8_t* bytes,
                 std::size_t size,
-                std::string& error);
+                std::string& error, bool geometryExtraction = false);
 
     bool evaluatePreview (const visualanimationimport::Request& request,
                           const visualdeformation::RationalFrameTime& frame,

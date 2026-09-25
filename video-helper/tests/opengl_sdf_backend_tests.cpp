@@ -109,6 +109,30 @@ std::vector<std::uint8_t> readPixels (const arbitgpu::NativeSdfSceneFrame& frame
     return pixels;
 }
 
+std::vector<float> readFloatPixels (const arbitgpu::NativeSdfSceneFrame& frame,
+                                    const arbitgl::GlFuncs& gl)
+{
+    int previous = 0;
+    glGetIntegerv (GL_READ_FRAMEBUFFER_BINDING, &previous);
+    unsigned framebuffer = 0;
+    gl.GenFramebuffers (1, &framebuffer);
+    gl.BindFramebuffer (GL_READ_FRAMEBUFFER, framebuffer);
+    gl.FramebufferTexture2D (GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                            static_cast<unsigned> (frame.colorImageHandle()), 0);
+    std::vector<float> pixels;
+    if (gl.CheckFramebufferStatus (GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+    {
+        pixels.resize (static_cast<std::size_t> (frame.width()) * frame.height() * 4u);
+        glReadPixels (0, 0, static_cast<int> (frame.width()), static_cast<int> (frame.height()),
+                      GL_RGBA, GL_FLOAT, pixels.data());
+    }
+    const auto readError = glGetError();
+    gl.BindFramebuffer (GL_READ_FRAMEBUFFER, static_cast<unsigned> (previous));
+    gl.DeleteFramebuffers (1, &framebuffer);
+    if (readError != GL_NO_ERROR) pixels.clear();
+    return pixels;
+}
+
 std::array<std::uint8_t, 4> pixel (
     const arbitgpu::NativeSdfSceneFrame& frame, int x, int y,
     const arbitgl::GlFuncs& gl, std::uint32_t& checksum)
@@ -253,9 +277,9 @@ int main()
         return 4;
     }
 
-    int polygonMode = 0;
+    int polygonMode[2] = {};
     unsigned char colorMask[4] = {};
-    glGetIntegerv (GL_POLYGON_MODE, &polygonMode);
+    glGetIntegerv (GL_POLYGON_MODE, polygonMode);
     glGetBooleanv (GL_COLOR_WRITEMASK, colorMask);
     if (glIsEnabled (GL_BLEND) != GL_TRUE
         || glIsEnabled (GL_DEPTH_TEST) != GL_TRUE
@@ -264,17 +288,17 @@ int main()
         || glIsEnabled (GL_RASTERIZER_DISCARD) != GL_TRUE
         || glIsEnabled (GL_COLOR_LOGIC_OP) != GL_TRUE
         || glIsEnabled (GL_FRAMEBUFFER_SRGB) != GL_TRUE
-        || polygonMode != GL_LINE
+        || polygonMode[0] != GL_LINE || polygonMode[1] != GL_LINE
         || colorMask[0] != GL_FALSE || colorMask[1] != GL_TRUE
         || colorMask[2] != GL_FALSE || colorMask[3] != GL_TRUE)
     {
         std::fprintf (stderr,
             "OpenGL SDF state mismatch blend=%d depth=%d cull=%d scissor=%d discard=%d "
-            "logic=%d srgb=%d polygon=%d mask=%u,%u,%u,%u\n",
+            "logic=%d srgb=%d polygon=%d,%d mask=%u,%u,%u,%u\n",
             glIsEnabled (GL_BLEND), glIsEnabled (GL_DEPTH_TEST),
             glIsEnabled (GL_CULL_FACE), glIsEnabled (GL_SCISSOR_TEST),
             glIsEnabled (GL_RASTERIZER_DISCARD), glIsEnabled (GL_COLOR_LOGIC_OP),
-            glIsEnabled (GL_FRAMEBUFFER_SRGB), polygonMode,
+            glIsEnabled (GL_FRAMEBUFFER_SRGB), polygonMode[0], polygonMode[1],
             colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
         return 5;
     }
@@ -461,6 +485,13 @@ int main()
             std::fprintf (stderr, "OpenGL SDF operation parity failed: %s\n", error.c_str());
             return 25;
         }
+    }
+
+    if (! videohelper::sdf::test::verifyNativeUtilityOutputs (
+            [&] (const auto& frame) { return readFloatPixels (frame,gl); }, error))
+    {
+        std::fprintf (stderr, "OpenGL SDF utility semantic pixels failed: %s\n", error.c_str());
+        return 26;
     }
 
     controls.output = arbitgpu::NativeSdfOutput::depth;

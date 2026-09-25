@@ -170,6 +170,11 @@ public:
         const surfacematerialbinding::ImportedSceneMaterialRequest& request,
         std::string& error);
 
+    bool publishSurfacePrograms (
+        const GlbNativeSceneAdmission& admission,
+        const geometrysurfacematerial::ObjectPrograms& programs,
+        const videowire::geometry::RuntimeFieldEvaluation& evaluation, std::string& error);
+
     bool publishDiffractionMaterial (
         const GlbNativeSceneAdmission& admission,
         const diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest& request,
@@ -204,6 +209,7 @@ private:
     std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> materialScene_;
     std::shared_ptr<const videorender::fixture3d::AdmittedSurfaceMaterialBinding>
         lastGoodMaterial_;
+    std::string lastSurfaceProgramsIdentity_;
     std::shared_ptr<const videorender::fixture3d::AdmittedDiffractionMaterialBinding>
         lastGoodDiffractionMaterial_;
     std::uint64_t lastGoodMaterialRevision_ = 0;

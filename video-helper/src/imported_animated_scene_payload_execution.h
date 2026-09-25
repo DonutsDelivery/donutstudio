@@ -69,7 +69,7 @@ struct ImportedAnimatedSceneReceipt final
 
     bool valid() const noexcept
     {
-        return payload && source && evaluation.deformation && frame.nativeFrame
+        return payload && source && (evaluation.deformation || evaluation.sceneAnimation) && frame.nativeFrame
             && frame.nativeFrame->depthImageHandle() != 0
             && frame.nativeFrame->depthTextureViewHandle() != 0;
     }
@@ -84,7 +84,8 @@ public:
     using Receipt = ImportedAnimatedSceneReceipt;
 
     ImportedAnimatedScenePayloadExecution(Store& store,
-                                          arbitgpu::NativeDeformationBackend& backend) noexcept;
+        arbitgpu::NativeDeformationBackend& backend,
+        arbitgpu::NativeFixtureSceneBackend& sceneBackend = arbitgpu::nativeFixtureSceneBackend()) noexcept;
 
     static bool validReceipt(const Receipt& receipt) noexcept { return receipt.valid(); }
     static const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& nativeFrame(
@@ -122,9 +123,11 @@ private:
     Store& store_;
     ImportedAnimationDeformationConsumer consumer_;
     videorender::animation3d::NativeAnimationDeformationRenderer renderer_;
+    videorender::fixture3d::FixtureSceneRenderer sceneRenderer_;
     ImportedAnimatedSceneAdmissionIdentity admittedIdentity_;
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> scene_;
-    gltf::GlbDeformationRenderBinding binding_;
+    std::shared_ptr<const gltf::GlbStaticMeshDocument> baseScene_;
+    std::vector<gltf::GlbDeformationRenderBinding> bindings_;
     std::shared_ptr<const arbitgpu::NativeDeformationScene> source_;
     std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> materialScene_;
     std::shared_ptr<const videorender::fixture3d::AdmittedSurfaceMaterialBinding>

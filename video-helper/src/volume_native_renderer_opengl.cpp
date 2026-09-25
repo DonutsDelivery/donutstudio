@@ -39,6 +39,7 @@ uniform vec3 uCameraTarget;
 uniform vec2 uExtent;
 uniform float uCameraHalfHeight;
 uniform int uStepCount;
+uniform bool uTransparentBackground;
 
 bool intersectBox(vec3 origin, vec3 direction, out float nearT, out float farT)
 {
@@ -66,7 +67,7 @@ void main()
     vec3 background = vec3(7.0 / 255.0, 10.0 / 255.0, 18.0 / 255.0);
     if (!intersectBox(localOrigin, localDirection, nearT, farT))
     {
-        outColor = vec4(background, 1.0);
+        outColor = uTransparentBackground ? vec4(0.0) : vec4(background, 1.0);
         return;
     }
 
@@ -88,7 +89,10 @@ void main()
         accumulated += transmittance * alpha * sampleColor;
         transmittance *= 1.0 - alpha;
     }
-    outColor = vec4(accumulated + transmittance * background, 1.0);
+    float coverage = 1.0 - transmittance;
+    outColor = uTransparentBackground
+        ? (coverage > 0.0 ? vec4(accumulated / coverage, coverage) : vec4(0.0))
+        : vec4(accumulated + transmittance * background, 1.0);
 }
 )glsl";
 
@@ -246,19 +250,32 @@ unsigned compileShader (const arbitgl::GlFuncs& gl, unsigned type,
 class OpenGlVolumeFrame final : public NativeVolumeFrame
 {
 public:
-    ~OpenGlVolumeFrame() override
+    ~OpenGlVolumeFrame() override { releaseNativeResources(); }
+
+    void releaseNativeResources() const noexcept override
     {
+        if (contextLifetime_ && !contextLifetime_->alive.load(std::memory_order_acquire)) return;
         if ((colorTexture_ == 0 && volumeTexture_ == 0) || ownerContext_ == nullptr) return;
         auto* previousContext = glfwGetCurrentContext();
         if (previousContext != ownerContext_) glfwMakeContextCurrent (ownerContext_);
         if (glfwGetCurrentContext() == ownerContext_)
         {
-            if (colorTexture_ != 0) glDeleteTextures (1, &colorTexture_);
-            if (volumeTexture_ != 0) glDeleteTextures (1, &volumeTexture_);
+            if (colorTexture_ != 0) { glDeleteTextures (1, &colorTexture_); colorTexture_ = 0; }
+            if (volumeTexture_ != 0) { glDeleteTextures (1, &volumeTexture_); volumeTexture_ = 0; }
         }
         if (previousContext != ownerContext_) glfwMakeContextCurrent (previousContext);
     }
 
+    arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    {
+        if (contextLifetime_ && !contextLifetime_->alive.load(std::memory_order_acquire)) return {};
+        return {backend_, arbitgpu::NativeTextureViewKind::Texture2D,
+            arbitgpu::NativeTexturePixelFormat::Rgba8Unorm, colorTexture_, colorTexture_,
+            width_, height_, 1, true, reinterpret_cast<std::uintptr_t>(ownerContext_), generation_,
+            colortransform::ColorSpace::SRGB, colortransform::TransferFunction::SRGB};
+    }
+    std::shared_ptr<const NativeVolumeContextLifetime> contextLifetime_;
+    const std::uint64_t generation_ = nextNativeVolumeFrameGeneration();
     const std::string& backend() const noexcept override { return backend_; }
     std::uint32_t width() const noexcept override { return width_; }
     std::uint32_t height() const noexcept override { return height_; }
@@ -268,14 +285,19 @@ public:
     std::string backend_ = "opengl";
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
-    unsigned colorTexture_ = 0;
-    unsigned volumeTexture_ = 0;
+    mutable unsigned colorTexture_ = 0;
+    mutable unsigned volumeTexture_ = 0;
     GLFWwindow* ownerContext_ = nullptr;
 };
 
 class OpenGlVolumeExecutionBackend final : public NativeVolumeExecutionBackend
 {
 public:
+    std::uintptr_t contextIdentity() const noexcept override
+    {
+        return reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext());
+    }
+
     NativeVolumeExecutionCapabilities capabilities() const override
     {
         NativeVolumeExecutionCapabilities result;
@@ -376,7 +398,7 @@ public:
         int previousTexture3D = 0;
         int previousUnpackAlignment = 0;
         int previousViewport[4] {};
-        int previousPolygonMode = 0;
+        int previousPolygonMode[2] {};
         unsigned char previousColorMask[4] {};
         const bool blendWasEnabled = glIsEnabled (GL_BLEND) == GL_TRUE;
         const bool depthWasEnabled = glIsEnabled (GL_DEPTH_TEST) == GL_TRUE;
@@ -393,7 +415,7 @@ public:
         glGetIntegerv (GL_TEXTURE_BINDING_3D, &previousTexture3D);
         glGetIntegerv (GL_UNPACK_ALIGNMENT, &previousUnpackAlignment);
         glGetIntegerv (GL_VIEWPORT, previousViewport);
-        glGetIntegerv (GL_POLYGON_MODE, &previousPolygonMode);
+        glGetIntegerv (GL_POLYGON_MODE, previousPolygonMode);
         glGetBooleanv (GL_COLOR_WRITEMASK, previousColorMask);
 
         unsigned framebuffer = 0;
@@ -405,6 +427,7 @@ public:
         frame->width_ = request.width;
         frame->height_ = request.height;
         frame->ownerContext_ = glfwGetCurrentContext();
+        frame->contextLifetime_ = request.contextLifetime;
 
         auto restore = [&]
         {
@@ -419,7 +442,7 @@ public:
             glPixelStorei (GL_UNPACK_ALIGNMENT, previousUnpackAlignment);
             glViewport (previousViewport[0], previousViewport[1],
                         previousViewport[2], previousViewport[3]);
-            glPolygonMode (GL_FRONT_AND_BACK, static_cast<unsigned> (previousPolygonMode));
+            glPolygonMode (GL_FRONT_AND_BACK, static_cast<unsigned> (previousPolygonMode[0]));
             glColorMask (previousColorMask[0], previousColorMask[1],
                          previousColorMask[2], previousColorMask[3]);
             if (blendWasEnabled) glEnable (GL_BLEND); else glDisable (GL_BLEND);
@@ -529,6 +552,8 @@ public:
             kMaximumRaySteps, std::max ({ dimensions.width, dimensions.height, dimensions.depth,
                                          32u }) * 2u));
         gl.Uniform1i (gl.GetUniformLocation (program, "uStepCount"), steps);
+        gl.Uniform1i (gl.GetUniformLocation (program, "uTransparentBackground"),
+                      request.transparentBackground ? 1 : 0);
 
         glBindTexture (GL_TEXTURE_3D, frame->volumeTexture_);
         glViewport (0, 0, static_cast<int> (request.width), static_cast<int> (request.height));

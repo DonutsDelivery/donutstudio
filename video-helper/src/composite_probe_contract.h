@@ -1,6 +1,7 @@
 #pragma once
 
 #include "render_snapshot.h"
+#include "../../shared/CompositeFrameArtifact.h"
 
 #include <cmath>
 #include <cstddef>
@@ -46,7 +47,7 @@ inline bool validateSnapshotClipIdentities (
 inline bool validateCompositeProbeContract (
     const videowire::ResolvedVisualSnapshot& snapshot,
     uint64_t snapshotGeneration, double timelineSec, int width, int height,
-    double fps, std::string& error)
+    double fps, std::string& error, bool artifact = false)
 {
     error.clear();
     if (! std::isfinite (timelineSec) || timelineSec < 0.0)
@@ -59,9 +60,11 @@ inline bool validateCompositeProbeContract (
         error = "fps must be finite and positive";
         return false;
     }
-    if (width < 1 || height < 1 || width > 1920 || height > 1920)
+    if (artifact ? (width != compositeartifact::width || height != compositeartifact::height)
+                 : (width < 1 || height < 1 || width > 1920 || height > 1920))
     {
-        error = "width/height must be between 1 and 1920";
+        error = artifact ? "artifact width/height must be exactly 3840x2160"
+                         : "width/height must be between 1 and 1920";
         return false;
     }
     if (snapshotGeneration == 0)

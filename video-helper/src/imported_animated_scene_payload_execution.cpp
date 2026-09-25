@@ -19,8 +19,9 @@ bool reject(std::string& error, const char* message)
 } // namespace
 
 ImportedAnimatedScenePayloadExecution::ImportedAnimatedScenePayloadExecution(
-    Store& store, arbitgpu::NativeDeformationBackend& backend) noexcept
-    : store_(store), renderer_(backend)
+    Store& store, arbitgpu::NativeDeformationBackend& backend,
+    arbitgpu::NativeFixtureSceneBackend& sceneBackend) noexcept
+    : store_(store), renderer_(backend), sceneRenderer_(sceneBackend)
 {
 }
 
@@ -60,9 +61,6 @@ bool ImportedAnimatedScenePayloadExecution::inspectCompatibility(
         error = "imported animation/deformation decode rejected: " + error;
         return false;
     }
-    if (!document->deformation)
-        return reject(error, "imported animation/deformation payload is unavailable");
-
     ImportedAnimatedSceneCompatibility inspected;
     inspected.clips.reserve(document->clips.size());
     std::map<visualanimationimport::StableId, bool> nativeMeshAdmission;
@@ -75,6 +73,14 @@ bool ImportedAnimatedScenePayloadExecution::inspectCompatibility(
         for (const auto meshStableId
              : importedAnimationCompatibleMeshStableIds(*document, clip))
         {
+            if (!clip.sceneTransformTargets.empty())
+            {
+                if (gltf::adaptAnimatedGlbMeshToVisual3DScene(*decodedScene, error,
+                        static_cast<std::size_t>(meshStableId - 1u), true))
+                    candidate.compatibleMeshStableIds.push_back(meshStableId);
+                error.clear();
+                continue;
+            }
             auto admitted = nativeMeshAdmission.find(meshStableId);
             if (admitted == nativeMeshAdmission.end())
             {
@@ -89,15 +95,14 @@ bool ImportedAnimatedScenePayloadExecution::inspectCompatibility(
                         document->deformation->meshes().end(),
                         [&binding] (const auto& entry) { return entry.id() == binding->mesh; });
                 const auto selectedMeshIndex = static_cast<std::size_t>(meshStableId - 1u);
-                auto adapted = gltf::adaptStaticGlbToVisual3DScene(
-                    *decodedScene, error, selectedMeshIndex);
+                auto adapted = gltf::adaptAnimatedGlbMeshToVisual3DScene(
+                    *decodedScene, error, selectedMeshIndex, true);
                 const auto expectedObject = binding == document->renderBindings.end()
                     ? 0u : static_cast<std::uint64_t>(binding->nodeIndex) * 65536u + 1u;
                 const auto nativeAdmitted = adapted && binding != document->renderBindings.end()
                     && deformationMesh != document->deformation->meshes().end()
-                    && adapted->objectCount == 1 && adapted->materialCount == 1
-                    && adapted->lightCount == 1 && adapted->cameraCount == 1
-                    && adapted->objects[0].id.value == expectedObject;
+                    && std::any_of(adapted->objects.begin(), adapted->objects.begin() + adapted->objectCount,
+                        [expectedObject](const auto& object) { return object.id.value == expectedObject; });
                 admitted = nativeMeshAdmission.emplace(meshStableId, nativeAdmitted).first;
                 error.clear();
             }
@@ -132,7 +137,8 @@ void ImportedAnimatedScenePayloadExecution::reset() noexcept
     clearSurfaceMaterial();
     source_.reset();
     scene_.reset();
-    binding_ = {};
+    baseScene_.reset();
+    bindings_.clear();
     admittedIdentity_ = {};
 }
 
@@ -164,40 +170,57 @@ bool ImportedAnimatedScenePayloadExecution::admit(
         ? std::optional<std::size_t> {}
         : std::optional<std::size_t> {
             static_cast<std::size_t>(operation.meshStableId - 1u) };
-    auto adapted = gltf::adaptStaticGlbToVisual3DScene(
-        *decodedScene, error, selectedMeshIndex);
+    auto adapted = gltf::adaptAnimatedGlbMeshToVisual3DScene(
+        *decodedScene, error, selectedMeshIndex, true);
     if (!adapted)
     {
         error = "imported animated scene native adaptation rejected: " + error;
         return false;
     }
     auto document = candidateConsumer.admittedDocument();
-    if (!document || !document->deformation
-        || adapted->objectCount != 1 || adapted->materialCount != 1
-        || adapted->lightCount != 1 || adapted->cameraCount != 1)
-        return reject(error, "imported animated scene is outside the single-draw native subset");
-
-    const auto bindingIt = operation.meshStableId == 0
-        ? (document->renderBindings.size() == 1
-            ? document->renderBindings.begin() : document->renderBindings.end())
-        : std::find_if(document->renderBindings.begin(), document->renderBindings.end(),
-            [&operation] (const auto& candidate)
-            { return candidate.mesh.value == operation.meshStableId; });
-    if (bindingIt == document->renderBindings.end())
-        return reject(error, "imported animated scene mesh selector is unavailable");
-    const auto& binding = *bindingIt;
-    const auto deformationMesh = std::find_if(
-        document->deformation->meshes().begin(), document->deformation->meshes().end(),
-        [&binding] (const auto& candidate) { return candidate.id() == binding.mesh; });
-    const auto expectedObject = static_cast<std::uint64_t>(binding.nodeIndex) * 65536u + 1u;
-    if (adapted->objects[0].id.value != expectedObject
-        || deformationMesh == document->deformation->meshes().end())
-        return reject(error, "imported animated scene mesh and object identities are incompatible");
+    if (!document)
+        return reject(error, "imported animated scene clip data is unavailable");
+    std::vector<gltf::GlbDeformationRenderBinding> bindings;
+    for (const auto& binding : document->renderBindings)
+    {
+        if (operation.meshStableId != 0 && binding.mesh.value != operation.meshStableId) continue;
+        const auto expectedObject = static_cast<std::uint64_t>(binding.nodeIndex) * 65536u + 1u;
+        const auto object = std::find_if(adapted->objects.begin(), adapted->objects.begin() + adapted->objectCount,
+            [expectedObject](const auto& candidate) { return candidate.id.value == expectedObject; });
+        if (object == adapted->objects.begin() + adapted->objectCount) continue;
+        const auto* mesh = document->deformation->findMesh(binding.mesh);
+        if (!mesh || mesh->vertexCount() > adapted->vertexCount - object->firstVertex)
+            return reject(error, "imported animated mesh has incompatible or changing topology");
+        std::size_t vertices = 0;
+        for (auto part = object; part != adapted->objects.begin() + adapted->objectCount
+             && (part->id.value - 1u) / 65536u == binding.nodeIndex; ++part)
+        {
+            if (part->firstVertex != object->firstVertex + vertices)
+                return reject(error, "imported animated mesh primitives are not contiguous");
+            vertices += part->vertexCount;
+        }
+        if (vertices != mesh->vertexCount())
+            return reject(error, "imported animated mesh primitive topology does not match its deformation");
+        bindings.push_back(binding);
+    }
+    if (bindings.empty() && std::none_of(document->clips.begin(), document->clips.end(),
+            [](const auto& clip) { return !clip.sceneTransformTargets.empty(); }))
+        return reject(error, "imported animated scene has no selected mesh, camera or light animation bindings");
+    for (std::size_t index = 0; index < adapted->objectCount; ++index)
+    {
+        const auto nodeIndex = (adapted->objects[index].id.value - 1u) / 65536u;
+        const auto meshIndex = decodedScene->nodes[nodeIndex].mesh;
+        if (meshIndex && document->deformation && document->deformation->findMesh({*meshIndex + 1u})
+            && std::none_of(bindings.begin(), bindings.end(),
+                [nodeIndex](const auto& binding) { return binding.nodeIndex == nodeIndex; }))
+            return reject(error, "animated mesh instances require a distinct mesh per scene node; this node has no exact deformation binding");
+    }
 
     clearSurfaceMaterial();
     consumer_ = std::move(candidateConsumer);
     scene_ = std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(std::move(*adapted));
-    binding_ = binding;
+    baseScene_ = std::make_shared<const gltf::GlbStaticMeshDocument>(std::move(*decodedScene));
+    bindings_ = std::move(bindings);
     admittedIdentity_ = identity;
     source_.reset();
     error.clear();
@@ -304,6 +327,11 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     if (!payload)
         return reject(error, "imported animated scene exact payload is not resident");
     if (!admit(payload, request.operation, error)) return false;
+    if (request.operation.pose.nodeStableId != 0
+        && std::none_of(scene_->objects.begin(), scene_->objects.begin() + scene_->objectCount,
+            [&](const auto& object) { return (object.id.value - 1u) / 65536u + 1u
+                == request.operation.pose.nodeStableId; }))
+        return reject(error, "selected pose object is not drawn by the imported scene selection");
 
     ImportedAnimationDeformationEvaluation evaluation;
     const auto evaluated = owner == ImportedAnimationEvaluationOwner::Preview
@@ -324,6 +352,8 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         material.sceneSnapshot = scene_;
         if (!publishSurfaceMaterial(material, error))
         {
+            if (surfacematerialbinding::hasGraphFrameInput(material.binding))
+                return false;
             if (owner != ImportedAnimationEvaluationOwner::Preview
                 || lastGoodMaterial_ == nullptr)
                 return false;
@@ -343,21 +373,44 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     if (!source_ || source_->sourceStableId != request.operation.sourceStableId
         || source_->deformationStableId != request.operation.deformationStableId
         || source_->structuralRevision != request.structuralRevision
-        || source_->clip != evaluation.deformation->clip())
+        || source_->clip != (evaluation.deformation ? evaluation.deformation->clip() : evaluation.sceneAnimation->clip()))
     {
         auto source = std::make_shared<arbitgpu::NativeDeformationScene>();
         source->sourceStableId = request.operation.sourceStableId;
         source->deformationStableId = request.operation.deformationStableId;
         source->structuralRevision = request.structuralRevision;
-        source->clip = evaluation.deformation->clip();
-        source->mesh = binding_.mesh;
-        source->object = scene_->objects[0].id;
+        source->clip = evaluation.deformation ? evaluation.deformation->clip() : evaluation.sceneAnimation->clip();
         source->scene = scene_;
         source->deformation = consumer_.admittedDocument()->deformation;
-        source->morphBaseWeights = binding_.morphBaseWeights;
-        for (const auto& base : binding_.jointBaseTransforms)
-            source->jointBaseTransforms.push_back({base.skin, base.joint,
-                base.translation, base.rotation, base.scale});
+        for (const auto& binding : bindings_)
+        {
+            auto draw = std::make_shared<arbitgpu::NativeDeformationScene>(*source);
+            draw->draws.clear();
+            draw->mesh = binding.mesh;
+            draw->skin = binding.skin;
+            draw->animationNodeStableId = binding.nodeIndex + 1u;
+            draw->object = {static_cast<std::uint32_t>(binding.nodeIndex * 65536u + 1u)};
+            draw->morphBaseWeights = binding.morphBaseWeights;
+            draw->batchMember = true;
+            for (const auto& base : binding.jointBaseTransforms)
+                draw->jointBaseTransforms.push_back({base.skin, base.joint,
+                    base.translation, base.rotation, base.scale, base.matrix});
+            source->draws.push_back(std::move(draw));
+        }
+        if (!source->draws.empty())
+        {
+            source->mesh = source->draws.front()->mesh;
+            source->object = source->draws.front()->object;
+        }
+        if (source->draws.size() == 1 && scene_->objectCount == 1
+            && scene_->materialCount == 1 && scene_->cameraCount == 1 && scene_->lightCount == 1
+            && scene_->materials[0].opacity == 1.0f
+            && scene_->lights[0].kind == HarmonicMIDI::grid::SceneLightKind::Directional)
+        {
+            const auto draw = source->draws.front();
+            *source = *draw;
+            source->batchMember = false;
+        }
         source_ = std::move(source);
     }
 
@@ -371,11 +424,46 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         || std::abs(exactSeconds) > surfacematerial::kMaximumEvaluationMagnitude)
         return reject(error, "imported animated material time is out of bounds");
     auto runtimeInputs = request.runtimeInputs;
+    if (evaluation.sceneAnimation)
+    {
+        std::vector<HarmonicMIDI::grid::SceneCameraRecord> cameras;
+        if (!gltf::sampleGlbCameraLights(*baseScene_, *evaluation.sceneAnimation, request.operation.combinationMode,
+                static_cast<float>(evaluation.playback.weight), *scene_, cameras, runtimeInputs.animatedLights, error))
+            return false;
+        const auto camera = std::find_if(cameras.begin(), cameras.end(),
+            [&](const auto& value) { return value.id == scene_->activeCamera; });
+        if (camera != cameras.end()) runtimeInputs.animatedCamera = *camera;
+    }
+    runtimeInputs.objectNodeStableId = request.operation.pose.nodeStableId;
     runtimeInputs.timeSeconds = static_cast<float>(exactSeconds);
-    runtimeInputs.morphWeight = request.operation.combinationMode
+    runtimeInputs.morphWeight = request.operation.pose.morphEnabled || request.operation.combinationMode
             == visualanimation::CombinationMode::WeightedBlend
         ? 1.0f : static_cast<float>(request.operation.playback.weight);
-    const auto rendered = owner == ImportedAnimationEvaluationOwner::Preview
+    const auto renderFrame = [&]() {
+        if (bindings_.empty())
+        {
+            videorender::fixture3d::RenderedFrame sceneFrame;
+            surfacematerial::MaterialEvaluationInputs materialInputs;
+            materialInputs.timeSeconds = runtimeInputs.timeSeconds;
+            const auto rendered = owner == ImportedAnimationEvaluationOwner::Preview
+                ? sceneRenderer_.renderPreview(scene_, material, materialInputs, runtimeInputs,
+                    {request.width, request.height}, videorender::animation3d::kNativeGpuCapability, sceneFrame, error)
+                : sceneRenderer_.renderExport(scene_, material, materialInputs, runtimeInputs,
+                    {request.width, request.height}, videorender::animation3d::kNativeGpuCapability, sceneFrame, error);
+            if (!rendered) return false;
+            frame.use = owner == ImportedAnimationEvaluationOwner::Preview
+                ? videorender::animation3d::RenderUse::Preview : videorender::animation3d::RenderUse::Export;
+            frame.source = source_; frame.nativeFrame = std::move(sceneFrame.nativeFrame);
+            frame.stats.drawCount = sceneFrame.stats.drawCount;
+            frame.stats.clipId = source_->clip.value; frame.stats.time = request.frame;
+            frame.stats.sourceStableId = source_->sourceStableId;
+            frame.stats.deformationStableId = source_->deformationStableId;
+            frame.stats.revision = request.structuralRevision;
+            frame.stats.staticUploadCount = sceneFrame.stats.staticUploadCount;
+            frame.stats.reusedStaticResources = sceneFrame.stats.reusedStaticResources;
+            return true;
+        }
+        return owner == ImportedAnimationEvaluationOwner::Preview
         ? renderer_.renderPreview(source_, evaluation.deformation,
                                   material ? material->nativeProgram() : nullptr,
                                   runtimeInputs, request.width, request.height,
@@ -384,7 +472,8 @@ bool ImportedAnimatedScenePayloadExecution::execute(
                                  material ? material->nativeProgram() : nullptr,
                                  runtimeInputs, request.width, request.height,
                                  videorender::animation3d::kNativeGpuCapability, frame, error);
-    if (!rendered) return false;
+    };
+    if (!renderFrame()) return false;
 
     ImportedAnimatedSceneReceipt receipt;
     receipt.owner = owner;

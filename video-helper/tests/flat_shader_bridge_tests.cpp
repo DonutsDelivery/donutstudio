@@ -79,6 +79,10 @@ videowire::CompiledVisualLayerPlan generatorPlan(const std::string& xml)
     plan.nodeKinds = { "visual.shader.generator", "video.out" };
     plan.nodeIds = { 41, 42 };
     plan.edges = { { 41, 0, 42, 0 } };
+    plan.ports = {
+        { 41, 0, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 42, 0, 1, "in", "frame", "image", "rgba8", "sRGB" }
+    };
     plan.operations = {
         { 41, "visual.shader.generator", "native-gpu", xml },
         { 42, "video.out", "native-gpu", "" }
@@ -218,7 +222,7 @@ videowire::CompiledVisualLayerPlan transitionPlan(const std::string& encoded)
     };
     plan.operations = {
         { 50, "video.source", "source-decode", "" },
-        { 51, "video.layer.source", "source-decode", "" },
+        { 51, "video.layer.source", "source-decode", "<NodeParams clipId=\"17\"/>" },
         { 52, shadertransition::operationKind, "native-gpu", encoded },
         { 53, "video.out", "native-gpu", "" }
     };
@@ -441,7 +445,16 @@ int main()
           "curated multipass admission caps persistent ping-pong images");
 
     videowire::VisualLayerExecution execution;
-    check(videowire::compileVisualLayerExecution(generatorPlan(generatorXml), execution, error),
+    const auto generator = generatorPlan(generatorXml);
+    check(videowire::validateCompiledVisualLayerPlans({}, { generator }, false, error),
+          "snapshot admission accepts the native shader generator operation kind");
+    auto unknownGenerator = generator;
+    unknownGenerator.nodeKinds[0] = "visual.shader.generator.future";
+    unknownGenerator.operations[0].kind = "visual.shader.generator.future";
+    check(!videowire::validateCompiledVisualLayerPlans({}, { unknownGenerator }, false, error)
+              && error == "visual layer plan contains unsupported typed operation: visual.shader.generator.future",
+          "snapshot admission still rejects unrecognized shader generator kinds");
+    check(videowire::compileVisualLayerExecution(generator, execution, error),
           "exact generator topology lowers");
     check(execution.flatShaderBridge && execution.shaderOperationPlan != nullptr
               && execution.shaderOperationPlan->operations.size() == 1
@@ -537,6 +550,8 @@ int main()
     check(videowire::compileVisualLayerExecution(
               transitionPlan(transitionXml), execution, error),
           "admitted transition lowers to the immutable helper operation");
+    check(execution.shaderTransitionFromClipId == 17,
+          "transition lowering retains the exact referenced Layer Source clip identity");
     check(execution.shaderOperationPlan != nullptr
               && execution.shaderOperationPlan->operations.size() == 1
               && execution.shaderOperationPlan->operations.front().kind

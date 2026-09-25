@@ -1,10 +1,13 @@
 #include "sdf_native_backend_parity.h"
 #include "sdf_reference_evaluator.h"
+#include "sdf_output_test_scenes.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <sstream>
+#include <utility>
 
 namespace videohelper::sdf::test
 {
@@ -171,6 +174,67 @@ std::uint8_t expectedDepth (const AdmittedSdfIr& geometry,
     const auto normalized = std::clamp (travel / controls.maximumDistance, 0.0, 1.0);
     return static_cast<std::uint8_t> (std::lround (normalized * 255.0));
 }
+
+bool verifyPositiveYSphere (const NativeSdfFloatReader& readPixels,
+                            const std::string& backend, std::string& error)
+{
+    const auto reject = [&] (const char* message) { error = message; return false; };
+    SdfIr source;
+    source.rootId = 72;
+    source.records = { record(71, SdfOperation::sphere, {}, {0.45}),
+                       record(72, SdfOperation::translate, {71}, {0.0, 0.6, 0.0}) };
+    auto admitted = admitSdfIr(source, {}, error);
+    if (!admitted) return false;
+    const auto geometry = std::make_shared<const AdmittedSdfIr>(std::move(*admitted));
+    NativeSdfRenderControls controls;
+    controls.maximumSteps = 128;
+    controls.maximumDistance = 8.0;
+    controls.output = arbitgpu::NativeSdfOutput::depth;
+    constexpr std::uint32_t extent = 33;
+    const auto rowOrder = backend == "opengl" ? arbitgpu::NativeTextureRowOrder::BottomFirst
+                                               : arbitgpu::NativeTextureRowOrder::TopFirst;
+    // Closed-form intersections for camera O=(0,0,3), sphere C=(0,0.6,0),
+    // radius 0.45, and focal length 1.8. In canonical top-first coordinates,
+    // pixel (16,10) hits at t=2.609445154144592; its mirror (16,22) misses.
+    // These values do not use the scalar IR evaluator or native ray marcher.
+    constexpr std::array<std::pair<std::uint32_t, double>, 2> probes {{
+        {10, 0.326180644268074}, {22, 1.0}
+    }};
+    std::vector<float> previewPixels;
+    auto& renderer = nativeSdfRenderer();
+    for (const auto use : {NativeSdfRenderUse::Preview, NativeSdfRenderUse::Export})
+    {
+        NativeSdfRenderedFrame rendered;
+        const bool ok = use == NativeSdfRenderUse::Preview
+            ? renderer.renderPreview(geometry, {extent, extent}, controls, kNativeGpuCapability, rendered, error)
+            : renderer.renderExport(geometry, {extent, extent}, controls, kNativeGpuCapability, rendered, error);
+        if (!ok || !rendered.nativeFrame) return false;
+        const auto descriptor = rendered.nativeFrame->colorTextureDescriptor();
+        if (!arbitgpu::isLinearSceneColor(descriptor) || descriptor.backend != backend
+            || descriptor.rowOrder != rowOrder || descriptor.width != extent || descriptor.height != extent)
+            return reject("positive-Y SDF sphere lost its native row descriptor");
+        const auto pixels = readPixels(*rendered.nativeFrame);
+        if (pixels.size() != extent * extent * 4u)
+            return reject("positive-Y SDF sphere readback has the wrong extent");
+        for (const auto& [topRow, expectedDepth] : probes)
+        {
+            const auto nativeRow = rowOrder == arbitgpu::NativeTextureRowOrder::BottomFirst
+                ? extent - 1u - topRow : topRow;
+            const auto offset = (nativeRow * extent + 16u) * 4u;
+            for (std::size_t channel = 0; channel < 4; ++channel)
+            {
+                const auto expected = channel == 3 ? 1.0 : expectedDepth;
+                if (!std::isfinite(pixels[offset + channel])
+                    || std::abs(pixels[offset + channel] - expected) > 0.002)
+                    return reject("positive scene Y must place the SDF sphere above centre in canonical top-first pixels");
+            }
+        }
+        if (use == NativeSdfRenderUse::Preview) previewPixels = pixels;
+        else if (pixels != previewPixels)
+            return reject("positive-Y SDF sphere differs between native preview and export");
+    }
+    return true;
+}
 } // namespace
 
 std::vector<NativeOperationFixture> nativeOperationFixtures (std::string& error)
@@ -232,13 +296,16 @@ bool verifyNativeDepthParity (const NativeOperationFixture& fixture,
     // different raymarch result. Foreground membership must match exactly.
     constexpr int polarRepeatDepthTolerance = 2;
     const auto inset = fixture.operation == SdfOperation::repeat ? width / 3 : 0u;
+    const bool topFirst = arbitgpu::nativeSdfExecutionBackend().capabilities().backend == "metal";
     for (std::uint32_t y = inset; y < height - inset; ++y)
     {
         for (std::uint32_t x = inset; x < width - inset; ++x)
         {
             const auto expected = expectedDepth (*fixture.geometry, controls, width, height, x, y);
             expectedForeground = expectedForeground || expected != 255;
-            const auto offset = (static_cast<std::size_t> (y) * width + x) * 4u;
+            // Keep every scalar probe in its original world-space ray direction.
+            const auto nativeRow = topFirst ? height - 1u - y : y;
+            const auto offset = (static_cast<std::size_t> (nativeRow) * width + x) * 4u;
             const auto actual = rgba[offset];
             const auto delta = std::abs (static_cast<int> (actual) - static_cast<int> (expected));
             const auto repeatedDomain = fixture.operation == SdfOperation::polarRepeat;
@@ -266,6 +333,212 @@ bool verifyNativeDepthParity (const NativeOperationFixture& fixture,
         return false;
     }
 
+    error.clear();
+    return true;
+}
+
+bool verifyNativeUtilityOutputs (const NativeSdfFloatReader& readPixels, std::string& error)
+{
+    using Output = arbitgpu::NativeSdfOutput;
+    auto& backend = arbitgpu::nativeSdfExecutionBackend();
+    const auto capabilities = backend.capabilities();
+    const auto reject = [&] (std::string message) { error = std::move (message); return false; };
+    for (unsigned raw = 0; raw < static_cast<unsigned> (Output::count); ++raw)
+        if (! capabilities.supports (static_cast<Output> (raw)))
+            return reject ("native SDF capability omitted an implemented output");
+    const std::array<Output,3> invalidOutputs {
+        static_cast<Output> (-1), Output::count, static_cast<Output> (9) };
+    for (const auto output : invalidOutputs)
+        if (capabilities.supports (output))
+            return reject ("native SDF capability admits an invalid output");
+    if (capabilities.backend != "opengl" && capabilities.backend != "metal")
+        return reject ("native SDF parity requires a declared GL or Metal row origin");
+    if (!verifyPositiveYSphere(readPixels, capabilities.backend, error)) return false;
+
+    NativeSdfRenderControls controls;
+    controls.maximumSteps = 128;
+    controls.maximumDistance = 12.0;
+    controls.shadowQuality = arbitgpu::NativeSdfQuality::ultra;
+    struct Case
+    {
+        const char* name;
+        OutputScene scene;
+        Output output;
+        std::vector<std::array<unsigned,2>> probes;
+        double tolerance;
+    };
+    const std::vector<Case> cases {
+        {"plane color",OutputScene::Plane,Output::color,{{16,16},{8,20},{28,4}},0.002},
+        {"sphere color",OutputScene::Sphere,Output::color,{{16,16},{19,16},{16,20},{0,0}},0.004},
+        {"sphere depth",OutputScene::Sphere,Output::depth,{{16,16},{19,16},{16,20},{0,0}},0.002},
+        {"sphere normal",OutputScene::Sphere,Output::normal,{{16,16},{19,16},{16,20},{0,0}},0.003},
+        {"flat curvature",OutputScene::Plane,Output::curvature,{{16,16},{8,20},{28,4}},0.01},
+        {"convex curvature",OutputScene::Sphere,Output::curvature,{{16,16},{19,16},{16,20},{0,0}},0.02},
+        {"concave cut curvature",OutputScene::CarvedBox,Output::curvature,{{16,16},{17,16},{16,17},{0,0}},0.025},
+        {"open AO",OutputScene::Plane,Output::ambientOcclusion,{{16,16},{8,20},{28,4}},0.01},
+        {"corner AO",OutputScene::Corner,Output::ambientOcclusion,{{16,16},{8,16},{16,8}},0.01},
+        {"open shadow",OutputScene::Plane,Output::softShadow,{{16,16},{8,20},{28,4}},0.01},
+        {"occluder shadow",OutputScene::OccludedPlane,Output::softShadow,{{16,16},{26,16},{16,8}},0.015},
+        {"sphere silhouette",OutputScene::Sphere,Output::edgeDistance,{{16,16},{26,16},{16,26},{0,0}},0.064},
+        {"flat face silhouette",OutputScene::Box,Output::edgeDistance,{{16,16},{25,16},{16,25},{0,0}},0.064},
+        {"unbounded plane silhouette",OutputScene::Plane,Output::edgeDistance,{{16,16},{0,0},{32,32}},0.001},
+        {"64 bit contributors",OutputScene::Pair,Output::materialId,{{9,16},{23,16},{16,16},{0,0}},0.001},
+        {"union contributors",OutputScene::Union,Output::materialId,{{14,16},{16,16},{18,16},{0,0}},0.001},
+        {"intersection contributors",OutputScene::Intersection,Output::materialId,{{14,16},{16,16},{18,16},{0,0}},0.001},
+        {"smooth union contributors",OutputScene::SmoothUnion,Output::materialId,{{14,16},{16,16},{18,16},{0,0}},0.001},
+        {"smooth intersection contributors",OutputScene::SmoothIntersection,Output::materialId,{{14,16},{16,16},{18,16},{0,0}},0.001},
+        {"cut contributor",OutputScene::CarvedBox,Output::materialId,{{16,16},{24,16},{0,0}},0.001},
+        {"smooth cut contributor",OutputScene::SmoothCarvedBox,Output::materialId,{{16,16},{24,16},{0,0}},0.001}
+    };
+    constexpr unsigned extent = 33;
+    const auto offsetAt = [topFirst = capabilities.backend == "metal"] (unsigned x, unsigned y)
+    {
+        // Existing scalar oracle probes use bottom-origin camera coordinates.
+        const auto nativeRow = topFirst ? extent - 1u - y : y;
+        return (nativeRow * extent + x) * 4u;
+    };
+    const auto channelAt = [&] (const std::vector<float>& pixels, unsigned x, unsigned y)
+    { return pixels[offsetAt(x, y)]; };
+    auto& renderer = nativeSdfRenderer();
+    std::vector<float> pairPixels;
+    std::array<bool,static_cast<std::size_t> (Output::count)> sampledOutputs {};
+    for (const auto& test : cases)
+    {
+        const auto geometry = outputTestGeometry (test.scene,error);
+        if (!geometry) return false;
+        controls.output = test.output;
+        sampledOutputs[static_cast<std::size_t> (test.output)] = true;
+        NativeSdfRenderedFrame preview, exported;
+        if (! renderer.renderPreview (geometry,{extent,extent},controls,kNativeGpuCapability,preview,error)
+            || ! renderer.renderExport (geometry,{extent,extent},controls,kNativeGpuCapability,exported,error)
+            || !preview.nativeFrame || !exported.nativeFrame)
+            return reject (std::string (test.name) + " native draw failed: " + error);
+        const auto previewDescriptor = preview.nativeFrame->colorTextureDescriptor();
+        const auto exportDescriptor = exported.nativeFrame->colorTextureDescriptor();
+        const auto rowOrder = capabilities.backend == "opengl"
+            ? arbitgpu::NativeTextureRowOrder::BottomFirst : arbitgpu::NativeTextureRowOrder::TopFirst;
+        if (!arbitgpu::isLinearSceneColor(previewDescriptor)
+            || !arbitgpu::isLinearSceneColor(exportDescriptor)
+            || previewDescriptor.rowOrder != rowOrder || exportDescriptor.rowOrder != rowOrder
+            || previewDescriptor.deviceOrContextIdentity != exportDescriptor.deviceOrContextIdentity
+            || previewDescriptor.rendererGeneration == exportDescriptor.rendererGeneration)
+            return reject (std::string (test.name) + " native attachment descriptors lost format, orientation or allocation identity");
+        const auto pixels = readPixels (*preview.nativeFrame);
+        const auto exportPixels = readPixels (*exported.nativeFrame);
+        if (pixels.size() != extent*extent*4u || pixels != exportPixels)
+            return reject (std::string (test.name) + " preview/export float pixels or extent disagree");
+        for (std::size_t i = 0; i < pixels.size(); ++i)
+            if (!std::isfinite (pixels[i]) || pixels[i] < 0.0f
+                || (test.output != Output::color && pixels[i] > 1.0f)
+                || (i%4u == 3u && pixels[i] != 1.0f))
+                return reject (std::string (test.name) + " contains a nonfinite, unbounded or invalid-alpha native pixel");
+        for (const auto& probe : test.probes)
+        {
+            const auto expected = reference::evaluateOutputPixel (
+                *geometry,controls,extent,extent,probe[0],probe[1]);
+            const auto offset = offsetAt(probe[0], probe[1]);
+            for (unsigned channel = 0; channel < 4; ++channel)
+                if (!std::isfinite (expected[channel])
+                    || std::abs (pixels[offset+channel]-expected[channel]) > test.tolerance)
+                {
+                    std::ostringstream message;
+                    message << test.name << " differs from scalar IR oracle at " << probe[0] << ','
+                        << probe[1] << " channel " << channel << ": expected " << expected[channel]
+                        << ", actual " << pixels[offset+channel];
+                    return reject (message.str());
+                }
+        }
+        const auto center = channelAt (pixels,16,16);
+        if (test.output == Output::curvature)
+        {
+            if (test.scene == OutputScene::Plane && std::abs (center-0.5f) > 0.01f)
+                return reject ("native plane curvature is not neutral");
+            if (test.scene == OutputScene::Sphere && (center < 0.73f || center > 0.77f))
+                return reject ("native convex sphere does not show positive 1/R curvature");
+            if (test.scene == OutputScene::CarvedBox && center > 0.2f)
+                return reject ("native spherical cut lost its negative curvature");
+        }
+        if (test.scene == OutputScene::Corner && test.output == Output::ambientOcclusion
+            && (center > 0.85f || channelAt (pixels,8,16) < 0.99f))
+            return reject ("native AO does not distinguish the corner from an open region");
+        if (test.scene == OutputScene::OccludedPlane && test.output == Output::softShadow
+            && (center > 0.01f || channelAt (pixels,26,16) < 0.99f))
+            return reject ("native shadow does not follow the light/occluder geometry");
+        if (test.output == Output::edgeDistance && test.scene != OutputScene::Plane)
+        {
+            const auto edgeX = test.scene == OutputScene::Sphere ? 26u : 25u;
+            if (center < 0.99f || channelAt (pixels,edgeX,16) >= 0.2f || channelAt (pixels,0,0) != 0.0f)
+                return reject ("native silhouette map does not measure foreground edge distance");
+        }
+        if (test.scene == OutputScene::Union || test.scene == OutputScene::Intersection
+            || test.scene == OutputScene::SmoothUnion || test.scene == OutputScene::SmoothIntersection)
+        {
+            auto reversed = outputTestSource (test.scene);
+            std::swap (reversed.records.back().inputs[0],reversed.records.back().inputs[1]);
+            auto admitted = admitSdfIr (reversed,{},error);
+            if (!admitted) return false;
+            const auto reverseGeometry = std::make_shared<const AdmittedSdfIr> (std::move (*admitted));
+            NativeSdfRenderedFrame reverseFrame;
+            if (!renderer.renderPreview (reverseGeometry,{extent,extent},controls,
+                                         kNativeGpuCapability,reverseFrame,error) || !reverseFrame.nativeFrame)
+                return reject (std::string (test.name) + " reversed-input draw failed: " + error);
+            const auto reversePixels = readPixels (*reverseFrame.nativeFrame);
+            if (reversePixels.size() != pixels.size())
+                return reject (std::string (test.name) + " reversed-input readback failed");
+            // The center ray is exactly equidistant to both spheres. Geometry
+            // stays the same when inputs swap; ordered A must own that seam.
+            constexpr std::array<double,3> leftColor {98.0/255.0,124.0/255.0,48.0/255.0};
+            constexpr std::array<double,3> rightColor {116.0/255.0,162.0/255.0,48.0/255.0};
+            const auto centerOffset = (16*extent+16)*4u;
+            for (unsigned channel = 0; channel < 3; ++channel)
+                if (!std::isfinite (reversePixels[centerOffset+channel])
+                    || std::abs (pixels[centerOffset+channel]-leftColor[channel]) > 0.001
+                    || std::abs (reversePixels[centerOffset+channel]-rightColor[channel]) > 0.001)
+                    return reject (std::string (test.name) + " does not preserve ordered A ownership on an equal-weight seam");
+        }
+        if (test.scene == OutputScene::Pair) pairPixels = pixels;
+    }
+    if (!std::all_of (sampledOutputs.begin(),sampledOutputs.end(),[] (bool sampled) { return sampled; }))
+        return reject ("native SDF semantic pixels did not cover all eight outputs");
+    // Record order is not material identity. The two leaves also share their
+    // low 32 bits, so truncating the full stable ID makes this test fail.
+    if (pairPixels.empty()
+        || std::equal (pairPixels.begin()+(16*extent+9)*4,pairPixels.begin()+(16*extent+9)*4+3,
+                       pairPixels.begin()+(16*extent+23)*4))
+        return reject ("distinct 64-bit primitive contributors share an invented constant material color");
+    auto reordered = outputTestSource (OutputScene::Pair);
+    std::reverse (reordered.records.begin(),reordered.records.end());
+    auto admittedReordered = admitSdfIr (reordered,{},error);
+    if (!admittedReordered) return false;
+    const auto geometry = std::make_shared<const AdmittedSdfIr> (std::move (*admittedReordered));
+    controls.output = Output::materialId;
+    NativeSdfRenderedFrame reorderedFrame;
+    if (!renderer.renderPreview (geometry,{extent,extent},controls,kNativeGpuCapability,reorderedFrame,error)
+        || !reorderedFrame.nativeFrame || readPixels (*reorderedFrame.nativeFrame) != pairPixels)
+        return reject ("SDF material colors changed when only record order changed");
+
+    arbitgpu::NativeSdfDrawRequest invalid;
+    invalid.geometry = outputTestSource (OutputScene::Sphere);
+    invalid.width = invalid.height = extent;
+    invalid.maximumSteps = controls.maximumSteps;
+    invalid.epsilon = controls.epsilon;
+    invalid.maximumDistance = controls.maximumDistance;
+    for (const auto output : invalidOutputs)
+    {
+        invalid.output = output;
+        const auto result = backend.render (invalid);
+        if (result.rendered || result.frame || result.error.empty())
+            return reject ("invalid native SDF output allocated a frame");
+    }
+    invalid.output = Output::curvature;
+    invalid.epsilon = std::numeric_limits<double>::quiet_NaN();
+    const auto nonfinite = backend.render (invalid);
+    invalid.epsilon = 0.001;
+    invalid.maximumSteps = 0;
+    const auto zeroSteps = backend.render (invalid);
+    if (nonfinite.rendered || nonfinite.frame || nonfinite.error.empty()
+        || zeroSteps.rendered || zeroSteps.frame || zeroSteps.error.empty())
+        return reject ("invalid SDF utility controls did not reject before native allocation");
     error.clear();
     return true;
 }

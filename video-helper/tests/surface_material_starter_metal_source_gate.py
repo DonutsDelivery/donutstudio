@@ -116,10 +116,18 @@ def main() -> int:
                 f"{backend_name} starter fixture must use the shared explicit transforms and lighting")
         require('"/base-color"' in source,
                 f"{backend_name} starter fixture must include a controlled Base Color alternative")
+        require("generatedSurfaceScene" in source
+                and all(f'"/{control}"' in source for control in ("transmission", "ior", "clearcoat")),
+                f"{backend_name} starter fixture must use generated Geometry Core and detect every dielectric control")
     require("Metal fixture preparation requires an exact bounded material binding" in backend,
             "production Metal backend must retain fail-closed material admission")
     vertex_shader = between(backend, "const char* kFixtureVertexShader", "const char* kFixtureFragmentShader")
     fragment_shader = between(backend, "const char* kFixtureFragmentShader", "[[maybe_unused]] const char* kDeformationComputeShader")
+    require("float4 surfaceCoating;" in vertex_shader and "float4 surfaceCoating;" in fragment_shader
+            and "u.surfaceCoating.x" in fragment_shader and "u.surfaceCoating.y" in fragment_shader
+            and "u.surfaceCoating.z" in fragment_shader
+            and "normal-incidence" in oracle["truthBoundary"],
+            "Metal must shade transmission, IOR and clearcoat with an explicit thin-surface oracle boundary")
     require(vertex_shader.count("float3 litBase;") == 1
             and fragment_shader.count("float3 litBase;") == 1
             and "out.litBase = out.baseColor * u.ambient.xyz;" in vertex_shader

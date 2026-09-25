@@ -1,4 +1,6 @@
 #include "backend.h"
+#include "fixture_vertex_modifier_shader.h"
+#include "fixture_texture_upload.h"
 #include "../geometry_core_diagnostic_colors.h"
 #include "../geometry_core_admission.h"
 #include "../gl_loader.h"
@@ -137,15 +139,16 @@ vec3 childPoint(int operation, vec3 point, vec4 p0, vec4 p1) {
                             p0.z * sin(p1.y * point.x));
     return point;
 }
-float sceneDistance(vec3 point) {
-    int indices[32], stages[32]; vec3 points[32]; float firstValues[32];
+float sceneDistanceWithMaterial(vec3 point, out int contributor) {
+    int indices[32], stages[32], firstContributors[32]; vec3 points[32]; float firstValues[32];
     int top = 0; indices[0] = uRootIndex; stages[0] = 0; points[0] = point;
-    float value = 0.0;
+    float value = 0.0; contributor = -1;
     for (int iteration = 0; iteration < 768; ++iteration) {
         int index = indices[top]; ivec4 record = ivec4(uRecords[index]);
         int operation = record.x; vec4 p0 = uParameters0[index], p1 = uParameters1[index];
         if (operation <= 9) {
             value = primitiveDistance(operation, points[top], p0, p1);
+            contributor = index;
             if (top == 0) return value;
             --top; continue;
         }
@@ -156,10 +159,16 @@ float sceneDistance(vec3 point) {
                 points[top] = points[top - 1]; continue;
             }
             if (stages[top] == 1) {
+                firstContributors[top] = contributor;
                 firstValues[top] = value; stages[top] = 2; ++top;
                 indices[top] = record.z; stages[top] = 0; points[top] = points[top - 1]; continue;
             }
             float a = firstValues[top], b = value;
+            // The dominant smooth weight has the same ordering as its hard
+            // Boolean. Cut surfaces belong to B; ordered input A wins ties.
+            bool takeFirst = (operation == 10 || operation == 13) ? a <= b
+                : a >= ((operation == 12 || operation == 15) ? -b : b);
+            if (takeFirst) contributor = firstContributors[top];
             if (operation == 10) value = min(a, b);
             else if (operation == 11) value = max(a, b);
             else if (operation == 12) value = max(a, -b);
@@ -181,22 +190,33 @@ float sceneDistance(vec3 point) {
     }
     return uMaximumDistance;
 }
+float sceneDistance(vec3 point) {
+    int contributor;
+    return sceneDistanceWithMaterial(point, contributor);
+}
 float qualityScale(int quality) {
     if (quality <= 0) return 4.0; if (quality == 1) return 2.0;
     if (quality == 2) return 1.0; return 0.5;
 }
 vec3 sceneNormal(vec3 point) {
     float e = max(uEpsilon * qualityScale(uNormalQuality), 0.000001);
-    return normalize(vec3(
-        sceneDistance(point + vec3(e,0,0)) - sceneDistance(point - vec3(e,0,0)),
-        sceneDistance(point + vec3(0,e,0)) - sceneDistance(point - vec3(0,e,0)),
-        sceneDistance(point + vec3(0,0,e)) - sceneDistance(point - vec3(0,0,e))));
+    vec3 gradient = vec3(0.0);
+    for (int sampleIndex = 0; sampleIndex < 6; ++sampleIndex) {
+        int axis = sampleIndex / 2;
+        float sign = (sampleIndex % 2) == 0 ? 1.0 : -1.0;
+        vec3 offset = vec3(0.0); offset[axis] = sign * e;
+        gradient[axis] += sign * sceneDistance(point + offset);
+    }
+    float squaredLength = dot(gradient, gradient);
+    return squaredLength > 0.0 && !isinf(squaredLength) && !isnan(squaredLength)
+        ? normalize(gradient) : vec3(0.0,0.0,1.0);
 }
 float sceneShadow(vec3 origin, vec3 direction) {
     int limit = uShadowQuality <= 0 ? 8 : (uShadowQuality == 1 ? 16 : (uShadowQuality == 2 ? 32 : 64));
     float travel = uEpsilon * 4.0, visibility = 1.0;
     for (int step = 0; step < 64; ++step) {
         if (step >= limit) break; float field = sceneDistance(origin + direction * travel);
+        if (isinf(field) || isnan(field)) return 0.0;
         if (field < uEpsilon) return 0.0;
         visibility = min(visibility, 12.0 * field / max(travel, uEpsilon));
         travel += clamp(field, uEpsilon * 2.0, 0.25);
@@ -204,21 +224,104 @@ float sceneShadow(vec3 origin, vec3 direction) {
     }
     return clamp(visibility, 0.0, 1.0);
 }
-void main() {
-    vec2 uv = (2.0 * gl_FragCoord.xy - uExtent) / uExtent.y;
-    vec3 origin = vec3(0.0,0.0,3.0), direction = normalize(vec3(uv,-1.8));
-    float travel = 0.0; bool hit = false;
+float sceneCurvature(vec3 point) {
+    // Mean curvature of an implicit surface from its gradient and Hessian.
+    // One distance-call site avoids inlining 36 complete traversal stacks.
+    float h = max(max(uEpsilon*qualityScale(uNormalQuality)*4.0,0.002),length(point)*0.0001);
+    const vec3 offsets[19] = vec3[19](vec3(0),
+        vec3(1,0,0),vec3(-1,0,0),vec3(0,1,0),vec3(0,-1,0),vec3(0,0,1),vec3(0,0,-1),
+        vec3(1,1,0),vec3(1,-1,0),vec3(-1,1,0),vec3(-1,-1,0),
+        vec3(1,0,1),vec3(1,0,-1),vec3(-1,0,1),vec3(-1,0,-1),
+        vec3(0,1,1),vec3(0,1,-1),vec3(0,-1,1),vec3(0,-1,-1));
+    float values[19];
+    for (int i = 0; i < 19; ++i) values[i] = sceneDistance(point + offsets[i]*h);
+    vec3 g = vec3(values[1]-values[2],values[3]-values[4],values[5]-values[6])/(2.0*h);
+    vec3 diagonal = (vec3(values[1]+values[2],values[3]+values[4],values[5]+values[6])-2.0*values[0])/(h*h);
+    vec3 crossTerms = vec3(values[7]-values[8]-values[9]+values[10],
+        values[11]-values[12]-values[13]+values[14],values[15]-values[16]-values[17]+values[18])/(4.0*h*h);
+    float g2 = dot(g,g);
+    if (g2 <= 0.000000000001 || isinf(g2) || isnan(g2)) return 0.5;
+    float directional = dot(g*g,diagonal)
+        + 2.0*dot(vec3(g.x*g.y,g.x*g.z,g.y*g.z),crossTerms);
+    float curvature = (g2*(diagonal.x+diagonal.y+diagonal.z)-directional)/(2.0*g2*sqrt(g2));
+    if (isinf(curvature) || isnan(curvature)) return 0.5;
+    curvature = clamp(curvature,-1.0/h,1.0/h);
+    return 0.5+0.5*curvature/(1.0+abs(curvature));
+}
+float sceneAmbientVisibility(vec3 point, vec3 normal) {
+    int count = 4+4*uNormalQuality;
+    float radius = min(uMaximumDistance,max(0.5,32.0*uEpsilon));
+    float occlusion = 0.0, total = 0.0, weight = 1.0;
+    for (int i=0;i<16;++i) {
+        if (i>=count) break;
+        float reach = radius*float(i+1)/float(count);
+        float field = sceneDistance(point+normal*reach);
+        if (isinf(field) || isnan(field)) return 0.0;
+        occlusion += weight*clamp(1.0-field/reach,0.0,1.0);
+        total += weight; weight *= 0.75;
+    }
+    return clamp(1.0-occlusion/total,0.0,1.0);
+}
+bool traceSdf(vec3 direction, out float travel) {
+    vec3 origin = vec3(0.0,0.0,3.0);
+    travel = 0.0;
     for (int step = 0; step < 512; ++step) {
         if (step >= uMaximumSteps || travel > uMaximumDistance) break;
         float field = sceneDistance(origin + direction * travel);
+        if (isinf(field) || isnan(field)) break;
         float threshold = max(uEpsilon * qualityScale(uAdaptiveQuality) * max(1.0, travel * 0.05), 0.000001);
-        if (field <= threshold) { hit = true; break; } travel += field;
+        if (field <= threshold) return true; travel += field;
     }
-    if (!hit) { outColor = uOutputPass == 1 ? vec4(1.0) : vec4(0.02745,0.03922,0.07059,1.0); return; }
-    vec3 point = origin + direction * travel, normal = sceneNormal(point);
+    return false;
+}
+float sceneEdgeDistance(vec2 uv) {
+    // Bounded eight-direction silhouette distance in output pixels, capped at
+    // eight pixels. Four bisections resolve a hit/miss bracket to half a pixel.
+    const vec2 axes[8] = vec2[8](vec2(1,0),vec2(-1,0),vec2(0,1),vec2(0,-1),
+        vec2(0.70710678,0.70710678),vec2(-0.70710678,0.70710678),
+        vec2(0.70710678,-0.70710678),vec2(-0.70710678,-0.70710678));
+    float distance = 8.0;
+    for (int i=0;i<8;++i) {
+        float low = 0.0, high = 8.0, travel;
+        vec2 axis = axes[i]*2.0/uExtent.y;
+        if (traceSdf(normalize(vec3(uv+axis*high,-1.8)),travel)) continue;
+        for (int j=0;j<4;++j) {
+            float middle = (low+high)*0.5;
+            if (traceSdf(normalize(vec3(uv+axis*middle,-1.8)),travel)) low = middle;
+            else high = middle;
+        }
+        distance = min(distance,high);
+    }
+    return distance/8.0;
+}
+void main() {
+    vec2 uv = (2.0 * gl_FragCoord.xy - uExtent) / uExtent.y;
+    vec3 origin = vec3(0.0,0.0,3.0), direction = normalize(vec3(uv,-1.8));
+    float travel;
+    bool hit = traceSdf(direction,travel);
+    if (!hit) {
+        outColor = uOutputPass >= 3 ? vec4(0.0,0.0,0.0,1.0)
+            : (uOutputPass == 1 ? vec4(1.0) : vec4(0.02745,0.03922,0.07059,1.0));
+        return;
+    }
     if (uOutputPass == 1) { outColor = vec4(vec3(clamp(travel / uMaximumDistance,0.0,1.0)),1.0); return; }
+    if (uOutputPass == 7) { outColor = vec4(vec3(sceneEdgeDistance(uv)),1.0); return; }
+    vec3 point = origin + direction * travel;
+    if (uOutputPass == 3) {
+        int contributor;
+        sceneDistanceWithMaterial(point,contributor);
+        int code = contributor < 0 ? 0 : int(uRecords[contributor].w);
+        outColor = vec4(vec3(code&255,(code>>8)&255,(code>>16)&255)/255.0,1.0); return;
+    }
+    if (uOutputPass == 4) { outColor = vec4(vec3(sceneCurvature(point)),1.0); return; }
+    vec3 normal = sceneNormal(point);
     if (uOutputPass == 2) { outColor = vec4(normal * 0.5 + 0.5,1.0); return; }
+    if (uOutputPass == 5) { outColor = vec4(vec3(sceneAmbientVisibility(point,normal)),1.0); return; }
     vec3 light = normalize(vec3(-0.45,0.75,0.6));
+    if (uOutputPass == 6) {
+        float visibility = dot(normal,light) <= 0.0 ? 0.0 : sceneShadow(point+normal*uEpsilon*4.0,light);
+        outColor = vec4(vec3(visibility),1.0); return;
+    }
     float diffuse = max(dot(normal,light),0.0), shadow = sceneShadow(point + normal*uEpsilon*4.0,light);
     float rim = pow(1.0 - max(dot(normal,-direction),0.0),3.0);
     outColor = vec4(vec3(0.12,0.42,0.88)*(0.12+0.88*diffuse*shadow)+vec3(0.18,0.35,0.65)*rim,1.0);
@@ -279,6 +382,14 @@ public:
     std::uint32_t height() const noexcept override { return height_; }
     std::uintptr_t colorImageHandle() const noexcept override { return texture_; }
     std::uintptr_t colorTextureViewHandle() const noexcept override { return texture_; }
+    NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    {
+        return { backend_, NativeTextureViewKind::Texture2D,
+                 NativeTexturePixelFormat::Rgba16Float, texture_, texture_, width_, height_,
+                 1, true, contextIdentity_, lifecycle_.value,
+                 colortransform::ColorSpace::LinearSRGB, colortransform::TransferFunction::Linear,
+                 NativeTextureRowOrder::BottomFirst };
+    }
     const FrameMemoryAdmission& frameMemoryAdmission() const noexcept override
     {
         return frameMemory_;
@@ -292,6 +403,7 @@ public:
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
     unsigned texture_ = 0;
+    std::uintptr_t contextIdentity_ = 0;
     RenderPassOutputBackend* outputBackend_ = nullptr;
     RenderPassOutputLifecycleHandle lifecycle_ {};
     FrameMemoryAdmission frameMemory_ {};
@@ -357,6 +469,16 @@ public:
             NativeSdfOutput::depth)] = true;
         result.supportedOutputs[static_cast<std::size_t> (
             NativeSdfOutput::normal)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::materialId)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::curvature)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::ambientOcclusion)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::softShadow)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::edgeDistance)] = true;
         result.maxOperations = kNativeSdfMaximumRecords;
         result.maxDepth = kNativeSdfMaximumDepth;
         result.maxExtent = static_cast<std::uint32_t> (std::min (maximumTextureSize, 4096));
@@ -403,9 +525,7 @@ public:
             || ! validQuality (request.adaptiveQuality)
             || ! validQuality (request.normalQuality)
             || ! validQuality (request.shadowQuality)
-            || (request.output != NativeSdfOutput::color
-                && request.output != NativeSdfOutput::depth
-                && request.output != NativeSdfOutput::normal))
+            || ! available.supports (request.output))
         {
             result.error = "OpenGL native SDF raymarch controls exceed backend limits";
             return result;
@@ -425,7 +545,7 @@ public:
         int previousVertexArray = 0;
         int previousTexture = 0;
         int previousViewport[4] = {};
-        int previousPolygonMode = 0;
+        int previousPolygonMode[2] = {}; // GL_POLYGON_MODE returns front and back modes.
         unsigned char previousColorMask[4] = {};
         const bool blendWasEnabled = glIsEnabled (GL_BLEND) == GL_TRUE;
         const bool depthWasEnabled = glIsEnabled (GL_DEPTH_TEST) == GL_TRUE;
@@ -440,13 +560,14 @@ public:
         glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &previousVertexArray);
         glGetIntegerv (GL_TEXTURE_BINDING_2D, &previousTexture);
         glGetIntegerv (GL_VIEWPORT, previousViewport);
-        glGetIntegerv (GL_POLYGON_MODE, &previousPolygonMode);
+        glGetIntegerv (GL_POLYGON_MODE, previousPolygonMode);
         glGetBooleanv (GL_COLOR_WRITEMASK, previousColorMask);
 
         unsigned vertexArray = 0;
         auto frame = std::make_shared<OpenGlSdfSceneFrame>();
         frame->width_ = request.width;
         frame->height_ = request.height;
+        frame->contextIdentity_ = reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext());
 
         renderpassoutput::Description outputDescription;
         outputDescription.extent = { request.width, request.height };
@@ -484,7 +605,7 @@ public:
         frame->receipt_.geometryCacheBytes = request.geometryCacheBytes;
         frame->receipt_.backendProgramBytes = std::strlen (kVertexShader) + std::strlen (kFragmentShader);
         frame->receipt_.uniformBytes = (kNativeSdfMaximumRecords * 12u * sizeof (float))
-            + 8u * sizeof (float);
+            + 4u * sizeof (float) + 6u * sizeof (int);
         frame->receipt_.attachmentBytes = outputAdmission.frameMemory.requestedBytes;
         frame->receipt_.totalBytes = frame->receipt_.compiledRecordBytes
             + frame->receipt_.geometryCacheBytes + frame->receipt_.backendProgramBytes
@@ -504,7 +625,7 @@ public:
             glBindTexture (GL_TEXTURE_2D, static_cast<unsigned> (previousTexture));
             glViewport (previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
             glPolygonMode (GL_FRONT_AND_BACK,
-                           static_cast<unsigned> (previousPolygonMode));
+                           static_cast<unsigned> (previousPolygonMode[0]));
             glColorMask (previousColorMask[0], previousColorMask[1],
                          previousColorMask[2], previousColorMask[3]);
             if (blendWasEnabled) glEnable (GL_BLEND); else glDisable (GL_BLEND);
@@ -545,7 +666,10 @@ public:
                 ? -1.0f : static_cast<float> (record.input0);
             gpuRecords[offset + 2] = record.input1 == std::numeric_limits<std::uint32_t>::max()
                 ? -1.0f : static_cast<float> (record.input1);
-            gpuRecords[offset + 3] = static_cast<float> (record.parameterCount);
+            // All 24 color bits fit exactly in a float. The shader does not
+            // consume parameterCount; admission already checked the schema.
+            gpuRecords[offset + 3] = static_cast<float> (
+                videohelper::sdf::nativeSdfMaterialColorCode (record.stableId));
             std::copy_n (record.parameters.data(), 4, gpuParameters0.data() + offset);
             std::copy_n (record.parameters.data() + 4, 4, gpuParameters1.data() + offset);
         }
@@ -1247,24 +1371,192 @@ private:
     std::uint64_t nextSubmission_ = 1;
 };
 
-class UnavailableOpticalFlowBackend final : public NativeOpticalFlowExecutionBackend
+const char* kOpticalFlowFragment = R"glsl(#version 330 core
+layout(location=0) out vec2 outFlow;
+uniform sampler2D uFirst;
+uniform sampler2D uSecond;
+uniform vec2 uExtent;
+float luma(vec4 c){ return dot(c.rgb,vec3(0.2126,0.7152,0.0722)); }
+ivec2 bounded(ivec2 p){ return clamp(p,ivec2(0),ivec2(uExtent)-ivec2(1)); }
+void main(){
+    ivec2 g=ivec2(gl_FragCoord.xy); float best=3.402823466e38; ivec2 bestD=ivec2(0); int bestMag=0;
+    for(int dy=-4;dy<=4;++dy) for(int dx=-4;dx<=4;++dx){
+        float score=0.0;
+        for(int py=-1;py<=1;++py) for(int px=-1;px<=1;++px){
+            ivec2 a=bounded(g+ivec2(px,py)); ivec2 b=bounded(g+ivec2(px+dx,py+dy));
+            float d=luma(texelFetch(uFirst,a,0))-luma(texelFetch(uSecond,b,0)); score+=d*d;
+        }
+        int mag=dx*dx+dy*dy; bool tie=score==best && (mag<bestMag || (mag==bestMag && (dy<bestD.y || (dy==bestD.y && dx<bestD.x))));
+        if(score<best || tie){best=score;bestD=ivec2(dx,dy);bestMag=mag;}
+    }
+    outFlow=vec2(bestD);
+})glsl";
+
+class OpenGlOpticalFlowBackend final : public NativeOpticalFlowExecutionBackend
 {
 public:
     videoopticalflow::BackendCapabilities opticalFlowCapabilities() const override
     {
-        return {};
+        videoopticalflow::BackendCapabilities result;
+        if (glfwGetCurrentContext()==nullptr) return result;
+        arbitgl::GlFuncs gl; std::string ignored; if(!loadCurrentGl(gl,ignored)) return result;
+        result.kind=videoopticalflow::BackendKind::NativeGpu; result.supportsOpticalFlow=true;
+        result.implementation={'G','L','B','l','o','c','k','F','l','o','w','0','0','0','0','1'};
+        result.implementationRevision=1; result.temporaryBytesPerPixel=0; return result;
     }
     NativeOpticalFlowSubmission executeOpticalFlow (
-        const videoopticalflow::AdmittedRequest&,
-        const NativeOpticalFlowInputResource&,
-        const NativeOpticalFlowInputResource&,
+        const videoopticalflow::AdmittedRequest& request,
+        const NativeOpticalFlowInputResource& first,
+        const NativeOpticalFlowInputResource& second,
         bool) override
     {
         NativeOpticalFlowSubmission result;
-        result.error = "native optical-flow execution requires the Metal compute backend";
+        std::lock_guard<std::mutex> lock(mutex_); auto* context=glfwGetCurrentContext();
+        if(context==nullptr){result.error="OpenGL optical-flow requires a current context";return result;}
+        const auto caps=opticalFlowCapabilities();
+        if(request.backendImplementation()!=caps.implementation || request.backendImplementationRevision()!=caps.implementationRevision){result.error="OpenGL optical-flow request was admitted for another backend revision";return result;}
+        const auto& extent=request.output().extent;
+        const bool exact=first.immutable&&second.immutable&&first.identity!=second.identity&&first.imageHandle&&second.imageHandle&&first.imageHandle!=second.imageHandle
+            && first.imageHandle==first.textureViewHandle&&second.imageHandle==second.textureViewHandle&&first.descriptor.extent==extent&&second.descriptor.extent==extent
+            && first.descriptor.format==renderpassoutput::PixelFormat::RGBA16Float&&second.descriptor.format==renderpassoutput::PixelFormat::RGBA16Float
+            && first.imageHandle <= std::numeric_limits<unsigned>::max()
+            && second.imageHandle <= std::numeric_limits<unsigned>::max()
+            && first.helperGeneration != 0 && first.helperGeneration == second.helperGeneration
+            && first.structuralRevision != 0 && first.structuralRevision == second.structuralRevision;
+        if(!exact){result.error="OpenGL optical-flow inputs violate exact immutable RGBA16F bindings";return result;}
+        arbitgl::GlFuncs gl; if(!loadCurrentGl(gl,result.error)) return result; if(!ensureProgram(context,gl,result.error)) return result;
+        collectRetired(context);
+        const State saved(gl);
+        gl.ActiveTexture(GL_TEXTURE0);
+        for (const auto* source : {&first, &second})
+        {
+            const auto texture = static_cast<unsigned>(source->textureViewHandle);
+            if (glIsTexture(texture) != GL_TRUE)
+            { result.error = "OpenGL optical-flow source texture is unavailable in this context"; return result; }
+            glBindTexture(GL_TEXTURE_2D, texture);
+            int width = 0, height = 0, format = 0;
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+            if (width != static_cast<int>(extent.width) || height != static_cast<int>(extent.height)
+                || format != GL_RGBA16F)
+            { result.error = "OpenGL optical-flow source storage does not match its admitted descriptor"; return result; }
+        }
+        unsigned output=0,fbo=0; glGenTextures(1,&output); glBindTexture(GL_TEXTURE_2D,output); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RG16F,(int)extent.width,(int)extent.height,0,GL_RG,GL_HALF_FLOAT,nullptr);
+        gl.GenFramebuffers(1,&fbo); gl.BindFramebuffer(GL_FRAMEBUFFER,fbo); gl.FramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,output,0);
+        if(gl.CheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){gl.DeleteFramebuffers(1,&fbo);glDeleteTextures(1,&output);result.error="OpenGL optical-flow output framebuffer is incomplete";return result;}
+        auto& p=programs_[context]; gl.UseProgram(p.program); gl.ActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,(unsigned)first.textureViewHandle); gl.Uniform1i(p.first,0); gl.ActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,(unsigned)second.textureViewHandle); gl.Uniform1i(p.second,1); gl.Uniform2f(p.extent,(float)extent.width,(float)extent.height);
+        for (const auto capability : State::capabilities) glDisable(capability);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glViewport(0,0,(int)extent.width,(int)extent.height); gl.BindVertexArray(p.vao); glDrawArrays(GL_TRIANGLES,0,3); glFinish(); gl.DeleteFramebuffers(1,&fbo);
+        do result.lifecycle.value=nextLifecycle_++; while(!result.lifecycle||outputs_.count(result.lifecycle.value)); outputs_[result.lifecycle.value]={context,output}; do result.submission=nextSubmission_++; while(result.submission==0);
+        result.result.requestCacheKey=request.cacheKey(); result.result.backendImplementation=request.backendImplementation(); result.result.backendImplementationRevision=request.backendImplementationRevision(); result.result.motionVectors.helperGeneration=first.helperGeneration; result.result.motionVectors.descriptor=request.output(); result.result.motionVectors.byteCount=request.footprint().outputBytes; std::memcpy(result.result.motionVectors.identity.data(),&result.lifecycle.value,sizeof(result.lifecycle.value)); std::memcpy(result.result.motionVectors.identity.data()+sizeof(result.lifecycle.value),&result.submission,sizeof(result.submission)); result.imageHandle=output; result.textureViewHandle=output; result.completed=true;
         return result;
     }
-    void releaseOpticalFlowOutput (NativeOpticalFlowOutputLifecycleHandle) noexcept override {}
+    void releaseOpticalFlowOutput (NativeOpticalFlowOutputLifecycleHandle lifecycle) noexcept override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = outputs_.find(lifecycle.value);
+        if (found == outputs_.end()) return;
+        auto& output = found->second;
+        if (output.texture == 0 || output.context == glfwGetCurrentContext())
+        {
+            if (output.texture != 0) glDeleteTextures(1, &output.texture);
+            outputs_.erase(found);
+        }
+        else
+            output.retired = true; // Drain on its render thread, never steal a live context.
+    }
+    void invalidateContext(std::uintptr_t identity) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto* context = reinterpret_cast<GLFWwindow*>(identity);
+        if (context == nullptr || glfwGetCurrentContext() != context) return;
+        arbitgl::GlFuncs gl;
+        std::string ignored;
+        if (!loadCurrentGl(gl, ignored)) return;
+        for (auto entry = outputs_.begin(); entry != outputs_.end();)
+        {
+            auto& output = entry->second;
+            if (output.context != context) { ++entry; continue; }
+            if (output.texture != 0) glDeleteTextures(1, &output.texture);
+            output.texture = 0;
+            output.context = nullptr;
+            if (output.retired) entry = outputs_.erase(entry);
+            else ++entry;
+        }
+        const auto program = programs_.find(context);
+        if (program != programs_.end())
+        {
+            if (program->second.vao) gl.DeleteVertexArrays(1, &program->second.vao);
+            if (program->second.program) gl.DeleteProgram(program->second.program);
+            programs_.erase(program);
+        }
+    }
+private:
+    struct Program{unsigned program=0,vao=0;int first=-1,second=-1,extent=-1;};
+    struct Output { GLFWwindow* context = nullptr; unsigned texture = 0; bool retired = false; };
+    struct State final
+    {
+        inline static constexpr std::array<GLenum, 8> capabilities {
+            GL_BLEND, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_CULL_FACE, GL_SCISSOR_TEST,
+            GL_RASTERIZER_DISCARD, GL_COLOR_LOGIC_OP, GL_FRAMEBUFFER_SRGB };
+        const arbitgl::GlFuncs& gl;
+        int drawFramebuffer = 0, readFramebuffer = 0, program = 0, vao = 0, activeTexture = 0;
+        int texture[2] {}, viewport[4] {}, polygonMode[2] {};
+        GLboolean colorMask[4] {};
+        std::array<GLboolean, capabilities.size()> enabled {};
+        explicit State(const arbitgl::GlFuncs& functions) : gl(functions)
+        {
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+            glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+            glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+            for (int unit = 0; unit < 2; ++unit)
+            {
+                gl.ActiveTexture(GL_TEXTURE0 + unit);
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture[unit]);
+            }
+            glGetIntegerv(GL_VIEWPORT, viewport);
+            glGetIntegerv(GL_POLYGON_MODE, polygonMode);
+            glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+            for (std::size_t i = 0; i < capabilities.size(); ++i) enabled[i] = glIsEnabled(capabilities[i]);
+        }
+        ~State()
+        {
+            gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<unsigned>(drawFramebuffer));
+            gl.BindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<unsigned>(readFramebuffer));
+            gl.UseProgram(static_cast<unsigned>(program));
+            gl.BindVertexArray(static_cast<unsigned>(vao));
+            for (int unit = 0; unit < 2; ++unit)
+            {
+                gl.ActiveTexture(GL_TEXTURE0 + unit);
+                glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(texture[unit]));
+            }
+            gl.ActiveTexture(static_cast<unsigned>(activeTexture));
+            glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            glPolygonMode(GL_FRONT_AND_BACK, static_cast<unsigned>(polygonMode[0]));
+            glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+            for (std::size_t i = 0; i < capabilities.size(); ++i)
+                if (enabled[i]) glEnable(capabilities[i]); else glDisable(capabilities[i]);
+        }
+    };
+    void collectRetired(GLFWwindow* context)
+    {
+        for (auto entry = outputs_.begin(); entry != outputs_.end();)
+            if (entry->second.context == context && entry->second.retired)
+            {
+                if (entry->second.texture != 0) glDeleteTextures(1, &entry->second.texture);
+                entry = outputs_.erase(entry);
+            }
+            else ++entry;
+    }
+    static bool loadCurrentGl(arbitgl::GlFuncs& gl,std::string& error){if(glfwGetCurrentContext()==nullptr){error="OpenGL optical-flow requires a current OpenGL 3.3 context";return false;}int major=0,minor=0;glGetIntegerv(GL_MAJOR_VERSION,&major);glGetIntegerv(GL_MINOR_VERSION,&minor);if(major<3||(major==3&&minor<3)){error="OpenGL optical-flow requires OpenGL 3.3";return false;}return arbitgl::loadGlFunctions(gl,error);}
+    bool ensureProgram(GLFWwindow* c,const arbitgl::GlFuncs& gl,std::string& error){if(programs_.count(c))return true; auto vs=compileShader(gl,GL_VERTEX_SHADER,kVertexShader,error);if(!vs)return false;auto fs=compileShader(gl,GL_FRAGMENT_SHADER,kOpticalFlowFragment,error);if(!fs){gl.DeleteShader(vs);return false;}Program p;p.program=gl.CreateProgram();gl.AttachShader(p.program,vs);gl.AttachShader(p.program,fs);gl.LinkProgram(p.program);gl.DeleteShader(vs);gl.DeleteShader(fs);int ok=0;gl.GetProgramiv(p.program,GL_LINK_STATUS,&ok);if(ok!=GL_TRUE){gl.DeleteProgram(p.program);error="OpenGL optical-flow program link failed";return false;}gl.GenVertexArrays(1,&p.vao);p.first=gl.GetUniformLocation(p.program,"uFirst");p.second=gl.GetUniformLocation(p.program,"uSecond");p.extent=gl.GetUniformLocation(p.program,"uExtent");programs_[c]=p;return true;}
+    std::mutex mutex_;std::unordered_map<GLFWwindow*,Program> programs_;std::unordered_map<std::uint64_t,Output> outputs_;std::uint64_t nextLifecycle_=1,nextSubmission_=1;
 };
 
 constexpr const char* kFixtureUnavailable
@@ -1315,6 +1607,12 @@ struct OpenGlFixtureState final
         glGetFloatv (GL_COLOR_CLEAR_VALUE, clearColor.data());
         glGetDoublev (GL_DEPTH_CLEAR_VALUE, &clearDepth);
         blend = glIsEnabled (GL_BLEND) == GL_TRUE;
+        glGetIntegerv(GL_BLEND_SRC_RGB,&blendFactors[0]);
+        glGetIntegerv(GL_BLEND_DST_RGB,&blendFactors[1]);
+        glGetIntegerv(GL_BLEND_SRC_ALPHA,&blendFactors[2]);
+        glGetIntegerv(GL_BLEND_DST_ALPHA,&blendFactors[3]);
+        for (unsigned i = 0; i < attachmentBlends.size(); ++i)
+            attachmentBlends[i] = gl.IsEnabledi(GL_BLEND, i) == GL_TRUE;
         depthTest = glIsEnabled (GL_DEPTH_TEST) == GL_TRUE;
         cullFace = glIsEnabled (GL_CULL_FACE) == GL_TRUE;
         scissor = glIsEnabled (GL_SCISSOR_TEST) == GL_TRUE;
@@ -1351,6 +1649,9 @@ struct OpenGlFixtureState final
         glPixelStorei (GL_UNPACK_SKIP_PIXELS, unpackSkipPixels);
         glPixelStorei (GL_UNPACK_SKIP_ROWS, unpackSkipRows);
         restoreEnable (GL_BLEND, blend);
+        gl.BlendFuncSeparate(blendFactors[0],blendFactors[1],blendFactors[2],blendFactors[3]);
+        for (unsigned i = 0; i < attachmentBlends.size(); ++i)
+            attachmentBlends[i] ? gl.Enablei(GL_BLEND, i) : gl.Disablei(GL_BLEND, i);
         restoreEnable (GL_DEPTH_TEST, depthTest);
         restoreEnable (GL_CULL_FACE, cullFace);
         restoreEnable (GL_SCISSOR_TEST, scissor);
@@ -1394,6 +1695,8 @@ struct OpenGlFixtureState final
     std::array<float, 4> clearColor {};
     double clearDepth = 1.0;
     bool blend = false;
+    std::array<bool, 8> attachmentBlends {};
+    std::array<int, 4> blendFactors {};
     bool depthTest = false;
     bool cullFace = false;
     bool scissor = false;
@@ -1413,19 +1716,37 @@ layout(location=6) in vec4 aInstanceMatrix1;
 layout(location=7) in vec4 aInstanceMatrix2;
 layout(location=8) in vec4 aInstanceMatrix3;
 layout(location=9) in vec4 aInstanceIdentityColor;
+layout(location=10) in vec4 aInstanceColor;
+layout(location=11) in vec4 aInstanceEmission;
 uniform mat4 uObjectMatrix;
 uniform float uTangentHandednessSign;
 uniform int uUseInstanceMatrix;
+uniform vec4 uRawIdentifiers[64];
+uniform int uRawObjectIndex;
+flat out vec4 vRawIdentifiers;
 uniform vec4 uCameraRotation;
 uniform vec3 uCameraTranslation;
 uniform vec4 uProjection;
 uniform vec4 uBaseColor;
+uniform vec4 uMotionRotation;
+uniform vec4 uMotionTranslationScale;
+uniform vec4 uPreviousCameraRotation;
+uniform vec4 uPreviousCameraTranslation;
+uniform vec4 uPreviousProjection;
+out vec4 vMotionCurrentClip;
+out vec4 vMotionPreviousClip;
 uniform vec4 uMaterialParams;
 uniform vec4 uTimeMixEndColorAndTime;
+uniform vec4 uVertexTime;
+uniform vec4 uVertexSpectrum[16];
 uniform vec3 uEmissive;
 uniform vec3 uAmbient;
 uniform vec4 uNoteInstanceTransforms[128];
 uniform int uNoteInstanceIndex;
+uniform float uNoteMeshScale;
+uniform vec4 uNoteAppearanceLow;
+uniform vec4 uNoteAppearanceHigh;
+flat out vec4 vNoteAppearance;
 out vec2 vUv;
 out vec3 vBaseColor;
 out vec3 vLitBase;
@@ -1442,14 +1763,17 @@ vec3 rotateQ(vec4 q, vec3 v) {
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
 }
 void main() {
+    vRawIdentifiers = uRawIdentifiers[uUseInstanceMatrix != 0 ? gl_InstanceID : uRawObjectIndex];
     mat4 objectMatrix = uUseInstanceMatrix != 0
         ? mat4(aInstanceMatrix0, aInstanceMatrix1,
                aInstanceMatrix2, aInstanceMatrix3)
         : uObjectMatrix;
     int noteIndex = uNoteInstanceIndex >= 0 ? uNoteInstanceIndex : gl_InstanceID;
     vec4 noteInstance = uNoteInstanceTransforms[noteIndex];
+    vNoteAppearance = mix(uNoteAppearanceLow, uNoteAppearanceHigh, noteInstance.w);
+    // ARBIT_VERTEX_MODIFIER
     vec3 world = (objectMatrix
-        * vec4(aPosition * noteInstance.w + noteInstance.xyz, 1.0)).xyz;
+        * vec4(modifiedPosition * uNoteMeshScale + noteInstance.xyz, 1.0)).xyz;
     vec3 worldNormal = normalize(transpose(inverse(mat3(objectMatrix))) * aNormal);
     vec4 inverseCamera = vec4(-uCameraRotation.xyz, uCameraRotation.w);
     vec3 camera = rotateQ(inverseCamera, world - uCameraTranslation);
@@ -1462,6 +1786,15 @@ void main() {
                                / (uProjection.w - uProjection.z),
                        distance);
     float metallic = uMaterialParams.x;
+    vMotionCurrentClip = gl_Position;
+    vec3 previousWorld = rotateQ(uMotionRotation, world) * uMotionTranslationScale.w
+        + uMotionTranslationScale.xyz;
+    vec3 previousCamera = rotateQ(vec4(-uPreviousCameraRotation.xyz, uPreviousCameraRotation.w),
+        previousWorld - uPreviousCameraTranslation.xyz);
+    vMotionPreviousClip = uPreviousProjection.w > 0.5 && -previousCamera.z > uPreviousProjection.z
+        ? vec4(previousCamera.x / (uPreviousProjection.x * uPreviousProjection.y),
+               previousCamera.y / uPreviousProjection.x, 0.0, -previousCamera.z)
+        : vMotionCurrentClip;
     float roughness = uMaterialParams.y;
     vec3 resolvedBaseColor = uMaterialParams.w > 0.5
         ? mix(uBaseColor.xyz, uTimeMixEndColorAndTime.xyz,
@@ -1473,8 +1806,9 @@ void main() {
             ? mix(vec3(1.0), aInstanceIdentityColor.rgb,
                   step(0.5, aInstanceIdentityColor.a))
             : vec3(1.0));
+    if (uUseInstanceMatrix != 0) vBaseColor *= aInstanceColor.rgb;
     vLitBase = vBaseColor * uAmbient;
-    vEmissive = uEmissive;
+    vEmissive = uEmissive + (uUseInstanceMatrix != 0 ? aInstanceEmission.rgb : vec3(0.0));
     vWorldPosition = world;
     vWorldNormal = worldNormal;
     vWorldTangent = normalize(mat3(objectMatrix) * aTangent.xyz);
@@ -1483,7 +1817,7 @@ void main() {
     vMetallicRoughness = vec2(metallic, roughness);
     vLinearDepth = clamp((distance - uProjection.z)
         / max(uProjection.w - uProjection.z, 0.000001), 0.0, 1.0);
-    vOpacity = uBaseColor.w * aColor.a;
+    vOpacity = uBaseColor.w * aColor.a * (uUseInstanceMatrix != 0 ? aInstanceColor.a : 1.0);
     vInstanceIdentityColor = uUseInstanceMatrix != 0
         ? aInstanceIdentityColor : vec4(0.0);
 }
@@ -1502,6 +1836,16 @@ in vec2 vMetallicRoughness;
 in float vLinearDepth;
 in float vOpacity;
 flat in vec4 vInstanceIdentityColor;
+flat in vec4 vNoteAppearance;
+flat in vec4 vRawIdentifiers;
+in vec4 vMotionCurrentClip;
+in vec4 vMotionPreviousClip;
+uniform vec4 uPassProgramControl;
+uniform vec4 uPassModes[8];
+uniform vec4 uPassColors[8];
+uniform vec4 uPassReferences[8];
+uniform vec4 uPassTransforms[8];
+uniform vec4 uMotionViewport;
 uniform sampler2D uBaseTexture;
 uniform sampler2D uMetallicRoughnessTexture;
 uniform sampler2D uNormalTexture;
@@ -1510,8 +1854,10 @@ uniform sampler2D uEmissiveTexture;
 uniform vec4 uTexturePresence;
 uniform float uEmissiveTexturePresence;
 uniform vec2 uAlphaModeCutoff;
+uniform vec4 uImageOutput;
 uniform vec4 uMaterialParams;
 uniform vec3 uAmbient;
+uniform vec4 uSurfaceCoating;
 uniform int uMaterialKind;
 uniform vec3 uCameraTranslation;
 uniform vec4 uLightRotation;
@@ -1537,8 +1883,64 @@ uniform vec4 uDiffractionFoilField[4];
 uniform vec4 uDiffractionOccupancyRectangles[5];
 uniform vec4 uDiffractionSpatialCounts;
 uniform vec4 uDiffractionEvaluationSchedule;
+uniform vec4 uDiffractionEnvironment;
 layout(location=0) out vec4 outColor;
 layout(location=1) out float outLinearDepth;
+layout(location=2) out vec4 outRawNormal;
+layout(location=3) out vec4 outRawEmission;
+layout(location=4) out float outRawMask;
+layout(location=5) out uint outRawMaterialId;
+layout(location=6) out uint outRawObjectId;
+layout(location=7) out vec2 outRawMotion;
+
+vec4 compositePass(vec4 color) {
+    int count = int(uPassProgramControl.x);
+    if (count == 0) return color;
+    vec4 values[8];
+    for (int i = 0; i < 8; ++i) {
+        if (i >= count) break;
+        vec4 p = uPassModes[i];
+        int mode = int(p.x);
+        float depth = clamp((outLinearDepth - p.y) / (p.z - p.y), 0.0, 1.0);
+        vec3 fog = uPassColors[i].rgb;
+        if (uPassTransforms[i].y > 0.5)
+            fog = mix(pow((fog + 0.055) / 1.055, vec3(2.4)), fog / 12.92,
+                lessThanEqual(fog, vec3(0.04045)));
+        uint identity = uint(uPassReferences[i].x) | (uint(uPassReferences[i].y) << 16u);
+        vec4 value = vec4(color.rgb, outRawMask);
+        if (mode == 1) value = vec4(mix(color.rgb, fog, depth * p.w), outRawMask);
+        float inspectionAlpha = uPassTransforms[i].w > 0.5 ? 1.0 : outRawMask;
+        if (mode == 2) value = vec4(vec3(uPassTransforms[i].w > 1.5 ? 1.0 - depth : depth), inspectionAlpha);
+        if (mode == 3) value = vec4(outRawNormal.xyz * 0.5 + 0.5, inspectionAlpha);
+        if (mode == 4) value = vec4(outRawEmission.rgb, outRawMask);
+        if (mode >= 5 && mode <= 7) {
+            float matte = outRawMask;
+            if (mode == 6) matte *= float(outRawMaterialId == identity);
+            if (mode == 7) matte *= float(outRawObjectId == identity);
+            value = vec4(vec3(matte), 1.0);
+        }
+        if (mode == 8) value = vec4(clamp(vec2(0.5) + outRawMotion / uMotionViewport.xy
+            * (1.0 + 63.0 * p.w), 0.0, 1.0), 0.5, outRawMask);
+        if (mode == 9 || mode == 10) {
+            vec4 a = values[int(uPassReferences[i].z) - 1];
+            vec4 b = values[int(uPassReferences[i].w) - 1];
+            value = mode == 9 ? mix(a, b, p.w)
+                : vec4(a.rgb + b.rgb * p.w, max(a.a, b.a));
+        }
+        value.rgb *= exp2(uPassTransforms[i].x);
+        values[i] = value;
+    }
+    int selected = int(uPassProgramControl.y);
+    vec4 value = values[selected];
+    int transform = int(uPassTransforms[selected].z);
+    if (transform > 0 && uPassProgramControl.z < 0.5) {
+        vec3 rgb = max(value.rgb, vec3(0.0));
+        if (transform == 2) rgb /= vec3(1.0) + rgb;
+        value.rgb = mix(1.055 * pow(rgb, vec3(1.0 / 2.4)) - 0.055, rgb * 12.92,
+            lessThanEqual(rgb, vec3(0.0031308)));
+    }
+    return uPassProgramControl.z > 0.5 ? value : clamp(value, 0.0, 1.0);
+}
 
 const float pi = 3.14159265358979323846;
 const int materialDiffractionReflective = 1;
@@ -1718,6 +2120,82 @@ float diffractionOrderContribution(int primaryOrder,
     return efficiency * lobe;
 }
 
+// Integrate discrete reciprocal orders. The environment is affine on the unit
+// sphere. A five-point angular rule follows the admitted roughness width.
+float diffractionEnvironmentSample(vec3 direction, vec3 position) {
+    bool hit = false;
+    if (direction.y < -1.0e-6 && position.y > uDiffractionEnvironment.y) {
+        float distance = (uDiffractionEnvironment.y - position.y) / direction.y;
+        hit = distance > 0.0 && distance <= uDiffractionEnvironment.z;
+    }
+    vec3 axis = uDiffractionIncidentDirectionAndIntensity.xyz;
+    if (uDiffractionPathKindAndBounce.x == 3.0)
+        return hit ? 0.625 + 0.25 * axis.y : 0.0;
+    return hit ? 0.0 : 0.625 + 0.375 * dot(axis, direction);
+}
+
+vec3 integrateDiffractionEnvironment(vec3 outgoing, vec3 tangent,
+                                    vec3 bitangent, vec3 normal) {
+    vec4 geometry;
+    vec4 secondaryGeometry;
+    resolveGrooveGeometry(vUv, geometry, secondaryGeometry);
+    bool crossed = int(secondaryGeometry.w + 0.5) == 2;
+    int firstOrder = int(round(uDiffractionMicrostructure.w));
+    int lastOrder = int(uDiffractionControl.x + 0.5);
+    int profile = int(uDiffractionControl.y + 0.5);
+    float duty = uDiffractionMicrostructure.x;
+    float sigma = max(2.0 * uDiffractionRoughness.y, 1.0e-4);
+    vec3 xyz = vec3(0.0);
+    float whiteY = 0.0;
+    for (int wavelengthIndex = 0; wavelengthIndex < 8; ++wavelengthIndex) {
+        vec4 spectral = uDiffractionSpectral[wavelengthIndex];
+        vec4 spectralZ = uDiffractionSpectralZ[wavelengthIndex];
+        float wavelength = spectral.x;
+        float radiance = 0.0;
+        float totalEfficiency = 0.0;
+        for (int primary = -lastOrder; primary <= lastOrder; ++primary) {
+            if (primary != 0 && abs(primary) < firstOrder) continue;
+            int secondaryLimit = crossed ? lastOrder : 0;
+            for (int secondary = -secondaryLimit; secondary <= secondaryLimit; ++secondary) {
+                if (secondary != 0 && abs(secondary) < firstOrder) continue;
+                vec2 xy = -outgoing.xy + float(primary) * wavelength / geometry.z * geometry.xy;
+                if (crossed)
+                    xy += float(secondary) * wavelength / secondaryGeometry.z * secondaryGeometry.xy;
+                if (dot(xy, xy) >= 1.0) continue;
+                float z = sqrt(max(0.0, 1.0 - dot(xy, xy)));
+                float phase = 2.0 * pi * geometry.w * (outgoing.z + z) / wavelength;
+                vec2 terrace = vec2(cos(phase), sin(phase));
+                float efficiency = profileEfficiency(profile, primary, duty, phase, terrace);
+                if (crossed) efficiency *= profileEfficiency(profile, secondary, duty, phase, terrace);
+                if (primary != 0 || secondary != 0) efficiency *= z / outgoing.z;
+                float height = 2.0 * pi * uDiffractionRoughness.x * (outgoing.z + z) / wavelength;
+                efficiency *= exp(-height * height);
+                vec3 direction = xy.x * tangent + xy.y * bitangent + z * normal;
+                vec3 side = normalize(cross(abs(direction.y) < 0.9
+                    ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), direction));
+                vec3 up = cross(direction, side);
+                float lighting = 0.5 * diffractionEnvironmentSample(direction, vWorldPosition);
+                lighting += 0.125 * diffractionEnvironmentSample(normalize(direction + sigma * side), vWorldPosition);
+                lighting += 0.125 * diffractionEnvironmentSample(normalize(direction - sigma * side), vWorldPosition);
+                lighting += 0.125 * diffractionEnvironmentSample(normalize(direction + sigma * up), vWorldPosition);
+                lighting += 0.125 * diffractionEnvironmentSample(normalize(direction - sigma * up), vWorldPosition);
+                radiance += efficiency * lighting;
+                totalEfficiency += efficiency;
+            }
+        }
+        float reflectance = spectralReflectance(wavelength, int(uDiffractionControl.w + 0.5),
+            uDiffractionMicrostructure.y, uDiffractionMicrostructure.z);
+        float energy = uDiffractionIncidentDirectionAndIntensity.w * spectral.y
+            * reflectance * spectralZ.y * radiance / max(1.0, totalEfficiency);
+        xyz += energy * vec3(spectral.z, spectral.w, spectralZ.x);
+        whiteY += spectralZ.y * spectral.w;
+    }
+    xyz /= max(whiteY, 1.0e-8);
+    return vec3(3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z,
+                -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z,
+                0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z);
+}
+
 vec3 evaluateDiffraction() {
     vec3 normal = normalize(vWorldNormal);
     vec3 dpdx = dFdx(vWorldPosition);
@@ -1737,8 +2215,16 @@ vec3 evaluateDiffraction() {
     vec3 incident = uDiffractionIncidentDirectionAndIntensity.xyz;
     vec3 outgoing = vec3(dot(toViewWorld, tangent), dot(toViewWorld, bitangent),
                          dot(toViewWorld, normal));
-    if (incident.z <= 0.0 || outgoing.z <= 0.0)
+    if (outgoing.z <= 0.0)
         return vec3(0.0);
+    if (uDiffractionEnvironment.x == 2.0 && uDiffractionPathKindAndBounce.x != 1.0)
+        return integrateDiffractionEnvironment(outgoing, tangent, bitangent, normal);
+    if (uDiffractionEnvironment.x == 2.0) {
+        if (uLightCount == 0) return vec3(0.0);
+        vec3 toLight = normalize(rotateQ(uLightRotations[0], vec3(0.0, 0.0, 1.0)));
+        incident = vec3(dot(toLight, tangent), dot(toLight, bitangent), dot(toLight, normal));
+    }
+    if (incident.z <= 1.0e-6) return vec3(0.0);
 
     float duty = uDiffractionMicrostructure.x;
     float substrateN = uDiffractionMicrostructure.y;
@@ -1817,6 +2303,7 @@ vec3 evaluateDiffraction() {
         float energy = uDiffractionIncidentDirectionAndIntensity.w
                      * spectral.y * pathTransport * quadrature * reflectance
                      * wavelengthRadiance * incident.z;
+        if (uDiffractionEnvironment.x == 2.0) energy *= uLightColors[0].w;
         xyz += energy * vec3(spectral.z, spectral.w, spectralZ.x);
         referenceWhiteY += quadrature * spectral.w;
     }
@@ -1828,6 +2315,17 @@ vec3 evaluateDiffraction() {
 
 void main() {
     outLinearDepth = vLinearDepth;
+    // Only graph Frames may be native scene attachments. Embedded glTF images
+    // keep their authored UVs and raster storage; w=2 declares a bottom-first Frame.
+    vec2 baseUv = uTexturePresence.w > 1.5 ? vec2(vUv.x, 1.0 - vUv.y) : vUv;
+    outRawNormal = vec4(normalize(vWorldNormal), 1.0);
+    outRawEmission = vec4(0.0);
+    outRawMask = 1.0;
+    outRawMaterialId = uint(vRawIdentifiers.x) | (uint(vRawIdentifiers.y) << 16u);
+    outRawObjectId = uint(vRawIdentifiers.z) | (uint(vRawIdentifiers.w) << 16u);
+    outRawMotion = clamp((vMotionCurrentClip.xy / vMotionCurrentClip.w
+        - vMotionPreviousClip.xy / vMotionPreviousClip.w) * 0.5 * uMotionViewport.xy,
+        vec2(-65504.0), vec2(65504.0));
     if (uMaterialKind == materialDiffractionReflective) {
         float coverage = uDiffractionSpatialCounts.y == 0.0
             ? 1.0 : uintBitsToFloat(floatBitsToUint(uDiffractionPathKindAndBounce.w));
@@ -1854,12 +2352,26 @@ void main() {
             ? max(evaluateDiffraction(), vec3(0.0)) : vLitBase;
         outColor = vec4(mix(vLitBase, diffraction,
             clamp(occupancy, 0.0, 1.0)), 1.0);
+        if (uTexturePresence.w > 0.5) {
+            vec4 imagery = texture(uBaseTexture, baseUv);
+            if (imagery.a <= 0.0) discard;
+            outColor *= vec4(srgbToLinear(imagery.rgb), imagery.a);
+        }
+        outColor.rgb = vNoteAppearance.rgb * (outColor.rgb + vec3(vNoteAppearance.a));
+        outColor = compositePass(outColor);
         return;
     }
-    vec4 texel = texture(uBaseTexture, vUv);
+    vec4 texel = texture(uBaseTexture, baseUv);
     texel.rgb = srgbToLinear(texel.rgb);
-    float alpha = vOpacity * texel.a;
-    if (uAlphaModeCutoff.x == 1.0 && alpha < uAlphaModeCutoff.y)
+    // Thin-surface, normal-incidence dielectric model. Transmission reveals
+    // the composited scene behind the surface; it is not volume refraction.
+    float interfaceRatio = (uSurfaceCoating.y - 1.0) / (uSurfaceCoating.y + 1.0);
+    float dielectric = uSurfaceCoating.w > 0.5 ? interfaceRatio * interfaceRatio : 0.04;
+    float transmission = uSurfaceCoating.w > 0.5 ? uSurfaceCoating.x : 0.0;
+    float coat = uSurfaceCoating.w > 0.5 ? 0.04 * uSurfaceCoating.z : 0.0;
+    float coverage = 1.0 - transmission * (1.0 - dielectric);
+    float alpha = vOpacity * texel.a * coverage;
+    if (alpha <= 0.0 || (uAlphaModeCutoff.x == 1.0 && alpha < uAlphaModeCutoff.y))
         discard;
     vec4 metallicRoughnessTexel = texture(uMetallicRoughnessTexture, vUv);
     float roughness = vMetallicRoughness.y * (uTexturePresence.x > 0.5 ? metallicRoughnessTexel.g : 1.0);
@@ -1871,6 +2383,28 @@ void main() {
         vec3 tangentNormal = texture(uNormalTexture, vUv).xyz * 2.0 - 1.0;
         tangentNormal.xy *= uMaterialParams.z;
         normal = normalize(mat3(tangent, bitangent, normal) * tangentNormal);
+    }
+    vec3 emissive = vEmissive * (uEmissiveTexturePresence > 0.5
+        ? srgbToLinear(texture(uEmissiveTexture, vUv).rgb) : vec3(1.0));
+    outRawNormal = vec4(normal, 1.0);
+    outRawEmission = vec4(vNoteAppearance.rgb * (emissive + vec3(vNoteAppearance.a)), 1.0);
+    outRawMask = clamp(alpha, 0.0, 1.0);
+    int imageOutput = int(uImageOutput.x);
+    if (imageOutput != 0) {
+        vec3 image = uImageOutput.yzw;
+        if (imageOutput == 1) image = vec3(vLinearDepth);
+        if (imageOutput == 2) image = normal * 0.5 + 0.5;
+        if (imageOutput == 3) image = vec3(clamp(vec2(0.5) + outRawMotion / uMotionViewport.xy, 0.0, 1.0), 0.5);
+        if (imageOutput == 4) image = vNoteAppearance.rgb * (emissive + vec3(vNoteAppearance.a));
+        if (imageOutput == 5) image = vec3(1.0);
+        if (imageOutput == 6 || imageOutput == 7) {
+            uint hash = (imageOutput == 6 ? outRawMaterialId : outRawObjectId) * 0x9e3779b9u;
+            hash ^= hash >> 16u;
+            image = vec3(32u + (hash & 191u), 32u + ((hash >> 8u) & 191u),
+                         32u + ((hash >> 16u) & 191u)) / 255.0;
+        }
+        outColor = vec4(image, alpha);
+        return;
     }
     vec3 lighting = uAmbient;
     for (int lightIndex = 0; lightIndex < 16; ++lightIndex) {
@@ -1894,16 +2428,17 @@ void main() {
         lighting += uLightColors[lightIndex].rgb * uLightColors[lightIndex].a
                   * max(dot(normal, normalize(toLight)), 0.0) * attenuation;
     }
-    float diffuseWeight = (1.0 - metallic) * (1.0 - 0.5 * roughness);
-    float specularWeight = mix(0.04, 1.0, metallic) * (1.0 - roughness);
+    float diffuseWeight = (1.0 - metallic) * (1.0 - 0.5 * roughness) * (1.0 - transmission);
+    float specularWeight = mix(dielectric, 1.0, metallic) * (1.0 - roughness);
     float occlusion = uTexturePresence.z > 0.5
         ? texture(uOcclusionTexture, vUv).r : 1.0;
-    vec3 emissive = vEmissive * (uEmissiveTexturePresence > 0.5
-        ? srgbToLinear(texture(uEmissiveTexture, vUv).rgb) : vec3(1.0));
-    outColor = vec4(vBaseColor * texel.rgb * lighting
-                    * (diffuseWeight + specularWeight) * occlusion + emissive, alpha);
+    outColor = vec4((vBaseColor * texel.rgb * lighting
+                    * (diffuseWeight + specularWeight) * (1.0 - coat) * occlusion
+                    + lighting * coat + emissive) / max(coverage, 0.000001), alpha);
+    outColor.rgb = vNoteAppearance.rgb * (outColor.rgb + vec3(vNoteAppearance.a));
     if (vInstanceIdentityColor.a > 0.5)
         outColor = vec4(vInstanceIdentityColor.rgb, 1.0);
+    outColor = compositePass(outColor);
 }
 )glsl";
 
@@ -1942,6 +2477,7 @@ struct OpenGlFixtureUniformLocations final
     int projection = -1;
     int baseColor = -1;
     int materialParams = -1;
+    int surfaceCoating = -1;
     int timeMixEndColorAndTime = -1;
     int emissive = -1;
     int ambient = -1;
@@ -1963,6 +2499,13 @@ struct OpenGlFixtureUniformLocations final
     int texturePresence = -1;
     int emissiveTexturePresence = -1;
     int alphaModeCutoff = -1;
+    int imageOutput = -1;
+    int rawIdentifiers = -1, rawObjectIndex = -1;
+    int passProgramControl = -1, passModes = -1, passColors = -1, passReferences = -1, passTransforms = -1;
+    int motionRotation = -1, motionTranslationScale = -1;
+    int previousCameraRotation = -1, previousCameraTranslation = -1, previousProjection = -1;
+    int motionViewport = -1;
+    int vertexTime = -1, vertexSpectrum = -1;
     int materialKind = -1;
     int diffractionGeometry = -1;
     int diffractionSecondaryGeometry = -1;
@@ -1980,21 +2523,25 @@ struct OpenGlFixtureUniformLocations final
     int diffractionOccupancyRectangles = -1;
     int diffractionSpatialCounts = -1;
     int diffractionEvaluationSchedule = -1;
+    int diffractionEnvironment = -1;
     int noteInstanceTransforms = -1;
     int noteInstanceIndex = -1;
+    int noteMeshScale = -1;
+    int noteAppearanceLow = -1;
+    int noteAppearanceHigh = -1;
 
     bool complete() const noexcept
     {
         return objectMatrix >= 0 && tangentHandednessSign >= 0
             && useInstanceMatrix >= 0
             && cameraRotation >= 0 && cameraTranslation >= 0 && projection >= 0
-            && baseColor >= 0 && materialParams >= 0
+            && baseColor >= 0 && materialParams >= 0 && surfaceCoating >= 0
             && timeMixEndColorAndTime >= 0 && emissive >= 0 && ambient >= 0
             && baseTexture >= 0 && lightCount >= 0
             && metallicRoughnessTexture >= 0 && normalTexture >= 0
             && occlusionTexture >= 0 && emissiveTexture >= 0
             && texturePresence >= 0 && emissiveTexturePresence >= 0
-            && alphaModeCutoff >= 0
+            && alphaModeCutoff >= 0 && imageOutput >= 0
             && materialKind >= 0 && diffractionGeometry >= 0
             && diffractionSecondaryGeometry >= 0
             && diffractionMicrostructure >= 0 && diffractionControl >= 0
@@ -2005,14 +2552,29 @@ struct OpenGlFixtureUniformLocations final
             && diffractionPathKindAndBounce >= 0
             && diffractionFoilField >= 0 && diffractionOccupancyRectangles >= 0
             && diffractionSpatialCounts >= 0
-            && diffractionEvaluationSchedule >= 0 && noteInstanceTransforms >= 0
-            && noteInstanceIndex >= 0;
+            && diffractionEvaluationSchedule >= 0 && diffractionEnvironment >= 0
+            && noteInstanceTransforms >= 0
+            && noteInstanceIndex >= 0 && noteMeshScale >= 0
+            && noteAppearanceLow >= 0 && noteAppearanceHigh >= 0;
     }
 };
 
 class OpenGlFixtureSceneResources final : public NativeFixtureSceneResources
 {
 public:
+    struct SharedProgram final
+    {
+        GLFWwindow* context = nullptr;
+        arbitgl::GlFuncs gl {};
+        unsigned id = 0;
+        ~SharedProgram()
+        {
+            // Scene resources and the context cache release their program leases
+            // under fixtureMutex while this program's context is current.
+            if (id != 0 && context != nullptr && glfwGetCurrentContext()==context)
+                gl.DeleteProgram(id);
+        }
+    };
     ~OpenGlFixtureSceneResources() override
     {
         if (! hasResources() || ownerContext == nullptr)
@@ -2038,7 +2600,6 @@ public:
 
     void destroyUnlocked() noexcept
     {
-        if (program != 0) gl.DeleteProgram (program);
         if (! textures.empty())
             glDeleteTextures (static_cast<int> (textures.size()), textures.data());
         if (indexBuffer != 0) gl.DeleteBuffers (1, &indexBuffer);
@@ -2051,6 +2612,7 @@ public:
         instanceBuffer = 0;
         textures.clear();
         program = 0;
+        sharedProgram.reset();
     }
 
     std::string backend_ = "opengl";
@@ -2058,6 +2620,7 @@ public:
     arbitgl::GlFuncs gl {};
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> snapshot;
     std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> materialProgram;
+    std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> materialProgramSource;
     // Identifies one prepared static-resource lifetime. Frames rendered from the
     // same preparation retain this value; preparing again allocates a new one.
     std::uint64_t rendererGeneration = 0;
@@ -2067,8 +2630,10 @@ public:
     unsigned instanceBuffer = 0;
     bool instancedSharedGeometry = false;
     bool diagnosticInstanceIdentityColors = false;
+    std::vector<videowire::geometry::InstanceAppearance> instanceAppearances;
     std::vector<unsigned> textures;
     unsigned program = 0;
+    std::shared_ptr<SharedProgram> sharedProgram;
     OpenGlFixtureUniformLocations uniforms {};
 };
 
@@ -2077,7 +2642,7 @@ class OpenGlFixtureSceneFrame final : public NativeFixtureSceneFrame
 public:
     ~OpenGlFixtureSceneFrame() override
     {
-        if ((texture_ == 0 && depthTexture_ == 0) || ownerContext == nullptr)
+        if (ownerContext == nullptr)
             return;
         std::lock_guard<std::mutex> lock (fixtureMutex());
         auto* previous = glfwGetCurrentContext();
@@ -2086,6 +2651,7 @@ public:
         if (glfwGetCurrentContext() == ownerContext)
         {
             if (depthTexture_ != 0) glDeleteTextures (1, &depthTexture_);
+            glDeleteTextures(static_cast<int>(rawTextures.size()), rawTextures.data());
             if (texture_ != 0) glDeleteTextures (1, &texture_);
         }
         if (previous != ownerContext)
@@ -2106,14 +2672,32 @@ public:
     NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
     {
         return { backend_, NativeTextureViewKind::Texture2D,
-                 NativeTexturePixelFormat::Rgba8Unorm, texture_, texture_, width_, height_, 1,
-                 true, reinterpret_cast<std::uintptr_t>(ownerContext), rendererGeneration_ };
+                 linearColor ? NativeTexturePixelFormat::Rgba16Float : NativeTexturePixelFormat::Rgba8Unorm,
+                 texture_, texture_, width_, height_, 1,
+                 true, reinterpret_cast<std::uintptr_t>(ownerContext), rendererGeneration_,
+                 linearColor ? colortransform::ColorSpace::LinearSRGB : colortransform::ColorSpace::Unspecified,
+                 linearColor ? colortransform::TransferFunction::Linear : colortransform::TransferFunction::Unspecified,
+                 NativeTextureRowOrder::BottomFirst };
     }
     NativeTextureViewDescriptor depthTextureDescriptor() const noexcept override
     {
         return { backend_, NativeTextureViewKind::Texture2D,
                  NativeTexturePixelFormat::R32Float, depthTexture_, depthTexture_, width_, height_, 1,
-                 true, reinterpret_cast<std::uintptr_t>(ownerContext), rendererGeneration_ };
+                 true, reinterpret_cast<std::uintptr_t>(ownerContext), rendererGeneration_,
+                 colortransform::ColorSpace::Unspecified, colortransform::TransferFunction::Unspecified,
+                 NativeTextureRowOrder::BottomFirst };
+    }
+
+    NativeTextureViewDescriptor passTextureDescriptor(renderpassoutput::Output output) const noexcept override
+    {
+        for (std::size_t i = 2; i < renderpasscomposite::kInputs.size(); ++i)
+            if (renderpasscomposite::kInputs[i] == output)
+                return { backend_, NativeTextureViewKind::Texture2D, rawFormats[i - 2],
+                    rawTextures[i - 2], rawTextures[i - 2], width_, height_, 1, true,
+                    reinterpret_cast<std::uintptr_t>(ownerContext), rendererGeneration_,
+                    colortransform::ColorSpace::Unspecified, colortransform::TransferFunction::Unspecified,
+                    NativeTextureRowOrder::BottomFirst };
+        return NativeFixtureSceneFrame::passTextureDescriptor(output);
     }
 
     std::string backend_ = "opengl";
@@ -2121,15 +2705,83 @@ public:
     std::uint32_t height_ = 0;
     GLFWwindow* ownerContext = nullptr;
     std::shared_ptr<const OpenGlFixtureSceneResources> staticResources;
+    bool linearColor = false;
+    std::shared_ptr<const NativeFixtureSceneFrame> materialFrameTexture;
+    std::map<surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint,
+        std::shared_ptr<const NativeFixtureSceneFrame>> materialFrameTextures;
     std::uint64_t rendererGeneration_ = 0;
     unsigned texture_ = 0;
     unsigned depthTexture_ = 0;
+    bool readRawPass(renderpassoutput::Output output, NativeRawPassPixels& pixels,
+                     std::string& error) const override
+    {
+        pixels = {};
+        std::lock_guard<std::mutex> lock(fixtureMutex());
+        const auto descriptor = passTextureDescriptor(output);
+        if (!descriptor.complete() || !rawPassFormatMatches(output, descriptor.format)
+            || !nativeFixtureDimensionsWithinBounds(width_, height_)
+            || !staticResources || glfwGetCurrentContext() != ownerContext)
+        { error = "OpenGL raw pass requires its live owning context and supported attachment"; return false; }
+        GLenum layout = GL_RED, type = GL_UNSIGNED_BYTE;
+        switch (descriptor.format)
+        {
+            case NativeTexturePixelFormat::Rgba8Unorm: layout = GL_RGBA; break;
+            case NativeTexturePixelFormat::Rgba16Float: layout = GL_RGBA; type = GL_HALF_FLOAT; break;
+            case NativeTexturePixelFormat::Rg16Float: layout = GL_RG; type = GL_HALF_FLOAT; break;
+            case NativeTexturePixelFormat::R32Float: type = GL_FLOAT; break;
+            case NativeTexturePixelFormat::R32Uint: layout = GL_RED_INTEGER; type = GL_UNSIGNED_INT; break;
+            case NativeTexturePixelFormat::R8Unorm: break;
+            default: error = "OpenGL raw attachment format is unsupported"; return false;
+        }
+        if (glGetError() != GL_NO_ERROR)
+        { error = "OpenGL raw pass encountered an earlier GPU error"; return false; }
+        const auto rowBytes = static_cast<std::size_t>(width_) * rawPassChannels(descriptor.format)
+            * rawPassScalarBytes(descriptor.format);
+        NativeRawPassPixels candidate { descriptor.format, width_, height_,
+            std::vector<std::uint8_t>(rowBytes * height_) };
+        GLint texture = 0, buffer = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &buffer);
+        constexpr std::array<GLenum, 6> packNames {
+            GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS,
+            GL_PACK_SKIP_ROWS, GL_PACK_SWAP_BYTES, GL_PACK_LSB_FIRST };
+        std::array<GLint, 6> packValues {};
+        for (std::size_t i = 0; i < packNames.size(); ++i)
+        {
+            glGetIntegerv(packNames[i], &packValues[i]);
+            glPixelStorei(packNames[i], i == 0 ? 1 : 0);
+        }
+        staticResources->gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(descriptor.imageHandle));
+        glGetTexImage(GL_TEXTURE_2D, 0, layout, type, candidate.bytes.data());
+        const auto result = glGetError();
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture));
+        staticResources->gl.BindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(buffer));
+        for (std::size_t i = 0; i < packNames.size(); ++i) glPixelStorei(packNames[i], packValues[i]);
+        if (result != GL_NO_ERROR)
+        { error = "OpenGL raw pass readback failed"; return false; }
+        for (std::uint32_t y = 0; y < height_ / 2; ++y)
+            std::swap_ranges(candidate.bytes.data() + y * rowBytes,
+                candidate.bytes.data() + (y + 1) * rowBytes,
+                candidate.bytes.data() + (height_ - 1 - y) * rowBytes);
+        pixels = std::move(candidate);
+        error.clear();
+        return true;
+    }
+
+    std::array<unsigned, 6> rawTextures {};
+    inline static constexpr std::array<NativeTexturePixelFormat, 6> rawFormats {
+        NativeTexturePixelFormat::Rgba16Float, NativeTexturePixelFormat::Rgba16Float,
+        NativeTexturePixelFormat::R8Unorm, NativeTexturePixelFormat::R32Uint,
+        NativeTexturePixelFormat::R32Uint, NativeTexturePixelFormat::Rg16Float };
 };
 
 struct OpenGlInstanceGpuRecord final
 {
     std::array<float, 16> matrix {};
     std::array<float, 4> identityColor {};
+    std::array<float, 4> color {1,1,1,1};
+    std::array<float, 4> emission {};
 };
 
 struct OpenGlFixtureUniforms final
@@ -2226,6 +2878,14 @@ std::array<float, 16> fixtureWorldMatrix (
 class OpenGlFixtureSceneBackend final : public NativeFixtureSceneBackend
 {
 public:
+    void releaseCachedProgramsForCurrentContext() noexcept override
+    {
+        auto* context = glfwGetCurrentContext();
+        if (context == nullptr) return;
+        std::lock_guard<std::mutex> lock (fixtureMutex());
+        programCache_.erase(context);
+    }
+
     BackendInfo info() const override
     {
         BackendInfo result;
@@ -2259,6 +2919,7 @@ public:
         if (! available.available) return capabilities;
         capabilities.immutableSourceBuffers = true;
         capabilities.stableElementIds = true;
+        capabilities.typedFieldEvaluation = true;
         capabilities.gpuInstancingWithoutMeshExpansion = true;
         capabilities.supportedCarriers =
             (1u << static_cast<unsigned> (
@@ -2271,7 +2932,7 @@ public:
         capabilities.maxCurvePoints = 1;
         capabilities.maxSplines = 1;
         capabilities.maxInstances = HarmonicMIDI::grid::Visual3DScene::kMaxObjects;
-        capabilities.maxFieldElements = 1;
+        capabilities.maxFieldElements = HarmonicMIDI::grid::Visual3DScene::kMaxVertices;
         capabilities.maxAttributes = videowire::geometry::kMaximumAttributes;
         capabilities.maxOperations = videowire::geometry::kMaximumOperations;
         capabilities.maxDispatches = videowire::geometry::kMaximumDispatches;
@@ -2290,15 +2951,13 @@ public:
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& requestedMaterialProgram,
         const std::shared_ptr<const videohelper::geometry::AdmittedPlanValue>& geometryAdmission,
-        bool diagnosticInstanceIdentityColors) override
+        bool diagnosticInstanceIdentityColors,
+        const std::vector<videowire::geometry::AttributeData>* frameAttributes = nullptr) override
     {
         using namespace HarmonicMIDI::grid;
 
         NativeFixtureScenePreparation result;
-        const auto materialProgram = requestedMaterialProgram == nullptr
-            ? std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> {}
-            : std::make_shared<const NativeFixtureSurfaceMaterialProgram> (
-                *requestedMaterialProgram);
+        const auto materialProgram = snapshotNativeSurfaceProgram(requestedMaterialProgram);
         std::lock_guard<std::mutex> lock (fixtureMutex());
         if (scene == nullptr || ! validateVisual3DScene (*scene).valid()
             || scene->objectCount == 0 || scene->materialCount == 0
@@ -2313,8 +2972,7 @@ public:
         const auto& sceneMaterial = scene->materials[0];
         const bool materialKindValid = materialProgram == nullptr
             || (materialProgram->kind == NativeFixtureMaterialKind::SurfacePbr
-                && materialProgram->parameters.identifiers[0] == sceneMaterial.id.value
-                && validNativeFixtureSurfaceParameters (materialProgram->parameters))
+                && validNativeSurfaceObjectPrograms(*materialProgram, *scene, NativeFixtureMaterialBackend::OpenGl))
             || validNativeFixtureDiffractionProgram (
                 *materialProgram, NativeFixtureMaterialBackend::OpenGl,
                 scene->objects[0].id);
@@ -2324,7 +2982,12 @@ public:
                 || materialProgram->backend != NativeFixtureMaterialBackend::OpenGl
                 || materialProgram->programIdentity.empty()
                 || materialProgram->bindingDigest.empty()
-                || materialProgram->object != scene->objects[0].id
+                || (materialProgram->kind != NativeFixtureMaterialKind::SurfacePbr
+                    && (materialProgram->object != scene->objects[0].id || !materialProgram->objectPrograms.empty()))
+                || (materialProgram->vertexProgram
+                    && (materialProgram->kind != NativeFixtureMaterialKind::SurfacePbr
+                        || scene->objectCount != 1
+                        || materialProgram->vertexProgram->programIdentity() != materialProgram->programIdentity))
                 || ! materialKindValid))
         {
             result.error = "OpenGL fixture preparation requires an exact bounded material binding";
@@ -2345,6 +3008,27 @@ public:
             result.error = "OpenGL fixture loader failed: " + missing;
             return result;
         }
+        int maximumTextureExtent = 0;
+        glGetIntegerv (GL_MAX_TEXTURE_SIZE, &maximumTextureExtent);
+        std::size_t textureBytes = sizeof (SceneTexelRgba8);
+        fixturetexture::SceneMipLayouts textureLayouts;
+        if (maximumTextureExtent <= 0
+            || ! fixturetexture::sceneMipLayouts (*scene, 1,
+                static_cast<std::uint32_t> (maximumTextureExtent),
+                fixturetexture::kMaximumTextureBytes, textureBytes, textureLayouts))
+        {
+            result.error = "OpenGL fixture texture bounds, sampler settings or allocation budget are invalid";
+            return result;
+        }
+        const auto generateMipmap = reinterpret_cast<PFNGLGENERATEMIPMAPPROC> (
+            glfwGetProcAddress ("glGenerateMipmap"));
+        if (generateMipmap == nullptr && std::any_of (
+                textureLayouts.begin(), textureLayouts.begin() + scene->textureCount,
+                [] (const auto& layout) { return layout.levelCount > 1; }))
+        {
+            result.error = "OpenGL fixture textures require mipmap generation support";
+            return result;
+        }
         OpenGlFixtureState previous (gl);
         auto resources = std::make_shared<OpenGlFixtureSceneResources>();
         resources->ownerContext = glfwGetCurrentContext();
@@ -2352,6 +3036,7 @@ public:
         resources->gl = gl;
         resources->snapshot = scene;
         resources->materialProgram = materialProgram;
+        resources->materialProgramSource = requestedMaterialProgram;
         const auto& firstObject = scene->objects[0];
         const auto admittedInstanceSetMatchesScene = [&]
         {
@@ -2368,8 +3053,23 @@ public:
                     return false;
             return true;
         }();
+        if (geometryAdmission != nullptr && !admittedInstanceSetMatchesScene) {
+            result.error = "OpenGL Geometry Core authority does not match the retained instance scene";
+            return result;
+        }
+        if (frameAttributes && (!admittedInstanceSetMatchesScene
+            || !videowire::geometry::validInstanceAppearanceAttributes(*frameAttributes,scene->objectCount,result.error)))
+            return result;
+        if (admittedInstanceSetMatchesScene)
+            for (std::size_t index=0;index<scene->objectCount;++index)
+                resources->instanceAppearances.push_back(videowire::geometry::instanceAppearance(
+                    frameAttributes ? *frameAttributes : geometryAdmission->value().descriptor().attributes,index));
         resources->instancedSharedGeometry = admittedInstanceSetMatchesScene
             && scene->objectCount > 1
+            && std::all_of(resources->instanceAppearances.begin(),resources->instanceAppearances.end(),
+                [](const auto& appearance) {
+                    return appearance.color[3]>=1.0f && appearance.metallic<0 && appearance.roughness<0;
+                })
             && materialProgram == nullptr
             && !firstObject.parent.isValid()
             && firstObject.material == sceneMaterial.id
@@ -2467,21 +3167,32 @@ public:
                     offsetof(OpenGlInstanceGpuRecord, identityColor)));
             gl.EnableVertexAttribArray(9);
             gl.VertexAttribDivisor(9, 1);
+            for (unsigned attribute=10;attribute<=11;++attribute) {
+                gl.VertexAttribPointer(attribute,4,GL_FLOAT,GL_FALSE,sizeof(OpenGlInstanceGpuRecord),
+                    reinterpret_cast<const void*>(attribute==10 ? offsetof(OpenGlInstanceGpuRecord,color)
+                                                               : offsetof(OpenGlInstanceGpuRecord,emission)));
+                gl.EnableVertexAttribArray(attribute);
+                gl.VertexAttribDivisor(attribute,1);
+            }
         }
 
         const SceneTexelRgba8 whiteTexel { 255, 255, 255, 255 };
         // Upload each image once. The shader applies the sRGB transfer only at
         // base-color and emissive sampling sites, while data roles read the same
         // immutable RGBA8 storage without a color transform.
-        resources->textures.resize (1 + scene->textureCount);
+        try { resources->textures.resize (1 + scene->textureCount); }
+        catch (const std::bad_alloc&) { return fail ("OpenGL fixture texture handle allocation failed"); }
         glGenTextures (static_cast<int> (resources->textures.size()), resources->textures.data());
+        if (glGetError() != GL_NO_ERROR || std::any_of (
+                resources->textures.begin(), resources->textures.end(),
+                [] (unsigned texture) { return texture == 0; }))
+            return fail ("OpenGL fixture texture allocation failed");
         gl.ActiveTexture (GL_TEXTURE0);
         gl.BindBuffer (GL_PIXEL_UNPACK_BUFFER, 0);
         glPixelStorei (GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei (GL_UNPACK_ROW_LENGTH, 0);
         glPixelStorei (GL_UNPACK_SKIP_PIXELS, 0);
         glPixelStorei (GL_UNPACK_SKIP_ROWS, 0);
-        std::size_t textureBytes = sizeof (whiteTexel);
         for (std::size_t slot = 0; slot < resources->textures.size(); ++slot)
         {
             const auto* data = static_cast<const void*> (&whiteTexel);
@@ -2492,8 +3203,6 @@ public:
                 data = scene->textureTexels.data() + texture.firstTexel;
                 textureWidth = texture.width;
                 textureHeight = texture.height;
-                textureBytes += static_cast<std::size_t> (textureWidth) * textureHeight
-                              * sizeof (SceneTexelRgba8);
             }
             glBindTexture (GL_TEXTURE_2D, resources->textures[slot]);
             const auto* source = slot > 0 ? &scene->textures[slot - 1] : nullptr;
@@ -2509,44 +3218,53 @@ public:
             glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
             glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
             glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+            const auto levelCount = slot > 0 ? textureLayouts[slot - 1].levelCount : 1u;
+            glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+            glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, static_cast<int> (levelCount - 1));
             glTexImage2D (GL_TEXTURE_2D, 0,
                           GL_RGBA8,
                           static_cast<int> (textureWidth), static_cast<int> (textureHeight),
                           0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-            if (minFilter == GL_NEAREST_MIPMAP_NEAREST
-                || minFilter == GL_LINEAR_MIPMAP_NEAREST
-                || minFilter == GL_NEAREST_MIPMAP_LINEAR
-                || minFilter == GL_LINEAR_MIPMAP_LINEAR)
-            {
-                const auto generateMipmap = reinterpret_cast<PFNGLGENERATEMIPMAPPROC> (
-                    glfwGetProcAddress ("glGenerateMipmap"));
+            if (glGetError() != GL_NO_ERROR)
+                return fail ("OpenGL fixture texture upload failed");
+            if (levelCount > 1)
                 generateMipmap (GL_TEXTURE_2D);
-            }
+            if (glGetError() != GL_NO_ERROR)
+                return fail ("OpenGL fixture mipmap allocation failed");
         }
 
-        vertexShader = compileFixtureShader (
-            gl, GL_VERTEX_SHADER, kFixtureVertexShader, result.error);
-        if (vertexShader == 0)
-            return fail (result.error);
-        fragmentShader = compileFixtureShader (
-            gl, GL_FRAGMENT_SHADER, kFixtureFragmentShader, result.error);
-        if (fragmentShader == 0)
-            return fail (result.error);
-        resources->program = gl.CreateProgram();
-        gl.AttachShader (resources->program, vertexShader);
-        gl.AttachShader (resources->program, fragmentShader);
-        gl.LinkProgram (resources->program);
-        int linked = 0;
-        gl.GetProgramiv (resources->program, GL_LINK_STATUS, &linked);
-        if (linked != GL_TRUE)
+        const auto vertexSource = fixtureVertexModifierShader (kFixtureVertexShader,
+            materialProgram != nullptr ? materialProgram->vertexProgram.get() : nullptr,
+            videohelper::materialprogram::BackendTarget::OpenGl, result.error);
+        if (vertexSource.empty()) return fail (result.error);
+        // Solid-body and harmonic-geometry frames can release every scene lease
+        // before the next preparation. Retain only the immutable linked program
+        // for the exact context and vertex source; the fragment source is fixed.
+        auto& contextPrograms = programCache_[glfwGetCurrentContext()];
+        const auto cached = contextPrograms.find(vertexSource);
+        if (cached != contextPrograms.end())
         {
-            char log[1024] = {};
-            int length = 0;
-            gl.GetProgramInfoLog (resources->program,
-                                  static_cast<int> (sizeof (log)), &length, log);
-            return fail (std::string ("OpenGL fixture program link failed: ")
-                + std::string (log, static_cast<std::size_t> (std::max (length, 0))));
+            resources->sharedProgram = cached->second.program;
+            cached->second.lastUse = ++programUseSerial_;
         }
+        if (!resources->sharedProgram)
+        {
+            vertexShader=compileFixtureShader(gl,GL_VERTEX_SHADER,vertexSource.c_str(),result.error);
+            if(vertexShader==0) return fail(result.error);
+            fragmentShader=compileFixtureShader(gl,GL_FRAGMENT_SHADER,kFixtureFragmentShader,result.error);
+            if(fragmentShader==0) return fail(result.error);
+            auto shared=std::make_shared<OpenGlFixtureSceneResources::SharedProgram>();
+            shared->context=glfwGetCurrentContext(); shared->gl=gl; shared->id=gl.CreateProgram();
+            gl.AttachShader(shared->id,vertexShader); gl.AttachShader(shared->id,fragmentShader); gl.LinkProgram(shared->id);
+            int linked=0; gl.GetProgramiv(shared->id,GL_LINK_STATUS,&linked);
+            if(linked!=GL_TRUE) {
+                char log[1024]={}; int length=0; gl.GetProgramInfoLog(shared->id,(int)sizeof(log),&length,log);
+                return fail(std::string("OpenGL fixture program link failed: ")+std::string(log,(size_t)std::max(length,0)));
+            }
+            resources->sharedProgram=shared;
+            result.stats.shaderProgramBuildCount = 1;
+        }
+        resources->program=resources->sharedProgram->id;
         cleanupShaders();
 
         const auto location = [&] (const char* name)
@@ -2562,7 +3280,10 @@ public:
         uniforms.projection = location ("uProjection");
         uniforms.baseColor = location ("uBaseColor");
         uniforms.materialParams = location ("uMaterialParams");
+        uniforms.surfaceCoating = location ("uSurfaceCoating");
         uniforms.timeMixEndColorAndTime = location ("uTimeMixEndColorAndTime");
+        uniforms.vertexTime = location ("uVertexTime");
+        uniforms.vertexSpectrum = location ("uVertexSpectrum[0]");
         uniforms.emissive = location ("uEmissive");
         uniforms.ambient = location ("uAmbient");
         uniforms.lightRotation = location ("uLightRotation");
@@ -2587,6 +3308,20 @@ public:
         uniforms.texturePresence = location ("uTexturePresence");
         uniforms.emissiveTexturePresence = location ("uEmissiveTexturePresence");
         uniforms.alphaModeCutoff = location ("uAlphaModeCutoff");
+        uniforms.imageOutput = location ("uImageOutput");
+        uniforms.rawIdentifiers = location("uRawIdentifiers[0]");
+        uniforms.rawObjectIndex = location("uRawObjectIndex");
+        uniforms.passProgramControl = location("uPassProgramControl");
+        uniforms.passModes = location("uPassModes[0]");
+        uniforms.passColors = location("uPassColors[0]");
+        uniforms.passReferences = location("uPassReferences[0]");
+        uniforms.passTransforms = location("uPassTransforms[0]");
+        uniforms.motionRotation = location("uMotionRotation");
+        uniforms.motionTranslationScale = location("uMotionTranslationScale");
+        uniforms.previousCameraRotation = location("uPreviousCameraRotation");
+        uniforms.previousCameraTranslation = location("uPreviousCameraTranslation");
+        uniforms.previousProjection = location("uPreviousProjection");
+        uniforms.motionViewport = location("uMotionViewport");
         uniforms.materialKind = location ("uMaterialKind");
         uniforms.diffractionGeometry = location ("uDiffractionGeometry");
         uniforms.diffractionSecondaryGeometry
@@ -2607,16 +3342,32 @@ public:
         uniforms.diffractionOccupancyRectangles
             = location ("uDiffractionOccupancyRectangles[0]");
         uniforms.diffractionSpatialCounts = location ("uDiffractionSpatialCounts");
+        uniforms.diffractionEnvironment = location ("uDiffractionEnvironment");
         uniforms.diffractionEvaluationSchedule
             = location ("uDiffractionEvaluationSchedule");
         uniforms.noteInstanceTransforms = location ("uNoteInstanceTransforms[0]");
         uniforms.noteInstanceIndex = location ("uNoteInstanceIndex");
+        uniforms.noteMeshScale = location ("uNoteMeshScale");
+        uniforms.noteAppearanceLow = location ("uNoteAppearanceLow");
+        uniforms.noteAppearanceHigh = location ("uNoteAppearanceHigh");
         if (resources->vertexArray == 0 || resources->vertexBuffer == 0
             || resources->indexBuffer == 0 || resources->textures.empty()
             || (resources->instancedSharedGeometry && resources->instanceBuffer == 0)
             || resources->program == 0 || ! uniforms.complete())
         {
             return fail ("OpenGL fixture static GPU resource creation failed");
+        }
+
+        if (cached == contextPrograms.end())
+        {
+            constexpr std::size_t kMaximumFixtureProgramCacheEntries = 64;
+            if (contextPrograms.size() >= kMaximumFixtureProgramCacheEntries)
+            {
+                const auto oldest = std::min_element(contextPrograms.begin(), contextPrograms.end(),
+                    [](const auto& a, const auto& b) { return a.second.lastUse < b.second.lastUse; });
+                contextPrograms.erase(oldest);
+            }
+            contextPrograms.emplace(vertexSource, CachedProgram{++programUseSerial_, resources->sharedProgram});
         }
 
         previous.restore();
@@ -2667,27 +3418,83 @@ public:
             result.error = "OpenGL fixture render dimensions exceed backend limits";
             return result;
         }
-        if (resources->materialProgram != nullptr
+        std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> materialProgram;
+        if (!resolveDiffractionRuntimeProgram(resources->materialProgram, resources->materialProgramSource, runtimeInputs,
+                materialProgram, result.error)) return result;
+        if (materialProgram != nullptr
             && ! nativeFixtureDiffractionWorkWithinBudget (
-                *resources->materialProgram, width, height))
+                *materialProgram, width, height))
         {
             result.error = "OpenGL fixture diffraction workload exceeds backend limits";
             return result;
         }
+        if (!validateMaterialFrameForDraw(materialProgram, runtimeInputs, "opengl",
+                reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext()), result.error))
+            return result;
+        unsigned materialFrameTexture = 0;
+        std::vector<std::shared_ptr<const NativeFixtureSceneFrame>> inputFrames;
+        if (runtimeInputs.materialFrameTexture) inputFrames.push_back(runtimeInputs.materialFrameTexture);
+        for (const auto& entry : runtimeInputs.materialFrameTextures) inputFrames.push_back(entry.second);
+        for (const auto& inputFrame : inputFrames)
+        {
+            const auto descriptor = inputFrame->colorTextureDescriptor();
+            if (descriptor.textureViewHandle > std::numeric_limits<unsigned>::max()
+                || descriptor.imageHandle != descriptor.textureViewHandle
+                || !glIsTexture(static_cast<unsigned>(descriptor.textureViewHandle)))
+            { result.error = "OpenGL material Frame texture is stale"; return result; }
+            materialFrameTexture = static_cast<unsigned>(descriptor.textureViewHandle);
+            GLint previous = 0, actualWidth = 0, actualHeight = 0, format = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+            glBindTexture(GL_TEXTURE_2D, materialFrameTexture);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &actualWidth);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &actualHeight);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(previous));
+            if (actualWidth != static_cast<int>(descriptor.width)
+                || actualHeight != static_cast<int>(descriptor.height) || format != GL_RGBA8)
+            { result.error = "OpenGL material Frame texture no longer matches its descriptor"; return result; }
+        }
+        const auto rootFrame = materialFrameForProgram(materialProgram.get(),runtimeInputs);
+        materialFrameTexture = rootFrame ? static_cast<unsigned>(rootFrame->colorTextureViewHandle()) : 0;
         if (!validFixtureRuntimeInputs(runtimeInputs))
         {
-            result.error = "OpenGL fixture scene modulation is non-finite or out of bounds";
+            result.error = !render3dimage::supported(runtimeInputs.imageOutput)
+                ? "Render 3D requested image output is unavailable on this backend"
+                : "OpenGL fixture scene modulation is non-finite or out of bounds";
             return result;
         }
-        if (resources->materialProgram != nullptr
-            && resources->materialProgram->baseColorSource
-                == NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix
+        if ((runtimeInputs.imageOutput != renderpassoutput::Output::Color || runtimeInputs.passComposite)
+            && materialProgram != nullptr
+            && materialProgram->kind == NativeFixtureMaterialKind::DiffractionReflective)
+        {
+            result.error = "Render 3D pass inspection/compositing is unavailable for diffraction materials";
+            return result;
+        }
+        if (runtimeInputs.imageOutput == renderpassoutput::Output::ObjectId
+            && resources->instancedSharedGeometry)
+        {
+            result.error = "Render 3D Object ID inspection requires individual scene draws";
+            return result;
+        }
+        if (materialProgram != nullptr
+            && nativeSurfaceUsesTime(*materialProgram)
             && (! std::isfinite (runtimeInputs.timeSeconds)
                 || std::abs (runtimeInputs.timeSeconds)
                     > surfacematerial::kMaximumEvaluationMagnitude))
         {
             result.error = "OpenGL fixture material time input is non-finite or out of bounds";
             return result;
+        }
+
+        if (materialProgram != nullptr && materialProgram->vertexProgram)
+        {
+            if (runtimeInputs.imageOutput == renderpassoutput::Output::Motion
+                || sceneUsesMotionPass(runtimeInputs))
+            {
+                result.error = "Motion output is unavailable for graph vertex deformation";
+                return result;
+            }
+            runtimeInputs.previousMotion.reset();
         }
 
         const auto& gl = resources->gl;
@@ -2699,6 +3506,9 @@ public:
         frame->ownerContext = glfwGetCurrentContext();
         frame->rendererGeneration_ = resources->rendererGeneration;
         frame->staticResources = resources;
+        frame->materialFrameTexture = runtimeInputs.materialFrameTexture;
+        frame->materialFrameTextures = runtimeInputs.materialFrameTextures;
+        frame->linearColor = runtimeInputs.linearColor;
         unsigned framebuffer = 0;
         unsigned depthAttachment = 0;
         auto cleanup = [&]
@@ -2735,7 +3545,7 @@ public:
         glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
         glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<int> (width),
+        glTexImage2D (GL_TEXTURE_2D, 0, runtimeInputs.linearColor ? GL_RGBA16F : GL_RGBA8, static_cast<int> (width),
                       static_cast<int> (height), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glGenTextures (1, &frame->depthTexture_);
         glBindTexture (GL_TEXTURE_2D, frame->depthTexture_);
@@ -2767,8 +3577,25 @@ public:
                                  GL_TEXTURE_2D, frame->depthTexture_, 0);
         gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
                                  GL_TEXTURE_2D, depthAttachment, 0);
-        const unsigned drawBuffers[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-        gl.DrawBuffers (2, drawBuffers);
+        const std::array<int, 6> rawFormats { GL_RGBA16F, GL_RGBA16F, GL_R8, GL_R32UI, GL_R32UI, GL_RG16F };
+        glGenTextures(6, frame->rawTextures.data());
+        for (std::size_t i = 0; i < frame->rawTextures.size(); ++i)
+        {
+            glBindTexture(GL_TEXTURE_2D, frame->rawTextures[i]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, rawFormats[i], static_cast<int>(width),
+                static_cast<int>(height), 0, i == 5 ? GL_RG : i < 2 ? GL_RGBA : i == 2 ? GL_RED : GL_RED_INTEGER,
+                i == 5 || i < 2 ? GL_FLOAT : i == 2 ? GL_UNSIGNED_BYTE : GL_UNSIGNED_INT, nullptr);
+            gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + 2 + static_cast<unsigned>(i),
+                GL_TEXTURE_2D, frame->rawTextures[i], 0);
+        }
+        const unsigned drawBuffers[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+            GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4,
+            GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT6, GL_COLOR_ATTACHMENT7 };
+        gl.DrawBuffers (8, drawBuffers);
         if (frame->texture_ == 0 || frame->depthTexture_ == 0
             || depthAttachment == 0 || framebuffer == 0
             || gl.CheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
@@ -2780,13 +3607,13 @@ public:
         const auto& material = scene->materials[0];
         const auto* selectedCamera = visual3d_detail::findById (
             scene->cameras, scene->cameraCount, scene->activeCamera);
-        if (! runtimeInputs.cameraOverride.has_value() && selectedCamera == nullptr)
+        if (!runtimeInputs.cameraOverride && !runtimeInputs.animatedCamera && selectedCamera == nullptr)
         {
             result.error = "OpenGL fixture render cannot resolve the active camera";
             return result;
         }
-        const auto& camera = runtimeInputs.cameraOverride.has_value()
-            ? *runtimeInputs.cameraOverride : *selectedCamera;
+        const auto& camera = runtimeInputs.cameraOverride ? *runtimeInputs.cameraOverride
+            : runtimeInputs.animatedCamera ? *runtimeInputs.animatedCamera : *selectedCamera;
         OpenGlFixtureUniforms values;
         values.objectMatrix = fixtureWorldMatrix (*scene, object);
         storeFixtureQuaternion (values.cameraRotation, camera.transform.rotation);
@@ -2798,9 +3625,9 @@ public:
             static_cast<float> (width) / static_cast<float> (height),
             camera.nearPlane, camera.farPlane
         };
-        if (resources->materialProgram != nullptr)
+        if (materialProgram != nullptr)
         {
-            const auto& program = *resources->materialProgram;
+            const auto& program = *materialProgram;
             const auto& pbr = program.parameters;
             values.baseColor = {
                 pbr.baseColorMetallic[0], pbr.baseColorMetallic[1],
@@ -2832,9 +3659,14 @@ public:
             values.emissive[channel] *= runtimeInputs.emissionGain;
         storeFixtureVec3 (values.ambient, scene->ambientColor);
         values.lightRotation = { 0.0f, 0.0f, 0.0f, 1.0f };
-        if (scene->lightCount == 1)
+        const auto lightCount = runtimeInputs.lightOverride ? std::size_t { 1 }
+            : !runtimeInputs.animatedLights.empty() ? runtimeInputs.animatedLights.size() : scene->lightCount;
+        const auto lightAt = [&](std::size_t index) -> const SceneLightRecord&
+            { return runtimeInputs.lightOverride ? *runtimeInputs.lightOverride
+                : !runtimeInputs.animatedLights.empty() ? runtimeInputs.animatedLights[index] : scene->lights[index]; };
+        if (lightCount == 1)
         {
-            const auto& light = scene->lights[0];
+            const auto& light = lightAt(0);
             if (light.kind == SceneLightKind::Environment)
             {
                 values.ambient[0] += light.color.x * light.intensity;
@@ -2863,15 +3695,63 @@ public:
         glColorMask (GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDepthMask (GL_TRUE);
         glDepthFunc (GL_LESS);
-        glClearColor (7.0f / 255.0f, 10.0f / 255.0f, 18.0f / 255.0f, 1.0f);
+        if (runtimeInputs.imageOutput == renderpassoutput::Output::Color)
+            glClearColor (7.0f / 255.0f, 10.0f / 255.0f, 18.0f / 255.0f, 1.0f);
+        else
+            glClearColor (0.0f, 0.0f, 0.0f, 0.0f);
         glClearDepth (1.0);
-        glClear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClear (GL_DEPTH_BUFFER_BIT);
+        const float background[4] { 7.0f / 255.0f, 10.0f / 255.0f, 18.0f / 255.0f, 1.0f };
+        const float emptyPass[4] { 0, 0, 0, 0 };
+        const float farDepth[4] { 1, 0, 0, 0 };
+        const unsigned emptyIdentity[4] { 0, 0, 0, 0 };
+        gl.ClearBufferfv(GL_COLOR, 0, runtimeInputs.imageOutput == renderpassoutput::Output::Color
+            && !runtimeInputs.passComposite ? background : emptyPass);
+        gl.ClearBufferfv(GL_COLOR, 1, farDepth);
+        for (int attachment = 2; attachment < 5; ++attachment) gl.ClearBufferfv(GL_COLOR, attachment, emptyPass);
+        gl.ClearBufferuiv(GL_COLOR, 5, emptyIdentity);
+        gl.ClearBufferuiv(GL_COLOR, 6, emptyIdentity);
+        gl.ClearBufferfv(GL_COLOR, 7, emptyPass);
+        if (runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage)
+        {
+            const auto clear = renderpasscomposite::inspectionClear(*runtimeInputs.passComposite);
+            gl.ClearBufferfv(GL_COLOR, 0, clear.data());
+        }
         gl.UseProgram (resources->program);
         gl.BindVertexArray (resources->vertexArray);
         gl.ActiveTexture (GL_TEXTURE0);
         glBindTexture (GL_TEXTURE_2D, resources->textures[0]);
         gl.BindSampler (0, 0);
         const auto& locations = resources->uniforms;
+        const auto motion = sceneMotionUniforms(runtimeInputs, camera, width, height);
+        gl.Uniform4fv(locations.motionRotation, 1, motion.rotation.data());
+        gl.Uniform4fv(locations.motionTranslationScale, 1, motion.translationScale.data());
+        gl.Uniform4fv(locations.previousCameraRotation, 1, motion.cameraRotation.data());
+        gl.Uniform4fv(locations.previousCameraTranslation, 1, motion.cameraTranslation.data());
+        gl.Uniform4fv(locations.previousProjection, 1, motion.projection.data());
+        gl.Uniform4fv(locations.motionViewport, 1, motion.viewport.data());
+        gl.Uniform4f(locations.vertexTime, runtimeInputs.timeSeconds, 0.0f, 0.0f, 0.0f);
+        if (materialProgram != nullptr && materialProgram->vertexProgram)
+            gl.Uniform4fv(locations.vertexSpectrum,
+                (materialProgram->vertexProgram->resources().audioParameterSlots + 3) / 4,
+                runtimeInputs.vertexSpectrum.data());
+        std::array<std::array<float, 4>, Visual3DScene::kMaxObjects> rawIdentifiers {};
+        for (std::size_t i = 0; i < scene->objectCount; ++i)
+        {
+            const auto& object = scene->objects[i];
+            rawIdentifiers[i] = { static_cast<float>(object.material.value & 65535u),
+                static_cast<float>(object.material.value >> 16u), static_cast<float>(object.id.value & 65535u),
+                static_cast<float>(object.id.value >> 16u) };
+        }
+        gl.Uniform4fv(locations.rawIdentifiers, static_cast<int>(rawIdentifiers.size()), rawIdentifiers[0].data());
+        gl.Uniform1i(locations.rawObjectIndex, 0);
+        auto passProgram = renderpasscomposite::gpuProgram(scenePassProgram(runtimeInputs));
+        passProgram.control[2] = runtimeInputs.linearColor ? 1.0f : 0.0f;
+        gl.Uniform4fv(locations.passProgramControl, 1, passProgram.control.data());
+        gl.Uniform4fv(locations.passModes, 8, passProgram.modes[0].data());
+        gl.Uniform4fv(locations.passColors, 8, passProgram.colors[0].data());
+        gl.Uniform4fv(locations.passReferences, 8, passProgram.references[0].data());
+        gl.Uniform4fv(locations.passTransforms, 8, passProgram.transforms[0].data());
         gl.UniformMatrix4fv (locations.objectMatrix, 1, GL_FALSE,
                              values.objectMatrix.data());
         gl.Uniform1f (locations.tangentHandednessSign,
@@ -2883,28 +3763,36 @@ public:
         gl.Uniform4fv (locations.projection, 1, values.projection.data());
         gl.Uniform4fv (locations.baseColor, 1, values.baseColor.data());
         gl.Uniform4fv (locations.materialParams, 1, values.materialParams.data());
+        const bool surfacePbr = materialProgram != nullptr
+            && materialProgram->kind == NativeFixtureMaterialKind::SurfacePbr;
+        const auto coating = surfacePbr ? materialProgram->parameters.transmissionIorClearcoat
+            : std::array<float, 4> {0.0f, 1.5f, 0.0f, 0.0f};
+        gl.Uniform4f(locations.surfaceCoating, coating[0], coating[1], coating[2], surfacePbr ? 1.0f : 0.0f);
         gl.Uniform4fv (locations.timeMixEndColorAndTime, 1,
                        values.timeMixEndColorAndTime.data());
         gl.Uniform3f (locations.emissive, values.emissive[0],
                       values.emissive[1], values.emissive[2]);
         gl.Uniform3f (locations.ambient, values.ambient[0],
                       values.ambient[1], values.ambient[2]);
+        const auto noteTransforms = noteInstanceShaderTransforms(noteInstances);
         gl.Uniform4fv (locations.noteInstanceTransforms,
                        static_cast<int>(visualnoteinstancing::kMaximumInstances),
-                       noteInstances.transforms[0].data());
+                       noteTransforms[0].data());
         gl.Uniform1i (locations.noteInstanceIndex, -1);
+        gl.Uniform1f (locations.noteMeshScale, noteInstances.meshScale);
+        gl.Uniform4fv (locations.noteAppearanceLow, 1, noteInstances.appearanceLow.data());
+        gl.Uniform4fv (locations.noteAppearanceHigh, 1, noteInstances.appearanceHigh.data());
         gl.Uniform4fv (locations.lightRotation, 1, values.lightRotation.data());
         gl.Uniform4fv (locations.lightColorIntensity, 1,
                        values.lightColorIntensity.data());
         gl.Uniform4fv (locations.lightPositionRange, 1,
                        values.lightPositionRange.data());
         gl.Uniform1i (locations.lightKind,
-                      scene->lightCount == 1
-                          && scene->lights[0].kind == SceneLightKind::Point ? 1 : 0);
-        gl.Uniform1i (locations.lightCount, static_cast<int> (scene->lightCount));
-        for (std::size_t lightIndex = 0; lightIndex < scene->lightCount; ++lightIndex)
+                      lightCount == 1 && lightAt(0).kind == SceneLightKind::Point ? 1 : 0);
+        gl.Uniform1i (locations.lightCount, static_cast<int> (lightCount));
+        for (std::size_t lightIndex = 0; lightIndex < lightCount; ++lightIndex)
         {
-            const auto& light = scene->lights[lightIndex];
+            const auto& light = lightAt(lightIndex);
             std::array<float, 4> rotation {}, color {}, position {}, cones {};
             storeFixtureQuaternion (rotation, light.transform.rotation);
             storeFixtureVec3 (color, light.color, light.intensity);
@@ -2922,9 +3810,11 @@ public:
         gl.Uniform1i (locations.normalTexture, 2);
         gl.Uniform1i (locations.occlusionTexture, 3);
         gl.Uniform1i (locations.emissiveTexture, 4);
-        const auto materialKind = resources->materialProgram != nullptr
-            ? resources->materialProgram->kind : NativeFixtureMaterialKind::SurfacePbr;
+        const auto materialKind = materialProgram != nullptr
+            ? materialProgram->kind : NativeFixtureMaterialKind::SurfacePbr;
         gl.Uniform1i (locations.materialKind, static_cast<int> (materialKind));
+        gl.Uniform4f (locations.imageOutput, static_cast<float> (runtimeInputs.imageOutput),
+                      0.0f, 0.0f, 0.0f);
         diffractivefoil::EvaluationSchedule spatialSchedule;
         std::uint32_t instanceBufferUploadCount = 0;
         std::uint32_t instancedDrawCount = 0;
@@ -2933,15 +3823,25 @@ public:
         std::uint32_t submittedNoteInstanceCount = 0;
         if (materialKind == NativeFixtureMaterialKind::DiffractionReflective)
         {
+            gl.ActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, materialFrameTexture != 0
+                ? materialFrameTexture : resources->textures[0]);
+            gl.BindSampler(0, 0);
+            gl.Uniform4f(locations.texturePresence, 0, 0, 0, materialFrameTexture != 0
+                ? (materialFrameIsBottomFirst(rootFrame) ? 2.0f : 1.0f) : 0.0f);
+            const auto& lighting = materialProgram->diffractionLightingAdmission->description();
+            gl.Uniform4f(locations.diffractionEnvironment,
+                         static_cast<float>(lighting.version), lighting.bouncePlaneHeight,
+                         lighting.bounceMaximumDistance, 0.0f);
             const diffractionmaterial::PhysicalDiffractionGpuLightingPath emptyPath {};
             const auto diffractionPathCount = materialKind
                     == NativeFixtureMaterialKind::DiffractionReflective
-                ? resources->materialProgram->diffractionPathCount : 1u;
+                ? materialProgram->diffractionPathCount : 1u;
 
-            if (resources->materialProgram != nullptr
-                && resources->materialProgram->diffractionFoilMaximumEvaluations != 0
+            if (materialProgram != nullptr
+                && materialProgram->diffractionFoilMaximumEvaluations != 0
                 && !nativeFixtureSpatialFoilEvaluationSchedule(
-                    *resources->materialProgram, width, height, spatialSchedule))
+                    *materialProgram, width, height, spatialSchedule))
             {
                 result.error = "OpenGL fixture diffraction workload exceeds backend limits";
                 return result;
@@ -2956,7 +3856,7 @@ public:
             {
                 const auto& lightingPath = materialKind
                         == NativeFixtureMaterialKind::DiffractionReflective
-                    ? resources->materialProgram->diffractionPaths[pathIndex]
+                    ? materialProgram->diffractionPaths[pathIndex]
                     : emptyPath;
                 const auto& diffraction = lightingPath.material;
                 gl.Uniform4fv (locations.diffractionGeometry, 1, &diffraction.geometry.x);
@@ -2983,12 +3883,12 @@ public:
                               static_cast<float>(lightingPath.kindBounceAndReserved[2]),
                               maskCoverage);
                 gl.Uniform4fv(locations.diffractionFoilField, 4,
-                              &resources->materialProgram->diffractionFoilField[0].x);
+                              &materialProgram->diffractionFoilField[0].x);
                 gl.Uniform4fv(locations.diffractionOccupancyRectangles, 5,
-                              &resources->materialProgram->diffractionOccupancyRectangles[0].x);
+                              &materialProgram->diffractionOccupancyRectangles[0].x);
                 gl.Uniform4f(locations.diffractionSpatialCounts,
-                             resources->materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4.0f : 0.0f,
-                             static_cast<float>(resources->materialProgram->diffractionOccupancyRectangleCount),
+                             materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4.0f : 0.0f,
+                             static_cast<float>(materialProgram->diffractionOccupancyRectangleCount),
                              0.0f, 0.0f);
                 gl.Uniform4f(locations.diffractionEvaluationSchedule,
                              uintAsFloat(spatialSchedule.width),
@@ -2998,7 +3898,8 @@ public:
                 if (pathIndex != 0)
                 {
                     glEnable(GL_BLEND);
-                    glBlendFunc(GL_ONE, GL_ONE);
+                    for (unsigned attachment = 1; attachment < 8; ++attachment) gl.Disablei(GL_BLEND, attachment);
+                    gl.BlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
                     glDepthFunc(GL_EQUAL);
                     glDepthMask(GL_FALSE);
                 }
@@ -3034,7 +3935,9 @@ public:
             {
                 const auto* queuedMaterial = visual3d_detail::findById (
                     scene->materials, scene->materialCount, scene->objects[objectIndex].material);
-                if (queuedMaterial == nullptr || queuedMaterial->alphaMode != SceneAlphaMode::Blend)
+                const bool transparentInstance=!resources->instanceAppearances.empty()
+                    && resources->instanceAppearances[objectIndex].color[3]<1.0f;
+                if (!nativeSurfaceRequiresBlend(nativeSurfaceForObject(materialProgram.get(), scene->objects[objectIndex].id)) && !transparentInstance && (queuedMaterial == nullptr || queuedMaterial->alphaMode != SceneAlphaMode::Blend))
                     drawOrder.push_back (objectIndex);
                 else
                 {
@@ -3075,6 +3978,8 @@ public:
                 {
                     instanceRecords[index].matrix = multiplyFixtureMatrices(
                         runtimeMatrix, fixtureWorldMatrix(*scene, scene->objects[index]));
+                    if (!runtimeTargetsObject(runtimeInputs, scene->objects[index]))
+                        instanceRecords[index].matrix = fixtureWorldMatrix(*scene, scene->objects[index]);
                     const auto stableIdentity = scene->objects[index].id.value;
                     const auto colorSlot = videohelper::geometry::diagnosticColorSlot(
                         diagnosticStableIdentities, stableIdentity);
@@ -3083,6 +3988,10 @@ public:
                         static_cast<float>((colorSlot >> 8) & 0xffu) / 255.0f,
                         static_cast<float>(colorSlot & 0xffu) / 255.0f,
                         resources->diagnosticInstanceIdentityColors ? 1.0f : 0.0f };
+                    instanceRecords[index].color=resources->instanceAppearances[index].color;
+                    instanceRecords[index].emission=resources->instanceAppearances[index].emission;
+                    for (std::size_t channel=0;channel<3;++channel)
+                        instanceRecords[index].emission[channel]*=runtimeInputs.emissionGain;
                 }
                 gl.BindBuffer(GL_ARRAY_BUFFER, resources->instanceBuffer);
                 gl.BufferData(GL_ARRAY_BUFFER,
@@ -3094,6 +4003,12 @@ public:
             for (const auto objectIndex : drawOrder)
             {
                 const auto& drawObject = scene->objects[objectIndex];
+                gl.Uniform1i(locations.rawObjectIndex, static_cast<int>(objectIndex));
+                const auto identityColor = render3dimage::identityColor (
+                    runtimeInputs.imageOutput == renderpassoutput::Output::MaterialId
+                        ? drawObject.material.value : drawObject.id.value);
+                gl.Uniform4f (locations.imageOutput, static_cast<float> (runtimeInputs.imageOutput),
+                              identityColor[0], identityColor[1], identityColor[2]);
                 const auto* drawMaterial = visual3d_detail::findById (
                     scene->materials, scene->materialCount, drawObject.material);
                 auto runtimeTransform = HarmonicMIDI::grid::SceneTransform3D {};
@@ -3105,10 +4020,12 @@ public:
                 runtimeTransform = applyRuntimeObjectTransform (
                     runtimeTransform, runtimeInputs.objectRotationDegrees,
                     runtimeInputs.objectScale);
+                if (!runtimeTargetsObject(runtimeInputs, drawObject)) runtimeTransform = {};
                 values.objectMatrix = multiplyFixtureMatrices (
                     fixtureTransformMatrix (runtimeTransform),
                     fixtureWorldMatrix (*scene, drawObject));
-                if (resources->materialProgram == nullptr && drawMaterial != nullptr)
+                const auto* drawProgram = nativeSurfaceForObject(materialProgram.get(), drawObject.id);
+                if (drawMaterial != nullptr)
                 {
                     storeFixtureVec3 (values.baseColor, drawMaterial->baseColor,
                                       drawMaterial->opacity);
@@ -3117,9 +4034,39 @@ public:
                         drawMaterial->normalScale, 0.0f
                     };
                     storeFixtureVec3 (values.emissive, drawMaterial->emissive);
+                    values.timeMixEndColorAndTime = {};
+                    if (drawProgram != nullptr)
+                    {
+                        const auto& pbr = drawProgram->parameters;
+                        values.baseColor = {pbr.baseColorMetallic[0], pbr.baseColorMetallic[1],
+                            pbr.baseColorMetallic[2], pbr.normalOpacity[3]};
+                        values.materialParams = {pbr.baseColorMetallic[3], pbr.emissionRoughness[3], 1.0f, 0.0f};
+                        values.emissive = {pbr.emissionRoughness[0], pbr.emissionRoughness[1], pbr.emissionRoughness[2], 0.0f};
+                        if (drawProgram->baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix)
+                        {
+                            values.timeMixEndColorAndTime = {drawProgram->timeMixEndColor[0], drawProgram->timeMixEndColor[1],
+                                drawProgram->timeMixEndColor[2], runtimeInputs.timeSeconds};
+                            values.materialParams[3] = 1.0f;
+                        }
+                    }
+                    const auto drawCoating = drawProgram ? drawProgram->parameters.transmissionIorClearcoat
+                        : std::array<float, 4> {0, 1.5f, 0, 0};
+                    gl.Uniform4f(locations.surfaceCoating, drawCoating[0], drawCoating[1], drawCoating[2], drawProgram ? 1.0f : 0.0f);
+                    if (!resources->instancedSharedGeometry && !resources->instanceAppearances.empty()) {
+                        const auto& appearance=resources->instanceAppearances[objectIndex];
+                        for (std::size_t channel=0;channel<3;++channel) {
+                            values.baseColor[channel]*=appearance.color[channel];
+                            values.timeMixEndColorAndTime[channel]*=appearance.color[channel];
+                            values.emissive[channel]+=appearance.emission[channel];
+                        }
+                        values.baseColor[3]*=appearance.color[3];
+                        if (appearance.metallic>=0) values.materialParams[0]=appearance.metallic;
+                        if (appearance.roughness>=0) values.materialParams[1]=appearance.roughness;
+                    }
                     for (std::size_t channel = 0; channel < 3; ++channel)
                         values.emissive[channel] *= runtimeInputs.emissionGain;
                     gl.Uniform4fv (locations.baseColor, 1, values.baseColor.data());
+                    gl.Uniform4fv(locations.timeMixEndColorAndTime, 1, values.timeMixEndColorAndTime.data());
                     gl.Uniform4fv (locations.materialParams, 1,
                                    values.materialParams.data());
                     gl.Uniform3f (locations.emissive, values.emissive[0],
@@ -3137,28 +4084,41 @@ public:
                                 return 1 + index;
                     return std::size_t { 0 };
                 };
-                const std::array<SceneTextureId, 5> textureIds {
+                std::array<SceneTextureId, 5> textureIds {
                     drawMaterial != nullptr ? drawMaterial->baseColorTexture : SceneTextureId {},
                     drawMaterial != nullptr ? drawMaterial->metallicRoughnessTexture : SceneTextureId {},
                     drawMaterial != nullptr ? drawMaterial->normalTexture : SceneTextureId {},
                     drawMaterial != nullptr ? drawMaterial->occlusionTexture : SceneTextureId {},
                     drawMaterial != nullptr ? drawMaterial->emissiveTexture : SceneTextureId {}
                 };
+                if (drawProgram != nullptr) {
+                    const auto baseTextureId = textureIds[0];
+                    textureIds = {};
+                    if (drawProgram->baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::ImportedSrgbTexture)
+                        textureIds[0] = baseTextureId;
+                }
+                const bool drawFrame = drawProgram && drawProgram->baseColorSource
+                    == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture;
+                const auto selectedFrame = materialFrameForProgram(drawProgram,runtimeInputs);
+                const auto selectedTexture = selectedFrame ? static_cast<unsigned>(selectedFrame->colorTextureViewHandle()) : 0;
                 for (std::size_t unit = 0; unit < textureIds.size(); ++unit)
                 {
                     gl.ActiveTexture (GL_TEXTURE0 + static_cast<unsigned> (unit));
                     glBindTexture (GL_TEXTURE_2D,
-                                   resources->textures[textureSlot (textureIds[unit])]);
+                                   unit == 0 && drawFrame && selectedTexture != 0
+                                       ? selectedTexture : resources->textures[textureSlot (textureIds[unit])]);
                     gl.BindSampler (static_cast<unsigned> (unit), 0);
                 }
                 gl.Uniform4f (locations.texturePresence,
                               textureIds[1].isValid() ? 1.0f : 0.0f,
                               textureIds[2].isValid() ? 1.0f : 0.0f,
-                              textureIds[3].isValid() ? 1.0f : 0.0f, 0.0f);
+                              textureIds[3].isValid() ? 1.0f : 0.0f,
+                              drawFrame ? (materialFrameIsBottomFirst(selectedFrame) ? 2.0f : 1.0f) : 0.0f);
                 gl.Uniform1f (locations.emissiveTexturePresence,
                               textureIds[4].isValid() ? 1.0f : 0.0f);
-                const auto alphaMode = drawMaterial != nullptr
-                    ? drawMaterial->alphaMode : SceneAlphaMode::Opaque;
+                const auto alphaMode = nativeSurfaceRequiresBlend(drawProgram) || (!resources->instanceAppearances.empty()
+                    && resources->instanceAppearances[objectIndex].color[3]<1.0f) ? SceneAlphaMode::Blend
+                    : drawMaterial != nullptr ? drawMaterial->alphaMode : SceneAlphaMode::Opaque;
                 gl.Uniform2f (locations.alphaModeCutoff,
                               alphaMode == SceneAlphaMode::Mask ? 1.0f : 0.0f,
                               drawMaterial != nullptr ? drawMaterial->alphaCutoff : 0.5f);
@@ -3169,7 +4129,8 @@ public:
                 if (alphaMode == SceneAlphaMode::Blend)
                 {
                     glEnable (GL_BLEND);
-                    glBlendFunc (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    for (unsigned attachment = 1; attachment < 8; ++attachment) gl.Disablei(GL_BLEND, attachment);
+                    gl.BlendFuncSeparate (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
                     glDepthMask (GL_FALSE);
                 }
                 else
@@ -3239,7 +4200,7 @@ public:
         result.frame = std::move (frame);
         result.stats.drawCount = resources->instancedSharedGeometry ? instancedDrawCount
             : materialKind == NativeFixtureMaterialKind::DiffractionReflective
-            ? resources->materialProgram->diffractionPathCount
+            ? materialProgram->diffractionPathCount
             : static_cast<std::size_t>(std::count_if(
                 scene->objects.begin(), scene->objects.begin() + scene->objectCount,
                 [] (const auto& drawObject) { return drawObject.indexCount != 0; }));
@@ -3253,11 +4214,22 @@ public:
         result.stats.submittedNoteInstanceCount = submittedNoteInstanceCount;
         result.stats.materialBytes = sizeof (values) * result.stats.drawCount;
         result.stats.reusedStaticResources = true;
-        result.stats.reusedMaterialProgram = resources->materialProgram != nullptr;
+        result.stats.reusedMaterialProgram = materialProgram != nullptr;
         result.stats.diffractionEvaluationBudget = spatialSchedule.maximumEvaluations;
         result.stats.diffractionEvaluationCount = spatialSchedule.requiredEvaluations;
         return result;
     }
+
+private:
+    struct CachedProgram
+    {
+        std::uint64_t lastUse = 0;
+        std::shared_ptr<OpenGlFixtureSceneResources::SharedProgram> program;
+    };
+    // Access and eviction hold fixtureMutex. Teardown removes only the current
+    // context so an export/probe cannot retire a viewport's cached programs.
+    std::map<GLFWwindow*, std::map<std::string, CachedProgram>> programCache_;
+    std::uint64_t programUseSerial_ = 0;
 };
 
 const char* kDeformationComputeShader = R"glsl(#version 430 core
@@ -3273,6 +4245,7 @@ layout(std430, binding=7) readonly buffer MorphWeights { float morphWeights[]; }
 uniform uint uVertexCount;
 uniform uint uJointCount;
 uniform uint uMorphTargetCount;
+uniform uint uOutputOffset;
 mat4 jointMatrix(uint index)
 {
     uint first = index * 16u;
@@ -3290,7 +4263,10 @@ void main()
 {
     uint vertex = gl_GlobalInvocationID.x;
     if (vertex >= uVertexCount) return;
-    uint base = vertex * 8u;
+    uint base = vertex * 16u;
+    uint outputBase = (vertex + uOutputOffset) * 16u;
+    for (uint component = 0u; component < 16u; ++component)
+        outputVertices[outputBase + component] = baseVertices[base + component];
     vec3 position = vec3(baseVertices[base], baseVertices[base + 1u],
                          baseVertices[base + 2u]);
     vec3 normal = vec3(baseVertices[base + 3u], baseVertices[base + 4u],
@@ -3320,14 +4296,12 @@ void main()
     }
     float normalLength = length(normal);
     normal = normalLength > 1.0e-8 ? normal / normalLength : vec3(0.0, 0.0, 1.0);
-    outputVertices[base] = position.x;
-    outputVertices[base + 1u] = position.y;
-    outputVertices[base + 2u] = position.z;
-    outputVertices[base + 3u] = normal.x;
-    outputVertices[base + 4u] = normal.y;
-    outputVertices[base + 5u] = normal.z;
-    outputVertices[base + 6u] = baseVertices[base + 6u];
-    outputVertices[base + 7u] = baseVertices[base + 7u];
+    outputVertices[outputBase] = position.x;
+    outputVertices[outputBase + 1u] = position.y;
+    outputVertices[outputBase + 2u] = position.z;
+    outputVertices[outputBase + 3u] = normal.x;
+    outputVertices[outputBase + 4u] = normal.y;
+    outputVertices[outputBase + 5u] = normal.z;
 }
 )glsl";
 
@@ -3364,6 +4338,8 @@ public:
     int vertexCountLocation = -1;
     int jointCountLocation = -1;
     int morphTargetCountLocation = -1;
+    int outputOffsetLocation = -1;
+    std::vector<std::shared_ptr<const OpenGlDeformationResources>> draws;
     mutable std::mutex submissionMutex;
 };
 
@@ -3408,6 +4384,39 @@ public:
         const std::shared_ptr<const NativeDeformationScene>& source,
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram) override
     {
+        if (!source || source->draws.empty()) return prepareDraw(source, materialProgram, {});
+        NativeDeformationPreparation result;
+        if (source->draws.size() > HarmonicMIDI::grid::Visual3DScene::kMaxObjects)
+        { result.error = "native OpenGL deformation draw capacity exceeded"; return result; }
+        OpenGlFixtureSceneBackend fixtureBackend;
+        const auto fixture = fixtureBackend.prepare(source->scene, materialProgram);
+        if (!fixture.prepared) { result.error = fixture.error; return result; }
+        auto resources = std::make_shared<OpenGlDeformationResources>();
+        resources->source = source;
+        resources->ownerContext = glfwGetCurrentContext();
+        resources->fixture = std::dynamic_pointer_cast<const OpenGlFixtureSceneResources>(fixture.resources);
+        if (!resources->fixture) { result.error = "native OpenGL scene batch has no vertex buffer"; return result; }
+        for (const auto& draw : source->draws)
+        {
+            if (!draw || !draw->draws.empty() || !draw->batchMember || draw->scene != source->scene)
+            { result.error = "native OpenGL scene batch has an invalid draw owner"; return result; }
+            auto prepared = prepareDraw(draw, {}, resources->fixture);
+            if (!prepared.prepared) { result.error = prepared.error; return result; }
+            resources->draws.push_back(std::dynamic_pointer_cast<const OpenGlDeformationResources>(prepared.resources));
+            result.stats.staticVertexBytes += prepared.stats.staticVertexBytes;
+            result.stats.staticDeformationBytes += prepared.stats.staticDeformationBytes;
+        }
+        result.prepared = true;
+        result.resources = std::move(resources);
+        result.stats.staticUploadCount = 1;
+        return result;
+    }
+
+    NativeDeformationPreparation prepareDraw (
+        const std::shared_ptr<const NativeDeformationScene>& source,
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram,
+        std::shared_ptr<const OpenGlFixtureSceneResources> fixture)
+    {
         NativeDeformationPreparation result;
         const auto available = info();
         if (! available.available)
@@ -3419,17 +4428,23 @@ public:
             || source->deformationStableId == 0 || source->structuralRevision == 0
             || ! source->clip.isValid() || ! source->mesh.isValid()
             || ! source->object.isValid() || ! source->scene || ! source->deformation
-            || source->scene->objectCount != 1 || source->scene->materialCount != 1
+            || !HarmonicMIDI::grid::validateVisual3DScene(*source->scene).valid()
+            || (!source->batchMember && (source->scene->objectCount != 1 || source->scene->materialCount != 1
             || source->scene->lightCount != 1 || source->scene->cameraCount != 1
             || source->scene->objects[0].id != source->object
             || source->scene->objects[0].firstVertex != 0
-            || source->scene->objects[0].vertexCount != source->scene->vertexCount)
+            || source->scene->objects[0].vertexCount != source->scene->vertexCount)))
         {
             result.error = "native OpenGL deformation requires one exact bounded scene owner";
             return result;
         }
         const auto* mesh = source->deformation->findMesh (source->mesh);
-        if (mesh == nullptr || mesh->vertexCount() != source->scene->vertexCount
+        const auto object = std::find_if(source->scene->objects.begin(),
+            source->scene->objects.begin() + source->scene->objectCount,
+            [&](const auto& value) { return value.id == source->object; });
+        if (mesh == nullptr || object == source->scene->objects.begin() + source->scene->objectCount
+            || object->firstVertex > source->scene->vertexCount
+            || mesh->vertexCount() > source->scene->vertexCount - object->firstVertex
             || mesh->vertexCount() == 0
             || mesh->vertexCount() > kNativeDeformationMaxVertices
             || mesh->jointWeightSets().size() > 1
@@ -3445,19 +4460,22 @@ public:
                 return result;
             }
 
-        OpenGlFixtureSceneBackend fixtureBackend;
-        auto fixturePreparation = fixtureBackend.prepare (source->scene, materialProgram);
-        if (! fixturePreparation.prepared)
+        if (!fixture)
         {
-            result.error = fixturePreparation.error;
-            return result;
-        }
-        auto fixture = std::dynamic_pointer_cast<const OpenGlFixtureSceneResources> (
-            fixturePreparation.resources);
-        if (fixture == nullptr)
-        {
-            result.error = "native OpenGL deformation did not receive fixture GPU resources";
-            return result;
+            OpenGlFixtureSceneBackend fixtureBackend;
+            auto fixturePreparation = fixtureBackend.prepare (source->scene, materialProgram);
+            if (! fixturePreparation.prepared)
+            {
+                result.error = fixturePreparation.error;
+                return result;
+            }
+            fixture = std::dynamic_pointer_cast<const OpenGlFixtureSceneResources> (
+                fixturePreparation.resources);
+            if (fixture == nullptr)
+            {
+                result.error = "native OpenGL deformation did not receive fixture GPU resources";
+                return result;
+            }
         }
 
         std::lock_guard<std::mutex> lock (fixtureMutex());
@@ -3527,7 +4545,7 @@ public:
             gl.BufferData (GL_SHADER_STORAGE_BUFFER, static_cast<std::ptrdiff_t> (size),
                            bytes, usage);
         };
-        upload (0, source->scene->vertices.data(), vertexBytes, GL_STATIC_DRAW);
+        upload (0, source->scene->vertices.data() + object->firstVertex, vertexBytes, GL_STATIC_DRAW);
         upload (1, jointIndices.data(), jointIndices.size() * sizeof (std::uint32_t),
                 GL_STATIC_DRAW);
         upload (2, jointWeights.data(), jointWeights.size() * sizeof (float), GL_STATIC_DRAW);
@@ -3561,9 +4579,11 @@ public:
             resources->computeProgram, "uJointCount");
         resources->morphTargetCountLocation = gl.GetUniformLocation (
             resources->computeProgram, "uMorphTargetCount");
+        resources->outputOffsetLocation = gl.GetUniformLocation(resources->computeProgram, "uOutputOffset");
         if (resources->computeProgram == 0 || resources->vertexCountLocation < 0
             || resources->jointCountLocation < 0
             || resources->morphTargetCountLocation < 0
+            || resources->outputOffsetLocation < 0
             || std::any_of (resources->buffers.begin(), resources->buffers.end(),
                             [] (unsigned buffer) { return buffer == 0; }))
         {
@@ -3586,7 +4606,7 @@ public:
         result.stats.deformationStableId = source->deformationStableId;
         result.stats.clipId = source->clip.value;
         result.stats.meshId = source->mesh.value;
-        result.stats.skinId = mesh->skin().value;
+        result.stats.skinId = source->skin.value_or(mesh->skin()).value;
         result.stats.revision = source->structuralRevision;
         return result;
     }
@@ -3612,6 +4632,51 @@ public:
         NativeDeformationFrameData frameData;
         if (! prepareNativeDeformationFrame (*source, *snapshot, frameData, result.error))
             return result;
+        if (!source->draws.empty())
+        {
+            if (resources->draws.size() != source->draws.size())
+            { result.error = "native OpenGL scene batch topology changed"; return result; }
+            if (source->retainDeformedGeometry)
+                for (std::size_t index=0;index<source->scene->vertexCount;++index) {
+                    const auto& vertex=source->scene->vertices[index];
+                    result.deformedVertices.insert(result.deformedVertices.end(),{
+                        vertex.position.x,vertex.position.y,vertex.position.z,
+                        vertex.normal.x,vertex.normal.y,vertex.normal.z,vertex.uv.x,vertex.uv.y});
+                }
+            for (std::size_t index = 0; index < source->draws.size(); ++index)
+            {
+                auto drawInputs = runtimeInputs;
+                if (snapshot->pose().morphEnabled && snapshot->pose().nodeStableId != source->draws[index]->animationNodeStableId
+                    && snapshot->combinationMode() != visualanimation::CombinationMode::WeightedBlend)
+                    drawInputs.morphWeight = static_cast<float>(snapshot->combinationWeight());
+                auto draw = render(source->draws[index], snapshot, resources->draws[index], width, height, drawInputs);
+                if (!draw.rendered) { result.error = draw.error; return result; }
+                if (source->retainDeformedGeometry) {
+                    const auto object=std::find_if(source->scene->objects.begin(),
+                        source->scene->objects.begin()+source->scene->objectCount,
+                        [&](const auto& value) { return value.id==source->draws[index]->object; });
+                    const auto* mesh=source->deformation->findMesh(source->draws[index]->mesh);
+                    if (draw.deformedVertices.size()!=mesh->vertexCount()*8u) {
+                        result.error="native OpenGL scene geometry readback changed topology"; return result;
+                    }
+                    std::copy(draw.deformedVertices.begin(),draw.deformedVertices.end(),
+                        result.deformedVertices.begin()+object->firstVertex*8u);
+                }
+                result.stats.dispatchCount += draw.stats.dispatchCount;
+                result.stats.dynamicUniformBytes += draw.stats.dynamicUniformBytes;
+            }
+            auto frame = nativeFixtureSceneBackend().render(source->scene, resources->fixture, width, height, runtimeInputs);
+            if (!frame.rendered) { result.error = frame.error; return result; }
+            result.rendered = true; result.frame = std::move(frame.frame);
+            result.stats.drawCount = frame.stats.drawCount;
+            result.stats.reusedStaticResources = true;
+            result.stats.sourceStableId = source->sourceStableId;
+            result.stats.deformationStableId = source->deformationStableId;
+            result.stats.clipId = source->clip.value;
+            result.stats.revision = source->structuralRevision;
+            result.stats.time = snapshot->time();
+            return result;
+        }
         for (std::size_t index = 0; index < frameData.morphTargetCount; ++index)
         {
             const auto base = source->morphBaseWeights.empty()
@@ -3660,10 +4725,43 @@ public:
             gl.Uniform1ui (resources->jointCountLocation, frameData.jointCount);
             gl.Uniform1ui (resources->morphTargetCountLocation,
                            frameData.morphTargetCount);
+            const auto object = std::find_if(source->scene->objects.begin(),
+                source->scene->objects.begin() + source->scene->objectCount,
+                [&](const auto& value) { return value.id == source->object; });
+            gl.Uniform1ui(resources->outputOffsetLocation, object->firstVertex);
             gl.DispatchCompute ((frameData.vertexCount + 63u) / 64u, 1, 1);
             gl.MemoryBarrier (GL_SHADER_STORAGE_BARRIER_BIT
                               | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
             glFinish();
+            if (source->retainDeformedGeometry)
+            {
+                const auto count = static_cast<std::size_t>(frameData.vertexCount);
+                gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resources->fixture->vertexBuffer);
+                const auto* mapped = static_cast<const HarmonicMIDI::grid::SceneVertex*>(gl.MapBufferRange(
+                    GL_SHADER_STORAGE_BUFFER, static_cast<std::ptrdiff_t>(object->firstVertex * sizeof(HarmonicMIDI::grid::SceneVertex)),
+                    static_cast<std::ptrdiff_t>(count * sizeof(HarmonicMIDI::grid::SceneVertex)),
+                    GL_MAP_READ_BIT));
+                if (mapped == nullptr)
+                {
+                    restore();
+                    result.error = "native OpenGL deformed geometry readback failed";
+                    return result;
+                }
+                result.deformedVertices.reserve(count * 8u);
+                for (std::size_t index=0;index<count;++index) {
+                    const auto& vertex=mapped[index];
+                    result.deformedVertices.insert(result.deformedVertices.end(),{
+                        vertex.position.x,vertex.position.y,vertex.position.z,
+                        vertex.normal.x,vertex.normal.y,vertex.normal.z,vertex.uv.x,vertex.uv.y});
+                }
+                if (gl.UnmapBuffer(GL_SHADER_STORAGE_BUFFER) != GL_TRUE)
+                {
+                    restore();
+                    result.deformedVertices.clear();
+                    result.error = "native OpenGL deformed geometry buffer became invalid";
+                    return result;
+                }
+            }
             const auto gpuError = glGetError();
             restore();
             if (gpuError != GL_NO_ERROR)
@@ -3674,6 +4772,14 @@ public:
             }
         }
 
+        if (source->batchMember)
+        {
+            result.rendered = true;
+            result.stats.dispatchCount = 1;
+            result.stats.dynamicUniformBytes = frameData.jointCount * 16u * sizeof(float)
+                + frameData.morphTargetCount * sizeof(float);
+            return result;
+        }
         auto fixtureSubmission = nativeFixtureSceneBackend().render (
             source->scene, resources->fixture, width, height, runtimeInputs);
         if (! fixtureSubmission.rendered)
@@ -3694,7 +4800,7 @@ public:
         result.stats.deformationStableId = source->deformationStableId;
         result.stats.clipId = source->clip.value;
         result.stats.meshId = source->mesh.value;
-        result.stats.skinId = mesh != nullptr ? mesh->skin().value : 0;
+        result.stats.skinId = mesh != nullptr ? source->skin.value_or(mesh->skin()).value : 0;
         result.stats.revision = source->structuralRevision;
         result.stats.time = snapshot->time();
         return result;
@@ -3741,8 +4847,13 @@ RenderPassOutputBackend& nativeRenderPassOutputBackend()
 
 NativeOpticalFlowExecutionBackend& nativeOpticalFlowExecutionBackend()
 {
-    static UnavailableOpticalFlowBackend backend;
+    static OpenGlOpticalFlowBackend backend;
     return backend;
+}
+
+void invalidateNativeOpticalFlowExecutionContext (std::uintptr_t contextIdentity) noexcept
+{
+    static_cast<OpenGlOpticalFlowBackend&>(nativeOpticalFlowExecutionBackend()).invalidateContext(contextIdentity);
 }
 
 NativeFixtureSceneBackend& nativeFixtureSceneBackend()

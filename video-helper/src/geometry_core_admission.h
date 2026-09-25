@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/GeometrySurfaceMaterial.h"
 
 #include "../../shared/GeometryCoreTransport.h"
 
@@ -122,7 +123,15 @@ admitPlanValue(videowire::geometry::ValueDescriptor source,
             "contract";
     return std::nullopt;
   }
-  if ((contract.carrier == videowire::geometry::CarrierKind::field &&
+  const bool usesFields = contract.carrier == videowire::geometry::CarrierKind::field ||
+      !source.spectrumFields.empty() || !source.scoreFields.empty() ||
+      std::any_of(source.operations.begin(), source.operations.end(), [](const auto &operation) {
+        return videowire::geometry::isElementFieldQuery(operation.code) ||
+               videowire::geometry::isConstructedFieldOperation(operation.code) ||
+               operation.code == videowire::geometry::OperationCode::evaluateField ||
+               operation.code == videowire::geometry::OperationCode::vectorDisplacement;
+      });
+  if ((usesFields &&
        !capabilities.typedFieldEvaluation) ||
       (contract.carrier == videowire::geometry::CarrierKind::instances3D &&
        !capabilities.gpuInstancingWithoutMeshExpansion)) {
@@ -187,6 +196,7 @@ struct RuntimeAdmission final {
     std::shared_ptr<const void> value;
   };
   std::shared_ptr<NativeResources> nativeResources;
+  std::string surfaceMaterial;
 };
 
 class GeometryCorePlanRuntime final {
@@ -287,7 +297,7 @@ private:
     if (!lowered)
       return std::nullopt;
     return admit(lowered->runtimeValue, lowered->contract, limits, context,
-                 PlanOwnerIdentity{1, 1, 1, 1, 1, use}, error);
+                 PlanOwnerIdentity{1, 1, 1, 1, 1, use}, error, lowered->surfaceMaterial);
   }
   std::optional<RuntimeAdmission>
   admitLowered(const std::vector<std::uint8_t> &bytes,
@@ -302,7 +312,7 @@ private:
     if (!lowered)
       return std::nullopt;
     return admit(lowered->runtimeValue, lowered->contract, limits, context,
-                 owner, error);
+                 owner, error, lowered->surfaceMaterial);
   }
   std::optional<RuntimeAdmission>
   admit(const std::vector<std::uint8_t> &bytes,
@@ -310,17 +320,45 @@ private:
         const videowire::geometry::ResourceLimits &limits,
         const videowire::geometry::AdmissionContext &context,
         const PlanOwnerIdentity &owner,
-        std::string &error) {
+        std::string &error, const std::string& surfaceMaterial = {}) {
+    if (!surfaceMaterial.empty()) {
+      const auto material = geometrysurfacematerial::decodeSet(surfaceMaterial, error);
+      if (!material) return std::nullopt;
+      if (material->front().material.structuralRevision != owner.planGeneration) {
+        error = "Geometry Surface revision does not match its immutable plan owner";
+        return std::nullopt;
+      }
+    }
     auto decoded = videowire::geometry::decodeRuntimeValue(
         bytes, contract, limits, context, error);
     if (!decoded)
       return std::nullopt;
+    if (!surfaceMaterial.empty()) {
+      const auto programs=geometrysurfacematerial::decodeSet(surfaceMaterial,error);
+      const auto& operations=decoded->descriptor().operations;
+      const bool hasTable=std::any_of(operations.begin(),operations.end(),[](const auto& op) {
+        return op.code==videowire::geometry::OperationCode::materialTableSlot;
+      });
+      if (!programs) return std::nullopt;
+      for (const auto& program : *programs) {
+        const bool referenced=std::any_of(operations.begin(),operations.end(),[&](const auto& op) {
+          return op.code==videowire::geometry::OperationCode::materialTableSlot && op.secondaryInputStableId==program.sourceMaterial;
+        });
+        if ((program.sourceMaterial==0 && hasTable) || (program.sourceMaterial!=0 && !referenced)) {
+          error="Geometry Surface program has no exact material-table owner"; return std::nullopt;
+        }
+      }
+    }
     auto plan = admitPlanValue(decoded->descriptor(), contract, limits, context,
                                backend_, error);
     if (!plan)
       return std::nullopt;
     std::uint64_t key = plan->receipt().backendBinding;
     for (const auto byte : bytes) {
+      key ^= byte;
+      key *= 1099511628211ull;
+    }
+    for (const unsigned char byte : surfaceMaterial) {
       key ^= byte;
       key *= 1099511628211ull;
     }
@@ -341,7 +379,7 @@ private:
       found->second.lastUse = ++clock_;
       return RuntimeAdmission{owner.use, owner, found->second.plan,
                               found->second.ownerLease,
-                              found->second.nativeResources};
+                              found->second.nativeResources, found->second.surfaceMaterial};
     }
     evictUnusedOwners();
     if (cache_.size() >= maximumOwners_) {
@@ -351,10 +389,10 @@ private:
     auto shared = std::make_shared<const AdmittedPlanValue>(std::move(*plan));
     auto ownerLease = std::make_shared<const std::uint8_t>(0);
     auto nativeResources = std::make_shared<RuntimeAdmission::NativeResources>();
-    cache_.emplace(owner, Entry{key, ++clock_, shared, ownerLease, nativeResources});
+    cache_.emplace(owner, Entry{key, ++clock_, shared, ownerLease, nativeResources, surfaceMaterial});
     ++admissionsInGeneration_;
     return RuntimeAdmission{owner.use, owner, std::move(shared),
-                            std::move(ownerLease), std::move(nativeResources)};
+                            std::move(ownerLease), std::move(nativeResources), surfaceMaterial};
   }
   struct Entry final {
     std::uint64_t planDigest = 0;
@@ -362,6 +400,7 @@ private:
     std::shared_ptr<const AdmittedPlanValue> plan;
     std::shared_ptr<const std::uint8_t> ownerLease;
     std::shared_ptr<RuntimeAdmission::NativeResources> nativeResources;
+    std::string surfaceMaterial;
   };
   void evictUnusedOwners() {
     while (cache_.size() >= maximumOwners_) {

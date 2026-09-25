@@ -51,6 +51,7 @@ struct VolumeUniforms {
     float4 cameraOrigin;
     float4 cameraTarget;
     float4 extentCameraSteps;
+    float4 backgroundMode;
 };
 
 bool intersectBox(float3 origin, float3 direction,
@@ -91,7 +92,7 @@ fragment float4 _main(VertexOut in [[stage_in]],
     float farT = 0.0f;
     if (!intersectBox(localOrigin, localDirection, u.boundsMinimum.xyz,
                       u.boundsMaximum.xyz, nearT, farT))
-        return float4(background, 1.0f);
+        return u.backgroundMode.x > 0.5f ? float4(0.0f) : float4(background, 1.0f);
 
     nearT = max(nearT, 0.0f);
     const int stepCount = max(int(u.extentCameraSteps.w + 0.5f), 1);
@@ -114,7 +115,10 @@ fragment float4 _main(VertexOut in [[stage_in]],
         accumulated += transmittance * alpha * sampleColor;
         transmittance *= 1.0f - alpha;
     }
-    return float4(accumulated + transmittance * background, 1.0f);
+    const float coverage = 1.0f - transmittance;
+    return u.backgroundMode.x > 0.5f
+        ? (coverage > 0.0f ? float4(accumulated / coverage, coverage) : float4(0.0f))
+        : float4(accumulated + transmittance * background, 1.0f);
 }
 )metal";
 
@@ -126,8 +130,9 @@ struct VolumeUniforms final
     float cameraOrigin[4] {};
     float cameraTarget[4] {};
     float extentCameraSteps[4] {};
+    float backgroundMode[4] {};
 };
-static_assert (sizeof (VolumeUniforms) == 144,
+static_assert (sizeof (VolumeUniforms) == 160,
                "Metal volume uniform layout changed");
 
 bool resourceValid (sg_resource_state state) noexcept
@@ -290,13 +295,27 @@ bool cameraForVolume (const AdmittedVolume& volume,
 class MetalVolumeFrame final : public NativeVolumeFrame
 {
 public:
-    ~MetalVolumeFrame() override
+    ~MetalVolumeFrame() override { releaseNativeResources(); }
+
+    void releaseNativeResources() const noexcept override
     {
+        if (contextLifetime_ && !contextLifetime_->alive.load(std::memory_order_acquire)) return;
         if (! hasResources()) return;
         std::lock_guard<std::mutex> lock (arbitgpu::sokolmetal::mutex());
         if (sg_isvalid()) destroyUnlocked();
     }
 
+    arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    {
+        if (contextLifetime_ && !contextLifetime_->alive.load(std::memory_order_acquire)) return {};
+        return {backend_, arbitgpu::NativeTextureViewKind::Texture2D,
+            arbitgpu::NativeTexturePixelFormat::Bgra8Unorm, colorImage.id, colorTextureView.id,
+            width_, height_, 1, true, deviceIdentity_, generation_,
+            colortransform::ColorSpace::SRGB, colortransform::TransferFunction::SRGB};
+    }
+    std::shared_ptr<const NativeVolumeContextLifetime> contextLifetime_;
+    const std::uint64_t generation_ = nextNativeVolumeFrameGeneration();
+    std::uintptr_t deviceIdentity_ = 0;
     const std::string& backend() const noexcept override { return backend_; }
     std::uint32_t width() const noexcept override { return width_; }
     std::uint32_t height() const noexcept override { return height_; }
@@ -314,7 +333,7 @@ public:
             || shader.id != 0 || pipeline.id != 0;
     }
 
-    void destroyUnlocked() noexcept
+    void destroyUnlocked() const noexcept
     {
         if (pipeline.id != 0) sg_destroy_pipeline (pipeline);
         if (shader.id != 0) sg_destroy_shader (shader);
@@ -337,19 +356,24 @@ public:
     std::string backend_ = "metal";
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
-    sg_image colorImage = {};
-    sg_view colorAttachmentView = {};
-    sg_view colorTextureView = {};
-    sg_image volumeImage = {};
-    sg_view volumeTextureView = {};
-    sg_sampler sampler = {};
-    sg_shader shader = {};
-    sg_pipeline pipeline = {};
+    mutable sg_image colorImage = {};
+    mutable sg_view colorAttachmentView = {};
+    mutable sg_view colorTextureView = {};
+    mutable sg_image volumeImage = {};
+    mutable sg_view volumeTextureView = {};
+    mutable sg_sampler sampler = {};
+    mutable sg_shader shader = {};
+    mutable sg_pipeline pipeline = {};
 };
 
 class MetalVolumeExecutionBackend final : public NativeVolumeExecutionBackend
 {
 public:
+    std::uintptr_t contextIdentity() const noexcept override
+    {
+        return reinterpret_cast<std::uintptr_t>(arbitgpu::sokolmetal::device());
+    }
+
     NativeVolumeExecutionCapabilities capabilities() const override
     {
         std::lock_guard<std::mutex> lock (arbitgpu::sokolmetal::mutex());
@@ -413,6 +437,8 @@ public:
         }
 
         auto frame = std::make_shared<MetalVolumeFrame>();
+        frame->contextLifetime_ = request.contextLifetime;
+        frame->deviceIdentity_ = reinterpret_cast<std::uintptr_t>(arbitgpu::sokolmetal::device());
         frame->width_ = request.width;
         frame->height_ = request.height;
         auto fail = [&] (const char* error)
@@ -518,12 +544,18 @@ public:
             kMaximumRaySteps,
             std::max ({ dimensions.width, dimensions.height, dimensions.depth })));
 
+        if (request.transparentBackground)
+            uniforms.extentCameraSteps[3] = static_cast<float>(std::min<std::uint32_t>(
+                kMaximumRaySteps, std::max({dimensions.width, dimensions.height, dimensions.depth, 32u}) * 2u));
+        uniforms.backgroundMode[0] = request.transparentBackground ? 1.0f : 0.0f;
+
         sg_pass pass = {};
         pass.attachments.colors[0] = frame->colorAttachmentView;
         pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
         pass.action.colors[0].store_action = SG_STOREACTION_STORE;
         pass.action.colors[0].clear_value = {
             7.0f / 255.0f, 10.0f / 255.0f, 18.0f / 255.0f, 1.0f };
+        if (request.transparentBackground) pass.action.colors[0].clear_value = {0, 0, 0, 0};
         pass.label = "arbit-metal-volume-raymarch-pass";
         sg_begin_pass (&pass);
         sg_apply_pipeline (frame->pipeline);

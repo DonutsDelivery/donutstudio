@@ -1,5 +1,6 @@
 #include "gl_loader.h"
 #include "renderer.h"
+#include "support/frame_texture_lease_cases.h"
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <array>
@@ -66,6 +67,64 @@ void printPixel(const char* name, const uint8_t* actual, const std::array<int, 4
               << static_cast<int>(actual[1]) << ',' << static_cast<int>(actual[2]) << ','
               << static_cast<int>(actual[3]) << ") oracle=(" << expected[0] << ','
               << expected[1] << ',' << expected[2] << ',' << expected[3] << ")\n";
+}
+
+bool particleSceneOverlayPixels(arbitgl::GlFuncs& gl, std::string& error)
+{
+    constexpr int side = 64;
+    videorender::FrameRenderer renderer;
+    if (!renderer.initialize(&gl, side, side, error)) return false;
+    std::vector<uint8_t> background(side * side * 4);
+    for (std::size_t i = 0; i < background.size(); i += 4)
+        std::copy(kSource.begin(), kSource.end(), background.begin() + i);
+    const auto texture = renderer.uploadRgba(background.data(), side, side, side * 4, 0);
+    videorender::LayerDesc rig;
+    rig.clipId = 73;
+    rig.texture = texture;
+    rig.nativeTextureBackend = "opengl";
+    rig.nativeTextureView = texture;
+    rig.texWidth = rig.texHeight = side;
+    rig.particleSource = rig.importedParticleOverlay = true;
+    rig.particleNodeId = 91;
+    rig.visualPlanStructuralRevision = 1;
+    rig.particleParameters.motionMode = 1;
+    rig.particleParameters.count = 256;
+    rig.particleParameters.size = 7;
+    rig.particleParameters.alpha = 0;
+    rig.shaderClock.timeSec = 1.25;
+    rig.shaderClock.frame = 30;
+    rig.shaderClock.playing = false;
+    auto score = std::make_shared<arbitmod::Score>();
+    score->scoreRevision = 1;
+    arbitmod::Note note;
+    note.id = -101; note.midiNote = 60; note.freqHz = 261.625565f;
+    note.velocity = 127; note.lengthBeats = 8;
+    score->notes.push_back(note);
+    canonicalblockc::FrameKey key;
+    key.projectGeneration = key.sourceGeneration = key.helperGeneration = 1;
+    key.backendGeneration = key.deviceGeneration = key.scoreGeneration = 1;
+    key.beatMapGeneration = key.fpsGeneration = key.loopGeneration = key.seekGeneration = 1;
+    key.fps = 24;
+    canonicalblockc::FrameProducer producer;
+    rig.canonicalBlockCFrame = producer.evaluate(key, score, 0.0f);
+    std::vector<uint8_t> silent, lit, seek, replay;
+    bool passed = renderer.renderToPixels(&rig, 1, silent, error) && silent.size() == background.size();
+    for (std::size_t i = 0; passed && i < silent.size(); ++i)
+        passed = std::abs(static_cast<int>(silent[i]) - background[i]) <= kTolerance;
+    rig.particleParameters.alpha = 1;
+    passed = renderer.renderToPixels(&rig, 1, lit, error) && passed && lit != silent;
+    rig.shaderClock.timeSec = 2.5;
+    rig.shaderClock.frame = 60;
+    passed = renderer.renderToPixels(&rig, 1, seek, error) && passed;
+    rig.shaderClock.timeSec = 1.25;
+    rig.shaderClock.frame = 30;
+    passed = renderer.renderToPixels(&rig, 1, replay, error) && passed && replay == lit;
+    rig.texture = 0;
+    std::vector<uint8_t> missing;
+    passed = !renderer.renderToPixels(&rig, 1, missing, error) && passed;
+    renderer.deleteTexture(texture);
+    renderer.shutdown();
+    return passed;
 }
 }
 
@@ -135,6 +194,15 @@ int main()
     const unsigned sourceTexture = renderer.uploadRgba(source.data(), kWidth, kHeight,
                                                         kWidth * 4, 0);
     const unsigned depthTexture = renderer.uploadR16(kDepth.data(), kWidth, kHeight, 0);
+    const bool frameLeasesPass = videohelper::tests::frameTextureLeaseCases(
+        renderer, kWidth, kHeight, [&](const auto& frame)
+        {
+            std::vector<uint8_t> pixels(static_cast<std::size_t>(kWidth) * kHeight * 4);
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(frame->colorTextureViewHandle()));
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+            glBindTexture(GL_TEXTURE_2D, 0);
+            return pixels;
+        });
 
     videorender::LayerDesc layer;
     layer.texture = sourceTexture;
@@ -261,12 +329,14 @@ int main()
     renderer.shutdown();
     const bool ownerClean = !renderer.ready() && glGetError() == GL_NO_ERROR;
 
+    const bool particleOverlayPass = particleSceneOverlayPixels(gl, error);
+
     glfwDestroyWindow(window);
     glfwTerminate();
     if (!rejectedAdmission || !pixelsPass || !depthChangesOutput || !colorTransformPixels
         || !framebufferStatePreserved
         || !zeroTextureReadbackRejected
-        || !externalTexturesDeleted || !ownerClean)
+        || !externalTexturesDeleted || !ownerClean || !particleOverlayPass || !frameLeasesPass)
     {
         std::cerr << "Depth Fog native pixel acceptance FAIL: rendered=" << rendered
                   << " rejectedAdmission=" << rejectedAdmission
@@ -275,6 +345,7 @@ int main()
                   << " framebufferStatePreserved=" << framebufferStatePreserved
                   << " zeroTextureReadbackRejected=" << zeroTextureReadbackRejected
                   << " texturesDeleted=" << externalTexturesDeleted
+                  << " particleOverlay=" << particleOverlayPass
                   << " ownerClean=" << ownerClean << " error=" << error
                   << " rejection=" << rejection << '\n';
         return 1;

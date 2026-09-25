@@ -5,8 +5,11 @@
 #include "../../shared/SdfRaymarchOperationContract.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -18,6 +21,33 @@ enum class VisualSdfPreparation
     rendered,
     rejected
 };
+
+class NativeSdfImage final : public arbitgpu::NativeFixtureSceneFrame
+{
+public:
+    explicit NativeSdfImage(std::shared_ptr<const arbitgpu::NativeSdfSceneFrame> frame) : frame_(std::move(frame)) {}
+    const std::string& backend() const noexcept override { return frame_->backend(); }
+    std::uint32_t width() const noexcept override { return frame_->width(); }
+    std::uint32_t height() const noexcept override { return frame_->height(); }
+    std::uintptr_t colorImageHandle() const noexcept override { return frame_->colorImageHandle(); }
+    std::uintptr_t colorTextureViewHandle() const noexcept override { return frame_->colorTextureViewHandle(); }
+    arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    { return frame_->colorTextureDescriptor(); }
+private:
+    std::shared_ptr<const arbitgpu::NativeSdfSceneFrame> frame_;
+};
+
+inline bool hasVisualSdf(const videowire::CompiledVisualLayerPlan& plan)
+{
+    return std::any_of(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == "visual.sdf.raymarch"; });
+}
+
+inline bool hasVisualSdf(const std::vector<videowire::CompiledVisualLayerPlan>& plans, int clipId)
+{
+    const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
+    return plan != nullptr && hasVisualSdf(*plan);
+}
 
 inline const char* operationKind (videowire::SdfOperation operation) noexcept
 {
@@ -53,63 +83,79 @@ inline const char* operationKind (videowire::SdfOperation operation) noexcept
     return nullptr;
 }
 
-template <typename Layer>
-inline VisualSdfPreparation prepareVisualSdfLayer (
-    const std::vector<videowire::CompiledVisualLayerPlan>& plans,
-    int clipId,
-    int width,
-    int height,
-    NativeSdfRenderUse use,
-    NativeSdfRenderer& renderer,
-    Layer& layer,
-    std::vector<NativeSdfRenderedFrame>& frameOwners,
-    std::string& error, NativeSdfCacheIdentity cacheIdentity = {})
+// Preflight and native preparation must admit the same immutable SDF records.
+// Device output support and render dimensions remain NativeSdfRenderer's job.
+inline std::optional<AdmittedSdfIr> admitVisualSdfPlan (
+    const videowire::CompiledVisualLayerPlan& plan,
+    videowire::SdfRaymarchOperation& destination,
+    std::string& error)
 {
-    const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
-    if (plan == nullptr) return VisualSdfPreparation::notPresent;
-
-    const auto terminal = std::find_if (plan->operations.begin(), plan->operations.end(),
+    const auto terminal = std::find_if (plan.operations.begin(), plan.operations.end(),
         [] (const auto& operation) { return operation.kind == "visual.sdf.raymarch"; });
-    if (terminal == plan->operations.end()) return VisualSdfPreparation::notPresent;
-
-    const auto reject = [&] (const char* message)
+    const auto reject = [&] (const char* message) -> std::optional<AdmittedSdfIr>
     {
         error = message;
-        return VisualSdfPreparation::rejected;
+        return std::nullopt;
     };
-    if (width <= 0 || height <= 0 || terminal->backendCapability != "native-gpu")
-        return reject ("visual SDF execution requires a bounded native-GPU target");
+    if (! plan.producerValidated || ! plan.error.empty()
+        || terminal == plan.operations.end() || terminal->backendCapability != "native-gpu")
+        return reject ("visual SDF execution requires a validated native-GPU plan");
+
+    if (plan.nodeIds.size() != plan.operations.size() || plan.nodeKinds.size() != plan.operations.size())
+        return reject ("visual SDF execution has incomplete operation identities");
+    std::set<int> identities;
+    for (std::size_t index = 0; index < plan.operations.size(); ++index)
+    {
+        const auto& compiled = plan.operations[index];
+        if (compiled.nodeId < 0 || ! identities.insert(compiled.nodeId).second
+            || plan.nodeIds[index] != compiled.nodeId || plan.nodeKinds[index] != compiled.kind)
+            return reject ("visual SDF execution has duplicate or mismatched operation identities");
+    }
 
     videowire::SdfRaymarchOperation operation;
     if (! decodeSdfRaymarchOperation (terminal->payloadXml, operation)
         || operation.terminalStableId != static_cast<std::uint64_t> (terminal->nodeId) + 1u)
         return reject ("visual SDF raymarch payload is malformed or has stale identity");
 
-    const auto output = std::find_if (plan->operations.begin(), plan->operations.end(),
+    if (operation.maximumSteps == 0 || ! std::isfinite(operation.epsilon) || operation.epsilon <= 0.0
+        || ! std::isfinite(operation.maximumDistance) || operation.maximumDistance < operation.epsilon
+        || ! detail::validQuality(static_cast<arbitgpu::NativeSdfQuality>(operation.adaptiveQuality))
+        || ! detail::validQuality(static_cast<arbitgpu::NativeSdfQuality>(operation.normalQuality))
+        || ! detail::validQuality(static_cast<arbitgpu::NativeSdfQuality>(operation.shadowQuality))
+        || ! detail::validOutput(static_cast<arbitgpu::NativeSdfOutput>(operation.outputPass)))
+        return reject ("visual SDF raymarch payload has invalid controls");
+
+    const auto output = std::find_if (plan.operations.begin(), plan.operations.end(),
         [] (const auto& candidate) { return candidate.kind == "video.out"; });
-    if (output == plan->operations.end() || output->backendCapability != "native-gpu"
-        || plan->operations.size() != operation.geometry.records.size() + 2u)
+    if (output == plan.operations.end() || output->backendCapability != "native-gpu"
+        || plan.operations.size() != operation.geometry.records.size() + 2u
+        || std::count_if(plan.operations.begin(), plan.operations.end(), [](const auto& candidate)
+            { return candidate.kind == "visual.sdf.raymarch"; }) != 1
+        || std::count_if(plan.operations.begin(), plan.operations.end(), [](const auto& candidate)
+            { return candidate.kind == "video.out"; }) != 1)
         return reject ("visual SDF execution requires exactly one raymarch terminal and one Output");
 
     const auto findOperation = [&] (int nodeId) -> const videowire::CompiledVisualOperation*
     {
-        const auto found = std::find_if (plan->operations.begin(), plan->operations.end(),
+        const auto found = std::find_if (plan.operations.begin(), plan.operations.end(),
             [nodeId] (const auto& candidate) { return candidate.nodeId == nodeId; });
-        return found == plan->operations.end() ? nullptr : &*found;
+        return found == plan.operations.end() ? nullptr : &*found;
     };
     const auto exactPort = [&] (int nodeId, int port, const char* direction,
                                 const char* carrier, const char* dataType)
     {
-        return std::count_if (plan->ports.begin(), plan->ports.end(), [&] (const auto& binding)
+        return std::count_if (plan.ports.begin(), plan.ports.end(), [&] (const auto& binding)
         {
             return binding.nodeId == nodeId && binding.port == port && binding.channels == 1
                 && binding.direction == direction && binding.carrier == carrier
-                && binding.dataType == dataType;
+                && binding.dataType == dataType
+                && binding.pixelFormat == (binding.carrier == "frame" ? "rgba8" : "unspecified")
+                && binding.colorSpace == (binding.carrier == "frame" ? "sRGB" : "unspecified");
         }) == 1;
     };
     const auto exactEdge = [&] (int fromNode, int fromPort, int toNode, int toPort)
     {
-        return std::count_if (plan->edges.begin(), plan->edges.end(), [&] (const auto& edge)
+        return std::count_if (plan.edges.begin(), plan.edges.end(), [&] (const auto& edge)
         {
             return edge.fromNodeId == fromNode && edge.fromPort == fromPort
                 && edge.toNodeId == toNode && edge.toPort == toPort;
@@ -117,6 +163,7 @@ inline VisualSdfPreparation prepareVisualSdfLayer (
     };
 
     std::size_t expectedEdgeCount = 2;
+    std::size_t expectedPortCount = 3;
     for (const auto& record : operation.geometry.records)
     {
         if (record.stableId == 0
@@ -147,6 +194,7 @@ inline VisualSdfPreparation prepareVisualSdfLayer (
         }
         if (! exactPort (nodeId, record.inputCount, "out", "control", "sdf"))
             return reject ("visual SDF operation has an incompatible typed output port");
+        expectedPortCount += record.inputCount + 1u;
     }
 
     if (! exactPort (terminal->nodeId, 0, "in", "control", "sdf")
@@ -161,10 +209,39 @@ inline VisualSdfPreparation prepareVisualSdfLayer (
         || ! exactEdge (static_cast<int> (root->stableId - 1u), root->inputCount,
                         terminal->nodeId, 0)
         || ! exactEdge (terminal->nodeId, 1, output->nodeId, 0)
-        || plan->edges.size() != expectedEdgeCount)
-        return reject ("visual SDF terminal topology is incomplete or contains extra edges");
+        || plan.edges.size() != expectedEdgeCount || plan.ports.size() != expectedPortCount)
+        return reject ("visual SDF terminal topology is incomplete or contains extra ports or edges");
 
     auto admitted = admitSdfIr (operation.geometry, {}, error);
+    if (admitted) destination = std::move(operation);
+    return admitted;
+}
+
+template <typename Layer>
+inline VisualSdfPreparation prepareVisualSdfLayer (
+    const std::vector<videowire::CompiledVisualLayerPlan>& plans,
+    int clipId,
+    int width,
+    int height,
+    NativeSdfRenderUse use,
+    NativeSdfRenderer& renderer,
+    Layer& layer,
+    std::vector<NativeSdfRenderedFrame>& frameOwners,
+    std::string& error, NativeSdfCacheIdentity cacheIdentity = {})
+{
+    const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
+    if (plan == nullptr || !hasVisualSdf(*plan))
+        return VisualSdfPreparation::notPresent;
+
+    const auto reject = [&] (const char* message)
+    {
+        error = message;
+        return VisualSdfPreparation::rejected;
+    };
+    if (width <= 0 || height <= 0)
+        return reject ("visual SDF execution requires a bounded native-GPU target");
+    videowire::SdfRaymarchOperation operation;
+    auto admitted = admitVisualSdfPlan(*plan, operation, error);
     if (! admitted) return VisualSdfPreparation::rejected;
     NativeSdfRenderControls controls;
     controls.maximumSteps = operation.maximumSteps;
@@ -188,15 +265,20 @@ inline VisualSdfPreparation prepareVisualSdfLayer (
                                  kNativeGpuCapability, rendered, error, cacheIdentity);
     if (! renderedOk) return VisualSdfPreparation::rejected;
 
-    layer.texture = 0;
-    layer.nativeTextureBackend = rendered.nativeFrame->backend();
-    layer.nativeTextureView = rendered.nativeFrame->colorTextureViewHandle();
-    if (layer.nativeTextureBackend == "opengl")
+    const auto descriptor = rendered.nativeFrame->colorTextureDescriptor();
+    unsigned texture = 0;
+    if (descriptor.backend == "opengl")
     {
-        if (layer.nativeTextureView > std::numeric_limits<unsigned>::max())
+        if (descriptor.textureViewHandle > std::numeric_limits<unsigned>::max())
             return reject ("OpenGL native SDF texture handle exceeds compositor width");
-        layer.texture = static_cast<unsigned> (layer.nativeTextureView);
+        texture = static_cast<unsigned> (descriptor.textureViewHandle);
     }
+    layer.texture = texture;
+    layer.nativeTextureBackend = descriptor.backend;
+    layer.nativeTextureView = descriptor.textureViewHandle;
+    layer.nativeTextureDescriptor = descriptor;
+    layer.nativeTextureOwner = rendered.nativeFrame;
+    layer.nativeLinearImage = std::make_shared<const NativeSdfImage>(rendered.nativeFrame);
     layer.texWidth = width;
     layer.texHeight = height;
     frameOwners.push_back (std::move (rendered));

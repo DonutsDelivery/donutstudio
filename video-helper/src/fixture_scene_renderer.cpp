@@ -2,6 +2,8 @@
 #include "diffractive_foil_admission.h"
 #include "diffraction_material_execution.h"
 #include "surface_material_binding_admission.h"
+#include "gpu_backend/fixture_vertex_modifier_shader.h"
+#include "../../shared/VisualImportedSceneRenderOperationContract.h"
 
 #include <algorithm>
 #include <array>
@@ -64,11 +66,13 @@ admitNativeSurfaceMaterial (const Visual3DScene& scene,
                             HarmonicMIDI::grid::SceneObjectId object,
                             const std::string& bindingDigest,
                             const videohelper::materialprogram::MaterialProgramRecord& program,
+                            bool graphFrame,
                             std::string& error)
 {
     using namespace surfacematerial;
     using NativeProgram = arbitgpu::NativeFixtureSurfaceMaterialProgram;
-    if (! object.isValid() || object != scene.objects[0].id)
+    const auto* targetObject = visual3d_detail::findById(scene.objects, scene.objectCount, object);
+    if (! object.isValid() || targetObject == nullptr)
     {
         error = "native surface material binding must target the exact admitted object";
         return {};
@@ -78,9 +82,9 @@ admitNativeSurfaceMaterial (const Visual3DScene& scene,
         error = "native surface material binding requires an exact admitted digest";
         return {};
     }
-    if (! program.hasSurfaceProgram() || program.hasVertexProgram())
+    if (! program.hasSurfaceProgram())
     {
-        error = "native surface material execution requires one surface-only program";
+        error = "native surface material execution requires one surface program";
         return {};
     }
     arbitgpu::NativeFixtureMaterialBackend nativeBackend
@@ -97,7 +101,8 @@ admitNativeSurfaceMaterial (const Visual3DScene& scene,
             error = "native surface material execution requires an OpenGL or Metal material program";
             return {};
     }
-    if (scene.objects[0].material != scene.materials[0].id)
+    const auto* targetMaterial = visual3d_detail::findById(scene.materials, scene.materialCount, targetObject->material);
+    if (targetMaterial == nullptr)
     {
         error = "native surface material execution requires the object's exact imported material";
         return {};
@@ -284,7 +289,7 @@ admitNativeSurfaceMaterial (const Visual3DScene& scene,
     const auto* ior = instructionFor (OutputSemantic::Ior);
     const auto* clearcoat = instructionFor (OutputSemantic::Clearcoat);
     const auto* materialId = instructionFor (OutputSemantic::MaterialId);
-    if (materialId->unsignedLiteral != scene.objects[0].material.value)
+    if (materialId->unsignedLiteral != targetObject->material.value)
     {
         error = "native surface material materialId must match the rendered object material";
         return {};
@@ -308,20 +313,32 @@ admitNativeSurfaceMaterial (const Visual3DScene& scene,
     native->object = object;
     native->bindingDigest = bindingDigest;
     native->programIdentity = program.programIdentity();
+    if (program.hasVertexProgram())
+    {
+        if (scene.objectCount != 1)
+        {
+            error = "Native vertex material execution requires one selected imported object";
+            return {};
+        }
+        if (arbitgpu::fixtureVertexModifierShader ("// ARBIT_VERTEX_MODIFIER", &program,
+                program.capabilities().backend.target, error).empty()) return {};
+        native->vertexProgram = std::make_shared<const videohelper::materialprogram::MaterialProgramRecord> (program);
+    }
     native->baseColorSource = texturedBaseColor
-        ? NativeProgram::BaseColorSource::ImportedSrgbTexture
+        ? (graphFrame ? NativeProgram::BaseColorSource::GraphFrameSrgbTexture
+                      : NativeProgram::BaseColorSource::ImportedSrgbTexture)
         : (timeMixedBaseColor
             ? NativeProgram::BaseColorSource::TimeLinearMix
             : NativeProgram::BaseColorSource::ConstantLinear);
-    if (texturedBaseColor)
+    if (texturedBaseColor && !graphFrame)
     {
-        if (! scene.materials[0].baseColorTexture.isValid())
+        if (! targetMaterial->baseColorTexture.isValid())
         {
             error = "native surface material imported texture binding has no decoded base-color texture";
             return {};
         }
         const auto* source = visual3d_detail::findById (
-            scene.textures, scene.textureCount, scene.materials[0].baseColorTexture);
+            scene.textures, scene.textureCount, targetMaterial->baseColorTexture);
         if (source == nullptr)
         {
             error = "native surface material imported texture binding does not resolve an admitted texture";
@@ -339,8 +356,8 @@ admitNativeSurfaceMaterial (const Visual3DScene& scene,
         texture.width = source->width;
         texture.height = source->height;
         texture.texelCount = texelCount;
-        std::copy_n (scene.textureTexels.begin() + source->firstTexel,
-                     texelCount, texture.texels.begin());
+        texture.texels.assign (scene.textureTexels.begin() + source->firstTexel,
+                              scene.textureTexels.begin() + source->firstTexel + texelCount);
         native->importedBaseColorTexture = std::move (texture);
     }
     const auto* nativeBaseColor = timeMixedBaseColor ? timeMixStart : base;
@@ -471,10 +488,24 @@ admitNativeDiffractionMaterial (
 
     std::string validationError;
     const auto& lighting = admitted.lighting().description();
+    if (lighting.version == 2
+        && std::any_of(lighting.paths[0].incident.radiance.begin(),
+                       lighting.paths[0].incident.radiance.end(),
+                       [](float value) { return value > 0.0f; })
+        && (scene.lightCount != 1
+            || scene.lights[0].kind != SceneLightKind::Directional
+            || scene.lights[0].color.x != 1.0f || scene.lights[0].color.y != 1.0f
+            || scene.lights[0].color.z != 1.0f))
+    {
+        error = "spectral environment direct lighting requires one white Directional Light; set Direct Intensity to zero for environment-only rendering";
+        return {};
+    }
     for (std::size_t pathIndex = 0; pathIndex < lighting.pathCount; ++pathIndex)
     {
+        auto validationLight = lighting.paths[pathIndex].incident;
+        if (lighting.version == 2) validationLight.direction = { 0.0f, 0.0f, 1.0f };
         if (! diffractionmaterial::physicalcheckpoint::validate (
-                admitted.material(), lighting.paths[pathIndex].incident,
+                admitted.material(), validationLight,
                 target == videohelper::materialprogram::BackendTarget::OpenGl
                     ? "opengl" : "metal",
                 validationError))
@@ -501,6 +532,8 @@ admitNativeDiffractionMaterial (
             diffractionmaterial::physicalcheckpoint::makeGpuParameters(
                 admitted.material(), lighting.paths[pathIndex].incident),
             lighting.paths[pathIndex]);
+        if (lighting.version == 2)
+            native->diffractionPaths[pathIndex].material.incident = { 0.0f, 0.0f, 1.0f, 0.0f };
         native->diffractionMaximumBounceDepth = std::max(
             native->diffractionMaximumBounceDepth,
             lighting.paths[pathIndex].bounceDepth);
@@ -528,7 +561,8 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
         return {};
     }
     const auto& scene = *sceneSnapshot;
-    if (request.version != kWireVersion)
+    const bool graphFrame = hasGraphFrameInput(request.binding);
+    if (request.version != (graphFrame ? kGraphFrameWireVersion : kWireVersion))
     {
         error = "surface material request version is unsupported";
         return {};
@@ -547,7 +581,8 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
         return {};
     }
     if (request.binding.targetKind != BindingTargetKind::ObjectOverride
-        || request.binding.object != scene.objects[0].id
+        || !HarmonicMIDI::grid::validateVisual3DScene(scene).valid()
+        || HarmonicMIDI::grid::visual3d_detail::findById(scene.objects, scene.objectCount, request.binding.object) == nullptr
         || request.binding.materialSlot.isValid())
     {
         error = "surface material request must bind the exact imported scene object";
@@ -583,6 +618,7 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
         = std::make_shared<const surfacematerial::AdmittedSurfaceMaterialIR> (
             std::move (*admittedProgram));
     Description description;
+    description.version = request.version;
     description.scene = &scene;
     description.sceneRevision = request.sceneRevision;
     description.structuralRevision = request.structuralRevision;
@@ -597,7 +633,7 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
         error = std::string (token (failure)) + ": " + diagnostic;
         return {};
     }
-    const auto resolution = admittedBindings->resolve (scene.objects[0].id);
+    const auto resolution = admittedBindings->resolve (request.binding.object);
     if (! resolution || resolution->kind != ResolutionKind::ObjectOverride
         || resolution->binding == nullptr || resolution->program == nullptr
         || resolution->program->program == nullptr)
@@ -606,8 +642,19 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
         return {};
     }
 
+    std::optional<videohelper::vertexmodifier::AdmittedVertexModifierIr> vertex;
+    if (request.vertexModifier)
+    {
+        vertex = videohelper::vertexmodifier::admitVertexModifierIr (
+            *request.vertexModifier, {}, diagnostic);
+        if (! vertex)
+        {
+            error = "Vertex modifier admission failed: " + diagnostic;
+            return {};
+        }
+    }
     auto compiled = videohelper::materialprogram::compileMaterialProgram (
-        resolution->program->program.get(), nullptr, target, diagnostic);
+        resolution->program->program.get(), vertex ? &*vertex : nullptr, target, diagnostic);
     if (! compiled)
     {
         error = "surface material compilation failed: " + diagnostic;
@@ -616,22 +663,85 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
     auto immutableCompiled
         = std::make_shared<const videohelper::materialprogram::MaterialProgramRecord> (
             std::move (*compiled));
+    const auto bindingDigest = admittedBindings->digest()
+        + (vertex ? ":vertex:" + immutableCompiled->programIdentity() : std::string {});
     auto native = admitNativeSurfaceMaterial (
-        scene, scene.objects[0].id, admittedBindings->digest(),
-        *immutableCompiled, diagnostic);
+        scene, request.binding.object, bindingDigest,
+        *immutableCompiled, graphFrame, diagnostic);
     if (native == nullptr)
     {
         error = std::move (diagnostic);
         return {};
     }
 
+    if (graphFrame) {
+        auto owned = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*native);
+        owned->frameEndpoint = request.binding.textures.front().graphFrame;
+        native = std::move(owned);
+    }
+
     error.clear();
     return std::shared_ptr<const AdmittedSurfaceMaterialBinding> (
         new AdmittedSurfaceMaterialBinding (
-            scene.id, scene.objects[0].id, request.sceneRevision,
+            scene.id, request.binding.object, request.sceneRevision,
             request.structuralRevision, request.evaluationRevision,
-            request.programRevision, admittedBindings->digest(), sceneSnapshot,
+            request.programRevision, bindingDigest, sceneSnapshot,
             std::move (native)));
+}
+
+std::shared_ptr<const AdmittedSurfaceMaterialBinding> admitSurfaceMaterialCollection (
+    const std::shared_ptr<const Visual3DScene>& scene,
+    const geometrysurfacematerial::ObjectPrograms& programs,
+    const videowire::geometry::RuntimeFieldEvaluation& evaluation,
+    videohelper::materialprogram::BackendTarget target, std::string& error)
+{
+    if (!scene || programs.empty()) { error = "Surface collection requires an owned scene and exact object programs"; return {}; }
+    const auto& first = programs.front().program.material;
+    visualimportedscenerender::Request request;
+    request.sourceStableId = scene->id.value;
+    request.renderStableId = request.sourceStableId == 1 ? 2 : 1;
+    request.sceneSnapshot = scene;
+    request.structuralRevision = first.structuralRevision;
+    request.evaluationRevision = first.evaluationRevision;
+    request.surfacePrograms = programs;
+    if (!visualimportedscenerender::valid(request))
+    { error = "Surface collection object, material, snapshot or Field identity is invalid"; return {}; }
+    std::shared_ptr<arbitgpu::NativeFixtureSurfaceMaterialProgram> root;
+    std::ostringstream evaluated;
+    evaluated.imbue(std::locale::classic());
+    for (const auto& object : programs)
+    {
+        const auto binding = admitSurfaceMaterialBinding(scene, object.program.material, target, error);
+        if (!binding) return {};
+        auto native = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*binding->nativeProgram());
+        for (const auto& field : object.program.fields)
+            if (!surfacematerialfield::evaluate(field, evaluation, object.instanceIndex,
+                    native->parameters, native->timeMixEndColor, error)) return {};
+        for (std::size_t channel = 0; channel < 3; ++channel)
+        {
+            native->parameters.baseColorMetallic[channel] *= object.appearance.color[channel];
+            native->timeMixEndColor[channel] *= object.appearance.color[channel];
+            native->parameters.emissionRoughness[channel] += object.appearance.emission[channel];
+        }
+        native->parameters.normalOpacity[3] *= object.appearance.color[3];
+        if (object.appearance.metallic >= 0) native->parameters.baseColorMetallic[3] = object.appearance.metallic;
+        if (object.appearance.roughness >= 0) native->parameters.emissionRoughness[3] = object.appearance.roughness;
+        // Canonical bytes of the actual draw parameters distinguish sampled
+        // Fields, while time-only shader inputs keep the same prepared program.
+        for (const auto value : native->parameters.baseColorMetallic) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
+        for (const auto value : native->parameters.emissionRoughness) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
+        for (const auto value : native->parameters.normalOpacity) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
+        for (const auto value : native->parameters.transmissionIorClearcoat) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
+        for (const auto value : native->timeMixEndColor) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
+        if (!root) root = std::move(native); else root->objectPrograms.push_back(std::move(native));
+    }
+    if (!arbitgpu::validNativeSurfaceObjectPrograms(*root, *scene, root->backend))
+    { error = "Surface collection exceeds the native exact-object shader subset"; return {}; }
+    const auto digest = videohelper::sha256Text(visualimportedscenerender::detail::encodeSurfacePrograms(programs) + evaluated.str());
+    error.clear();
+    return std::shared_ptr<const AdmittedSurfaceMaterialBinding>(new AdmittedSurfaceMaterialBinding(
+        scene->id, first.binding.object, first.sceneRevision, first.structuralRevision,
+        first.evaluationRevision, first.programRevision, digest, scene, std::move(root)));
 }
 
 std::shared_ptr<const AdmittedDiffractionMaterialBinding>
@@ -682,12 +792,22 @@ admitDiffractionMaterialBinding (
         spatial->programIdentity = arbitgpu::nativeFixtureDiffractionProgramIdentity(
             spatial->bindingDigest, *spatial->diffractionLightingAdmission);
     }
+    if (request.graphFrame)
+    {
+        spatial->baseColorSource = arbitgpu::NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture;
+        spatial->programIdentity = arbitgpu::nativeFixtureDiffractionProgramIdentity(
+            spatial->bindingDigest, *spatial->diffractionLightingAdmission, 0, 1.0f, {}, true);
+    }
     native = std::move(spatial);
+    const auto bindingIdentity = request.graphFrame
+        ? native->programIdentity + ":" + std::to_string(request.graphFrame->node)
+            + ":" + std::to_string(request.graphFrame->port)
+        : request.structuralDigest;
 
     error.clear();
     return std::shared_ptr<const AdmittedDiffractionMaterialBinding> (
         new AdmittedDiffractionMaterialBinding (
-            *admitted, request.structuralDigest, sceneSnapshot, std::move (native)));
+            *admitted, bindingIdentity, sceneSnapshot, std::move (native), nullptr, {}, request));
 }
 
 std::shared_ptr<const AdmittedDiffractionMaterialBinding>
@@ -760,6 +880,8 @@ admitDiffractionProductPlan (
     lowered.object = sceneSnapshot->objects[0].id;
     lowered.material = description;
     lowered.lighting = plan.lighting;
+    if (plan.lighting.version == 2)
+        lowered.version = diffractionmaterialbinding::kEnvironmentWireVersion;
     std::string diagnostic;
     const auto admittedMaterial = admit (lowered.material, diagnostic);
     if (! admittedMaterial)
@@ -988,7 +1110,7 @@ bool FixtureSceneRenderer::render (
     if (material != nullptr)
     {
         if (material->scene_ != snapshot->id
-            || material->object_ != snapshot->objects[0].id
+            || visual3d_detail::findById(snapshot->objects, snapshot->objectCount, material->object_) == nullptr
             || material->sceneSnapshot_ != snapshot
             || material->nativeProgram_ == nullptr)
         {
@@ -996,8 +1118,7 @@ bool FixtureSceneRenderer::render (
             return false;
         }
         nativeMaterial = material->nativeProgram_;
-        if (nativeMaterial->baseColorSource
-                == arbitgpu::NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix
+        if (arbitgpu::nativeSurfaceUsesTime(*nativeMaterial)
             && (! std::isfinite (runtimeInputs.timeSeconds)
                 || std::abs (runtimeInputs.timeSeconds)
                     > surfacematerial::kMaximumEvaluationMagnitude))
@@ -1020,7 +1141,41 @@ bool FixtureSceneRenderer::render (
         nativeMaterial = diffractionMaterial->nativeProgram_;
     }
 
+    if (!sceneInputs.diffractionParameters.empty())
+    {
+        if (!diffractionMaterial || !diffractionMaterial->authoredRequest_ || diffractionMaterial->productPlan_)
+        { error = "Diffraction modulation requires one graph-authored physical material"; return false; }
+        diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest evaluated;
+        if (!diffractionmaterialbinding::applyRuntimeParameters(*diffractionMaterial->authoredRequest_,
+                sceneInputs.diffractionParameters, evaluated, error)) return false;
+        const auto physical = diffractionmaterial::admit(evaluated.material, error);
+        if (!physical) return false;
+        evaluated.structuralDigest = physical->structuralDigest();
+        if (evaluated.spatialFoil)
+        {
+            const auto foil = diffractivefoil::admit(*evaluated.spatialFoil, error);
+            if (!foil) return false;
+            evaluated.structuralDigest = foil->structuralDigest();
+        }
+        const auto target = nativeMaterial->backend == arbitgpu::NativeFixtureMaterialBackend::Metal
+            ? videohelper::materialprogram::BackendTarget::Metal : videohelper::materialprogram::BackendTarget::OpenGl;
+        const auto admission = admitDiffractionMaterialBinding(snapshot, evaluated, target, error);
+        if (!admission) return false;
+        sceneInputs.diffractionSourceProgram = nativeMaterial;
+        sceneInputs.diffractionEvaluatedProgram = admission->nativeProgram();
+    }
+    else if (sceneInputs.diffractionSourceProgram || sceneInputs.diffractionEvaluatedProgram)
+    { error = "Diffraction runtime admission must be derived from this draw's scalar parameters"; return false; }
+
     const auto info = backend_.info();
+    const bool expectsFrame = nativeMaterial && arbitgpu::nativeSurfaceUsesFrame(*nativeMaterial);
+    if (expectsFrame != static_cast<bool>(sceneInputs.materialFrameTexture)
+        || (expectsFrame && (!arbitgpu::validMaterialFrameTexture(sceneInputs.materialFrameTexture)
+            || sceneInputs.materialFrameTexture->backend() != info.backend)))
+    {
+        error = "Native material Frame draw requires its exact owned texture";
+        return false;
+    }
     if (! info.available || info.backend.empty())
     {
         error = info.error.empty()

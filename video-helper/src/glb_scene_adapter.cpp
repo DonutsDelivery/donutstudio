@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <utility>
@@ -362,8 +363,8 @@ bool copyMaterials(const GlbStaticMeshDocument& asset,
         std::size_t texelCount = 0;
         std::size_t expectedBytes = 0;
         if (sourceImage.width == 0 || sourceImage.height == 0
-            || sourceImage.width > Visual3DScene::kMaxTextureTexels
-            || sourceImage.height > Visual3DScene::kMaxTextureTexels
+            || sourceImage.width > Visual3DScene::kMaxTextureDimension
+            || sourceImage.height > Visual3DScene::kMaxTextureDimension
             || !checkedMultiply(static_cast<std::size_t>(sourceImage.width),
                                 static_cast<std::size_t>(sourceImage.height), texelCount)
             || !checkedMultiply(texelCount, 4u, expectedBytes)
@@ -381,6 +382,8 @@ bool copyMaterials(const GlbStaticMeshDocument& asset,
         texture.wrapS = sourceSampler.wrapS;
         texture.wrapT = sourceSampler.wrapT;
         texture.firstTexel = scene.textureTexelCount;
+        scene.textureTexels.reserve(scene.textureTexelCount + texelCount);
+        scene.textureTexels.resize(scene.textureTexelCount + texelCount);
         for (std::size_t texelIndex = 0; texelIndex < texelCount; ++texelIndex)
         {
             const auto byte = texelIndex * 4u;
@@ -456,7 +459,9 @@ bool copyPrimitive(const GlbPrimitiveRecord& primitive,
     if (!primitive.material || *primitive.material >= scene.materialCount)
         return fail(error, "GLB primitive material reference is missing or out of range");
 
-    if (!primitive.normalAccessor || primitive.normals.empty())
+    if (!primitive.normalAccessor && primitive.indexAccessor)
+        return fail(error, "flat GLB normals for indexed TRIANGLES require unsupported corner expansion");
+    if ((!primitive.normalAccessor && !primitive.generatedFlatNormals) || primitive.normals.empty())
         return fail(error, "Visual3DScene adaptation requires a NORMAL attribute");
     if (primitive.positions.empty() || primitive.positions.size() % 3 != 0)
         return fail(error, "GLB POSITION data has invalid cardinality");
@@ -479,6 +484,15 @@ bool copyPrimitive(const GlbPrimitiveRecord& primitive,
         return fail(error, "GLB vertex data exceeds Visual3DScene capacity");
     if (!appendFits(scene.indexCount, primitive.indices.size(), scene.indices.size()))
         return fail(error, "GLB index data exceeds Visual3DScene capacity");
+    if (primitive.generatedFlatNormals)
+    {
+        if (primitive.normalAccessor || primitive.indexAccessor || primitive.tangentAccessor
+            || !primitive.tangents.empty() || primitive.indices.size() != vertexCount)
+            return fail(error, "generated flat GLB normals require non-indexed triangle corners");
+        for (std::size_t index = 0; index < primitive.indices.size(); ++index)
+            if (primitive.indices[index] != index)
+                return fail(error, "generated flat GLB normals require sequential triangle indices");
+    }
     if (scene.objectCount == scene.objects.size())
         return fail(error, "GLB primitive count exceeds Visual3DScene object capacity");
 
@@ -705,8 +719,46 @@ std::optional<Visual3DScene> adaptStaticGlbToVisual3DScene(
 
     if (scene.cameraCount == 0)
     {
-        fail(error, "selected GLB scene has no supported camera");
-        return std::nullopt;
+        // A mesh-only import still needs a view in the editor. Frame its selected
+        // world-space geometry; an authored camera remains authoritative above.
+        std::array<double, 3> low {std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
+        std::array<double, 3> high {-low[0], -low[1], -low[2]};
+        for (std::size_t nodeIndex = 0; nodeIndex < asset.nodes.size(); ++nodeIndex)
+        {
+            const auto& node = asset.nodes[nodeIndex];
+            if (!selected[nodeIndex] || !node.mesh || (meshIndex && *node.mesh != *meshIndex)) continue;
+            const auto& matrix = node.worldTransform;
+            for (const auto& primitive : asset.meshes[*node.mesh].primitives)
+                for (std::size_t vertex = 0; vertex < primitive.positions.size(); vertex += 3)
+                    for (std::size_t axis = 0; axis < 3; ++axis)
+                    {
+                        const double value = matrix[axis] * static_cast<double>(primitive.positions[vertex])
+                            + matrix[4 + axis] * static_cast<double>(primitive.positions[vertex + 1])
+                            + matrix[8 + axis] * static_cast<double>(primitive.positions[vertex + 2])
+                            + matrix[12 + axis];
+                        low[axis] = std::min(low[axis], value);
+                        high[axis] = std::max(high[axis], value);
+                    }
+        }
+        if (!std::all_of(low.begin(), low.end(), [](double v) { return std::isfinite(v); })
+            || !std::all_of(high.begin(), high.end(), [](double v) { return std::isfinite(v); }))
+        { fail(error, "selected GLB scene has no finite geometry to frame"); return std::nullopt; }
+        const double radius = std::max(0.01, 0.5 * std::sqrt(
+            (high[0] - low[0]) * (high[0] - low[0])
+            + (high[1] - low[1]) * (high[1] - low[1])
+            + (high[2] - low[2]) * (high[2] - low[2])));
+        const double distance = radius * 3.5;
+        auto& camera = scene.cameras[0];
+        camera.id = SceneCameraId {static_cast<std::uint32_t>(asset.nodes.size() + 1)};
+        camera.transform.translation = {static_cast<float>((low[0] + high[0]) * 0.5),
+            static_cast<float>((low[1] + high[1]) * 0.5),
+            static_cast<float>((low[2] + high[2]) * 0.5 + distance)};
+        camera.verticalFovRadians = 0.7853981634f;
+        camera.nearPlane = static_cast<float>(std::max(0.0001, radius * 0.001));
+        camera.farPlane = static_cast<float>(distance + radius * 4.0 + 1.0);
+        scene.activeCamera = camera.id;
+        scene.cameraCount = 1;
     }
     const auto validation = validateVisual3DScene(scene);
     if (!validation.valid())
@@ -717,5 +769,160 @@ std::optional<Visual3DScene> adaptStaticGlbToVisual3DScene(
         return std::nullopt;
     }
     return scene;
+}
+
+std::optional<Visual3DScene> adaptAnimatedGlbMeshToVisual3DScene(
+    const GlbStaticMeshDocument& asset,
+    std::string& error,
+    std::optional<std::size_t> meshIndex, bool multipleDraws)
+{
+    auto scene = adaptStaticGlbToVisual3DScene(asset, error, meshIndex);
+    if (!scene) return std::nullopt;
+
+    if (multipleDraws)
+    {
+        std::size_t count = 0;
+        for (std::size_t index = 0; index < scene->objectCount; ++index)
+        {
+            auto object = scene->objects[index];
+            if (object.indexCount == 0) continue;
+            const auto node = static_cast<std::size_t>((object.id.value - 1u)
+                / visualimportedsceneidentity::kObjectPrimitiveStride);
+            if (node >= asset.nodes.size() || !decompose(asset.nodes[node].worldTransform, object.transform))
+            { fail(error, "animated mesh world transform cannot be represented as TRS"); return std::nullopt; }
+            object.parent = {};
+            scene->objects[count++] = object;
+        }
+        scene->objectCount = static_cast<std::uint32_t>(count);
+        if (count == 0 || !validateVisual3DScene(*scene).valid())
+        { fail(error, "animated scene has no valid bounded mesh draws"); return std::nullopt; }
+        return scene;
+    }
+    std::optional<SceneObjectRecord> draw;
+    for (std::size_t index = 0; index < scene->objectCount; ++index)
+    {
+        const auto& object = scene->objects[index];
+        if (object.vertexCount == 0 && object.indexCount == 0) continue;
+        if (draw)
+        {
+            fail(error, "imported animated scene requires one renderable mesh primitive");
+            return std::nullopt;
+        }
+        draw = object;
+    }
+    if (!draw)
+    {
+        fail(error, "imported animated scene has no selected renderable mesh");
+        return std::nullopt;
+    }
+    const auto nodeIndex = static_cast<std::size_t>(
+        (draw->id.value - 1u) / visualimportedsceneidentity::kObjectPrimitiveStride);
+    if (nodeIndex >= asset.nodes.size()
+        || !decompose(asset.nodes[nodeIndex].worldTransform, draw->transform))
+    {
+        fail(error, "imported animated mesh world transform cannot be represented as TRS");
+        return std::nullopt;
+    }
+    draw->parent = {};
+    scene->objects = {};
+    scene->objects[0] = *draw;
+    scene->objectCount = 1;
+    if (!validateVisual3DScene(*scene).valid())
+    {
+        fail(error, "imported animated single-draw scene failed validation");
+        return std::nullopt;
+    }
+    return scene;
+}
+bool sampleGlbCameraLights(const GlbStaticMeshDocument& asset,
+    const visualanimation::Sample& sample, visualanimation::CombinationMode mode, float weight,
+    const Visual3DScene& scene, std::vector<SceneCameraRecord>& cameras,
+    std::vector<SceneLightRecord>& lights, std::string& error)
+{
+    using Mode = visualanimation::CombinationMode;
+    std::vector<std::array<float,16>> local, world(asset.nodes.size());
+    std::vector<bool> required(asset.nodes.size(),false);
+    const auto require=[&](std::uint32_t id) {
+        if (id==0 || id>asset.nodes.size()) return false;
+        for (std::optional<std::size_t> node=id-1u;node;node=asset.nodes[*node].parent) required[*node]=true;
+        return true;
+    };
+    for (std::size_t index=0;index<scene.cameraCount;++index)
+        if (!require(scene.cameras[index].id.value)) return fail(error,"imported camera node identity is invalid");
+    for (std::size_t index=0;index<scene.lightCount;++index)
+        if (!require(scene.lights[index].id.value)) return fail(error,"imported light node identity is invalid");
+    for (const auto& node : asset.nodes) local.push_back(node.localTransform);
+    const auto rotationProduct = [](const SceneQuaternion& a, const SceneQuaternion& b) {
+        return SceneQuaternion{a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+            a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x, a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,
+            a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};
+    };
+    const auto rotationBlend = [](SceneQuaternion a, SceneQuaternion b, float amount) {
+        if (a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w<0) b={-b.x,-b.y,-b.z,-b.w};
+        SceneQuaternion q{a.x+(b.x-a.x)*amount,a.y+(b.y-a.y)*amount,
+            a.z+(b.z-a.z)*amount,a.w+(b.w-a.w)*amount};
+        const auto length=std::sqrt(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w);
+        return SceneQuaternion{q.x/length,q.y/length,q.z/length,q.w/length};
+    };
+    for (const auto& track : sample.tracks())
+    {
+        if (track.channel()==visualanimation::Channel::MorphWeights) continue;
+        if (!track.target().isValid() || track.target().value>asset.nodes.size())
+            return fail(error,"camera/light animation target is outside the exact scene");
+        const auto index=static_cast<std::size_t>(track.target().value-1u);
+        if (!required[index]) continue;
+        SceneTransform3D transform;
+        if (!decompose(local[index],transform))
+            return fail(error,"animated camera/light ancestor cannot be represented as TRS");
+        const auto& values=track.values();
+        if (track.channel()==visualanimation::Channel::Rotation)
+        {
+            const SceneQuaternion sampled{values[0],values[1],values[2],values[3]};
+            if (mode==Mode::Replace) transform.rotation=sampled;
+            else if (mode==Mode::WeightedBlend) transform.rotation=rotationBlend(transform.rotation,sampled,weight);
+            else {
+                const auto delta=rotationBlend({},sampled,weight);
+                transform.rotation=mode==Mode::Add ? rotationProduct(delta,transform.rotation)
+                    : rotationProduct(transform.rotation,delta);
+            }
+        }
+        else
+        {
+            const bool scale=track.channel()==visualanimation::Channel::Scale;
+            auto& target=scale ? transform.scale : transform.translation;
+            const auto combine=[&](float base,float value) {
+                const float identity=scale ? 1.0f : 0.0f;
+                if (mode==Mode::WeightedBlend) return base+(value-base)*weight;
+                if (mode==Mode::Multiply) return base*(identity+(value-identity)*weight);
+                if (mode==Mode::Add || mode==Mode::AddAfterImportedAnimation) return base+(value-identity)*weight;
+                return value;
+            };
+            target={combine(target.x,values[0]),combine(target.y,values[1]),combine(target.z,values[2])};
+        }
+        local[index]=compose(transform);
+    }
+    std::vector<std::uint8_t> state(asset.nodes.size(),0);
+    std::function<bool(std::size_t)> resolve=[&](std::size_t index) {
+        if (index>=asset.nodes.size() || state[index]==1) return false;
+        if (state[index]==2) return true;
+        state[index]=1;
+        const auto parent=asset.nodes[index].parent;
+        if (parent && !resolve(*parent)) return false;
+        world[index]=parent ? multiply(world[*parent],local[index]) : local[index];
+        state[index]=2; return true;
+    };
+    cameras.assign(scene.cameras.begin(),scene.cameras.begin()+scene.cameraCount);
+    lights.assign(scene.lights.begin(),scene.lights.begin()+scene.lightCount);
+    const auto update=[&](auto& record) {
+        const auto index=static_cast<std::size_t>(record.id.value-1u);
+        return resolve(index) && decompose(world[index],record.transform);
+    };
+    for (auto& camera : cameras)
+        if (!update(camera) || !near(camera.transform.scale.x,1) || !near(camera.transform.scale.y,1)
+            || !near(camera.transform.scale.z,1))
+            return fail(error,"animated imported camera requires a finite unscaled world transform");
+    for (auto& light : lights)
+        if (!update(light)) return fail(error,"animated imported light requires a finite world TRS transform");
+    error.clear(); return true;
 }
 } // namespace videohelper::gltf

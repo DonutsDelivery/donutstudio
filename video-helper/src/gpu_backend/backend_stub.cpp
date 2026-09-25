@@ -148,6 +148,7 @@ NativeOpticalFlowExecutionBackend& nativeOpticalFlowExecutionBackend()
     static UnavailableOpticalFlowBackend backend;
     return backend;
 }
+void invalidateNativeOpticalFlowExecutionContext (std::uintptr_t) noexcept {}
 
 namespace
 {

@@ -350,6 +350,9 @@ if(ARBIT_WITH_NCNN)
     set(NCNN_SHARED_LIB OFF CACHE BOOL "" FORCE)
     set(NCNN_INSTALL_SDK OFF CACHE BOOL "" FORCE)
     set(NCNN_SYSTEM_GLSLANG OFF CACHE BOOL "" FORCE)
+    # The vendored glslang is linked into the helper, never installed. Its
+    # export set cannot include our directory-scoped nlohmann_json dependency.
+    set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 
     if(ARBIT_NCNN_ZEROCOPY)
         # SIMPLEVK off => ncnn includes <vulkan/vulkan.h> (real external-memory
@@ -492,6 +495,7 @@ target_include_directories(arbit-video-helper PRIVATE
 )
 
 target_link_libraries(arbit-video-helper PRIVATE
+    $<$<PLATFORM_ID:Windows>:bcrypt>
     PkgConfig::AV
     nlohmann_json::nlohmann_json
 )
@@ -758,10 +762,19 @@ add_test(NAME gltf_glb_admission COMMAND arbit-gltf-glb-tests)
 
 add_executable(arbit-glb-scene-adapter-tests
     tests/glb_scene_adapter_tests.cpp
-    src/glb_scene_adapter.cpp)
+    src/glb_scene_adapter.cpp
+    src/gltf_glb.cpp
+    src/animation_clip.cpp
+    src/animation_playback_control.cpp
+    src/deformation_contract.cpp
+    src/animation_deformation_evaluation.cpp
+    src/imported_animation_deformation_consumer.cpp)
 target_include_directories(arbit-glb-scene-adapter-tests PRIVATE
     src
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-glb-scene-adapter-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    PkgConfig::AV)
 if(NOT MSVC)
     target_compile_options(arbit-glb-scene-adapter-tests PRIVATE -Wall -Wextra -Werror)
 endif()
@@ -1151,6 +1164,38 @@ if(NOT MSVC)
     target_compile_options(arbit-volume-data-admission-tests PRIVATE -Wall -Wextra -Werror)
 endif()
 add_test(NAME volume_data_admission COMMAND arbit-volume-data-admission-tests)
+
+add_executable(arbit-volume-operation-contract-tests
+    tests/volume_operation_contract_tests.cpp)
+add_executable(arbit-volume-plan-contract-tests
+    tests/volume_plan_contract_tests.cpp)
+foreach(volume_contract_target IN ITEMS
+        arbit-volume-operation-contract-tests arbit-volume-plan-contract-tests)
+    target_include_directories(${volume_contract_target} PRIVATE
+        src ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    if(NOT MSVC)
+        target_compile_options(${volume_contract_target} PRIVATE -Wall -Wextra -Werror)
+    endif()
+endforeach()
+add_test(NAME volume_operation_contract COMMAND arbit-volume-operation-contract-tests)
+add_test(NAME volume_plan_contract COMMAND arbit-volume-plan-contract-tests)
+
+set(ARBIT_VOLUME_COMPOSITOR_TEST_SOURCES
+    tests/volume_compositor_tests.cpp
+    src/renderer.cpp
+    src/geometry_core_backend.cpp
+    src/fixture_scene_renderer.cpp
+    src/color_transform_gl.cpp
+    src/sdf_native_renderer.cpp
+    src/deformation_contract.cpp
+    src/native_animation_deformation.cpp
+    src/visual_plan_execution_telemetry.cpp
+    src/visual_renderer_telemetry.cpp
+    src/shader_generator.cpp
+    src/particle_engine.cpp
+    src/gl_loader.cpp
+    src/lut_loader.cpp)
+
 add_test(NAME metal_volume_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/metal_volume_source_contract.py)
@@ -1462,6 +1507,10 @@ add_test(NAME surface_material_starter_oracle_cross_language
 
 add_executable(arbit-composite-probe-contract-tests tests/composite_probe_contract_tests.cpp)
 target_include_directories(arbit-composite-probe-contract-tests PRIVATE src)
+target_link_libraries(arbit-composite-probe-contract-tests PRIVATE $<$<PLATFORM_ID:Windows>:bcrypt>)
+if(WIN32)
+    target_compile_definitions(arbit-composite-probe-contract-tests PRIVATE NOMINMAX)
+endif()
 if(NOT MSVC)
     target_compile_options(arbit-composite-probe-contract-tests PRIVATE -Wall -Wextra)
 endif()
@@ -1499,10 +1548,18 @@ add_test(NAME imported_animation_visual_plan_execution
     COMMAND arbit-imported-animation-visual-plan-execution-tests)
 
 add_executable(arbit-imported-scene-visual-plan-execution-tests
-    tests/imported_scene_visual_plan_execution_tests.cpp)
+    tests/imported_scene_visual_plan_execution_tests.cpp
+    src/geometry_core_backend.cpp
+    src/fixture_scene_renderer.cpp
+    src/visual_plan_execution_telemetry.cpp
+    src/deformation_contract.cpp
+    src/native_animation_deformation.cpp
+    src/gpu_backend/backend_stub.cpp)
 target_include_directories(arbit-imported-scene-visual-plan-execution-tests PRIVATE
     src
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_definitions(arbit-imported-scene-visual-plan-execution-tests PRIVATE
+    ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
 target_link_libraries(arbit-imported-scene-visual-plan-execution-tests PRIVATE
     nlohmann_json::nlohmann_json)
 if(NOT MSVC)
@@ -1544,6 +1601,16 @@ if(NOT MSVC)
 endif()
 add_test(NAME flat_shader_bridge_contract COMMAND arbit-flat-shader-bridge-tests)
 set_tests_properties(flat_shader_bridge_contract PROPERTIES TIMEOUT 30)
+
+add_executable(arbit-metal-shader-source-tests tests/metal_shader_source_tests.cpp)
+target_include_directories(arbit-metal-shader-source-tests PRIVATE src)
+target_compile_definitions(arbit-metal-shader-source-tests PRIVATE
+    SHADER_CATALOG_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs")
+target_link_libraries(arbit-metal-shader-source-tests PRIVATE nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-metal-shader-source-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME metal_shader_source COMMAND arbit-metal-shader-source-tests)
 
 if(UNIX AND NOT WIN32)
     add_executable(arbit-tracking-runtime-tests tests/tracking_runtime_tests.cpp)
@@ -1653,6 +1720,7 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
             src/visual_plan_execution_telemetry.cpp
             src/visual_renderer_telemetry.cpp
             src/geometry_core_backend.cpp
+            src/fixture_scene_renderer.cpp
             src/color_transform_gl.cpp
             src/gpu_backend/backend_stub.cpp
             src/shader_generator.cpp
@@ -1677,6 +1745,7 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
             src/visual_plan_execution_telemetry.cpp
             src/visual_renderer_telemetry.cpp
             src/geometry_core_backend.cpp
+            src/fixture_scene_renderer.cpp
             src/color_transform_gl.cpp
             src/gpu_backend/backend_stub.cpp
             src/shader_generator.cpp
@@ -1704,6 +1773,7 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
             src/visual_plan_execution_telemetry.cpp
             src/visual_renderer_telemetry.cpp
             src/geometry_core_backend.cpp
+            src/fixture_scene_renderer.cpp
             src/color_transform_gl.cpp
             src/gpu_backend/backend_opengl.cpp
             src/sdf_native_renderer.cpp
@@ -1735,6 +1805,7 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
             tests/custom_shader_gl_pixel_tests.cpp
             src/renderer.cpp
             src/geometry_core_backend.cpp
+            src/fixture_scene_renderer.cpp
             src/color_transform_gl.cpp
             src/gpu_backend/backend_opengl.cpp
             src/sdf_native_renderer.cpp
@@ -1764,6 +1835,44 @@ if(GLFW3_FOUND AND OpenGL_FOUND)
             TIMEOUT 600
             SKIP_RETURN_CODE 77
             RUN_SERIAL TRUE)
+
+        add_executable(arbit-native-scene-orientation-gl-tests
+            tests/native_scene_orientation_gl_tests.cpp
+            src/renderer.cpp
+            src/gltf_glb.cpp
+            src/glb_scene_adapter.cpp
+            src/glb_native_render_seam.cpp
+            src/imported_scene_payload_execution.cpp
+            src/imported_animated_scene_payload_execution.cpp
+            src/native_animation_deformation_renderer.cpp
+            src/animation_clip.cpp
+            src/animation_playback_control.cpp
+            src/animation_deformation_evaluation.cpp
+            src/imported_animation_deformation_consumer.cpp
+            src/geometry_core_backend.cpp
+            src/fixture_scene_renderer.cpp
+            src/color_transform_gl.cpp
+            src/gpu_backend/backend_opengl.cpp
+            src/sdf_native_renderer.cpp
+            src/deformation_contract.cpp
+            src/native_animation_deformation.cpp
+            src/visual_plan_execution_telemetry.cpp
+            src/visual_renderer_telemetry.cpp
+            src/shader_generator.cpp
+            src/particle_engine.cpp
+            src/gl_loader.cpp
+            src/lut_loader.cpp)
+        target_include_directories(arbit-native-scene-orientation-gl-tests PRIVATE
+            src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+        target_compile_definitions(arbit-native-scene-orientation-gl-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0 ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+        target_link_libraries(arbit-native-scene-orientation-gl-tests PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+        target_compile_options(arbit-native-scene-orientation-gl-tests PRIVATE -Wall -Wextra -Werror)
+        add_test(NAME native_scene_orientation_gl COMMAND arbit-native-scene-orientation-gl-tests)
+        set_tests_properties(native_scene_orientation_gl PROPERTIES
+            LABELS "native-fixture-runtime;native-geometry-core-runtime"
+            TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
     endif()
 
     # The production particle GL path requires OpenGL 4.3 shader-storage
@@ -1808,6 +1917,22 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
             -Wall -Wextra -Werror)
     endif()
     add_test(NAME opengl_volume_backend COMMAND arbit-opengl-volume-backend-tests)
+    add_executable(arbit-opengl-volume-compositor-tests
+        ${ARBIT_VOLUME_COMPOSITOR_TEST_SOURCES}
+        src/volume_native_renderer_opengl.cpp
+        src/gpu_backend/backend_opengl.cpp)
+    target_include_directories(arbit-opengl-volume-compositor-tests PRIVATE
+        src ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-volume-compositor-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0 ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-volume-compositor-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL PkgConfig::AV nlohmann_json::nlohmann_json)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-volume-compositor-tests PRIVATE -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME opengl_volume_compositor COMMAND arbit-opengl-volume-compositor-tests)
+    set_tests_properties(opengl_volume_compositor PROPERTIES
+        LABELS "native-volume-runtime" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
     set_tests_properties(opengl_volume_backend PROPERTIES
         LABELS "native-volume-runtime"
         TIMEOUT 60
@@ -1841,10 +1966,30 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE)
 
+    add_executable(arbit-optical-flow-native-opengl-tests
+        tests/optical_flow_native_opengl_tests.cpp
+        src/optical_flow_native_executor.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-optical-flow-native-opengl-tests PRIVATE
+        src ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-optical-flow-native-opengl-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0)
+    target_link_libraries(arbit-optical-flow-native-opengl-tests PRIVATE PkgConfig::GLFW3 OpenGL::GL)
+    if(NOT MSVC)
+        target_compile_options(arbit-optical-flow-native-opengl-tests PRIVATE -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME optical_flow_native_opengl COMMAND arbit-optical-flow-native-opengl-tests)
+    set_tests_properties(optical_flow_native_opengl PROPERTIES
+        LABELS "native-optical-flow-runtime" TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
     # visual_plan_executor.h owns the production Geometry Core path, so its
     # focused test must link the same native backend it instantiates.
     target_sources(arbit-visual-plan-executor-tests PRIVATE
         src/geometry_core_backend.cpp
+        src/fixture_scene_renderer.cpp
         src/visual_plan_execution_telemetry.cpp
         src/deformation_contract.cpp
         src/native_animation_deformation.cpp
@@ -1861,6 +2006,7 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
     add_executable(arbit-opengl-geometry-core-backend-tests
         tests/opengl_geometry_core_backend_tests.cpp
         src/geometry_core_backend.cpp
+        src/fixture_scene_renderer.cpp
         src/deformation_contract.cpp
         src/native_animation_deformation.cpp
         src/gpu_backend/backend_opengl.cpp
@@ -1950,10 +2096,15 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
 
     add_executable(arbit-opengl-animation-deformation-backend-tests
         tests/opengl_animation_deformation_backend_tests.cpp
+        src/imported_animated_scene_payload_execution.cpp
+        src/fixture_scene_renderer.cpp
+        src/native_animation_deformation_renderer.cpp
         tests/support/fixture_scene.cpp
         src/gltf_glb.cpp
         src/glb_scene_adapter.cpp
         src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/imported_animation_deformation_consumer.cpp
         src/animation_deformation_evaluation.cpp
         src/deformation_contract.cpp
         src/native_animation_deformation.cpp
@@ -1985,6 +2136,7 @@ if(APPLE AND ARBIT_WITH_METAL)
     add_executable(arbit-metal-geometry-core-backend-tests
         tests/metal_geometry_core_backend_tests.mm
         src/geometry_core_backend.cpp
+        src/fixture_scene_renderer.cpp
         src/deformation_contract.cpp
         src/native_animation_deformation.cpp
         src/gpu_backend/backend_sokol.mm)
@@ -2005,8 +2157,15 @@ if(APPLE AND ARBIT_WITH_METAL)
 
     add_executable(arbit-metal-animation-deformation-backend-tests
         tests/metal_animation_deformation_backend_tests.mm
+        src/imported_animated_scene_payload_execution.cpp
+        src/fixture_scene_renderer.cpp
+        src/native_animation_deformation_renderer.cpp
         tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
         src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/imported_animation_deformation_consumer.cpp
         src/animation_deformation_evaluation.cpp
         src/deformation_contract.cpp
         src/native_animation_deformation.cpp
@@ -2019,7 +2178,8 @@ if(APPLE AND ARBIT_WITH_METAL)
     target_compile_definitions(arbit-metal-animation-deformation-backend-tests PRIVATE
         ARBIT_HAVE_VIEWPORT=0 ARBIT_HAVE_METAL_BACKEND=1)
     target_link_libraries(arbit-metal-animation-deformation-backend-tests PRIVATE
-        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
+        nlohmann_json::nlohmann_json PkgConfig::AV)
     target_compile_options(arbit-metal-animation-deformation-backend-tests PRIVATE
         -Wall -Wextra -Werror)
     add_test(NAME metal_animation_deformation_backend
@@ -2237,6 +2397,7 @@ if(APPLE AND ARBIT_WITH_METAL)
             tests/metal_color_transform_runtime_tests.cpp
             src/renderer.cpp
             src/geometry_core_backend.cpp
+            src/fixture_scene_renderer.cpp
             src/color_transform_gl.cpp
             src/sdf_native_renderer.cpp
             src/deformation_contract.cpp
@@ -2273,8 +2434,36 @@ if(APPLE AND ARBIT_WITH_METAL)
             TIMEOUT 600
             RUN_SERIAL TRUE)
 
+        set_source_files_properties(tests/volume_compositor_tests.cpp PROPERTIES LANGUAGE OBJCXX)
+        add_executable(arbit-metal-volume-compositor-tests
+            ${ARBIT_VOLUME_COMPOSITOR_TEST_SOURCES}
+            src/volume_native_renderer_metal.mm
+            src/gpu_backend/metal_shader_generator.mm
+            src/gpu_backend/backend_sokol.mm)
+        set_target_properties(arbit-metal-volume-compositor-tests PROPERTIES
+            OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED ON)
+        target_include_directories(arbit-metal-volume-compositor-tests PRIVATE
+            src third_party/sokol ${CMAKE_CURRENT_SOURCE_DIR}/../shared
+            ${ARBIT_MVK_SHADER_CONVERTER_INCLUDE} ${ncnn_SOURCE_DIR}/glslang)
+        target_compile_definitions(arbit-metal-volume-compositor-tests PRIVATE
+            ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=1 ARBIT_HAVE_METAL_GENERATORS=1)
+        target_link_libraries(arbit-metal-volume-compositor-tests PRIVATE
+            PkgConfig::GLFW3 OpenGL::GL PkgConfig::AV
+            "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
+            "-framework IOSurface" "-framework Foundation"
+            nlohmann_json::nlohmann_json glslang SPIRV glslang-default-resource-limits
+            ${ARBIT_MVK_SHADER_CONVERTER_LIBRARY}
+            ${ARBIT_MVK_SPIRV_CROSS_LIBRARY} ${ARBIT_MVK_SPIRV_TOOLS_LIBRARY})
+        target_compile_options(arbit-metal-volume-compositor-tests PRIVATE
+            -Wall -Wextra -Werror -Wno-deprecated-declarations)
+        add_test(NAME metal_volume_compositor COMMAND arbit-metal-volume-compositor-tests)
+        set_tests_properties(metal_volume_compositor PROPERTIES
+            LABELS "native-volume-runtime;physical-apple-silicon"
+            TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
         add_executable(arbit-metal-frame-compositor-smoke
             tests/metal_frame_compositor_smoke_tests.cpp
+            src/sdf_native_renderer.cpp
             src/gl_loader.cpp
             src/gpu_backend/metal_shader_generator.mm
             src/gpu_backend/backend_sokol.mm)
@@ -2303,6 +2492,7 @@ if(APPLE AND ARBIT_WITH_METAL)
                 tests/custom_shader_gl_pixel_tests.cpp
                 src/renderer.cpp
                 src/geometry_core_backend.cpp
+                src/fixture_scene_renderer.cpp
                 src/color_transform_gl.cpp
                 src/gpu_backend/backend_sokol.mm
                 src/gpu_backend/metal_shader_generator.mm

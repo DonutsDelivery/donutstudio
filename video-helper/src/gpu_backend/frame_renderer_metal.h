@@ -1,5 +1,6 @@
 // gpu_backend/frame_renderer_metal.h -- native Metal production compositor.
 #pragma once
+#include "../../../shared/DecodedFrameColorContract.h"
 
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND && ARBIT_HAVE_VIEWPORT
 
@@ -10,8 +11,10 @@
 #include <vector>
 
 namespace arbitgl { struct GlFuncs; }
+namespace arbitgpu { class NativeFixtureSceneFrame; }
 namespace videopreview { struct State; }
 namespace videowire { class VisualPlanTelemetry; struct CompiledVisualLayerPlan; }
+namespace visualtemporaloperation { struct Payload; }
 
 namespace videorender
 {
@@ -69,6 +72,18 @@ public:
                         unsigned textureB, int width, int height, float mix);
     void uploadLut3D (unsigned textureHandle, const float* rgbTriples, int size);
     void deleteTexture (unsigned textureHandle);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseRgbaTexture(
+        unsigned textureHandle, int width, int height, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseDecodedFrame(
+        unsigned texture, int width, int height, decodedframecolor::Declaration color, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseLinearImageForDisplay(
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseShaderFrame(
+        const LayerDesc& layer, std::string& error);
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseTemporalFrame(
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& current,
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& previous,
+        const visualtemporaloperation::Payload& payload, float mix, std::string& error);
     bool setClipShader (int clipId, const std::string& source,
                         std::string& logOut, std::vector<GenParam>& paramsOut);
     bool prepareShaderOperationPlan (const LayerDesc& layer, std::string& errorOut);
@@ -88,6 +103,8 @@ public:
                                      const LayerDesc* layers, int numLayers,
                                      const ImageLayerDesc* overlays, int numOverlays);
     void clearDirectOutputs();
+    bool readLastCompositeFloat(std::vector<float>& rgba, std::string& error);
+    void setHdrImageCapture(bool enabled);
 
     bool ready() const;
     bool queryResourceCapabilities (int& maximumImageDimension,

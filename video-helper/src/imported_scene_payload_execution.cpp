@@ -1,6 +1,7 @@
 #include "imported_scene_payload_execution.h"
 #include "VisualImportedAnimationOperationContract.h"
 #include "VisualImportedSceneIdentity.h"
+#include "geometry_score_field.h"
 
 #include <limits>
 #include <iterator>
@@ -40,7 +41,7 @@ ImportedScenePayloadExecution::ImportedScenePayloadExecution(
     : store_(store), backend_(backend),
       deformationExecution_(
           std::make_unique<ImportedAnimatedScenePayloadExecution>(
-              store, deformationBackend))
+              store, deformationBackend, backend))
 {
 }
 
@@ -138,6 +139,14 @@ bool ImportedScenePayloadExecution::execute(
     // through the caller's receipt.
     if (retiredOwnerSinceLastAttempt_)
         output = ImportedSceneExecutionReceipt {};
+    const bool hasMaterialFrame = (request.material
+        && surfacematerialbinding::hasGraphFrameInput(request.material->binding))
+        || (request.diffractionMaterial && request.diffractionMaterial->graphFrame.has_value())
+        || geometrysurfacematerial::objectFrameEndpoint(request.surfacePrograms).has_value();
+    if (hasMaterialFrame != static_cast<bool>(request.runtimeInputs.materialFrameTexture)
+        || (hasMaterialFrame
+            && !arbitgpu::validMaterialFrameTexture(request.runtimeInputs.materialFrameTexture)))
+        return reject(error, "imported scene material Frame requires its exact owned native texture");
     const bool composedScene = request.sceneSnapshot != nullptr;
     if (composedScene)
     {
@@ -153,6 +162,7 @@ bool ImportedScenePayloadExecution::execute(
         operation.structuralRevision = request.structuralRevision;
         operation.evaluationRevision = request.evaluationRevision;
         operation.material = request.material;
+        operation.surfacePrograms = request.surfacePrograms;
         operation.diffractionMaterial = request.diffractionMaterial;
         if (operation.material && operation.material->sceneSnapshot == nullptr)
             operation.material->sceneSnapshot = request.sceneSnapshot;
@@ -161,6 +171,8 @@ bool ImportedScenePayloadExecution::execute(
     }
     else
     {
+        if (!request.surfacePrograms.empty())
+            return reject(error, "Surface object collections require the retained Scene3D snapshot owner");
         if (!visualmodelasset::validStableAssetId(request.asset.id)
             || request.asset.version == 0
             || request.asset.version > static_cast<std::uint64_t>(
@@ -209,8 +221,19 @@ bool ImportedScenePayloadExecution::execute(
             return reject(error, "imported diffraction material does not match the exact plan revision");
     }
 
+    auto sceneInputs = request.runtimeInputs;
+    sceneInputs.cameraOverride = request.camera;
+    sceneInputs.lightOverride = request.light;
+    // Material Fields consume the retained request frame during evaluation.
+    // As in Geometry Core, only an explicit note-instance mapping carries that
+    // frame into the native draw. The receipt still retains its original owner.
+    if (!sceneInputs.noteInstanceMapping)
+        sceneInputs.canonicalBlockCFrame.reset();
+
     if (request.deformation)
     {
+        if (arbitgpu::sceneUsesMotionPass(request.runtimeInputs))
+            return reject(error, "Motion pass requires static topology without imported skin or morph deformation");
         if (!visualanimationoperation::valid(*request.deformation)
             || !visualanimationimport::sameAsset(
                 request.deformation->asset, request.asset)
@@ -226,9 +249,7 @@ bool ImportedScenePayloadExecution::execute(
         deformationRequest.width = request.dimensions.width;
         deformationRequest.height = request.dimensions.height;
         deformationRequest.material = request.material;
-        deformationRequest.runtimeInputs = request.runtimeInputs;
-        deformationRequest.runtimeInputs.cameraOverride = request.camera;
-        deformationRequest.runtimeInputs.lightOverride = request.light;
+        deformationRequest.runtimeInputs = sceneInputs;
         ImportedAnimatedSceneReceipt deformationFrame;
         const auto rendered = use == ImportedSceneUse::Preview
             ? deformationExecution_->executePreview(
@@ -244,6 +265,7 @@ bool ImportedScenePayloadExecution::execute(
         receipt.materialDiagnostic = deformationFrame.materialDiagnostic;
         receipt.deformationFrame = std::move(deformationFrame);
         receipt.canonicalBlockCFrame = request.runtimeInputs.canonicalBlockCFrame;
+        receipt.materialFrameTexture = request.runtimeInputs.materialFrameTexture;
         output = std::move(receipt);
         error.clear();
         return true;
@@ -302,7 +324,18 @@ bool ImportedScenePayloadExecution::execute(
 
     bool usedLastGoodMaterial = false;
     std::string materialDiagnostic;
-    if (request.material)
+    if (!request.surfacePrograms.empty())
+    {
+        if (request.frame.rateNumerator == 0 || request.frame.rateDenominator == 0)
+            return reject(error, "Surface collection requires the exact rational preview or export frame");
+        videowire::geometry::RuntimeFieldEvaluation evaluation;
+        evaluation.timelineSeconds = static_cast<double>(request.frame.frame) * request.frame.rateDenominator / request.frame.rateNumerator;
+        evaluation.scoreAt = [&](const auto& operation, const auto& positions, auto& result, auto& diagnostic) {
+            return scorefield::evaluateSampleField(operation, positions, request.runtimeInputs.canonicalBlockCFrame, result, diagnostic);
+        };
+        if (!seam.publishSurfacePrograms(admission, request.surfacePrograms, evaluation, error)) return false;
+    }
+    else if (request.material)
     {
         auto material = *request.material;
         if (material.sceneSnapshot != nullptr
@@ -311,7 +344,7 @@ bool ImportedScenePayloadExecution::execute(
         material.sceneSnapshot = admission.scene;
         if (!seam.publishSurfaceMaterial(admission, material, error))
         {
-            if (use != ImportedSceneUse::Preview
+            if (hasMaterialFrame || use != ImportedSceneUse::Preview
                 || seam.lastGoodMaterialRevision() == 0)
                 return false;
             usedLastGoodMaterial = true;
@@ -323,7 +356,7 @@ bool ImportedScenePayloadExecution::execute(
         if (!seam.publishDiffractionMaterial(
                 admission, *request.diffractionMaterial, error))
         {
-            if (use != ImportedSceneUse::Preview
+            if (hasMaterialFrame || use != ImportedSceneUse::Preview
                 || seam.lastGoodMaterialRevision() == 0)
                 return false;
             usedLastGoodMaterial = true;
@@ -336,15 +369,19 @@ bool ImportedScenePayloadExecution::execute(
         seam.clearDiffractionMaterial(admission);
     }
 
-    auto sceneInputs = request.runtimeInputs;
-    sceneInputs.cameraOverride = request.camera;
-    sceneInputs.lightOverride = request.light;
+    if (arbitgpu::sceneUsesMotionPass(sceneInputs) && sceneInputs.noteInstanceMapping)
+        return reject(error, "Motion pass does not yet retain previous note-instance transforms");
+    sceneInputs.previousMotion = owner.motion.predecessor(request.frame.frame,
+        request.frame.rateNumerator, request.frame.rateDenominator,
+        request.dimensions.width, request.dimensions.height);
     gltf::GlbNativeFrameReceipt frame;
     const auto rendered = use == ImportedSceneUse::Preview
         ? seam.renderPreview(admission, request.dimensions, sceneInputs, frame, error)
         : seam.renderExport(admission, request.dimensions, sceneInputs, frame, error);
     if (!rendered)
         return false;
+    owner.motion.commit(request.frame.frame, request.frame.rateNumerator,
+        request.frame.rateDenominator, request.dimensions.width, request.dimensions.height, sceneInputs);
 
     ImportedSceneExecutionReceipt receipt;
     receipt.use = use;
@@ -354,6 +391,7 @@ bool ImportedScenePayloadExecution::execute(
     receipt.usedLastGoodMaterial = usedLastGoodMaterial;
     receipt.materialDiagnostic = std::move(materialDiagnostic);
     receipt.canonicalBlockCFrame = request.runtimeInputs.canonicalBlockCFrame;
+    receipt.materialFrameTexture = request.runtimeInputs.materialFrameTexture;
     output = std::move(receipt);
     error.clear();
     return true;

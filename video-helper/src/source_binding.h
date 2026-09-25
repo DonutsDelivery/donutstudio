@@ -94,4 +94,24 @@ const Segment* resolveTransitionFrom (const SegmentRange& segments,
     return best->displayStartSec + duration >= current.displayStartSec - abutEpsilon
          ? best : nullptr;
 }
+
+template <typename SegmentRange>
+const typename SegmentRange::value_type* resolveClipSegmentAtDisplayTime (
+    const SegmentRange& segments, int clipId, double displaySeconds) noexcept
+{
+    using Segment = typename SegmentRange::value_type;
+    const Segment* best = nullptr;
+    for (const auto& candidate : segments)
+    {
+        if (candidate.clipId != clipId || candidate.rate <= 1.0e-9)
+            continue;
+        const double duration = (candidate.outSec - candidate.inSec) / candidate.rate;
+        if (displaySeconds < candidate.displayStartSec
+            || displaySeconds >= candidate.displayStartSec + duration)
+            continue;
+        if (best == nullptr || candidate.displayStartSec > best->displayStartSec)
+            best = &candidate;
+    }
+    return best;
+}
 } // namespace videowire

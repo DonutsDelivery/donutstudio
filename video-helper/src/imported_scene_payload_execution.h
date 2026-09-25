@@ -38,6 +38,7 @@ struct ImportedSceneRequest final
     int clipId = 0;
     std::string staticPayloadIdentity;
     std::optional<surfacematerialbinding::ImportedSceneMaterialRequest> material;
+    geometrysurfacematerial::ObjectPrograms surfacePrograms;
     std::optional<diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest>
         diffractionMaterial;
     std::optional<HarmonicMIDI::grid::SceneCameraRecord> camera;
@@ -59,6 +60,9 @@ struct ImportedSceneExecutionReceipt final
     bool usedLastGoodMaterial = false;
     std::string materialDiagnostic;
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
+    // Keep the prerequisite alive through asynchronous submission and through
+    // the compositor's ownership of this output, not just executePreview().
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> materialFrameTexture;
 
     bool valid() const noexcept
     {
@@ -126,6 +130,7 @@ private:
         gltf::GlbNativeSceneAdmission admission;
         std::string exactPayloadIdentity;
         std::uint64_t lastUse = 0;
+        arbitgpu::NativeSceneMotionHistory motion;
     };
 
     void synchronizeGenerations(std::uint64_t projectGeneration,

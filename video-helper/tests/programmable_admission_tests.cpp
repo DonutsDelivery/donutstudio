@@ -10,6 +10,7 @@
 #include <thread>
 #include <array>
 #include <vector>
+#include <utility>
 using namespace programmableruntime;
 
 static Grant makeGrant(PayloadKind kind,const std::string& source,const SessionSecret& secret,
@@ -100,6 +101,83 @@ int main()
     error.clear(); assert(programmableadmission::admitCatalogGpuField(
         isfSession,isfOwner,"shaderSource","runtimeGrant",rawGrant,error,now));
     assert(error.empty());
+
+    // The raw segment/clip source route also admits application generators, but
+    // only their bounded templates with the same authenticated catalog grant.
+    const std::array<std::pair<std::string, std::string>, 3> builtins {{
+        { "solid", "void mainImage(out vec4 o, in vec2 fc){ o = vec4(0.800000,0.200000,0.101961,1.000000); }" },
+        { "gradient", "void mainImage(out vec4 o, in vec2 fc){\n"
+                      "  vec2 uv = fc / uResolution;\n"
+                      "  float t = clamp(dot(uv - vec2(0.5), vec2(-0.707107,0.707107)) + 0.5, 0.0, 1.0);\n"
+                      "  o = mix(vec4(0.800000,0.200000,0.101961,1.000000), vec4(0.101961,0.600000,0.901961,1.000000), t);\n}" },
+        { "image", "/*{ \"ISFVSN\": \"2.0\", \"INPUTS\": [ { \"NAME\": \"uGenImage\", \"TYPE\": \"image\" } ] }*/\n"
+                   "void main(){ gl_FragColor = IMG_NORM_PIXEL(uGenImage, isf_FragNormCoord); }" }
+    }};
+    for (const auto& builtin : builtins)
+    {
+        auto approved = makeGrant(PayloadKind::shader, builtin.second, secret, generation, 9, now);
+        approved.catalogPackId = builtingeneratorshader::catalogPackId;
+        approved.catalogProgramId = builtin.first;
+        approved.verifiedBundledCurated = true;
+        approved.mac = sign(secret, approved, PayloadKind::shader);
+        const auto admitBuiltin = [&](const Grant& candidate, const std::string& bytes)
+        {
+            programmableadmission::SessionVerifier session(secret, generation);
+            Grant admitted;
+            std::string failure;
+            const nlohmann::json owner {{"shaderSource", bytes},
+                {"runtimeGrant", programmableadmission::toJson(candidate)}};
+            return programmableadmission::admitCatalogGpuField(
+                session, owner, "shaderSource", "runtimeGrant", admitted, failure, now);
+        };
+        assert(admitBuiltin(approved, builtin.second));
+        auto altered = approved;
+        altered.catalogProgramId = "unknown-generator";
+        altered.mac = sign(secret, altered, PayloadKind::shader);
+        assert(!admitBuiltin(altered, builtin.second));
+        altered = approved;
+        altered.catalogProgramId = builtin.first == "solid" ? "gradient" : "solid";
+        altered.mac = sign(secret, altered, PayloadKind::shader);
+        assert(!admitBuiltin(altered, builtin.second));
+        altered = approved;
+        altered.verifiedBundledCurated = false;
+        altered.mac = sign(secret, altered, PayloadKind::shader);
+        assert(!admitBuiltin(altered, builtin.second));
+        altered = approved;
+        altered.sessionGeneration++;
+        altered.mac = sign(secret, altered, PayloadKind::shader);
+        assert(!admitBuiltin(altered, builtin.second));
+        altered = approved;
+        altered.kind = PayloadKind::raymarch;
+        altered.mac = sign(secret, altered, PayloadKind::raymarch);
+        assert(!admitBuiltin(altered, builtin.second));
+
+        // Even an otherwise authentic grant cannot expand a template into code.
+        const auto appended = builtin.second + "\nvoid injected() {}";
+        altered = approved;
+        altered.fingerprint = fingerprint(PayloadKind::shader, appended);
+        altered.mac = sign(secret, altered, PayloadKind::shader);
+        assert(!admitBuiltin(altered, appended));
+        if (builtin.first == "image") continue;
+        const auto replaceNumber = [&](const std::string& number)
+        {
+            auto bytes = builtin.second;
+            bytes.replace(bytes.find("0.800000"), 8, number);
+            return bytes;
+        };
+        const auto changedColour = replaceNumber("0.400000");
+        assert(builtingeneratorshader::validSource(builtin.first, changedColour));
+        assert(!admitBuiltin(approved, changedColour)); // Exact byte fingerprint still required.
+        for (const char* invalid : { "1.100000", "-0.800000", "nan", "0.123456",
+                                     "8e-1", "0.800000/*injected*/", "0.800000 + 0.000000" })
+        {
+            const auto bytes = replaceNumber(invalid);
+            altered = approved;
+            altered.fingerprint = fingerprint(PayloadKind::shader, bytes);
+            altered.mac = sign(secret, altered, PayloadKind::shader);
+            assert(!admitBuiltin(altered, bytes));
+        }
+    }
 
     auto forged=programmableadmission::toJson(g); forged["nonce"]=5; forged["cpuMs"]=26;
     error.clear(); assert(!verifier.admit(forged,PayloadKind::shader,source,parsed,error,now));

@@ -1,6 +1,8 @@
 #include "VisualAnimationDeformationEvaluation.h"
 #include "gpu_backend/backend.h"
 #include "support/fixture_scene.h"
+#include "animated_geometry_fixture.h"
+#include "multiobject_animation_fixture.h"
 
 #define SOKOL_METAL
 #include "sokol_gfx.h"
@@ -82,6 +84,7 @@ struct Fixture final
         mutableSource->scene = scene;
         mutableSource->deformation = asset;
         mutableSource->morphBaseWeights = { 0.0f };
+        mutableSource->retainDeformedGeometry = true;
         source = std::move(mutableSource);
     }
 
@@ -151,6 +154,30 @@ int main()
                  "the exact Metal deformation fixture must be admitted");
 
     auto& backend = arbitgpu::nativeDeformationBackend();
+    std::string extractionError;
+    const bool extracted=verifyAnimatedGeometryExtraction(extractionError);
+    if (!extracted) std::cerr << extractionError << '\n';
+    ok &= expect(extracted,"imported animation reaches retained Geometry3D through the native GPU path");
+    const bool multiobject = multiobjectanimationfixture::verify(backend,
+        [](const auto& frame) { return readBgra8(frame); }, extractionError);
+    if (!multiobject) std::cerr << extractionError << '\n';
+    ok &= expect(multiobject, "multi-object imported animation preserves GPU preview, export and seek");
+    const bool rigidScene = multiobjectanimationfixture::verify(backend,
+        [](const auto& frame) { return readBgra8(frame); }, extractionError, true);
+    if (!rigidScene) std::cerr << extractionError << '\n';
+    ok &= expect(rigidScene, "rigid-only parent animation is selectable and rendered on Metal");
+    for (const bool rigid : {false, true}) {
+        const bool repeated = multiobjectanimationfixture::verify(backend,
+            [](const auto& frame) { return readBgra8(frame); }, extractionError, rigid, true);
+        if (!repeated) std::cerr << extractionError << '\n';
+        ok &= expect(repeated, "repeated imported nodes retain independent whole-scene poses on Metal");
+    }
+    for (unsigned target : {1u,2u}) {
+        const bool sceneOnly=multiobjectanimationfixture::verifySceneOnly(backend,
+            [](const auto& frame) { return readBgra8(frame); },target,extractionError);
+        if (!sceneOnly) std::cerr << extractionError << '\n';
+        ok &= expect(sceneOnly,"camera/light-only clips render without mesh deformation on Metal");
+    }
     const auto info = backend.info();
     if (! info.available || ! info.compute || info.backend != "metal")
     {
@@ -165,6 +192,22 @@ int main()
     auto first = backend.render(fixture.source, firstSnapshot, preparation.resources, 96, 96);
     auto repeated = backend.render(fixture.source, firstSnapshot, preparation.resources, 96, 96);
     auto moved = backend.render(fixture.source, movedSnapshot, preparation.resources, 96, 96);
+    ok &= expect(first.deformedVertices.size()==24u*8u
+                 && first.deformedVertices==repeated.deformedVertices
+                 && moved.deformedVertices.size()==first.deformedVertices.size(),
+                 "GPU geometry extraction preserves topology and exact frame repetition");
+    if (first.deformedVertices.size()==24u*8u && moved.deformedVertices.size()==24u*8u)
+        for (std::size_t vertex=0;vertex<24;++vertex)
+        {
+            ok &= expect(std::abs(moved.deformedVertices[vertex*8]-first.deformedVertices[vertex*8]-0.75f)<0.00001f,
+                         "retained geometry contains the GPU evaluated morph displacement");
+            ok &= expect(first.deformedVertices[vertex*8+6]==fixture.sceneValue.vertices[vertex].uv.x
+                         && first.deformedVertices[vertex*8+7]==fixture.sceneValue.vertices[vertex].uv.y,
+                         "GPU extraction preserves UVs in the full tangent and color vertex layout");
+        }
+    auto sought=backend.render(fixture.source,firstSnapshot,preparation.resources,96,96);
+    ok &= expect(sought.deformedVertices==first.deformedVertices,
+                 "seeking backwards restores the original retained GPU geometry");
     arbitgpu::NativeDeformationRuntimeInputs mutedMorphRuntime;
     mutedMorphRuntime.morphWeight = 0.0f;
     auto mutedMorph = backend.render(

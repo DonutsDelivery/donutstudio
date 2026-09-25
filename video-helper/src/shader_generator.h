@@ -188,6 +188,8 @@ public:
     // binds 1x1 black so the sampler read returns 0 — the zero-feed contract. The
     // textures are owned by the caller (decoded + uploaded once, static for the
     // clip), NOT by this generator: render() only binds, never deletes them.
+    // Bridge operations also bind bare GLSL inputImage/startImage/endImage from
+    // this map and upload their evaluated progress from genValues.
     unsigned render (const arbitgl::GlFuncs* gl, const ShaderClock& clock,
                      int width, int height, const AudioFeatures* audio = nullptr,
                      const canonicalblockc::CanonicalBlockCFrame* notes = nullptr,
@@ -250,6 +252,7 @@ private:
     std::vector<GenParam> params_;
     std::vector<int> paramLocs_;   // M7: uniform location per params_ entry (-1 = absent/optimized out)
     int inputImageLoc_ = -1;       // FlatShaderBridge v1 exact filter sampler
+    int bridgeStartImageLoc_ = -1, bridgeEndImageLoc_ = -1, bridgeProgressLoc_ = -1;
     Locs locs_;
 
     unsigned vao_ = 0, vbo_ = 0, fbo_ = 0;

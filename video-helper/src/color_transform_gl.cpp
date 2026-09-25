@@ -46,6 +46,9 @@ vec3 decodeTransfer(vec3 value)
         return mix(linearHigh, linearLow, low);
     }
     if (inputTransfer == 3) return pow(value, vec3(2.2));
+    if (inputTransfer == 6)
+        return mix(pow((value + 0.099) / 1.099, vec3(1.0 / 0.45)),
+                   value / 4.5, lessThan(value, vec3(0.081)));
     if (inputTransfer == 4)
     {
         const float m1 = 2610.0 / 16384.0;
@@ -79,6 +82,9 @@ vec3 encodeTransfer(vec3 value)
         return mix(encodedHigh, encodedLow, low);
     }
     if (outputTransfer == 3) return pow(value, vec3(1.0 / 2.2));
+    if (outputTransfer == 6)
+        return mix(1.099 * pow(value, vec3(0.45)) - 0.099,
+                   4.5 * value, lessThan(value, vec3(0.018)));
     if (outputTransfer == 4)
     {
         const float m1 = 2610.0 / 16384.0;

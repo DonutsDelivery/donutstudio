@@ -4,6 +4,10 @@
 #include "diffraction_material_binding_admission.h"
 #include "flat_shader_bridge.h"
 #include "geometry_core_backend.h"
+#include "geometry_core_execution_cache.h"
+#include "material_frame_evaluation.h"
+#include "material_frame_schedule.h"
+#include "harmonic_link_geometry.h"
 #include "key_cleanup_payload_schema.h"
 #include "common_effect_payload_schema.h"
 #include "shader_transition_admission.h"
@@ -14,6 +18,8 @@
 #include "../../shared/VisualImportedSceneRenderOperationContract.h"
 #include "../../shared/VisualAnimationDeformationEvaluation.h"
 #include "../../shared/OpticalFlowOperationContract.h"
+#include "../../shared/RenderPassCompositeContract.h"
+#include "../../shared/RenderPassOutputContract.h"
 #include "../../shared/VisualTemporalOperationContract.h"
 #include "../../shared/VisualTemporalSamplingContract.h"
 
@@ -23,7 +29,12 @@
 #include "render_snapshot.h"
 #include "visual_plan_resource_budget.h"
 #include "visual_plan_telemetry.h"
+#include "particle_parameters.h"
+#include "particle_body_replay.h"
+#include "particle_solid_renderer.h"
 #include "volume_native_renderer.h"
+#include "sdf_visual_plan_execution.h"
+#include "typed_scene_pass_plan.h"
 
 #include <algorithm>
 #include <array>
@@ -45,7 +56,36 @@
 
 namespace videowire
 {
+inline bool requiresBakedSpectralHistory(const CompiledVisualLayerPlan& plan)
+{
+    for (const auto& operation : plan.operations)
+    {
+        if (operation.kind != "geometry.core.runtime") continue;
+        std::string error;
+        const auto bytes = geometry::decodeLoweredPlanText(operation.payloadXml, error);
+        const auto lowered = bytes ? geometry::decodeLoweredRuntimePlan(*bytes, error) : std::nullopt;
+        if (!lowered) continue;
+        const auto value = geometry::decodeRuntimeValue(lowered->runtimeValue, lowered->contract, {}, {}, error);
+        if (value && std::any_of(value->descriptor().spectrumFields.begin(), value->descriptor().spectrumFields.end(),
+                [](const auto& binding) { return binding.history.enabled && !binding.history.live; })) return true;
+    }
+    return false;
+}
 inline constexpr int kMaxVisualParticles = 4096;
+
+inline std::set<std::string> simulationAutomationDestinations(const std::vector<CompiledVisualLayerPlan>& plans)
+{
+    std::set<std::string> result;
+    for (const auto& plan:plans)
+        for (const auto& operation:plan.operations)
+            if (operation.kind=="visual.particles")
+                for (const auto& parameter:visualsimulation::parameters)
+                    result.insert("clip"+std::to_string(plan.clipId)+"/visual"
+                        +std::to_string(operation.nodeId)+"/"+parameter.name);
+            else if (visualtemporaloperation::isTemporalKind(operation.kind))
+                result.insert("clip"+std::to_string(plan.clipId)+"/visual"+std::to_string(operation.nodeId)+"/reset");
+    return result;
+}
 
 // Immutable description of one native temporal image operation. Pixels remain
 // renderer-owned GPU images; this value transports the exact owner, mode,
@@ -95,6 +135,14 @@ struct VisualPlanEvaluationContext
         = visualtemporalsampling::EvaluationMode::preview;
     uint64_t projectGeneration = 0;
     uint64_t deviceGeneration = 0;
+    uint64_t loopGeneration = 0;
+    uint64_t seekGeneration = 0;
+    std::function<bool(videowire::geometry::RetainedMeshData&, double,
+        std::uint64_t, bool, std::string&)> importedGeometry {};
+    std::function<bool(double, visualdeformation::RationalFrameTime&, std::string&)> materialFrameClock {};
+    videohelper::importedscene::MaterialFrameResolver materialFrameResolver {};
+    std::optional<videohelper::importedscene::MaterialFrameReceipt> geometryMaterialFrame;
+    std::map<materialframe::Endpoint,videohelper::importedscene::MaterialFrameReceipt> geometryMaterialFrames;
 };
 
 struct VisualTriggerConsumption
@@ -169,6 +217,8 @@ private:
 // continue through the existing native compositor.
 struct VisualLayerExecution
 {
+    bool volume = false;
+    bool sdf = false;
     uint64_t structuralRevision = 0;
     CompiledVisualDagSchedule dagSchedule;
     int particleNodeId = 0;
@@ -177,6 +227,14 @@ struct VisualLayerExecution
     int drawShapeSecondaryNodeId = 0;
     std::optional<visualanimationimport::Request> importedAnimation;
     std::optional<visualimportedscenerender::Request> importedSceneRender;
+    std::optional<renderpassoutput::Extent> typedScenePassExtent;
+    // Evaluated before the imported scene draw, independently of serialized
+    // node order. This is the existing source-decode operation, not a second
+    // video source or an imported-texture substitution.
+    std::optional<CompiledVisualScheduledOperation> materialFrameSource;
+    std::shared_ptr<const CompiledVisualLayerPlan> geometryFramePlan;
+    ImmutableShaderOperationPlan geometryFrameShaders;
+    std::optional<materialframe::Schedule> geometryFrameSchedule;
     std::optional<visualnoteinstancing::Mapping> noteInstanceMapping;
     // Exact image roots consumed by the established compositor, recorded in
     // stable Blend destination-port order rather than inferred from kind or
@@ -208,8 +266,11 @@ struct VisualLayerExecution
     visualtemporaloperation::Payload temporalPayload;
     bool matteApply = false;
     bool depthFog = false;
+    std::optional<renderpasscomposite::Parameters> passComposite;
+    std::optional<renderpasscomposite::Program> passProgram;
     int depthEffect = 0;
     bool particles = false;
+    bool importedParticleOverlay = false;
     bool keyCleanup = false;
     bool colorTransform = false;
     colortransformoperation::Payload colorTransformPayload;
@@ -226,9 +287,11 @@ struct VisualLayerExecution
     bool keyCleanupMatteView = false;
     bool flatShaderBridge = false;
     ImmutableShaderOperationPlan shaderOperationPlan;
-    int particleSeed = 1, particleCount = 512;
-    float particleLifetime = 1.8f, particleSize = 4.0f, particleSpeed = 1.0f;
-    float particleRed = 0.2f, particleGreen = 0.7f, particleBlue = 1.0f, particleAlpha = 1.0f;
+    // Exact saved clip referenced by the one admitted video.layer.source feeding
+    // a curated transition. Viewport/export resolve this at the same timeline
+    // instant and keep the resulting LayerDesc alive through compositing.
+    int shaderTransitionFromClipId = 0;
+    videorender::ParticleParams particleParameters;
     bool matteInvert = false;
     int matteCombineMode = -1;
     float matteBlack = 0.0f, matteWhite = 1.0f;
@@ -242,7 +305,6 @@ struct VisualLayerExecution
     float shape2Cx = 0.5f, shape2Cy = 0.5f, shape2W = 0.0f, shape2H = 0.0f;
     float shapeR = 1.0f, shapeG = 1.0f, shapeB = 1.0f, shapeA = 1.0f;
     std::optional<renderpassoutput::Description> colorAovPass;
-    std::optional<renderpassoutput::Description> motionAovPass;
     std::optional<sceneaov::Payload> sceneAovPass;
     std::optional<aovinspection::Payload> aovInspectionPass;
     std::optional<TemporalFeedbackPass> temporalFeedbackPass;
@@ -309,6 +371,204 @@ inline bool visualBoundedPayloadFloat (const std::string& xml, const char* name,
         || value < minimum || value > maximum)
         return false;
     result = value;
+    return true;
+}
+
+inline std::string visualPayloadString(const std::string& xml, const char* name);
+
+inline bool admitParticleParameters(const std::string& xml,
+                                    videorender::ParticleParams& p, std::string& error)
+{
+    // Historical controls retain their clamping policy. New motion controls
+    // reject malformed and out-of-range payloads before native submission.
+    const auto legacy = [&](const char* key, float fallback, float low, float high)
+    {
+        const float value = visualPayloadFloat(xml, key, fallback);
+        return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
+    };
+    p.seed = static_cast<int>(legacy("seed", 1.0f, 0.0f, 65535.0f));
+    p.count = static_cast<int>(legacy("count", 512.0f, 1.0f, 4096.0f));
+    p.lifetime = legacy("lifetime", 1.8f, 0.1f, 10.0f);
+    p.size = legacy("size", 4.0f, 1.0f, 32.0f);
+    p.force = legacy("speed", 1.0f, 0.0f, 4.0f);
+    p.red = legacy("red", 0.2f, 0.0f, 1.0f);
+    p.green = legacy("green", 0.7f, 0.0f, 1.0f);
+    p.blue = legacy("blue", 1.0f, 0.0f, 1.0f);
+    p.alpha = legacy("alpha", 1.0f, 0.0f, 1.0f);
+    float mode = 0.0f, track = 0.0f, collision = 0.0f, shape = 0, constraint = 0, reset = 0, history = 0, space=0;
+    if (!visualBoundedPayloadFloat(xml, "motionMode", 0, 0, 2, mode)
+        || !visualBoundedPayloadFloat(xml, "spawnTrack", 0, 0, 65535, track)
+        || std::floor(mode) != mode || std::floor(track) != track
+        || !visualBoundedPayloadFloat(xml, "gravity", 0, -4, 4, p.gravity)
+        || !visualBoundedPayloadFloat(xml, "drag", 0, 0, 10, p.drag)
+        || !visualBoundedPayloadFloat(xml, "attraction", 0, 0, 10, p.attraction)
+        || !visualBoundedPayloadFloat(xml, "linkSpring", 0, 0, 10, p.linkSpring)
+        || !visualBoundedPayloadFloat(xml, "linkRatioInfluence", 1, 0, 1, p.linkRatioInfluence)
+        || !visualBoundedPayloadFloat(xml, "collisionMode", 0, 0, 2, collision)
+        || std::floor(collision) != collision
+        || !visualBoundedPayloadFloat(xml, "bodyShape", 0, 0, 1, shape) || std::floor(shape) != shape
+        || !visualBoundedPayloadFloat(xml, "linkConstraint", 0, 0, 1, constraint) || std::floor(constraint) != constraint
+        || !visualBoundedPayloadFloat(xml, "resetMode", 0, 0, 1, reset) || std::floor(reset) != reset
+        || !visualBoundedPayloadFloat(xml, "historicalReplay", 0, 0, 1, history) || std::floor(history) != history
+        || !visualBoundedPayloadFloat(xml, "bodyMass", 1, 0.01f, 100, p.bodyMass)
+        || !visualBoundedPayloadFloat(xml, "friction", 0, 0, 1, p.friction)
+        || !visualBoundedPayloadFloat(xml, "linkRestScale", 1, 0.1f, 4, p.linkRestScale)
+        || !visualBoundedPayloadFloat(xml, "impulseX", 0, -4, 4, p.impulseX)
+        || !visualBoundedPayloadFloat(xml, "impulseY", 0, -4, 4, p.impulseY)
+        || !visualBoundedPayloadFloat(xml,"simulationSpace",0,0,1,space) || std::floor(space)!=space
+        || !visualBoundedPayloadFloat(xml,"spawnZ",0.5f,-4,4,p.spawnZ)
+        || !visualBoundedPayloadFloat(xml,"impulseZ",0,-4,4,p.impulseZ)
+        || !visualBoundedPayloadFloat(xml,"gravityX",0,-4,4,p.gravityX)
+        || !visualBoundedPayloadFloat(xml,"gravityZ",0,-4,4,p.gravityZ)
+        || !visualBoundedPayloadFloat(xml,"orientationX",0,-180,180,p.orientationDegrees[0])
+        || !visualBoundedPayloadFloat(xml,"orientationY",0,-180,180,p.orientationDegrees[1])
+        || !visualBoundedPayloadFloat(xml,"orientationZ",0,-180,180,p.orientationDegrees[2])
+        || !visualBoundedPayloadFloat(xml,"angularX",0,-32,32,p.angularVelocity[0])
+        || !visualBoundedPayloadFloat(xml,"angularY",0,-32,32,p.angularVelocity[1])
+        || !visualBoundedPayloadFloat(xml,"angularZ",0,-32,32,p.angularVelocity[2])
+        || !visualBoundedPayloadFloat(xml,"angularDrag",0,0,10,p.angularDrag)
+        || !visualBoundedPayloadFloat(xml, "bodyRadius", 0.015f, 0.001f, 0.1f, p.bodyRadius)
+        || !visualBoundedPayloadFloat(xml, "restitution", 0.7f, 0, 1, p.restitution)
+        || !visualBoundedPayloadFloat(xml, "rmsGain", 0, 0, 8, p.rmsGain)
+        || !visualBoundedPayloadFloat(xml, "onsetGain", 0, 0, 8, p.onsetGain)
+        || !visualBoundedPayloadFloat(xml, "emissionRate", -1, -1, 64, p.emissionRate)
+        || !visualBoundedPayloadFloat(xml, "reset", 0, 0, 1, p.reset)
+        || !visualBoundedPayloadFloat(xml, "resetTime", 0, 0, 86400, p.resetTime))
+    {
+        error = "particle motion controls are malformed or outside their bounds";
+        return false;
+    }
+    p.motionMode = static_cast<int>(mode);
+    p.spawnTrack = static_cast<int>(track);
+    p.collisionMode = static_cast<int>(collision);
+    p.bodyShape = static_cast<int>(shape);
+    p.linkConstraint = static_cast<int>(constraint);
+    p.resetMode = static_cast<int>(reset);
+    p.historicalReplay = history != 0;
+    p.simulationSpace=static_cast<int>(space);
+    if (p.simulationSpace==1 && (p.motionMode!=2 || !p.historicalReplay || p.bodyShape!=0))
+    { error="Solid 3D requires Coupled bodies, project history and sphere bounds (Body collider: Circle)"; return false; }
+    if (p.simulationSpace==0 && (p.impulseZ!=0 || p.gravityX!=0 || p.gravityZ!=0 || p.spawnZ!=0.5f
+        || p.orientationDegrees!=std::array<float,3>{} || p.angularVelocity!=std::array<float,3>{} || p.angularDrag!=0))
+    { error="Depth, vector gravity, orientation and angular controls require Solid 3D"; return false; }
+    p.geometryCount=0;
+    p.geometryAnchors={};
+    p.geometryDepths={}; p.geometryIdentities={};
+    p.geometryBinding.reset();
+    p.preparedBodies.reset();
+    p.preparedSolids.reset();
+    const auto emitterPayload=visualPayloadString(xml,"emitterGeometryPlan");
+    const auto attractorPayload=visualPayloadString(xml,"attractorGeometryPlan");
+    const auto meshPayload=visualPayloadString(xml,"colliderGeometryPlan");
+    const auto pointsPayload=visualPayloadString(xml,"colliderPointsPlan");
+    const auto bodyPayload=visualPayloadString(xml,"bodyGeometryPlan");
+    if (!emitterPayload.empty() || !attractorPayload.empty() || !meshPayload.empty() || !pointsPayload.empty() || !bodyPayload.empty())
+    {
+        using namespace videowire::geometry;
+        if (p.motionMode==0 || (emitterPayload.empty() && !attractorPayload.empty()))
+        { error="Geometry particle binding requires a timeline motion mode and an emitter"; return false; }
+        auto binding=std::make_shared<videorender::ParticleGeometryBinding>();
+        bool animated=false;
+        const auto decode=[&](const std::string& payload,CarrierKind carrier,std::shared_ptr<const ValueDescriptor>& destination) {
+            if (payload.empty()) return true;
+            const auto bytes=decodeLoweredPlanText(payload,error);
+            const auto plan=bytes ? decodeLoweredRuntimePlan(*bytes,error) : std::nullopt;
+            const auto value=plan ? decodeRuntimeValue(plan->runtimeValue,plan->contract,{}, {},error) : std::nullopt;
+            if (!value) return false;
+            const auto& descriptor=value->descriptor();
+            if (!validateParticleGeometry(descriptor,carrier,error)) return false;
+            animated=animated || hasRuntimeFields(descriptor)
+                || std::any_of(descriptor.operations.begin(),descriptor.operations.end(),[](const auto& operation) {
+                    return operation.retainedMesh && !operation.retainedMesh->importedAnimation.empty();
+                });
+            destination=std::make_shared<const ValueDescriptor>(descriptor);
+            return true;
+        };
+        if (!decode(emitterPayload,CarrierKind::points3D,binding->emitters)
+            || !decode(attractorPayload,CarrierKind::points3D,binding->attractors)
+            || !decode(meshPayload,CarrierKind::geometry3D,binding->mesh)
+            || !decode(pointsPayload,CarrierKind::points3D,binding->points)) return false;
+        if (!bodyPayload.empty()) {
+            if (p.simulationSpace!=1 || !decode(bodyPayload,CarrierKind::geometry3D,binding->body))
+            { if (error.empty()) error="Solid body geometry requires Solid 3D"; return false; }
+            if (hasRuntimeFields(*binding->body) || std::any_of(binding->body->operations.begin(),binding->body->operations.end(),
+                [](const auto& op) { return op.retainedMesh && !op.retainedMesh->importedAnimation.empty(); }))
+            { error="Rigid body geometry must be static; animated/deforming body shapes are unsupported"; return false; }
+        }
+        const bool contacts=binding->mesh || binding->points;
+        if ((animated || contacts) && (p.motionMode!=2 || !p.historicalReplay || (contacts && p.bodyShape!=0)))
+        { error="Animated emitters and geometry colliders require Coupled bodies with project history; geometry contacts require circle bodies"; return false; }
+        float scale=0.25f,cx=0.5f,cy=0.5f,cz=0.5f,projection=0;
+        if (!visualBoundedPayloadFloat(xml,"geometryScale",0.25f,0.001f,10,scale)
+            || !visualBoundedPayloadFloat(xml,"geometryCenterX",0.5f,-4,4,cx)
+            || !visualBoundedPayloadFloat(xml,"geometryCenterY",0.5f,-4,4,cy)
+            || !visualBoundedPayloadFloat(xml,"geometryCenterZ",0.5f,-4,4,cz)
+            || !visualBoundedPayloadFloat(xml,"geometryProjection",0,0,2,projection)
+            || std::floor(projection)!=projection
+            || !visualBoundedPayloadFloat(xml,"colliderThickness",0.005f,0,0.1f,p.colliderThickness))
+        { error="Geometry particle projection controls are invalid"; return false; }
+        const auto project=[&](const Vec3& point) {
+            return std::array<float,2>{cx+scale*(projection==2 ? point.y : point.x),
+                cy+scale*(projection==0 ? point.y : point.z)};
+        };
+        binding->scale=scale; binding->centerX=cx; binding->centerY=cy; binding->projection=static_cast<int>(projection);
+        binding->centerZ=cz;
+        if (binding->emitters) {
+            auto emitters=std::get<PointsData>(binding->emitters->data).points;
+            auto attractors=binding->attractors ? std::get<PointsData>(binding->attractors->data).points : emitters;
+            const auto order=[](const auto& a,const auto& b) { return a.stableId<b.stableId; };
+            std::sort(emitters.begin(),emitters.end(),order); std::sort(attractors.begin(),attractors.end(),order);
+            p.geometryCount=static_cast<int>(emitters.size());
+            for (std::size_t i=0;i<emitters.size();++i) {
+                const auto emission=project(emitters[i].position),target=project(attractors[i%attractors.size()].position);
+                p.geometryAnchors[i]={emission[0],emission[1],target[0],target[1]};
+                p.geometryIdentities[i]=emitters[i].stableId;
+            }
+        }
+        if (p.simulationSpace==1) {
+            if (projection!=0) { error="Solid 3D uses XYZ world coordinates; Geometry projection must be XY"; return false; }
+            if (binding->mesh && std::get<GeometryData>(binding->mesh->data).indices.empty())
+            { error="Solid mesh collision bounds require triangle Geometry"; return false; }
+            const auto contacts=(binding->mesh ? 1u:0u)+(binding->points ? std::get<PointsData>(binding->points->data).points.size():0u);
+            if (static_cast<std::size_t>(p.count)+contacts>64)
+            { error="Solid 3D supports at most 64 bodies plus collider objects; reduce Count or collider points"; return false; }
+        }
+        if (p.motionMode==2 && p.historicalReplay) p.geometryBinding=std::move(binding);
+    }
+    if (p.collisionMode != 0 && p.motionMode == 0)
+    {
+        error = "particle bodies require Timeline reactive motion; collisions use the unit box, not imported mesh topology";
+        return false;
+    }
+    if (p.linkSpring > 0.0f && p.motionMode == 0)
+    {
+        error = "harmonic-link springs require Timeline reactive motion; capacity is 128 score notes and 256 links";
+        return false;
+    }
+    float springCount = 0.0f;
+    if (p.motionMode == 2
+        && (!visualBoundedPayloadFloat(xml, "count", 512, 1, 64, springCount)
+            || std::floor(springCount) != springCount))
+    {
+        error = "coupled replay supports 1 to 64 bodies; set Count to 64 or less";
+        return false;
+    }
+    if (p.motionMode != 2 && (p.collisionMode == 2 || p.bodyShape != 0
+        || p.linkConstraint != 0 || p.resetMode != 0 || p.bodyMass != 1
+        || p.friction != 0 || p.linkRestScale != 1 || p.impulseX != 0 || p.impulseY != 0 || p.historicalReplay))
+    {
+        error = "body contacts, shapes, mass, friction, rest length, impulses, history and reset policy require Coupled bodies";
+        return false;
+    }
+    if ((p.emissionRate!=-1 || p.reset!=0) && (p.motionMode!=2 || !p.historicalReplay))
+    { error="Automated emission and reset require Coupled bodies with project history"; return false; }
+    if ((p.linkSpring > 0.0f || p.collisionMode != 0)
+        && (!visualBoundedPayloadFloat(xml, "count", 512, 1, 4096, springCount)
+            || std::floor(springCount) != springCount))
+    {
+        error = "reactive body capacity is 4096 particles; canonical score capacity is 128 notes and 256 links";
+        return false;
+    }
     return true;
 }
 
@@ -460,8 +720,11 @@ public:
         visualtemporalsampling::LifecycleState samplingLifecycle;
         bool lowered = false;
     };
+    using SlotTable = std::array<Slot, kMaxAdmittedPlans>;
 
-    VisualPlanExecutionState() : temporalAuthority_(std::make_shared<TemporalAuthority>()) {}
+    VisualPlanExecutionState()
+        : slots_(std::make_unique<SlotTable>()),
+          temporalAuthority_(std::make_shared<TemporalAuthority>()) {}
     ~VisualPlanExecutionState()
     {
         const auto authority = temporalAuthority_;
@@ -796,9 +1059,9 @@ private:
 
         size_t retainedBytes = 0;
         for (size_t index = 0; index < slotCount_; ++index)
-            if (&slots_[index] != slot && slots_[index].volumeProduct.admitted != nullptr)
+            if (&(*slots_)[index] != slot && (*slots_)[index].volumeProduct.admitted != nullptr)
             {
-                const auto bytes = slots_[index].volumeProduct.admitted->bytes().size();
+                const auto bytes = (*slots_)[index].volumeProduct.admitted->bytes().size();
                 if (bytes > kMaxInjectedVolumeBytes - retainedBytes)
                 {
                     error = "in-memory volume product byte capacity exceeded";
@@ -822,17 +1085,17 @@ private:
 
     Slot* findSlot (int clipId)
     {
-        auto it = std::lower_bound(slots_.begin(), slots_.begin() + (ptrdiff_t) slotCount_, clipId,
+        auto it = std::lower_bound(slots_->begin(), slots_->begin() + (ptrdiff_t) slotCount_, clipId,
             [](const Slot& slot, int id) { return slot.clipId < id; });
-        return it != slots_.begin() + (ptrdiff_t) slotCount_ && it->clipId == clipId ? &*it : nullptr;
+        return it != slots_->begin() + (ptrdiff_t) slotCount_ && it->clipId == clipId ? &*it : nullptr;
     }
     const Slot* findSlot (int clipId) const
     {
-        auto it = std::lower_bound(slots_.begin(), slots_.begin() + (ptrdiff_t) slotCount_, clipId,
+        auto it = std::lower_bound(slots_->begin(), slots_->begin() + (ptrdiff_t) slotCount_, clipId,
             [](const Slot& slot, int id) { return slot.clipId < id; });
-        return it != slots_.begin() + (ptrdiff_t) slotCount_ && it->clipId == clipId ? &*it : nullptr;
+        return it != slots_->begin() + (ptrdiff_t) slotCount_ && it->clipId == clipId ? &*it : nullptr;
     }
-    std::array<Slot, kMaxAdmittedPlans> slots_ {};
+    std::unique_ptr<SlotTable> slots_;
     size_t slotCount_ = 0;
     VisualPlanTelemetry telemetry_;
     VisualPlanTelemetry* telemetryOwner_ = &telemetry_;
@@ -1126,6 +1389,7 @@ inline bool compileVisualLayerExecution (const CompiledVisualLayerPlan& plan,
                                          VisualLayerExecution& execution,
                                          std::string& error);
 
+
 struct SurfaceGraphOperationContract
 {
     surfacematerial::OperationKind kind = surfacematerial::OperationKind::Invalid;
@@ -1256,10 +1520,18 @@ inline bool surfaceGraphOperationContract (std::string_view nodeKind,
         }
     }
 
-    for (const auto semantic : surfacematerial::kInputSemantics)
+    static constexpr std::array<const char*, 14> graphInputTokens {
+        "position", "normal", "tangent", "tex-coord-0", "tex-coord-1", "vertex-color",
+        "view-direction", "time", "audio-level", "audio-bass", "audio-mid", "audio-treble",
+        "audio-beat", "control"
+    };
+    static_assert(graphInputTokens.size() == surfacematerial::kInputSemantics.size(),
+                  "surface graph input slugs must cover every immutable input semantic");
+    for (std::size_t semanticIndex = 0; semanticIndex < surfacematerial::kInputSemantics.size(); ++semanticIndex)
     {
+        const auto semantic = surfacematerial::kInputSemantics[semanticIndex];
         std::string expected ("visual.surface.input.");
-        expected.append (surfacematerial::token (semantic));
+        expected.append (graphInputTokens[semanticIndex]);
         if (nodeKind != expected) continue;
         contract.kind = surfacematerial::OperationKind::Input;
         contract.resultType = surfacematerial::inputType (semantic);
@@ -1337,7 +1609,548 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                                                 VisualLayerExecution& execution,
                                                 std::string& error)
 {
+    if (hasTypedScenePass(plan))
+    {
+        typedscenepass::Payload payload;
+        std::optional<aovinspection::Payload> inspection;
+        CompiledVisualLayerPlan base;
+        if (!lowerTypedScenePass(plan, payload, inspection, base, error)
+            || !compileVisualLayerExecutionOrdered(base, execution, error)) return false;
+        execution.typedScenePassExtent = payload.extent;
+        if (inspection) execution.passComposite = typedscenepass::inspectionParameters(*inspection);
+        return true;
+    }
+    if (std::any_of(plan.operations.begin(), plan.operations.end(), [](const auto& operation)
+        { return operation.kind == "visual.sdf.raymarch"; }))
+    {
+        SdfRaymarchOperation operation;
+        if (!videohelper::sdf::admitVisualSdfPlan(plan, operation, error)) return false;
+        execution = {};
+        execution.structuralRevision = plan.structuralRevision;
+        execution.sdf = true;
+        execution.transform = execution.effects = execution.mask = false;
+        return true;
+    }
+    if (visualvolume::isVolumePlan(plan))
+    {
+        visualvolume::Operation volume;
+        if (!visualvolume::validatePlan(plan, volume, error)) return false;
+        execution = {};
+        execution.structuralRevision = plan.structuralRevision;
+        execution.volume = true;
+        execution.transform = execution.effects = execution.mask = false;
+        return true;
+    }
+    const auto exactParameterlessOutputPayload = [](const auto& operation)
+    {
+        if (operation.payloadXml.empty()) return true;
+        std::string_view payload = operation.payloadXml;
+        const auto trim = [](std::string_view value)
+        {
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'
+                    || value.front() == '\r' || value.front() == '\n')) value.remove_prefix(1);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t'
+                    || value.back() == '\r' || value.back() == '\n')) value.remove_suffix(1);
+            return value;
+        };
+        payload = trim(payload);
+        constexpr std::string_view declaration { "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" };
+        if (payload.substr(0, declaration.size()) == declaration)
+        {
+            payload.remove_prefix(declaration.size());
+            payload = trim(payload);
+        }
+        if (payload.size() < 13 || payload.substr(0, 11) != "<NodeParams") return false;
+        payload.remove_prefix(11);
+        payload = trim(payload);
+        return payload == "/>";
+    };
+    const auto importedFog = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == "visual.depth.fog"; });
+    const auto fogRender = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == visualimportedscenerender::kRenderNodeKind; });
+    if (importedFog != plan.operations.end() && fogRender != plan.operations.end())
+    {
+        const auto reject = [&] {
+            error = "Imported Depth Fog requires the same Render 3D Image and Depth outputs and one optional Video Output";
+            return false;
+        };
+        const auto output = std::find_if(plan.operations.begin(), plan.operations.end(),
+            [](const auto& operation) { return operation.kind == "video.out"; });
+        const auto countKind = [&](const auto& kind) {
+            return std::count_if(plan.operations.begin(), plan.operations.end(),
+                [&](const auto& operation) { return operation.kind == kind; });
+        };
+        if (countKind("visual.depth.fog") != 1 || countKind("video.out") > 1
+            || countKind(visualimportedscenerender::kRenderNodeKind) != 1
+            || countKind(visualimportedscenerender::kSourceNodeKind) != 1
+            || importedFog->backendCapability != "native-gpu" || !importedFog->runtimeGrantJson.empty()
+            || (output != plan.operations.end() && (output->backendCapability != "native-gpu"
+                || !output->runtimeGrantJson.empty() || !exactParameterlessOutputPayload(*output)))
+            || plan.nodeIds.size() != plan.operations.size()
+            || plan.nodeKinds.size() != plan.operations.size()) return reject();
+        std::set<int> identities;
+        for (const auto& operation : plan.operations)
+        {
+            const auto node = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), operation.nodeId);
+            if (operation.nodeId < 0 || node == plan.nodeIds.end() || !identities.insert(operation.nodeId).second
+                || plan.nodeKinds[static_cast<std::size_t>(node - plan.nodeIds.begin())] != operation.kind)
+                return reject();
+        }
+        const auto framePort = [&](int node, int port, const char* direction, bool depth) {
+            return std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& binding) {
+                return binding.nodeId == node && binding.port == port && binding.direction == direction
+                    && binding.carrier == "frame" && binding.channels == 1
+                    && binding.dataType == (depth ? "depth" : "image")
+                    && binding.pixelFormat == (depth ? "r32f" : "rgba8")
+                    && binding.colorSpace == (depth ? "unspecified" : "sRGB");
+            }) == 1;
+        };
+        const auto portCount = [&](int node) {
+            return std::count_if(plan.ports.begin(), plan.ports.end(),
+                [&](const auto& binding) { return binding.nodeId == node; });
+        };
+        if (portCount(importedFog->nodeId) != 3
+            || !framePort(importedFog->nodeId, 0, "in", false)
+            || !framePort(importedFog->nodeId, 1, "in", true)
+            || !framePort(importedFog->nodeId, 2, "out", false)
+            || !framePort(fogRender->nodeId, 1, "out", false)
+            || !framePort(fogRender->nodeId, 4, "out", true)
+            || (output != plan.operations.end() && (portCount(output->nodeId) != 1
+                || !framePort(output->nodeId, 0, "in", false)))) return reject();
+        std::set<int> removed { importedFog->nodeId };
+        std::set<std::array<int, 4>> expected {
+            { fogRender->nodeId, 1, importedFog->nodeId, 0 },
+            { fogRender->nodeId, 4, importedFog->nodeId, 1 } };
+        if (output != plan.operations.end())
+        {
+            removed.insert(output->nodeId);
+            expected.insert({ importedFog->nodeId, 2, output->nodeId, 0 });
+        }
+        std::set<std::array<int, 4>> actual;
+        for (const auto& edge : plan.edges)
+            if (edge.fromNodeId == fogRender->nodeId
+                || removed.count(edge.fromNodeId) || removed.count(edge.toNodeId))
+                if (!actual.insert({ edge.fromNodeId, edge.fromPort, edge.toNodeId, edge.toPort }).second)
+                    return reject();
+        if (actual != expected) return reject();
+
+        // The producer retains the authored fog after the imported render. Peel
+        // only this exact extension, then admit the complete upstream scene.
+        auto base = plan;
+        base.edges.erase(std::remove_if(base.edges.begin(), base.edges.end(), [&](const auto& edge)
+            { return removed.count(edge.fromNodeId) || removed.count(edge.toNodeId); }), base.edges.end());
+        base.ports.erase(std::remove_if(base.ports.begin(), base.ports.end(), [&](const auto& port)
+            { return removed.count(port.nodeId); }), base.ports.end());
+        base.operations.erase(std::remove_if(base.operations.begin(), base.operations.end(), [&](const auto& operation)
+            { return removed.count(operation.nodeId); }), base.operations.end());
+        for (std::size_t i = base.nodeIds.size(); i-- > 0;)
+            if (removed.count(base.nodeIds[i]))
+            { base.nodeIds.erase(base.nodeIds.begin() + i); base.nodeKinds.erase(base.nodeKinds.begin() + i); }
+        if (!compileVisualLayerExecutionOrdered(base, execution, error)) return false;
+        if (!execution.importedSceneRender || execution.passComposite || execution.importedParticleOverlay
+            || execution.importedSceneRender->imageOutput != renderpassoutput::Output::Color) return reject();
+        const auto& payload = importedFog->payloadXml;
+        if (!visualBoundedPayloadFloat(payload, "near", 0, 0, 1, execution.fogNear)
+            || !visualBoundedPayloadFloat(payload, "far", 1, 0, 1, execution.fogFar)
+            || !visualBoundedPayloadFloat(payload, "density", 1, 0, 32, execution.fogDensity)
+            || !visualBoundedPayloadFloat(payload, "red", 1, 0, 1, execution.fogRed)
+            || !visualBoundedPayloadFloat(payload, "green", 1, 0, 1, execution.fogGreen)
+            || !visualBoundedPayloadFloat(payload, "blue", 1, 0, 1, execution.fogBlue)
+            || !visualBoundedPayloadFloat(payload, "alpha", 1, 0, 1, execution.fogAlpha))
+        { error = "Imported Depth Fog parameters are malformed or outside their bounds"; return false; }
+        execution.depthFog = true;
+        execution.depthEffect = 1;
+        return true;
+    }
+    const auto particleOverlay = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == "visual.particles"; });
+    const auto overlayRender = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == visualimportedscenerender::kRenderNodeKind; });
+    if (particleOverlay != plan.operations.end() && overlayRender != plan.operations.end())
+    {
+        const auto reject = [&] {
+            error = "Imported particle rig requires Render 3D Image -> Blend image, Particles -> Blend overlay, and Blend -> Video Output";
+            return false;
+        };
+        const auto blend = std::find_if(plan.operations.begin(), plan.operations.end(),
+            [](const auto& operation) { return operation.kind == "video.blend"; });
+        const auto output = std::find_if(plan.operations.begin(), plan.operations.end(),
+            [](const auto& operation) { return operation.kind == "video.out"; });
+        if (blend == plan.operations.end() || output == plan.operations.end()
+            || particleOverlay->backendCapability != "native-gpu"
+            || blend->backendCapability != "native-gpu"
+            || output->backendCapability != "native-gpu"
+            || !exactParameterlessOutputPayload(*output)) return reject();
+        const std::set<int> removed { particleOverlay->nodeId, blend->nodeId, output->nodeId };
+        if (removed.size() != 3) return reject();
+        const std::set<std::array<int, 4>> expected {
+            { overlayRender->nodeId, 1, blend->nodeId, 0 },
+            { particleOverlay->nodeId, 1, blend->nodeId, 2 },
+            { blend->nodeId, 1, output->nodeId, 0 } };
+        std::set<std::array<int, 4>> actual;
+        auto base = plan;
+        for (const auto& edge : plan.edges)
+            if (removed.count(edge.fromNodeId) || removed.count(edge.toNodeId))
+                if (!actual.insert({ edge.fromNodeId, edge.fromPort, edge.toNodeId, edge.toPort }).second)
+                    return reject();
+        if (actual != expected) return reject();
+        const auto imagePort = [&](int node, int port, const char* direction) {
+            return std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& binding) {
+                return binding.nodeId == node && binding.port == port && binding.direction == direction
+                    && binding.carrier == "frame" && binding.channels == 1 && binding.dataType == "image"
+                    && binding.pixelFormat == "rgba8" && binding.colorSpace == "sRGB";
+            }) == 1;
+        };
+        const auto portCount = [&](int node) {
+            return std::count_if(plan.ports.begin(), plan.ports.end(),
+                [&](const auto& binding) { return binding.nodeId == node; });
+        };
+        const auto particlePorts = portCount(particleOverlay->nodeId);
+        const auto geometryPort = [&](const auto& port) {
+            return port.nodeId == particleOverlay->nodeId && port.port >= 2 && port.port < particlePorts
+                && port.direction == "in" && port.carrier == "control" && port.channels == 1
+                && port.dataType == ((port.port == 4 || port.port == 6) ? "geometry3D" : "points3D")
+                && port.pixelFormat == "unspecified"
+                && port.colorSpace == "unspecified";
+        };
+        if (particlePorts == 4 || particlePorts == 7)
+        {
+            for (int index = 2; index < particlePorts; ++index)
+                if (std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                    { return port.port == index && geometryPort(port); }) != 1) return reject();
+        }
+        if (particlePorts >= 2)
+        {
+            if (std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                { return port.nodeId == particleOverlay->nodeId && port.port == 0
+                    && port.direction == "in" && port.carrier == "event" && port.channels == 1
+                    && port.dataType == "unspecified" && port.pixelFormat == "unspecified"
+                    && port.colorSpace == "unspecified"; }) != 1)
+                return reject();
+        }
+        if (portCount(blend->nodeId) != 4 || portCount(output->nodeId) != 1
+            || (particlePorts != 1 && particlePorts != 2 && particlePorts != 4 && particlePorts != 7)
+            || !imagePort(particleOverlay->nodeId, 1, "out")
+            || !imagePort(blend->nodeId, 0, "in") || !imagePort(blend->nodeId, 1, "out")
+            || !imagePort(blend->nodeId, 2, "in") || !imagePort(blend->nodeId, 3, "in")
+            || !imagePort(output->nodeId, 0, "in")) return reject();
+        base.edges.erase(std::remove_if(base.edges.begin(), base.edges.end(), [&](const auto& edge)
+            { return removed.count(edge.fromNodeId) || removed.count(edge.toNodeId); }), base.edges.end());
+        base.ports.erase(std::remove_if(base.ports.begin(), base.ports.end(), [&](const auto& port)
+            { return removed.count(port.nodeId); }), base.ports.end());
+        base.operations.erase(std::remove_if(base.operations.begin(), base.operations.end(), [&](const auto& op)
+            { return removed.count(op.nodeId); }), base.operations.end());
+        if (base.nodeIds.size() != base.nodeKinds.size()) return reject();
+        for (std::size_t i = base.nodeIds.size(); i-- > 0;)
+            if (removed.count(base.nodeIds[i]))
+            { base.nodeIds.erase(base.nodeIds.begin() + i); base.nodeKinds.erase(base.nodeKinds.begin() + i); }
+        if (!compileVisualLayerExecutionOrdered(base, execution, error)) return false;
+        if (!execution.importedSceneRender || execution.passComposite
+            || execution.importedSceneRender->imageOutput != renderpassoutput::Output::Color) return reject();
+        if (!admitParticleParameters(particleOverlay->payloadXml, execution.particleParameters, error)) return false;
+        if (execution.particleParameters.simulationSpace==1)
+        { error="Solid 3D requires its own Image output; imported-scene overlay is a planar particle path"; return false; }
+        if (execution.particleParameters.motionMode == 0)
+        { error = "Imported particle rig requires a deterministic timeline motion mode"; return false; }
+        execution.particles = execution.importedParticleOverlay = true;
+        execution.particleNodeId = particleOverlay->nodeId;
+        return true;
+    }
+    const auto composite = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == renderpasscomposite::kNodeKind; });
+    const auto rawRender = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [&](const auto& operation) {
+            return operation.kind == visualimportedscenerender::kRenderNodeKind
+                && (std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                    { return port.nodeId == operation.nodeId; }) == 12
+                    || std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                    { return port.nodeId == operation.nodeId; }) == 13
+                    || std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                    { return port.nodeId == operation.nodeId; }) == 9
+                    || std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                    { return port.nodeId == operation.nodeId; }) == 8);
+        });
+    if (rawRender != plan.operations.end() || composite != plan.operations.end())
+    {
+        const auto reject = [&] { error = "Render Pass Composite requires one Render 3D with exact raw typed pass fan-out"; return false; };
+        if (rawRender == plan.operations.end()) return reject();
+        const bool motionPort = std::any_of(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+            { return port.nodeId == rawRender->nodeId && port.port == 12; });
+        const std::size_t rawCount = motionPort ? 8u : 7u;
+        const std::array<const char*, 8> types { "image", "depth", "normal", "emission", "mask", "materialId", "objectId", "motionVectors" };
+        const std::array<const char*, 8> formats { "rgba8", "r32f", "rgba16f", "rgba16f", "r8", "r32uint", "r32uint", "rg16f" };
+        const auto exactPort = [&](int node, int port, const char* direction, std::size_t index)
+        {
+            const auto space = index == 0 ? "sRGB" : index == 3 ? "linearSRGB" : "unspecified";
+            return std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& binding)
+            { return binding.nodeId == node && binding.port == port && binding.direction == direction
+                && binding.carrier == "frame" && binding.channels == (index == 7 ? 2 : 1) && binding.dataType == types[index]
+                && binding.pixelFormat == formats[index] && binding.colorSpace == space; }) == 1;
+        };
+        for (std::size_t i = 0; i < rawCount; ++i)
+            if (!exactPort(rawRender->nodeId, renderpasscomposite::renderPort(renderpasscomposite::kInputs[i]), "out", i)) return reject();
+        // Every output must belong to the admitted pass layout. An unknown
+        // output must not disappear when the raw ports are removed below.
+        if (std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+            { return port.nodeId == rawRender->nodeId && port.direction == "out"; })
+            != static_cast<std::ptrdiff_t>(rawCount)) return reject();
+        auto base = plan;
+        std::set<int> removeNodes;
+        std::optional<renderpasscomposite::Parameters> parameters;
+        std::optional<renderpasscomposite::Program> passProgram;
+        if (composite != plan.operations.end())
+        {
+            std::map<int, renderpasscomposite::Parameters> pending;
+            std::map<int, std::pair<int, int>> branches;
+            std::set<int> terminals;
+            const auto linearPort = [&](int node, int port, const char* direction)
+            {
+                return std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& p)
+                    { return p.nodeId == node && p.port == port && p.direction == direction
+                        && p.carrier == "frame" && p.channels == 1 && p.dataType == "image"
+                        && p.pixelFormat == "rgba32f" && p.colorSpace == "linearSRGB"; }) == 1;
+            };
+            std::size_t expectedRenderEdges = 0;
+            for (const auto& op : plan.operations)
+            {
+                if (op.kind != renderpasscomposite::kNodeKind) continue;
+                renderpasscomposite::Parameters value;
+                const auto portCount = std::count_if(plan.ports.begin(), plan.ports.end(),
+                    [&](const auto& p) { return p.nodeId == op.nodeId; });
+                const std::size_t inputCount = portCount >= 9 ? 8u : 7u;
+                if (op.backendCapability != visualimportedscenerender::kRenderBackendCapability
+                    || !renderpasscomposite::decode(op.payloadXml, value)
+                    || !pending.emplace(op.nodeId, value).second
+                    || (portCount != 8 && portCount != 9 && portCount != 12)
+                    || (inputCount == 8 && !motionPort)
+                    || (value.mode == renderpasscomposite::Mode::MotionView && inputCount != 8)
+                    || !exactPort(op.nodeId, 7, "out", 0)) return reject();
+                const bool branch = renderpasscomposite::branches(value.mode);
+                if (branch && portCount != 12) return reject();
+                if (portCount == 12 && (!linearPort(op.nodeId, 9, "out")
+                    || !linearPort(op.nodeId, 10, "in") || !linearPort(op.nodeId, 11, "in"))) return reject();
+                for (std::size_t i = 0; i < inputCount; ++i)
+                {
+                    if (!exactPort(op.nodeId, renderpasscomposite::inputPort(i), "in", i)) return reject();
+                    const auto matches = std::count_if(plan.edges.begin(), plan.edges.end(), [&](const auto& edge)
+                        { return edge.fromNodeId == rawRender->nodeId
+                            && edge.fromPort == renderpasscomposite::renderPort(renderpasscomposite::kInputs[i])
+                            && edge.toNodeId == op.nodeId && edge.toPort == renderpasscomposite::inputPort(i); });
+                    if (matches != (branch ? 0 : 1)) return reject();
+                }
+                if (std::count_if(plan.edges.begin(), plan.edges.end(), [&](const auto& edge)
+                    { return edge.toNodeId == op.nodeId; }) != static_cast<int>(branch ? 2u : inputCount)) return reject();
+                if (branch)
+                {
+                    std::pair<int, int> sources {-1, -1};
+                    for (const auto& edge : plan.edges)
+                        if (edge.toNodeId == op.nodeId)
+                        {
+                            if (edge.fromPort != 9 || (edge.toPort != 10 && edge.toPort != 11)) return reject();
+                            auto& source = edge.toPort == 10 ? sources.first : sources.second;
+                            if (source != -1) return reject();
+                            source = edge.fromNodeId;
+                        }
+                    branches.emplace(op.nodeId, sources);
+                }
+                else expectedRenderEdges += inputCount;
+                terminals.insert(op.nodeId);
+            }
+            if (pending.size() > renderpasscomposite::kMaximumPasses
+                || std::count_if(plan.edges.begin(), plan.edges.end(), [&](const auto& edge)
+                    { return edge.fromNodeId == rawRender->nodeId; }) != static_cast<int>(expectedRenderEdges)) return reject();
+            const auto passNodes = pending;
+            int sinkSource = -1;
+            for (const auto& edge : plan.edges)
+                if (passNodes.count(edge.fromNodeId))
+                {
+                    if (passNodes.count(edge.toNodeId))
+                    {
+                        if (!branches.count(edge.toNodeId) || edge.fromPort != 9
+                            || !linearPort(edge.fromNodeId, 9, "out")) return reject();
+                        terminals.erase(edge.fromNodeId);
+                        continue;
+                    }
+                    const auto sink = std::find_if(plan.operations.begin(), plan.operations.end(),
+                        [&](const auto& op) { return op.nodeId == edge.toNodeId && op.kind == "video.out"; });
+                    if (sink == plan.operations.end() || !removeNodes.empty()
+                        || edge.fromPort != 7 || edge.toPort != 0
+                        || sink->backendCapability != "native-gpu" || !sink->payloadXml.empty()
+                        || !exactPort(sink->nodeId, 0, "in", 0)
+                        || std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& p)
+                            { return p.nodeId == sink->nodeId; }) != 1
+                        || std::count_if(plan.edges.begin(), plan.edges.end(), [&](const auto& e)
+                            { return e.toNodeId == sink->nodeId; }) != 1
+                        || std::any_of(plan.edges.begin(), plan.edges.end(), [&](const auto& e)
+                            { return e.fromNodeId == sink->nodeId; })
+                        || !removeNodes.insert(sink->nodeId).second)
+                    { error = "Video export accepts the final SDR Image only; raw AOV files and HDR output encoding are unavailable"; return false; }
+                    sinkSource = edge.fromNodeId;
+                }
+            if (terminals.size() != 1 || (sinkSource != -1 && sinkSource != *terminals.begin())) return reject();
+            std::set<int> reachable {*terminals.begin()};
+            for (std::size_t i = 0; i < pending.size(); ++i)
+                for (const auto& branch : branches)
+                    if (reachable.count(branch.first))
+                    { reachable.insert(branch.second.first); reachable.insert(branch.second.second); }
+            if (reachable.size() != pending.size()) return reject();
+            renderpasscomposite::Program program;
+            std::map<int, int> indexes;
+            while (!pending.empty())
+            {
+                bool progress = false;
+                for (auto item = pending.begin(); item != pending.end();)
+                {
+                    const auto branch = branches.find(item->first);
+                    if (branch != branches.end() && (!indexes.count(branch->second.first)
+                        || !indexes.count(branch->second.second))) { ++item; continue; }
+                    auto& step = program.steps[program.count];
+                    step.parameters = item->second;
+                    if (branch != branches.end())
+                    { step.inputA = indexes.at(branch->second.first); step.inputB = indexes.at(branch->second.second); }
+                    indexes[item->first] = static_cast<int>(program.count++);
+                    removeNodes.insert(item->first);
+                    item = pending.erase(item); progress = true;
+                }
+                if (!progress) return reject();
+            }
+            program.output = static_cast<std::size_t>(indexes.at(*terminals.begin()));
+            if (!renderpasscomposite::valid(program)) return reject();
+            parameters = program.steps[program.output].parameters;
+            passProgram = program;
+        }
+        base.edges.erase(std::remove_if(base.edges.begin(), base.edges.end(), [&](const auto& edge)
+            { return removeNodes.count(edge.fromNodeId) || removeNodes.count(edge.toNodeId); }), base.edges.end());
+        const bool retainedScene = std::any_of(plan.operations.begin(), plan.operations.end(),
+            [](const auto& operation) { return operation.kind == "visual.3d.scene.retained"; });
+        base.ports.erase(std::remove_if(base.ports.begin(), base.ports.end(), [&](const auto& port)
+            { return removeNodes.count(port.nodeId)
+                || (port.nodeId == rawRender->nodeId && port.direction == "out"
+                    && port.port >= (retainedScene ? 2 : 7)); }), base.ports.end());
+        base.operations.erase(std::remove_if(base.operations.begin(), base.operations.end(), [&](const auto& op)
+            { return removeNodes.count(op.nodeId); }), base.operations.end());
+        if (base.nodeIds.size() != base.nodeKinds.size()) return reject();
+        for (std::size_t i = base.nodeIds.size(); i-- > 0;)
+            if (removeNodes.count(base.nodeIds[i]))
+            { base.nodeIds.erase(base.nodeIds.begin() + i); base.nodeKinds.erase(base.nodeKinds.begin() + i); }
+        if (!compileVisualLayerExecutionOrdered(base, execution, error)) return false;
+        if (!execution.importedSceneRender || (parameters
+            && execution.importedSceneRender->imageOutput != renderpassoutput::Output::Color)) return reject();
+        if (passProgram && renderpasscomposite::usesMotion(*passProgram)
+            && (execution.importedSceneRender->deformation || execution.noteInstanceMapping))
+        { error = "Motion pass does not yet retain previous skin, morph or note-instance deformation"; return false; }
+        execution.passComposite = parameters;
+        execution.passProgram = passProgram;
+        return true;
+    }
     execution = {};
+    const auto geometryCore = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == "geometry.core.runtime"; });
+    if (geometryCore != plan.operations.end())
+    {
+        const auto bytes = videowire::geometry::decodeLoweredPlanText(geometryCore->payloadXml,error);
+        const auto lowered = bytes ? videowire::geometry::decodeLoweredRuntimePlan(*bytes,error) : std::nullopt;
+        if (!lowered) return false;
+        std::vector<materialframe::Endpoint> frameEndpoints;
+        if (!lowered->surfaceMaterial.empty()) {
+            const auto surface = geometrysurfacematerial::decodeSet(lowered->surfaceMaterial, error);
+            if (!surface || surface->front().material.structuralRevision != plan.structuralRevision) {
+                if (error.empty()) error = "Geometry Surface revision does not match its compiled plan";
+                return false;
+            }
+            frameEndpoints = geometrysurfacematerial::graphFrameEndpoints(*surface);
+        }
+        if (!frameEndpoints.empty())
+        {
+            if (geometryCore->backendCapability != "native-gpu")
+            { error = "Material Frame dependencies require the native Geometry renderer"; return false; }
+            auto shaders = std::make_shared<ShaderOperationPlan>(); shaders->revision = plan.structuralRevision;
+            execution.geometryFrameSchedule = materialframe::admit(plan,geometryCore->nodeId,frameEndpoints,
+                [&](materialframe::Operation& operation,std::string& diagnostic) {
+                    CompiledVisualLayerPlan atom; atom.clipId = plan.clipId; atom.structuralRevision = plan.structuralRevision;
+                    const auto addPort = [&](int node,int port,const char* direction) {
+                        atom.ports.push_back({node,port,1,direction,"frame","image","rgba8","sRGB"});
+                    };
+                    for (std::size_t i = 0; i < operation.inputs.size(); ++i) {
+                        const auto input = operation.inputs[i];
+                        atom.operations.push_back({input.node,"video.source","source-decode",{}});
+                        addPort(input.node,0,"out"); addPort(operation.output.node,static_cast<int>(i),"in");
+                        atom.edges.push_back({input.node,0,operation.output.node,static_cast<int>(i)});
+                    }
+                    atom.operations.push_back(operation.source);
+                    atom.operations.push_back({geometryCore->nodeId,"video.out","native-gpu",{}});
+                    addPort(operation.output.node,operation.output.port,"out"); addPort(geometryCore->nodeId,0,"in");
+                    atom.edges.push_back({operation.output.node,operation.output.port,geometryCore->nodeId,0});
+                    for (const auto& op : atom.operations) { atom.nodeIds.push_back(op.nodeId); atom.nodeKinds.push_back(op.kind); }
+                    VisualLayerExecution atomExecution;
+                    if (!compileVisualLayerExecution(atom,atomExecution,diagnostic) || !atomExecution.shaderOperationPlan
+                        || atomExecution.shaderOperationPlan->operations.size() != 1) return false;
+                    operation.shader = atomExecution.shaderOperationPlan;
+                    if (std::any_of(operation.shader->operations.front().payload.passResources.passes.begin(),
+                        operation.shader->operations.front().payload.passResources.passes.end(),
+                        [](const auto& pass) { return pass.persistent; })) {
+                        diagnostic = "Surface Frame shaders require stateless passes; use explicit temporal Frame nodes for replayable history";
+                        return false;
+                    }
+                    shaders->operations.push_back(operation.shader->operations.front());
+                    shaders->passTargetCount += operation.shader->passTargetCount;
+                    if (shaders->operations.size() > ShaderOperationPlan::maximumOperations
+                        || shaders->passTargetCount > ShaderOperationPlan::maximumPassTargets) {
+                        diagnostic = "Material Frame shader dependencies exceed the shared operation/pass budget"; return false;
+                    }
+                    return true;
+                },error);
+            if (!execution.geometryFrameSchedule) return false;
+            execution.geometryFramePlan = std::make_shared<const CompiledVisualLayerPlan>(plan);
+            shaders->digest = shaderOperationPlanDigest(*shaders,shaders->revision);
+            if (!shaders->operations.empty()) execution.geometryFrameShaders = std::move(shaders);
+        }
+        else if (plan.operations.size() != 1 || plan.nodeKinds.size() != 1 || plan.nodeIds.size() != 1
+            || plan.nodeKinds[0] != geometryCore->kind || plan.nodeIds[0] != geometryCore->nodeId
+            || geometryCore->backendCapability != "native-gpu" || !plan.edges.empty()
+            || plan.ports.size() != 1 || plan.ports[0].nodeId != geometryCore->nodeId
+            || plan.ports[0].port != 1 || plan.ports[0].direction != "out"
+            || plan.ports[0].channels != 1 || plan.ports[0].carrier != "frame"
+            || plan.ports[0].dataType != "image" || plan.ports[0].pixelFormat != "rgba8"
+            || plan.ports[0].colorSpace != "sRGB")
+        {
+            error = "Geometry Core requires its exact immutable Image render operation";
+            return false;
+        }
+        if ((lowered->contract.carrier != videowire::geometry::CarrierKind::geometry3D
+             && lowered->contract.carrier != videowire::geometry::CarrierKind::instances3D)
+            || !videowire::geometry::decodeRuntimeValue(lowered->runtimeValue,lowered->contract,{}, {},error))
+        {
+            if (error.empty()) error = "Geometry Core image output requires Geometry3D or Instances3D";
+            return false;
+        }
+        execution.structuralRevision = plan.structuralRevision;
+        execution.transform = execution.effects = execution.mask = false;
+        return true;
+    }
+    const auto harmonicGeometry = std::find_if(plan.operations.begin(), plan.operations.end(),
+        [](const auto& operation) { return operation.kind == visualharmonicgeometry::kOperationKind; });
+    if (harmonicGeometry != plan.operations.end())
+    {
+        visualharmonicgeometry::Mapping mapping;
+        if (plan.operations.size() != 1 || plan.nodeKinds.size() != 1 || plan.nodeIds.size() != 1
+            || plan.nodeKinds[0] != harmonicGeometry->kind || plan.nodeIds[0] != harmonicGeometry->nodeId
+            || harmonicGeometry->backendCapability != "native-gpu" || !plan.edges.empty()
+            || plan.ports.size() != 1 || plan.ports[0].nodeId != harmonicGeometry->nodeId
+            || plan.ports[0].port != 1 || plan.ports[0].direction != "out"
+            || plan.ports[0].channels != 1 || plan.ports[0].carrier != "frame"
+            || plan.ports[0].dataType != "image" || plan.ports[0].pixelFormat != "rgba8"
+            || plan.ports[0].colorSpace != "sRGB"
+            || !visualharmonicgeometry::decode(harmonicGeometry->payloadXml, mapping))
+        {
+            error = "Harmonic Link Geometry requires its exact immutable Image render operation";
+            return false;
+        }
+        execution.structuralRevision = plan.structuralRevision;
+        execution.transform = execution.effects = execution.mask = false;
+        return true;
+    }
     const auto importedSource = std::find_if(plan.operations.begin(), plan.operations.end(),
         [](const auto& operation) { return operation.kind == visualanimationoperation::kSourceNodeKind; });
     const auto importedDeformation = std::find_if(plan.operations.begin(), plan.operations.end(),
@@ -1388,6 +2201,75 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             {
                 error = "composed Scene3D execution requires one canonical exact V7 render request";
                 return false;
+            }
+            const auto retainedScene = std::find_if (plan.operations.begin(), plan.operations.end(),
+                [] (const auto& operation) { return operation.kind == "visual.3d.scene.retained"; });
+            if (retainedScene != plan.operations.end())
+            {
+                const auto frameEndpoint = request.material
+                    && surfacematerialbinding::hasGraphFrameInput(request.material->binding)
+                    ? request.material->binding.textures.front().graphFrame : geometrysurfacematerial::objectFrameEndpoint(request.surfacePrograms);
+                const std::size_t frameCount = frameEndpoint ? 1u : 0u;
+                const auto frameSource = std::find_if(plan.operations.begin(), plan.operations.end(),
+                    [&](const auto& operation) { return frameEndpoint && operation.nodeId == frameEndpoint->node; });
+                const bool exactFrame = !frameEndpoint || (plan.operations.size() == 3 && frameEndpoint->port == 0
+                    && frameSource == plan.operations.begin() + 1 && frameSource->kind == "video.source"
+                    && frameSource->backendCapability == "source-decode" && frameSource->payloadXml.empty()
+                    && plan.nodeIds.size() == 3 && plan.nodeKinds.size() == 3
+                    && plan.nodeIds[1] == frameSource->nodeId && plan.nodeKinds[1] == frameSource->kind
+                    && std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port) {
+                        return ((port.nodeId == frameSource->nodeId && port.port == 0 && port.direction == "out")
+                            || (port.nodeId == importedSceneRender->nodeId && port.port == 12 && port.direction == "in"))
+                            && port.carrier == "frame" && port.channels == 1 && port.dataType == "image"
+                            && port.pixelFormat == "rgba8" && port.colorSpace == "sRGB";
+                    }) == 2 && plan.edges.size() == 2
+                    && plan.edges[1].fromNodeId == frameSource->nodeId && plan.edges[1].fromPort == 0
+                    && plan.edges[1].toNodeId == importedSceneRender->nodeId && plan.edges[1].toPort == 12);
+                const auto framePort = std::find_if (plan.ports.begin(), plan.ports.end(),
+                    [&] (const auto& port) {
+                        return port.nodeId == importedSceneRender->nodeId && port.port == 1
+                            && port.direction == "out" && port.carrier == "frame" && port.channels == 1
+                            && port.dataType == "image" && port.pixelFormat == "rgba8" && port.colorSpace == "sRGB";
+                    });
+                const bool exact = exactFrame && plan.operations.size() == 2 + frameCount && plan.nodeIds.size() == 2 + frameCount
+                    && plan.nodeKinds.size() == 2 + frameCount && plan.ports.size() == 3 + 2 * frameCount && plan.edges.size() == 1 + frameCount
+                    && retainedScene == plan.operations.begin()
+                    && importedSceneRender == plan.operations.begin() + 1 + frameCount
+                    && retainedScene->nodeId >= 0 && retainedScene->nodeId != importedSceneRender->nodeId
+                    && static_cast<std::uint64_t> (retainedScene->nodeId) + 1u == request.sourceStableId
+                    && retainedScene->backendCapability == "control-eval" && retainedScene->payloadXml.empty()
+                    && plan.nodeIds[0] == retainedScene->nodeId && plan.nodeKinds[0] == retainedScene->kind
+                    && plan.nodeIds[1 + frameCount] == importedSceneRender->nodeId
+                    && plan.nodeKinds[1 + frameCount] == importedSceneRender->kind
+                    && exactControlPort (retainedScene->nodeId, 0, "out", "scene3D")
+                    && exactControlPort (importedSceneRender->nodeId, 0, "in", "scene3D")
+                    && std::all_of (plan.ports.begin(), plan.ports.end(), [] (const auto& port) {
+                        return port.carrier != "control"
+                            || (port.pixelFormat == "unspecified" && port.colorSpace == "unspecified");
+                    })
+                    && framePort != plan.ports.end()
+                    && plan.edges[0].fromNodeId == retainedScene->nodeId && plan.edges[0].fromPort == 0
+                    && plan.edges[0].toNodeId == importedSceneRender->nodeId && plan.edges[0].toPort == 0
+                    && (!request.material || (request.sceneSnapshot->objectCount == 1
+                        && request.material->binding.object == request.sceneSnapshot->objects[0].id))
+                    && !request.diffractionMaterial;
+                if (!exact)
+                {
+                    error = "retained Scene3D execution requires its exact immutable snapshot schedule";
+                    return false;
+                }
+                execution.structuralRevision = plan.structuralRevision;
+                execution.transform = execution.effects = execution.mask = false;
+                execution.importedSceneRender = std::move (request);
+                if (frameEndpoint)
+                {
+                    const auto node = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), frameEndpoint->node);
+                    execution.materialFrameSource = CompiledVisualScheduledOperation {
+                        static_cast<std::size_t>(std::distance(plan.nodeIds.begin(), node)),
+                        static_cast<std::size_t>(std::distance(plan.operations.begin(), frameSource)),
+                        frameEndpoint->node, {} };
+                }
+                return true;
             }
             const auto sceneProducer = std::find_if(
                 plan.operations.begin(), plan.operations.end(), [&](const auto& operation)
@@ -1584,16 +2466,28 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             const bool hasSurfaceMaterial = canonicalRequest && request.material.has_value();
             const bool hasDiffractionMaterial = canonicalRequest
                 && request.diffractionMaterial.has_value();
+            const auto materialFrameEndpoint = hasDiffractionMaterial
+                ? request.diffractionMaterial->graphFrame
+                : hasSurfaceMaterial && surfacematerialbinding::hasGraphFrameInput(request.material->binding)
+                    ? request.material->binding.textures.front().graphFrame : std::nullopt;
+            const bool hasMaterialFrame = materialFrameEndpoint.has_value();
+            const int materialFramePort = hasDiffractionMaterial ? 1 : 12;
             const bool hasMaterial = hasSurfaceMaterial || hasDiffractionMaterial;
             const bool hasDeformation = canonicalRequest
                 && request.deformation.has_value();
             const bool hasCamera = canonicalRequest && request.camera.has_value();
+            const bool hasLight = canonicalRequest && request.light.has_value();
             const auto noteSource = std::find_if(plan.operations.begin(), plan.operations.end(),
                 [](const auto& operation) { return operation.kind == "visual.score.note-collection"; });
             const auto noteInstancer = std::find_if(plan.operations.begin(), plan.operations.end(),
                 [](const auto& operation) { return operation.kind == "visual.3d.note-instanced-mesh"; });
             const bool hasNoteInstances = canonicalRequest
                 && (noteSource != plan.operations.end() || noteInstancer != plan.operations.end());
+            if (hasNoteInstances && (noteSource == plan.operations.end() || noteInstancer == plan.operations.end()))
+            {
+                error = "Imported note instancing requires its exact score source and mesh instancer";
+                return false;
+            }
             visualnoteinstancing::Mapping noteInstanceMapping;
             const bool exactNoteInstanceMapping = !hasNoteInstances
                 || (noteInstancer != plan.operations.end()
@@ -1602,9 +2496,22 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             const auto cameraOperation = std::find_if(
                 plan.operations.begin(), plan.operations.end(), [](const auto& operation)
                 { return operation.kind == "visual.3d.camera.perspective"; });
-            const auto cameraTransformOperation = std::find_if(
+            const auto lightOperation = std::find_if(
                 plan.operations.begin(), plan.operations.end(), [](const auto& operation)
-                { return operation.kind == "visual.3d.transform"; });
+                { return operation.kind == "visual.3d.light.directional"; });
+            const auto transformFor = [&](const auto& consumer)
+            {
+                if (consumer == plan.operations.end()) return plan.operations.end();
+                const auto edge = std::find_if(plan.edges.begin(), plan.edges.end(), [&](const auto& value)
+                    { return value.toNodeId == consumer->nodeId && value.toPort == 0 && value.fromPort == 0; });
+                return std::find_if(plan.operations.begin(), plan.operations.end(), [&](const auto& operation)
+                    { return edge != plan.edges.end() && operation.nodeId == edge->fromNodeId
+                        && operation.kind == "visual.3d.transform"; });
+            };
+            const auto cameraTransformOperation = transformFor(cameraOperation);
+            const auto lightTransformOperation = transformFor(lightOperation);
+            const int transformCount = (hasCamera ? 1 : 0) + (hasLight ? 1 : 0)
+                - (hasCamera && hasLight && cameraTransformOperation == lightTransformOperation ? 1 : 0);
             if (hasDeformation
                 != (importedDeformation != plan.operations.end()))
             {
@@ -1644,13 +2551,68 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 importedSceneRender->nodeId, 3, "in", "mesh");
             const bool exactCameraInput = exactControlPort(
                 importedSceneRender->nodeId, 5, "in", "camera");
+            const bool exactLightInput = exactControlPort(
+                importedSceneRender->nodeId, 6, "in", "light");
+            const auto exactRawOutput = [&](renderpassoutput::Output output)
+            {
+                const auto requirements = renderpassoutput::requirements(output);
+                const auto format = [&]() -> const char*
+                {
+                    switch (requirements.format)
+                    {
+                        case renderpassoutput::PixelFormat::R8Unorm: return "r8";
+                        case renderpassoutput::PixelFormat::RG16Float: return "rg16f";
+                        case renderpassoutput::PixelFormat::RGBA16Float: return "rgba16f";
+                        case renderpassoutput::PixelFormat::R32Float: return "r32f";
+                        case renderpassoutput::PixelFormat::R32Uint: return "r32uint";
+                        case renderpassoutput::PixelFormat::Invalid: break;
+                    }
+                    return "";
+                }();
+                const auto dataType = [&]() -> const char*
+                {
+                    switch (output)
+                    {
+                        case renderpassoutput::Output::Normal: return "normal";
+                        case renderpassoutput::Output::Motion: return "motionVectors";
+                        case renderpassoutput::Output::Emission: return "emission";
+                        case renderpassoutput::Output::Mask: return "mask";
+                        case renderpassoutput::Output::MaterialId: return "materialId";
+                        case renderpassoutput::Output::ObjectId: return "objectId";
+                        default: return "";
+                    }
+                }();
+                const auto colorSpace = requirements.colorSpace
+                        == renderpassoutput::ColorSpace::LinearSRGB
+                    ? "linearSRGB" : "unspecified";
+                const auto port = renderpasscomposite::renderPort(output);
+                const auto channels = output == renderpassoutput::Output::Motion ? 2 : 1;
+                return port >= 0 && std::count_if(
+                    plan.ports.begin(), plan.ports.end(), [&](const auto& binding)
+                    {
+                        return binding.nodeId == importedSceneRender->nodeId
+                            && binding.port == port && binding.direction == "out"
+                            && binding.carrier == "frame" && binding.channels == channels
+                            && binding.dataType == dataType
+                            && binding.pixelFormat == format
+                            && binding.colorSpace == colorSpace;
+                    }) == 1;
+            };
             const auto renderPortCount = std::count_if(
                 plan.ports.begin(), plan.ports.end(), [&](const auto& binding)
                 { return binding.nodeId == importedSceneRender->nodeId; });
+            bool exactRawOutputs = true;
+            const auto rawOutputCount = renderPortCount == 12
+                ? renderpasscomposite::kInputs.size() - 1
+                : renderpasscomposite::kInputs.size();
+            for (std::size_t index = 2; index < rawOutputCount; ++index)
+                exactRawOutputs = exactRawOutputs
+                    && exactRawOutput(renderpasscomposite::kInputs[index]);
             exactPorts = exactPorts
                 && (! hasMaterial || exactMaterialInput)
                 && (! hasDeformation || exactDeformationInput)
                 && (! hasCamera || exactCameraInput)
+                && (! hasLight || exactLightInput)
                 && (renderPortCount == 2
                     || (renderPortCount == 3 && exactMaterialInput)
                     || (renderPortCount == 4
@@ -1660,7 +2622,15 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                         && exactDepthOutput)
                     || (renderPortCount == 6 && exactMaterialInput
                         && exactDeformationInput && exactDepthOutput
-                        && exactCameraInput));
+                        && exactCameraInput)
+                    || (renderPortCount == 7 && exactMaterialInput
+                        && exactDeformationInput && exactDepthOutput
+                        && exactCameraInput && exactLightInput)
+                    || ((renderPortCount == 12 || renderPortCount == 13)
+                        && exactMaterialInput
+                        && exactDeformationInput && exactDepthOutput
+                        && exactCameraInput && exactLightInput
+                        && exactRawOutputs));
             if (hasCamera)
                 exactPorts = exactPorts
                     && cameraOperation != plan.operations.end()
@@ -1668,6 +2638,13 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     && exactControlPort(cameraTransformOperation->nodeId, 0, "out", "transform3D")
                     && exactControlPort(cameraOperation->nodeId, 0, "in", "transform3D")
                     && exactControlPort(cameraOperation->nodeId, 1, "out", "camera");
+            if (hasLight)
+                exactPorts = exactPorts && lightOperation != plan.operations.end()
+                    && lightTransformOperation != plan.operations.end()
+                    && exactControlPort(lightTransformOperation->nodeId, 0, "out", "transform3D")
+                    && exactControlPort(lightOperation->nodeId, 0, "in", "transform3D")
+                    && exactControlPort(lightOperation->nodeId, 1, "out", "light")
+                    && request.light->kind == HarmonicMIDI::grid::SceneLightKind::Directional;
             if (hasDeformation)
             {
                 const std::array<const char*, 4> deformationTypes {
@@ -1689,30 +2666,103 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     && exactControlPort(noteInstancer->nodeId, 2, "out", "mesh")
                     && exactDeformationInput;
 
+            const auto diffractionOperation = [](const auto& operation)
+            {
+                return operation.kind == "visual.material.diffraction-grating"
+                    || operation.kind == "visual.material.diffractive-foil";
+            };
             const auto materialTerminal = std::find_if(
-                plan.operations.begin(), plan.operations.end(), [](const auto& operation)
+                plan.operations.begin(), plan.operations.end(), [&](const auto& operation)
                 {
                     return operation.kind == "visual.surface.material"
-                        || operation.kind == "visual.material.diffraction-grating";
+                        || diffractionOperation(operation);
                 });
             const int materialOutputPort = hasDiffractionMaterial ? 0 : 10;
             const bool exactMaterialOutput = materialTerminal != plan.operations.end()
                 && exactControlPort(materialTerminal->nodeId, materialOutputPort,
                                     "out", "material");
             exactPorts = exactPorts && (! hasMaterial || exactMaterialOutput);
+            const auto frameEndpoint = hasMaterialFrame
+                ? *materialFrameEndpoint
+                : surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint {};
+            const auto frameSource = std::find_if(plan.operations.begin(), plan.operations.end(),
+                [&](const auto& operation) { return operation.nodeId == frameEndpoint.node; });
+            // First bounded Frame prerequisite: the clip's existing decoder
+            // output. Generated/filter/multi-source dependencies need their
+            // own admitted execution path and must not be mistaken for this.
+            const bool exactFrameSource = !hasMaterialFrame
+                || (materialTerminal != plan.operations.end()
+                    && frameSource != plan.operations.end()
+                    && frameEndpoint.port == 0 && frameSource->kind == "video.source"
+                    && frameSource->backendCapability == "source-decode"
+                    && frameSource->payloadXml.empty() && frameSource->runtimeGrantJson.empty()
+                    && std::count_if(plan.operations.begin(), plan.operations.end(),
+                        [&](const auto& operation) { return operation.nodeId == frameEndpoint.node; }) == 1
+                    && std::count_if(plan.ports.begin(), plan.ports.end(),
+                        [&](const auto& port) { return port.nodeId == frameEndpoint.node; }) == 1
+                    && std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                        { return port.nodeId == frameEndpoint.node && port.port == 0
+                            && port.direction == "out" && port.carrier == "frame" && port.channels == 1
+                            && port.dataType == "image" && port.pixelFormat == "rgba8"
+                            && port.colorSpace == "sRGB"; }) == 1
+                    && std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                        { return port.nodeId == materialTerminal->nodeId && port.port == materialFramePort
+                            && port.direction == "in" && port.carrier == "frame" && port.channels == 1
+                            && port.dataType == "image" && port.pixelFormat == "rgba8"
+                            && port.colorSpace == "sRGB"; }) == 1
+                    && std::none_of(plan.edges.begin(), plan.edges.end(),
+                        [&](const auto& edge) { return edge.toNodeId == frameEndpoint.node; }));
             const auto surfaceOperation = [](const auto& operation)
                 { return operation.kind.rfind("visual.surface.", 0) == 0; };
+            materialfield::Topology materialFieldTopology;
+            if (request.materialField)
+            {
+                const auto field = materialfield::admit(*request.materialField, error);
+                if (!field || materialTerminal == plan.operations.end()
+                    || request.materialField->materialNode != materialTerminal->nodeId)
+                { error = "Material Field does not own this material terminal"; return false; }
+                materialFieldTopology = materialfield::topology(*request.materialField, field->descriptor());
+                for (const auto& [id, kind] : materialFieldTopology.nodes)
+                {
+                    const auto operation = std::find_if(plan.operations.begin(), plan.operations.end(),
+                        [&](const auto& item) { return item.nodeId == id; });
+                    const auto output = materialFieldTopology.outputPorts.at(id);
+                    const bool score = materialFieldTopology.scoreSources.count(id) != 0;
+                    if (operation == plan.operations.end() || operation->kind != kind
+                        || operation->backendCapability != "control-eval" || !operation->runtimeGrantJson.empty()
+                        || std::count_if(plan.ports.begin(), plan.ports.end(),
+                            [&](const auto& port) { return port.nodeId == id; }) != output + 1
+                        || !exactControlPort(id, output, "out", score ? "noteCollection" : "field"))
+                    { error = "Material Field node differs from its canonical operation"; return false; }
+                    for (int port = 0; port < output; ++port)
+                        if (!exactControlPort(id, port, "in",
+                                kind == "visual.geometry.field-score-sample.vertex" && port == 1 ? "noteCollection" : "field"))
+                        { error = "Material Field input has an incompatible carrier"; return false; }
+                }
+                if (!exactControlPort(materialTerminal->nodeId, materialfield::kInputPort, "in", "field")
+                    || (hasNoteInstances && !materialFieldTopology.scoreSources.empty()))
+                { error = "Material Field requires its exact Field port and independent score source"; return false; }
+            }
             const bool exactKinds = std::all_of(
                 plan.operations.begin(), plan.operations.end(), [&](const auto& operation)
                 {
                     return (&operation == &*importedSource)
+                        || materialFieldTopology.nodes.count(operation.nodeId) != 0
                         || (&operation == &*importedSceneRender)
+                        || (hasMaterialFrame && frameSource != plan.operations.end()
+                            && &operation == &*frameSource)
                         || (hasDeformation && &operation == &*importedDeformation
                             && operation.backendCapability
                                 == visualanimationoperation::kDeformationBackendCapability)
                         || (hasCamera
+                            && cameraOperation != plan.operations.end()
+                            && cameraTransformOperation != plan.operations.end()
                             && (&operation == &*cameraOperation
                                 || &operation == &*cameraTransformOperation)
+                            && operation.backendCapability == "control-eval")
+                        || (hasLight && lightOperation != plan.operations.end()
+                            && lightTransformOperation != plan.operations.end()
+                            && (&operation == &*lightOperation || &operation == &*lightTransformOperation)
                             && operation.backendCapability == "control-eval")
                         || (hasDiffractionMaterial
                             && materialTerminal != plan.operations.end()
@@ -1720,15 +2770,41 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                             && operation.backendCapability == "control-eval")
                         || (surfaceOperation(operation)
                             && operation.backendCapability == "control-eval")
+                        || (hasSurfaceMaterial && request.material->vertexModifier
+                            && operation.kind.rfind("visual.vertex.", 0) == 0
+                            && operation.backendCapability == "control-eval")
                         || (hasNoteInstances
                             && (&operation == &*noteSource || &operation == &*noteInstancer)
-                            && operation.backendCapability == "control-eval");
+                            && operation.backendCapability == "control-eval")
+                        || operation.kind == "video.out";
                 });
+            const auto outputOperation = std::find_if(plan.operations.begin(), plan.operations.end(),
+                [](const auto& operation) { return operation.kind == "video.out"; });
+            const bool hasOutput = outputOperation != plan.operations.end();
+            const bool exactOutput = !hasOutput || (outputOperation->backendCapability == "native-gpu"
+                && exactParameterlessOutputPayload(*outputOperation) && outputOperation->runtimeGrantJson.empty()
+                && std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                    { return port.nodeId == outputOperation->nodeId; }) == 1
+                && std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                    { return port.nodeId == outputOperation->nodeId && port.port == 0
+                        && port.direction == "in" && port.carrier == "frame" && port.channels == 1
+                        && port.dataType == "image" && port.pixelFormat == "rgba8"
+                        && port.colorSpace == "sRGB"; }) == 1);
+            // Native plans are scheduled independently of serialized document
+            // order. Require the same exact node/operation identity set here;
+            // exactEdges below remains the topology authority.
             bool exactSchedule = plan.nodeIds.size() == plan.operations.size()
                 && plan.nodeKinds.size() == plan.operations.size();
-            for (std::size_t index = 0; exactSchedule && index < plan.operations.size(); ++index)
-                exactSchedule = plan.nodeIds[index] == plan.operations[index].nodeId
-                    && plan.nodeKinds[index] == plan.operations[index].kind;
+            std::set<int> scheduledIdentities;
+            for (const auto& operation : plan.operations)
+            {
+                const auto node = std::find(plan.nodeIds.begin(), plan.nodeIds.end(),
+                                            operation.nodeId);
+                exactSchedule = exactSchedule && node != plan.nodeIds.end()
+                    && scheduledIdentities.insert(operation.nodeId).second
+                    && plan.nodeKinds[(size_t) std::distance(plan.nodeIds.begin(), node)]
+                        == operation.kind;
+            }
 
             const auto sceneEdge = std::find_if(plan.edges.begin(), plan.edges.end(),
                 [&](const auto& edge)
@@ -1759,6 +2835,9 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             const EdgeIdentity deformationEdgeIdentity {
                 hasDeformation ? importedDeformation->nodeId : 0, 4,
                 importedSceneRender->nodeId, 3 };
+            const EdgeIdentity outputEdgeIdentity {
+                importedSceneRender->nodeId, 1,
+                hasOutput ? outputOperation->nodeId : 0, 0 };
             const int cameraNodeId = hasCamera && cameraOperation != plan.operations.end()
                 ? cameraOperation->nodeId : 0;
             const int cameraTransformNodeId
@@ -1804,8 +2883,15 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     plan.ports.begin(), plan.ports.end(), [&](const auto& binding)
                     { return binding.nodeId == materialTerminalNode; });
                 validMaterialGraph = validMaterialGraph
-                    && terminalPortCount == static_cast<int> (
-                        surfacematerial::kSurfaceOutputCount + 1u)
+                    && (terminalPortCount == 11 || ((terminalPortCount == 12 || terminalPortCount == 13)
+                        && exactSurfacePort(plan, materialTerminalNode, 11, "in",
+                                            surfacematerial::ValueType::Vec3)))
+                    && (terminalPortCount != 13 || std::count_if(plan.ports.begin(), plan.ports.end(),
+                        [&](const auto& port)
+                        { return port.nodeId == materialTerminalNode && port.port == 12
+                            && port.direction == "in" && port.carrier == "frame" && port.channels == 1
+                            && port.dataType == "image" && port.pixelFormat == "rgba8"
+                            && port.colorSpace == "sRGB"; }) == 1)
                     && contracts.size() == request.material->program.operations.size();
                 for (const auto output : surfacematerial::kSurfaceOutputs)
                 {
@@ -1900,6 +2986,49 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     && std::count_if(plan.operations.begin(), plan.operations.end(),
                         [](const auto& operation)
                         { return operation.kind == "visual.surface.material"; }) == 1;
+                if (request.material->vertexModifier)
+                {
+                    const auto& vertex = *request.material->vertexModifier;
+                    const auto nodeIdFor = [](videowire::VertexModifierStableId id)
+                    {
+                        return id > 0 && id <= static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1u
+                            ? static_cast<int>(id - 1u) : -1;
+                    };
+                    bool exactVertex = (terminalPortCount == 12 || terminalPortCount == 13)
+                        && std::count_if(plan.operations.begin(), plan.operations.end(), [](const auto& operation)
+                            { return operation.kind.rfind("visual.vertex.", 0) == 0; })
+                            == static_cast<int>(vertex.records.size());
+                    const auto vertexType = [](videowire::VertexModifierValueType type)
+                    {
+                        return type == videowire::VertexModifierValueType::scalar
+                            ? surfacematerial::ValueType::Scalar : surfacematerial::ValueType::Vec3;
+                    };
+                    for (const auto& record : vertex.records)
+                    {
+                        const auto id = nodeIdFor(record.stableId);
+                        const auto schema = videowire::vertexModifierOperationSchema(record.operation);
+                        const auto node = std::find_if(plan.operations.begin(), plan.operations.end(),
+                            [&](const auto& operation) { return operation.nodeId == id; });
+                        exactVertex = exactVertex && id >= 0 && node != plan.operations.end()
+                            && node->kind == videowire::vertexModifierGraphKindToken(record.operation)
+                            && node->backendCapability == "control-eval"
+                            && std::count_if(plan.ports.begin(), plan.ports.end(),
+                                [&](const auto& port) { return port.nodeId == id; }) == schema.inputCount + 1
+                            && exactSurfacePort(plan, id, schema.inputCount, "out", vertexType(schema.resultType));
+                        for (std::uint8_t input = 0; input < schema.inputCount; ++input)
+                        {
+                            const auto producer = std::find_if(vertex.records.begin(), vertex.records.end(),
+                                [&](const auto& item) { return item.stableId == record.inputs[input]; });
+                            exactVertex = exactVertex
+                                && exactSurfacePort(plan, id, input, "in", vertexType(schema.inputTypes[input]))
+                                && producer != vertex.records.end();
+                            if (producer != vertex.records.end())
+                                exactMaterialEdges.insert({ nodeIdFor(producer->stableId), producer->inputCount, id, input });
+                        }
+                    }
+                    exactMaterialEdges.insert({ nodeIdFor(vertex.rootId), 2, materialTerminalNode, 11 });
+                    exactMaterialTopology = exactMaterialTopology && exactVertex;
+                }
             }
             else if (hasDiffractionMaterial && materialTerminal != plan.operations.end())
             {
@@ -1907,20 +3036,27 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     plan.ports.begin(), plan.ports.end(), [&](const auto& binding)
                     { return binding.nodeId == materialTerminalNode; });
                 const auto expectedOperationCount = static_cast<std::size_t>(
-                    (hasDeformation ? 3 : 2) + (hasCamera ? 2 : 0) + 1);
-                exactMaterialTopology = materialTerminal->kind
-                        == "visual.material.diffraction-grating"
-                    && terminalPortCount == 1
+                    (hasDeformation ? 3 : 2) + (hasCamera ? 1 : 0) + (hasLight ? 1 : 0) + transformCount
+                    + (hasNoteInstances ? 2 : 0) + 1 + (hasMaterialFrame ? 1 : 0)
+                    + (hasOutput ? 1 : 0)) + materialFieldTopology.nodes.size();
+                exactMaterialTopology = diffractionOperation(*materialTerminal)
+                    && (!request.diffractionMaterial->spatialFoil
+                        || materialTerminal->kind == "visual.material.diffractive-foil")
+                    && (!request.materialField || terminalPortCount == 3)
+                    && (terminalPortCount != 3 || exactControlPort(materialTerminalNode, materialfield::kInputPort, "in", "field"))
+                    && (hasMaterialFrame ? (terminalPortCount == 2 || terminalPortCount == 3)
+                        : (terminalPortCount == 1 || ((terminalPortCount == 2 || terminalPortCount == 3)
+                            && std::count_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+                                { return port.nodeId == materialTerminalNode && port.port == 1
+                                    && port.direction == "in" && port.carrier == "frame" && port.channels == 1
+                                    && port.dataType == "image" && port.pixelFormat == "rgba8"
+                                    && port.colorSpace == "sRGB"; }) == 1)))
                     && plan.operations.size() == expectedOperationCount
-                    && std::count_if(plan.operations.begin(), plan.operations.end(),
-                        [](const auto& operation)
-                        {
-                            return operation.kind
-                                == "visual.material.diffraction-grating";
-                        }) == 1;
+                    && std::count_if(plan.operations.begin(), plan.operations.end(), diffractionOperation) == 1;
             }
 
             std::set<EdgeIdentity> expectedEdges { sceneEdgeIdentity };
+            expectedEdges.insert(materialFieldTopology.edges.begin(), materialFieldTopology.edges.end());
             if (hasNoteInstances)
             {
                 expectedEdges.insert ({ importedSource->nodeId, 0, noteInstancer->nodeId, 0 });
@@ -1940,24 +3076,37 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 expectedEdges.insert (materialEdgeIdentity);
                 expectedEdges.insert (exactMaterialEdges.begin(), exactMaterialEdges.end());
             }
+            if (hasMaterialFrame)
+                expectedEdges.insert({ frameEndpoint.node, frameEndpoint.port, materialTerminalNode, materialFramePort });
             if (hasCamera && cameraOperation != plan.operations.end()
                 && cameraTransformOperation != plan.operations.end())
             {
                 expectedEdges.insert(cameraTransformEdgeIdentity);
                 expectedEdges.insert(cameraEdgeIdentity);
             }
+            if (hasLight && lightOperation != plan.operations.end()
+                && lightTransformOperation != plan.operations.end())
+            {
+                expectedEdges.insert({ lightTransformOperation->nodeId, 0, lightOperation->nodeId, 0 });
+                expectedEdges.insert({ lightOperation->nodeId, 1, importedSceneRender->nodeId, 6 });
+            }
+            if (hasOutput) expectedEdges.insert(outputEdgeIdentity);
+            std::set<EdgeIdentity> actualEdges;
             const bool exactEdges = sceneEdge != plan.edges.end()
                 && (hasMaterial ? materialEdge != plan.edges.end() : materialEdge == plan.edges.end())
                 && plan.edges.size() == expectedEdges.size()
                 && std::all_of (plan.edges.begin(), plan.edges.end(), [&](const auto& edge)
-                    { return expectedEdges.count (edgeIdentity (edge)) == 1; });
+                    { return actualEdges.insert(edgeIdentity(edge)).second; })
+                && actualEdges == expectedEdges;
             if (! hasMaterial)
                 exactMaterialTopology = plan.operations.size()
                         == static_cast<std::size_t>((hasDeformation ? 3 : 2)
-                            + (hasCamera ? 2 : 0) + (hasNoteInstances ? 2 : 0))
+                            + (hasCamera ? 1 : 0) + (hasLight ? 1 : 0) + transformCount
+                            + (hasNoteInstances ? 2 : 0) + (hasOutput ? 1 : 0))
                     && plan.edges.size()
                         == static_cast<std::size_t>((hasDeformation ? 6 : 1)
-                            + (hasCamera ? 2 : 0) + (hasNoteInstances ? 3 : 0))
+                            + (hasCamera ? 2 : 0) + (hasLight ? 2 : 0) + (hasNoteInstances ? 3 : 0)
+                            + (hasOutput ? 1 : 0))
                     && materialTerminal == plan.operations.end();
             visualanimationimport::Request deformationRequest;
             std::string deformationError;
@@ -1990,31 +3139,32 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 || std::count_if(plan.operations.begin(), plan.operations.end(),
                     [](const auto& operation)
                     { return operation.kind == "visual.3d.transform"; })
-                    != (hasCamera ? 1 : 0)
+                    != transformCount
+                || std::count_if(plan.operations.begin(), plan.operations.end(),
+                    [](const auto& operation)
+                    { return operation.kind == "visual.3d.light.directional"; }) != (hasLight ? 1 : 0)
                 || std::count_if(plan.operations.begin(), plan.operations.end(),
                     [](const auto& operation)
                     { return operation.kind == "visual.surface.material"; })
                     != (hasSurfaceMaterial ? 1 : 0)
-                || std::count_if(plan.operations.begin(), plan.operations.end(),
-                    [](const auto& operation)
-                    {
-                        return operation.kind
-                            == "visual.material.diffraction-grating";
-                    }) != (hasDiffractionMaterial ? 1 : 0)
+                || std::count_if(plan.operations.begin(), plan.operations.end(), diffractionOperation)
+                    != (hasDiffractionMaterial ? 1 : 0)
                 || std::count_if(plan.operations.begin(), plan.operations.end(),
                     [](const auto& operation)
                     { return operation.kind == "visual.score.note-collection"; })
-                    != (hasNoteInstances ? 1 : 0)
+                    != (hasNoteInstances ? 1 : 0) + static_cast<int>(materialFieldTopology.scoreSources.size())
                 || std::count_if(plan.operations.begin(), plan.operations.end(),
                     [](const auto& operation)
                     { return operation.kind == "visual.3d.note-instanced-mesh"; })
                     != (hasNoteInstances ? 1 : 0)
+                || std::count_if(plan.operations.begin(), plan.operations.end(),
+                    [](const auto& operation) { return operation.kind == "video.out"; }) > 1
                 || importedSource->backendCapability
                     != visualimportedscenerender::kSourceBackendCapability
                 || importedSceneRender->backendCapability
                     != visualimportedscenerender::kRenderBackendCapability
-                || ! exactPorts || ! exactKinds || ! exactSchedule || ! exactEdges
-                || ! exactMaterialTopology || ! exactDeformation
+                || ! exactPorts || ! exactKinds || ! exactOutput || ! exactSchedule || ! exactEdges
+                || ! exactMaterialTopology || ! exactDeformation || !exactFrameSource
                 || ! exactNoteInstanceMapping || ! canonicalRequest
                 || request.sourceStableId
                     != static_cast<std::uint64_t>(importedSource->nodeId) + 1u
@@ -2023,9 +3173,20 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 || (hasCamera
                     && (cameraOperation == plan.operations.end()
                         || request.camera->id.value
-                            != static_cast<std::uint32_t>(cameraOperation->nodeId) + 1u)))
+                            != static_cast<std::uint32_t>(cameraOperation->nodeId) + 1u))
+                || (hasLight && (lightOperation == plan.operations.end()
+                    || request.light->id.value != static_cast<std::uint32_t>(lightOperation->nodeId) + 1u)))
             {
-                error = "imported scene render requires one exact source-to-Render 3D typed schedule";
+                error = "imported scene render requires one exact source-to-Render 3D typed schedule"
+                    " [ports=" + std::to_string(exactPorts)
+                    + " kinds=" + std::to_string(exactKinds)
+                    + " schedule=" + std::to_string(exactSchedule)
+                    + " edges=" + std::to_string(exactEdges)
+                    + " material=" + std::to_string(exactMaterialTopology)
+                    + " deformation=" + std::to_string(exactDeformation)
+                    + " frame=" + std::to_string(exactFrameSource)
+                    + " notes=" + std::to_string(exactNoteInstanceMapping)
+                    + " request=" + std::to_string(canonicalRequest) + "]";
                 return false;
             }
             if (hasDiffractionMaterial)
@@ -2042,6 +3203,14 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             execution.structuralRevision = plan.structuralRevision;
             execution.transform = execution.effects = execution.mask = false;
             execution.importedSceneRender = std::move(request);
+            if (hasMaterialFrame)
+            {
+                const auto node = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), frameEndpoint.node);
+                execution.materialFrameSource = CompiledVisualScheduledOperation {
+                    static_cast<std::size_t>(std::distance(plan.nodeIds.begin(), node)),
+                    static_cast<std::size_t>(std::distance(plan.operations.begin(), frameSource)),
+                    frameEndpoint.node, {} };
+            }
             if (hasNoteInstances)
                 execution.noteInstanceMapping = noteInstanceMapping;
             return true;
@@ -2262,12 +3431,18 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             error = "Render Passes requires one exact native AOV operation and canonical payload";
             return false;
         }
+        if (isMotion)
+        {
+            // The extent-only wire operation carries no paired-frame producer.
+            // NativeExecutor admission and an owned worker are required before
+            // a computed Motion publication can enter the renderer.
+            error = "Render Passes Motion has no two-frame optical-flow source";
+            return false;
+        }
         execution.structuralRevision = plan.structuralRevision;
         execution.transform = execution.effects = execution.mask = false;
         if (isColor)
             execution.colorAovPass = coloraov::description (colorPayload);
-        else if (isMotion)
-            execution.motionAovPass = opticalflowoperation::description (motionPayload);
         else
             execution.sceneAovPass = std::move(scenePayload);
         return true;
@@ -2837,6 +4012,26 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             shaderPlan->revision = plan.structuralRevision;
             shaderPlan->digest = shaderOperationPlanDigest(*shaderPlan, shaderPlan->revision);
             execution.shaderOperationPlan = std::move(shaderPlan);
+            if (sourceResources.size() == 2)
+            {
+                const auto layerSource = std::find_if(plan.operations.begin(), plan.operations.end(),
+                    [](const auto& op) { return op.kind == "video.layer.source"; });
+                if (layerSource != plan.operations.end())
+                {
+                    const auto marker = layerSource->payloadXml.find("clipId=\"");
+                    if (marker == std::string::npos)
+                    { error = "shader transition Layer Source requires an exact saved clip identity"; return false; }
+                    const auto begin = marker + 8;
+                    const auto end = layerSource->payloadXml.find('"', begin);
+                    const auto token = end == std::string::npos ? std::string {} : layerSource->payloadXml.substr(begin,end-begin);
+                    if (token.empty() || !std::all_of(token.begin(),token.end(),[](unsigned char c){ return c>='0'&&c<='9'; }))
+                    { error = "shader transition Layer Source requires an exact saved clip identity"; return false; }
+                    try { execution.shaderTransitionFromClipId = std::stoi(token); }
+                    catch (...) { execution.shaderTransitionFromClipId = 0; }
+                    if (execution.shaderTransitionFromClipId <= 0)
+                    { error = "shader transition Layer Source requires an exact saved clip identity"; return false; }
+                }
+            }
             return true;
         }
 
@@ -2854,16 +4049,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             execution.transform = execution.effects = execution.mask = false;
             execution.particles = true;
             execution.particleNodeId = ids[0];
-            execution.particleSeed = std::clamp((int) visualPayloadFloat(payload, "seed", 1.0f), 0, 65535);
-            execution.particleCount = std::clamp((int) visualPayloadFloat(payload, "count", 512.0f), 1,
-                                                 kMaxVisualParticles);
-            execution.particleLifetime = std::clamp(visualPayloadFloat(payload, "lifetime", 1.8f), 0.1f, 10.0f);
-            execution.particleSize = std::clamp(visualPayloadFloat(payload, "size", 4.0f), 1.0f, 32.0f);
-            execution.particleSpeed = std::clamp(visualPayloadFloat(payload, "speed", 1.0f), 0.0f, 4.0f);
-            execution.particleRed = std::clamp(visualPayloadFloat(payload, "red", 0.2f), 0.0f, 1.0f);
-            execution.particleGreen = std::clamp(visualPayloadFloat(payload, "green", 0.7f), 0.0f, 1.0f);
-            execution.particleBlue = std::clamp(visualPayloadFloat(payload, "blue", 1.0f), 0.0f, 1.0f);
-            execution.particleAlpha = std::clamp(visualPayloadFloat(payload, "alpha", 1.0f), 0.0f, 1.0f);
+            if (!admitParticleParameters(payload, execution.particleParameters, error)) return false;
             return true;
         }
 
@@ -3629,16 +4815,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 const auto& payload = plan.operations[(size_t) current].payloadXml;
                 execution.particles = true;
                 execution.particleNodeId = ids[(size_t) current];
-                execution.particleSeed = std::clamp((int) visualPayloadFloat(payload, "seed", 1.0f), 0, 65535);
-                execution.particleCount = std::clamp((int) visualPayloadFloat(payload, "count", 512.0f), 1,
-                                                     kMaxVisualParticles);
-                execution.particleLifetime = std::clamp(visualPayloadFloat(payload, "lifetime", 1.8f), 0.1f, 10.0f);
-                execution.particleSize = std::clamp(visualPayloadFloat(payload, "size", 4.0f), 1.0f, 32.0f);
-                execution.particleSpeed = std::clamp(visualPayloadFloat(payload, "speed", 1.0f), 0.0f, 4.0f);
-                execution.particleRed = std::clamp(visualPayloadFloat(payload, "red", 0.2f), 0.0f, 1.0f);
-                execution.particleGreen = std::clamp(visualPayloadFloat(payload, "green", 0.7f), 0.0f, 1.0f);
-                execution.particleBlue = std::clamp(visualPayloadFloat(payload, "blue", 1.0f), 0.0f, 1.0f);
-                execution.particleAlpha = std::clamp(visualPayloadFloat(payload, "alpha", 1.0f), 0.0f, 1.0f);
+                if (!admitParticleParameters(payload, execution.particleParameters, error)) return false;
             }
             if (! recordInput(ids[(size_t) current], 0))
             {
@@ -4339,7 +5516,7 @@ inline bool VisualPlanExecutionState::admitPlans (
         if (diagnostic != nullptr) *diagnostic = reason;
         return false;
     }
-    std::array<Slot, kMaxAdmittedPlans> next {};
+    auto next = std::make_unique<SlotTable>();
     struct LoweringSample { uint64_t durationNs = 0; bool installed = false; };
     std::vector<LoweringSample> loweringSamples;
     loweringSamples.reserve(normalizedPlanIndices.size());
@@ -4348,12 +5525,12 @@ inline bool VisualPlanExecutionState::admitPlans (
     for (const auto planIndex : normalizedPlanIndices)
     {
         const auto& plan = plans[planIndex];
-        auto duplicate = std::find_if(next.begin(), next.begin() + (ptrdiff_t) count,
+        auto duplicate = std::find_if(next->begin(), next->begin() + (ptrdiff_t) count,
             [&](const Slot& slot) { return slot.clipId == plan.clipId; });
-        if (duplicate != next.begin() + (ptrdiff_t) count
+        if (duplicate != next->begin() + (ptrdiff_t) count
             && duplicate->structuralRevision >= plan.structuralRevision)
             continue;
-        if (duplicate == next.begin() + (ptrdiff_t) count)
+        if (duplicate == next->begin() + (ptrdiff_t) count)
         {
             if (count == kMaxAdmittedPlans)
             {
@@ -4363,7 +5540,7 @@ inline bool VisualPlanExecutionState::admitPlans (
                     *diagnostic = "visual execution admission exceeds fixed plan capacity";
                 continue;
             }
-            duplicate = next.begin() + (ptrdiff_t) count++;
+            duplicate = next->begin() + (ptrdiff_t) count++;
         }
         Slot slot;
         slot.clipId = plan.clipId;
@@ -4389,14 +5566,6 @@ inline bool VisualPlanExecutionState::admitPlans (
         {
             slot.lowered = false;
             loweringError = "Color AOV extent does not match the admitted canvas";
-        }
-        if (slot.lowered && slot.execution.motionAovPass.has_value()
-            && slot.execution.motionAovPass->extent != renderpassoutput::Extent {
-                static_cast<std::uint32_t> (canvasWidth),
-                static_cast<std::uint32_t> (canvasHeight) })
-        {
-            slot.lowered = false;
-            loweringError = "Motion AOV extent does not match the admitted canvas";
         }
         if (slot.lowered && slot.execution.aovInspectionPass.has_value()
             && slot.execution.aovInspectionPass->extent != renderpassoutput::Extent {
@@ -4436,7 +5605,7 @@ inline bool VisualPlanExecutionState::admitPlans (
     if (totalAllocatedFrameBytes != 0)
         telemetry().recordResources(totalPeakLiveFrames, totalAllocatedFrameSlots,
                                     totalAllocatedFrameBytes);
-    std::sort(next.begin(), next.begin() + (ptrdiff_t) count,
+    std::sort(next->begin(), next->begin() + (ptrdiff_t) count,
         [](const Slot& a, const Slot& b) { return a.clipId < b.clipId; });
     {
         const auto authority = temporalAuthority_;
@@ -4446,8 +5615,8 @@ inline bool VisualPlanExecutionState::admitPlans (
         for (size_t index = 0; index < count; ++index)
         {
             TemporalRecord record;
-            record.clipId = next[index].clipId;
-            record.structuralRevision = next[index].structuralRevision;
+            record.clipId = (*next)[index].clipId;
+            record.structuralRevision = (*next)[index].structuralRevision;
             record.owner = Owner { record.structuralRevision };
             const auto previous = findTemporalRecord(*authority, record.clipId);
             if (previous != authority->records.end())
@@ -4459,7 +5628,7 @@ inline bool VisualPlanExecutionState::admitPlans (
             }
             records.push_back(std::move(record));
         }
-        slots_ = next;
+        *slots_ = *next;
         slotCount_ = count;
         authority->records = std::move(records);
         ++authority->generation;
@@ -4605,14 +5774,19 @@ inline bool validateVisualInspectionTarget (
     return true;
 }
 
+inline ImmutableShaderOperationPlan scheduledShaderPlan(const VisualLayerExecution* execution)
+{
+    return execution == nullptr ? ImmutableShaderOperationPlan{}
+        : execution->geometryFrameShaders ? execution->geometryFrameShaders : execution->shaderOperationPlan;
+}
+
 inline void seedFlatShaderRuntimeParameters(
     const VisualLayerExecution* execution,
     std::map<std::string, double>& parameters)
 {
-    if (execution == nullptr || !execution->flatShaderBridge
-        || execution->shaderOperationPlan == nullptr)
-        return;
-    for (const auto& operation : execution->shaderOperationPlan->operations)
+    const auto shaders = scheduledShaderPlan(execution);
+    if (!shaders) return;
+    for (const auto& operation : shaders->operations)
     {
         const auto alias = shadercatalog::runtimeNodeAlias(operation.nodeId);
         if (alias.empty()) continue;
@@ -4653,16 +5827,75 @@ inline std::uint64_t geometryCoreDeviceGeneration()
     return runtimeDeviceGeneration(source.geometryCoreCapabilities());
 }
 
+inline bool isHarmonicLinkGeometryPlan(const std::vector<CompiledVisualLayerPlan>& plans, int clipId)
+{
+    const auto* plan = findVisualLayerPlan(plans, clipId);
+    return plan != nullptr && std::any_of(plan->operations.begin(), plan->operations.end(),
+        [](const auto& operation) { return operation.kind == visualharmonicgeometry::kOperationKind; });
+}
+
+inline bool isGeometryCoreRenderPlan(const std::vector<CompiledVisualLayerPlan>& plans, int clipId)
+{
+    const auto* plan = findVisualLayerPlan(plans, clipId);
+    return plan != nullptr && std::any_of(plan->operations.begin(), plan->operations.end(),
+        [](const auto& operation) { return operation.kind == "geometry.core.runtime"
+            || operation.kind == visualharmonicgeometry::kOperationKind; });
+}
+
+inline bool isTypedParticlePlan(const std::vector<CompiledVisualLayerPlan>& plans, int clipId)
+{
+    const auto* plan = findVisualLayerPlan(plans, clipId);
+    return plan != nullptr && std::any_of(plan->operations.begin(), plan->operations.end(),
+        [](const auto& operation) { return operation.kind == "visual.particles"; });
+}
+
+inline bool isImportedParticleOverlayPlan(const std::vector<CompiledVisualLayerPlan>& plans, int clipId)
+{
+    const auto* plan = findVisualLayerPlan(plans, clipId);
+    return isTypedParticlePlan(plans, clipId) && plan != nullptr
+        && std::any_of(plan->operations.begin(), plan->operations.end(), [](const auto& operation)
+            { return operation.kind == visualimportedscenerender::kRenderNodeKind; });
+}
+
+template <typename Layer, typename = void>
+struct HasGeometrySpectrumInput : std::false_type {};
+template <typename Layer, typename = void>
+struct HasGeometryScoreInput : std::false_type {};
+template <typename Renderer, typename = void>
+struct HasLinearSceneCapture : std::false_type {};
+template <typename Renderer>
+struct HasLinearSceneCapture<Renderer, std::void_t<decltype(std::declval<Renderer>().hdrImageCaptureEnabled())>> : std::true_type {};
+template <typename Layer>
+struct HasGeometryScoreInput<Layer, std::void_t<decltype(std::declval<Layer>().canonicalBlockCFrame)>> : std::true_type {};
+template <typename Layer>
+struct HasGeometrySpectrumInput<Layer, std::void_t<
+    decltype(std::declval<Layer>().audioPresent),
+    decltype(std::declval<Layer>().audioFeatures.bands),
+    decltype(std::declval<Layer>().spectrumFeaturesAt)>> : std::true_type {};
+
+template <typename Layer, typename = void>
+struct HasGeometrySpectrumHistoryInput : std::false_type {};
+template <typename Layer>
+struct HasGeometrySpectrumHistoryInput<Layer, std::void_t<
+    decltype(std::declval<Layer>().spectrumHistoryFeaturesAt)>> : std::true_type {};
+template <typename Layer, typename = void>
+struct HasGeometrySpectrumSourceInput : std::false_type {};
+template <typename Layer>
+struct HasGeometrySpectrumSourceInput<Layer, std::void_t<
+    decltype(std::declval<Layer>().spectrumSourceFeaturesAt)>> : std::true_type {};
+
 template <typename LayerDesc>
 inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                                         videohelper::geometry::PlanUse use,
                                         const VisualPlanEvaluationContext* evaluationContext,
                                         int width, int height, LayerDesc& layer,
-                                        std::string& error)
+                                        std::string& error, double evaluationTimeSec = 0.0,
+                                        bool linearColor = false)
 {
     const CompiledVisualOperation* geometryOperation = nullptr;
     for(const auto& operation:plan.operations)
-        if(operation.kind=="geometry.core.runtime")
+        if(operation.kind=="geometry.core.runtime"
+            || operation.kind == visualharmonicgeometry::kOperationKind)
         {
             if(geometryOperation != nullptr)
             {
@@ -4689,25 +5922,30 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
         error="Geometry Core requires the compositor output extent";
         return false;
     }
-    static videohelper::geometry::NativeGeometryCoreCapabilitySource source(arbitgpu::nativeFixtureSceneBackend());
-    static videohelper::geometry::GeometryCorePlanRuntime runtime(source);
-    struct RetainedExecutionCache final
+    VisualLayerExecution checkedExecution;
+    if (!compileVisualLayerExecutionOrdered(plan, checkedExecution, error)) return false;
+    layer.shaderSource = false;
+    layer.particleSource = false;
+    layer.scoreSource = false;
+    layer.isAdjustment = false;
+    if (geometryOperation->kind == visualharmonicgeometry::kOperationKind)
     {
-        struct Entry final
+        visualharmonicgeometry::Mapping mapping;
+        if (!visualharmonicgeometry::decode(geometryOperation->payloadXml, mapping))
         {
-            std::uint64_t lastUse = 0;
-            std::shared_ptr<const videohelper::geometry::AdmittedPlanValue> admittedPlan;
-            std::shared_ptr<const videohelper::geometry::NativeGeometryExecution> execution;
-            bool reserved = false;
-        };
-        std::mutex mutex;
-        std::map<videohelper::geometry::PlanOwnerIdentity, Entry> owners;
-        std::uint64_t clock = 0;
-        std::uint64_t projectGeneration = 0;
-        std::uint64_t helperGeneration = 0;
-        std::uint64_t deviceGeneration = 0;
-    };
-    static RetainedExecutionCache retained;
+            error = "Harmonic Link Geometry mapping is malformed or out of bounds";
+            return false;
+        }
+        const videohelper::geometry::PlanOwnerIdentity owner {
+            evaluationContext->projectGeneration, evaluationContext->helperGeneration,
+            evaluationContext->deviceGeneration, static_cast<std::uint64_t>(plan.clipId),
+            plan.structuralRevision, use };
+        return videohelper::harmonicgeometry::render(mapping, owner, width, height, layer, error, linearColor);
+    }
+    auto& cache = videohelper::geometry::geometryExecutionCache();
+    auto& runtime = cache.runtime;
+    auto& retained = cache.retained;
+    using RetainedExecutionCache = videohelper::geometry::GeometryExecutionCache::Retained;
     if(!runtime.reconcileGeneration(evaluationContext->projectGeneration,
                                     evaluationContext->helperGeneration,
                                     evaluationContext->deviceGeneration,error))
@@ -4757,13 +5995,84 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                 ? runtime.admitPreview(owner,*bytes,videowire::geometry::ResourceLimits{},context,error)
                 : runtime.admitExport(owner,*bytes,videowire::geometry::ResourceLimits{},context,error);
             if(!admitted) return false;
+            std::optional<geometrysurfacematerial::ProgramSet> geometrySurface;
+            if (!admitted->surfaceMaterial.empty()) {
+                geometrySurface = geometrysurfacematerial::decodeSet(admitted->surfaceMaterial, error);
+                if (!geometrySurface) return false;
+            }
+            const auto frameEndpoints = geometrySurface
+                ? geometrysurfacematerial::graphFrameEndpoints(*geometrySurface) : std::vector<materialframe::Endpoint>{};
+            const bool hasFrame = !frameEndpoints.empty();
+            const bool dynamicSpectrum=!admitted->plan->value().descriptor().spectrumFields.empty();
+            const bool dynamicScore=!admitted->plan->value().descriptor().scoreFields.empty()
+                || videowire::geometry::hasRuntimeScoreFields(admitted->plan->value().descriptor())
+                || (geometrySurface && geometrysurfacematerial::usesScore(*geometrySurface));
+            const bool dynamicImported=std::any_of(admitted->plan->value().descriptor().operations.begin(),
+                admitted->plan->value().descriptor().operations.end(),[](const auto& operation) {
+                    return operation.retainedMesh && !operation.retainedMesh->importedAnimation.empty();
+                });
+            const bool dynamicGeometry=dynamicSpectrum || dynamicScore || dynamicImported || hasFrame
+                || videowire::geometry::hasRuntimeFields(admitted->plan->value().descriptor())
+                || (geometrySurface && geometrysurfacematerial::timeDependent(*geometrySurface));
+            arbitgpu::NativeFixtureSceneRuntimeInputs scoreInputs;
+            scoreInputs.linearColor = linearColor;
+            for (const auto endpoint : frameEndpoints)
+            {
+                visualdeformation::RationalFrameTime frame;
+                if (!evaluationContext->materialFrameClock
+                    || !evaluationContext->materialFrameClock(evaluationTimeSec,frame,error))
+                { if (error.empty()) error = "Geometry Surface Frame requires the project timeline clock"; return false; }
+                const videohelper::importedscene::MaterialFrameEvaluation expected {
+                    endpoint,frame,plan.clipId,
+                    plan.structuralRevision,plan.structuralRevision,
+                    evaluationContext->projectGeneration,evaluationContext->helperGeneration,
+                    use == videohelper::geometry::PlanUse::preview
+                        ? videohelper::importedscene::NativeImportedSceneRenderUse::Preview
+                        : videohelper::importedscene::NativeImportedSceneRenderUse::Export };
+                const auto receipt = evaluationContext->geometryMaterialFrames.find(endpoint);
+                if (receipt == evaluationContext->geometryMaterialFrames.end() || !(receipt->second.evaluation == expected)
+                    || !arbitgpu::validMaterialFrameTexture(receipt->second.nativeFrame))
+                { error = "Geometry Surface Frame requires the exact scheduled evaluation receipt"; return false; }
+                scoreInputs.materialFrameTextures.emplace(endpoint,receipt->second.nativeFrame);
+            }
+            if constexpr (HasGeometryScoreInput<LayerDesc>::value)
+                scoreInputs.canonicalBlockCFrame=layer.canonicalBlockCFrame;
+            if (dynamicScore && !canonicalblockc::valid(scoreInputs.canonicalBlockCFrame))
+            {
+                error="Score Field requires the canonical score frame for this preview or export time";
+                return false;
+            }
+            videohelper::geometry::SpectrumEvaluation spectrumEvaluation;
+            spectrumEvaluation.timeSeconds=evaluationTimeSec;
+            spectrumEvaluation.loopGeneration=evaluationContext->loopGeneration;
+            spectrumEvaluation.seekGeneration=evaluationContext->seekGeneration;
+            if constexpr (HasGeometrySpectrumInput<LayerDesc>::value)
+            {
+                const auto& bands=layer.audioFeatures.bands;
+                spectrumEvaluation.liveFrameAvailable=layer.audioPresent;
+                if (layer.audioPresent)
+                    std::copy_n(bands.begin(),std::min(bands.size(),spectrumEvaluation.bands.size()),
+                                spectrumEvaluation.bands.begin());
+                spectrumEvaluation.featuresAt=layer.spectrumFeaturesAt;
+                if constexpr (HasGeometrySpectrumHistoryInput<LayerDesc>::value)
+                    spectrumEvaluation.historyFeaturesAt=layer.spectrumHistoryFeaturesAt;
+                if constexpr (HasGeometrySpectrumSourceInput<LayerDesc>::value)
+                    spectrumEvaluation.sourceFeaturesAt=layer.spectrumSourceFeaturesAt;
+            }
+            else if (dynamicSpectrum)
+            {
+                error="Audio Spectrum Field requires the shared audio feature frame";
+                return false;
+            }
             {
                 std::lock_guard<std::mutex> lock(retained.mutex);
                 const auto existing=retained.owners.find(owner);
-                if(existing!=retained.owners.end() && !existing->second.reserved
+                if(!dynamicGeometry && existing!=retained.owners.end() && !existing->second.reserved
                     && existing->second.admittedPlan == admitted->plan
                     && existing->second.execution->frame->width()==static_cast<std::uint32_t>(width)
-                    && existing->second.execution->frame->height()==static_cast<std::uint32_t>(height))
+                    && existing->second.execution->frame->height()==static_cast<std::uint32_t>(height)
+                    && arbitgpu::isLinearSceneColor(existing->second.execution->frame->colorTextureDescriptor())
+                        == scoreInputs.linearColor)
                 {
                     existing->second.lastUse=++retained.clock;
                     const auto& frame=existing->second.execution->frame;
@@ -4788,11 +6097,13 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                 }
                 if(existing!=retained.owners.end())
                 {
-                    if(existing->second.reserved || existing->second.execution.use_count()!=1)
+                    if(existing->second.reserved || (!dynamicGeometry && existing->second.execution.use_count()!=1))
                     {
                         error="Geometry Core cannot replace a live compositor lease at a new extent";
                         return false;
                     }
+                    if (dynamicSpectrum && existing->second.admittedPlan==admitted->plan)
+                        spectrumEvaluation.followers=existing->second.spectrumFollowers;
                     retained.owners.erase(existing);
                 }
                 if(retained.owners.size()>=32)
@@ -4814,11 +6125,19 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                 // Reserve admission before native decode/allocation/draw. A full
                 // live cache therefore rejects without touching backend memory.
                 retained.owners.emplace(owner,typename RetainedExecutionCache::Entry{
-                    ++retained.clock,admitted->plan,{},true});
+                    ++retained.clock,admitted->plan,{},true,{}});
             }
             auto execution = videohelper::geometry::executeNativeGeometry(
                 arbitgpu::nativeFixtureSceneBackend(), *admitted,
-                static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), error);
+                static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), error,
+                false, std::move(scoreInputs), dynamicSpectrum ? &spectrumEvaluation : nullptr,
+                [&](auto& sourceGeometry, std::string& diagnostic) {
+                    if (!evaluationContext->importedGeometry) {
+                        diagnostic="Animated Geometry3D requires the preview or export asset owner"; return false;
+                    }
+                    return evaluationContext->importedGeometry(sourceGeometry,evaluationTimeSec,
+                        plan.structuralRevision,use==videohelper::geometry::PlanUse::exportRender,diagnostic);
+                },evaluationTimeSec);
             if(!execution)
             {
                 std::lock_guard<std::mutex> lock(retained.mutex);
@@ -4837,6 +6156,7 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                     return false;
                 }
                 inserted->second.execution=retainedExecution;
+                inserted->second.spectrumFollowers=std::move(spectrumEvaluation.followers);
                 inserted->second.reserved=false;
                 inserted->second.lastUse=++retained.clock;
                 const auto& frame=inserted->second.execution->frame;
@@ -4881,14 +6201,14 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
                                     std::optional<renderpassoutput::Description>* colorAovPass = nullptr,
                                     std::optional<TemporalFeedbackPass>* temporalFeedbackPass = nullptr,
                                     bool* temporalFeedbackRequired = nullptr,
-                                    std::optional<renderpassoutput::Description>* motionAovPass = nullptr,
                                     std::optional<sceneaov::Payload>* sceneAovPass = nullptr,
                                     std::optional<aovinspection::Payload>* aovInspectionPass = nullptr,
                                     std::optional<visualtemporalsampling::Payload>* motionBlurPass = nullptr,
                                     const std::map<std::string, double>* runtimeParameters = nullptr,
                                     int geometryWidth = 0, int geometryHeight = 0,
                                     const VisualPlanEvaluationContext* evaluationContext = nullptr,
-                                    bool deferTemporalPublication = false)
+                                    bool deferTemporalPublication = false,
+                                    bool linearColor = false)
 {
     const auto evaluationBegin = std::chrono::steady_clock::now();
     // Old snapshots which carry no plans retain their established compositor
@@ -4901,7 +6221,7 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
         return false;
     }
     if (! admitGeometryCoreOperations(*plan, geometryUse, evaluationContext, geometryWidth,
-                                      geometryHeight, layer, error)) return false;
+                                      geometryHeight, layer, error, evaluationTimeSec, linearColor)) return false;
     bool pausedHold = false;
     pausedHold = state != nullptr
         && state->isHold(clipId, plan->structuralRevision, evaluationTimeSec);
@@ -4929,8 +6249,6 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     }
     if (colorAovPass != nullptr)
         *colorAovPass = execution->colorAovPass;
-    if (motionAovPass != nullptr)
-        *motionAovPass = execution->motionAovPass;
     if (sceneAovPass != nullptr)
         *sceneAovPass = execution->sceneAovPass;
     if (aovInspectionPass != nullptr)
@@ -4951,6 +6269,29 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     if (execution->importedAnimation.has_value())
     {
         error = "imported animation plan requires a retained native compositor frame binding";
+        return false;
+    }
+    if (execution->sdf)
+    {
+        error = "SDF graph requires native SDF preparation before composition";
+        return false;
+    }
+    if (execution->volume && (!layer.nativeTextureOwner
+        || !arbitgpu::materialFrameIsSrgb(layer.nativeTextureDescriptor)
+        || layer.nativeTextureView != layer.nativeTextureDescriptor.textureViewHandle
+        || layer.nativeTextureBackend != layer.nativeTextureDescriptor.backend
+        || layer.texWidth <= 0 || layer.texHeight <= 0
+        || layer.nativeTextureDescriptor.width != static_cast<std::uint32_t>(layer.texWidth)
+        || layer.nativeTextureDescriptor.height != static_cast<std::uint32_t>(layer.texHeight)
+        || layer.visualPlanStructuralRevision != execution->structuralRevision))
+    {
+        error = "Volume graph requires its retained native image before composition";
+        return false;
+    }
+    if (execution->importedParticleOverlay
+        && (layer.nativeTextureView == 0 || layer.texWidth <= 0 || layer.texHeight <= 0))
+    {
+        error = "Imported particle rig requires its retained native scene image before composition";
         return false;
     }
     if (execution->matteApply
@@ -5030,6 +6371,32 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     layer.graphTemporalActive = execution->feedback;
     layer.graphTemporalNodeId = execution->temporalNodeId;
     layer.graphTemporalPayload = execution->temporalPayload;
+    if (execution->feedback && layer.particleHistory && layer.particleHistory->parameterAt)
+    {
+        const auto destination="clip"+std::to_string(clipId)+"/visual"
+            +std::to_string(execution->temporalNodeId)+"/reset";
+        double current=execution->temporalPayload.reset, previous=current;
+        const double now=layer.particleProjectSeconds;
+        if (!std::isfinite(layer.particleHistory->parameterFrameSeconds)
+            || layer.particleHistory->parameterFrameSeconds<=0)
+        { error="Temporal reset requires the project value-grid clock"; return false; }
+        const double from=std::max(0.0,now-layer.particleHistory->parameterFrameSeconds);
+        if (!std::isfinite(now) || now<0 || !std::isfinite(from) || now-from>1)
+        { error="Temporal reset frame interval exceeds its one-second bound"; return false; }
+        if (!layer.particleHistory->parameterAt(destination,from,previous,error)) return false;
+        bool reset=now<=0 && previous>=.5;
+        const auto first=static_cast<std::int64_t>(std::floor(from*120))+1;
+        const auto last=static_cast<std::int64_t>(std::ceil(now*120));
+        for (auto step=first;step<=last;++step)
+        {
+            current=execution->temporalPayload.reset;
+            if (!layer.particleHistory->parameterAt(destination,std::min(now,double(step)/120),current,error)) return false;
+            if (!std::isfinite(current) || !std::isfinite(previous))
+            { error="Temporal reset automation is nonfinite"; return false; }
+            reset=reset || (current>=.5 && previous<.5); previous=current;
+        }
+        layer.feedbackHistoryReset=layer.feedbackHistoryReset || (!layer.feedbackHistoryHold && reset);
+    }
     if (execution->feedback && execution->temporalPayload.mode == visualtemporaloperation::Mode::feedback)
     {
         layer.graphFeedbackEffect = {};
@@ -5090,8 +6457,10 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     layer.depthParam2 = execution->depthParam2; layer.depthColorRed = execution->depthColorRed;
     layer.depthColorGreen = execution->depthColorGreen; layer.depthColorBlue = execution->depthColorBlue;
     layer.particleSource = execution->particles;
+    layer.importedParticleOverlay = execution->importedParticleOverlay;
     layer.flatShaderBridge = execution->flatShaderBridge;
     layer.shaderOperationPlan = execution->shaderOperationPlan;
+    layer.shaderTransitionFromClipId = execution->shaderTransitionFromClipId;
     layer.shaderOperationParameters.clear();
     if (execution->shaderOperationPlan != nullptr)
     {
@@ -5138,17 +6507,47 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
         }
         layer.particleStateReset = state != nullptr && layer.feedbackHistoryReset;
         layer.shaderSource = false;
-        layer.texture = 0;
-        const auto update = [&](const char* name, double value)
+        if (!execution->importedParticleOverlay) layer.texture = 0;
+        layer.particleParameters = execution->particleParameters;
+        layer.particleParameters.historyClipId=clipId;
+        layer.particleParameters.historyNodeId=execution->particleNodeId;
+        if (layer.particleParameters.geometryBinding || layer.particleParameters.simulationSpace==1
+            || (layer.particleParameters.motionMode==2 && layer.particleParameters.historicalReplay))
         {
-            const auto found = layer.genParams.find(name);
-            if (found != layer.genParams.end()) found->second = value;
-        };
-        update("nativeBuiltin", 1.0); update("seed", execution->particleSeed);
-        update("count", execution->particleCount); update("lifetime", execution->particleLifetime);
-        update("size", execution->particleSize); update("speed", execution->particleSpeed);
-        update("red", execution->particleRed); update("green", execution->particleGreen);
-        update("blue", execution->particleBlue); update("alpha", execution->particleAlpha);
+            // Imported deformation can submit native GPU work. Finish replay
+            // before the compositor takes its Metal lock or begins a pass.
+            auto parameters=videorender::particleParamsForLayer(layer);
+            parameters.geometryRevision=plan->structuralRevision;
+            if (geometryWidth<=0 || geometryHeight<=0)
+            { error="Particle geometry requires the compositor output extent"; return false; }
+            if (!videorender::particleHistoryReady(parameters,error,layer.shaderClock.timeSec)) return false;
+            auto solids=std::make_shared<videorender::ParticleSolidState>();
+            auto bodies=videorender::replayParticleBodies(parameters,layer.shaderClock.timeSec,
+                float(geometryWidth)/geometryHeight,layer.canonicalBlockCFrame.get(),&error,
+                parameters.simulationSpace==1 ? solids.get():nullptr);
+            if (!error.empty()) return false;
+            layer.particleParameters=parameters;
+            if (parameters.historicalReplay)
+            {
+                auto currentParameters=parameters;
+                if (!videorender::sampleParticleParameters(parameters,currentParameters,
+                    parameters.historyProjectSeconds,error)) return false;
+                const auto replayWindow=videorender::particleReplayWindow(currentParameters,layer.shaderClock.timeSec);
+                if (!videorender::sampleParticleParameters(parameters,layer.particleParameters,
+                    double(replayWindow.start+replayWindow.age)/videorender::kParticleReplayTicksPerSecond,error)) return false;
+            }
+            layer.particleParameters.geometryRevision=parameters.geometryRevision;
+            layer.particleParameters.preparedBodies=std::make_shared<const videorender::ParticleBodyState>(std::move(bodies));
+            if (parameters.simulationSpace==1) {
+                layer.particleParameters.preparedSolids=std::move(solids);
+                if (!evaluationContext) { error="Solid 3D requires the preview/export evaluation owner"; return false; }
+                const videohelper::geometry::PlanOwnerIdentity owner{
+                    evaluationContext->projectGeneration,evaluationContext->helperGeneration,evaluationContext->deviceGeneration,
+                    static_cast<std::uint64_t>(clipId),plan->structuralRevision,geometryUse};
+                if (!videorender::renderParticleSolids(layer.particleParameters,owner,execution->particleNodeId,
+                    geometryWidth,geometryHeight,layer,error,linearColor)) return false;
+            }
+        }
         // The caller already populated the canonical viewport/export ShaderClock
         // (project FPS, playing/hold and seek position). Never synthesize 60 Hz.
     }
@@ -5207,6 +6606,206 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
 // AOV becomes available only after the renderer has submitted the native pass
 // and retained its published output. Renderer rejection is terminal; there is
 // deliberately no CPU production fallback.
+template <typename Renderer, typename Layer, typename = void>
+struct HasMaterialShaderFrame : std::false_type {};
+template <typename Renderer, typename Layer>
+struct HasMaterialShaderFrame<Renderer, Layer, std::void_t<decltype(
+    std::declval<Renderer>().leaseShaderFrame(std::declval<const Layer&>(), std::declval<std::string&>()))>> : std::true_type {};
+
+template <typename Renderer, typename = void>
+struct HasMaterialTemporalFrame : std::false_type {};
+template <typename Renderer>
+struct HasMaterialTemporalFrame<Renderer,std::void_t<decltype(std::declval<Renderer>().leaseTemporalFrame(
+    std::declval<std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>>(),
+    std::declval<std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>>(),
+    std::declval<visualtemporaloperation::Payload>(),0.0f,std::declval<std::string&>()))>> : std::true_type {};
+
+template <typename Renderer, typename Layer>
+inline bool prepareGeometryMaterialFrame(Renderer& renderer, const CompiledVisualLayerPlan& plan,
+    const Layer& layer, videohelper::geometry::PlanUse use, double seconds,
+    const std::map<std::string,double>* parameters, VisualPlanEvaluationContext& context, std::string& error,
+    const VisualLayerExecution* admitted = nullptr)
+{
+    if (!std::any_of(plan.operations.begin(),plan.operations.end(),
+        [](const auto& operation) { return operation.kind == "geometry.core.runtime"; })) return true;
+    VisualLayerExecution localExecution;
+    if (!admitted && !compileVisualLayerExecution(plan,localExecution,error)) return false;
+    const auto& execution = admitted ? *admitted : localExecution;
+    if (!execution.geometryFrameSchedule) return true;
+    context.geometryMaterialFrame.reset();
+    context.geometryMaterialFrames.clear();
+    if constexpr (!HasMaterialShaderFrame<Renderer,Layer>::value)
+    { error = "Reactive Surface Frame scheduling requires a native Frame renderer"; return false; }
+    else
+    {
+        using namespace videohelper::importedscene;
+        const auto& schedule = *execution.geometryFrameSchedule;
+        visualdeformation::RationalFrameTime frame;
+        if (!context.materialFrameClock || !context.materialFrameClock(seconds,frame,error)
+            || frame.rateNumerator == 0 || frame.rateDenominator == 0
+            || !std::isfinite(layer.materialFrameStartSeconds) || layer.materialFrameStartSeconds < 0
+            || layer.materialFrameStartSeconds > 86400000)
+        { if (error.empty()) error = "Reactive Surface Frame requires an exact timeline sample"; return false; }
+        const auto start = static_cast<std::int64_t>(std::ceil(layer.materialFrameStartSeconds
+            * frame.rateNumerator / frame.rateDenominator - 1.0e-9));
+        // The shared reset authority can contain transient edges between Frame
+        // samples. Until this DAG consumes that reset lifecycle, reject them
+        // instead of replaying an apparently neutral current value over history.
+        if (layer.particleHistory && layer.particleHistory->parameterAt)
+        {
+            std::size_t resetSamples = 0;
+            const double begin = double(start) * frame.rateDenominator / frame.rateNumerator;
+            const double end = double(frame.frame) * frame.rateDenominator / frame.rateNumerator;
+            if (!std::isfinite(begin) || !std::isfinite(end) || end < begin || end > 86400000)
+            { error = "Surface Frame reset-history interval is invalid"; return false; }
+            for (const auto& entry : schedule.operations) if (entry.second.temporal)
+            {
+                const auto destination = "clip" + std::to_string(plan.clipId) + "/visual"
+                    + std::to_string(entry.first.node) + "/reset";
+                const auto sample = [&](double at) {
+                    if (++resetSamples > materialframe::maximumEvaluations * 32)
+                    { error = "Surface Frame reset-history validation exceeds its bounded sample budget"; return false; }
+                    double value = 0;
+                    if (!layer.particleHistory->parameterAt(destination,at,value,error)) return false;
+                    if (!std::isfinite(value) || value != 0)
+                    { error = "Surface Frame temporal reset requires the shared reset-history scheduler"; return false; }
+                    return true;
+                };
+                if (!sample(begin)) return false;
+                const auto first = static_cast<std::int64_t>(std::floor(begin * 120)) + 1;
+                const auto last = static_cast<std::int64_t>(std::ceil(end * 120));
+                for (auto step = first; step <= last; ++step)
+                    if (!sample(std::min(end,double(step) / 120))) return false;
+            }
+        }
+        MaterialFrameEvaluation evaluation {{},frame,plan.clipId,
+            plan.structuralRevision,plan.structuralRevision,context.projectGeneration,context.helperGeneration,
+            use == videohelper::geometry::PlanUse::preview ? NativeImportedSceneRenderUse::Preview : NativeImportedSceneRenderUse::Export};
+        using Image = std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>;
+        using Sample = std::pair<materialframe::Endpoint,std::int64_t>;
+        std::map<Sample,Image> memo;
+        std::size_t evaluations = 0;
+        std::uint64_t bytes = 0;
+        const auto temporal = [&](const Image& current,const Image& previous,
+            const visualtemporaloperation::Payload& payload,float mix) -> Image {
+            if constexpr (HasMaterialTemporalFrame<Renderer>::value)
+                return renderer.leaseTemporalFrame(current,previous,payload,mix,error);
+            error = "Temporal Surface Frame requires the native owned-image compositor"; return {};
+        };
+        const auto attach = [](Layer& target,const Image& source) {
+            target.texture = 0; target.nativeTextureView = 0;
+            target.nativeTextureOwner.reset(); target.nativeTextureBackend.clear();
+            target.fromLayer = nullptr;
+            if (!source) return;
+            target.nativeTextureView = source->colorTextureViewHandle();
+            target.nativeTextureDescriptor = source->colorTextureDescriptor();
+            target.nativeTextureBackend = source->backend(); target.nativeTextureOwner = source;
+            target.texWidth = source->width(); target.texHeight = source->height();
+        };
+        std::function<Image(materialframe::Endpoint,std::int64_t)> evaluate;
+        evaluate = [&](materialframe::Endpoint endpoint,std::int64_t tick) -> Image {
+            const Sample sample {endpoint,tick};
+            if (const auto found = memo.find(sample); found != memo.end()) return found->second;
+            if (++evaluations > materialframe::maximumEvaluations || tick < start)
+            { error = "Material Frame temporal replay exceeds its bounded sample budget or clip interval"; return {}; }
+            const auto found = schedule.operations.find(endpoint);
+            if (found == schedule.operations.end()) { error = "Material Frame dependency is unavailable"; return {}; }
+            const auto& operation = found->second;
+            Image image;
+            if (operation.temporal)
+            {
+                const auto& payload = *operation.temporal;
+                using Mode = visualtemporaloperation::Mode;
+                const auto input = operation.inputs.front();
+                if (payload.mode == Mode::stutter)
+                    image = evaluate(input,start + ((tick-start) / payload.holdFrames) * payload.holdFrames);
+                else if (payload.mode == Mode::frameDelay && tick-start >= payload.historyLength)
+                    image = evaluate(input,tick-payload.historyLength);
+                else
+                {
+                    auto current = evaluate(input,tick);
+                    if (!current) return {};
+                    if (payload.mode == Mode::frameDelay)
+                        image = temporal(current,{},payload,0);
+                    else if (payload.mode == Mode::feedback)
+                    {
+                        Image previous;
+                        if (tick > start) { previous = evaluate(endpoint,tick-1); if (!previous) return {}; }
+                        image = previous ? temporal(current,previous,payload,1) : current;
+                    }
+                    else
+                    {
+                        auto accumulated = current;
+                        const auto count = std::min<std::int64_t>(payload.historyLength,tick-start+1);
+                        for (std::int64_t i = 1; i < count; ++i)
+                        {
+                            auto previous = evaluate(input,tick-i);
+                            if (!previous) return {};
+                            accumulated = temporal(accumulated,previous,payload,1.0f / float(i+1));
+                            if (!accumulated) return {};
+                        }
+                        image = payload.mode == Mode::echo
+                            ? temporal(current,accumulated,payload,payload.mix) : accumulated;
+                    }
+                }
+            }
+            else if (!operation.shader)
+            {
+                auto request = evaluation; request.endpoint = endpoint; request.frame.frame = tick;
+                MaterialFrameReceipt receipt;
+                if (!resolveMaterialFrame(request,context.materialFrameResolver,receipt,error)) return {};
+                image = receipt.nativeFrame;
+            }
+            else
+            {
+                std::vector<Image> inputs;
+                for (const auto input : operation.inputs)
+                { auto value = evaluate(input,tick); if (!value) return {}; inputs.push_back(std::move(value)); }
+                auto frameLayer = layer;
+                std::map<std::string,double> sampledParameters = parameters ? *parameters : std::map<std::string,double>{};
+                if (tick != frame.frame)
+                {
+                    if (!layer.materialInputsAt || !layer.materialInputsAt(
+                        double(tick) * frame.rateDenominator / frame.rateNumerator,frameLayer,sampledParameters,error))
+                    { if (error.empty()) error = "Historical shader Frame inputs are unavailable"; return {}; }
+                }
+                auto fromLayer = frameLayer;
+                attach(frameLayer,inputs.empty() ? Image{} : inputs.back());
+                if (inputs.size() == 2) { attach(fromLayer,inputs.front()); frameLayer.fromLayer = &fromLayer; }
+                frameLayer.flatShaderBridge = true;
+                frameLayer.shaderOperationPlan = operation.shader;
+                frameLayer.visualPlanStructuralRevision = plan.structuralRevision;
+                frameLayer.shaderOperationParameters.clear();
+                const auto& shader = operation.shader->operations.front();
+                auto values = shader.generatedParameters;
+                if (shader.transitionPayload)
+                    values["progress"] = shadertransition::evaluateProgress(shader.transitionPayload->progress,
+                        shader.transitionPayload->direction,shader.transitionPayload->easing);
+                else if (!applyFlatShaderBridgeRuntimeParameters(shader.payload,shader.nodeId,
+                    shader.customGrant.has_value(),sampledParameters,values,error)) return {};
+                frameLayer.shaderOperationParameters.emplace(shader.nodeId,std::move(values));
+                image = renderer.leaseShaderFrame(frameLayer,error);
+            }
+            if (!arbitgpu::validMaterialFrameTexture(image))
+            { if (error.empty()) error = "Material Frame dependency produced no owned Image"; return {}; }
+            bytes += std::uint64_t(image->width()) * image->height() * 4;
+            if (bytes > colortransform::kMaximumResidentBytes)
+            { error = "Material Frame dependencies exceed the native resident-image budget"; return {}; }
+            memo.emplace(sample,image); return image;
+        };
+        for (const auto endpoint : schedule.outputs)
+        {
+            auto image = evaluate(endpoint,frame.frame);
+            if (!image) { context.geometryMaterialFrames.clear(); return false; }
+            auto receipt = evaluation; receipt.endpoint = endpoint;
+            context.geometryMaterialFrames.emplace(endpoint,MaterialFrameReceipt{receipt,std::move(image)});
+        }
+        if (context.geometryMaterialFrames.size() == 1)
+            context.geometryMaterialFrame = context.geometryMaterialFrames.begin()->second;
+        return true;
+    }
+}
+
 template <typename Renderer, typename LayerDesc>
 inline bool executeVisualLayerPlanForRenderer (
     Renderer& renderer, const std::vector<CompiledVisualLayerPlan>& plans,
@@ -5226,19 +6825,28 @@ inline bool executeVisualLayerPlanForRenderer (
     auto* publicationTransaction = temporalSamplingTransaction != nullptr
         ? temporalSamplingTransaction : &immediateTemporalTransaction;
     std::optional<renderpassoutput::Description> colorAovPass;
-    std::optional<renderpassoutput::Description> motionAovPass;
     std::optional<sceneaov::Payload> sceneAovPass;
     std::optional<aovinspection::Payload> aovInspectionPass;
     std::optional<TemporalFeedbackPass> temporalFeedbackPass;
     std::optional<visualtemporalsampling::Payload> motionBlurPass;
     bool temporalFeedbackRequired = false;
+    const bool linearColor = [&] {
+        if constexpr (HasLinearSceneCapture<Renderer>::value) return renderer.hdrImageCaptureEnabled();
+        else return false;
+    }();
+    VisualPlanEvaluationContext materialContext = evaluationContext != nullptr
+        ? *evaluationContext : VisualPlanEvaluationContext{};
+    if (const auto* plan = findVisualLayerPlan(plans,clipId))
+        if (!prepareGeometryMaterialFrame(renderer,*plan,layer,geometryUse,evaluationTimeSec,
+                runtimeParameters,materialContext,error,
+                state ? state->compiled(clipId,plan->structuralRevision) : nullptr)) return false;
     if (! executeVisualLayerPlan (plans, clipId, layer, error, geometryUse, inspection, resource,
                                   state, evaluationTimeSec, eventSchedules, eventCursor,
                                   &colorAovPass, &temporalFeedbackPass,
-                                  &temporalFeedbackRequired, &motionAovPass, &sceneAovPass,
+                                  &temporalFeedbackRequired, &sceneAovPass,
                                   &aovInspectionPass, &motionBlurPass, runtimeParameters,
                                   renderer.outputWidth(), renderer.outputHeight(),
-                                  evaluationContext, true))
+                                  &materialContext, true, linearColor))
         return false;
     if (temporalFeedbackRequired && ! temporalFeedbackPass.has_value())
     {
@@ -5250,9 +6858,6 @@ inline bool executeVisualLayerPlanForRenderer (
         return false;
     if (colorAovPass.has_value()
         && ! renderer.replaceColorAovPass (*colorAovPass, error))
-        return false;
-    if (motionAovPass.has_value()
-        && ! renderer.replaceMotionAovPass (*motionAovPass, error))
         return false;
     std::optional<visualtemporalsampling::LifecycleState> pendingSamplingLifecycle;
     uint64_t pendingSamplingRevision = 0;

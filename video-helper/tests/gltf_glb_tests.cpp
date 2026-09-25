@@ -1,7 +1,10 @@
 #include "../src/gltf_glb.h"
+#include "../src/glb_geometry_core_adapter.h"
 #include "../src/imported_animation_deformation_consumer.h"
 #include "../src/sha256.h"
 #include "../../shared/VisualStarterModelAssets.h"
+#include "../../shared/ReactiveCharacterAsset.h"
+#include "../../shared/HolographicTradingCardAsset.h"
 #include "../../plugin/Tests/fixtures/visual-model/StaticVisualModelWorkflowFixture.h"
 
 #include <nlohmann/json.hpp>
@@ -11,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -137,6 +141,98 @@ std::vector<std::uint8_t> decodeBase64(std::string_view text)
             bytes.push_back(static_cast<std::uint8_t>(accumulator >> bits));
         }
     }
+    return bytes;
+}
+
+const std::vector<std::uint8_t>& rgb1024ImageBytes()
+{
+    // Authored four-quadrant 1024x1024 RGB8 PNG, compressed with zlib level 9.
+    // Colors: (10,20,30), (40,50,60), (70,80,90), (100,110,120).
+    static const auto bytes = decodeBase64(
+        "iVBORw0KGgoAAAANSUhEUgAABAAAAAQACAIAAADwf7zUAAAXL0lEQVR42u3XoQ0AIRAAQTQajUaj0Wg0Gv36y6cMxE0yPWw2"
+        "5VIBCKj1AUBASQIBDAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAA"
+        "YAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAADIAKAhgA"
+        "AAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAABgAAAwAAAYAAAMA"
+        "gAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAABgAAAwAAAYAAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAA"
+        "BgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDA"
+        "AABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAAJBAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAM"
+        "AAAGAAADAIABAMAAAGAAADAAABgAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIAB"
+        "AMAAAGAAADAAABgAAAOgggAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDA"
+        "AABgAAAwAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAG"
+        "AAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAADAIABAMAA"
+        "AGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAADAIABAMAAAGAAADAAABgA"
+        "AAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAIABAMAAAGAAADAAABgAAAwAAAYAAAMA"
+        "gAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAIABUEEAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAA"
+        "ABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYA"
+        "AAMAgAEAwAAAYAAAMAAAGAAAA6CCAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAAD"
+        "AIABAMAAAGAAADAAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAA"
+        "ADAAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAMA"
+        "gAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAMggQAGAAADAIABAMAAAGAAADAA"
+        "ABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYA"
+        "AAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAGQAUBDAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAAD"
+        "AIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAA"
+        "ADAAABgAAAwAAAYAAAMAgAEAwAAAYAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwA"
+        "AAYAAAMAgAEAwAAAYAAAMAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEA"
+        "wAAAYAAAMAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAA"
+        "SCCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADACAAQDAAABg"
+        "AAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADACAAVBBAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAMAgAEAwAAAYAAAMAAAGAAADAAA"
+        "BgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDA"
+        "AABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAY"
+        "AAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAAD"
+        "AIABAMAAAGAAADAAABgAAAwAAAYAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAA"
+        "ADAAABgAAAwAAAYAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwA"
+        "AAYAwACoIIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAIAB"
+        "AMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAIABUEEAAwCAAQDA"
+        "AABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAAAwCAAQDAAABgAAAwAAAY"
+        "AAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAAD"
+        "AIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADACAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAA"
+        "ADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADACAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAADwYgLk2"
+        "AAGd7wcgIAMAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMA"
+        "YAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAYABUEMAAAGAA"
+        "ADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAMAAAGAAADAAABgAAAwA"
+        "AAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAMAAqCCAAQDAAABgAAAwAAAYAAAMAAAG"
+        "AAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADACAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAA"
+        "AGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADACAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgA"
+        "AAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMA"
+        "gAEAwAAAYAAAMAAAGAAADAAABgDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgDAAEgggAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAA"
+        "ABgAAAwAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAgAFQ"
+        "QQADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAADAIABAMAA"
+        "AGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAADAIABAMAAAGAAADAAABgA"
+        "AAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAIABAMAAAGAAADAAABgAAAwAAAYAAAMA"
+        "gAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAASCGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAA"
+        "AwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABg"
+        "AAAwAAAYAAAMAAAGAAADAGAAVBDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAA"
+        "BgDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwBgAAAw"
+        "AAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwBgAAAwAAAYAAAMAAAG"
+        "AAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQAwAAAYAAAMAAAGAAADAIABAMAA"
+        "AGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgA"
+        "AAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQAwACoIYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAM"
+        "AAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIAB"
+        "AMAAAGAAADAAABgAAAwAAAYAAAMAYABUEMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDA"
+        "AABgAAAwAAAYAAAMAAAGAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAY"
+        "AAAMAAAGAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAAD"
+        "AGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAGAAADAAABgA"
+        "AAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAGAAJBDAAABgAAAwAAAYAAAM"
+        "AAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgDAAABgAAAwAAAYAAAMAAAGAAADAIAB"
+        "AMAAAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgDAAKgggAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDA"
+        "AABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAY"
+        "AAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAAD"
+        "AIABAMAAAGAAADAAABgAAAwAAAYAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAA"
+        "ADAAABgAAAwAAAYAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwA"
+        "AAYAAAkEMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAMAAA"
+        "GAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABAMAAAGAAADAAABgAAAwAAAYAAAMAgAEAMAAqCGAAADAAABgA"
+        "AAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAGAAADAAABgAAAwAAAYAAAMA"
+        "gAEAwAAAYAAAMAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAGAAADAAABgAAAwAAAYAAAMAgAEAwAAAYAAA"
+        "MAAAGAAADAAABgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAA"
+        "BgAAAwCAAQDAAABgAAAwAAAYAAAMAAAGAAADAIABADAAABgAAAwAAAYAAAMAgAEAwAAAYAAAMAAAGAAADAAABgCABy55sLbR"
+        "ZhNbUwAAAABJRU5ErkJggg==");
     return bytes;
 }
 
@@ -467,6 +563,28 @@ bool rejected(const std::vector<std::uint8_t>& bytes,
 
 int main()
 {
+    {
+        std::string characterError;
+        GlbAdmissionOptions admission;
+        admission.admitAnimations=true;
+        admission.admitSkins=true;
+        const auto scene=videohelper::gltf::decodeAnimatedGlbBaseScene(
+            reactivecharacter::kGlb.data(),reactivecharacter::kGlb.size(),admission,characterError);
+        check(scene && scene->decodedVertexCount==144 && scene->decodedIndexCount==216,
+              "reactive character has a native-decodable six-part body mesh");
+        videohelper::gltf::GlbAnimationDecodeOptions animationOptions;
+        animationOptions.admission=admission;
+        const auto animation=videohelper::gltf::decodeGlbAnimations(
+            reactivecharacter::kGlb.data(),reactivecharacter::kGlb.size(),animationOptions,characterError);
+        if (!animation) std::fprintf(stderr,"reactive character: %s\n",characterError.c_str());
+        check(animation && animation->clips.size()==1 && animation->clips[0].name=="Body Sway"
+              && animation->clips[0].jointBindings.size()==1
+              && animation->clips[0].jointBindings[0].joint.value==2
+              && animation->deformation && animation->deformation->skins().size()==1
+              && animation->deformation->meshes().size()==1
+              && animation->deformation->meshes()[0].morphTargets().size()==1,
+              "reactive character preserves exact body-bone animation and named morph deformation");
+    }
     GlbAdmissionOptions options;
     auto valid = makeGlb(validRoot(), {1, 2, 3, 4});
     std::string error;
@@ -592,6 +710,30 @@ int main()
 
     const auto meshRoot = staticMeshRoot();
     const auto meshBin = staticMeshBin();
+    {
+        const std::vector<std::uint8_t> bytes(holographictradingcard::kGlb.begin(),
+                                             holographictradingcard::kGlb.end());
+        const auto geometry = videohelper::gltf::decodeGlbMeshToGeometryCore(
+            bytes, 0, 0, 71, 70, 1, error);
+        check(geometry.has_value(), "Score-Deformed Imported Mesh starter extracts the exact bundled static card");
+        if (geometry)
+        {
+            const auto& mesh = std::get<videowire::geometry::GeometryData>(geometry->descriptor().data);
+            check(!mesh.positions.empty() && mesh.positions.size() <= videowire::geometry::scorefield::kMaximumElements,
+                  "bundled card mesh fits the score-field sample limit");
+        }
+    }
+    {
+        const auto geometry=videohelper::gltf::decodeGlbMeshToGeometryCore(
+            makeGlb(meshRoot,meshBin),std::nullopt,0,71,70,1,error);
+        check(geometry.has_value(),"real GLB bytes use the canonical static decoder for Geometry Core extraction");
+        auto animated=meshRoot; animated["animations"]=nlohmann::json::array({nlohmann::json::object()});
+        check(!videohelper::gltf::decodeGlbMeshToGeometryCore(makeGlb(animated,meshBin),std::nullopt,0,71,70,1,error),
+            "animated source bytes cannot silently become a static Geometry Core mesh");
+        auto morph=meshRoot; morph["meshes"][0]["primitives"][0]["targets"]=nlohmann::json::array({{{"POSITION",0}}});
+        check(!videohelper::gltf::decodeGlbMeshToGeometryCore(makeGlb(morph,meshBin),std::nullopt,0,71,70,1,error),
+            "morph source bytes cannot silently discard their deformation");
+    }
     {
         error.clear();
         const auto decoded = videohelper::gltf::decodeStaticGlb(
@@ -873,8 +1015,205 @@ int main()
     {
         auto root = meshRoot;
         root["meshes"][0]["primitives"][0].erase("indices");
-        check(decodeRejected(root, meshBin),
-              "non-indexed triangle primitives are outside the bounded static subset");
+        std::string diagnostic;
+        const auto decoded = videohelper::gltf::decodeStaticGlb(makeGlb(root, meshBin), {}, diagnostic);
+        check(decoded && diagnostic.empty()
+              && !decoded->meshes[0].primitives[0].indexAccessor
+              && decoded->meshes[0].primitives[0].indices == std::vector<std::uint32_t>{0, 1, 2}
+              && decoded->decodedIndexCount == 3 && decoded->decodedBytes == 212,
+              "non-indexed TRIANGLES receive explicit indices charged to count and byte budgets");
+
+        for (const auto count : {0u, 2u, 4u, std::numeric_limits<std::uint32_t>::max()})
+        {
+            auto malformed = root;
+            malformed["accessors"][0]["count"] = count;
+            check(decodeRejected(malformed, meshBin),
+                  "non-indexed zero, incomplete, overrun and huge POSITION counts fail closed");
+        }
+        for (const auto mode : {0, 1, 2, 3, 5, 6})
+        {
+            auto malformed = root;
+            malformed["meshes"][0]["primitives"][0]["mode"] = mode;
+            check(decodeRejected(malformed, meshBin),
+                  "index synthesis admits only TRIANGLES topology");
+        }
+        for (const auto& badIndex : {nlohmann::json(nullptr), nlohmann::json(-1),
+                                   nlohmann::json(999), nlohmann::json("absent")})
+        {
+            auto malformed = root;
+            malformed["meshes"][0]["primitives"][0]["indices"] = badIndex;
+            check(decodeRejected(malformed, meshBin),
+                  "a present malformed index reference cannot request sequential synthesis");
+        }
+        auto malformed = root;
+        malformed["accessors"][1]["count"] = 2;
+        check(decodeRejected(malformed, meshBin),
+              "non-indexed NORMAL count must still match POSITION");
+        malformed = root;
+        malformed["accessors"][0]["normalized"] = true;
+        check(decodeRejected(malformed, meshBin),
+              "non-indexed POSITION retains its strict FLOAT accessor contract");
+        auto nonfinite = meshBin;
+        const auto nan = std::numeric_limits<float>::quiet_NaN();
+        std::memcpy(nonfinite.data(), &nan, sizeof(nan));
+        check(decodeRejected(root, nonfinite), "non-indexed non-finite vertices fail closed");
+
+        GlbAdmissionOptions limited;
+        limited.limits.maxDecodedIndices = 2;
+        check(decodeRejected(root, meshBin, &diagnostic, limited)
+              && diagnostic == "decoded glTF index count exceeds the admission limit",
+              "generated indices are bounded before allocation");
+        limited = {};
+        limited.limits.maxDecodedVertices = 2;
+        check(decodeRejected(root, meshBin, nullptr, limited),
+              "non-indexed vertices cannot bypass the vertex budget");
+        limited = {};
+        limited.limits.maxDecodedBytes = 211;
+        check(decodeRejected(root, meshBin, nullptr, limited),
+              "generated uint32 index bytes cannot bypass the decoded byte budget");
+        root["meshes"][0]["primitives"].push_back(root["meshes"][0]["primitives"][0]);
+        limited = {};
+        limited.limits.maxDecodedIndices = 5;
+        check(decodeRejected(root, meshBin, nullptr, limited),
+              "sequential index limits are aggregate across primitives");
+    }
+    {
+        auto root = meshRoot;
+        auto& primitive = root["meshes"][0]["primitives"][0];
+        primitive.erase("indices");
+        primitive["attributes"].erase("NORMAL");
+        auto bin = meshBin;
+        const float raisedCorner = 1.0f;
+        std::memcpy(bin.data() + 8 * sizeof(float), &raisedCorner, sizeof(float));
+        const auto nan = std::numeric_limits<float>::quiet_NaN();
+        std::memcpy(bin.data() + 72, &nan, sizeof(float)); // Ignored TANGENT data.
+        std::string diagnostic;
+        const auto decoded = videohelper::gltf::decodeStaticGlb(makeGlb(root, bin), {}, diagnostic);
+        check(decoded && diagnostic.empty() && decoded->decodedVertexCount == 3
+              && decoded->decodedIndexCount == 3 && decoded->decodedBytes == 164,
+              "missing flat normals are generated within the decoded byte budget without vertex expansion");
+        if (decoded)
+        {
+            const auto& values = decoded->meshes[0].primitives[0];
+            check(values.generatedFlatNormals && !values.normalAccessor && !values.tangentAccessor
+                  && values.tangents.empty() && values.normals.size() == 9
+                  && values.indices == std::vector<std::uint32_t>{0, 1, 2}
+                  && near(values.normals[0], 0.0f) && near(values.normals[1], -std::sqrt(0.5f))
+                  && near(values.normals[2], std::sqrt(0.5f)),
+                  "non-axis-aligned face normals derive from positions and ignore provided tangents");
+            bool sharedFaceNormal = true;
+            for (std::size_t corner = 1; corner < 3; ++corner)
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                    sharedFaceNormal = sharedFaceNormal
+                        && values.normals[corner * 3 + axis] == values.normals[axis];
+            check(sharedFaceNormal && values.texCoords0.size() == 6 && values.colors0.size() == 12,
+                  "all three corners share one flat normal while UV and color order remains intact");
+        }
+        GlbAdmissionOptions limited;
+        limited.limits.maxDecodedBytes = 163;
+        check(decodeRejected(root, bin, &diagnostic, limited)
+              && diagnostic == "decoded glTF byte size exceeds the admission limit",
+              "generated normal storage cannot evade a one-byte-short aggregate budget");
+        auto indexed = root;
+        indexed["meshes"][0]["primitives"][0]["indices"] = 5;
+        check(decodeRejected(indexed, bin, &diagnostic)
+              && diagnostic == "flat glTF normals for indexed TRIANGLES require unsupported corner expansion",
+              "indexed meshes without normals are explicitly rejected instead of silently smoothed");
+        auto invalidReference = root;
+        invalidReference["meshes"][0]["primitives"][0]["attributes"]["TANGENT"] = 999;
+        check(decodeRejected(invalidReference, bin),
+              "ignored tangent data still requires a valid bounded accessor reference");
+
+        for (const auto scale : {1.0e-25f, 1.0e25f})
+        {
+            auto scaled = bin;
+            const std::array<float, 9> positions {{0, 0, 0, scale, 0, 0, 0, scale, scale}};
+            std::memcpy(scaled.data(), positions.data(), sizeof(positions));
+            const auto value = videohelper::gltf::decodeStaticGlb(makeGlb(root, scaled), {}, diagnostic);
+            check(value && near(value->meshes[0].primitives[0].normals[1], -std::sqrt(0.5f))
+                  && near(value->meshes[0].primitives[0].normals[2], std::sqrt(0.5f)),
+                  "double cross products normalize finite tiny and large triangles without float overflow");
+        }
+        auto degenerate = bin;
+        const std::array<float, 9> collinear {{0, 0, 0, 1, 0, 0, 2, 0, 0}};
+        std::memcpy(degenerate.data(), collinear.data(), sizeof(collinear));
+        check(decodeRejected(root, degenerate, &diagnostic)
+              && diagnostic == "cannot generate flat glTF normals for a degenerate triangle",
+              "degenerate faces cannot receive invented fallback normals");
+        std::memcpy(degenerate.data(), &nan, sizeof(float));
+        check(decodeRejected(root, degenerate), "non-finite missing-normal positions fail admission");
+    }
+    {
+        constexpr std::size_t repeats = 576;
+        constexpr std::size_t vertices = repeats * 3;
+        const auto& image = rgb1024ImageBytes();
+        auto root = staticMeshRootWithImage("image/png", image.size());
+        root["meshes"][0]["primitives"][0].erase("indices");
+        root["meshes"][0]["primitives"][0]["attributes"].erase("NORMAL");
+        std::vector<std::uint8_t> bin;
+        for (std::size_t attribute = 0; attribute < 5; ++attribute)
+        {
+            const auto offset = root["bufferViews"][attribute]["byteOffset"].get<std::size_t>();
+            const auto length = root["bufferViews"][attribute]["byteLength"].get<std::size_t>();
+            root["bufferViews"][attribute]["byteOffset"] = bin.size();
+            root["bufferViews"][attribute]["byteLength"] = length * repeats;
+            root["accessors"][attribute]["count"] = vertices;
+            for (std::size_t repeat = 0; repeat < repeats; ++repeat)
+                bin.insert(bin.end(), meshBin.begin() + offset, meshBin.begin() + offset + length);
+        }
+        root["bufferViews"][5]["byteOffset"] = bin.size();
+        bin.insert(bin.end(), {0, 0, 1, 0, 2, 0, 0, 0}); // Unused, valid index accessor.
+        root["bufferViews"][6]["byteOffset"] = bin.size();
+        bin.insert(bin.end(), image.begin(), image.end());
+        root["buffers"][0]["byteLength"] = bin.size();
+        const auto bytes = makeGlb(root, bin);
+        auto native = videohelper::nativeImportedAnimationDecodeOptions(bytes.size(), {});
+        std::string diagnostic;
+        const auto decoded = videohelper::gltf::decodeAnimatedGlbBaseScene(bytes, native.admission, diagnostic);
+        check(decoded && diagnostic.empty() && decoded->decodedVertexCount == vertices
+              && decoded->decodedIndexCount == vertices
+              && decoded->decodedBytes == 4194304u + vertices * 52u
+              && decoded->meshes[0].primitives[0].generatedFlatNormals,
+              "production import bounds admit 1728 non-indexed vertices, generated normals and a full 1024 RGB PNG");
+        if (decoded)
+        {
+            const auto& primitive = decoded->meshes[0].primitives[0];
+            bool sequential = !primitive.indexAccessor && primitive.indices.size() == vertices;
+            for (std::size_t index = 0; index < primitive.indices.size(); ++index)
+                sequential = sequential && primitive.indices[index] == index;
+            check(sequential, "all 1728 generated indices preserve source vertex order");
+            const auto& rgba = decoded->images[0].decodedRgba8;
+            check(decoded->images[0].width == 1024 && decoded->images[0].height == 1024
+                  && rgba.size() == 4194304 && rgba[0] == 10 && rgba[1] == 20 && rgba[2] == 30
+                  && rgba[3] == 255 && rgba[2048] == 40 && rgba[2097152] == 70
+                  && rgba[rgba.size() - 4] == 100 && rgba.back() == 255,
+                  "RGB expands to full-size RGBA8 with unchanged corner pixels and opaque alpha");
+        }
+        auto limited = native.admission;
+        limited.limits.maxDecodedImageBytes = 4194303;
+        check(decodeRejected(root, bin, &diagnostic, limited)
+              && diagnostic == "decoded embedded image bytes exceed the image admission limit",
+              "a one-byte-short RGBA budget rejects the full image before allocation");
+
+        auto duplicateImage = root;
+        duplicateImage["images"].push_back(duplicateImage["images"][0]);
+        check(decodeRejected(duplicateImage, bin, &diagnostic, native.admission)
+              && diagnostic == "decoded embedded image bytes exceed the image admission limit",
+              "decoded image bounds remain aggregate across repeated embedded images");
+        const auto imageOffset = root["bufferViews"][6]["byteOffset"].get<std::size_t>();
+        auto oversized = bin;
+        oversized[imageOffset + 19] = 1; // Header width 1025, still within dimension cap.
+        check(decodeRejected(root, oversized, &diagnostic, native.admission)
+              && diagnostic == "decoded embedded image bytes exceed the image admission limit",
+              "an oversized decoded image header is rejected before invoking the codec");
+        auto truncated = bin;
+        truncated.resize(imageOffset + 33);
+        auto truncatedRoot = root;
+        truncatedRoot["bufferViews"][6]["byteLength"] = 33;
+        truncatedRoot["buffers"][0]["byteLength"] = truncated.size();
+        check(decodeRejected(truncatedRoot, truncated, &diagnostic, native.admission)
+              && diagnostic == "embedded PNG image decode failed",
+              "a valid-size image header without compressed pixels cannot publish a texture");
     }
     {
         auto root = meshRoot;
@@ -988,6 +1327,155 @@ int main()
     const auto animatedRoot = animatedDeformationRoot();
     const auto animatedBin = animatedDeformationBin();
     {
+        auto root = animatedRoot;
+        auto bin = animatedBin;
+        auto& primitive = root["meshes"][0]["primitives"][0];
+        primitive["attributes"]["TANGENT"] = 2; // Structurally valid FLOAT VEC4, ignored without NORMAL.
+        primitive["targets"][0]["TANGENT"] = 4;
+        const float raisedCorner = 1.0f;
+        std::memcpy(bin.data() + 96 + 8 * sizeof(float), &raisedCorner, sizeof(float));
+        std::string diagnostic;
+        const auto decoded = videohelper::gltf::decodeGlbAnimations(makeGlb(root, bin), {}, diagnostic);
+        check(decoded && decoded->deformation && diagnostic.empty(),
+              "non-indexed missing-normal morphs enter the immutable deformation contract");
+        if (decoded && decoded->deformation)
+        {
+            const auto& mesh = decoded->deformation->meshes()[0];
+            const auto& delta = mesh.morphTargets()[0].normalDeltas();
+            // Target positions are (.25,0,0), (1,0,0), (0,1,1).
+            check(mesh.vertexCount() == 3 && !mesh.jointWeightSets().empty()
+                  && mesh.jointWeightSets()[0].jointIndices().size() == 12
+                  && mesh.jointWeightSets()[0].weights().size() == 12
+                  && mesh.jointWeightSets()[0].weights()[0] == 1.0f
+                  && delta.size() == 9 && near(delta[0], 0.0f)
+                  && near(delta[1], -std::sqrt(0.5f))
+                  && near(delta[2], std::sqrt(0.5f) - 1.0f)
+                  && !mesh.morphTargets()[0].hasTangentDeltas(),
+                  "generated morph normals encode target-minus-base before skinning and discard tangent deltas");
+            bool sameCorners = delta.size() == 9;
+            for (std::size_t corner = 1; sameCorners && corner < 3; ++corner)
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                    sameCorners = sameCorners && delta[corner * 3 + axis] == delta[axis];
+            check(sameCorners, "morph normal generation preserves the flat triangle and skin vertex correspondence");
+        }
+        videohelper::gltf::GlbAnimationDecodeOptions limited;
+        limited.deformationLimits.maxMorphDeltaMagnitude = 0.5f;
+        auto smallDelta = bin;
+        const float displacement = 0.49f;
+        std::memcpy(smallDelta.data() + 96 + 8 * sizeof(float), &displacement, sizeof(float));
+        // Flip a very shallow base triangle using admitted small position deltas.
+        const float baseHeight = 0.01f, negativeHeight = -0.02f;
+        std::memcpy(smallDelta.data() + 7 * sizeof(float), &baseHeight, sizeof(float));
+        std::memcpy(smallDelta.data() + 96 + 7 * sizeof(float), &negativeHeight, sizeof(float));
+        check(animationRejected(root, smallDelta, &diagnostic, limited),
+              "generated morph normal deltas retain the requested component magnitude bound");
+        auto indexed = root;
+        indexed["meshes"][0]["primitives"][0]["indices"] = 1;
+        check(animationRejected(indexed, bin, &diagnostic)
+              && diagnostic == "flat glTF morph normals require non-indexed TRIANGLES",
+              "indexed missing-normal morphs reject before any inconsistent corner remapping");
+        auto degenerate = bin;
+        const float minusOne = -1.0f, zero = 0.0f;
+        std::memcpy(degenerate.data() + 96 + 7 * sizeof(float), &minusOne, sizeof(float));
+        std::memcpy(degenerate.data() + 96 + 8 * sizeof(float), &zero, sizeof(float));
+        check(animationRejected(root, degenerate, &diagnostic)
+              && diagnostic == "cannot generate flat glTF normals for a degenerate triangle",
+              "degenerate morph target faces cannot publish fabricated normals");
+        auto normalWithoutBase = root;
+        normalWithoutBase["meshes"][0]["primitives"][0]["targets"][0]["NORMAL"] = 4;
+        check(animationRejected(normalWithoutBase, bin, &diagnostic)
+              && diagnostic == "glTF morph NORMAL requires a base NORMAL attribute",
+              "morph NORMAL cannot refer to an absent base NORMAL attribute");
+
+        limited = {};
+        // One inverse bind is 64 bytes, joint/weight values 96 bytes and the
+        // first morph's positions 36 bytes. Its generated normals need 36 more.
+        limited.limits.maxDecodedBytes = 231;
+        animationFactoryCalls = deformationFactoryCalls = 0;
+        const auto bytes = makeGlb(root, bin);
+        const auto overBudget = videohelper::gltf::detail::decodeGlbAnimationsWithFactories(
+            bytes.data(), bytes.size(), limited, countingAnimationFactory,
+            countingDeformationFactory, diagnostic);
+        check(!overBudget && animationFactoryCalls == 0 && deformationFactoryCalls == 0
+              && diagnostic == "decoded glTF animation or deformation bytes exceed the admission limit",
+              "generated morph normal storage is admitted before allocation and immutable publication");
+
+        auto mixedRoot = root;
+        auto mixedBin = bin;
+        const auto normalOffset = mixedBin.size();
+        for (int corner = 0; corner < 3; ++corner)
+            for (const auto component : {0.0f, 0.0f, 1.0f}) appendFloat(mixedBin, component);
+        const auto normalView = mixedRoot["bufferViews"].size();
+        mixedRoot["bufferViews"].push_back({{"buffer", 0}, {"byteOffset", normalOffset},
+                                          {"byteLength", 36}, {"target", 34962}});
+        const auto normalAccessor = mixedRoot["accessors"].size();
+        mixedRoot["accessors"].push_back({{"bufferView", normalView}, {"componentType", 5126},
+                                         {"count", 3}, {"type", "VEC3"}});
+        mixedRoot["buffers"][0]["byteLength"] = mixedBin.size();
+        auto authoredNormal = primitive;
+        authoredNormal["attributes"]["NORMAL"] = normalAccessor;
+        authoredNormal["attributes"].erase("TANGENT");
+        authoredNormal["targets"][0].erase("TANGENT");
+        for (const auto generatedFirst : {false, true})
+        {
+            mixedRoot["meshes"][0]["primitives"] = generatedFirst
+                ? nlohmann::json::array({primitive, authoredNormal})
+                : nlohmann::json::array({authoredNormal, primitive});
+            const auto mixed = videohelper::gltf::decodeGlbAnimations(
+                makeGlb(mixedRoot, mixedBin), {}, diagnostic);
+            check(mixed && mixed->deformation->meshes()[0].vertexCount() == 6,
+                  "mixed authored and generated normals retain concatenated primitive vertices");
+            if (mixed)
+            {
+                const auto& delta = mixed->deformation->meshes()[0].morphTargets()[0].normalDeltas();
+                const auto generatedOffset = generatedFirst ? 0u : 9u;
+                const auto unchangedOffset = generatedFirst ? 9u : 0u;
+                check(delta.size() == 18
+                      && near(delta[generatedOffset + 1], -std::sqrt(0.5f))
+                      && delta[unchangedOffset] == 0 && delta[unchangedOffset + 1] == 0
+                      && delta[unchangedOffset + 2] == 0,
+                      "generated morph normals and zero padding retain exact primitive offsets in both orders");
+            }
+        }
+    }
+    {
+        auto root=animatedRoot;
+        root["nodes"].push_back({{"children",{0}}, {"translation",{2.0,0.0,0.0}}});
+        root["animations"][0]["channels"].push_back(
+            {{"sampler",0},{"target",{{"node",2},{"path","translation"}}}});
+        videohelper::gltf::GlbAnimationDecodeOptions options;
+        options.retainGeometryHierarchy=true;
+        const auto decoded=videohelper::gltf::decodeGlbAnimations(makeGlb(root,animatedBin),options,error);
+        check(decoded && decoded->deformation->skins()[0].joints().size()==3
+            && decoded->deformation->skins()[0].joints()[0].id().value==2
+            && decoded->deformation->skins()[0].joints()[0].parent().value==1
+            && decoded->deformation->skins()[0].joints()[1].parent().value==3,
+            "Geometry3D skin decoding retains non-joint ancestors without reindexing vertex influences");
+        check(decoded && decoded->clips[0].jointBindings.size()==2
+            && decoded->renderBindings[0].jointBaseTransforms.size()==3,
+            "Geometry3D parent animation and base transforms share the original node identities");
+        auto matrixParent = root;
+        matrixParent["nodes"].push_back({{"children", {2}}, {"matrix",
+            {1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 3.0,0.0,0.0,1.0}}});
+        const auto matrixDecoded = videohelper::gltf::decodeGlbAnimations(
+            makeGlb(matrixParent, animatedBin), options, error);
+        check(matrixDecoded && matrixDecoded->renderBindings.size() == 1
+            && matrixDecoded->renderBindings[0].jointBaseTransforms.size() == 4
+            && matrixDecoded->renderBindings[0].jointBaseTransforms.back().matrix
+            && (*matrixDecoded->renderBindings[0].jointBaseTransforms.back().matrix)[12] == 3.0f,
+            "static matrix ancestors retain their exact transforms in the native skin palette");
+        root["nodes"][0].erase("skin");
+        root.erase("skins");
+        root["meshes"][0]["primitives"][0]["attributes"].erase("JOINTS_0");
+        root["meshes"][0]["primitives"][0]["attributes"].erase("WEIGHTS_0");
+        root["animations"][0]["channels"].erase(root["animations"][0]["channels"].begin());
+        const auto rigid=videohelper::gltf::decodeGlbAnimations(makeGlb(root,animatedBin),options,error);
+        check(rigid && rigid->deformation->meshes()[0].skin().isValid()
+            && rigid->deformation->meshes()[0].jointWeightSets()[0].weights()[0]==1.0f
+            && rigid->deformation->skins()[0].joints()[0].id().value==1,
+            "Geometry3D retains rigid mesh parent tracks alongside named morph animation");
+    }
+    {
         error.clear();
         const auto decoded = videohelper::gltf::decodeGlbAnimations(
             makeGlb(animatedRoot, animatedBin), {}, error);
@@ -1040,6 +1528,13 @@ int main()
         root["skins"].push_back(root["skins"][0]);
         check(animationRejected(root, animatedBin),
               "an animated joint shared by multiple skins is rejected by the bounded binding model");
+        {
+            auto options = videohelper::nativeImportedAnimationDecodeOptions(animatedBin.size());
+            options.admission.limits.maxContainerBytes = 512u * 1024u * 1024u;
+            const auto shared = videohelper::gltf::decodeGlbAnimations(makeGlb(root, animatedBin), options, error);
+            check(shared && shared->clips[0].jointBindings.size() == 2,
+                  "native scene animation retains one sampled node binding for each skin ancestor chain");
+        }
 
         root = animatedRoot;
         root["nodes"].push_back({{"mesh", 0}, {"skin", 0}});
@@ -1278,6 +1773,41 @@ int main()
                          == exportEvaluation.deformation->morphWeights()[0].values(),
               "preview and export consume one playback mapping and deformation snapshot contract");
 
+        auto controlled = request;
+        controlled.meshStableId = 1;
+        controlled.pose.meshStableId = 1;
+        controlled.pose.boneEnabled = true;
+        controlled.pose.boneStableId = 2;
+        controlled.pose.translation[1] = 0.5;
+        controlled.pose.morphEnabled = true;
+        controlled.pose.morphTargetStableId = 2;
+        controlled.pose.morphTargetIndex = 1;
+        controlled.pose.morphWeight = 0.8;
+        check(consumer.evaluatePreview(controlled, frame, 77, preview, error)
+                  && consumer.evaluateExport(controlled, frame, 77, exportEvaluation, error)
+                  && preview.deformation->pose().boneStableId == 2
+                  && preview.deformation->pose().translation[1] == 0.5
+                  && preview.deformation->pose().morphTargetIndex == 1
+                  && preview.deformation->pose().morphWeight == 0.8
+                  && exportEvaluation.deformation->pose().morphWeight == 0.8
+                  && preview.deformation->time() == exportEvaluation.deformation->time(),
+              "selected GLB bone and second named morph retain exact controls for preview and export");
+        auto missingBone = controlled;
+        auto legacyPose = controlled;
+        legacyPose.pose.morphTargetIndex = visualanimation::kUnresolvedMorphTargetIndex;
+        check(consumer.evaluatePreview(legacyPose, frame, 77, preview, error)
+                  && preview.deformation->pose().morphTargetIndex == 1,
+              "an older named morph selector resolves its exact mesh-local index during admission");
+        missingBone.pose.boneStableId = 1;
+        check(!consumer.evaluatePreview(missingBone, frame, 77, preview, error)
+                  && error.find("selected bone") != std::string::npos,
+              "the selected bone must belong to the exact GLB mesh skin");
+        auto mismatchedMorph = controlled;
+        mismatchedMorph.pose.morphTargetStableId = 1;
+        check(!consumer.evaluateExport(mismatchedMorph, frame, 77, exportEvaluation, error)
+                  && error.find("catalog identity") != std::string::npos,
+              "a named morph selection cannot silently address another target index");
+
         auto mismatched = request;
         mismatched.asset.contentSha256[0] = mismatched.asset.contentSha256[0] == '0' ? '1' : '0';
         videohelper::ImportedAnimationDeformationEvaluation unchanged;
@@ -1325,6 +1855,56 @@ int main()
                   unnamedClip, unnamedBytes.data(), unnamedBytes.size(), error)
                   && error.empty(),
               "stable animation selectors admit an unnamed clip without synthesizing a name");
+
+        auto repeatedRoot = animatedRoot;
+        repeatedRoot["nodes"].push_back({{"mesh", 0}, {"skin", 0}, {"name", "Repeated"}});
+        repeatedRoot["nodes"][0]["name"] = "Repeated";
+        repeatedRoot["scenes"][0]["nodes"].push_back(2);
+        auto repeatedMorph = repeatedRoot["animations"][0]["channels"][1];
+        repeatedMorph["target"]["node"] = 2;
+        repeatedRoot["animations"][0]["channels"].push_back(repeatedMorph);
+        repeatedRoot["animations"].push_back(repeatedRoot["animations"][0]);
+        const auto repeatedBytes = makeGlb(repeatedRoot, animatedBin);
+        videohelper::Sha256 repeatedHash;
+        repeatedHash.update(repeatedBytes.data(), repeatedBytes.size());
+        auto repeatedRequest = controlled;
+        repeatedRequest.asset.contentSha256 = repeatedHash.finishHex();
+        repeatedRequest.asset.sourceByteSize = repeatedBytes.size();
+        repeatedRequest.meshStableId = 0;
+        repeatedRequest.pose.nodeStableId = 3;
+        const auto repeatedDecoded = videohelper::gltf::decodeGlbAnimations(
+            repeatedBytes, videohelper::nativeImportedAnimationDecodeOptions(repeatedBytes.size()), error);
+        check(repeatedDecoded && repeatedDecoded->renderBindings.size() == 2
+            && repeatedDecoded->renderBindings[0].mesh == repeatedDecoded->renderBindings[1].mesh
+            && repeatedDecoded->renderBindings[0].skin == repeatedDecoded->renderBindings[1].skin
+            && repeatedDecoded->renderBindings[0].nodeIndex == 0
+            && repeatedDecoded->renderBindings[1].nodeIndex == 2,
+            "repeated animated nodes retain distinct bindings to the shared authored mesh and skin");
+        videohelper::ImportedAnimationDeformationConsumer repeatedConsumer;
+        check(repeatedConsumer.admit(repeatedRequest, repeatedBytes.data(), repeatedBytes.size(), error)
+            && repeatedConsumer.evaluatePreview(repeatedRequest, frame, 77, preview, error)
+            && repeatedConsumer.evaluateExport(repeatedRequest, frame, 77, exportEvaluation, error)
+            && preview.deformation->morphWeights().size() == 2
+            && preview.deformation->morphWeights()[0].mesh() == preview.deformation->morphWeights()[1].mesh()
+            && preview.deformation->morphWeights()[0].animationTarget()
+                != preview.deformation->morphWeights()[1].animationTarget()
+            && preview.deformation->pose().nodeStableId == 3
+            && exportEvaluation.deformation->pose().nodeStableId == 3,
+            "Whole scene evaluates repeated mesh morph tracks and selected shared-skin pose by exact node");
+        auto ambiguousPose = repeatedRequest;
+        ambiguousPose.meshStableId = 1;
+        ambiguousPose.pose.nodeStableId = 0;
+        check(!repeatedConsumer.evaluatePreview(ambiguousPose, frame, 77, preview, error)
+            && error.find("select an exact object node ID") != std::string::npos,
+            "mesh-only pose selection fails closed when repeated nodes make it ambiguous");
+        auto ambiguousClip = repeatedRequest;
+        ambiguousClip.animationClipStableId = 0;
+        check(!repeatedConsumer.evaluatePreview(ambiguousClip, frame, 77, preview, error)
+            && error == "imported animation/deformation named clip is ambiguous",
+            "duplicate clip names require a stable clip ID");
+        repeatedRequest.animationClipStableId = 2;
+        check(repeatedConsumer.evaluatePreview(repeatedRequest, frame, 77, preview, error),
+            "an exact stable clip ID disambiguates duplicate names without renaming asset content");
 
         auto multiMeshRoot = animatedRoot;
         multiMeshRoot["meshes"].push_back(multiMeshRoot["meshes"][0]);

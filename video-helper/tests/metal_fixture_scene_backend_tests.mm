@@ -3,7 +3,15 @@
 #include "../src/diffraction_material_execution.h"
 #include "../src/fixture_scene_renderer.h"
 #include "support/fixture_scene.h"
+#include "support/vertex_modifier_fixture.h"
+#include "support/diffraction_environment_cases.h"
 #include "support/surface_material_starter_oracle.h"
+#include "support/generated_surface_scene.h"
+#include "support/render_pass_program_cases.h"
+#include "support/material_frame_binding_cases.h"
+#include "support/native_scene_orientation_fixture.h"
+#include "support/raw_pass_readback_checks.h"
+#include "support/linear_scene_hdr_checks.h"
 #include "../src/sha256.h"
 #include "../../shared/DiffractionMaterialPresets.h"
 #include "../../shared/generated/SurfaceMaterialStarterPrograms.h"
@@ -20,6 +28,7 @@
 #include <cstddef>
 #endif
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -36,21 +45,23 @@ bool expect(bool condition, const char* message)
 }
 
 std::vector<std::uint8_t> readBgra8(
-    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame)
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame,
+    renderpassoutput::Output output = renderpassoutput::Output::Color)
 {
-    if (!frame || frame->colorImageHandle() == 0)
+    if (!frame || !frame->passTextureDescriptor(output).complete())
         return {};
     sg_image image {};
-    image.id = static_cast<std::uint32_t>(frame->colorImageHandle());
+    image.id = static_cast<std::uint32_t>(frame->passTextureDescriptor(output).imageHandle);
     const auto imageInfo = sg_mtl_query_image_info(image);
     if (imageInfo.active_slot < 0 || imageInfo.active_slot >= SG_NUM_INFLIGHT_FRAMES)
         return {};
     id<MTLTexture> texture = (__bridge id<MTLTexture>) imageInfo.tex[imageInfo.active_slot];
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) sg_mtl_command_queue();
-    if (texture == nil || queue == nil || texture.pixelFormat != MTLPixelFormatBGRA8Unorm)
+    if (texture == nil || queue == nil)
         return {};
-
-    const auto tightRowBytes = static_cast<std::size_t>(frame->width()) * 4u;
+    const auto bytesPerPixel = output == renderpassoutput::Output::Normal
+        || output == renderpassoutput::Output::Emission ? 8u : output == renderpassoutput::Output::Mask ? 1u : 4u;
+    const auto tightRowBytes = static_cast<std::size_t>(frame->width()) * bytesPerPixel;
     const auto rowBytes = (tightRowBytes + 255u) & ~std::size_t(255u);
     id<MTLBuffer> buffer = [texture.device newBufferWithLength:rowBytes * frame->height()
                                                    options:MTLResourceStorageModeShared];
@@ -198,10 +209,29 @@ int main()
     {
         auto& backend = arbitgpu::nativeFixtureSceneBackend();
         const auto info = backend.info();
+        std::string linearError;
+        const bool linearCaptured = linearscenechecks::capture(backend, linearError) != nullptr;
+        if (!expect(linearCaptured, linearError.c_str()))
+            return EXIT_FAILURE;
         if (!info.available || info.backend != "metal")
         {
             std::cerr << "FAIL: strict physical Metal fixture backend unavailable: "
                       << info.error << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!videohelper::tests::materialFrameBindingCases(backend, [](const auto& frame)
+            {
+                auto pixels = readBgra8(frame);
+                for (std::size_t i = 0; i < pixels.size(); i += 4)
+                    std::swap(pixels[i], pixels[i + 2]);
+                return pixels;
+            })) return EXIT_FAILURE;
+
+        std::string orientationError;
+        if (!expect(videohelper::tests::orientation::materialOrientationCases(backend, orientationError),
+                    "embedded textures and native Frames preserve four-quadrant text orientation"))
+        {
+            std::cerr << orientationError << '\n';
             return EXIT_FAILURE;
         }
 
@@ -222,6 +252,7 @@ int main()
         rasterSceneValue.materials[0].doubleSided = true;
         rasterSceneValue.textureCount = 0;
         rasterSceneValue.textureTexelCount = 0;
+        rasterSceneValue.textureTexels.clear();
         rasterSceneValue.lightCount = 0;
         rasterSceneValue.ambientColor = { 1.0f, 1.0f, 1.0f };
         auto rasterScene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(
@@ -279,6 +310,172 @@ int main()
         const auto oracle = surfacematerialstarteroracle::load(
             SURFACE_MATERIAL_STARTER_ORACLE_PATH);
         bool starterOk = true;
+        auto outputSceneValue = videohelper::fixture3d::makeScene();
+        outputSceneValue.objects[0].transform = {};
+        outputSceneValue.cameras[0].transform = {};
+        outputSceneValue.cameras[0].transform.translation.z = 5.0f;
+        outputSceneValue.materials[0].emissive = { 0.8f, 0.08f, 0.02f };
+        auto outputScene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(outputSceneValue);
+        auto outputResources = backend.prepare(outputScene, nullptr);
+        starterOk &= expect(outputResources.prepared, "Metal output inspection scene prepares");
+        const auto rawFrame = backend.render(outputScene, outputResources.resources, 64, 64, {});
+        starterOk &= expect(rawFrame.rendered && rawFrame.frame != nullptr, "Metal raw passes share one native scene draw");
+        if (rawFrame.frame)
+        {
+            rawpasschecks::verify(rawFrame.frame, [&](bool condition, const char* message)
+                { starterOk &= expect(condition, message); });
+            for (const auto output : renderpassoutput::kOutputs)
+            {
+                auto expected = readBgra8(rawFrame.frame, output);
+                if (output == renderpassoutput::Output::Color)
+                    for (std::size_t offset = 0; offset + 3 < expected.size(); offset += 4)
+                        std::swap(expected[offset], expected[offset + 2]);
+                arbitgpu::NativeRawPassPixels exported;
+                std::string readError;
+                starterOk &= expect(rawFrame.frame->readRawPass(output, exported, readError)
+                    && exported.bytes == expected, "Metal export preserves top-first raw bytes and normalizes BGRA Image to RGBA");
+            }
+            const auto center = 32u * 64u + 32u;
+            const auto stationaryMotion = readBgra8(rawFrame.frame, renderpassoutput::Output::Motion);
+            starterOk &= expect(stationaryMotion.size() == 64u * 64u * 4u
+                && std::all_of(stationaryMotion.begin(), stationaryMotion.end(), [](auto byte) { return byte == 0; }),
+                "Metal first-frame Motion is raw zero RG16F, not display gray");
+            arbitgpu::NativeFixtureSceneRuntimeInputs moving;
+            moving.previousMotion = arbitgpu::NativeSceneMotionSample {};
+            moving.objectTranslationOffset[0] = 0.25f;
+            moving.passComposite = renderpasscomposite::Parameters {};
+            moving.passComposite->mode = renderpasscomposite::Mode::MotionView;
+            moving.passComposite->amount = 0;
+            const auto moved = backend.render(outputScene, outputResources.resources, 64, 64, moving);
+            const auto repeated = backend.render(outputScene, outputResources.resources, 64, 64, moving);
+            const auto motion = readBgra8(moved.frame, renderpassoutput::Output::Motion);
+            std::uint16_t x = 0, y = 1;
+            if (motion.size() == 64u * 64u * 4u)
+            { std::memcpy(&x, motion.data() + center * 4u, 2); std::memcpy(&y, motion.data() + center * 4u + 2u, 2); }
+            starterOk &= expect(moved.rendered && repeated.rendered
+                && moved.stats.drawCount == rawFrame.stats.drawCount
+                && moved.frame->passTextureDescriptor(renderpassoutput::Output::Motion).format
+                    == arbitgpu::NativeTexturePixelFormat::Rg16Float
+                && x > 0 && x < 0x7c00u && (y & 0x7fffu) == 0
+                && motion == readBgra8(repeated.frame, renderpassoutput::Output::Motion)
+                && readBgra8(moved.frame) == readBgra8(repeated.frame),
+                "Metal object motion is positive, finite and repeatable without another scene draw");
+            auto directMotion = moving;
+            directMotion.passComposite.reset();
+            directMotion.imageOutput = renderpassoutput::Output::Motion;
+            const auto direct = backend.render(outputScene, outputResources.resources, 64, 64, directMotion);
+            starterOk &= expect(direct.rendered && readBgra8(direct.frame) == readBgra8(moved.frame)
+                && readBgra8(direct.frame, renderpassoutput::Output::Motion) == motion,
+                "Metal Motion Image selection matches the raw-pass inspector and preserves raw vectors");
+            moving.objectTranslationOffset[0] = 0;
+            moving.cameraTranslationOffset[0] = 0.25f;
+            const auto cameraMoved = backend.render(outputScene, outputResources.resources, 64, 64, moving);
+            const auto cameraMotion = readBgra8(cameraMoved.frame, renderpassoutput::Output::Motion);
+            x = 0;
+            if (cameraMotion.size() == 64u * 64u * 4u) std::memcpy(&x, cameraMotion.data() + center * 4u, 2);
+            starterOk &= expect(cameraMoved.rendered && (x & 0x8000u) != 0 && (x & 0x7fffu) != 0,
+                "Metal camera translation produces negative motion");
+            for (const auto output : { renderpassoutput::Output::MaterialId, renderpassoutput::Output::ObjectId })
+            {
+                const auto descriptor = rawFrame.frame->passTextureDescriptor(output);
+                const auto bytes = readBgra8(rawFrame.frame, output);
+                std::uint32_t actual = 0, background = 1;
+                if (bytes.size() == 64u * 64u * 4u)
+                { std::memcpy(&actual, bytes.data() + center * 4u, 4); std::memcpy(&background, bytes.data(), 4); }
+                const auto expected = output == renderpassoutput::Output::MaterialId
+                    ? outputSceneValue.objects[0].material.value : outputSceneValue.objects[0].id.value;
+                starterOk &= expect(descriptor.format == arbitgpu::NativeTexturePixelFormat::R32Uint
+                    && actual == expected && background == 0, "Metal integer attachments preserve scene IDs");
+            }
+            const auto normal = readBgra8(rawFrame.frame, renderpassoutput::Output::Normal);
+            std::array<std::uint16_t, 4> components {};
+            if (normal.size() == 64u * 64u * 8u) std::memcpy(components.data(), normal.data() + center * 8u, 8);
+            starterOk &= expect(components[0] == 0 && components[1] == 0 && components[2] == 0x3c00u,
+                "Metal raw normal contains signed XYZ values before display conversion");
+            for (const auto mode : { renderpasscomposite::Mode::DepthFog, renderpasscomposite::Mode::ObjectMatte })
+            {
+                arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+                inputs.passComposite = renderpasscomposite::Parameters {};
+                inputs.passComposite->mode = mode;
+                inputs.passComposite->farDepth = 0.001f;
+                inputs.passComposite->fogColor = { 0.2f, 0.4f, 0.6f };
+                inputs.passComposite->identity = outputSceneValue.objects[0].id.value;
+                const auto composed = backend.render(outputScene, outputResources.resources, 64, 64, inputs);
+                const auto pixels = composed.frame ? readBgra8(composed.frame) : std::vector<std::uint8_t> {};
+                starterOk &= expect(composed.rendered && composed.stats.reusedStaticResources
+                    && pixels.size() == 64u * 64u * 4u, "Metal pass composition retains native scene resource reuse");
+                if (pixels.size() == 64u * 64u * 4u)
+                    starterOk &= expect(std::abs(static_cast<int>(pixels[center * 4u])
+                        - (mode == renderpasscomposite::Mode::DepthFog ? 153 : 255)) <= 1,
+                        "Metal depth fog and ID matte consume raw scene values");
+            }
+        }
+        {
+            arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+            inputs.passProgram = renderpassfixture::hdrBranches();
+            inputs.passComposite = inputs.passProgram->steps[inputs.passProgram->output].parameters;
+            const auto composed = backend.render(outputScene, outputResources.resources, 64, 64, inputs);
+            const auto pixels = composed.frame ? readBgra8(composed.frame) : std::vector<std::uint8_t> {};
+            const auto expected = renderpassfixture::expectedSdr();
+            starterOk &= expect(composed.rendered && pixels.size() == 64u * 64u * 4u,
+                "Metal HDR branches use the native scene compositor");
+            if (pixels.size() == 64u * 64u * 4u)
+                for (std::size_t channel = 0; channel < 3; ++channel)
+                    starterOk &= expect(std::abs(static_cast<int>(pixels[(32u * 64u + 32u) * 4u + 2u - channel])
+                        - expected[channel]) <= 1,
+                        "Metal linear HDR and sRGB conversion match the shared branch reference");
+            const auto repeated = backend.render(outputScene, outputResources.resources, 64, 64, inputs);
+            starterOk &= expect(repeated.rendered && readBgra8(repeated.frame) == pixels,
+                "Metal pass branching is repeatable for preview and export");
+            inputs.passProgram->steps[2].inputA = 3;
+            starterOk &= expect(!backend.render(outputScene, outputResources.resources, 64, 64, inputs).rendered,
+                "Metal rejects a forward pass reference");
+        }
+        for (const auto output : { renderpassoutput::Output::Depth, renderpassoutput::Output::Normal,
+                                  renderpassoutput::Output::Motion,
+                                  renderpassoutput::Output::Emission, renderpassoutput::Output::Mask,
+                                  renderpassoutput::Output::MaterialId, renderpassoutput::Output::ObjectId })
+        {
+            arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+            inputs.imageOutput = output;
+            const auto frame = backend.render(outputScene, outputResources.resources, 64, 64, inputs);
+            starterOk &= expect(frame.rendered && frame.frame != nullptr,
+                                "each Render 3D inspection output draws on Metal");
+            if (!frame.frame) continue;
+            const auto pixels = readBgra8(frame.frame);
+            if (pixels.size() != 64u * 64u * 4u)
+            {
+                starterOk = false;
+                continue;
+            }
+            const auto centerPixel = (32u * 64u + 32u) * 4u;
+            std::array<float, 3> expected {};
+            if (output == renderpassoutput::Output::Normal) expected = { 0.5f, 0.5f, 1.0f };
+            if (output == renderpassoutput::Output::Motion) expected = { 0.5f, 0.5f, 0.5f };
+            if (output == renderpassoutput::Output::Emission) expected = { 0.8f, 0.08f, 0.02f };
+            if (output == renderpassoutput::Output::Mask) expected = { 1.0f, 1.0f, 1.0f };
+            if (output == renderpassoutput::Output::MaterialId)
+                expected = render3dimage::identityColor(outputSceneValue.objects[0].material.value);
+            if (output == renderpassoutput::Output::ObjectId)
+                expected = render3dimage::identityColor(outputSceneValue.objects[0].id.value);
+            if (output == renderpassoutput::Output::Depth)
+            {
+                const auto& camera = outputSceneValue.cameras[0];
+                const auto depth = (4.0f - camera.nearPlane) / (camera.farPlane - camera.nearPlane);
+                expected = { depth, depth, depth };
+            }
+            for (std::size_t channel = 0; channel < 3; ++channel)
+                starterOk &= expect(std::abs(static_cast<int>(pixels[centerPixel + 2u - channel])
+                    - static_cast<int>(std::lround(expected[channel] * 255.0f))) <= 1,
+                    "Metal inspection pixels contain the requested native quantity");
+            starterOk &= expect(pixels[centerPixel + 3u] == 255 && pixels[3] == 0,
+                                "Metal inspection retains coverage and transparent background");
+            const auto repeated = backend.render(outputScene, outputResources.resources, 64, 64, inputs);
+            starterOk &= expect(repeated.rendered && readBgra8(repeated.frame) == pixels
+                                    && repeated.stats.reusedStaticResources,
+                                "Metal output inspection is deterministic and reuses native geometry");
+        }
+        outputResources.resources.reset();
         std::vector<std::uint8_t> sampledStarterPixels;
         const auto center = (32u * 64u + 32u) * 4u;
         for (std::size_t starterIndex = 0;
@@ -289,7 +486,11 @@ int main()
             starterOk = expect(expected.id == starter.id,
                                "generated programs and independent JSON oracle must share stable IDs")
                 && starterOk;
-            auto starterSceneValue = surfaceSceneValue;
+            std::string generatedError;
+            auto generatedScene = videohelper::tests::generatedSurfaceScene(surfaceSceneValue, generatedError);
+            starterOk &= expect(generatedScene.has_value(), "Metal exact starter uses admitted generated Geometry Core transport");
+            if (!generatedScene) continue;
+            auto starterSceneValue = std::move(*generatedScene);
             starterSceneValue.materials[0].id = {starter.materialIdValue()};
             starterSceneValue.objects[0].material = {starter.materialIdValue()};
             const auto starterScene
@@ -362,6 +563,52 @@ int main()
                 && expect(!previewPixels.empty() && previewPixels == exportPixels,
                           "preview and export owners must produce exact matching Metal pixels")
                 && starterOk;
+            if (starterIndex == 0)
+            {
+                auto vertexRequest = request;
+                vertexRequest.vertexModifier = videohelper::test::audioNormalDisplacement();
+                const auto vertexBinding = videorender::fixture3d::admitSurfaceMaterialBinding(
+                    starterScene, vertexRequest, videohelper::materialprogram::BackendTarget::Metal, starterError);
+                const auto prepared = vertexBinding ? backend.prepare(starterScene, vertexBinding->nativeProgram())
+                                                    : arbitgpu::NativeFixtureScenePreparation {};
+                starterOk &= expect(vertexBinding != nullptr && prepared.prepared,
+                                    "audio vertex material reaches Metal shader compilation");
+                if (vertexBinding)
+                {
+                    auto mismatched = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(
+                        *vertexBinding->nativeProgram());
+                    mismatched->programIdentity = binding->nativeProgram()->programIdentity;
+                    starterOk &= expect(!backend.prepare(starterScene, mismatched).prepared,
+                        "Metal rejects a substituted vertex shader identity");
+                }
+                if (prepared.prepared)
+                {
+                    arbitgpu::NativeFixtureSceneRuntimeInputs quiet, loud;
+                    loud.vertexSpectrum[6] = 0.5f;
+                    const auto quietFrame = backend.render(starterScene, prepared.resources, 64, 64, quiet);
+                    const auto loudFrame = backend.render(starterScene, prepared.resources, 64, 64, loud);
+                    const auto replayFrame = backend.render(starterScene, prepared.resources, 64, 64, quiet);
+                    const auto quietPixels = quietFrame.rendered ? readBgra8(quietFrame.frame) : std::vector<std::uint8_t> {};
+                    const auto loudPixels = loudFrame.rendered ? readBgra8(loudFrame.frame) : std::vector<std::uint8_t> {};
+                    starterOk &= expect(!quietPixels.empty() && quietPixels == previewPixels
+                        && !loudPixels.empty() && loudPixels != quietPixels
+                        && replayFrame.rendered && readBgra8(replayFrame.frame) == quietPixels,
+                        "Metal vertex displacement follows audio and replay restores original geometry");
+                    loud.vertexSpectrum[6] = 1.0f;
+                    const auto boundedFrame = backend.render(starterScene, prepared.resources, 64, 64, loud);
+                    starterOk &= expect(boundedFrame.rendered && readBgra8(boundedFrame.frame) == loudPixels,
+                        "Metal vertex displacement remains inside its authored bound");
+                    videorender::fixture3d::RenderedFrame vertexExport;
+                    starterOk &= expect(exportOwner.renderExport(starterScene, vertexBinding, {}, loud,
+                        {64, 64}, videorender::fixture3d::kNativeGpuCapability, vertexExport, starterError)
+                        && readBgra8(vertexExport.nativeFrame) == loudPixels,
+                        "Metal vertex deformation preview and export have identical pixels");
+                    loud.passComposite = renderpasscomposite::Parameters {};
+                    loud.passComposite->mode = renderpasscomposite::Mode::MotionView;
+                    starterOk &= expect(!backend.render(starterScene, prepared.resources, 64, 64, loud).rendered,
+                        "Metal reports unsupported motion inspection for vertex deformation");
+                }
+            }
             if (previewPixels.size() > center + 3u)
             {
                 const std::array<std::uint8_t, 4> actualRgba {{
@@ -414,9 +661,21 @@ int main()
                         { p.baseColorMetallic[3] = 0.0f; }),
                         "Metal lit pixels must detect a wrong metallic binding") && starterOk;
                 if (starterIndex == 2)
+                {
                     starterOk = expect(rejectsControlledMaterialAlternative("/opacity", [] (auto& p)
                         { p.normalOpacity[3] = 1.0f; }),
                         "Metal lit pixels must detect a wrong opacity binding") && starterOk;
+                    starterOk &= expect(rejectsControlledMaterialAlternative("/transmission", [] (auto& p)
+                        { p.transmissionIorClearcoat[0] = 0.0f; }),
+                        "Metal lit pixels must detect a wrong transmission binding");
+                    starterOk &= expect(rejectsControlledMaterialAlternative("/ior", [] (auto& p)
+                        { p.transmissionIorClearcoat[1] = 2.8f; }),
+                        "Metal lit pixels must detect a wrong IOR binding");
+                }
+                if (starterIndex == 3)
+                    starterOk &= expect(rejectsControlledMaterialAlternative("/clearcoat", [] (auto& p)
+                        { p.transmissionIorClearcoat[2] = 0.0f; }),
+                        "Metal lit pixels must detect a wrong clearcoat binding");
 
                 if (starterIndex != 0)
                     continue;
@@ -517,6 +776,9 @@ int main()
             return EXIT_FAILURE;
         }
         const auto& scene = cardAsset->scene;
+        starterOk = diffractionenvironmenttests::run(backend, scene, cardAsset->operation,
+            videohelper::materialprogram::BackendTarget::Metal,
+            [](const auto& frame) { return readBgra8(frame); }) && starterOk;
         bool ok = expect(cardAsset->assetId
                              == "builtin.visual-model.holographic-trading-card"
                          && cardAsset->contentSha256
@@ -788,6 +1050,9 @@ int main()
         const auto transportPreparation = backend.prepare(scene, transportProgram);
         const auto transportFrame = backend.render(
             scene, transportPreparation.resources, 96, 96, {});
+        const bool linearDiffraction = linearscenechecks::diffraction(backend, scene,
+            transportPreparation.resources, linearError);
+        if (!expect(linearDiffraction, linearError.c_str())) return EXIT_FAILURE;
         const bool everyPathSubmitted = transportPreparation.prepared
             && transportFrame.rendered
             && transportFrame.stats.drawCount == transportKinds.size();

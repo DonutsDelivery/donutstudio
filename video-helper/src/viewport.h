@@ -32,6 +32,7 @@
 #include "render_snapshot.h"
 #include "visual_plan_telemetry.h"
 #include "node_preview_presentation.h"
+#include "mix_analyze.h"
 
 #include <atomic>
 #include <cstdint>
@@ -221,14 +222,17 @@ public:
 
     std::string setTimeline (std::vector<ViewportSegment> segments,
                              std::vector<videowire::CompiledVisualLayerPlan> plans = {},
-                             std::vector<videowire::VisualEventScheduleBinding> eventSchedules = {});
+                             std::vector<videowire::VisualEventScheduleBinding> eventSchedules = {},
+                             std::shared_ptr<const videorender::VisualParameterTimeline> parameterTimeline = {});
     std::string setInspectionTarget (int clipId, uint64_t structuralRevision,
                                      int nodeId, int outputPort);
     std::string describeInspection() const;
     std::string setInspectionPresentation (videopreview::State state);
-    bool installSnapshot (videowire::ResolvedVisualSnapshot snapshot);
+    bool installSnapshot (videowire::ResolvedVisualSnapshot snapshot,
+                          std::string* errorOut = nullptr);
     bool beginSnapshot (uint64_t authoringRevision);
-    bool completeSnapshot (videowire::ResolvedVisualSnapshot snapshot);
+    bool completeSnapshot (videowire::ResolvedVisualSnapshot snapshot,
+                           std::string* errorOut = nullptr);
     bool rejectSnapshot (uint64_t authoringRevision);
     videowire::RevisionTuple revisionState() const;
     bool advanceEvaluation (uint64_t sequence);
@@ -252,7 +256,8 @@ public:
     // those features instead of zero. Empty path clears it (back to zero-feed
     // when stopped). Decode/analyze runs on the calling RPC thread, not the
     // render thread. No effect while playing (live ring stays authoritative).
-    void setAudioMix (const std::string& wavPath);
+    std::string setAudioMix (const std::string& wavPath,
+                            const std::vector<videohelper::AnalysisSourcePath>& sources = {});
 
     // M5 Block C live preview: the owned note/link score that score-reactive
     // shader clips read (uNotes/uLinks/uNoteCount). Mirrors the export jobSpec's

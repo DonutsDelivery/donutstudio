@@ -1,6 +1,9 @@
 #pragma once
 
 #include "render_snapshot.h"
+#include "typed_scene_pass_plan.h"
+#include "../../shared/GeometryCoreScene.h"
+#include "../../shared/VisualImportedSceneRenderOperationContract.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -173,7 +176,8 @@ namespace visualresource_detail
 inline bool isSceneRecord (const std::string& dataType)
 {
     static const std::set<std::string> types {
-        "scene3D", "transform3D", "material", "light", "camera", "sdf", "animationClip"
+        "scene3D", "transform3D", "material", "light", "camera", "sdf", "animationClip",
+        "mesh", "skeleton", "morphTargets", "volume"
     };
     return types.count (dataType) != 0;
 }
@@ -182,6 +186,8 @@ inline uint64_t bytesPerPixel (const std::string& pixelFormat)
 {
     if (pixelFormat == "r8") return 1;
     if (pixelFormat == "r16") return 2;
+    if (pixelFormat == "rg16f") return 4;
+    if (pixelFormat == "r32f" || pixelFormat == "r32uint") return 4;
     if (pixelFormat == "rgba8") return 4;
     if (pixelFormat == "rgba16f") return 8;
     if (pixelFormat == "rgba32f") return 16;
@@ -228,6 +234,21 @@ inline bool accountVisualPlanResources (const CompiledVisualLayerPlan& plan,
         error = "visual resource admission found mismatched node descriptors";
         return false;
     }
+    if (hasTypedScenePass(plan))
+    {
+        typedscenepass::Payload payload;
+        std::optional<aovinspection::Payload> inspection;
+        CompiledVisualLayerPlan base;
+        if (!lowerTypedScenePass(plan, payload, inspection, base, error)) return false;
+        const auto& scene = *payload.scene.sceneSnapshot;
+        usage.descriptors = plan.nodeIds.size();
+        usage.operations = plan.operations.size();
+        usage.sceneRecords = scene.objectCount + scene.materialCount + scene.lightCount + scene.cameraCount;
+        usage.frameOutputs = usage.peakLiveFrames = usage.frameSlots = typedscenepass::kFrameSlots;
+        usage.allocatedFrameBytes = static_cast<std::uint64_t>(payload.extent.width) * payload.extent.height
+            * typedscenepass::kFrameBytesPerPixel;
+        return true;
+    }
 
     std::map<int, size_t> scheduleIndex;
     for (size_t index = 0; index < plan.nodeIds.size(); ++index)
@@ -239,6 +260,27 @@ inline bool accountVisualPlanResources (const CompiledVisualLayerPlan& plan,
 
     usage.descriptors = plan.nodeKinds.size();
     usage.operations = plan.operations.size();
+    const auto retainedScene = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(),
+        geometry::kRetainedSceneOperation);
+    const bool hasRetainedScene = retainedScene != plan.nodeKinds.end();
+    if (hasRetainedScene)
+    {
+        const auto render = std::find_if(plan.operations.begin(), plan.operations.end(),
+            [](const CompiledVisualOperation& operation)
+            { return operation.kind == "visual.3d.render"; });
+        visualimportedscenerender::Request request;
+        std::string payloadError;
+        if (render == plan.operations.end()
+            || ! visualimportedscenerender::decodeCanonical(render->payloadXml, request, payloadError)
+            || request.sceneSnapshot == nullptr)
+        {
+            error = "visual resource admission requires the exact retained scene payload";
+            return false;
+        }
+        const auto& scene = *request.sceneSnapshot;
+        usage.sceneRecords = scene.objectCount + scene.materialCount
+            + scene.lightCount + scene.cameraCount;
+    }
     std::map<std::pair<int, int>, const CompiledVisualPortBinding*> outputs;
     for (const auto& port : plan.ports)
     {
@@ -270,6 +312,32 @@ inline bool accountVisualPlanResources (const CompiledVisualLayerPlan& plan,
         use.lastUsedAt = std::max(use.lastUsedAt, destination->second);
     }
 
+
+    // Native collapsed terminals publish their Frame output directly to the
+    // layer bridge. The producer accounts that retained output even when the
+    // collapsed helper plan has no scheduled consumer edge for it.
+    static const std::set<std::string> collapsedFrameTerminals {
+        "geometry.core.runtime", "geometry.harmonic-links.runtime",
+        "visual.sdf.raymarch", "visual.3d.render.passes",
+        "visual.3d.aov.depth", "visual.3d.aov.normal", "visual.3d.aov.emission",
+        "visual.3d.aov.mask", "visual.3d.aov.material-id", "visual.3d.aov.object-id",
+        "visual.depth.inspect", "visual.normal.inspect"
+    };
+    for (const auto& [identity, output] : outputs)
+    {
+        if (output->carrier != "frame" || usedOutputs.count(identity) != 0)
+            continue;
+        const auto node = scheduleIndex.find(identity.first);
+        if (node == scheduleIndex.end())
+            continue;
+        const auto& kind = plan.nodeKinds[node->second];
+        const bool retainedRenderImage = hasRetainedScene && kind == "visual.3d.render"
+            && output->port == 1 && output->dataType == "image";
+        if (! retainedRenderImage && collapsedFrameTerminals.count(kind) == 0)
+            continue;
+        usedOutputs[identity] = Use { output, node->second, node->second };
+    }
+
     std::vector<Lifetime> lifetimes;
     std::vector<FrameDescriptor> slots;
     std::vector<size_t> slotLiveUntil;
@@ -280,7 +348,7 @@ inline bool accountVisualPlanResources (const CompiledVisualLayerPlan& plan,
             if (use.producedAt != schedulePosition) continue;
             if (use.port->carrier != "frame")
             {
-                if (isSceneRecord(use.port->dataType)) ++usage.sceneRecords;
+                if (! hasRetainedScene && isSceneRecord(use.port->dataType)) ++usage.sceneRecords;
                 continue;
             }
             const auto pixelBytes = bytesPerPixel(use.port->pixelFormat);
@@ -349,6 +417,17 @@ inline bool admitVisualPlanResources (const CompiledVisualLayerPlan& plan,
     if (canvasWidth > limits.maximumImageDimension || canvasHeight > limits.maximumImageDimension)
         return capacityError("image dimension", static_cast<uint64_t>(std::max(canvasWidth, canvasHeight)),
                              static_cast<uint64_t>(limits.maximumImageDimension));
+    if (hasTypedScenePass(plan))
+    {
+        typedscenepass::Payload payload;
+        std::optional<aovinspection::Payload> inspection;
+        CompiledVisualLayerPlan base;
+        if (!lowerTypedScenePass(plan, payload, inspection, base, error)) return false;
+        const auto authoredDimension = std::max(payload.extent.width, payload.extent.height);
+        if (authoredDimension > static_cast<std::uint32_t>(limits.maximumImageDimension))
+            return capacityError("image dimension", authoredDimension,
+                                 static_cast<uint64_t>(limits.maximumImageDimension));
+    }
     if (usage.descriptors > limits.descriptors) return capacityError("descriptor", usage.descriptors, limits.descriptors);
     if (usage.operations > limits.operations) return capacityError("operation", usage.operations, limits.operations);
     if (usage.sceneRecords > limits.sceneRecords) return capacityError("scene record", usage.sceneRecords, limits.sceneRecords);
@@ -363,6 +442,18 @@ inline bool admitVisualPlanResources (const CompiledVisualLayerPlan& plan,
         || plan.allocatedFrameSlotCount != usage.frameSlots)
     {
         error = "visual resource admission disagrees with producer accounting";
+        const auto describeMismatch = [&error](const char* field, size_t producer, size_t helper)
+        {
+            if (producer != helper)
+                error += std::string("; ") + field + ": producer=" + std::to_string(producer)
+                       + ", helper=" + std::to_string(helper);
+        };
+        describeMismatch("descriptors", plan.descriptorCount, usage.descriptors);
+        describeMismatch("operations", plan.operationCount, usage.operations);
+        describeMismatch("sceneRecords", plan.sceneRecordCount, usage.sceneRecords);
+        describeMismatch("frameOutputs", plan.frameOutputCount, usage.frameOutputs);
+        describeMismatch("peakLiveFrames", plan.peakLiveFrameCount, usage.peakLiveFrames);
+        describeMismatch("frameSlots", plan.allocatedFrameSlotCount, usage.frameSlots);
         return false;
     }
     return true;

@@ -10,13 +10,17 @@
 #include "../../../shared/RenderPassOutputContract.h"
 #include "../../../shared/AovInspectionOperationContract.h"
 #include "../../../shared/SceneAovOperationContract.h"
+#include "../../../shared/Render3DImageOutput.h"
+#include "../../../shared/ColorTransformContract.h"
 #include "../optical_flow_contract.h"
 #include "../diffraction_material_execution.h"
 #include "../../../shared/DiffractionMaterialGpuLayout.h"
 #include "../../../shared/DiffractiveFoilIR.h"
 #include "../../../shared/DiffractionLightingPlan.h"
+#include "../../../shared/DiffractionRuntimeParameters.h"
 #include "../../../shared/SdfIr.h"
 #include "../../../shared/SurfaceMaterialIR.h"
+#include "../../../shared/SurfaceMaterialBindingContract.h"
 #include "../../../shared/Visual3DScene.h"
 #include "../../../shared/GeometryCore.h"
 #include "../../../shared/VisualNoteInstancingContract.h"
@@ -29,12 +33,15 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace arbitgpu { class NativeSdfCompiledProgram; }
+namespace videohelper::materialprogram { class MaterialProgramRecord; }
 namespace videohelper::geometry { class AdmittedPlanValue; }
 namespace videohelper::sdf
 {
@@ -270,6 +277,7 @@ public:
 // Process-owned strict native implementation. Unsupported builds report an
 // unavailable capability and reject every execution; there is no CPU fallback.
 NativeOpticalFlowExecutionBackend& nativeOpticalFlowExecutionBackend();
+void invalidateNativeOpticalFlowExecutionContext (std::uintptr_t contextIdentity) noexcept;
 
 // Cheap device/capability query.  Does not initialize sokol_gfx or submit GPU
 // work, so it is safe to expose in the regular version/capability RPCs.
@@ -288,6 +296,8 @@ enum class NativeSdfQuality : std::uint8_t
     count = 4
 };
 
+// Persistent SDF outputPass selections on the Image port. These values are
+// distinct from renderpassoutput::Output and do not select raw AOV attachments.
 enum class NativeSdfOutput : std::uint8_t
 {
     color = 0,
@@ -340,6 +350,8 @@ inline constexpr std::size_t kNativeSdfMaximumEvaluationSteps = 256;
 
 struct NativeSdfCompiledRecord final
 {
+    // Retain all 64 bits for the primitive-contributor visualization.
+    videowire::SdfStableId stableId = 0;
     std::uint32_t operation = 0;
     std::uint32_t input0 = std::numeric_limits<std::uint32_t>::max();
     std::uint32_t input1 = std::numeric_limits<std::uint32_t>::max();
@@ -415,6 +427,7 @@ struct NativeSdfResourceReceipt final
 
 // The frame owns every native resource created for one submitted SDF draw.
 // It contains no CPU pixels and may only be consumed by the matching backend.
+struct NativeTextureViewDescriptor;
 class NativeSdfSceneFrame
 {
 public:
@@ -424,8 +437,16 @@ public:
     virtual std::uint32_t height() const noexcept = 0;
     virtual std::uintptr_t colorImageHandle() const noexcept = 0;
     virtual std::uintptr_t colorTextureViewHandle() const noexcept = 0;
+    virtual NativeTextureViewDescriptor colorTextureDescriptor() const noexcept = 0;
     virtual const FrameMemoryAdmission& frameMemoryAdmission() const noexcept = 0;
     virtual const NativeSdfResourceReceipt& sdfResourceReceipt() const noexcept = 0;
+    // Explicit diagnostic readback preserves finite float map values for native
+    // acceptance. Normal rendering and composition remain GPU-owned.
+    virtual bool readColorFloatPixels (std::vector<float>& output) const
+    {
+        output.clear();
+        return false;
+    }
     virtual bool readColorPixels (std::vector<std::uint8_t>& output) const
     {
         output.clear();
@@ -486,6 +507,8 @@ struct NativeFixtureSceneStats
     // pixel slot reserved for one admitted lighting path.
     std::uint64_t diffractionEvaluationBudget = 0;
     std::uint64_t diffractionEvaluationCount = 0;
+    // Successful native shader-program builds performed by this preparation.
+    std::uint32_t shaderProgramBuildCount = 0;
 };
 
 // The compiler target is part of the immutable native-program receipt. Backends
@@ -513,7 +536,8 @@ struct NativeFixtureSurfaceMaterialProgram final
     {
         ConstantLinear = 0,
         ImportedSrgbTexture = 1,
-        TimeLinearMix = 2
+        TimeLinearMix = 2,
+        GraphFrameSrgbTexture = 3
     };
 
     struct ImportedSrgbTexture final
@@ -521,11 +545,21 @@ struct NativeFixtureSurfaceMaterialProgram final
         std::uint32_t width = 0;
         std::uint32_t height = 0;
         std::size_t texelCount = 0;
-        std::array<HarmonicMIDI::grid::SceneTexelRgba8,
-                   HarmonicMIDI::grid::Visual3DScene::kMaxTextureTexels> texels {};
+        std::vector<HarmonicMIDI::grid::SceneTexelRgba8> texels;
+
+        bool valid() const noexcept
+        {
+            using HarmonicMIDI::grid::Visual3DScene;
+            return width > 0 && height > 0
+                && width <= Visual3DScene::kMaxTextureDimension
+                && height <= Visual3DScene::kMaxTextureDimension
+                && static_cast<std::uint64_t>(width) * height == texelCount
+                && texelCount <= Visual3DScene::kMaxTextureTexels
+                && texels.size() == texelCount;
+        }
     };
 
-    static constexpr std::uint32_t kLayoutVersion = 10;
+    static constexpr std::uint32_t kLayoutVersion = 13;
 
     std::uint32_t layoutVersion = kLayoutVersion;
     NativeFixtureMaterialBackend backend = NativeFixtureMaterialBackend::Invalid;
@@ -533,8 +567,10 @@ struct NativeFixtureSurfaceMaterialProgram final
     HarmonicMIDI::grid::SceneObjectId object {};
     std::string bindingDigest;
     std::string programIdentity;
+    std::shared_ptr<const videohelper::materialprogram::MaterialProgramRecord> vertexProgram;
     BaseColorSource baseColorSource = BaseColorSource::ConstantLinear;
     std::optional<ImportedSrgbTexture> importedBaseColorTexture;
+    std::optional<surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint> frameEndpoint;
     // End color for the admitted mix(constant, constant, clamp(time, 0, 1))
     // checkpoint. The built-in GPU program performs the mix per draw.
     std::array<float, 3> timeMixEndColor {};
@@ -554,6 +590,9 @@ struct NativeFixtureSurfaceMaterialProgram final
     std::uint32_t diffractionFoilMaximumEvaluations = 0;
     std::array<diffractionmaterial::GpuFloat4, 5> diffractionOccupancyRectangles {};
     std::uint8_t diffractionOccupancyRectangleCount = 0;
+    // Additional exact object bindings using this same built-in Surface shader.
+    // Never nested; a draw selects by stable SceneObjectId, not array position.
+    std::vector<std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>> objectPrograms;
 };
 
 inline bool validNativeFixtureSurfaceParameters (
@@ -569,7 +608,86 @@ inline bool validNativeFixtureSurfaceParameters (
     return finite (parameters.baseColorMetallic)
         && finite (parameters.emissionRoughness)
         && finite (parameters.normalOpacity)
-        && finite (parameters.transmissionIorClearcoat);
+        && finite (parameters.transmissionIorClearcoat)
+        && parameters.transmissionIorClearcoat[0] >= 0.0f && parameters.transmissionIorClearcoat[0] <= 1.0f
+        && parameters.transmissionIorClearcoat[1] >= surfacematerial::kMinimumMaterialIor
+        && parameters.transmissionIorClearcoat[1] <= surfacematerial::kMaximumMaterialIor
+        && parameters.transmissionIorClearcoat[2] >= 0.0f && parameters.transmissionIorClearcoat[2] <= 1.0f;
+}
+
+inline bool nativeSurfaceRequiresBlend(const NativeFixtureSurfaceMaterialProgram* program) noexcept
+{
+    return program != nullptr && program->kind == NativeFixtureMaterialKind::SurfacePbr
+        && (program->parameters.normalOpacity[3] < 1.0f
+            || program->parameters.transmissionIorClearcoat[0] > 0.0f
+            || program->baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::ImportedSrgbTexture
+            || program->baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture);
+}
+
+inline const NativeFixtureSurfaceMaterialProgram* nativeSurfaceForObject(
+    const NativeFixtureSurfaceMaterialProgram* program,
+    HarmonicMIDI::grid::SceneObjectId object) noexcept
+{
+    if (program == nullptr) return nullptr;
+    if (program->object == object) return program;
+    for (const auto& candidate : program->objectPrograms)
+        if (candidate && candidate->object == object) return candidate.get();
+    return nullptr;
+}
+
+inline bool nativeSurfaceUsesTime(const NativeFixtureSurfaceMaterialProgram& root) noexcept
+{
+    const auto uses = [](const NativeFixtureSurfaceMaterialProgram& program) {
+        return program.vertexProgram || program.baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix;
+    };
+    return uses(root) || std::any_of(root.objectPrograms.begin(), root.objectPrograms.end(),
+        [&](const auto& program) { return program && uses(*program); });
+}
+
+inline bool nativeSurfaceUsesFrame(const NativeFixtureSurfaceMaterialProgram& root) noexcept
+{
+    const auto uses = [](const NativeFixtureSurfaceMaterialProgram& program) {
+        return program.baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture;
+    };
+    return uses(root) || std::any_of(root.objectPrograms.begin(), root.objectPrograms.end(),
+        [&](const auto& program) { return program && uses(*program); });
+}
+
+inline std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> snapshotNativeSurfaceProgram(
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& source)
+{
+    if (!source) return {};
+    auto copy = std::make_shared<NativeFixtureSurfaceMaterialProgram>(*source);
+    for (auto& program : copy->objectPrograms)
+        if (program) program = std::make_shared<const NativeFixtureSurfaceMaterialProgram>(*program);
+    return copy;
+}
+
+inline bool validNativeSurfaceObjectPrograms(const NativeFixtureSurfaceMaterialProgram& root,
+    const HarmonicMIDI::grid::Visual3DScene& scene, NativeFixtureMaterialBackend backend)
+{
+    using namespace HarmonicMIDI::grid;
+    if (root.objectPrograms.size() >= Visual3DScene::kMaxObjects) return false;
+    std::set<std::uint32_t> objects;
+    std::set<std::string> programs;
+    const auto valid = [&](const NativeFixtureSurfaceMaterialProgram& program) {
+        const auto* object = visual3d_detail::findById(scene.objects, scene.objectCount, program.object);
+        programs.insert(program.programIdentity);
+        return object && object->indexCount > 0 && objects.insert(object->id.value).second && program.backend == backend
+            && programs.size() <= surfacematerialbinding::kMaximumPrograms
+            && program.layoutVersion == NativeFixtureSurfaceMaterialProgram::kLayoutVersion
+            && program.kind == NativeFixtureMaterialKind::SurfacePbr
+            && !program.programIdentity.empty() && !program.bindingDigest.empty()
+            && program.parameters.identifiers[0] == object->material.value
+            && validNativeFixtureSurfaceParameters(program.parameters)
+            && static_cast<unsigned>(program.baseColorSource)
+                <= static_cast<unsigned>(NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture)
+            && (root.objectPrograms.empty() || !program.vertexProgram);
+    };
+    if (!valid(root)) return false;
+    for (const auto& program : root.objectPrograms)
+        if (!program || !program->objectPrograms.empty() || !valid(*program)) return false;
+    return true;
 }
 
 // Canonical, versioned receipt for the exact admitted diffraction inputs. The
@@ -580,7 +698,7 @@ inline std::string nativeFixtureDiffractionProgramIdentity (
     const diffractionmaterial::AdmittedLightingPlan& admitted,
     std::uint8_t patternMask = 0,
     float maskCoverage = 1.0f,
-    std::string_view productDigest = {})
+    std::string_view productDigest = {}, bool graphFrame = false)
 {
     std::string result = "diffraction-receipt-v1:";
     const auto appendHex = [&result] (std::uint64_t value, std::size_t digits)
@@ -611,6 +729,11 @@ inline std::string nativeFixtureDiffractionProgramIdentity (
     }
     const auto& lighting = admitted.description();
     appendHex(lighting.version, 8);
+    if (lighting.version == 2)
+    {
+        appendFloat(lighting.bouncePlaneHeight);
+        appendFloat(lighting.bounceMaximumDistance);
+    }
     appendHex(diffractionmaterial::kMaximumLightingPaths, 2);
     appendHex(diffractionmaterial::kMaximumIndirectBounces, 2);
     appendHex(diffractionmaterial::kMaximumSpectralSamples, 4);
@@ -635,6 +758,7 @@ inline std::string nativeFixtureDiffractionProgramIdentity (
             appendFloat(path.incident.radiance[spectralIndex]);
         }
     }
+    if (graphFrame) result.append(":graph-frame-srgb-v1");
     return result;
 }
 
@@ -900,7 +1024,8 @@ inline bool validNativeFixtureDiffractionProgram (
                            return validNativeFixtureDiffractionParameters(path.material)
                                && std::isfinite(length)
                                && std::abs(length - 1.0f) <= 1.0e-4f
-                               && value.z > 1.0e-6f && std::isfinite(value.w)
+                               && (program.diffractionLightingAdmission->description().version == 2
+                                   || value.z > 1.0e-6f) && std::isfinite(value.w)
                                && value.w >= 0.0f && value.w <= 16.0f
                                && kindDepthValid
                                && path.kindBounceAndReserved[2]
@@ -934,9 +1059,12 @@ inline bool validNativeFixtureDiffractionProgram (
             && direction[1] == path.incidentDirectionAndIntensity.y
             && direction[2] == path.incidentDirectionAndIntensity.z
             && intensity == path.incidentDirectionAndIntensity.w
-            && direction[0] == path.material.incident.x
-            && direction[1] == path.material.incident.y
-            && direction[2] == path.material.incident.z;
+            && (program.diffractionLightingAdmission->description().version == 2
+                ? (path.material.incident.x == 0.0f && path.material.incident.y == 0.0f
+                   && path.material.incident.z == 1.0f)
+                : (direction[0] == path.material.incident.x
+                   && direction[1] == path.material.incident.y
+                   && direction[2] == path.material.incident.z));
         for (std::size_t spectralIndex = 0;
              receiptValid
                  && spectralIndex < diffractionmaterial::kMaximumSpectralSamples;
@@ -962,7 +1090,8 @@ inline bool validNativeFixtureDiffractionProgram (
         && program.programIdentity == nativeFixtureDiffractionProgramIdentity(
                program.bindingDigest, *program.diffractionLightingAdmission,
                program.diffractionPatternMask, program.diffractionMaskCoverage,
-               program.diffractionProductDigest);
+               program.diffractionProductDigest,
+               program.baseColorSource == Program::BaseColorSource::GraphFrameSrgbTexture);
     return expectedBackend != NativeFixtureMaterialBackend::Invalid
         && expectedObject.isValid()
         && program.layoutVersion == Program::kLayoutVersion
@@ -971,7 +1100,8 @@ inline bool validNativeFixtureDiffractionProgram (
         && program.object == expectedObject
         && ! program.bindingDigest.empty()
         && identityValid
-        && program.baseColorSource == Program::BaseColorSource::ConstantLinear
+        && (program.baseColorSource == Program::BaseColorSource::ConstantLinear
+            || program.baseColorSource == Program::BaseColorSource::GraphFrameSrgbTexture)
         && ! program.importedBaseColorTexture.has_value()
         && allZero (program.timeMixEndColor)
         && allZero (surface.baseColorMetallic)
@@ -1034,7 +1164,9 @@ inline std::uint64_t nativeFixtureDiffractionLobeEvaluations (
     const auto lobeCount = latticeValue == crossedTwoDimensional
         ? signedOrderCount * signedOrderCount : signedOrderCount;
     const auto pixels = static_cast<std::uint64_t> (width) * height;
-    const auto pathCount = static_cast<std::uint64_t>(material.diffractionPathCount);
+    const auto pathCount = material.diffractionLightingAdmission
+            && material.diffractionLightingAdmission->description().version == 2
+        ? 11ull : static_cast<std::uint64_t>(material.diffractionPathCount);
     if (pixels == 0 || wavelengthCount > std::numeric_limits<std::uint64_t>::max() / lobeCount
         || pathCount > std::numeric_limits<std::uint64_t>::max()
             / (wavelengthCount * lobeCount)
@@ -1106,8 +1238,11 @@ struct NativeFixtureScenePreparation
 enum class NativeTextureViewKind : std::uint8_t { Invalid = 0, Texture2D };
 enum class NativeTexturePixelFormat : std::uint8_t
 {
-    Invalid = 0, Rgba8Unorm, Bgra8Unorm, R32Float
+    Invalid = 0, Rgba8Unorm, Bgra8Unorm, R32Float, Rgba16Float, R8Unorm, R32Uint, Rg16Float, Rgba32Float
 };
+// Raster row at texture coordinate V=0. Decoded images and compositor targets
+// are top-first; native GL scene attachments retain GL's bottom-first rows.
+enum class NativeTextureRowOrder : std::uint8_t { TopFirst = 0, BottomFirst };
 struct NativeTextureViewDescriptor final
 {
     std::string backend;
@@ -1120,10 +1255,13 @@ struct NativeTextureViewDescriptor final
     std::uint32_t sampleCount = 0;
     bool sampledBinding = false;
     std::uintptr_t deviceOrContextIdentity = 0;
-    // Identifies the prepared static-resource lifetime on every backend. It is
-    // stable across repeated renders from one preparation and changes when the
-    // scene is prepared again.
+    // Identifies the backend resource lifetime: a fixture's static preparation
+    // or an SDF output allocation. Fixture generations remain stable across
+    // repeated renders from one preparation.
     std::uint64_t rendererGeneration = 0;
+    colortransform::ColorSpace colorSpace = colortransform::ColorSpace::Unspecified;
+    colortransform::TransferFunction transfer = colortransform::TransferFunction::Unspecified;
+    NativeTextureRowOrder rowOrder = NativeTextureRowOrder::TopFirst;
 
     bool complete() const noexcept
     {
@@ -1131,9 +1269,72 @@ struct NativeTextureViewDescriptor final
             && format != NativeTexturePixelFormat::Invalid && imageHandle != 0
             && textureViewHandle != 0 && width != 0 && height != 0
             && sampleCount == 1 && sampledBinding && deviceOrContextIdentity != 0
-            && rendererGeneration != 0;
+            && rendererGeneration != 0
+            && (rowOrder == NativeTextureRowOrder::TopFirst
+                || rowOrder == NativeTextureRowOrder::BottomFirst);
     }
 };
+
+inline bool isLinearSceneColor(const NativeTextureViewDescriptor& descriptor) noexcept
+{
+    return descriptor.complete() && descriptor.format == NativeTexturePixelFormat::Rgba16Float
+        && descriptor.colorSpace == colortransform::ColorSpace::LinearSRGB
+        && descriptor.transfer == colortransform::TransferFunction::Linear;
+}
+
+// Owned tight rows, top row first, native scalar byte order. No display transform.
+// BGRA is normalized to RGBA by readRawPass; float16 and uint32 bits are preserved.
+struct NativeRawPassPixels final
+{
+    NativeTexturePixelFormat format = NativeTexturePixelFormat::Invalid;
+    std::uint32_t width = 0, height = 0;
+    std::vector<std::uint8_t> bytes;
+};
+inline unsigned rawPassChannels(NativeTexturePixelFormat format) noexcept
+{
+    switch (format)
+    {
+        case NativeTexturePixelFormat::Rgba8Unorm:
+        case NativeTexturePixelFormat::Bgra8Unorm:
+        case NativeTexturePixelFormat::Rgba16Float:
+        case NativeTexturePixelFormat::Rgba32Float: return 4;
+        case NativeTexturePixelFormat::Rg16Float: return 2;
+        case NativeTexturePixelFormat::R32Float:
+        case NativeTexturePixelFormat::R32Uint:
+        case NativeTexturePixelFormat::R8Unorm: return 1;
+        default: return 0;
+    }
+}
+inline unsigned rawPassScalarBytes(NativeTexturePixelFormat format) noexcept
+{
+    switch (format)
+    {
+        case NativeTexturePixelFormat::Rgba8Unorm:
+        case NativeTexturePixelFormat::Bgra8Unorm:
+        case NativeTexturePixelFormat::R8Unorm: return 1;
+        case NativeTexturePixelFormat::Rgba16Float:
+        case NativeTexturePixelFormat::Rg16Float: return 2;
+        case NativeTexturePixelFormat::R32Float:
+        case NativeTexturePixelFormat::R32Uint:
+        case NativeTexturePixelFormat::Rgba32Float: return 4;
+        default: return 0;
+    }
+}
+inline bool rawPassFormatMatches(renderpassoutput::Output output, NativeTexturePixelFormat format) noexcept
+{
+    using O = renderpassoutput::Output;
+    using F = NativeTexturePixelFormat;
+    switch (output)
+    {
+        case O::Color: return format == F::Rgba8Unorm || format == F::Bgra8Unorm || format == F::Rgba16Float;
+        case O::Depth: return format == F::R32Float;
+        case O::Normal: case O::Emission: return format == F::Rgba16Float;
+        case O::Motion: return format == F::Rg16Float;
+        case O::Mask: return format == F::R8Unorm;
+        case O::MaterialId: case O::ObjectId: return format == F::R32Uint;
+        default: return false;
+    }
+}
 
 // The frame owns every backend resource created for one submitted fixture draw.
 // Handles are backend-local and may only be consumed by the matching native
@@ -1152,7 +1353,76 @@ public:
     virtual std::uintptr_t nativeResourceCacheIdentity() const noexcept { return 0; }
     virtual NativeTextureViewDescriptor colorTextureDescriptor() const noexcept { return {}; }
     virtual NativeTextureViewDescriptor depthTextureDescriptor() const noexcept { return {}; }
+    virtual NativeTextureViewDescriptor passTextureDescriptor(renderpassoutput::Output output) const noexcept
+    {
+        return output == renderpassoutput::Output::Color ? colorTextureDescriptor()
+            : output == renderpassoutput::Output::Depth ? depthTextureDescriptor()
+            : NativeTextureViewDescriptor {};
+    }
+    virtual bool readRawPass(renderpassoutput::Output, NativeRawPassPixels& pixels, std::string& error) const
+    {
+        pixels = {};
+        error = "raw pass readback is unavailable for this native frame";
+        return false;
+    }
 };
+
+// Material Frame inputs borrow the same immutable native-frame owner as the
+// compositor. A handle without this owner, or an attachment with different
+// metadata, cannot serve as an authored Frame<Image> dependency.
+inline bool validMaterialFrameTexture(
+    const std::shared_ptr<const NativeFixtureSceneFrame>& frame) noexcept
+{
+    if (!frame) return false;
+    const auto descriptor = frame->colorTextureDescriptor();
+    return descriptor.complete() && nativeFixtureDimensionsWithinBounds(descriptor.width, descriptor.height)
+        && (descriptor.backend == "opengl" || descriptor.backend == "metal")
+        && descriptor.backend == frame->backend()
+        && (descriptor.format == NativeTexturePixelFormat::Rgba8Unorm
+            || (descriptor.backend == "metal"
+                && descriptor.format == NativeTexturePixelFormat::Bgra8Unorm))
+        && descriptor.imageHandle == frame->colorImageHandle()
+        && descriptor.textureViewHandle == frame->colorTextureViewHandle()
+        && descriptor.width == frame->width() && descriptor.height == frame->height();
+}
+
+// An owned texture copy with a proved colour interpretation. Native handles and
+// lifetime stay with the original immutable owner; the declaration is not a new
+// image identity and cannot turn a borrowed handle into an owned Frame.
+class DeclaredSrgbMaterialFrame final : public NativeFixtureSceneFrame
+{
+public:
+    explicit DeclaredSrgbMaterialFrame(std::shared_ptr<const NativeFixtureSceneFrame> owner) : owner_(std::move(owner)) {}
+    const std::string& backend() const noexcept override { return owner_->backend(); }
+    std::uint32_t width() const noexcept override { return owner_->width(); }
+    std::uint32_t height() const noexcept override { return owner_->height(); }
+    std::uintptr_t colorImageHandle() const noexcept override { return owner_->colorImageHandle(); }
+    std::uintptr_t colorTextureViewHandle() const noexcept override { return owner_->colorTextureViewHandle(); }
+    NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override {
+        auto descriptor = owner_->colorTextureDescriptor();
+        descriptor.colorSpace = colortransform::ColorSpace::SRGB;
+        descriptor.transfer = colortransform::TransferFunction::SRGB; return descriptor;
+    }
+private:
+    std::shared_ptr<const NativeFixtureSceneFrame> owner_;
+};
+inline std::shared_ptr<const NativeFixtureSceneFrame> declaredSrgbMaterialFrame(
+    std::shared_ptr<const NativeFixtureSceneFrame> owner)
+{ return validMaterialFrameTexture(owner) ? std::make_shared<const DeclaredSrgbMaterialFrame>(std::move(owner)) : nullptr; }
+inline bool materialFrameIsSrgb(const NativeTextureViewDescriptor& descriptor)
+{
+    return descriptor.complete() && descriptor.colorSpace == colortransform::ColorSpace::SRGB
+        && descriptor.transfer == colortransform::TransferFunction::SRGB;
+}
+inline bool materialFrameIsSrgb(const std::shared_ptr<const NativeFixtureSceneFrame>& frame)
+{
+    return validMaterialFrameTexture(frame) && materialFrameIsSrgb(frame->colorTextureDescriptor());
+}
+
+inline bool materialFrameIsBottomFirst(const std::shared_ptr<const NativeFixtureSceneFrame>& frame)
+{
+    return frame && frame->colorTextureDescriptor().rowOrder == NativeTextureRowOrder::BottomFirst;
+}
 
 struct NativeFixtureSceneSubmission
 {
@@ -1167,27 +1437,206 @@ struct NativeFixtureSceneSubmission
 // One immutable per-frame contract feeds static and deformed imported scenes.
 // The deformation backend consumes morphWeight; the fixture draw consumes the
 // remaining fields, including the exact admitted Block C frame and mapping.
+struct NativeSceneMotionSample final
+{
+    std::array<float, 3> objectTranslationOffset {};
+    std::array<float, 3> objectRotationDegrees {};
+    float objectScale = 1.0f;
+    std::array<float, 3> cameraTranslationOffset {};
+    std::optional<HarmonicMIDI::grid::SceneCameraRecord> cameraOverride;
+};
+
 struct NativeImportedSceneRuntimeInputs final
 {
+    // Explicit HDR export working representation. Ordinary preview stays SDR.
+    bool linearColor = false;
     float timeSeconds = 0.0f;
+    // Per-evaluation lease, never a static scene/material/cache identity. The
+    // native draw must validate the device/context before sampling this view.
+    std::shared_ptr<const NativeFixtureSceneFrame> materialFrameTexture;
+    std::map<surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint,
+        std::shared_ptr<const NativeFixtureSceneFrame>> materialFrameTextures;
+    // Evaluated by FixtureSceneRenderer against its immutable authored binding.
+    // Only uniforms change; the original mesh, textures and pipelines stay owned.
+    diffractionmaterialbinding::RuntimeParameters diffractionParameters;
+    std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> diffractionSourceProgram;
+    std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> diffractionEvaluatedProgram;
+    std::array<float, 64> vertexSpectrum {};
     float morphWeight = 1.0f;
+    std::uint64_t objectNodeStableId = 0;
     std::array<float, 3> objectTranslationOffset {};
     std::array<float, 3> objectRotationDegrees {};
     float objectScale = 1.0f;
     std::array<float, 3> cameraTranslationOffset {};
     std::optional<HarmonicMIDI::grid::SceneCameraRecord> cameraOverride;
     std::optional<HarmonicMIDI::grid::SceneLightRecord> lightOverride;
+    // Sampled imported records are subordinate to explicit graph overrides.
+    std::optional<HarmonicMIDI::grid::SceneCameraRecord> animatedCamera;
+    std::vector<HarmonicMIDI::grid::SceneLightRecord> animatedLights;
     float emissionGain = 1.0f;
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
     std::optional<visualnoteinstancing::Mapping> noteInstanceMapping;
+    renderpassoutput::Output imageOutput = renderpassoutput::Output::Color;
+    std::uint32_t rawExportMask = 0;
+    std::optional<renderpasscomposite::Parameters> passComposite;
+    std::optional<renderpasscomposite::Program> passProgram;
+    // Previous adjacent timeline sample. Absence produces exactly zero motion.
+    // Raw RG16F stores current minus previous pixel position, positive Y upwards.
+    std::optional<NativeSceneMotionSample> previousMotion;
+};
+
+inline renderpasscomposite::Program scenePassProgram(const NativeImportedSceneRuntimeInputs& inputs)
+{
+    if (inputs.passProgram) return *inputs.passProgram;
+    renderpasscomposite::Program result;
+    if (inputs.passComposite) { result.count = 1; result.steps[0].parameters = *inputs.passComposite; }
+    return result;
+}
+inline bool sceneUsesMotionPass(const NativeImportedSceneRuntimeInputs& inputs)
+{
+    return inputs.imageOutput == renderpassoutput::Output::Motion
+        || render3dimage::exports(inputs.rawExportMask, renderpassoutput::Output::Motion)
+        || renderpasscomposite::usesMotion(scenePassProgram(inputs));
+}
+
+inline NativeSceneMotionSample sceneMotionSample(const NativeImportedSceneRuntimeInputs& inputs)
+{
+    return { inputs.objectTranslationOffset, inputs.objectRotationDegrees,
+        inputs.objectScale, inputs.cameraTranslationOffset, inputs.cameraOverride };
+}
+
+// Owned by the existing per-clip scene owner. A failed render never commits a
+// sample. First frame, seek, loop, rate/extent change and owner reset yield zero.
+struct NativeSceneMotionHistory final
+{
+    std::optional<NativeSceneMotionSample> current, previous;
+    std::int64_t frame = 0;
+    std::uint32_t numerator = 0, denominator = 0, width = 0, height = 0;
+    std::optional<NativeSceneMotionSample> predecessor(std::int64_t next,
+        std::uint32_t num, std::uint32_t den, std::uint32_t w, std::uint32_t h) const
+    {
+        if (!current || num != numerator || den != denominator || w != width || h != height)
+            return {};
+        if (next == frame) return previous;
+        return next > frame && next - frame == 1 ? current : std::nullopt;
+    }
+    void commit(std::int64_t next, std::uint32_t num, std::uint32_t den,
+        std::uint32_t w, std::uint32_t h, const NativeImportedSceneRuntimeInputs& inputs)
+    {
+        previous = predecessor(next, num, den, w, h);
+        current = sceneMotionSample(inputs);
+        frame = next; numerator = num; denominator = den; width = w; height = h;
+    }
 };
 
 using NativeFixtureSceneRuntimeInputs = NativeImportedSceneRuntimeInputs;
 using NativeDeformationRuntimeInputs = NativeImportedSceneRuntimeInputs;
 
+inline bool runtimeTargetsObject(const NativeImportedSceneRuntimeInputs& inputs,
+                                const HarmonicMIDI::grid::SceneObjectRecord& object) noexcept
+{
+    return inputs.objectNodeStableId == 0
+        || (object.id.value - 1u) / 65536u + 1u == inputs.objectNodeStableId;
+}
+
+inline bool resolveDiffractionRuntimeProgram(
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& authored,
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& authoredSource,
+    const NativeImportedSceneRuntimeInputs& inputs,
+    std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& resolved, std::string& error)
+{
+    resolved = authored;
+    if (!inputs.diffractionEvaluatedProgram && !inputs.diffractionSourceProgram)
+    {
+        if (inputs.diffractionParameters.empty()) return true;
+        error = "Diffraction scalar parameters require frame-local material admission";
+        return false;
+    }
+    const auto& value = inputs.diffractionEvaluatedProgram;
+    // Preparation snapshots caller-owned values. The retained source owner
+    // authorizes this evaluation; only the snapshot defines its allowed layout.
+    if (!authored || !authoredSource || inputs.diffractionSourceProgram != authoredSource || !value
+        || authored->kind != NativeFixtureMaterialKind::DiffractionReflective
+        || !authored->diffractionLightingAdmission
+        || !validNativeFixtureDiffractionProgram(*value, authored->backend, authored->object)
+        || value->baseColorSource != authored->baseColorSource
+        || value->diffractionPathCount != authored->diffractionPathCount
+        || value->diffractionFoilMaximumEvaluations != authored->diffractionFoilMaximumEvaluations
+        || value->diffractionProductDigest != authored->diffractionProductDigest
+        || value->diffractionPatternMask != authored->diffractionPatternMask
+        || value->diffractionOccupancyRectangleCount != authored->diffractionOccupancyRectangleCount
+        || value->diffractionLightingAdmission->description().version
+            != authored->diffractionLightingAdmission->description().version)
+    { error = "Diffraction evaluation requires its exact authored program and unchanged draw layout"; return false; }
+    for (std::size_t i = 0; i < value->diffractionPathCount; ++i)
+    {
+        const auto& a = authored->diffractionPaths[i].material;
+        const auto& b = value->diffractionPaths[i].material;
+        if (a.secondaryGeometry.w != b.secondaryGeometry.w || a.control.x != b.control.x
+            || a.control.y != b.control.y || a.control.w != b.control.w
+            || a.microstructure.w != b.microstructure.w || a.grooveField.x != b.grooveField.x)
+        { error = "Diffraction runtime profile, lattice, coating, field and spectral schedule must remain authored"; return false; }
+    }
+    resolved = value;
+    return true;
+}
+
+inline std::shared_ptr<const NativeFixtureSceneFrame> materialFrameForProgram(
+    const NativeFixtureSurfaceMaterialProgram* material, const NativeImportedSceneRuntimeInputs& inputs)
+{
+    if (!material || material->baseColorSource != NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture)
+        return {};
+    if (inputs.materialFrameTextures.empty()) return inputs.materialFrameTexture;
+    if (!material->frameEndpoint) return {};
+    const auto found = inputs.materialFrameTextures.find(*material->frameEndpoint);
+    return found == inputs.materialFrameTextures.end() ? nullptr : found->second;
+}
+
+inline bool validateMaterialFrameForDraw(
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& material,
+    const NativeImportedSceneRuntimeInputs& inputs, const char* backend,
+    std::uintptr_t deviceOrContext, std::string& error)
+{
+    const auto usesFrame = [](const auto& program) { return program && program->baseColorSource
+        == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture; };
+    const bool expected = material && nativeSurfaceUsesFrame(*material);
+    if ((inputs.materialFrameTextures.empty() && expected != static_cast<bool>(inputs.materialFrameTexture))
+        || (!inputs.materialFrameTextures.empty() && inputs.materialFrameTexture)
+        || inputs.materialFrameTextures.size() > surfacematerialbinding::kMaximumPrograms)
+    { error = "Native material Frame draw requires its exact owned texture"; return false; }
+    const auto validate = [&](const auto& frame) {
+        if (!validMaterialFrameTexture(frame))
+        { error = "Native material Frame draw has no complete owned texture"; return false; }
+        const auto descriptor = frame->colorTextureDescriptor();
+        if (descriptor.backend != backend || descriptor.deviceOrContextIdentity != deviceOrContext)
+        { error = "Native material Frame texture belongs to another device or context"; return false; }
+        if (inputs.linearColor && (descriptor.colorSpace != colortransform::ColorSpace::SRGB
+            || descriptor.transfer != colortransform::TransferFunction::SRGB))
+        { error = "Linear Scene3D requires an explicitly sRGB material Frame; video transfer is not inferred"; return false; }
+        return true;
+    };
+    if (inputs.materialFrameTexture && !validate(inputs.materialFrameTexture)) return false;
+    for (const auto& entry : inputs.materialFrameTextures)
+        if (entry.first.node <= 0 || entry.first.port < 0)
+        { error = "Native material Frame map has an invalid graph endpoint"; return false; }
+        else if (!validate(entry.second)) return false;
+    if (material) {
+        if (usesFrame(material) && !materialFrameForProgram(material.get(),inputs))
+        { error = "Native material Frame endpoint has no scheduled image"; return false; }
+        for (const auto& program : material->objectPrograms)
+            if (usesFrame(program) && !materialFrameForProgram(program.get(),inputs))
+            { error = "Native object material Frame endpoint has no scheduled image"; return false; }
+    }
+    return true;
+}
+
 struct NativeNoteInstanceBatch final
 {
     std::array<std::array<float, 4>, visualnoteinstancing::kMaximumInstances> transforms {};
+    std::array<float, visualnoteinstancing::kMaximumInstances> appearanceValues {};
+    std::array<float, 4> appearanceLow { 1.0f, 1.0f, 1.0f, 0.0f };
+    std::array<float, 4> appearanceHigh { 1.0f, 1.0f, 1.0f, 0.0f };
+    float meshScale = 1.0f;
     std::array<std::int64_t, visualnoteinstancing::kMaximumInstances> identities {};
     std::array<std::uint16_t, visualnoteinstancing::kMaximumInstances> canonicalRows {};
     std::size_t count = 0;
@@ -1207,6 +1656,9 @@ inline NativeNoteInstanceBatch prepareNativeNoteInstances(
     const auto& frame = *inputs.canonicalBlockCFrame;
     const auto& mapping = *inputs.noteInstanceMapping;
     batch.admitted = true;
+    batch.appearanceLow = mapping.appearanceLow;
+    batch.appearanceHigh = mapping.appearanceHigh;
+    batch.meshScale = mapping.meshScale;
     const auto axisValue = [&frame](visualnoteinstancing::MappingAxis axis,
                                     std::size_t row) noexcept
     {
@@ -1246,8 +1698,20 @@ inline NativeNoteInstanceBatch prepareNativeNoteInstances(
         };
         batch.identities[index] = identity;
         batch.canonicalRows[index] = static_cast<std::uint16_t>(row);
+        batch.appearanceValues[index] = visualnoteinstancing::appearanceValue(
+            mapping, identity, axisValue(visualnoteinstancing::MappingAxis::Velocity, row));
     }
     return batch;
+}
+
+inline auto noteInstanceShaderTransforms(const NativeNoteInstanceBatch& batch) noexcept
+{
+    auto packed = batch.transforms;
+    // Scale is shared by the mapping. Its uniform frees w for the note's
+    // appearance value without adding another 128-element shader array.
+    for (std::size_t index = 0; index < batch.count; ++index)
+        packed[index][3] = batch.appearanceValues[index];
+    return packed;
 }
 
 inline HarmonicMIDI::grid::SceneQuaternion multiplySceneQuaternion(
@@ -1400,6 +1864,41 @@ inline bool validFixtureCameraOverride(
             && std::isfinite(camera->farPlane) && camera->farPlane > camera->nearPlane);
 }
 
+struct NativeSceneMotionUniforms final
+{
+    std::array<float, 4> rotation { 0, 0, 0, 1 }, translationScale { 0, 0, 0, 1 };
+    std::array<float, 4> cameraRotation {}, cameraTranslation {}, projection {};
+    std::array<float, 4> viewport {};
+};
+
+inline NativeSceneMotionUniforms sceneMotionUniforms(const NativeFixtureSceneRuntimeInputs& inputs,
+    const HarmonicMIDI::grid::SceneCameraRecord& camera, std::uint32_t width, std::uint32_t height) noexcept
+{
+    NativeSceneMotionUniforms result;
+    const auto previous = inputs.previousMotion.value_or(sceneMotionSample(inputs));
+    const auto currentRotation = runtimeEulerQuaternion(inputs.objectRotationDegrees);
+    const auto previousRotation = runtimeEulerQuaternion(previous.objectRotationDegrees);
+    const auto delta = multiplySceneQuaternion(previousRotation,
+        { -currentRotation.x, -currentRotation.y, -currentRotation.z, currentRotation.w });
+    const auto scale = previous.objectScale / inputs.objectScale;
+    const auto translated = rotateSceneVector(delta, { inputs.objectTranslationOffset[0],
+        inputs.objectTranslationOffset[1], inputs.objectTranslationOffset[2] });
+    result.rotation = { delta.x, delta.y, delta.z, delta.w };
+    result.translationScale = { previous.objectTranslationOffset[0] - translated.x * scale,
+        previous.objectTranslationOffset[1] - translated.y * scale,
+        previous.objectTranslationOffset[2] - translated.z * scale, scale };
+    const auto& priorCamera = previous.cameraOverride ? *previous.cameraOverride : camera;
+    const auto& q = priorCamera.transform.rotation;
+    const auto& p = priorCamera.transform.translation;
+    result.cameraRotation = { q.x, q.y, q.z, q.w };
+    result.cameraTranslation = { p.x + previous.cameraTranslationOffset[0],
+        p.y + previous.cameraTranslationOffset[1], p.z + previous.cameraTranslationOffset[2], 0 };
+    result.projection = { std::tan(priorCamera.verticalFovRadians * 0.5f), static_cast<float>(width) / height,
+        priorCamera.nearPlane, inputs.previousMotion ? 1.0f : 0.0f };
+    result.viewport = { static_cast<float>(width), static_cast<float>(height), 0, 0 };
+    return result;
+}
+
 inline bool validFixtureLightOverride(
     const std::optional<HarmonicMIDI::grid::SceneLightRecord>& light) noexcept
 {
@@ -1426,13 +1925,44 @@ inline bool validFixtureRuntimeInputs(
                 return false;
         return true;
     };
-    return valid(inputs.objectTranslationOffset, 1000000.0f)
+    return inputs.objectNodeStableId <= 65536
+        && inputs.rawExportMask <= render3dimage::kRawExportMask
+        && render3dimage::supported(inputs.imageOutput)
+        && (!inputs.linearColor || inputs.imageOutput == renderpassoutput::Output::Color
+            || inputs.imageOutput == renderpassoutput::Output::Emission)
+        && std::all_of(inputs.vertexSpectrum.begin(), inputs.vertexSpectrum.end(), [](float value)
+            { return std::isfinite(value) && value >= 0.0f && value <= 1.0f; })
+        && (!inputs.previousMotion || (valid(inputs.previousMotion->objectTranslationOffset, 1000000.0f)
+            && valid(inputs.previousMotion->objectRotationDegrees, 360.0f)
+            && std::isfinite(inputs.previousMotion->objectScale)
+            && inputs.previousMotion->objectScale >= 0.01f && inputs.previousMotion->objectScale <= 100.0f
+            && valid(inputs.previousMotion->cameraTranslationOffset, 1000000.0f)
+            && validFixtureCameraOverride(inputs.previousMotion->cameraOverride)))
+        && (!inputs.passComposite || (renderpasscomposite::valid(*inputs.passComposite)
+            && inputs.imageOutput == renderpassoutput::Output::Color))
+        && (!inputs.passProgram || (inputs.passComposite && renderpasscomposite::valid(*inputs.passProgram)
+            && renderpasscomposite::sameParameters(inputs.passProgram->steps[inputs.passProgram->output].parameters,
+                                                  *inputs.passComposite)))
+        && (inputs.passProgram || !inputs.passComposite || !renderpasscomposite::branches(inputs.passComposite->mode))
+        && valid(inputs.objectTranslationOffset, 1000000.0f)
         && std::isfinite(inputs.morphWeight)
         && inputs.morphWeight >= 0.0f && inputs.morphWeight <= 1.0f
         && valid(inputs.objectRotationDegrees, 360.0f)
         && std::isfinite(inputs.objectScale)
         && inputs.objectScale >= 0.01f && inputs.objectScale <= 100.0f
         && valid(inputs.cameraTranslationOffset, 1000000.0f)
+        && validFixtureCameraOverride(inputs.animatedCamera)
+        && inputs.animatedLights.size() <= HarmonicMIDI::grid::Visual3DScene::kMaxLights
+        && std::all_of(inputs.animatedLights.begin(), inputs.animatedLights.end(),
+            [](auto light) {
+                if (light.kind == HarmonicMIDI::grid::SceneLightKind::Spot) {
+                    if (!std::isfinite(light.innerConeAngle) || !std::isfinite(light.outerConeAngle)
+                        || light.innerConeAngle < 0 || light.outerConeAngle <= light.innerConeAngle
+                        || light.outerConeAngle > 1.5707964f) return false;
+                    light.kind = HarmonicMIDI::grid::SceneLightKind::Point;
+                }
+                return validFixtureLightOverride(light);
+            })
         && validFixtureCameraOverride(inputs.cameraOverride)
         && validFixtureLightOverride(inputs.lightOverride)
         && std::isfinite(inputs.emissionGain)
@@ -1487,6 +2017,9 @@ public:
     virtual ~NativeFixtureSceneBackend() = default;
     virtual BackendInfo info() const = 0;
     virtual GeometryCoreExecutionCapabilities geometryCoreCapabilities() const { return {}; }
+    // Release cached programs while their context is current, before destroying
+    // it. Live scene-resource leases remain valid until their owners release them.
+    virtual void releaseCachedProgramsForCurrentContext() noexcept {}
     virtual NativeFixtureScenePreparation prepare (
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram = {}) = 0;
@@ -1495,10 +2028,12 @@ public:
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram,
         const std::shared_ptr<const videohelper::geometry::AdmittedPlanValue>&
             geometryAdmission,
-        bool diagnosticInstanceIdentityColors = false)
+        bool diagnosticInstanceIdentityColors = false,
+        const std::vector<videowire::geometry::AttributeData>* frameAttributes = nullptr)
     {
         (void) geometryAdmission;
         (void) diagnosticInstanceIdentityColors;
+        (void) frameAttributes;
         return prepare (scene, materialProgram);
     }
     virtual NativeFixtureSceneSubmission render (
@@ -1529,6 +2064,7 @@ struct NativeDeformationJointBaseTransform
     std::array<float, 3> translation { 0.0f, 0.0f, 0.0f };
     std::array<float, 4> rotation { 0.0f, 0.0f, 0.0f, 1.0f };
     std::array<float, 3> scale { 1.0f, 1.0f, 1.0f };
+    std::optional<std::array<float, 16>> matrix = std::nullopt;
 };
 
 // One immutable owner joins exact graph, clip, scene-object, mesh, skin and
@@ -1548,6 +2084,16 @@ struct NativeDeformationScene
     // glTF mesh/node default weights in exact mesh target order. Empty means
     // the schema-defined all-zero base state.
     std::vector<float> morphBaseWeights;
+    // Opt-in Geometry3D extraction reads the compute result, never a CPU
+    // deformation substitute. Ordinary imported rendering does not read back.
+    bool retainDeformedGeometry = false;
+    // A scene batch shares one immutable scene and one GPU vertex buffer.
+    // Each member addresses a contiguous mesh range in that scene.
+    std::vector<std::shared_ptr<const NativeDeformationScene>> draws;
+    bool batchMember = false;
+    // glTF node identity selects the instance, while mesh/skin data remain shared.
+    std::uint64_t animationNodeStableId = 0;
+    std::optional<visualdeformation::SkinId> skin;
 };
 
 struct NativeDeformationFrameData
@@ -1604,6 +2150,8 @@ struct NativeDeformationSubmission
     std::shared_ptr<const NativeFixtureSceneFrame> frame;
     NativeDeformationStats stats {};
     std::string error;
+    // Eight floats per vertex: position, normal, UV, in selected mesh space.
+    std::vector<float> deformedVertices {};
 };
 
 class NativeDeformationBackend

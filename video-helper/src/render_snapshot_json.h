@@ -217,9 +217,31 @@ bool parseSnapshotJson (const Json& object, ShaderResolver&& resolveShader,
         }
     }
 
-    return normalizeSnapshot (
+    std::shared_ptr<const videorender::VisualParameterTimeline> parameterTimeline;
+    if (object.contains("paramTimeline"))
+    {
+        const auto& timeline=object["paramTimeline"];
+        if (!timeline.is_array() || timeline.size()>262144)
+        { error="Simulation automation timeline capacity exceeded"; return false; }
+        std::vector<videorender::VisualParameterSample> samples;
+        for (const auto& value:timeline)
+        {
+            if (!value.is_object() || !value.contains("paramId") || !value["paramId"].is_string()
+                || !value.contains("atSec") || !value["atSec"].is_number()
+                || !value.contains("value") || !value["value"].is_number())
+            { error="Malformed simulation automation timeline"; return false; }
+            samples.push_back({value["paramId"].template get<std::string>(),
+                value["atSec"].template get<double>(),value["value"].template get<double>()});
+        }
+        auto admitted=std::make_shared<videorender::VisualParameterTimeline>();
+        if (!admitted->bind(samples,error)) return false;
+        parameterTimeline=std::move(admitted);
+    }
+    const bool normalized=normalizeSnapshot (
         std::move (raw), std::move (plans), std::move (eventSchedules), object.value ("authoringRevision",
                                       object.value ("structuralRevision", uint64_t { 0 })), hasPlans,
         result, error);
+    if (normalized) result.parameterTimeline=std::move(parameterTimeline);
+    return normalized;
 }
 } // namespace videowire

@@ -1,22 +1,55 @@
 #pragma once
+#include "note_reactive_light.h"
+#include "geometry_score_field.h"
 
 #include "imported_animation_visual_plan_execution.h"
 #include "imported_scene_payload_execution.h"
+#include "material_frame_evaluation.h"
 #include "visual_plan_executor.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace videohelper::importedscene
 {
+template <typename Layer, typename = void>
+struct HasRawPassExport : std::false_type {};
+template <typename Layer>
+struct HasRawPassExport<Layer, std::void_t<
+    decltype(std::declval<Layer>().rawExportFrame),
+    decltype(std::declval<Layer>().rawExportMask),
+    decltype(std::declval<Layer>().rawExportClipId),
+    decltype(std::declval<Layer>().rawExportRenderId),
+    decltype(std::declval<Layer>().rawExportImageOutput)>> : std::true_type {};
+
+template <typename Layer, typename = void>
+struct HasImportedTextureOwner : std::false_type {};
+template <typename Layer>
+struct HasImportedTextureOwner<Layer, std::void_t<
+    decltype(std::declval<Layer>().nativeTextureOwner)>> : std::true_type {};
+
+template <typename Layer, typename = void>
+struct HasImportedLinearImage : std::false_type {};
+template <typename Layer>
+struct HasImportedLinearImage<Layer, std::void_t<
+    decltype(std::declval<Layer>().nativeLinearImage)>> : std::true_type {};
+
+template <typename Layer, typename = void>
+struct HasImportedVertexSpectrum : std::false_type {};
+template <typename Layer>
+struct HasImportedVertexSpectrum<Layer, std::void_t<
+    decltype(std::declval<Layer>().audioPresent),
+    decltype(std::declval<Layer>().audioFeatures.bands)>> : std::true_type {};
 
 inline void seedImportedSceneRuntimeParameters(
     const std::vector<videowire::CompiledVisualLayerPlan>& plans,
@@ -41,6 +74,16 @@ inline void seedImportedSceneRuntimeParameters(
         parameters.emplace(prefix + "trimEndSeconds",
                            deformation.playback.trimEndSeconds);
         parameters.emplace(prefix + "weight", deformation.playback.weight);
+        parameters.emplace(prefix + "selectedMorphWeight", deformation.pose.morphWeight);
+        const char* translationIds[] { "boneTranslateX", "boneTranslateY", "boneTranslateZ" };
+        const char* rotationIds[] { "boneRotateX", "boneRotateY", "boneRotateZ" };
+        const char* scaleIds[] { "boneScaleX", "boneScaleY", "boneScaleZ" };
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            parameters.emplace(prefix + translationIds[axis], deformation.pose.translation[axis]);
+            parameters.emplace(prefix + rotationIds[axis], deformation.pose.rotationDegrees[axis]);
+            parameters.emplace(prefix + scaleIds[axis], deformation.pose.scale[axis]);
+        }
     }
     const auto renderPrefix = "visual"
         + std::to_string(compiled.importedSceneRender->renderStableId) + "/";
@@ -50,13 +93,17 @@ inline void seedImportedSceneRuntimeParameters(
         parameters.emplace(renderPrefix + parameter, 0.0);
     parameters.emplace(renderPrefix + "objectScale", 1.0);
     parameters.emplace(renderPrefix + "emissionGain", 1.0);
+    if (compiled.importedSceneRender->diffractionMaterial)
+        for (const auto& operation : plan->operations)
+            if (operation.kind == "visual.material.diffraction-grating"
+                || operation.kind == "visual.material.diffractive-foil")
+            {
+                const auto prefix = "visual" + std::to_string(static_cast<std::uint64_t>(operation.nodeId) + 1u) + "/";
+                for (const auto& [name, value] : diffractionmaterialbinding::runtimeParameterValues(
+                        *compiled.importedSceneRender->diffractionMaterial))
+                    parameters.emplace(prefix + name, value);
+            }
 }
-
-enum class NativeImportedSceneRenderUse : std::uint8_t
-{
-    Preview = 0,
-    Export = 1
-};
 
 struct ImportedSceneStaticResourceIdentity final
 {
@@ -68,7 +115,8 @@ inline std::string exactImportedScenePayloadIdentity(
     const videowire::CompiledVisualLayerPlan& plan)
 {
     for (const auto& operation : plan.operations)
-        if (operation.kind == visualimportedscenerender::kRenderNodeKind)
+        if (operation.kind == visualimportedscenerender::kRenderNodeKind
+            || (operation.kind == typedscenepass::kNodeKind && videowire::hasTypedScenePass(plan)))
             return operation.payloadXml;
     return {};
 }
@@ -221,10 +269,28 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     FrameOwnerContainer& frameOwners,
     std::string& error,
     const std::map<std::string, double>* runtimeParameters = nullptr,
-    ImportedSceneStaticResourceIdentity staticIdentity = {})
+    ImportedSceneStaticResourceIdentity staticIdentity = {},
+    const MaterialFrameResolver* materialFrameResolver = nullptr,
+    bool linearColor = false)
 {
+    const auto inputLayer = layer;
     const auto canonicalBlockCFrame = layer.canonicalBlockCFrame;
+    const auto audioFeatures = [&]
+    {
+        if constexpr (HasImportedVertexSpectrum<Layer>::value) return layer.audioFeatures;
+        else return std::array<float, 0> {};
+    }();
+    const bool audioPresent = [&]
+    {
+        if constexpr (HasImportedVertexSpectrum<Layer>::value) return layer.audioPresent;
+        else return false;
+    }();
     layer = Layer {};
+    if constexpr (HasImportedVertexSpectrum<Layer>::value)
+    {
+        layer.audioFeatures = audioFeatures;
+        layer.audioPresent = audioPresent;
+    }
     const auto reject = [&error](const char* message)
     {
         error = message;
@@ -254,12 +320,36 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             > 67108864u)
         return reject("imported scene render dimensions exceed the product bound");
 
+    if (compiled->typedScenePassExtent)
+    {
+        if constexpr (!HasImportedTextureOwner<Layer>::value || !HasImportedLinearImage<Layer>::value)
+            return reject("Render Passes requires a compositor layer with an owned native texture");
+        linearColor = true;
+    }
+
+    const auto renderExtent = compiled->typedScenePassExtent.value_or(renderpassoutput::Extent {
+        static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)});
+    if (renderExtent.width == 0 || renderExtent.height == 0 || renderExtent.width > 8192
+        || renderExtent.height > 8192
+        || static_cast<std::uint64_t>(renderExtent.width) * renderExtent.height > 67108864u)
+        return reject("imported scene render dimensions exceed the product bound");
+
     modelpayload::ImportedSceneRequest request;
     request.asset = compiled->importedSceneRender->asset;
     request.sceneIndex = compiled->importedSceneRender->sceneIndex;
-    request.dimensions = { static_cast<std::uint32_t>(width),
-                           static_cast<std::uint32_t>(height) };
+    request.dimensions = {renderExtent.width, renderExtent.height};
     request.deformation = compiled->importedSceneRender->deformation;
+    request.runtimeInputs.imageOutput = compiled->importedSceneRender->imageOutput;
+    request.runtimeInputs.linearColor = linearColor;
+    if (linearColor && request.runtimeInputs.imageOutput != renderpassoutput::Output::Color
+        && request.runtimeInputs.imageOutput != renderpassoutput::Output::Emission)
+        return reject("HDR Scene3D requires Image/Color or Emission, not a data-pass visualization");
+    request.runtimeInputs.rawExportMask = use == NativeImportedSceneRenderUse::Export
+        ? compiled->importedSceneRender->rawExportMask : 0;
+    if (request.runtimeInputs.rawExportMask != 0 && compiled->importedSceneRender->diffractionMaterial)
+        return reject("Raw pass export is unavailable for diffraction frames");
+    request.runtimeInputs.passComposite = compiled->passComposite;
+    request.runtimeInputs.passProgram = compiled->passProgram;
     request.projectGeneration = staticIdentity.projectGeneration;
     request.helperGeneration = staticIdentity.helperGeneration;
     request.clipId = clipId;
@@ -294,6 +384,17 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             0.0, 86400.0);
         request.deformation->playback.weight = std::clamp(
             value("weight", request.deformation->playback.weight), 0.0, 1.0);
+        auto& pose = request.deformation->pose;
+        pose.morphWeight = std::clamp(value("selectedMorphWeight", pose.morphWeight), -16.0, 16.0);
+        const char* translationIds[] { "boneTranslateX", "boneTranslateY", "boneTranslateZ" };
+        const char* rotationIds[] { "boneRotateX", "boneRotateY", "boneRotateZ" };
+        const char* scaleIds[] { "boneScaleX", "boneScaleY", "boneScaleZ" };
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            pose.translation[axis] = std::clamp(value(translationIds[axis], pose.translation[axis]), -10000.0, 10000.0);
+            pose.rotationDegrees[axis] = std::clamp(value(rotationIds[axis], pose.rotationDegrees[axis]), -3600.0, 3600.0);
+            pose.scale[axis] = std::clamp(value(scaleIds[axis], pose.scale[axis]), static_cast<double>(0.0001f), 1000.0);
+        }
     }
     if (runtimeParameters != nullptr)
     {
@@ -325,17 +426,110 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         };
         request.runtimeInputs.emissionGain = value("emissionGain", 1.0, 0.0, 64.0);
     }
-    if (request.deformation
-        && !importedanimation::importedAnimationFrameIdentity(
+    if (!importedanimation::importedAnimationFrameIdentity(
             sourceSeconds, framesPerSecond, request.frame, error))
         return VisualImportedScenePreparation::rejected;
+    if (request.deformation)
+    {
+        // The immutable graph stores the authored time offset. Sample the same
+        // rational frame clock as the imported Geometry Core execution path.
+        const double frameSeconds = static_cast<double>(request.frame.frame)
+            * request.frame.rateDenominator / request.frame.rateNumerator;
+        request.deformation->playback.timelineSeconds += frameSeconds;
+        if (!std::isfinite(request.deformation->playback.timelineSeconds)
+            || std::abs(request.deformation->playback.timelineSeconds)
+                > visualanimation::PlaybackControlLimits{}.maxAbsoluteTimelineSeconds)
+            return reject("Imported animation timeline position exceeds the playback bound");
+    }
     request.structuralRevision = plan->structuralRevision;
     request.evaluationRevision = compiled->importedSceneRender->evaluationRevision;
     request.material = compiled->importedSceneRender->material;
+    request.surfacePrograms = compiled->importedSceneRender->surfacePrograms;
+    if (!request.surfacePrograms.empty()) request.runtimeInputs.canonicalBlockCFrame = canonicalBlockCFrame;
     request.diffractionMaterial = compiled->importedSceneRender->diffractionMaterial;
+    if (request.diffractionMaterial && runtimeParameters)
+        for (const auto& operation : plan->operations)
+            if (operation.kind == "visual.material.diffraction-grating"
+                || operation.kind == "visual.material.diffractive-foil")
+            {
+                const auto prefix = "visual" + std::to_string(static_cast<std::uint64_t>(operation.nodeId) + 1u) + "/";
+                const auto baseline = diffractionmaterialbinding::runtimeParameterValues(*request.diffractionMaterial);
+                for (const auto& [key, value] : *runtimeParameters)
+                    if (key.compare(0, prefix.size(), prefix) == 0)
+                    {
+                        const auto name = key.substr(prefix.size());
+                        const auto original = baseline.find(name);
+                        if (original == baseline.end() || !std::isfinite(value))
+                            return reject("Diffraction modulation targets an unavailable or nonfinite parameter");
+                        if (value != original->second) request.runtimeInputs.diffractionParameters.emplace(name, value);
+                    }
+            }
     request.camera = compiled->importedSceneRender->camera;
+    if (compiled->importedSceneRender->materialField)
+    {
+        if (!request.diffractionMaterial) return reject("Material Field requires an authored diffraction material");
+        videowire::geometry::RuntimeFieldEvaluation evaluation;
+        evaluation.timelineSeconds = static_cast<double>(request.frame.frame)
+            * request.frame.rateDenominator / request.frame.rateNumerator;
+        evaluation.scoreAt = [&](const auto& operation, const auto& positions, auto& result, auto& diagnostic)
+        {
+            return scorefield::evaluateSampleField(operation, positions, canonicalBlockCFrame, result, diagnostic);
+        };
+        if (!materialfield::evaluate(*compiled->importedSceneRender->materialField, evaluation,
+                *request.diffractionMaterial, request.runtimeInputs.diffractionParameters, error))
+            return VisualImportedScenePreparation::rejected;
+        request.runtimeInputs.canonicalBlockCFrame = canonicalBlockCFrame;
+    }
     request.light = compiled->importedSceneRender->light;
+    if (compiled->importedSceneRender->noteLight)
+    {
+        if (!request.light || !applyNoteReactiveLight(*request.light,
+                *compiled->importedSceneRender->noteLight, canonicalBlockCFrame))
+            return reject("note-reactive light requires the canonical score frame for this preview or export time");
+    }
     request.sceneSnapshot = compiled->importedSceneRender->sceneSnapshot;
+    request.runtimeInputs.timeSeconds = static_cast<float>(sourceSeconds);
+    if (request.material && request.material->vertexModifier)
+    {
+        const bool usesSpectrum = std::any_of(request.material->vertexModifier->records.begin(),
+            request.material->vertexModifier->records.end(), [](const auto& record)
+            { return record.operation == videowire::VertexModifierOperation::audioParameter; });
+        if (usesSpectrum)
+        {
+            if constexpr (HasImportedVertexSpectrum<Layer>::value)
+            {
+                if (layer.audioPresent)
+                {
+                    const auto& bands = layer.audioFeatures.bands;
+                    if (bands.size() != request.runtimeInputs.vertexSpectrum.size())
+                        return reject("Imported vertex deformation requires the shared 64-band audio frame");
+                    std::copy(bands.begin(), bands.end(), request.runtimeInputs.vertexSpectrum.begin());
+                }
+            }
+            else return reject("Imported vertex deformation requires the shared audio frame");
+        }
+        if (request.runtimeInputs.imageOutput == renderpassoutput::Output::Motion
+            || arbitgpu::sceneUsesMotionPass(request.runtimeInputs))
+            return reject("Motion output is unavailable for graph vertex deformation");
+    }
+
+    const auto materialFrameEndpoint = request.diffractionMaterial
+        ? request.diffractionMaterial->graphFrame
+        : request.material && surfacematerialbinding::hasGraphFrameInput(request.material->binding)
+            ? request.material->binding.textures.front().graphFrame : geometrysurfacematerial::objectFrameEndpoint(request.surfacePrograms);
+    if (materialFrameEndpoint)
+    {
+        if (!compiled->materialFrameSource || materialFrameResolver == nullptr || !*materialFrameResolver)
+            return reject("Graph Frame texture rendering requires an owned native Frame resolver");
+        const MaterialFrameEvaluation evaluation {
+            *materialFrameEndpoint, request.frame, clipId,
+            request.structuralRevision, request.evaluationRevision,
+            staticIdentity.projectGeneration, staticIdentity.helperGeneration, use };
+        MaterialFrameReceipt resolved;
+        if (!resolveMaterialFrame(evaluation, *materialFrameResolver, resolved, error))
+            return VisualImportedScenePreparation::rejected;
+        request.runtimeInputs.materialFrameTexture = std::move(resolved.nativeFrame);
+    }
 
     typename Execution::Receipt receipt;
     const bool executed = use == NativeImportedSceneRenderUse::Preview
@@ -348,15 +542,21 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     const auto& frame = Execution::nativeFrame(receipt);
     if (!frame)
         return reject("imported scene renderer returned no native compositor frame");
-    if (frame->width() != static_cast<std::uint32_t>(width)
-        || frame->height() != static_cast<std::uint32_t>(height))
-        return reject("imported scene native frame dimensions do not match the layer");
+    if (frame->width() != renderExtent.width || frame->height() != renderExtent.height)
+        return reject("imported scene native frame dimensions do not match the declared render extent");
     const auto backend = frame->backend();
     if (backend != "opengl" && backend != "metal")
         return reject("imported scene native frame backend is unsupported by the compositor");
     const auto nativeView = frame->colorTextureViewHandle();
     const auto colorDescriptor = frame->colorTextureDescriptor();
     const auto depthDescriptor = frame->depthTextureDescriptor();
+    if (request.runtimeInputs.materialFrameTexture)
+    {
+        const auto inputDescriptor = request.runtimeInputs.materialFrameTexture->colorTextureDescriptor();
+        if (inputDescriptor.backend != colorDescriptor.backend
+            || inputDescriptor.deviceOrContextIdentity != colorDescriptor.deviceOrContextIdentity)
+            return reject("Graph Frame texture and scene output belong to different native devices or contexts");
+    }
     const auto exactDescriptor = [&] (const arbitgpu::NativeTextureViewDescriptor& descriptor,
                                       arbitgpu::NativeTexturePixelFormat format,
                                       std::uintptr_t image, std::uintptr_t view)
@@ -364,15 +564,17 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         return descriptor.complete() && descriptor.backend == backend
             && descriptor.format == format && descriptor.imageHandle == image
             && descriptor.textureViewHandle == view
-            && descriptor.width == static_cast<std::uint32_t>(width)
-            && descriptor.height == static_cast<std::uint32_t>(height);
+            && descriptor.width == renderExtent.width
+            && descriptor.height == renderExtent.height;
     };
     if (nativeView == 0)
         return reject("imported scene native frame has no texture view");
     if (!exactDescriptor(colorDescriptor,
-                         backend == "metal" ? arbitgpu::NativeTexturePixelFormat::Bgra8Unorm
+                         linearColor ? arbitgpu::NativeTexturePixelFormat::Rgba16Float
+                         : backend == "metal" ? arbitgpu::NativeTexturePixelFormat::Bgra8Unorm
                                               : arbitgpu::NativeTexturePixelFormat::Rgba8Unorm,
-                         frame->colorImageHandle(), nativeView))
+                         frame->colorImageHandle(), nativeView)
+        || (linearColor && !arbitgpu::isLinearSceneColor(colorDescriptor)))
         return reject("imported scene native color descriptor violates the compositor contract");
     if (frame->depthImageHandle() == 0 || frame->depthTextureViewHandle() == 0)
         return reject("imported scene native frame has no published depth resource");
@@ -380,6 +582,22 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     if (!exactDescriptor(depthDescriptor, arbitgpu::NativeTexturePixelFormat::R32Float,
                          frame->depthImageHandle(), nativeDepthView))
         return reject("imported scene native depth descriptor must be exact sampleable R32F");
+    if (compiled->passComposite)
+    {
+        const std::array<arbitgpu::NativeTexturePixelFormat, 6> formats {
+            arbitgpu::NativeTexturePixelFormat::Rgba16Float, arbitgpu::NativeTexturePixelFormat::Rgba16Float,
+            arbitgpu::NativeTexturePixelFormat::R8Unorm, arbitgpu::NativeTexturePixelFormat::R32Uint,
+            arbitgpu::NativeTexturePixelFormat::R32Uint, arbitgpu::NativeTexturePixelFormat::Rg16Float };
+        for (std::size_t i = 0; i < formats.size(); ++i)
+        {
+            if (i == 5 && !arbitgpu::sceneUsesMotionPass(request.runtimeInputs)) continue;
+            const auto raw = frame->passTextureDescriptor(renderpasscomposite::kInputs[i + 2]);
+            if (!exactDescriptor(raw, formats[i], raw.imageHandle, raw.textureViewHandle)
+                || raw.deviceOrContextIdentity != colorDescriptor.deviceOrContextIdentity
+                || raw.rendererGeneration != colorDescriptor.rendererGeneration)
+                return reject("Render Pass Composite requires retained raw attachments from the same native scene draw");
+        }
+    }
 
     unsigned openGlTexture = 0;
     if (backend == "opengl")
@@ -391,20 +609,38 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         openGlTexture = static_cast<unsigned>(nativeView);
     }
 
+    if (compiled->importedParticleOverlay) layer = inputLayer;
+    layer.canonicalBlockCFrame = compiled->importedParticleOverlay
+        ? canonicalBlockCFrame : receipt.canonicalBlockCFrame;
+    if constexpr (HasRawPassExport<Layer>::value)
+    {
+        layer.rawExportFrame = frame;
+        layer.rawExportMask = request.runtimeInputs.rawExportMask;
+        layer.rawExportClipId = clipId;
+        layer.rawExportRenderId = compiled->importedSceneRender->renderStableId;
+        layer.rawExportImageOutput = request.runtimeInputs.imageOutput;
+    }
+    else if (request.runtimeInputs.rawExportMask != 0)
+        return reject("Raw pass export requires a layer that retains the native frame owner");
     frameOwners.push_back(std::move(receipt));
     layer.texture = openGlTexture;
     layer.nativeTextureBackend = backend;
     layer.nativeTextureView = nativeView;
     layer.nativeTextureDescriptor = colorDescriptor;
+    if constexpr (HasImportedTextureOwner<Layer>::value && HasImportedLinearImage<Layer>::value)
+        if (compiled->typedScenePassExtent)
+        {
+            layer.nativeTextureOwner = frame;
+            layer.nativeLinearImage = frame;
+        }
     layer.depthTexture = backend == "opengl" ? static_cast<unsigned>(nativeDepthView) : 0;
     layer.nativeDepthTextureBackend = backend;
     layer.nativeDepthTextureView = nativeDepthView;
     layer.nativeDepthTextureDescriptor = depthDescriptor;
-    layer.depthWidth = width;
-    layer.depthHeight = height;
-    layer.texWidth = width;
-    layer.texHeight = height;
-    layer.canonicalBlockCFrame = receipt.canonicalBlockCFrame;
+    layer.depthWidth = static_cast<int>(renderExtent.width);
+    layer.depthHeight = static_cast<int>(renderExtent.height);
+    layer.texWidth = static_cast<int>(renderExtent.width);
+    layer.texHeight = static_cast<int>(renderExtent.height);
     error.clear();
     return VisualImportedScenePreparation::rendered;
 }

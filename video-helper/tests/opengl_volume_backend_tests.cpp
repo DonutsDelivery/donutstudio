@@ -169,17 +169,17 @@ int main()
     int texture2D = 0;
     int texture3D = 0;
     int unpackAlignment = 0;
-    int polygonMode = 0;
+    int polygonMode[2] {};
     unsigned char colorMask[4] {};
     glGetIntegerv (GL_ACTIVE_TEXTURE, &activeTexture);
     glGetIntegerv (GL_TEXTURE_BINDING_2D, &texture2D);
     glGetIntegerv (GL_TEXTURE_BINDING_3D, &texture3D);
     glGetIntegerv (GL_UNPACK_ALIGNMENT, &unpackAlignment);
-    glGetIntegerv (GL_POLYGON_MODE, &polygonMode);
+    glGetIntegerv (GL_POLYGON_MODE, polygonMode);
     glGetBooleanv (GL_COLOR_WRITEMASK, colorMask);
     if (activeTexture != GL_TEXTURE3 || texture2D != static_cast<int> (preserved2D)
         || texture3D != static_cast<int> (preserved3D) || unpackAlignment != 8
-        || polygonMode != GL_LINE
+        || polygonMode[0] != GL_LINE || polygonMode[1] != GL_LINE
         || colorMask[0] != GL_FALSE || colorMask[1] != GL_TRUE
         || colorMask[2] != GL_FALSE || colorMask[3] != GL_TRUE
         || glIsEnabled (GL_BLEND) != GL_TRUE || glIsEnabled (GL_DEPTH_TEST) != GL_TRUE

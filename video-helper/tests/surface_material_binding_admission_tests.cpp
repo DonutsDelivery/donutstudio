@@ -300,6 +300,10 @@ void testTextureAndResourceRejections()
     const auto baseline = makeDescription(scene, program);
 
     auto malformed = baseline;
+    malformed.bindings[0].textures[0].graphFrame = TextureSlotBinding::GraphFrameEndpoint { 24, 0 };
+    expectRejected(malformed, AdmissionFailure::InvalidTextureBinding,
+                   "an unresolved graph Frame cannot be smuggled into a native imported texture receipt");
+    malformed = baseline;
     malformed.bindings[0].textures.clear();
     expectRejected(malformed, AdmissionFailure::InvalidTextureBinding,
                    "every admitted IR texture slot requires an exact binding");
@@ -356,6 +360,31 @@ void testTextureAndResourceRejections()
                    "unreferenced video resource receipts fail closed");
 }
 
+void testGraphFrameEndpointIdentity()
+{
+    const auto scene = makeScene();
+    const auto program = makeProgram();
+    auto description = makeDescription(scene, program);
+    description.version = kGraphFrameWireVersion;
+    auto& texture = description.bindings[0].textures[0];
+    texture.source = TextureSourceKind::GraphFrame;
+    texture.graphFrame = TextureSlotBinding::GraphFrameEndpoint { 24, 0 };
+    AdmissionFailure failure = AdmissionFailure::None;
+    const auto admitted = admitDescription(description, failure);
+    check(admitted.has_value(), "a v2 Frame endpoint coexists with existing imported/video bindings");
+    texture.graphFrame->node = 25;
+    const auto changed = admitDescription(description, failure);
+    check(admitted && changed && admitted->digest() != changed->digest(),
+          "the flattened Frame endpoint participates in immutable material cache identity");
+    texture.graphFrame->node = -1;
+    expectRejected(description, AdmissionFailure::InvalidTextureBinding,
+                   "negative Frame endpoint identity fails closed");
+    texture.graphFrame->node = 24;
+    texture.videoResource = videoIdentity();
+    expectRejected(description, AdmissionFailure::InvalidTextureBinding,
+                   "a Graph Frame cannot carry a competing video resource identity");
+}
+
 void testModulationAndBoundsRejections()
 {
     const auto scene = makeScene();
@@ -405,6 +434,7 @@ int main()
     testResolutionImmutabilityAndDigest();
     testIdentityAndTargetRejections();
     testTextureAndResourceRejections();
+    testGraphFrameEndpointIdentity();
     testModulationAndBoundsRejections();
     if (failures != 0)
     {

@@ -87,6 +87,26 @@ int main()
            "preview snapshot normalizes");
     check (videowire::parseSnapshotJson (wire, noShader, exportSnapshot, error),
            "export snapshot normalizes");
+    auto automated=wire;
+    automated["paramTimeline"]={{{"paramId","clip10/visual7/gravity"},{"atSec",0},{"value",1}},
+                                {{"paramId","clip10/visual7/gravity"},{"atSec",.5},{"value",-1}}};
+    videowire::ResolvedVisualSnapshot automatedPreview,automatedExport;
+    check(videowire::parseSnapshotJson(automated,noShader,automatedPreview,error)
+        && videowire::parseSnapshotJson(automated,noShader,automatedExport,error),
+        "preview and export admit the same immutable automation timeline");
+    if (automatedPreview.parameterTimeline && automatedExport.parameterTimeline)
+    {
+        double previewValue=0,exportValue=0;
+        automatedPreview.parameterTimeline->sample("clip10/visual7/gravity",.5,previewValue);
+        automatedExport.parameterTimeline->sample("clip10/visual7/gravity",.5,exportValue);
+        check(previewValue==-1 && previewValue==exportValue,"historical values retain their exact destination and step");
+    }
+    automated["paramTimeline"][1]["atSec"]=0;
+    check(!videowire::parseSnapshotJson(automated,noShader,rejected,error),
+          "duplicate automation timestamps reject the candidate snapshot");
+    automated["paramTimeline"]=json::array({{{"paramId","bad"},{"atSec",0},{"value","nan"}}});
+    check(!videowire::parseSnapshotJson(automated,noShader,rejected,error),
+          "malformed automation scalar rejects before publication");
     check (preview.authoringRevision == exportSnapshot.authoringRevision
            && preview.segments.size() == exportSnapshot.segments.size(),
            "preview and export receive equivalent snapshot identity");
@@ -162,6 +182,139 @@ int main()
     check (! videowire::parseSnapshotJson(rejectedDepthOperation, noShader, rejected, error)
            && error == "depth payload does not match the executable receipt schema",
            "helper rejects malformed executable depth capability and payload");
+
+    videowire::CompiledVisualLayerPlan geometryPlan;
+    geometryPlan.clipId = 10;
+    geometryPlan.structuralRevision = 3;
+    geometryPlan.producerValidated = true;
+    // The producer intentionally serializes the collapsed Render 3D operation
+    // before a reactive Frame prerequisite. Admission must schedule the typed
+    // dependency edge rather than treating document order as execution order.
+    geometryPlan.nodeKinds = { "geometry.core.runtime", "video.source" };
+    geometryPlan.nodeIds = { 71, 91 };
+    geometryPlan.operations = {
+        { 71, "geometry.core.runtime", "native-gpu", "lowered-geometry" },
+        { 91, "video.source", "source-decode", "" }
+    };
+    geometryPlan.ports = {
+        { 71, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 71, 12, 1, "in", "frame", "image", "rgba8", "sRGB" },
+        { 91, 0, 1, "out", "frame", "image", "rgba8", "sRGB" }
+    };
+    geometryPlan.edges = { { 91, 0, 71, 12 } };
+    error.clear();
+    check (videowire::validateCompiledVisualLayerPlans({}, { geometryPlan }, false, error),
+           "snapshot admits collapsed Geometry Core with a later-serialized reactive Frame prerequisite");
+
+    auto harmonicPlan = geometryPlan;
+    harmonicPlan.nodeKinds = { "geometry.harmonic-links.runtime" };
+    harmonicPlan.nodeIds = { 72 };
+    harmonicPlan.operations = { { 72, "geometry.harmonic-links.runtime", "native-gpu", "harmonic" } };
+    harmonicPlan.ports = { { 72, 1, 1, "out", "frame", "image", "rgba8", "sRGB" } };
+    harmonicPlan.edges.clear();
+    error.clear();
+    check (videowire::validateCompiledVisualLayerPlans({}, { harmonicPlan }, false, error),
+           "snapshot admits the executable collapsed Harmonic Link Geometry terminal without video.out");
+
+    auto retainedScenePlan = geometryPlan;
+    retainedScenePlan.nodeKinds = { "visual.3d.render", "visual.3d.scene.retained" };
+    retainedScenePlan.nodeIds = { 81, 80 };
+    retainedScenePlan.operations = {
+        { 81, "visual.3d.render", "native-gpu", "retained-render" },
+        { 80, "visual.3d.scene.retained", "control-eval", "" }
+    };
+    retainedScenePlan.ports = {
+        { 81, 0, 1, "in", "control", "scene3D", "unspecified", "unspecified" },
+        { 81, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 80, 0, 1, "out", "control", "scene3D", "unspecified", "unspecified" }
+    };
+    retainedScenePlan.edges = { { 80, 0, 81, 0 } };
+    error.clear();
+    check (videowire::validateCompiledVisualLayerPlans({}, { retainedScenePlan }, false, error),
+           "snapshot topologically admits retained Scene3D before its collapsed native render terminal");
+
+    auto advancedPassPlan = harmonicPlan;
+    advancedPassPlan.nodeKinds = { "visual.3d.render.passes" };
+    advancedPassPlan.nodeIds = { 82 };
+    advancedPassPlan.operations = { { 82, "visual.3d.render.passes", "native-gpu", "passes" } };
+    advancedPassPlan.ports = { { 82, 0, 1, "out", "frame", "image", "rgba8", "sRGB" } };
+    error.clear();
+    check (videowire::validateCompiledVisualLayerPlans({}, { advancedPassPlan }, false, error),
+           "snapshot admits the executable collapsed advanced Render Passes terminal");
+
+    auto sdfOutputPlan = harmonicPlan;
+    sdfOutputPlan.nodeKinds = { "visual.sdf.sphere", "visual.sdf.raymarch", "video.out" };
+    sdfOutputPlan.nodeIds = { 70, 80, 90 };
+    // Operation order is deliberately independent of node serialization order.
+    sdfOutputPlan.operations = {
+        { 90, "video.out", "native-gpu", "" },
+        { 70, "visual.sdf.sphere", "control-eval", "sphere" },
+        { 80, "visual.sdf.raymarch", "native-gpu", "raymarch" }
+    };
+    sdfOutputPlan.ports = {
+        { 70, 0, 1, "out", "control", "sdf", "unspecified", "unspecified" },
+        { 80, 0, 1, "in", "control", "sdf", "unspecified", "unspecified" },
+        { 80, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 90, 0, 1, "in", "frame", "image", "rgba8", "sRGB" }
+    };
+    sdfOutputPlan.edges = { { 70, 0, 80, 0 }, { 80, 1, 90, 0 } };
+    error.clear();
+    check (videowire::validateCompiledVisualLayerPlans({}, { sdfOutputPlan }, false, error),
+           "snapshot admits an exact typed SDF raymarch feeding video.out with independent operation order");
+
+    videowire::CompiledVisualLayerPlan sourcelessLegacy;
+    sourcelessLegacy.producerValidated = true;
+    sourcelessLegacy.nodeKinds = { "video.effects", "video.out" };
+    sourcelessLegacy.nodeIds = { 61, 62 };
+    sourcelessLegacy.operations = {
+        { 61, "video.effects", "native-gpu", "" },
+        { 62, "video.out", "native-gpu", "" }
+    };
+    sourcelessLegacy.ports = {
+        { 61, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 62, 0, 1, "in", "frame", "image", "rgba8", "sRGB" }
+    };
+    sourcelessLegacy.edges = { { 61, 1, 62, 0 } };
+    error.clear();
+    check (! videowire::validateCompiledVisualLayerPlans({}, { sourcelessLegacy }, false, error)
+           && error == "visual layer plan has an unsupported production terminal",
+           "video.out alone does not classify a sourceless regular graph as a collapsed native plan");
+
+    auto malformedGeometry = geometryPlan;
+    malformedGeometry.ports[2].dataType = "depth";
+    error.clear();
+    check (! videowire::validateCompiledVisualLayerPlans({}, { malformedGeometry }, false, error)
+           && error == "bounded visual DAG has an incompatible typed edge",
+           "collapsed Geometry Core still rejects malformed typed Frame dependencies");
+
+    auto unknownCollapsed = harmonicPlan;
+    unknownCollapsed.nodeKinds = { "geometry.future.runtime" };
+    unknownCollapsed.operations[0].kind = "geometry.future.runtime";
+    error.clear();
+    check (! videowire::validateCompiledVisualLayerPlans({}, { unknownCollapsed }, false, error)
+           && error == "visual layer plan contains unsupported typed operation: geometry.future.runtime",
+           "snapshot names and rejects unknown collapsed operation kinds");
+
+    auto importedTyped = retainedScenePlan;
+    importedTyped.nodeKinds = { "visual.3d.imported-animation", "visual.3d.transform",
+        "visual.3d.camera.perspective", "visual.3d.light.directional", "visual.3d.render" };
+    importedTyped.nodeIds = { 201, 202, 203, 204, 205 };
+    importedTyped.operations = {
+        { 201, "visual.3d.imported-animation", "source-decode", "" },
+        { 202, "visual.3d.transform", "control-eval", "" },
+        { 203, "visual.3d.camera.perspective", "control-eval", "" },
+        { 204, "visual.3d.light.directional", "control-eval", "" },
+        { 205, "visual.3d.render", "native-gpu", "" } };
+    importedTyped.ports.clear(); importedTyped.edges.clear();
+    check (videowire::validateCompiledVisualLayerPlans({}, { importedTyped }, false, error),
+           "snapshot whitelist admits imported transform camera and directional-light operations");
+    importedTyped.nodeKinds.insert(importedTyped.nodeKinds.begin() + 1, "visual.3d.light.point");
+    importedTyped.nodeIds.insert(importedTyped.nodeIds.begin() + 1, 206);
+    importedTyped.operations.insert(importedTyped.operations.begin() + 1,
+        { 206, "visual.3d.light.point", "control-eval", "" });
+    check (! videowire::validateCompiledVisualLayerPlans({}, { importedTyped }, false, error)
+           && error == "visual layer plan contains unsupported typed operation: visual.3d.light.point",
+           "snapshot whitelist rejects imported operation without native executor admission");
 
     const std::string validDepth = "<DepthAssetBinding depthAssetId=\"depth-1\" depthAssetVersion=\"v1\" state=\"available\" contract=\"parked-metadata\" pendingExecutionSeam=\"depth-consuming-operation\"/>";
     for (const char* extra : { "path", "file", "uri", "decoder", "upload", "futureField" })
@@ -282,7 +435,7 @@ int main()
         "video.legacy.source", "video.legacy.retime", "video.legacy.transform",
         "video.legacy.effects", "video.out"
     };
-    check (videowire::normalizeSnapshot (raw, { compiledPlan }, 1, true, rejected, error)
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { compiledPlan }, {}, 1, true, rejected, error)
            && rejected.visualLayerPlans.size() == 1
            && rejected.segments.size() == 1,
            "fixed visual layer plan lowers onto the existing render segment");
@@ -298,7 +451,7 @@ int main()
         { 101, "video.source", "source-decode", "" },
         { 102, "video.out", "native-gpu", "" }
     };
-    check (videowire::normalizeSnapshot (raw, { typedPlan }, 2, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { typedPlan }, {}, 2, true, rejected, error),
            "typed node, port, and edge bindings are admitted");
     auto importedScenePlan = typedPlan;
     importedScenePlan.nodeKinds = {
@@ -325,13 +478,13 @@ int main()
         { 202, "visual.3d.render", "native-gpu", "" }
     };
     const bool importedSceneAdmitted = videowire::normalizeSnapshot (
-        raw, { importedScenePlan }, 2, true, rejected, error);
+               raw, std::vector<videowire::CompiledVisualLayerPlan> { importedScenePlan }, {}, 2, true, rejected, error);
     if (! importedSceneAdmitted)
         std::fprintf(stderr, "imported scene admission: %s\n", error.c_str());
     check (importedSceneAdmitted,
            "typed non-frame scene resources admit only through source decode");
     importedScenePlan.operations[0].backendCapability = "control-eval";
-    check (! videowire::normalizeSnapshot (raw, { importedScenePlan }, 2, true, rejected, error),
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { importedScenePlan }, {}, 2, true, rejected, error),
            "typed scene resources reject deterministic control evaluation");
     auto deformedImportedScenePlan = importedScenePlan;
     deformedImportedScenePlan.nodeKinds = {
@@ -364,11 +517,11 @@ int main()
         { 202, "visual.3d.render", "native-gpu", "" }
     };
     check (videowire::normalizeSnapshot (
-               raw, { deformedImportedScenePlan }, 2, true, rejected, error),
+               raw, std::vector<videowire::CompiledVisualLayerPlan> { deformedImportedScenePlan }, {}, 2, true, rejected, error),
            "native GPU deformation admits as a non-frame control resource");
     deformedImportedScenePlan.operations[1].backendCapability = "control-eval";
     check (! videowire::normalizeSnapshot (
-               raw, { deformedImportedScenePlan }, 2, true, rejected, error),
+               raw, std::vector<videowire::CompiledVisualLayerPlan> { deformedImportedScenePlan }, {}, 2, true, rejected, error),
            "imported deformation rejects CPU control evaluation");
     auto particlePlan = typedPlan;
     particlePlan.nodeKinds = { "visual.particles", "video.out" };
@@ -389,26 +542,30 @@ int main()
     particleEvents.portId = 0;
     particleEvents.sessionRevision = 9;
     particleEvents.triggers = { { 0, 4.0, 0.5f, 1 }, { 32, 4.01, 1.0f, 2 } };
-    check (videowire::normalizeSnapshot (raw, { particlePlan }, { particleEvents },
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { particlePlan },
+                                         std::vector<videowire::VisualEventScheduleBinding> { particleEvents },
                                          2, true, rejected, error)
            && rejected.visualEventSchedules.size() == 1,
            "particle Event schedules retain exact stable sink identity and order");
     auto connectedWithoutTriggers = particleEvents;
     connectedWithoutTriggers.triggers.clear();
-    check (videowire::normalizeSnapshot (raw, { particlePlan }, { connectedWithoutTriggers },
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { particlePlan },
+                                         std::vector<videowire::VisualEventScheduleBinding> { connectedWithoutTriggers },
                                          2, true, rejected, error)
            && rejected.visualEventSchedules.size() == 1
            && rejected.visualEventSchedules.front().triggers.empty(),
            "an active particle Event sink remains authoritative before its first trigger");
     particleEvents.portId = 1;
-    check (! videowire::normalizeSnapshot (raw, { particlePlan }, { particleEvents },
-                                           2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { particlePlan },
+                                         std::vector<videowire::VisualEventScheduleBinding> { particleEvents },
+                                         2, true, rejected, error)
            && error == "visual Event schedule has invalid stable sink identity",
            "particle Event schedules reject a Frame port masquerading as an Event sink");
     particleEvents.portId = 0;
     particleEvents.triggers[1].timelineBeat = 3.0;
-    check (! videowire::normalizeSnapshot (raw, { particlePlan }, { particleEvents },
-                                           2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { particlePlan },
+                                         std::vector<videowire::VisualEventScheduleBinding> { particleEvents },
+                                         2, true, rejected, error)
            && error == "visual Event schedule trigger ordering or bounds are invalid",
            "particle Event schedules reject non-deterministic timeline order");
     auto pointsPlan = typedPlan;
@@ -434,15 +591,15 @@ int main()
         { 102, "video.out", "native-gpu", "" }
     };
     const bool pointsAdmitted = videowire::normalizeSnapshot(
-        raw, { pointsPlan }, 2, true, rejected, error);
+        raw, std::vector<videowire::CompiledVisualLayerPlan> { pointsPlan }, {}, 2, true, rejected, error);
     if (! pointsAdmitted) std::fprintf(stderr, "points admission: %s\n", error.c_str());
     check (pointsAdmitted,
            "clone-to-points admits only as typed control geometry");
     pointsPlan.operations[0].backendCapability = "control-eval";
-    check (! videowire::normalizeSnapshot (raw, { pointsPlan }, 2, true, rejected, error),
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { pointsPlan }, {}, 2, true, rejected, error),
            "frame-producing operations cannot claim control evaluation");
     typedPlan.operations[1].backendCapability = "cpu-fallback";
-    check (! videowire::normalizeSnapshot (raw, { typedPlan }, 2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { typedPlan }, {}, 2, true, rejected, error)
            && error == "visual layer plan operation identity or backend admission is invalid",
            "unadmitted operation backend rejects before rendering");
     typedPlan.operations[1].backendCapability = "native-gpu";
@@ -473,10 +630,10 @@ int main()
         { 106, "visual.field.color", "control-eval", "" },
         { 102, "video.out", "native-gpu", "" }
     };
-    check (videowire::normalizeSnapshot (raw, { proceduralPlan }, 2, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { proceduralPlan }, {}, 2, true, rejected, error),
            "procedural noise and scalar/vector/color fields admit as control evaluation");
     proceduralPlan.operations[2].backendCapability = "native-gpu";
-    check (! videowire::normalizeSnapshot (raw, { proceduralPlan }, 2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { proceduralPlan }, {}, 2, true, rejected, error)
            && error == "visual layer plan operation identity or backend admission is invalid",
            "field operation cannot claim native renderer execution");
 
@@ -512,10 +669,10 @@ int main()
         { 107, "visual.color.remap", "control-eval", "" },
         { 102, "video.out", "native-gpu", "" }
     };
-    check (videowire::normalizeSnapshot (raw, { valueMathPlan }, 2, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { valueMathPlan }, {}, 2, true, rejected, error),
            "typed vector and color math admit only as deterministic control evaluation");
     valueMathPlan.operations[4].backendCapability = "native-gpu";
-    check (! videowire::normalizeSnapshot (raw, { valueMathPlan }, 2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { valueMathPlan }, {}, 2, true, rejected, error)
            && error == "visual layer plan operation identity or backend admission is invalid",
            "color math cannot claim native image execution");
 
@@ -549,64 +706,64 @@ int main()
         { 107, "visual.uv.remap", "control-eval", "" },
         { 102, "video.out", "native-gpu", "" }
     };
-    check (videowire::normalizeSnapshot (raw, { shapeUvPlan }, 2, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { shapeUvPlan }, {}, 2, true, rejected, error),
            "shape geometry and UV operations admit as typed control evaluation");
     shapeUvPlan.operations[3].backendCapability = "native-gpu";
-    check (! videowire::normalizeSnapshot (raw, { shapeUvPlan }, 2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { shapeUvPlan }, {}, 2, true, rejected, error)
            && error == "visual layer plan operation identity or backend admission is invalid",
            "shape geometry cannot claim native image execution");
 
     typedPlan.nodeKinds[1] = "video.future";
     typedPlan.operations[1].kind = "video.future";
-    check (! videowire::normalizeSnapshot (raw, { typedPlan }, 2, true, rejected, error)
-           && error == "visual layer plan contains an unsupported typed operation",
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { typedPlan }, {}, 2, true, rejected, error)
+           && error == "visual layer plan contains unsupported typed operation: video.future",
            "unsupported typed operation rejects without a fixed-chain comparison");
     typedPlan.nodeKinds[1] = "video.out";
     typedPlan.operations[1].kind = "video.out";
     typedPlan.ports[1].dataType = "mask";
-    check (! videowire::normalizeSnapshot (raw, { typedPlan }, 2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { typedPlan }, {}, 2, true, rejected, error)
            && error == "visual layer plan has an incompatible typed edge binding",
            "incompatible typed edge bindings reject before rendering");
     auto editablePlan = compiledPlan;
     editablePlan.nodeKinds = { "video.source", "video.transform", "video.out" };
-    check (videowire::normalizeSnapshot (raw, { editablePlan }, 2, true, rejected, error)
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { editablePlan }, {}, 2, true, rejected, error)
            && rejected.visualLayerPlans.size() == 1
            && rejected.visualLayerPlans[0].nodeKinds == editablePlan.nodeKinds,
            "editable transform plan lowers onto existing production operations");
     editablePlan.nodeKinds = {
         "video.source", "video.transform", "video.effects", "video.out"
     };
-    check (videowire::normalizeSnapshot (raw, { editablePlan }, 3, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { editablePlan }, {}, 3, true, rejected, error),
            "editable effects plan lowers onto the production effect rack");
     editablePlan.nodeKinds = {
         "video.source", "video.transform", "video.effects", "video.mask.shape", "video.out"
     };
-    check (videowire::normalizeSnapshot (raw, { editablePlan }, 4, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { editablePlan }, {}, 4, true, rejected, error),
            "editable shape-mask plan lowers onto production mask operations");
     editablePlan.nodeKinds = {
         "video.source", "video.transform", "video.effects", "video.mask.shape",
         "video.blend", "video.out"
     };
-    check (videowire::normalizeSnapshot (raw, { editablePlan }, 5, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { editablePlan }, {}, 5, true, rejected, error),
            "editable blend plan lowers onto production layer compositing");
     editablePlan.nodeKinds = {
         "video.source", "video.transform", "video.effects", "video.mask.shape",
         "video.text", "video.blend", "video.out"
     };
-    check (videowire::normalizeSnapshot (raw, { editablePlan }, 6, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { editablePlan }, {}, 6, true, rejected, error),
            "editable text plan lowers onto production text compositing");
     editablePlan.nodeKinds = {
         "video.source", "video.transform", "video.effects", "video.mask.shape",
         "video.text", "video.layer.source", "video.blend", "video.out"
     };
-    check (videowire::normalizeSnapshot (raw, { editablePlan }, 7, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { editablePlan }, {}, 7, true, rejected, error),
            "editable second-source plan lowers onto production layer compositing");
     editablePlan.nodeKinds = { "video.source", "video.out" };
-    check (videowire::normalizeSnapshot (raw, { editablePlan }, 8, true, rejected, error),
+    check (videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { editablePlan }, {}, 8, true, rejected, error),
            "delete-healed direct plan lowers onto existing production operations");
     compiledPlan.producerValidated = false;
     compiledPlan.error = "malformed fixed topology";
-    check (! videowire::normalizeSnapshot (raw, { compiledPlan }, 2, true, rejected, error)
+    check (! videowire::normalizeSnapshot (raw, std::vector<videowire::CompiledVisualLayerPlan> { compiledPlan }, {}, 2, true, rejected, error)
            && error == "malformed fixed topology",
            "malformed visual layer plan rejects the current structural candidate");
     videowire::RevisionLedger planRevisions;

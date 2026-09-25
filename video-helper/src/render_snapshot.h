@@ -1,7 +1,11 @@
 #pragma once
+#include "../../shared/VisualVolumePlanContract.h"
+#include "visual_parameter_timeline.h"
 
 #include "source_binding.h"
 #include "matte_cache.h"
+#include "../../shared/MaterialFieldBinding.h"
+#include "../../shared/VisualImportedSceneRenderOperationContract.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +16,7 @@
 #include <string>
 #include <utility>
 #include <map>
+#include <memory>
 #include <vector>
 
 namespace videowire
@@ -111,6 +116,51 @@ inline bool isParameterlessShapeBooleanKind (const std::string& kind) noexcept
 inline bool isParameterlessPathMatteKind (const std::string& kind) noexcept
 {
     return kind == "visual.shape.invert" || kind == "visual.matte.path";
+}
+
+inline bool isAdmittedVertexModifierKind (const std::string& kind) noexcept
+{
+    static const std::vector<std::string> kinds {
+        "visual.vertex.imported-position", "visual.vertex.imported-normal",
+        "visual.vertex.imported-uv", "visual.vertex.imported-color",
+        "visual.vertex.scalar.constant", "visual.vertex.vec3.constant",
+        "visual.vertex.time-seconds", "visual.vertex.audio-parameter",
+        "visual.vertex.control-parameter", "visual.vertex.scalar.add",
+        "visual.vertex.scalar.subtract", "visual.vertex.scalar.multiply",
+        "visual.vertex.vec3.add", "visual.vertex.vec3.subtract",
+        "visual.vertex.vec3.multiply", "visual.vertex.vec3.scale",
+        "visual.vertex.vec3.compose", "visual.vertex.component.x",
+        "visual.vertex.component.y", "visual.vertex.component.z",
+        "visual.vertex.scalar.remap", "visual.vertex.vec3.remap",
+        "visual.vertex.scalar.noise-3d", "visual.vertex.vec3.noise-3d",
+        "visual.vertex.bounded-displacement"
+    };
+    return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
+}
+
+inline bool isAdmittedSurfaceProgramKind (const std::string& kind) noexcept
+{
+    static const std::vector<std::string> exactKinds {
+        "visual.surface.input.position", "visual.surface.input.normal",
+        "visual.surface.input.tangent", "visual.surface.input.tex-coord-0",
+        "visual.surface.input.tex-coord-1", "visual.surface.input.vertex-color",
+        "visual.surface.input.view-direction", "visual.surface.input.time",
+        "visual.surface.input.audio-level", "visual.surface.input.audio-bass",
+        "visual.surface.input.audio-mid", "visual.surface.input.audio-treble",
+        "visual.surface.input.audio-beat", "visual.surface.input.control"
+    };
+    if (std::find(exactKinds.begin(), exactKinds.end(), kind) != exactKinds.end()) return true;
+    static const std::vector<std::string> scalarAndVectorOperations {
+        "add", "subtract", "multiply", "divide", "minimum", "maximum",
+        "clamp", "mix", "absolute", "power"
+    };
+    for (const auto& operation : scalarAndVectorOperations)
+        for (const auto* type : { "scalar", "vec2", "vec3", "vec4" })
+            if (kind == "visual.surface." + operation + "." + type) return true;
+    for (const auto* operation : { "dot", "normalize", "length", "component" })
+        for (const auto* type : { "vec2", "vec3", "vec4" })
+            if (kind == std::string("visual.surface.") + operation + "." + type) return true;
+    return false;
 }
 
 struct CompiledVisualLayerPlan
@@ -259,6 +309,9 @@ inline bool admitBoundedNativeImageDescriptors (const CompiledVisualLayerPlan& p
         const auto edge = std::find_if(plan.edges.begin(), plan.edges.end(), [&](const auto& candidate)
             { return candidate.toNodeId == successor && candidate.toPort == 0; });
         if (edge == plan.edges.end()) break;
+        const auto destinationPort = std::find_if(plan.ports.begin(), plan.ports.end(), [&](const auto& port)
+            { return port.nodeId == edge->toNodeId && port.port == edge->toPort; });
+        if (destinationPort != plan.ports.end() && destinationPort->carrier != "frame") break;
         mark(edge->toNodeId, edge->toPort);
         mark(edge->fromNodeId, edge->fromPort);
         successor = edge->fromNodeId;
@@ -279,21 +332,23 @@ inline bool admitBoundedNativeImageDescriptors (const CompiledVisualLayerPlan& p
 // Schedule typed native-compositor DAGs independently of serialized document
 // order. Stable node identities break ready-node ties. Destination-port
 // identities determine input routing.
-inline bool compileBoundedVisualDagSchedule (const CompiledVisualLayerPlan& plan,
-                                             CompiledVisualDagSchedule& schedule,
-                                             std::string& error)
+inline bool compileTypedVisualDagSchedule (const CompiledVisualLayerPlan& plan,
+                                           CompiledVisualDagSchedule& schedule,
+                                           const std::vector<std::string>& terminalKinds,
+                                           bool requireBoundedCompositor,
+                                           std::string& error)
 {
     schedule.operations.clear();
     const size_t nodeCount = plan.nodeIds.size();
     const bool exactThreeSource = isExactThreeSourceVisualDag(plan.nodeKinds);
-    if ((! exactThreeSource
+    if ((requireBoundedCompositor && ! exactThreeSource
             && ! isBoundedNativeCompositorDag(plan.nodeKinds))
         || nodeCount != plan.nodeKinds.size() || plan.operations.size() != nodeCount)
     {
         error = "bounded visual DAG has incomplete node or operation identities";
         return false;
     }
-    if (! admitBoundedNativeImageDescriptors(plan, error)) return false;
+    if (requireBoundedCompositor && ! admitBoundedNativeImageDescriptors(plan, error)) return false;
 
     std::vector<size_t> operationForNode(nodeCount, nodeCount);
     for (size_t nodeIndex = 0; nodeIndex < nodeCount; ++nodeIndex)
@@ -425,8 +480,25 @@ inline bool compileBoundedVisualDagSchedule (const CompiledVisualLayerPlan& plan
         for (const auto destination : outgoing[ready]) --indegree[destination];
     }
 
-    const auto outputKind = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(), "video.out");
-    const size_t outputIndex = static_cast<size_t>(std::distance(plan.nodeKinds.begin(), outputKind));
+    size_t outputIndex = nodeCount;
+    for (size_t nodeIndex = 0; nodeIndex < nodeCount; ++nodeIndex)
+        if (std::find(terminalKinds.begin(), terminalKinds.end(), plan.nodeKinds[nodeIndex])
+                != terminalKinds.end() && outgoing[nodeIndex].empty())
+        {
+            if (outputIndex != nodeCount)
+            {
+                error = "typed visual DAG has multiple executable terminals";
+                schedule.operations.clear();
+                return false;
+            }
+            outputIndex = nodeIndex;
+        }
+    if (outputIndex == nodeCount)
+    {
+        error = "typed visual DAG has no executable terminal";
+        schedule.operations.clear();
+        return false;
+    }
     std::vector<bool> reachesOutput(nodeCount, false);
     reachesOutput[outputIndex] = true;
     for (auto it = schedule.operations.rbegin(); it != schedule.operations.rend(); ++it)
@@ -440,6 +512,13 @@ inline bool compileBoundedVisualDagSchedule (const CompiledVisualLayerPlan& plan
     }
     error.clear();
     return true;
+}
+
+inline bool compileBoundedVisualDagSchedule (const CompiledVisualLayerPlan& plan,
+                                             CompiledVisualDagSchedule& schedule,
+                                             std::string& error)
+{
+    return compileTypedVisualDagSchedule(plan, schedule, { "video.out" }, true, error);
 }
 
 struct VisualTriggerBinding
@@ -475,6 +554,7 @@ struct ResolvedVisualSnapshot
     std::vector<RenderSegment> segments;
     std::vector<CompiledVisualLayerPlan> visualLayerPlans;
     std::vector<VisualEventScheduleBinding> visualEventSchedules;
+    std::shared_ptr<const videorender::VisualParameterTimeline> parameterTimeline;
     uint64_t authoringRevision = 0;
 };
 
@@ -565,6 +645,11 @@ inline bool validateCompiledVisualLayerPlans (
                                        : plan.error;
             return false;
         }
+        if (visualvolume::isVolumePlan(plan))
+        {
+            visualvolume::Operation volume;
+            if (!visualvolume::validatePlan(plan, volume, error)) return false;
+        }
         const bool hasTypedBindings = ! plan.nodeIds.empty() || ! plan.edges.empty()
                                    || ! plan.ports.empty();
         const bool exactThreeSourceDag = isExactThreeSourceVisualDag(plan.nodeKinds);
@@ -575,14 +660,33 @@ inline bool validateCompiledVisualLayerPlans (
                 "visual.3d.imported-animation") == 1
             && std::count(plan.nodeKinds.begin(), plan.nodeKinds.end(),
                           "visual.3d.render") == 1;
-        const bool nativeSdfPlan = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(),
-            "visual.sdf.raymarch") != plan.nodeKinds.end();
+        const std::vector<std::string> collapsedNativeTerminals {
+            "video.out",
+            "geometry.core.runtime", "geometry.harmonic-links.runtime",
+            "visual.3d.render", "visual.sdf.raymarch", "visual.3d.render.passes",
+            "visual.volume.render",
+            "visual.3d.aov.depth", "visual.3d.aov.normal", "visual.3d.aov.emission",
+            "visual.3d.aov.mask", "visual.3d.aov.material-id", "visual.3d.aov.object-id",
+            "visual.depth.inspect", "visual.normal.inspect"
+        };
+        const bool collapsedNativePlan = ! importedSceneDag && std::any_of(
+            plan.nodeKinds.begin(), plan.nodeKinds.end(), [&](const std::string& kind)
+            { return kind != "video.out"
+                && std::find(collapsedNativeTerminals.begin(), collapsedNativeTerminals.end(), kind)
+                     != collapsedNativeTerminals.end(); });
         if (hasTypedBindings)
         {
             if (scheduledNativeDag)
             {
                 CompiledVisualDagSchedule schedule;
                 if (! compileBoundedVisualDagSchedule(plan, schedule, error))
+                    return false;
+            }
+            else if (collapsedNativePlan)
+            {
+                CompiledVisualDagSchedule schedule;
+                if (! compileTypedVisualDagSchedule(
+                        plan, schedule, collapsedNativeTerminals, false, error))
                     return false;
             }
             if (plan.nodeIds.size() != plan.nodeKinds.size() || plan.ports.empty())
@@ -608,11 +712,16 @@ inline bool validateCompiledVisualLayerPlans (
                     && plan.nodeKinds[(size_t) std::distance(plan.nodeIds.begin(), nodePosition)] == "visual.depth.asset"
                     && port.port == 0 && port.channels == 0 && port.direction == "out"
                     && port.carrier == "none";
+                const bool descriptorlessParticleTrigger = nodePosition != plan.nodeIds.end()
+                    && plan.nodeKinds[(size_t) std::distance(plan.nodeIds.begin(), nodePosition)] == "visual.particles"
+                    && port.port == 0 && port.channels == 1 && port.direction == "in"
+                    && port.carrier == "event" && port.dataType == "unspecified";
                 if (nodePosition == plan.nodeIds.end()
                     || port.port < 0 || (port.channels <= 0 && ! depthTombstone)
                     || (port.direction != "in" && port.direction != "out")
                     || port.carrier.empty() || (port.carrier == "none" && ! depthTombstone)
-                    || (! depthTombstone && (port.dataType.empty() || port.dataType == "unspecified"))
+                    || (! depthTombstone && ! descriptorlessParticleTrigger
+                        && (port.dataType.empty() || port.dataType == "unspecified"))
                     || std::any_of(plan.ports.begin(),
                                    plan.ports.begin() + static_cast<std::ptrdiff_t>(portIndex),
                                    [&port](const CompiledVisualPortBinding& prior)
@@ -653,9 +762,15 @@ inline bool validateCompiledVisualLayerPlans (
                             || operation.backendCapability == "source-decode")
                         && (! isNativeGpuControlResource
                             || operation.backendCapability == "native-gpu");
-                    if ((! scheduledNativeDag
+                    const auto identityNode = std::find(
+                        plan.nodeIds.begin(), plan.nodeIds.end(), operation.nodeId);
+                    const bool operationIdentityMatches = identityNode != plan.nodeIds.end()
+                        && plan.nodeKinds[(size_t) std::distance(plan.nodeIds.begin(), identityNode)]
+                            == operation.kind;
+                    if ((! scheduledNativeDag && ! collapsedNativePlan
                             && (operation.nodeId != plan.nodeIds[operationIndex]
                                 || operation.kind != plan.nodeKinds[operationIndex]))
+                        || (collapsedNativePlan && ! operationIdentityMatches)
                         || (operation.backendCapability != "source-decode"
                             && operation.backendCapability != "native-gpu"
                             && operation.backendCapability != "control-eval")
@@ -692,6 +807,7 @@ inline bool validateCompiledVisualLayerPlans (
                 "video.legacy.transform", "video.legacy.effects", "video.source",
                 "video.transform", "video.effects", "video.mask.shape", "video.text",
                 "video.layer.source", "video.blend", "video.out", "visual.shader.transition",
+                "visual.shader.generator",
                 "visual.shader.custom", "visual.shader.filter", "visual.effect.sharpen", "visual.effect.blur",
                 "visual.effect.vignette", "visual.effect.glow", "visual.effect.bloom",
                 "visual.effect.halation", "visual.effect.lens-distortion",
@@ -711,19 +827,24 @@ inline bool validateCompiledVisualLayerPlans (
                 "visual.shape.rectangle", "visual.shape.ellipse", "visual.shape.union",
                 "visual.shape.intersection", "visual.shape.subtract", "visual.shape.invert",
                 "visual.matte.path", "visual.uv.transform",
-                "visual.uv.remap", "visual.clone-to-points", "visual.draw.shape", "visual.feedback",
+                "visual.uv.remap", "visual.clone-to-points", "visual.draw.shape",
+                "visual.frame-delay", "visual.feedback", "visual.echo", "visual.stutter",
+                "visual.long-exposure", "visual.motion-blur",
                 "visual.matte.asset", "visual.matte.combine", "visual.matte.refine",
                 "visual.matte.apply", "visual.depth.asset",
                 "visual.particles", "tracking.point.asset", "tracking.planar.asset",
                 "tracking.correction", "tracking.point.apply.transform", "tracking.planar.apply.quad",
                 "visual.3d.imported-animation", "visual.deformation.imported",
                 "visual.score.note-collection", "visual.3d.note-instanced-mesh",
-                "visual.3d.render",
+                "visual.3d.render", "visual.3d.transform", "visual.3d.camera.perspective",
+                "visual.3d.light.directional", "visual.depth.fog",
+                "visual.material.diffraction-grating", "visual.material.diffractive-foil",
                 "visual.surface.constant.scalar", "visual.surface.constant.uint",
                 "visual.surface.constant.vec2", "visual.surface.constant.vec3",
                 "visual.surface.constant.vec4", "visual.surface.texture-sample-2d",
                 "visual.surface.compose.vec2", "visual.surface.compose.vec3",
                 "visual.surface.compose.vec4", "visual.surface.material",
+                "visual.volume.density", "visual.volume.render",
                 "visual.sdf.sphere", "visual.sdf.box", "visual.sdf.rounded-box",
                 "visual.sdf.plane", "visual.sdf.torus", "visual.sdf.capsule",
                 "visual.sdf.cylinder", "visual.sdf.cone", "visual.sdf.gyroid",
@@ -733,28 +854,57 @@ inline bool validateCompiledVisualLayerPlans (
                 "visual.sdf.scale", "visual.sdf.repeat", "visual.sdf.polar-repeat",
                 "visual.sdf.mirror", "visual.sdf.twist", "visual.sdf.bend",
                 "visual.sdf.taper", "visual.sdf.displacement", "visual.sdf.domain-warp",
-                "visual.sdf.raymarch"
+                "visual.sdf.raymarch", "geometry.core.runtime", "geometry.harmonic-links.runtime",
+                "visual.3d.scene.retained", "visual.3d.render.passes",
+                "visual.3d.aov.depth", "visual.3d.aov.normal", "visual.3d.aov.emission",
+                "visual.3d.aov.mask", "visual.3d.aov.material-id", "visual.3d.aov.object-id",
+                "visual.depth.inspect", "visual.normal.inspect"
             };
-            if (plan.nodeKinds.empty()
-                || (! scheduledNativeDag
-                    && ! nativeSdfPlan
-                    && ! importedSceneDag
+            if (plan.nodeKinds.empty())
+            {
+                error = "visual layer plan has no typed operation";
+                return false;
+            }
+            const auto unknownKind = std::find_if(plan.nodeKinds.begin(), plan.nodeKinds.end(),
+                [&supportedKinds, &plan](const std::string& kind)
+                { return std::find(supportedKinds.begin(), supportedKinds.end(), kind)
+                         == supportedKinds.end()
+                    && ! isAdmittedVertexModifierKind(kind)
+                    && ! isAdmittedSurfaceProgramKind(kind)
+                    && !([&]
+                    {
+                        const auto render = std::find_if(plan.operations.begin(), plan.operations.end(),
+                            [](const auto& operation) { return operation.kind == "visual.3d.render"; });
+                        if (render == plan.operations.end()) return false;
+                        visualimportedscenerender::Request request;
+                        std::string fieldError;
+                        if (!visualimportedscenerender::decode(render->payloadXml, request)
+                            || !request.materialField) return false;
+                        const auto field = materialfield::admit(*request.materialField, fieldError);
+                        if (!field) return false;
+                        const auto topology = materialfield::topology(*request.materialField, field->descriptor());
+                        return std::any_of(topology.nodes.begin(), topology.nodes.end(), [&](const auto& node)
+                            { return node.second == kind; });
+                    })(); });
+            if (unknownKind != plan.nodeKinds.end())
+            {
+                error = "visual layer plan contains unsupported typed operation: " + *unknownKind;
+                return false;
+            }
+            if ((! scheduledNativeDag && ! collapsedNativePlan && ! importedSceneDag
                     && plan.nodeKinds.front() != "video.source"
                     && plan.nodeKinds.front() != "video.legacy.source"
                     && plan.nodeKinds.front() != "video.legacy.generator"
+                    && plan.nodeKinds.front() != "visual.shader.generator"
                     && plan.nodeKinds.front() != "visual.shader.custom"
                     && plan.nodeKinds.front() != "visual.particles")
-                || (! scheduledNativeDag && ! importedSceneDag
-                    && plan.nodeKinds.back() != "video.out")
-                || std::any_of(plan.nodeKinds.begin(), plan.nodeKinds.end(),
-                    [&supportedKinds](const std::string& kind)
-                    { return std::find(supportedKinds.begin(), supportedKinds.end(), kind)
-                             == supportedKinds.end(); }))
+                || (! scheduledNativeDag && ! collapsedNativePlan && ! importedSceneDag
+                    && plan.nodeKinds.back() != "video.out"))
             {
-                error = "visual layer plan contains an unsupported typed operation";
+                error = "visual layer plan has an unsupported production terminal";
                 return false;
             }
-            if (! scheduledNativeDag)
+            if (! scheduledNativeDag && ! collapsedNativePlan)
             {
                 for (const auto& edge : plan.edges)
                 {

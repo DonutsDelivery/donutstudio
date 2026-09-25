@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include "particle_parameters.h"
+
 #if ARBIT_HAVE_VIEWPORT
 
 #include <memory>
@@ -50,18 +52,6 @@ class MetalParticleEngine;
 // v1 particle params. These ride the clip's genParams map ("clip<id>/gen/<name>")
 // exactly like a shader's ISF INPUTs, so they serialize + mod-route for free; the
 // renderer unpacks them from LayerDesc::genParams into this struct per frame.
-struct ParticleParams
-{
-    int   count      = 512;    // pool size (legacy clips clamp to kMaxParticles)
-    int   spawnTrack = 0;      // track whose notes seed/colour/force particles
-    float size       = 2.0f;   // point sprite size in px
-    float gravity    = 0.0f;   // downward acceleration (screen units / s^2)
-    float force      = 1.0f;   // note-velocity -> spawn-velocity scale
-    int   seed       = 0;      // deterministic curated-source seed
-    float lifetime   = 0.0f;   // seconds; <= 0 keeps note-reactive legacy range
-    float red = -1.0f, green = -1.0f, blue = -1.0f, alpha = 1.0f; // red < 0 keeps hue
-};
-
 // Populated only when ARBIT_PARTICLE_DIAGNOSTICS=1. This keeps production free
 // of synchronous readbacks while letting the native smoke localise blank output.
 struct ParticleDiagnostics
@@ -117,7 +107,8 @@ private:
     bool ensurePrograms (const arbitgl::GlFuncs* gl);
     void ensurePool (const arbitgl::GlFuncs* gl, int count);
     void ensureTarget (const arbitgl::GlFuncs* gl, int width, int height);
-    void uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblockc::CanonicalBlockCFrame* notes);
+    void uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblockc::CanonicalBlockCFrame* notes,
+                      const ParticleParams& params);
     unsigned compileCompute (const arbitgl::GlFuncs* gl, const char* src, std::string& err) const;
     unsigned compileDraw (const arbitgl::GlFuncs* gl, const char* vs, const char* fs, std::string& err) const;
 
@@ -198,6 +189,13 @@ private:
     int uCount_ = -1, uSpawnTrack_ = -1, uGravity_ = -1, uForce_ = -1, uLifetime_ = -1;
     int uDt_ = -1, uFrame_ = -1, uNoteCount_ = -1, uAspect_ = -1, uNotesC_ = -1;
     int uPointSize_ = -1, uColor_ = -1;
+    int uMotionMode_ = -1, uSeed_ = -1, uElapsed_ = -1, uDrag_ = -1,
+        uAttraction_ = -1, uAudioMotion_ = -1, uCollision_ = -1;
+    int uGeometryCount_ = -1, uGeometryAnchors_ = -1, uBodyReplay_ = -1;
+    void cacheTimelineUniforms(const arbitgl::GlFuncs* gl, unsigned program);
+    void uploadTimelineUniforms(const arbitgl::GlFuncs* gl,
+                                const ShaderClock& clock, const ParticleParams& params,
+                                float aspect, const canonicalblockc::CanonicalBlockCFrame* notes);
 };
 
 } // namespace videorender

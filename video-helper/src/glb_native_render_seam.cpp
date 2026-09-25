@@ -1,6 +1,7 @@
 #include "glb_native_render_seam.h"
 #include "material_program_compiler.h"
 #include "surface_material_binding_admission.h"
+#include "../../shared/VisualImportedSceneRenderOperationContract.h"
 
 #include <algorithm>
 #include <string>
@@ -41,6 +42,9 @@ GlbAdmissionOptions nativeRenderOptions (
                            + Visual3DScene::kMaxTextureTexels
                                * sizeof (HarmonicMIDI::grid::SceneTexelRgba8);
     limits.maxEmbeddedImageBytes = Visual3DScene::kMaxTextureTexels * 4u;
+    limits.maxDecodedImageBytes = Visual3DScene::kMaxTextureTexels * 4u;
+    limits.maxImageWidth = Visual3DScene::kMaxTextureDimension;
+    limits.maxImageHeight = Visual3DScene::kMaxTextureDimension;
     options.admitAnimations = true;
     options.admitSkins = true;
     options.supportedRequiredExtensions = {"KHR_lights_punctual"};
@@ -207,11 +211,48 @@ bool GlbNativeRenderSeam::publishSurfaceMaterial (
 
     materialScene_ = admission.scene;
     lastGoodMaterial_ = std::move (candidate);
+    lastSurfaceProgramsIdentity_.clear();
     lastGoodDiffractionMaterial_.reset();
     lastGoodMaterialRevision_ = request.programRevision;
     rejectedMaterialRevision_ = 0;
     error.clear();
     return true;
+}
+
+bool GlbNativeRenderSeam::publishSurfacePrograms (
+    const GlbNativeSceneAdmission& admission,
+    const geometrysurfacematerial::ObjectPrograms& programs,
+    const videowire::geometry::RuntimeFieldEvaluation& evaluation, std::string& error)
+{
+    if (!admission.valid() || programs.empty())
+        return fail(error, "native Surface collection publication rejected", "scene or object programs are empty");
+    const auto& request = programs.front().program.material;
+    if (request.programRevision < highestMaterialRevisionSeen_)
+        return fail(error, "native Surface collection publication rejected", "program revision is stale");
+    highestMaterialRevisionSeen_ = std::max(highestMaterialRevisionSeen_, request.programRevision);
+    const auto identity = videohelper::sha256Text(visualimportedscenerender::detail::encodeSurfacePrograms(programs));
+    const bool sameScene = materialScene_.lock() == admission.scene;
+    if (sameScene && lastGoodMaterial_ && request.programRevision == lastGoodMaterialRevision_
+        && (request.evaluationRevision < lastGoodMaterial_->evaluationRevision()
+            || (request.evaluationRevision == lastGoodMaterial_->evaluationRevision()
+                && identity != lastSurfaceProgramsIdentity_)))
+        return fail(error, "native Surface collection publication rejected", "revision names a different immutable object collection");
+    using videohelper::materialprogram::BackendTarget;
+    const auto backend = backend_.info().backend;
+    const auto target = backend == "metal" ? BackendTarget::Metal
+        : backend == "opengl" ? BackendTarget::OpenGl : BackendTarget::Invalid;
+    auto candidate = videorender::fixture3d::admitSurfaceMaterialCollection(admission.scene, programs, evaluation, target, error);
+    if (!candidate) return false;
+    if (sameScene && lastGoodMaterial_ && identity == lastSurfaceProgramsIdentity_
+        && candidate->bindingDigest() == lastGoodMaterial_->bindingDigest())
+    { error.clear(); return true; }
+    materialScene_ = admission.scene;
+    lastGoodMaterial_ = std::move(candidate);
+    lastGoodDiffractionMaterial_.reset();
+    lastSurfaceProgramsIdentity_ = identity;
+    lastGoodMaterialRevision_ = request.programRevision;
+    rejectedMaterialRevision_ = 0;
+    error.clear(); return true;
 }
 
 void GlbNativeRenderSeam::clearSurfaceMaterial (
@@ -220,6 +261,7 @@ void GlbNativeRenderSeam::clearSurfaceMaterial (
     if (materialScene_.lock() != admission.scene || lastGoodMaterial_ == nullptr)
         return;
     lastGoodMaterial_.reset();
+    lastSurfaceProgramsIdentity_.clear();
     if (lastGoodDiffractionMaterial_ == nullptr)
     {
         materialScene_.reset();

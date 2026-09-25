@@ -39,6 +39,7 @@
 
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <set>
 #include <string>
 #include <vector>
@@ -450,6 +451,55 @@ inline Dialect detectDialect (const std::string& src)
     return Dialect::Unknown;
 }
 
+// Curated bare GLSL may expose value uniforms through one explicit metadata line:
+// // ARBIT_PARAM {"NAME":"sceneScale","TYPE":"float","DEFAULT":1,"MIN":0.5,"MAX":2}
+// This is deliberately distinct from ISF's leading JSON header so dialect detection
+// and all existing ISF trust semantics remain unchanged.
+inline bool parseBareGlslParameters (const std::string& src, std::vector<GenInput>& inputs,
+                                     std::string& error)
+{
+    inputs.clear(); error.clear();
+    std::set<std::string> names;
+    std::size_t offset = 0;
+    while ((offset = src.find("// ARBIT_PARAM ", offset)) != std::string::npos)
+    {
+        if (offset != 0 && src[offset - 1] != '\n') { offset += 3; continue; }
+        const auto start = offset + 15u;
+        const auto end = src.find('\n', start);
+        const auto text = src.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        nlohmann::json item;
+        try { item = nlohmann::json::parse(text); }
+        catch (const std::exception& e) { error = std::string("invalid ARBIT_PARAM JSON: ") + e.what(); return false; }
+        static const std::set<std::string> allowed {"NAME","TYPE","DEFAULT","MIN","MAX"};
+        bool unsupportedKey = false;
+        if (item.is_object())
+            for (auto it = item.begin(); it != item.end(); ++it)
+                if (!allowed.count(it.key())) { unsupportedKey = true; break; }
+        if (!item.is_object() || unsupportedKey || !item.contains("NAME") || !item["NAME"].is_string()
+            || !item.contains("TYPE") || !item["TYPE"].is_string())
+        { error = "ARBIT_PARAM requires string NAME and TYPE"; return false; }
+        GenInput input; input.name=item["NAME"].get<std::string>(); input.label=input.name;
+        input.type=inputTypeFromWire(item["TYPE"].get<std::string>());
+        if (input.name.size() > 64 || !detail::isValidGlslIdentifier(input.name) || detail::isReservedName(input.name)
+            || !names.insert(input.name).second || input.type != InputType::Float)
+        { error = "ARBIT_PARAM requires a unique unreserved float uniform name"; return false; }
+        const auto finite=[](const nlohmann::json& v, double& out)
+        { if(!v.is_number()) return false; out=v.get<double>(); return std::isfinite(out) && std::abs(out) <= 3.4028234663852886e38; };
+        if (item.contains("DEFAULT") && !finite(item["DEFAULT"],input.defaultScalar))
+        { error="ARBIT_PARAM DEFAULT must be finite"; return false; }
+        if (item.contains("MIN")) { input.hasMin=true; if(!finite(item["MIN"],input.minScalar)) { error="ARBIT_PARAM MIN must be finite"; return false; } }
+        if (item.contains("MAX")) { input.hasMax=true; if(!finite(item["MAX"],input.maxScalar)) { error="ARBIT_PARAM MAX must be finite"; return false; } }
+        if ((input.hasMin && input.hasMax && input.minScalar > input.maxScalar)
+            || (input.hasMin && input.defaultScalar < input.minScalar)
+            || (input.hasMax && input.defaultScalar > input.maxScalar))
+        { error="ARBIT_PARAM default/range is incoherent"; return false; }
+        inputs.push_back(std::move(input));
+        if (inputs.size() > 32) { error="bare GLSL exceeds 32 ARBIT_PARAM controls"; return false; }
+        offset = end == std::string::npos ? src.size() : end + 1;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // ISF header parsing
 // ---------------------------------------------------------------------------
@@ -687,8 +737,9 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
     // uCamUp, perspective from uCamFov. ro = eye, rd = normalised direction.
     // arbitDisplayFragCoord already maps the compositor's storage orientation to
     // the usual bottom-left shader coordinates, so positive uv.y is world-up.
+    // Image-plane y spans [-1,1] for cot(FOV/2) to give the declared vertical FOV.
     p += "void arbitCameraRay(vec2 fragCoord, out vec3 ro, out vec3 rd){"
-         " vec2 uv=(fragCoord-0.5*uResolution)/uResolution.y;"
+         " vec2 uv=(2.0*fragCoord-uResolution)/uResolution.y;"
          " vec3 f=normalize(uCamTarget-uCamPos);"
          " vec3 r=normalize(cross(f,uCamUp));"
          " vec3 u=cross(r,f);"
@@ -781,6 +832,12 @@ inline WrapResult wrapToContract (const std::string& src)
     }
 
     IsfHeader isf;
+    if (r.dialect == Dialect::BareGlsl || r.dialect == Dialect::Shadertoy)
+    {
+        std::string parameterError;
+        if (!parseBareGlslParameters(src, r.params, parameterError))
+        { r.diagnostics.push_back({WrapDiagnostic::Error, parameterError}); return r; }
+    }
     if (r.dialect == Dialect::Isf)
     {
         isf = parseIsfHeader (src);
@@ -847,6 +904,12 @@ inline WrapResult wrapToContract (const std::string& src)
         body, "vec3", "hsv2rgb", "vec3");
     std::string out = arbitPrelude (
         r.dialect, r.dialect == Dialect::Isf ? &isf : nullptr, includeHsv2Rgb);
+    if (r.dialect != Dialect::Isf && !r.params.empty())
+    {
+        out += "// --- curated bare GLSL parameters ---\n";
+        for (const auto& parameter : r.params)
+            out += std::string("uniform ") + inputTypeToGlsl(parameter.type) + " " + parameter.name + ";\n";
+    }
     out += body;
     if (!out.empty() && out.back() != '\n') out += '\n';
 

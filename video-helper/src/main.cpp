@@ -19,6 +19,8 @@
 #include "render_snapshot_json.h"
 #include "score_json_parser.h"
 #include "model_payload_transport.h"
+#include "glb_geometry_core_adapter.h"
+#include "imported_geometry_execution.h"
 #include "imported_scene_payload_execution.h"
 #include "imported_animated_scene_payload_execution.h"
 #if ARBIT_HAVE_VIEWPORT
@@ -47,6 +49,7 @@ namespace arbitselftest { using RifeBackend = arbitrife::RifeEngine; }
 #include <algorithm>
 
 #include <nlohmann/json.hpp>
+#include "video_control_plan_json.h"
 
 #include <cstdio>
 #include <iostream>
@@ -82,6 +85,7 @@ namespace
 {
 std::map<uint32_t, std::unique_ptr<MediaContext>> g_media;
 uint32_t g_nextMediaId = 1;
+compositeartifact::Store g_compositeArtifacts;
 videoshm::Region g_shm;
 uint32_t g_nextSlot = 0;
 std::filesystem::path g_trustedMatteCacheRoot;
@@ -536,50 +540,9 @@ MediaContext* findMedia (const json& params, std::string& error)
 //     viewport's text_set_image shm transport is not used)
 // ── M6 mod-matrix enum string ⇄ value maps (mirror arbitmod's enums; unknown
 // strings fall back to the engine default so a typo can't crash an export) ──
-static arbitmod::SourceType parseSourceType (const std::string& s)
-{
-    using ST = arbitmod::SourceType;
-    if (s == "NotePitch")       return ST::NotePitch;
-    if (s == "NoteVelocity")    return ST::NoteVelocity;
-    if (s == "NoteGate")        return ST::NoteGate;
-    if (s == "NoteTrigger")     return ST::NoteTrigger;
-    if (s == "NoteCount")       return ST::NoteCount;
-    if (s == "NoteAge")         return ST::NoteAge;
-    if (s == "CentsFromRoot")   return ST::CentsFromRoot;
-    if (s == "PrimeEnergy")     return ST::PrimeEnergy;
-    if (s == "RootTrigger")     return ST::RootTrigger;
-    if (s == "ClockBeatPhase")  return ST::ClockBeatPhase;
-    if (s == "ClockBarPhase")   return ST::ClockBarPhase;
-    if (s == "ClockBeat")       return ST::ClockBeat;
-    if (s == "HarmRatio")       return ST::HarmRatio;
-    if (s == "HarmRatioLog2")   return ST::HarmRatioLog2;
-    if (s == "HarmRatioNum")    return ST::HarmRatioNum;
-    if (s == "HarmRatioDen")    return ST::HarmRatioDen;
-    if (s == "HarmLissajous")   return ST::HarmLissajous;
-    if (s == "HarmBeatingRate") return ST::HarmBeatingRate;
-    if (s == "HarmTenney")      return ST::HarmTenney;
-    if (s == "HarmLinkRatio")   return ST::HarmLinkRatio;
-    if (s == "Env")             return ST::Env;
-    if (s == "Lfo")             return ST::Lfo;
-    if (s == "AudioRms")        return ST::AudioRms;
-    if (s == "AudioPeak")       return ST::AudioPeak;
-    if (s == "AudioOnset")      return ST::AudioOnset;
-    if (s == "AudioBand")       return ST::AudioBand;
-    return ST::ClockBeatPhase;
-}
-static arbitmod::Curve parseCurve (const std::string& s)
-{
-    if (s == "Exp")    return arbitmod::Curve::Exp;
-    if (s == "Log")    return arbitmod::Curve::Log;
-    if (s == "SCurve") return arbitmod::Curve::SCurve;
-    return arbitmod::Curve::Linear;
-}
-static arbitmod::Mode parseMode (const std::string& s)
-{
-    if (s == "Multiply") return arbitmod::Mode::Multiply;
-    if (s == "Replace")  return arbitmod::Mode::Replace;
-    return arbitmod::Mode::Add;
-}
+using videocontrol::parseSourceType;
+using videocontrol::parseCurve;
+using videocontrol::parseMode;
 static arbitmod::LFOShape parseLfoShape (const std::string& s)
 {
     if (s == "Triangle")   return arbitmod::LFOShape::Triangle;
@@ -644,120 +607,7 @@ static void parseRoutingsJson (const json& arr, std::vector<arbitmod::Routing>& 
     }
 }
 
-static bool parseVideoControlPlanJson(const json& value, videocontrol::Plan& plan,
-                                      std::string& error)
-{
-    plan = {};
-    if (value.is_null()) return true;
-    if (!value.is_object())
-    {
-        error = "controlPlan must be an object";
-        return false;
-    }
-    plan.version = value.value("version", 1);
-    plan.numSlots = value.value("numSlots", 0);
-    if (!value.contains("operations") || !value["operations"].is_array())
-    {
-        error = "controlPlan.operations must be an array";
-        return false;
-    }
-    if (value["operations"].size() > videocontrol::kMaxOperations)
-    {
-        error = "video control plan operation count exceeds capacity";
-        return false;
-    }
-
-    for (const auto& item : value["operations"])
-    {
-        if (!item.is_object())
-        {
-            error = "video control plan operation must be an object";
-            return false;
-        }
-        videocontrol::Operation operation;
-        operation.nodeId = item.value("nodeId", -1);
-        operation.kind = item.value("kind", std::string{});
-        operation.destination = item.value("destination", std::string{});
-        operation.targetClipId = item.value("targetClipId", -1);
-        operation.targetNodeId = item.value("targetNodeId", -1);
-        operation.targetParamId = item.value("targetParamId", std::string{});
-        operation.depth = item.value("depth", 1.0f);
-        operation.curve = parseCurve(item.value("curve", std::string("Linear")));
-        operation.smoothingBeats = item.value("smoothing", 0.0f);
-        operation.mode = parseMode(item.value("mode", std::string("Add")));
-        operation.enabled = item.value("enabled", true);
-
-        if (item.contains("inputs") && item["inputs"].is_array())
-            for (const auto& input : item["inputs"])
-            {
-                if (!input.is_array())
-                {
-                    error = "video control plan input must be an array";
-                    return false;
-                }
-                std::vector<int> fanIn;
-                for (const auto& slot : input)
-                    if (slot.is_number_integer()) fanIn.push_back(slot.get<int>());
-                    else
-                    {
-                        error = "video control plan input slot must be an integer";
-                        return false;
-                    }
-                operation.inputs.push_back(std::move(fanIn));
-            }
-
-        if (item.contains("params") && item["params"].is_array())
-            for (const auto& parameter : item["params"])
-                if (parameter.is_number()) operation.params.push_back(parameter.get<float>());
-                else
-                {
-                    error = "video control plan parameter must be numeric";
-                    return false;
-                }
-
-        if (item.contains("outputSlots") && item["outputSlots"].is_array())
-            for (const auto& slot : item["outputSlots"])
-                if (slot.is_number_integer()) operation.outputSlots.push_back(slot.get<int>());
-                else
-                {
-                    error = "video control plan output slot must be an integer";
-                    return false;
-                }
-
-        if (operation.kind == "source")
-        {
-            operation.source.type = parseSourceType(
-                item.value("sourceType", std::string("ClockBeatPhase")));
-            const auto parameter = [&operation](std::size_t index, float fallback)
-            {
-                return index < operation.params.size() ? operation.params[index] : fallback;
-            };
-            operation.source.trackId = static_cast<int>(std::lround(parameter(0, -1.0f)));
-            operation.source.pitchLo = parameter(1, 0.0f);
-            operation.source.pitchHi = parameter(2, 127.0f);
-            operation.source.primeIndex = static_cast<int>(std::lround(parameter(3, 1.0f)));
-            operation.source.axis = static_cast<int>(std::lround(parameter(4, 0.0f)));
-            operation.source.linkId = static_cast<int>(std::lround(parameter(5, 0.0f)));
-            operation.source.band = static_cast<int>(std::lround(parameter(6, 0.0f)));
-            operation.source.lissajousK = static_cast<int>(std::lround(parameter(7, 7.0f)));
-            operation.source.triggerDecayBeats = parameter(8, 0.5f);
-            operation.source.adsr = { parameter(9, 0.05f), parameter(10, 0.1f),
-                                      parameter(11, 0.8f), parameter(12, 0.2f),
-                                      parameter(13, 0.0f) };
-            operation.source.lfo.periodBeats = parameter(14, 1.0f);
-            operation.source.lfo.phase0 = parameter(15, 0.0f);
-            operation.source.lfo.seed = static_cast<uint32_t>(
-                std::lround(parameter(16, 1.0f)));
-            operation.source.lfo.shape = static_cast<arbitmod::LFOShape>(std::clamp(
-                static_cast<int>(std::lround(parameter(17, 0.0f))), 0, 4));
-            operation.source.lfo.hz = parameter(18, 0.0f) >= 0.5f;
-            operation.source.lfo.rateHz = parameter(19, 1.0f);
-            operation.source.lfo.retrigger = parameter(20, 0.0f) >= 0.5f;
-        }
-        plan.operations.push_back(std::move(operation));
-    }
-    return videocontrol::validatePlan(plan, error);
-}
+using videocontrol::parsePlanJson;
 
 static videotime::BeatTimeline parseBeatTimelineJson (const json& owner,
                                                       double fallbackBpm,
@@ -869,8 +719,37 @@ static bool admitProgrammableJob (const json& params, std::string& error)
     return true;
 }
 
+std::string parseSpectrumAnalysisSources(const json& params,
+                                         std::vector<videohelper::AnalysisSourcePath>& sources)
+{
+    sources.clear();
+    const auto found=params.find("spectrumAnalysisSources");
+    if (found==params.end() || found->is_null()) return {};
+    if (!found->is_array() || found->size()>videowire::geometry::spectrum::kMaximumAnalysisSources)
+        return "Spectrum analysis sources must be an array of at most eight tracks or groups";
+    for (const auto& item : *found)
+    {
+        if (!item.is_object() || !item.contains("trackId") || !item["trackId"].is_number_integer()
+            || !item.contains("source") || !item["source"].is_number_integer()
+            || !item.contains("path") || !item["path"].is_string())
+            return "Spectrum source requires trackId, source and project analysis path";
+        const auto track=item["trackId"].get<std::int64_t>();
+        const auto source=item["source"].get<std::int64_t>();
+        if (track<0 || track>std::numeric_limits<std::int32_t>::max() || (source!=1 && source!=2))
+            return "Invalid selected spectrum track/group identity";
+        sources.push_back({static_cast<int>(track),source==2,item["path"].get<std::string>()});
+    }
+    return {};
+}
+
 std::string parseExportJob (const json& params, ExportJob& job)
 {
+    if (params.contains("parameterTimelineError"))
+    {
+        const auto& failure=params["parameterTimelineError"];
+        return failure.is_string() && !failure.get_ref<const std::string&>().empty()
+            ? failure.get<std::string>() : "Simulation automation bake failed";
+    }
     std::string admissionError;
     if(!admitProgrammableJob(params,admissionError)) return admissionError;
     // Process-owned launch capability; jobSpec can neither supply nor override it.
@@ -894,10 +773,16 @@ std::string parseExportJob (const json& params, ExportJob& job)
     job.height = params.value ("height", 1080);
     job.fps = params.value ("fps", 30.0);
     job.codec = codec;
+    job.hdrImageProfile = params.value("hdrImageProfile", "off");
+    if (hdrimage::find(job.hdrImageProfile) == nullptr)
+        return "unsupported HDR image profile; HDR PQ/HLG video encoding is unavailable";
     job.proresProfile = params.value ("proresProfile", "hq");   // hq | 4444 | 4444xq
     job.encoder = encoder;
     job.interpolation = interpolation;
     job.audioPath = params.value ("audioPath", "");
+    job.projectSpectrumAnalysisPath = params.value ("projectSpectrumAnalysisPath", "");
+    if (const auto error=parseSpectrumAnalysisSources(params,job.spectrumAnalysisSources); !error.empty())
+        return error;
     job.durationSec = params.value ("durationSec", 0.0);
     job.lufsTarget = params.value ("lufsTarget", 0.0);   // 0 = off; <0 = LUFS target (downward-only)
     job.startSec = params.value ("startSec", 0.0);
@@ -1049,7 +934,7 @@ std::string parseExportJob (const json& params, ExportJob& job)
     if (params.contains("controlPlan"))
     {
         std::string controlPlanError;
-        if (!parseVideoControlPlanJson(params["controlPlan"], job.controlPlan,
+        if (!parsePlanJson(params["controlPlan"], job.controlPlan,
                                        controlPlanError))
             return controlPlanError;
     }
@@ -1483,6 +1368,67 @@ json handle (const std::string& method, const json& params, std::string& error)
                       { "contentSha256", key.contentSha256 },
                       { "sourceMediaType", key.sourceMediaType },
                       { "sourceByteSize", key.sourceByteSize } };
+    }
+
+    if (method == "model_payload_geometry")
+    {
+        visualanimationimport::ExactContentAssetKey key;
+        if (!readModelPayloadKey(params,key,error)) return {};
+        std::uint64_t meshId=0,geometryId=0,sourceId=0,scene=0,objectScope=0,objectNodeId=0;
+        if ((params.contains("objectScope") && !readUnsignedInteger(params["objectScope"],objectScope))
+            || objectScope>2
+            || (params.contains("objectNodeId") && !readUnsignedInteger(params["objectNodeId"],objectNodeId))
+            || objectNodeId>65536 || (objectScope==2 ? objectNodeId==0 : objectNodeId!=0))
+        { error="Imported geometry object scope or exact node selection is invalid"; return {}; }
+        if (!params.contains("meshId") || !readUnsignedInteger(params["meshId"],meshId)
+            || (meshId==0 && objectScope==0) || meshId>4096 || !params.contains("geometryId")
+            || !readUnsignedInteger(params["geometryId"],geometryId)
+            || !videowire::geometry::validStableId(geometryId) || !params.contains("sourceId")
+            || !readUnsignedInteger(params["sourceId"],sourceId)
+            || !videowire::geometry::validStableId(sourceId))
+        { error="Imported geometry selection has invalid stable identities"; return {}; }
+        std::optional<std::size_t> sceneIndex;
+        if (params.contains("sceneIndex")) {
+            if (!readUnsignedInteger(params["sceneIndex"],scene) || scene>=64)
+            { error="Imported geometry scene selection is out of range"; return {}; }
+            sceneIndex=static_cast<std::size_t>(scene);
+        }
+        const auto payload=g_modelPayloads.resolvePreview(key);
+        if (!payload) { error="Imported geometry exact asset bytes are unavailable"; return {}; }
+        const auto geometry=[&]() -> std::optional<videowire::geometry::AdmittedValue> {
+          if (params.contains("animation")) {
+            visualanimationimport::Request animation;
+            if (!params["animation"].is_string()) {
+                error="Animated Geometry3D preparation has a different source selection"; return {};
+            }
+            if (!visualanimationoperation::decode(params["animation"].get<std::string>(),animation,error)) return {};
+            if (!visualanimationimport::sameAsset(animation.asset,key)
+                || animation.meshStableId!=meshId || animation.sourceStableId!=sourceId
+                || animation.sceneIndex!=sceneIndex) {
+                error="Animated Geometry3D preparation has a different source selection"; return {};
+            }
+            return videohelper::geometry::prepareAnimatedGeometry(payload,animation,geometryId,error,
+                static_cast<std::uint32_t>(objectScope),static_cast<std::uint32_t>(objectNodeId));
+          }
+          if (objectScope!=0) {
+            auto options=videohelper::nativeImportedAnimationDecodeOptions(payload->bytes().size(),sceneIndex);
+            const auto base=videohelper::gltf::decodeStaticGlb(payload->bytes(),options.admission,error);
+            if (!base) return {};
+            return videohelper::gltf::adaptGlbObjectsToGeometryCore(*base,
+                meshId==0 ? std::nullopt : std::optional<std::size_t>{static_cast<std::size_t>(meshId-1)},
+                static_cast<std::uint32_t>(objectNodeId),geometryId,sourceId,key.version,error);
+          }
+          return videohelper::gltf::decodeGlbMeshToGeometryCore(payload->bytes(),sceneIndex,
+            static_cast<std::size_t>(meshId-1),geometryId,sourceId,key.version,error);
+        }();
+        if (!geometry) return {};
+        videowire::geometry::PortContract contract;
+        contract.carrier=videowire::geometry::CarrierKind::geometry3D;
+        contract.maxVertices=4096; contract.maxIndices=12288;
+        contract.maxAttributes=videowire::geometry::kMaximumAttributes;
+        contract=videowire::geometry::withAttributeContract(std::move(contract),geometry->descriptor());
+        return json{{"geometry",videowire::geometry::encodeLoweredPlanText(
+            videowire::geometry::lowerRuntimePlan(contract,*geometry))}};
     }
 
     if (method == "model_payload_animation_compatibility")
@@ -2084,8 +2030,35 @@ json handle (const std::string& method, const json& params, std::string& error)
     // NOTE: "export" is handled in main() (deferred reply — handleExportAsync).
     // NOTE: "proxy_generate" too (deferred reply — handleProxyAsync).
 
+    if (method == "composite_frame_artifact_read" || method == "composite_frame_artifact_release")
+    {
+        if (!params.contains("handle") || !params["handle"].is_string())
+        { error = "malformed composite artifact handle"; return {}; }
+        const auto handle = params["handle"].get<std::string>();
+        if (method == "composite_frame_artifact_release")
+        {
+            if (!g_compositeArtifacts.release("product", handle, error)) return {};
+            return json { { "released", true } };
+        }
+        if (!params.contains("offset") || !params["offset"].is_number_unsigned()
+            || params["offset"].get<uint64_t>() >= compositeartifact::maxBytes)
+        {
+            g_compositeArtifacts.release("product", handle, error);
+            error = "malformed composite artifact offset";
+            return {};
+        }
+        const auto offset = params["offset"].get<size_t>();
+        std::vector<uint8_t> bytes;
+        bool done = false;
+        if (!g_compositeArtifacts.read("product", handle, offset, bytes, done, error)) return {};
+        return json { { "handle", handle }, { "offset", offset }, { "byteLength", bytes.size() },
+            { "done", done }, { "dataBase64", base64Encode(bytes) } };
+    }
+
     if (method == "composite_frame_probe")
     {
+        if (params.contains("artifact") && !params["artifact"].is_boolean())
+        { error = "artifact must be a boolean"; return {}; }
         auto compositorLease = g_compositorOwnership.tryClaim (
             videohelper::CompositorOwnershipGate::Owner::frameProbe);
         if (! compositorLease)
@@ -2104,7 +2077,7 @@ json handle (const std::string& method, const json& params, std::string& error)
         const auto snapshotGeneration = params.value ("snapshotGeneration", uint64_t { 0 });
         if (! videohelper::validateCompositeProbeContract (
                 identity, snapshotGeneration, timelineSec,
-                job.width, job.height, job.fps, error)) return {};
+                job.width, job.height, job.fps, error, params.value("artifact", false))) return {};
         const auto clipRevisions = params.value ("clipRevisions", json::array());
         if (! clipRevisions.is_array())
         {
@@ -2123,20 +2096,31 @@ json handle (const std::string& method, const json& params, std::string& error)
         CompositeFrameResult frame;
         error = renderCompositeFrame (job, timelineSec, frame, &g_modelPayloads);
         if (! error.empty()) return {};
-        return json {
+        json result {
             { "width", frame.width }, { "height", frame.height },
             { "format", "rgba8" }, { "strideBytes", frame.width * 4 },
             { "snapshotGeneration", snapshotGeneration },
             { "clipRevisions", clipRevisions },
             { "graphLayerCount", job.visualLayerPlans.size() },
             { "compositorBackend", frame.compositorBackend },
-            { "presentationBackend", frame.presentationBackend },
-            { "rgbaBase64", base64Encode (frame.rgba) }
+            { "presentationBackend", frame.presentationBackend }
 #if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
             , { "testScriptLimitsAtOperation", {
                 { "cpuMs", job.scriptCpuMs }, { "memoryMiB", job.scriptMemoryMiB } } }
 #endif
         };
+        if (params.value("artifact", false))
+        {
+            if (frame.width != compositeartifact::width || frame.height != compositeartifact::height)
+            { error = "unexpected composite artifact dimensions"; return {}; }
+            const auto handle = g_compositeArtifacts.create("product", std::move(frame.rgba), [] { return true; }, error);
+            if (handle.empty()) return {};
+            result["artifactHandle"] = handle;
+            result["byteLength"] = compositeartifact::maxBytes;
+            result["chunkBytes"] = compositeartifact::chunkBytes;
+        }
+        else result["rgbaBase64"] = base64Encode(frame.rgba);
+        return result;
     }
 
     if (method == "proxy_progress")
@@ -2451,7 +2435,11 @@ json handle (const std::string& method, const json& params, std::string& error)
         // audio-reactive features the exporter does. Empty/absent path clears it.
         // Decode+analyze happens synchronously here (off the render thread); the
         // plugin calls this from its own background bake thread.
-        g_viewport.setAudioMix (params.value ("path", std::string {}));
+        std::vector<videohelper::AnalysisSourcePath> sources;
+        error=parseSpectrumAnalysisSources(params,sources);
+        if (!error.empty()) return {};
+        error=g_viewport.setAudioMix (params.value ("path", std::string {}),sources);
+        if (!error.empty()) return {};
         return json { { "ok", true } };
     }
 
@@ -2494,9 +2482,10 @@ json handle (const std::string& method, const json& params, std::string& error)
             g_testDeferredSnapshot = std::move (snapshot);
             return json { { "deferred", true } };
         }
-        if (! g_viewport.installSnapshot (std::move (snapshot)))
+        std::string installError;
+        if (! g_viewport.installSnapshot (std::move (snapshot), &installError))
         {
-            error = "stale authoring revision";
+            error = installError.empty() ? "snapshot installation failed" : installError;
             return {};
         }
         const auto revisions = g_viewport.revisionState();
@@ -2562,9 +2551,10 @@ json handle (const std::string& method, const json& params, std::string& error)
         }
         auto snapshot = std::move (*g_testDeferredSnapshot);
         g_testDeferredSnapshot.reset();
-        if (! g_viewport.completeSnapshot (std::move (snapshot)))
+        std::string installError;
+        if (! g_viewport.completeSnapshot (std::move (snapshot), &installError))
         {
-            error = "deferred snapshot is no longer current";
+            error = installError.empty() ? "deferred snapshot installation failed" : installError;
             return {};
         }
         return json { { "ok", true } };
@@ -2646,7 +2636,7 @@ json handle (const std::string& method, const json& params, std::string& error)
     {
         videocontrol::Plan plan;
         std::string controlPlanError;
-        if (!parseVideoControlPlanJson(params, plan, controlPlanError))
+        if (!parsePlanJson(params, plan, controlPlanError))
         {
             error = controlPlanError;
             return {};
@@ -3056,6 +3046,7 @@ json handle (const std::string& method, const json& params, std::string& error)
 
     if (method == "shutdown")
     {
+        g_compositeArtifacts.clear();
         // Abort + join any in-flight export/proxy/render-cache job so
         // std::exit doesn't tear down a joinable std::thread (terminate) or
         // leave a half-written file.
@@ -3202,6 +3193,7 @@ int main (int argc, char** argv)
     const auto processRequest = [&] (const char* lineData, size_t lineSize)
     {
         if (lineSize == 0) return;
+        g_compositeArtifacts.prune();
 
         json req = json::parse (lineData, lineData + lineSize, nullptr, false);
         if (req.is_discarded())

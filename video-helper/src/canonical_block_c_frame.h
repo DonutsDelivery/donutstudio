@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 
 
 namespace canonicalblockc
@@ -167,8 +168,13 @@ public:
 
     static bool admissible(const FrameKey& key,
                            const std::shared_ptr<const arbitmod::Score>& score,
-                           float beat) noexcept
+                           float beat, std::string* diagnostic = nullptr) noexcept
     {
+        const auto reject = [&] (const char* reason) noexcept
+        {
+            if (diagnostic != nullptr) *diagnostic = reason;
+            return false;
+        };
         if (score == nullptr || key.carrierVersion != kCanonicalBlockCFrameVersion
             || key.projectGeneration == 0 || key.sourceGeneration == 0
             || key.helperGeneration == 0 || key.backendGeneration == 0
@@ -177,17 +183,19 @@ public:
             || key.loopGeneration == 0 || key.seekGeneration == 0 || key.frame < 0
             || !std::isfinite(key.fps) || key.fps <= 0.0 || !std::isfinite(key.beat)
             || !std::isfinite(beat) || key.beat != static_cast<double>(beat)
-            || score->notes.size() > arbitblockc::kMaxNotes
-            || score->links.size() > arbitblockc::kMaxLinks
             || score->notationVersion <= 0 || score->scoreRevision == 0
             || score->edoStepsPerOctave <= 0
             || !std::isfinite(score->rootFreq) || score->rootFreq <= 0.0f
             || !std::isfinite(score->historyBeats) || score->historyBeats < 0.0f
             || !std::isfinite(score->lookaheadBeats) || score->lookaheadBeats < 0.0f)
-            return false;
-        for (std::size_t noteIndex = 0; noteIndex < score->notes.size(); ++noteIndex)
+            return reject("Block C frame metadata or score header is invalid");
+        // Validate the complete projected score. The 128/256 texture limits
+        // apply to the resident rows selected by BlockCPacker, not source data.
+        // Index identities once so long scores do not require pairwise scans.
+        std::unordered_set<int> noteIds;
+        noteIds.reserve(score->notes.size());
+        for (const auto& note : score->notes)
         {
-            const auto& note = score->notes[noteIndex];
             if (note.id == 0 || note.durableKind < 0 || note.durableKind > 2
                 || note.trackId < 0 || !std::isfinite(note.startBeat)
                 || !std::isfinite(note.lengthBeats) || note.lengthBeats < 0.0f
@@ -196,19 +204,12 @@ public:
                 || !std::isfinite(note.durationSeconds) || note.durationSeconds < 0.0f
                 || note.ratioNum <= 0 || note.ratioDen <= 0
                 || !std::isfinite(note.centsOffset) || note.commaCount < 0
-                || note.commaCount > static_cast<int>(note.commas.size())) return false;
-            for (std::size_t prior = 0; prior < noteIndex; ++prior)
-                if (score->notes[prior].id == note.id) return false;
-            if (note.linkMasterId != 0)
-            {
-                const bool haveMaster = std::any_of (
-                    score->notes.begin(), score->notes.end(), [&note] (const auto& candidate)
-                    { return candidate.id == note.linkMasterId; });
-                if (!haveMaster) return false;
-            }
-            for (const auto prime : note.primes) if (!std::isfinite(prime)) return false;
+                || note.commaCount > static_cast<int>(note.commas.size()))
+                return reject("Block C note identity, timing, pitch, ratio, or notation is invalid");
+            if (!noteIds.insert(note.id).second) return reject("Block C note identity is duplicated");
+            for (const auto prime : note.primes) if (!std::isfinite(prime)) return reject("Block C note prime basis is invalid");
             for (const auto& comma : note.commas)
-                if (comma.prime < 0) return false;
+                if (comma.prime < 0) return reject("Block C note comma is invalid");
             for (const auto& point : note.pitchBendPoints)
                 if (!std::isfinite(point.position) || !std::isfinite(point.semitones)
                     || !std::isfinite(point.tension) || !std::isfinite(point.sCurve)
@@ -216,31 +217,31 @@ public:
                     || !std::isfinite(point.vibratoRateHz)
                     || !std::isfinite(point.vibratoFadeIn)
                     || !std::isfinite(point.vibratoFadeOut)
-                    || point.vibratoWaveform < 0) return false;
+                    || point.vibratoWaveform < 0) return reject("Block C pitch bend point is invalid");
             for (std::size_t anchorIndex = 0; anchorIndex < note.pitchAnchors.size(); ++anchorIndex)
             {
                 const auto& anchor = note.pitchAnchors[anchorIndex];
                 if (anchor.id == 0 || !std::isfinite(anchor.position)
-                    || !std::isfinite(anchor.frequency) || anchor.frequency <= 0.0f) return false;
+                    || !std::isfinite(anchor.frequency) || anchor.frequency <= 0.0f) return reject("Block C pitch anchor is invalid");
                 for (std::size_t prior = 0; prior < anchorIndex; ++prior)
-                    if (note.pitchAnchors[prior].id == anchor.id) return false;
+                    if (note.pitchAnchors[prior].id == anchor.id) return reject("Block C pitch anchor identity is duplicated");
             }
         }
-        for (std::size_t linkIndex = 0; linkIndex < score->links.size(); ++linkIndex)
+        for (const auto& note : score->notes)
+            if (note.linkMasterId != 0 && noteIds.count(note.linkMasterId) == 0)
+                return reject("Block C note link master is missing");
+
+        std::unordered_set<int> linkIds;
+        linkIds.reserve(score->links.size());
+        for (const auto& link : score->links)
         {
-            const auto& link = score->links[linkIndex];
             if (link.id == 0 || link.slaveNoteId == 0 || link.masterNoteId == 0
-                || link.slaveHarmonic <= 0 || link.masterHarmonic <= 0) return false;
-            for (std::size_t prior = 0; prior < linkIndex; ++prior)
-                if (score->links[prior].id == link.id) return false;
-            bool haveSlave = false, haveMaster = false;
-            for (const auto& note : score->notes)
-            {
-                haveSlave = haveSlave || note.id == link.slaveNoteId;
-                haveMaster = haveMaster || note.id == link.masterNoteId;
-            }
-            if (!haveSlave || !haveMaster) return false;
+                || link.slaveHarmonic <= 0 || link.masterHarmonic <= 0) return reject("Block C harmonic link is invalid");
+            if (!linkIds.insert(link.id).second) return reject("Block C harmonic link identity is duplicated");
+            if (noteIds.count(link.slaveNoteId) == 0 || noteIds.count(link.masterNoteId) == 0)
+                return reject("Block C harmonic link endpoint is missing");
         }
+        if (diagnostic != nullptr) diagnostic->clear();
         return true;
     }
 
@@ -408,6 +409,13 @@ std::shared_ptr<const CanonicalBlockCFrame> warmFrameProducerTo(
         packedFrame = frame;
     }
     return cachedFrame;
+}
+
+inline bool explainAdmissibility(const FrameKey& key,
+                                 const std::shared_ptr<const arbitmod::Score>& score,
+                                 float beat, std::string& diagnostic) noexcept
+{
+    return FrameProducer::admissible(key, score, beat, &diagnostic);
 }
 
 inline bool valid(const std::shared_ptr<const CanonicalBlockCFrame>& frame) noexcept

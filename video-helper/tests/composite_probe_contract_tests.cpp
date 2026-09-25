@@ -70,6 +70,67 @@ int main()
     check (! videohelper::validateCompositeProbeContract(snapshot, 9, 0.0, 1921, 1080, 30.0, error),
            "oversized canvas is rejected");
 
+    check (!videohelper::validateCompositeProbeContract(snapshot, 9, 0.0, 3840, 2160, 30.0, error),
+           "4K cannot enter the inline helper response");
+    check (videohelper::validateCompositeProbeContract(snapshot, 9, 0.0, 3840, 2160, 30.0, error, true),
+           "exact 4K is admitted for artifact transport");
+    check (!videohelper::validateCompositeProbeContract(snapshot, 9, 0.0, 3842, 2160, 30.0, error, true),
+           "artifact dimensions are exact");
+    {
+        using namespace compositeartifact;
+        auto now = std::chrono::steady_clock::now();
+        Store store([&] { return now; });
+        bool current = true;
+        const auto create = [&](const std::string& owner)
+        { return store.create(owner, std::vector<uint8_t>(maxBytes, 41), [&] { return current; }, error); };
+        const auto first = create("first");
+        check(validHandle(first), "artifact handles use secure opaque tokens");
+        check(create("first").empty(), "one live handle per principal");
+        const auto second = create("second");
+        check(!second.empty() && create("third").empty(), "global handle and byte budget is bounded");
+        std::vector<uint8_t> bytes;
+        bool done = false;
+        check(!store.read("wrong", first, 0, bytes, done, error), "wrong owner cannot read");
+        check(!store.release("wrong", first, error), "wrong owner cannot release");
+        check(!store.read("first", "../path", 0, bytes, done, error), "malformed handles fail");
+        size_t offset = 0;
+        int chunks = 0;
+        while (offset < maxBytes)
+        {
+            if (!store.read("first", first, offset, bytes, done, error))
+            { check(false, "sequential 4K transfer succeeds"); break; }
+            check(bytes.size() == std::min(chunkBytes, maxBytes - offset), "chunk size is exact and bounded");
+            check(std::all_of(bytes.begin(), bytes.end(), [](auto byte) { return byte == 41; }), "pixels are lossless");
+            offset += bytes.size();
+            check(done == (offset == maxBytes), "only last chunk finishes the transfer");
+            ++chunks;
+        }
+        check(offset == 33177600 && chunks == 32, "full 4K is delivered in 32 bounded chunks");
+        check(!store.read("first", first, 0, bytes, done, error), "completion destroys the handle");
+        check(!store.release("first", first, error), "completed handles cannot be replayed");
+        const auto replay = create("first");
+        check(store.read("first", replay, 0, bytes, done, error), "first read succeeds");
+        check(!store.read("first", replay, 0, bytes, done, error), "repeated offset fails and clears owned bytes");
+        check(!store.read("first", replay, chunkBytes, bytes, done, error), "failed transfer cannot resume");
+        const auto skipped = create("first");
+        check(!store.read("first", skipped, chunkBytes, bytes, done, error), "skipped offset fails");
+        const auto stale = create("first");
+        current = false;
+        check(!store.read("first", stale, 0, bytes, done, error), "stale identity fails and frees bytes");
+        current = true;
+        const auto expired = create("first");
+        now += std::chrono::milliseconds(lifetimeMs);
+        check(!store.read("first", expired, 0, bytes, done, error), "exact TTL boundary expires");
+        check(!create("third").empty(), "expiry frees quota for every principal");
+        store.clear();
+        check(!store.read("second", second, 0, bytes, done, error), "shutdown/reopen clear invalidates handles");
+        const auto released = create("first");
+        check(store.release("first", released, error), "explicit release succeeds");
+        check(!store.read("first", released, 0, bytes, done, error), "released handle is invalid");
+        check(store.create("first", std::vector<uint8_t>(16), [] { return true; }, error).empty(),
+              "incorrect raw byte count is rejected");
+    }
+
     std::vector<char> line;
     std::istringstream exact (std::string (64, 'x') + "\n");
     check (videohelper::readBoundedLine (exact, line, 64) == videohelper::BoundedLineResult::line

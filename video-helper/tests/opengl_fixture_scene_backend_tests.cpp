@@ -5,7 +5,15 @@
 #include "../src/diffractive_foil_admission.h"
 #include "../src/gl_loader.h"
 #include "support/fixture_scene.h"
+#include "support/vertex_modifier_fixture.h"
+#include "support/diffraction_environment_cases.h"
 #include "support/surface_material_starter_oracle.h"
+#include "support/generated_surface_scene.h"
+#include "support/render_pass_program_cases.h"
+#include "support/material_frame_binding_cases.h"
+#include "support/native_scene_orientation_fixture.h"
+#include "support/raw_pass_readback_checks.h"
+#include "support/linear_scene_hdr_checks.h"
 #include "../src/sha256.h"
 #include "../../shared/DiffractionMaterialPresets.h"
 #include "../../shared/generated/SurfaceMaterialStarterPrograms.h"
@@ -207,8 +215,17 @@ int main()
     bool ok = true;
     auto& backend = arbitgpu::nativeFixtureSceneBackend();
     const auto info = backend.info();
+    std::string linearError;
+    const bool linearCaptured = linearscenechecks::capture(backend, linearError) != nullptr;
+    ok &= expect(linearCaptured, linearError.c_str());
     ok &= expect (info.available && info.backend == "opengl",
                   "the production fixture backend must report the live OpenGL context");
+    ok &= videohelper::tests::materialFrameBindingCases(backend,
+        [&](const auto& frame) { return readRgba8(gl, frame); });
+    std::string orientationError;
+    ok &= expect(videohelper::tests::orientation::materialOrientationCases(backend, orientationError),
+                 "embedded textures and native Frames preserve four-quadrant text orientation");
+    if (!orientationError.empty()) std::cerr << orientationError << '\n';
 
     auto sceneValue = videohelper::fixture3d::makeScene();
     sceneValue.lightCount = 0;
@@ -325,6 +342,242 @@ int main()
     const auto firstPixels = readRgba8 (gl, first.frame);
     reportCoverage ("constant-emission", firstPixels);
 
+    // Pin the camera and object so the centre pixel has a known world normal.
+    auto outputSceneValue = sceneValue;
+    outputSceneValue.objectCount = 1;
+    outputSceneValue.objects[0].transform = {};
+    outputSceneValue.cameras[0].transform = {};
+    outputSceneValue.cameras[0].transform.translation.z = 5.0f;
+    auto outputScene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (outputSceneValue);
+    auto outputResources = backend.prepare (outputScene, material);
+    ok &= expect (outputResources.prepared, "output inspection scene prepares");
+    for (const auto output : { renderpassoutput::Output::Depth, renderpassoutput::Output::Normal,
+                              renderpassoutput::Output::Motion,
+                              renderpassoutput::Output::Emission, renderpassoutput::Output::Mask,
+                              renderpassoutput::Output::MaterialId, renderpassoutput::Output::ObjectId })
+    {
+        arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+        inputs.imageOutput = output;
+        const auto frame = backend.render (outputScene, outputResources.resources, 64, 64, inputs);
+        ok &= expect (frame.rendered && frame.frame != nullptr, "each Render 3D inspection output draws");
+        if (!frame.frame) continue;
+        const auto pixels = readRgba8 (gl, frame.frame);
+        const auto center = (32u * 64u + 32u) * 4u;
+        std::array<float, 3> expected {};
+        if (output == renderpassoutput::Output::Normal) expected = { 0.5f, 0.5f, 1.0f };
+        if (output == renderpassoutput::Output::Motion) expected = { 0.5f, 0.5f, 0.5f };
+        if (output == renderpassoutput::Output::Emission) expected = { 0.8f, 0.08f, 0.02f };
+        if (output == renderpassoutput::Output::Mask) expected = { 1.0f, 1.0f, 1.0f };
+        if (output == renderpassoutput::Output::MaterialId)
+            expected = render3dimage::identityColor (outputSceneValue.objects[0].material.value);
+        if (output == renderpassoutput::Output::ObjectId)
+            expected = render3dimage::identityColor (outputSceneValue.objects[0].id.value);
+        if (output == renderpassoutput::Output::Depth)
+        {
+            const auto& camera = outputSceneValue.cameras[0];
+            const auto depth = (4.0f - camera.nearPlane) / (camera.farPlane - camera.nearPlane);
+            expected = { depth, depth, depth };
+        }
+        for (std::size_t channel = 0; channel < 3; ++channel)
+            ok &= expect (std::abs (static_cast<int> (pixels[center + channel])
+                - static_cast<int> (std::lround (expected[channel] * 255.0f))) <= 1,
+                "inspection pixels contain the requested native quantity");
+        ok &= expect (pixels[center + 3u] == 255 && pixels[3] == 0,
+                      "inspection preserves object coverage and transparent background");
+        const auto repeated = backend.render (outputScene, outputResources.resources, 64, 64, inputs);
+        ok &= expect (repeated.rendered && readRgba8 (gl, repeated.frame) == pixels
+                          && repeated.stats.reusedStaticResources,
+                      "inspection is deterministic and reuses native geometry");
+    }
+    auto rawSceneValue = outputSceneValue;
+    rawSceneValue.objects[0].id.value = 0xf1234567u;
+    rawSceneValue.materials[0].id.value = 0xe2345678u;
+    rawSceneValue.objects[0].material = rawSceneValue.materials[0].id;
+    rawSceneValue.materials[0].emissive = { 2.5f, 0.25f, 0.0f };
+    auto rawScene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(rawSceneValue);
+    auto rawResources = backend.prepare(rawScene, nullptr);
+    auto rawFrame = backend.render(rawScene, rawResources.resources, 64, 64, {});
+    ok &= expect(rawFrame.rendered && rawFrame.frame != nullptr, "raw scene passes render together");
+    if (rawFrame.frame)
+    {
+        const std::size_t center = 32u * 64u + 32u;
+        const auto readMotion = [&](const auto& frame)
+        {
+            std::vector<float> values(64u * 64u * 2u, -99.0f);
+            if (!frame) return values;
+            const auto descriptor = frame->passTextureDescriptor(renderpassoutput::Output::Motion);
+            ok &= expect(descriptor.complete() && descriptor.format == arbitgpu::NativeTexturePixelFormat::Rg16Float,
+                "Motion is a retained two-channel half-float data attachment");
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(descriptor.textureViewHandle));
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RG, GL_FLOAT, values.data());
+            return values;
+        };
+        const auto still = readMotion(rawFrame.frame);
+        ok &= expect(std::all_of(still.begin(), still.end(), [](float value) { return value == 0; }),
+            "first frame publishes zero vectors including background");
+        arbitgpu::NativeFixtureSceneRuntimeInputs moving;
+        moving.previousMotion = arbitgpu::NativeSceneMotionSample {};
+        moving.objectTranslationOffset[0] = 0.25f;
+        moving.passComposite = renderpasscomposite::Parameters {};
+        moving.passComposite->mode = renderpasscomposite::Mode::MotionView;
+        moving.passComposite->amount = 0;
+        const auto moved = backend.render(rawScene, rawResources.resources, 64, 64, moving);
+        const auto movedAgain = backend.render(rawScene, rawResources.resources, 64, 64, moving);
+        const auto vectors = readMotion(moved.frame);
+        std::vector<float> depth(64u * 64u);
+        if (moved.frame)
+        {
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(moved.frame->depthTextureViewHandle()));
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED, GL_FLOAT, depth.data());
+        }
+        const auto& camera = rawScene->cameras[0];
+        const auto distance = camera.nearPlane + depth[center] * (camera.farPlane - camera.nearPlane);
+        const auto expectedPixels = 0.25f * 32.0f / (std::tan(camera.verticalFovRadians * 0.5f) * distance);
+        ok &= expect(moved.rendered && movedAgain.rendered && moved.stats.drawCount == rawFrame.stats.drawCount
+            && vectors == readMotion(movedAgain.frame) && readRgba8(gl, moved.frame) == readRgba8(gl, movedAgain.frame)
+            && std::abs(vectors[center * 2u] - expectedPixels) < 0.01f
+            && std::abs(vectors[center * 2u + 1u]) < 0.001f,
+            "object motion uses signed pixel displacement and repeatable one-render inspection");
+        auto directMotion = moving;
+        directMotion.passComposite.reset();
+        directMotion.imageOutput = renderpassoutput::Output::Motion;
+        const auto direct = backend.render(rawScene, rawResources.resources, 64, 64, directMotion);
+        ok &= expect(direct.rendered && readRgba8(gl, direct.frame) == readRgba8(gl, moved.frame)
+            && readMotion(direct.frame) == vectors,
+            "Motion Image selection matches the raw-pass inspector without changing its vectors");
+        moving.objectTranslationOffset[0] = 0;
+        moving.cameraTranslationOffset[0] = 0.25f;
+        const auto cameraMoved = backend.render(rawScene, rawResources.resources, 64, 64, moving);
+        const auto cameraVectors = readMotion(cameraMoved.frame);
+        ok &= expect(cameraMoved.rendered && cameraVectors[center * 2u] < -0.1f,
+            "camera translation produces the opposite signed motion");
+        moving.cameraTranslationOffset[0] = 0;
+        moving.previousMotion->objectTranslationOffset[0] = 1000000.0f;
+        const auto extremeFrame = backend.render(rawScene, rawResources.resources, 64, 64, moving);
+        const auto extremeMotion = readMotion(extremeFrame.frame);
+        ok &= expect(extremeFrame.rendered && extremeMotion[center * 2u] == -65504.0f,
+            "motion saturates at the finite RG16F range");
+        moving.previousMotion.reset();
+        const auto resetFrame = backend.render(rawScene, rawResources.resources, 64, 64, moving);
+        const auto resetMotion = readMotion(resetFrame.frame);
+        ok &= expect(std::all_of(resetMotion.begin(), resetMotion.end(), [](float value) { return value == 0; }),
+            "reset suppresses motion even when the current transform is displaced");
+        rawpasschecks::verify(rawFrame.frame, [&](bool condition, const char* message)
+            { ok &= expect(condition, message); });
+        for (const auto output : { renderpassoutput::Output::MaterialId, renderpassoutput::Output::ObjectId })
+        {
+            const auto descriptor = rawFrame.frame->passTextureDescriptor(output);
+            std::vector<std::uint32_t> ids(64u * 64u);
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(descriptor.textureViewHandle));
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, ids.data());
+            const auto expected = output == renderpassoutput::Output::MaterialId ? 0xe2345678u : 0xf1234567u;
+            ok &= expect(descriptor.complete() && descriptor.format == arbitgpu::NativeTexturePixelFormat::R32Uint
+                && ids[center] == expected && ids[0] == 0u, "raw IDs retain all 32 bits and zero background");
+            arbitgpu::NativeRawPassPixels exported;
+            std::string readError;
+            ok &= expect(rawFrame.frame->readRawPass(output, exported, readError), "GL IDs export without palette encoding");
+            for (std::uint32_t row = 0; row < 64 && exported.bytes.size() == 64u * 64u * 4u; ++row)
+                ok &= expect(std::memcmp(exported.bytes.data() + row * 64u * 4u,
+                    ids.data() + (63u - row) * 64u, 64u * 4u) == 0,
+                    "GL ID readback flips rows into the shared top-first file convention");
+        }
+        for (const auto output : { renderpassoutput::Output::Normal, renderpassoutput::Output::Emission })
+        {
+            const auto descriptor = rawFrame.frame->passTextureDescriptor(output);
+            std::vector<float> values(64u * 64u * 4u);
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(descriptor.textureViewHandle));
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, values.data());
+            const std::array<float, 3> expected = output == renderpassoutput::Output::Normal
+                ? std::array<float, 3> { 0, 0, 1 } : std::array<float, 3> { 2.5f, 0.25f, 0 };
+            ok &= expect(descriptor.complete() && descriptor.format == arbitgpu::NativeTexturePixelFormat::Rgba16Float,
+                "raw normals and emission retain floating-point descriptors");
+            for (std::size_t channel = 0; channel < 3; ++channel)
+                ok &= expect(std::abs(values[center * 4u + channel] - expected[channel]) < 0.001f,
+                    "raw vectors and HDR emission are not display-encoded or clamped");
+        }
+        for (const auto mode : { renderpasscomposite::Mode::DepthFog, renderpasscomposite::Mode::NormalView,
+                                renderpasscomposite::Mode::MaskView, renderpasscomposite::Mode::ObjectMatte })
+        {
+            arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+            inputs.passComposite = renderpasscomposite::Parameters {};
+            inputs.passComposite->mode = mode;
+            inputs.passComposite->farDepth = 0.001f;
+            inputs.passComposite->fogColor = { 0.2f, 0.4f, 0.6f };
+            inputs.passComposite->identity = 0xf1234567u;
+            const auto composed = backend.render(rawScene, rawResources.resources, 64, 64, inputs);
+            const auto pixels = composed.frame ? readRgba8(gl, composed.frame) : std::vector<std::uint8_t> {};
+            ok &= expect(composed.rendered && composed.stats.reusedStaticResources
+                && composed.stats.drawCount == rawFrame.stats.drawCount && pixels.size() == 64u * 64u * 4u,
+                "typed pass fan-out and compositing reuse one scene draw");
+            if (pixels.size() != 64u * 64u * 4u) continue;
+            const std::array<float, 3> expected = mode == renderpasscomposite::Mode::DepthFog
+                ? std::array<float, 3> { 0.2f, 0.4f, 0.6f } : mode == renderpasscomposite::Mode::NormalView
+                ? std::array<float, 3> { 0.5f, 0.5f, 1 } : std::array<float, 3> { 1, 1, 1 };
+            for (std::size_t channel = 0; channel < 3; ++channel)
+                ok &= expect(std::abs(static_cast<int>(pixels[center * 4u + channel])
+                    - static_cast<int>(std::lround(expected[channel] * 255))) <= 1,
+                    "pass composite consumes the requested depth, normal or integer matte");
+            inputs.passComposite->mode = renderpasscomposite::Mode::ObjectMatte;
+            inputs.passComposite->identity = 7;
+            const auto wrongId = backend.render(rawScene, rawResources.resources, 64, 64, inputs);
+            const auto rejectedPixels = wrongId.frame ? readRgba8(gl, wrongId.frame) : std::vector<std::uint8_t> {};
+            ok &= expect(!rejectedPixels.empty() && rejectedPixels[center * 4u] == 0,
+                "ID matte compares raw integer identity rather than palette color");
+        }
+    }
+    {
+        arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+        inputs.passProgram = renderpassfixture::hdrBranches();
+        inputs.passComposite = inputs.passProgram->steps[inputs.passProgram->output].parameters;
+        const auto composed = backend.render(rawScene, rawResources.resources, 64, 64, inputs);
+        const auto pixels = composed.frame ? readRgba8(gl, composed.frame) : std::vector<std::uint8_t> {};
+        const auto expected = renderpassfixture::expectedSdr();
+        ok &= expect(composed.rendered && composed.stats.drawCount == rawFrame.stats.drawCount
+            && pixels.size() == 64u * 64u * 4u, "HDR pass branches fuse into the retained scene draw");
+        if (pixels.size() == 64u * 64u * 4u)
+            for (std::size_t channel = 0; channel < 3; ++channel)
+                ok &= expect(std::abs(static_cast<int>(pixels[(32u * 64u + 32u) * 4u + channel])
+                    - expected[channel]) <= 1,
+                    "linear HDR survives branch fan-out and sRGB fog decoding until final tone mapping");
+        if (composed.frame)
+        {
+            const auto emission = composed.frame->passTextureDescriptor(renderpassoutput::Output::Emission);
+            std::vector<float> raw(64u * 64u * 4u);
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(emission.textureViewHandle));
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, raw.data());
+            ok &= expect(emission.format == arbitgpu::NativeTexturePixelFormat::Rgba16Float
+                && std::abs(raw[(32u * 64u + 32u) * 4u] - 2.5f) < 0.001f,
+                "HDR branch output transforms leave the retained raw emission attachment unchanged");
+        }
+        const auto repeated = backend.render(rawScene, rawResources.resources, 64, 64, inputs);
+        ok &= expect(repeated.rendered && readRgba8(gl, repeated.frame) == pixels,
+            "HDR pass graph renders deterministically on repeated preview/export samples");
+        inputs.passProgram->steps[2].inputA = 3;
+        ok &= expect(!backend.render(rawScene, rawResources.resources, 64, 64, inputs).rendered,
+            "forward references cannot enter the native pass program");
+    }
+    rawFrame.frame.reset(); rawResources.resources.reset();
+    arbitgpu::NativeFixtureSceneRuntimeInputs unsupportedOutput;
+    unsupportedOutput.imageOutput = renderpassoutput::Output::Count;
+    ok &= expect (!backend.render (outputScene, outputResources.resources, 64, 64,
+                                  unsupportedOutput).rendered,
+                  "invalid output cannot masquerade as color");
+    outputResources.resources.reset();
+    outputSceneValue.materials[0].alphaMode = HarmonicMIDI::grid::SceneAlphaMode::Mask;
+    outputSceneValue.materials[0].opacity = 0.25f;
+    outputSceneValue.materials[0].alphaCutoff = 0.5f;
+    auto cutoutScene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(outputSceneValue);
+    auto cutoutResources = backend.prepare(cutoutScene, nullptr);
+    arbitgpu::NativeFixtureSceneRuntimeInputs cutoutInput;
+    cutoutInput.imageOutput = renderpassoutput::Output::Mask;
+    const auto cutoutFrame = backend.render(cutoutScene, cutoutResources.resources, 64, 64, cutoutInput);
+    const auto cutoutPixels = cutoutFrame.rendered ? readRgba8(gl, cutoutFrame.frame)
+                                                  : std::vector<std::uint8_t> {};
+    ok &= expect(cutoutPixels.size() == 64u * 64u * 4u
+                     && cutoutPixels[(32u * 64u + 32u) * 4u + 3u] == 0,
+                 "Mask inspection respects the rendered material alpha cutoff");
+    cutoutResources.resources.reset();
+
     auto second = backend.render (scene, preparation.resources, 64, 64, noteRuntime);
     if (! second.rendered)
         std::cerr << "OpenGL second fixture render error: " << second.error << '\n';
@@ -349,6 +602,29 @@ int main()
         scene, preparation.resources, 64, 64, explicitLight);
     ok &= expect (! invalidLight.rendered && invalidLight.frame == nullptr,
                   "OpenGL rejects a malformed Light binding before drawing");
+    {
+        auto value = videohelper::fixture3d::makeScene();
+        value.ambientColor = {}; value.lightCount = 0;
+        value.materials[0].baseColor = { 1, 1, 1 };
+        value.materials[0].emissive = {}; value.materials[0].metallic = 0;
+        auto litScene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(std::move(value));
+        auto lightResources = backend.prepare(litScene, nullptr);
+        arbitgpu::NativeFixtureSceneRuntimeInputs dynamicLight;
+        dynamicLight.lightOverride.emplace();
+        dynamicLight.lightOverride->id.value = 91;
+        dynamicLight.lightOverride->intensity = 4;
+        const auto lit = backend.render(litScene, lightResources.resources, 64, 64, dynamicLight);
+        dynamicLight.lightOverride->intensity = 0;
+        const auto dark = backend.render(litScene, lightResources.resources, 64, 64, dynamicLight);
+        dynamicLight.lightOverride->intensity = 4;
+        const auto replay = backend.render(litScene, lightResources.resources, 64, 64, dynamicLight);
+        const auto litPixels = lit.frame ? readRgba8(gl, lit.frame) : std::vector<std::uint8_t> {};
+        const auto darkPixels = dark.frame ? readRgba8(gl, dark.frame) : std::vector<std::uint8_t> {};
+        const auto replayPixels = replay.frame ? readRgba8(gl, replay.frame) : std::vector<std::uint8_t> {};
+        ok &= expect(lit.rendered && dark.rendered && replay.rendered
+            && !litPixels.empty() && litPixels != darkPixels && litPixels == replayPixels,
+            "per-frame directional light overrides alter pixels and replay without uploading scene resources");
+    }
     if (! second.rendered || second.frame == nullptr)
     {
         first.frame.reset();
@@ -450,7 +726,11 @@ int main()
         ok &= expect (expected.id == starter.id,
                       "generated starter programs and independent JSON oracle must share stable IDs");
 
-        auto starterSceneValue = starterLightingSceneValue;
+        std::string generatedError;
+        auto generatedScene = videohelper::tests::generatedSurfaceScene(starterLightingSceneValue, generatedError);
+        ok &= expect(generatedScene.has_value(), "exact starter uses admitted generated Geometry Core scene transport");
+        if (!generatedScene) continue;
+        auto starterSceneValue = std::move(*generatedScene);
         starterSceneValue.materials[0].id = { starter.materialIdValue() };
         starterSceneValue.objects[0].material = { starter.materialIdValue() };
         const auto starterScene
@@ -519,6 +799,82 @@ int main()
                       "distinct production preview and export owners must render fresh OpenGL frames");
         ok &= expect (! previewPixels.empty() && previewPixels == exportPixels,
                       "preview and export owners must produce exact matching OpenGL pixels");
+        if (starterIndex == 0)
+        {
+            auto vertexRequest = request;
+            vertexRequest.vertexModifier = videohelper::test::audioNormalDisplacement();
+            const auto vertexBinding = videorender::fixture3d::admitSurfaceMaterialBinding(
+                starterScene, vertexRequest, videohelper::materialprogram::BackendTarget::OpenGl,
+                admissionError);
+            if (vertexBinding)
+            {
+                backend.releaseCachedProgramsForCurrentContext();
+                auto changedRequest = vertexRequest;
+                changedRequest.vertexModifier = videohelper::test::audioNormalDisplacement(0.5);
+                const auto changedBinding = videorender::fixture3d::admitSurfaceMaterialBinding(
+                    starterScene, changedRequest, videohelper::materialprogram::BackendTarget::OpenGl,
+                    admissionError);
+                ok &= expect(changedBinding != nullptr, "changed vertex source admits independently");
+                if (changedBinding)
+                {
+                    const std::array<std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram>, 5> programs {{
+                        {}, vertexBinding->nativeProgram(), changedBinding->nativeProgram(),
+                        vertexBinding->nativeProgram(), {}
+                    }};
+                    for (std::size_t index = 0; index < programs.size(); ++index)
+                    {
+                        // Each preparation is destroyed before the next lookup.
+                        const auto preparation = backend.prepare(starterScene, programs[index]);
+                        ok &= expect(preparation.prepared
+                            && preparation.stats.shaderProgramBuildCount == (index < 3 ? 1u : 0u),
+                            "program cache must distinguish exact vertex sources across resource gaps");
+                    }
+                }
+            }
+            const auto prepared = vertexBinding ? backend.prepare(starterScene, vertexBinding->nativeProgram())
+                                                : arbitgpu::NativeFixtureScenePreparation {};
+            ok &= expect(vertexBinding != nullptr && prepared.prepared,
+                         "audio vertex material reaches OpenGL shader compilation");
+            if (vertexBinding)
+            {
+                auto mismatched = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(
+                    *vertexBinding->nativeProgram());
+                mismatched->programIdentity = binding->nativeProgram()->programIdentity;
+                ok &= expect(!backend.prepare(starterScene, mismatched).prepared,
+                             "vertex shader identity cannot be substituted after material admission");
+            }
+            if (prepared.prepared)
+            {
+                arbitgpu::NativeFixtureSceneRuntimeInputs quiet, loud;
+                loud.vertexSpectrum[6] = 0.5f;
+                const auto quietFrame = backend.render(starterScene, prepared.resources, 64, 64, quiet);
+                const auto loudFrame = backend.render(starterScene, prepared.resources, 64, 64, loud);
+                const auto replayFrame = backend.render(starterScene, prepared.resources, 64, 64, quiet);
+                const auto quietPixels = quietFrame.rendered ? readRgba8(gl, quietFrame.frame) : std::vector<std::uint8_t> {};
+                const auto loudPixels = loudFrame.rendered ? readRgba8(gl, loudFrame.frame) : std::vector<std::uint8_t> {};
+                ok &= expect(!quietPixels.empty() && quietPixels == previewPixels
+                             && !loudPixels.empty() && loudPixels != quietPixels
+                             && replayFrame.rendered && readRgba8(gl, replayFrame.frame) == quietPixels,
+                             "GPU displacement follows the audio frame and seeking to silence restores original geometry");
+                loud.vertexSpectrum[6] = 1.0f;
+                const auto boundedFrame = backend.render(starterScene, prepared.resources, 64, 64, loud);
+                ok &= expect(boundedFrame.rendered && readRgba8(gl, boundedFrame.frame) == loudPixels,
+                             "audio above the displacement bound cannot move GPU vertices farther");
+                videorender::fixture3d::RenderedFrame vertexExport;
+                const auto exported = exportOwner.renderExport(starterScene, vertexBinding, {}, loud,
+                    {64, 64}, videorender::fixture3d::kNativeGpuCapability, vertexExport, admissionError);
+                ok &= expect(exported && readRgba8(gl, vertexExport.nativeFrame) == loudPixels,
+                             "vertex displacement preview and export produce the same native pixels");
+                loud.passComposite = renderpasscomposite::Parameters {};
+                loud.passComposite->mode = renderpasscomposite::Mode::MotionView;
+                ok &= expect(!backend.render(starterScene, prepared.resources, 64, 64, loud).rendered,
+                             "OpenGL reports unsupported motion inspection for vertex deformation");
+                loud.passComposite.reset();
+                loud.vertexSpectrum[6] = std::numeric_limits<float>::quiet_NaN();
+                ok &= expect(!backend.render(starterScene, prepared.resources, 64, 64, loud).rendered,
+                             "non-finite audio cannot reach a native vertex shader");
+            }
+        }
         if (previewPixels.size() > center + 3u)
         {
             const std::array<std::uint8_t, 4> actualCenter {{
@@ -569,9 +925,21 @@ int main()
                     { p.baseColorMetallic[3] = 0.0f; }),
                     "OpenGL lit pixels must detect a wrong metallic binding");
             if (starterIndex == 2)
+            {
                 ok &= expect (rejectsControlledMaterialAlternative ("/opacity", [] (auto& p)
                     { p.normalOpacity[3] = 1.0f; }),
                     "OpenGL lit pixels must detect a wrong opacity binding");
+                ok &= expect (rejectsControlledMaterialAlternative ("/transmission", [] (auto& p)
+                    { p.transmissionIorClearcoat[0] = 0.0f; }),
+                    "OpenGL lit pixels must detect a wrong transmission binding");
+                ok &= expect (rejectsControlledMaterialAlternative ("/ior", [] (auto& p)
+                    { p.transmissionIorClearcoat[1] = 2.8f; }),
+                    "OpenGL lit pixels must detect a wrong IOR binding");
+            }
+            if (starterIndex == 3)
+                ok &= expect (rejectsControlledMaterialAlternative ("/clearcoat", [] (auto& p)
+                    { p.transmissionIorClearcoat[2] = 0.0f; }),
+                    "OpenGL lit pixels must detect a wrong clearcoat binding");
 
             if (starterIndex != 0)
                 continue;
@@ -693,7 +1061,9 @@ int main()
         && objectZeroFrame.stats.drawCount == 1
         && composedPreparation.prepared && composed.rendered
         && composedExport.rendered
-        && composedPreparation.stats.staticUploadCount == 2
+        && composedPreparation.stats.staticUploadCount == 1
+        && composedPreparation.stats.vertexBytes == objectZeroPreparation.stats.vertexBytes
+        && composedPreparation.stats.indexBytes == objectZeroPreparation.stats.indexBytes
         && composed.stats.drawCount == 2
         && composed.stats.reusedStaticResources
         && composedExport.stats.reusedStaticResources
@@ -711,15 +1081,15 @@ int main()
     ok &= expect (composedContractHolds,
                   "only the second OpenGL object must add distinct green pixels in its own region");
 
-    auto transparentSceneValue = sceneValue;
-    transparentSceneValue.materials[0].opacity = 0.5f;
-    const auto transparentPreparation = backend.prepare (
-        std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (transparentSceneValue),
+    auto invalidOpacitySceneValue = sceneValue;
+    invalidOpacitySceneValue.materials[0].opacity = 1.5f;
+    const auto invalidOpacityPreparation = backend.prepare (
+        std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (invalidOpacitySceneValue),
         material);
-    ok &= expect (! transparentPreparation.prepared
-                      && transparentPreparation.resources == nullptr
-                      && transparentPreparation.stats.staticUploadCount == 0,
-                  "OpenGL rejects unsupported opacity before GPU upload");
+    ok &= expect (! invalidOpacityPreparation.prepared
+                      && invalidOpacityPreparation.resources == nullptr
+                      && invalidOpacityPreparation.stats.staticUploadCount == 0,
+                  "OpenGL rejects out-of-range opacity before GPU upload");
 
     auto wrongMaterial = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram> (*material);
     wrongMaterial->parameters.identifiers[0] += 1u;
@@ -785,6 +1155,7 @@ int main()
     importedTexture.width = 2;
     importedTexture.height = 2;
     importedTexture.texelCount = 4;
+    importedTexture.texels.resize (importedTexture.texelCount);
     std::copy_n (texturedSceneValue.textureTexels.begin(), 4,
                  importedTexture.texels.begin());
     texturedMaterial->importedBaseColorTexture = std::move (importedTexture);
@@ -864,6 +1235,7 @@ int main()
     auto semanticScene = texturedSceneValue;
     semanticScene.textureCount = 0;
     semanticScene.textureTexelCount = 0;
+    semanticScene.textureTexels.clear();
     semanticScene.materials[0].baseColorTexture = {};
     semanticScene.materials[0].baseColor = { 0.8f, 0.1f, 0.05f };
     semanticScene.materials[0].roughness = 0.2f;
@@ -956,7 +1328,7 @@ int main()
     backFaceScene->materials[0].doubleSided = true;
     const auto doubleSidedPixels = renderStaticPixels (*backFaceScene);
     auto reflectedScene = std::make_unique<HarmonicMIDI::grid::Visual3DScene> (*onePrimitiveScene);
-    reflectedScene->objects[0].transform.scale.x = -1.0f;
+    reflectedScene->objects[0].transform.scale.x *= -1.0f;
     reflectedScene->materials[0].doubleSided = false;
     const auto reflectedPixels = renderStaticPixels (*reflectedScene);
 
@@ -1012,6 +1384,7 @@ int main()
     packedTextureScene->materials[0].roughness = 1.0f;
     packedTextureScene->textureCount = 5;
     packedTextureScene->textureTexelCount = 5;
+    packedTextureScene->textureTexels.resize (packedTextureScene->textureTexelCount);
     for (std::size_t index = 0; index < packedTextureScene->textureCount; ++index)
     {
         packedTextureScene->textures[index].id
@@ -1035,7 +1408,7 @@ int main()
     packedTextureScene->materials[0].emissive = { 0.2f, 0.2f, 0.2f };
     const auto packedTexturePixels = renderStaticPixels (*packedTextureScene);
     auto reflectedNormalScene = std::make_unique<HarmonicMIDI::grid::Visual3DScene> (*packedTextureScene);
-    reflectedNormalScene->objects[0].transform.scale.x = -1.0f;
+    reflectedNormalScene->objects[0].transform.scale.x *= -1.0f;
     const auto reflectedNormalPixels = renderStaticPixels (*reflectedNormalScene);
     auto reflectedWithoutNormal = std::make_unique<HarmonicMIDI::grid::Visual3DScene> (*reflectedNormalScene);
     reflectedWithoutNormal->materials[0].normalTexture = {};
@@ -1054,6 +1427,9 @@ int main()
         std::swap (analyticReflectedNormal->indices[index], analyticReflectedNormal->indices[index + 1]);
     const auto analyticReflectedNormalPixels = renderStaticPixels (*analyticReflectedNormal);
     auto sharedRoleScene = std::make_unique<HarmonicMIDI::grid::Visual3DScene> (*packedTextureScene);
+    // The front-facing geometry normal keeps both transfer-role controls
+    // distinguishable after RGBA8 quantization. Normal mapping is tested above.
+    sharedRoleScene->materials[0].normalTexture = {};
     sharedRoleScene->materials[0].baseColorTexture = sharedRoleScene->textures[0].id;
     sharedRoleScene->materials[0].metallicRoughnessTexture = sharedRoleScene->textures[0].id;
     const auto sharedRolePixels = renderStaticPixels (*sharedRoleScene);
@@ -1299,6 +1675,9 @@ int main()
     diffractionProgram->diffractionPaths[0].material.roughness.y = 0.0f;
     auto diffractionFrame = backend.render (
         diffractionScene, diffractionPreparation.resources, 96, 96, {});
+    const bool linearDiffraction = linearscenechecks::diffraction(backend, diffractionScene,
+        diffractionPreparation.resources, linearError);
+    ok &= expect(linearDiffraction, linearError.c_str());
     if (! diffractionPreparation.prepared)
         std::cerr << "OpenGL diffraction preparation error: "
                   << diffractionPreparation.error << '\n';
@@ -1309,8 +1688,19 @@ int main()
         ? readRgba8 (gl, diffractionFrame.frame) : std::vector<std::uint8_t> {};
     reportCoverage ("diffraction", diffractionPixels);
 
-    const auto foilEvaluationCount = 320u * 180u;
+    // The authored card reserves three lighting paths at a 1080p ceiling;
+    // this smaller draw still reserves one pixel slot per path.
+    constexpr auto foilLightingPathCount = 3u;
+    constexpr auto foilEvaluationCount = 320u * 180u * foilLightingPathCount;
+    constexpr auto foilEvaluationBudget = 1920u * 1080u * foilLightingPathCount;
     const auto& foilRequest = *cardAsset->operation.diffractionMaterial;
+    ok &= expect(foilRequest.lighting.pathCount == foilLightingPathCount
+                     && foilRequest.spatialFoil
+                     && foilRequest.spatialFoil->workBudget.maximumEvaluations == foilEvaluationBudget,
+                 "the compiled card retains its three-path 1080p work ceiling");
+    ok &= diffractionenvironmenttests::run(backend, diffractionScene, cardAsset->operation,
+        videohelper::materialprogram::BackendTarget::OpenGl,
+        [&](const auto& frame) { return readRgba8(gl, frame); });
 
     const auto foilPreviewBinding = videorender::fixture3d::admitDiffractionMaterialBinding(
         diffractionScene, foilRequest,
@@ -1345,13 +1735,15 @@ int main()
         std::cerr << "Diffractive foil render error: " << diffractionError << '\n';
     ok &= expect(foilRendered
                      && foilPreviewFrame.stats.diffractionEvaluationBudget
-                         == foilEvaluationCount
+                         == foilEvaluationBudget
                      && foilPreviewFrame.stats.diffractionEvaluationCount
                          == foilEvaluationCount
                      && foilExportFrame.stats.diffractionEvaluationBudget
-                         == foilEvaluationCount
+                         == foilEvaluationBudget
                      && foilExportFrame.stats.diffractionEvaluationCount
-                         == foilEvaluationCount,
+                         == foilEvaluationCount
+                     && foilPreviewFrame.stats.drawCount == foilLightingPathCount
+                     && foilExportFrame.stats.drawCount == foilLightingPathCount,
                  "OpenGL reports the exact deterministic pixel-slot and lighting-path evaluation count");
 
     auto belowCeilingFoilRequest = foilRequest;
@@ -1594,8 +1986,11 @@ int main()
             && omittedFrame.rendered && omittedPathPixels[pathIndex] != transportPixels;
     }
 
+    // The 63 mm card is 159.65 mm ahead of the camera, with a 0.65 radian
+    // vertical field of view. This 8 mm shift keeps its front face in frame:
+    // the horizontal NDC bounds at 96x96 are approximately [-0.7343, 0.4369].
     arbitgpu::NativeFixtureSceneRuntimeInputs shiftedCamera;
-    shiftedCamera.cameraTranslationOffset[0] = 0.75f;
+    shiftedCamera.cameraTranslationOffset[0] = 0.008f;
     auto shiftedDiffractionFrame = backend.render (
         diffractionScene, diffractionPreparation.resources, 96, 96, shiftedCamera);
     const auto shiftedDiffractionPixels = shiftedDiffractionFrame.rendered
@@ -1657,18 +2052,36 @@ int main()
         = diffractionmaterial::makeRealtimeCrossedTwoDimensionalGratingPreset();
     auto admittedCrossed = diffractionmaterial::admit (
         crossedDescription, diffractionError);
+    // Aim the measured 540 nm (1,1) order at the centre of the unchanged card.
+    // Normal incidence puts most nonzero orders outside its narrow field of
+    // view, leaving an invariant zero-order reflection after RGBA8 quantization.
+    auto crossedIncident = incident;
+    const float crossedX = 540.0f / crossedDescription.geometry.grooveSpacingNanometres;
+    const float crossedY = 540.0f / crossedDescription.geometry.secondaryGrooveSpacingNanometres;
+    crossedIncident.direction = { crossedX, crossedY,
+        std::sqrt(1.0f - crossedX * crossedX - crossedY * crossedY) };
+    auto crossedLightPath = lightingPath;
+    crossedLightPath.incident = crossedIncident;
+    auto crossedLighting = lightingDescription;
+    crossedLighting.paths[0] = crossedLightPath;
+    const auto admittedCrossedLighting = diffractionmaterial::AdmittedLightingPlan::admit(
+        crossedLighting, diffractionError);
     auto crossedProgram
         = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram> (
             *diffractionProgram);
     crossedProgram->bindingDigest = admittedCrossed
         ? admittedCrossed->structuralDigest() : std::string {};
-    if (admittedLighting)
+    if (admittedCrossedLighting)
+    {
+        crossedProgram->diffractionLightingAdmission
+            = std::make_shared<const diffractionmaterial::AdmittedLightingPlan>(*admittedCrossedLighting);
         crossedProgram->programIdentity = arbitgpu::nativeFixtureDiffractionProgramIdentity(
-            crossedProgram->bindingDigest, *admittedLighting);
+            crossedProgram->bindingDigest, *admittedCrossedLighting);
+    }
     if (admittedCrossed)
         crossedProgram->diffractionPaths[0] = diffractionmaterial::makeGpuLightingPath(
             diffractionmaterial::physicalcheckpoint::makeGpuParameters(
-                *admittedCrossed, incident), lightingPath);
+                *admittedCrossed, crossedIncident), crossedLightPath);
     auto unequalCrossedBlazedProgram
         = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram> (
             *crossedProgram);
@@ -1699,14 +2112,14 @@ int main()
             *crossedProgram);
     crossedDirectionProgram->bindingDigest = admittedCrossedDirection
         ? admittedCrossedDirection->structuralDigest() : std::string {};
-    if (admittedLighting)
+    if (admittedCrossedLighting)
         crossedDirectionProgram->programIdentity
             = arbitgpu::nativeFixtureDiffractionProgramIdentity(
-                crossedDirectionProgram->bindingDigest, *admittedLighting);
+                crossedDirectionProgram->bindingDigest, *admittedCrossedLighting);
     if (admittedCrossedDirection)
         crossedDirectionProgram->diffractionPaths[0] = diffractionmaterial::makeGpuLightingPath(
             diffractionmaterial::physicalcheckpoint::makeGpuParameters(
-                *admittedCrossedDirection, incident), lightingPath);
+                *admittedCrossedDirection, crossedIncident), crossedLightPath);
     auto crossedDirectionPreparation = backend.prepare (
         diffractionScene, crossedDirectionProgram);
     auto crossedDirectionFrame = backend.render (
@@ -1725,14 +2138,14 @@ int main()
             *crossedProgram);
     crossedPeriodProgram->bindingDigest = admittedCrossedPeriod
         ? admittedCrossedPeriod->structuralDigest() : std::string {};
-    if (admittedLighting)
+    if (admittedCrossedLighting)
         crossedPeriodProgram->programIdentity
             = arbitgpu::nativeFixtureDiffractionProgramIdentity(
-                crossedPeriodProgram->bindingDigest, *admittedLighting);
+                crossedPeriodProgram->bindingDigest, *admittedCrossedLighting);
     if (admittedCrossedPeriod)
         crossedPeriodProgram->diffractionPaths[0] = diffractionmaterial::makeGpuLightingPath(
             diffractionmaterial::physicalcheckpoint::makeGpuParameters(
-                *admittedCrossedPeriod, incident), lightingPath);
+                *admittedCrossedPeriod, crossedIncident), crossedLightPath);
     auto crossedPeriodPreparation = backend.prepare (
         diffractionScene, crossedPeriodProgram);
     auto crossedPeriodFrame = backend.render (
@@ -1752,15 +2165,15 @@ int main()
         = "opengl-fixture-diffraction-primary-period-program";
     primaryPeriodProgram->bindingDigest = admittedPrimaryPeriod
         ? admittedPrimaryPeriod->structuralDigest() : std::string {};
-    if (admittedLighting)
+    if (admittedCrossedLighting)
         primaryPeriodProgram->programIdentity
             = arbitgpu::nativeFixtureDiffractionProgramIdentity(
-                primaryPeriodProgram->bindingDigest, *admittedLighting);
+                primaryPeriodProgram->bindingDigest, *admittedCrossedLighting);
     if (admittedPrimaryPeriod)
         primaryPeriodProgram->diffractionPaths[0]
             = diffractionmaterial::makeGpuLightingPath(
                 diffractionmaterial::physicalcheckpoint::makeGpuParameters(
-                    *admittedPrimaryPeriod, incident), lightingPath);
+                    *admittedPrimaryPeriod, crossedIncident), crossedLightPath);
     auto primaryPeriodPreparation = backend.prepare (diffractionScene, primaryPeriodProgram);
     auto primaryPeriodFrame = backend.render (
         diffractionScene, primaryPeriodPreparation.resources, 96, 96, {});
@@ -1779,7 +2192,6 @@ int main()
                 return false;
         return true;
     };
-
     ok &= expect (admittedDiffraction.has_value()
                       && everyPathPerturbsPixels
                       && diffractionPreparation.prepared
@@ -1801,6 +2213,10 @@ int main()
                       && diffractionPixels.size() == 96u * 96u * 4u
                       && ! backgroundOnly (diffractionPixels)
                       && diffractionPixels != shiftedDiffractionPixels
+                      // The clear colour is opaque, so alpha cannot prove
+                      // that the shifted camera still frames the grating.
+                      && nonBackgroundCount(shiftedDiffractionPixels) > 3000
+                      && nonBackgroundCount(diffractionPixels) > 3000
                       && diffractionPixels != rotatedPixels
                       && spatialPixels != diffractionPixels
                       && spatialPixels != rotatedPixels
@@ -1891,6 +2307,7 @@ int main()
                   "fixture resource cleanup must restore the caller's OpenGL context");
 
     glfwMakeContextCurrent (window);
+    backend.releaseCachedProgramsForCurrentContext();
     gl.DeleteBuffers (1, &callerPixelUnpackBuffer);
     gl.DeleteFramebuffers (1, &callerFramebuffer);
     glDeleteTextures (1, &callerTexture);

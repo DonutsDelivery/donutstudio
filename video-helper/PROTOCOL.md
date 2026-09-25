@@ -158,6 +158,20 @@ macOS the compositor must report a native Metal backend and the
 presentation identity is `metal-iosurface-cpu-readback`; there is no OpenGL or
 CPU-renderer fallback. Other platforms report the offscreen OpenGL async
 readback explicitly.
+The default probe keeps inline RGBA base64 and the existing 1920-pixel extent
+limit. `artifact: true` requires exactly 3840 by 2160 pixels and returns
+`artifactHandle`, `byteLength: 33177600` and `chunkBytes: 1048576` instead of
+`rgbaBase64`. The handle belongs to the private product/helper pipe. Read it
+with `composite_frame_artifact_read` using `{handle, offset}`, beginning at zero
+and advancing by the returned `byteLength`. A reply contains `handle`, `offset`,
+`byteLength`, `done` and canonical `dataBase64`. Each read consumes one chunk;
+repeated or skipped offsets invalidate the transfer. The final read deletes it.
+`composite_frame_artifact_release` takes `{handle}` and releases unfinished data.
+One artifact may remain active for this pipe, with a 60-second monotonic expiry.
+Expiry is pruned on requests; shutdown clears all bytes. No line cap changes.
+The product validates the metadata and every chunk, releases on transfer failure,
+and publishes a separate handle bound to its authenticated automation principal.
+
 Arbit computes segments from the beat-marker mapping (`VideoBeatMath.h` is the
 single source of truth); the helper only evaluates
 `sourceSec = inSec + (displaySec − displayStartSec) × rate` for the segment
@@ -501,6 +515,17 @@ framesPresented, frameHash, gpu}`.
 
 ## Export (GL-composited, baked timeline)
 
+Render 3D's saved `Export ... Data` selections add lossless NPY pass files and a
+manifest beside the video. See [raw pass export v1](RAW_PASS_EXPORT.md) for data
+types, supported frames, naming and partial-output ownership. The video encoder
+still receives SDR BT.709 pixels; raw emission files do not imply HDR video support.
+
+`hdrImageProfile` optionally adds linear float32 final images to the same bundle.
+See [linear HDR final images](RAW_PASS_EXPORT.md#linear-hdr-final-images) for the
+explicit input interpretation, actual primary conversion, fixed SDR reference
+transform and unsupported combinations. The default is `off`. HDR image export
+does not advertise PQ/HLG video or HDR-monitor presentation.
+
 `export {jobSpec}` renders offline through the SAME GL 3.3 FrameRenderer the
 live viewport uses, so preview and export agree: multi-layer compositing
 ordered by `(trackLayer, zOrder)`, per-clip effects rack, crop/transform,
@@ -553,7 +578,7 @@ use the same evaluator, so a beat-synced result exports exactly as it previews.
 Control closure ending at a video parameter sink. The same object is
 embedded in export jobs and sent live with `viewport_set_control_plan`.
 
-- `version`: currently `1`.
+- `version`: `1` for scalar plans, `2` when producer-evaluated Signal windows are present.
 - `numSlots`: fixed scalar slot count.
 - `operations`: topologically ordered operations carrying exact input fan-in,
   resolved parameters, output slots, and sink shaping metadata.
@@ -564,6 +589,39 @@ out-of-range or multiply-owned slots, forward references, and capacity
 violations. It never truncates or approximates topology. Legacy flat
 `modMatrix` entries remain accepted for old projects; Graph-owned routes are
 sent through `controlPlan` only, preventing double application.
+
+Version 2 adds `signalWindow` with `policy: "floor-frame-v1"`, `sampleRate: 48000`,
+`fps`, `frameCount`, `durationSeconds`, `graphRevision` and `tempoRevision`.
+A `signal.window` operation carries one scalar `frameValues` column and one
+output slot. Its values come from the plugin's existing Signal and Control
+runtimes. The helper executes downstream Control operations and the existing
+sink depth, curve, smoothing and mode handling.
+
+For absolute timeline frame `f`, the producer evaluates samples in
+`[floor(f * 48000 / fps), floor((f + 1) * 48000 / fps))`. It resets private
+runtime state and advances contiguously from frame zero. Preview and export
+look up the same column by absolute frame, including export range warm-up.
+Preview warms downstream state from frame zero for an available Signal plan.
+A missing frame or mismatched FPS parks only dependent sinks, with a viewport
+diagnostic. Export rejects uncovered ranges or mismatched FPS before rendering.
+Video parameters still update once per frame. These windows do not promise
+host audio block parity or per-sample video processing.
+
+The initial source closure admits Signal Constant or an unconnected Clock's
+continuous phase output into exactly one connected Sample, Average, RMS or Peak
+reducer input. Clock input/reset cables, other Signal producers, disabled nodes,
+port layout drift and Signal fan-in are rejected with per-sink diagnostics.
+Existing saved topology and unrelated Control-only sinks remain intact.
+
+Preparation is cached off the audio callback. Limits are a 60-second video
+timeline, 8,000,000 sample-node evaluations, 32,768 scalar frame values and 2 MiB
+of Control-plan JSON. The helper's complete request-line limit remains 16 MiB.
+A full minute at 30 fps with one clock and one reducer fits these limits.
+Capacity failure rejects all Signal-dependent closures as complete routes;
+it never truncates columns or substitutes zero. Graph snapshot/revision,
+source parameters, project FPS, video end time and the existing tempo timeline
+invalidate the processor cache. The admitted sources read no Score, note,
+audio-feature or host audio-block state.
 
 **Async + progress + cancel.** `export` replies are DEFERRED: the helper
 parses the jobSpec, spawns a render worker and answers the request id only
@@ -583,6 +641,37 @@ with `"export already running"`). While it runs:
 
 jobSpec fields (on top of the original outPath/width/height/fps/codec/
 encoder/interpolation/audioPath/durationSec/startSec/endSec):
+
+- `spectrumAnalysisSources: [{trackId, source, path}]`: at most eight distinct
+  stable track IDs, with `source: 1` for an ordinary track or `2` for a group.
+  Each path names a full-project post-FX, pre-fader WAV captured during the
+  same offline render as the master mix. Sample zero is project time zero.
+  The existing Block B analyzer supplies its 64 bands. Preview and range export
+  use the same absolute-time lookup and following window. These recordings do
+  not replace the master mix used for audio muxing.
+  `viewport_set_audio_mix` accepts the same array beside its master `path`.
+  Selected spectra use baked analysis during playback and scrubbing. Stop after
+  a source edit to refresh the bake. Missing IDs, a track/group type mismatch,
+  unreadable files or more than eight sources fail explicitly. No other track
+  or master source is substituted. Beyond the recorded tail the source is silent.
+  Selected-source live history and external-input monitoring are unavailable.
+  Geometry runtime transport v12 adds source kind and signed stable track ID to
+  each spectrum binding. Versions 1 through 11 retain their master-source meaning.
+  The v10 imported-animation payload and v11 timeline/score field operations
+  keep their existing encoding.
+
+- `projectSpectrumAnalysisPath`: optional full-project master mix WAV for
+  spectrum geometry, history and imported vertex-audio materials. Sample zero
+  is project time zero. This uses the same
+  Block B analyzer as preview and does not replace the range-scoped `audioPath`
+  used for muxing. The app renders this file for range exports using these
+  consumers, preserving analyzer warmup before the range start. A full-timeline
+  export can use `audioPath` directly. Missing history
+  analysis fails with a diagnostic rather than substituting current bands.
+  Live history cannot export. Its preview keeps at most 20 seconds of received
+  samples and resets on the existing seek/loop generations, backward time, or
+  a gap longer than 250 ms. Baked history uses project time, at most 128 rows,
+  and the shared bounded attack/release follower.
 
 - `segments: [{sourcePath, clipId, trackLayer, inSec, outSec, rate,
   displayStartSec, clockStartSec?, clockDurationSec?, transition?: {type, durationSec}}]` — the same

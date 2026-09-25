@@ -510,6 +510,11 @@ inline std::string digest(
             appendU16(bytes, texture.slot);
             appendU8(bytes, static_cast<std::uint8_t>(texture.source));
             appendIdentity(bytes, texture.videoResource);
+            if (description.version == kGraphFrameWireVersion)
+            {
+                appendU32(bytes, texture.graphFrame ? static_cast<std::uint32_t>(texture.graphFrame->node) : UINT32_MAX);
+                appendU32(bytes, texture.graphFrame ? static_cast<std::uint32_t>(texture.graphFrame->port) : UINT32_MAX);
+            }
         }
     }
 
@@ -558,7 +563,9 @@ inline std::optional<AdmittedMaterialBindings> admit(
     diagnostic.clear();
     using namespace HarmonicMIDI::grid;
 
-    if (untrusted.version != kWireVersion)
+    const bool hasFrame = std::any_of(untrusted.bindings.begin(), untrusted.bindings.end(),
+        [](const auto& binding) { return hasGraphFrameInput(binding); });
+    if (untrusted.version != (hasFrame ? kGraphFrameWireVersion : kWireVersion))
     {
         detail::fail(AdmissionFailure::UnsupportedVersion, failure, diagnostic);
         return std::nullopt;
@@ -813,13 +820,23 @@ inline std::optional<AdmittedMaterialBindings> admit(
             for (std::size_t slot = 0; slot < binding.textures.size(); ++slot)
             {
                 const auto& texture = binding.textures[slot];
-                if (texture.slot != slot)
+                if (texture.slot != slot
+                    || (texture.source != TextureSourceKind::GraphFrame && texture.graphFrame.has_value()))
                 {
                     detail::fail(AdmissionFailure::InvalidTextureBinding,
                                  failure, diagnostic);
                     return std::nullopt;
                 }
-                if (texture.source == TextureSourceKind::ImportedBaseColor)
+                if (texture.source == TextureSourceKind::GraphFrame)
+                {
+                    if (!texture.graphFrame || texture.graphFrame->node < 0 || texture.graphFrame->port < 0
+                        || slot != 0 || binding.textures.size() != 1 || hasIdentity(texture.videoResource))
+                    {
+                        detail::fail(AdmissionFailure::InvalidTextureBinding, failure, diagnostic);
+                        return std::nullopt;
+                    }
+                }
+                else if (texture.source == TextureSourceKind::ImportedBaseColor)
                 {
                     if (hasIdentity(texture.videoResource))
                     {

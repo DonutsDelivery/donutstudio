@@ -1,5 +1,23 @@
 #include "../src/geometry_core_backend.h"
 #include "../src/canonical_block_c_frame.h"
+#include "note_instance_appearance_fixture.h"
+#include "spectrum_instancer_fixture.h"
+#include "spectral_history_fixture.h"
+#include "point_distribution_fixture.h"
+#include "constructed_field_fixture.h"
+#include "imported_geometry_fixture.h"
+#include "instance_appearance_fixture.h"
+#include "instance_material_fields_fixture.h"
+#include "reactive_surface_fixture.h"
+#include "reactive_frame_fixture.h"
+#include "material_table_fixture.h"
+#include "audio_deformer_fixture.h"
+#include "ordered_audio_geometry_fixture.h"
+#include "score_field_fixture.h"
+#include "timeline_curve_fixture.h"
+#include "geometry_scene_composition_fixture.h"
+#include "native_geometry_admission_fixture.h"
+#include "solid_body_fixture.h"
 #include "sokol_gfx.h"
 #import <Metal/Metal.h>
 
@@ -128,6 +146,46 @@ int main() {
   mesh.vertexIds = {1,2,3}; mesh.indices = {0,1,2}; value.data = std::move(mesh);
   value.operations = {{10,OperationCode::copy,0,10,{0,0,0,0}}}; value.dispatchCount = 1;
   std::string error;
+  if (!verifyNativeGeometryAdmission(backend,error)) return fail(error) ? 0 : 1;
+  if (!verifyNativeDistributedInstances(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeConstructedFields(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeImportedGeometry(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeInstanceAppearance(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeInstanceMaterialFields(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeReactiveSurface(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeReactiveFrame(backend, readBgra8, ordinarySharedScene(), error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeSolidBodies(readBgra8,error)) return fail(error) ? 0 : 1;
+  if (!verifyNativeSolidBodies(readBgra8,error,{},true)) return fail(error) ? 0 : 1;
+  {
+    const auto imported=videohelper::gltf::adaptGlbMeshToGeometryCore(importedGeometryFixture(),1,9001,9000,1,error);
+    if (!imported || !verifyNativeSolidBodies(readBgra8,error,
+        std::make_shared<const videowire::geometry::ValueDescriptor>(imported->descriptor()))) return fail(error) ? 0 : 1;
+  }
+  if (!verifyNativeObjectSurfacePrograms(backend, readBgra8, ordinarySharedScene(), error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeMaterialTables(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeSpectrumInstancer(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeSpectralHistory(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeAudioDeformer(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeOrderedAudioGeometry(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeScoreFields(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeTimelineCurves(backend, readBgra8, error))
+    return fail(error) ? 0 : 1;
+  if (!verifyNativeGeometryComposition(backend, readBgra8, true, error))
+    return fail(error) ? 0 : 1;
   auto admitted = admitValue(value, contract, error);
   if (!admitted) return fail(error) ? 0 : 1;
   videohelper::geometry::GeometryCorePlanRuntime runtime(source);
@@ -234,6 +292,8 @@ int main() {
   const auto duplicatedNotePixels = readBgra8(duplicatedNoteExecution->frame);
   const auto frequencyMutationPixels = readBgra8(frequencyMutationExecution->frame);
   const auto ignoredNotePixels = readBgra8(ignoredNoteExecution->frame);
+  if (!verifyNativeNoteAppearance(backend, readBgra8, true, error))
+    return fail(error) ? 0 : 1;
   const auto colorAt = [](const std::vector<std::uint8_t>& image,
                           unsigned x,unsigned y) {
     const auto offset=(y*64u+x)*4u;

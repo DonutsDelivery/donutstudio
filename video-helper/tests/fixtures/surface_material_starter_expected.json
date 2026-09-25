@@ -122,17 +122,17 @@
           89
         ],
         [
-          229,
-          237,
-          242,
-          89
+          67,
+          75,
+          90,
+          255
         ]
       ],
       "directionalLitCenterRgba8": [
-        199,
-        215,
-        227,
-        89
+        14,
+        18,
+        26,
+        255
       ]
     },
     {
@@ -167,16 +167,16 @@
           255
         ],
         [
-          52,
-          110,
-          207,
+          76,
+          120,
+          209,
           255
         ]
       ],
       "directionalLitCenterRgba8": [
-        9,
-        40,
-        159,
+        19,
+        48,
+        162,
         255
       ]
     },
@@ -229,7 +229,7 @@
   "provenance": {
     "constants": "Independent authored constants, separate from production module and generated-program tables",
     "independence": "This Python binary64 model computes JSON pixels without reading native output or production starter definitions.",
-    "model": "Quaternion-rotated fixture normal and directional light, explicit ambient and intensity, metallic/roughness weights, emission, opacity, and linear RGBA8 quantization",
+    "model": "Quaternion-rotated fixture normal and directional light, ambient, metallic/roughness weights, normal-incidence IOR Fresnel, thin transmission coverage, clearcoat energy layering, emission, straight-alpha blending over the opaque fixture background, and linear RGBA8 quantization",
     "fixture": {
       "objectRotationXyzw": [
         -0.16773126,
@@ -256,8 +256,8 @@
       "lightIntensity": 0.88
     }
   },
-  "sampledRgba8Fnv1a64": "b24adda5c60d56ea",
-  "sampledRgba8Sha256": "0c7faee9a27cac3929bda0fb36fd72b783ca5ff3c91978a3cb2135ade9251a5e",
+  "sampledRgba8Fnv1a64": "8768096ef0eab2e4",
+  "sampledRgba8Sha256": "1d88199977bd8848ff8da5716bbde41514ebbab577a6b0e050db4d7098d531f8",
   "schema": 3,
-  "truthBoundary": "The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, quaternion-transformed object normal, and stable material binding. It omits transmission, IOR, and clearcoat scene transport."
+  "truthBoundary": "The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, transmission, IOR and clearcoat. The native surface model uses normal-incidence Fresnel and thin alpha transmission, not volumetric refraction, screen-space distortion, absorption or multilayer path tracing."
 }

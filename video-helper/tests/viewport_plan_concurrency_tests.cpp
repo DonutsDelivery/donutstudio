@@ -1,4 +1,5 @@
 #include "../src/visual_plan_publication.h"
+#include "../src/viewport_telemetry_owner.h"
 
 #include <atomic>
 #include <cstdio>
@@ -39,6 +40,34 @@ videowire::CompiledVisualLayerPlan planFor(int clipId, uint64_t revision)
 
 int main()
 {
+    videowire::VisualPlanTelemetry handoffTelemetry;
+    videowire::ViewportTelemetryOwner<> handoffOwner(handoffTelemetry, false);
+    bool handedOff = false;
+    {
+        // Hold the diagnostic lock on another thread, as a concurrent RPC
+        // snapshot or plan admission does while the viewport sends a frame.
+        auto diagnosticLock = handoffTelemetry.lockForTesting();
+        std::thread renderHandoff([&]
+        {
+            handedOff = handoffOwner.zeroCopyHandoff(true, true, true);
+        });
+        renderHandoff.join();
+    }
+    check(handedOff,
+          "successful frame send remains handed off during telemetry contention");
+    const auto contendedHandoff = handoffTelemetry.snapshot();
+    check(contendedHandoff.droppedSamples == 1
+          && contendedHandoff.recordingContentionDrops == 1
+          && contendedHandoff.transportFramesHandedOff == 0
+          && contendedHandoff.droppedSocketFailure == 0,
+          "contention drops only the telemetry sample without reporting a socket failure");
+    check(handoffOwner.zeroCopyHandoff(true, true, true)
+          && handoffTelemetry.snapshot().transportFramesHandedOff == 1,
+          "frame handoff telemetry resumes after diagnostic contention");
+    check(! handoffOwner.zeroCopyHandoff(true, true, false)
+          && handoffTelemetry.snapshot().droppedSocketFailure == 1,
+          "a failed socket send still rejects the frame handoff");
+
     std::string diagnostic;
     std::shared_ptr<videowire::VisualPlanExecutionSnapshot> published;
     check(videowire::makeVisualPlanExecutionSnapshot({ planFor(7, 1) }, published, diagnostic),

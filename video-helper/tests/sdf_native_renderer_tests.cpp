@@ -76,8 +76,9 @@ class FakeFrame final : public arbitgpu::NativeSdfSceneFrame
 {
 public:
     FakeFrame (std::uint32_t width, std::uint32_t height,
-               std::uintptr_t handle, int& deletions) noexcept
-        : width_ (width), height_ (height), handle_ (handle), deletions_ (deletions)
+               std::uintptr_t handle, int& deletions, bool omitDescriptor) noexcept
+        : width_ (width), height_ (height), handle_ (handle), deletions_ (deletions),
+          omitDescriptor_ (omitDescriptor)
     {
     }
 
@@ -87,6 +88,14 @@ public:
     std::uint32_t height() const noexcept override { return height_; }
     std::uintptr_t colorImageHandle() const noexcept override { return handle_; }
     std::uintptr_t colorTextureViewHandle() const noexcept override { return handle_ + 1000; }
+    arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    {
+        if (omitDescriptor_) return {};
+        return { backend_, arbitgpu::NativeTextureViewKind::Texture2D,
+                 arbitgpu::NativeTexturePixelFormat::Rgba16Float, handle_, handle_ + 1000,
+                 width_, height_, 1, true, 1234, handle_,
+                 colortransform::ColorSpace::LinearSRGB, colortransform::TransferFunction::Linear };
+    }
     const arbitgpu::FrameMemoryAdmission& frameMemoryAdmission() const noexcept override
     {
         return frameMemory_;
@@ -104,6 +113,7 @@ private:
     std::uint32_t height_ = 0;
     std::uintptr_t handle_ = 0;
     int& deletions_;
+    bool omitDescriptor_ = false;
 };
 
 class FakeBackend final : public arbitgpu::NativeSdfExecutionBackend
@@ -131,7 +141,7 @@ public:
         result.rendered = true;
         result.frame = std::make_shared<FakeFrame> (
             request.width, request.height,
-            static_cast<std::uintptr_t> (submissions), deletions);
+            static_cast<std::uintptr_t> (submissions), deletions, omitTextureDescriptor);
         return result;
     }
 
@@ -140,6 +150,7 @@ public:
     std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram> firstCompiledProgram;
     std::vector<std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram>> compiledPrograms;
     bool rejectSubmission = false;
+    bool omitTextureDescriptor = false;
     int submissions = 0;
     int deletions = 0;
 };
@@ -151,6 +162,9 @@ struct TestLayer
     int texHeight = 0;
     std::string nativeTextureBackend;
     std::uintptr_t nativeTextureView = 0;
+    arbitgpu::NativeTextureViewDescriptor nativeTextureDescriptor;
+    std::shared_ptr<const void> nativeTextureOwner;
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> nativeLinearImage;
 };
 } // namespace
 
@@ -347,10 +361,19 @@ int main()
     plan.ports = {
         { 70, 0, 1, "out", "control", "sdf", "unspecified", "unspecified" },
         { 80, 0, 1, "in", "control", "sdf", "unspecified", "unspecified" },
-        { 80, 1, 1, "out", "frame", "image", "rgba8", "srgb" },
-        { 90, 0, 1, "in", "frame", "image", "rgba8", "srgb" }
+        { 80, 1, 1, "out", "frame", "image", "rgba8", "sRGB" },
+        { 90, 0, 1, "in", "frame", "image", "rgba8", "sRGB" }
     };
     plan.edges = { { 70, 0, 80, 0 }, { 80, 1, 90, 0 } };
+    check(hasVisualSdf(plan) && hasVisualSdf({plan}, plan.clipId)
+            && !hasVisualSdf({}, plan.clipId) && !hasVisualSdf({plan}, plan.clipId + 1),
+          "native source dispatch selects only the owning clip's SDF terminal");
+    auto replacedPlan = plan;
+    ++replacedPlan.structuralRevision;
+    replacedPlan.operations.clear();
+    check(!hasVisualSdf({plan, replacedPlan}, plan.clipId)
+            && !hasVisualSdf({replacedPlan, plan}, plan.clipId),
+          "a newer non-SDF revision replaces an older SDF source in either publication order");
     std::vector<NativeSdfRenderedFrame> visualOwners;
     TestLayer visualLayer;
     const int submissionsBeforeVisualPlan = backend.submissions;
@@ -362,8 +385,11 @@ int main()
            && visualLayer.nativeTextureBackend == "test-native"
            && visualLayer.nativeTextureView != 0
            && visualLayer.texWidth == 640 && visualLayer.texHeight == 360
-           && visualOwners.size() == 1,
-           "the exact typed SDF plan publishes its backend-owned native view");
+           && visualOwners.size() == 1
+           && arbitgpu::isLinearSceneColor(visualLayer.nativeTextureDescriptor)
+           && visualLayer.nativeTextureDescriptor.textureViewHandle == visualLayer.nativeTextureView
+           && visualLayer.nativeTextureOwner == visualOwners.front().nativeFrame,
+           "the exact typed SDF plan publishes its owned native view and complete descriptor");
 
     auto staleMalformedPlan = plan;
     staleMalformedPlan.structuralRevision = plan.structuralRevision - 1;
@@ -383,9 +409,84 @@ int main()
            && backend.submissions == submissionsBeforeVisualPlan + 2,
            "duplicate SDF bindings fail before native export execution");
     const int deletionsBeforeVisualFrameRelease = backend.deletions;
+    std::weak_ptr<const void> publishedFrame = visualLayer.nativeTextureOwner;
     visualOwners.clear();
+    check (backend.deletions == deletionsBeforeVisualFrameRelease + 1 && !publishedFrame.expired(),
+           "the compositor layer keeps its SDF attachment alive after frame-list release");
+    visualLayer = {};
     check (backend.deletions == deletionsBeforeVisualFrameRelease + 2,
-           "the product SDF frame remains owned through compositing and releases once");
+           "the SDF attachment releases exactly once after its final compositor lease");
+    check (publishedFrame.expired(), "the released SDF compositor lease retains no frame");
+
+    backend.omitTextureDescriptor = true;
+    check (prepareVisualSdfLayer ({ plan }, plan.clipId, 640, 360,
+                NativeSdfRenderUse::Preview, renderer, visualLayer, visualOwners, error)
+               == VisualSdfPreparation::rejected
+           && error == "native GPU SDF backend returned an incompatible texture descriptor"
+           && visualOwners.empty() && !visualLayer.nativeTextureOwner
+           && visualLayer.nativeTextureView == 0,
+           "an opaque SDF handle cannot be published without its backend descriptor");
+    backend.omitTextureDescriptor = false;
+
+    FakeBackend utilityBackend;
+    utilityBackend.reportedCapabilities.supportedOutputs.fill(true);
+    NativeSdfRenderer utilityRenderer(utilityBackend);
+    for (std::uint8_t outputPass = 0; outputPass < 8; ++outputPass)
+    {
+        auto utilityPlan = plan;
+        wireOperation.outputPass = outputPass;
+        utilityPlan.operations[1].payloadXml = videowire::encodeSdfRaymarchOperation(wireOperation);
+        videowire::SdfRaymarchOperation checked;
+        check(admitVisualSdfPlan(utilityPlan, checked, error).has_value()
+                && checked.outputPass == outputPass,
+              "all eight declared outputs pass SDF preflight with their exact immutable selector");
+        for (const auto use : {NativeSdfRenderUse::Preview, NativeSdfRenderUse::Export})
+        {
+            std::vector<NativeSdfRenderedFrame> owners;
+            TestLayer layer;
+            const int before = utilityBackend.submissions;
+            check(prepareVisualSdfLayer({utilityPlan}, utilityPlan.clipId, 320, 180,
+                    use, utilityRenderer, layer, owners, error) == VisualSdfPreparation::rendered
+                    && utilityBackend.submissions == before + 1
+                    && static_cast<std::uint8_t>(utilityBackend.lastRequest.output) == outputPass
+                    && owners.size() == 1 && owners.front().use == use,
+                  "preview and export dispatch the admitted output selector to the native backend");
+        }
+    }
+    wireOperation.outputPass = 4;
+    auto unsupportedUtility = plan;
+    unsupportedUtility.operations[1].payloadXml = videowire::encodeSdfRaymarchOperation(wireOperation);
+    utilityBackend.reportedCapabilities.supportedOutputs[4] = false;
+    const int beforeRejectedUtility = utilityBackend.submissions;
+    std::vector<NativeSdfRenderedFrame> rejectedOwners;
+    TestLayer rejectedLayer;
+    videowire::SdfRaymarchOperation checked;
+    check(admitVisualSdfPlan(unsupportedUtility, checked, error).has_value(),
+          "preflight does not invent device output capabilities");
+    check(prepareVisualSdfLayer({unsupportedUtility}, plan.clipId, 320, 180,
+            NativeSdfRenderUse::Export, utilityRenderer, rejectedLayer, rejectedOwners, error)
+            == VisualSdfPreparation::rejected
+            && utilityBackend.submissions == beforeRejectedUtility && rejectedOwners.empty()
+            && error == "native GPU SDF backend does not support output curvature",
+          "a device without the requested utility rejects it before submission");
+    utilityBackend.reportedCapabilities.supportedOutputs[4] = true;
+    for (int change = 0; change < 4; ++change)
+    {
+        auto invalid = unsupportedUtility;
+        if (change == 0) invalid.operations[0].backendCapability = "native-gpu";
+        if (change == 1) invalid.operations[1].backendCapability = "cpu";
+        if (change == 2) invalid.edges.push_back(invalid.edges.front());
+        if (change == 3) invalid.ports.push_back(invalid.ports.front());
+        check(hasVisualSdf({invalid}, invalid.clipId),
+              "malformed SDF sources still enter strict native preparation instead of generator fallback");
+        check(!admitVisualSdfPlan(invalid, checked, error),
+              "SDF preflight rejects changed capabilities and duplicate topology");
+        check(prepareVisualSdfLayer({invalid}, plan.clipId, 320, 180,
+                NativeSdfRenderUse::Preview, utilityRenderer, rejectedLayer, rejectedOwners, error)
+                == VisualSdfPreparation::rejected
+                && utilityBackend.submissions == beforeRejectedUtility && rejectedOwners.empty(),
+              "native preparation rejects the same invalid plan without allocating a frame");
+    }
 
     std::printf ("sdf-native-renderer-dispatch: %d/%d checks passed; submissions=%d deletions=%d\n",
                  checks - failures, checks, backend.submissions, backend.deletions);

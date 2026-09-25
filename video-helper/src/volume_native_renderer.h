@@ -1,6 +1,8 @@
 #pragma once
 
 #include "volume_data_admission.h"
+#include "gpu_backend/backend.h"
+#include <atomic>
 
 #include <cstdint>
 #include <memory>
@@ -19,12 +21,26 @@ struct NativeVolumeExecutionCapabilities final
     std::uint64_t maxRenderPixels = 0;
 };
 
-struct NativeVolumeDrawRequest final
+struct NativeVolumeContextLifetime final
+{
+    std::atomic<bool> alive {true};
+};
+
+struct NativeVolumeRenderRequest final
 {
     std::shared_ptr<const AdmittedVolume> volume;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    bool transparentBackground = false;
+    std::shared_ptr<const NativeVolumeContextLifetime> contextLifetime {};
 };
+using NativeVolumeDrawRequest = NativeVolumeRenderRequest;
+
+inline std::uint64_t nextNativeVolumeFrameGeneration() noexcept
+{
+    static std::atomic<std::uint64_t> generation {1};
+    return generation.fetch_add(1, std::memory_order_relaxed);
+}
 
 // One submitted frame owns the backend-native 3D upload, raymarch target, and
 // sampled color view. No CPU pixels or filesystem authority cross this seam.
@@ -37,6 +53,8 @@ public:
     virtual std::uint32_t height() const noexcept = 0;
     virtual std::uintptr_t colorImageHandle() const noexcept = 0;
     virtual std::uintptr_t colorTextureViewHandle() const noexcept = 0;
+    virtual arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept { return {}; }
+    virtual void releaseNativeResources() const noexcept {}
 };
 
 struct NativeVolumeSubmission final
@@ -51,6 +69,9 @@ class NativeVolumeExecutionBackend
 public:
     virtual ~NativeVolumeExecutionBackend() = default;
     virtual NativeVolumeExecutionCapabilities capabilities() const = 0;
+    // Zero denotes an unavailable context. Cache hits must retain this identity
+    // even when the platform backend object itself is process-owned.
+    virtual std::uintptr_t contextIdentity() const noexcept { return 0; }
     virtual NativeVolumeSubmission render (const NativeVolumeDrawRequest& request) = 0;
 };
 
@@ -86,28 +107,33 @@ public:
     bool renderPreview (const std::shared_ptr<const AdmittedVolume>& volume,
                         std::uint32_t width, std::uint32_t height,
                         std::string_view backendCapability,
-                        NativeVolumeRenderedFrame& output, std::string& error)
+                        NativeVolumeRenderedFrame& output, std::string& error,
+                        bool transparentBackground = false,
+                        std::shared_ptr<const NativeVolumeContextLifetime> contextLifetime = {})
     {
         return render (volume, width, height, backendCapability,
-                       NativeVolumeRenderUse::Preview, output, error);
+                       NativeVolumeRenderUse::Preview, output, error, transparentBackground, std::move(contextLifetime));
     }
 
     bool renderExport (const std::shared_ptr<const AdmittedVolume>& volume,
                        std::uint32_t width, std::uint32_t height,
                        std::string_view backendCapability,
-                       NativeVolumeRenderedFrame& output, std::string& error)
+                       NativeVolumeRenderedFrame& output, std::string& error,
+                       bool transparentBackground = false,
+                       std::shared_ptr<const NativeVolumeContextLifetime> contextLifetime = {})
     {
         return render (volume, width, height, backendCapability,
-                       NativeVolumeRenderUse::Export, output, error);
+                       NativeVolumeRenderUse::Export, output, error, transparentBackground, std::move(contextLifetime));
     }
 
 private:
     bool render (const std::shared_ptr<const AdmittedVolume>& volume,
                  std::uint32_t width, std::uint32_t height,
                  std::string_view backendCapability, NativeVolumeRenderUse use,
-                 NativeVolumeRenderedFrame& output, std::string& error)
+                 NativeVolumeRenderedFrame& output, std::string& error, bool transparentBackground,
+                 std::shared_ptr<const NativeVolumeContextLifetime> contextLifetime)
     {
-        if (volume == nullptr)
+        if (volume == nullptr || (contextLifetime && !contextLifetime->alive.load(std::memory_order_acquire)))
         {
             error = "native GPU volume rendering requires an immutable admitted volume";
             return false;
@@ -139,7 +165,7 @@ private:
             return false;
         }
 
-        NativeVolumeDrawRequest request { volume, width, height };
+        NativeVolumeDrawRequest request { volume, width, height, transparentBackground, std::move(contextLifetime) };
         auto submission = backend_.render (request);
         if (! submission.rendered || submission.frame == nullptr)
         {
@@ -155,6 +181,23 @@ private:
         {
             error = "native GPU volume backend returned an incompatible frame";
             return false;
+        }
+
+        if (transparentBackground)
+        {
+            const auto descriptor = submission.frame->colorTextureDescriptor();
+            if (!arbitgpu::materialFrameIsSrgb(descriptor) || descriptor.backend != capabilities.backend
+                || descriptor.width != width || descriptor.height != height
+                || descriptor.deviceOrContextIdentity != backend_.contextIdentity()
+                || descriptor.deviceOrContextIdentity == 0
+                || descriptor.imageHandle != submission.frame->colorImageHandle()
+                || descriptor.textureViewHandle != submission.frame->colorTextureViewHandle()
+                || descriptor.format != (capabilities.backend == "metal"
+                    ? arbitgpu::NativeTexturePixelFormat::Bgra8Unorm : arbitgpu::NativeTexturePixelFormat::Rgba8Unorm))
+            {
+                error = "native volume frame has no exact owned SDR texture descriptor";
+                return false;
+            }
         }
 
         output = { use, volume->cacheIdentity(), width, height, std::move (submission.frame) };

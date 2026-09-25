@@ -1,4 +1,6 @@
 #include "backend.h"
+#include "fixture_vertex_modifier_shader.h"
+#include "fixture_texture_upload.h"
 #include "../geometry_core_admission.h"
 #include "../geometry_core_diagnostic_colors.h"
 #include "../sdf_native_program.h"
@@ -10,9 +12,11 @@
 #endif
 #include "../gl_loader.h"
 #include "../particle_engine.h"
+#include "../particle_body_replay.h"
 #include "../renderer.h"
 #include "../shader_generator.h"
 #include "../../../shared/ColorTransformGpuMath.h"
+#include "../../../shared/HdrImageOutputContract.h"
 #include <atomic>
 #endif
 
@@ -219,6 +223,17 @@ struct FixtureUniforms
     // the Geometry Core matrix stream; y selects one Block C row for a geometry
     // draw, or UINT_MAX to use Metal's instance_id for an ordinary scene draw.
     std::uint32_t geometryInstanceControl[4];
+    float noteAppearanceLow[4];
+    float noteAppearanceHigh[4];
+    float noteMeshScale[4];
+    float imageOutput[4];
+    float diffractionEnvironment[4];
+    float rawIdentifiers[64][4];
+    arbitgpu::NativeSceneMotionUniforms motion;
+    float vertexTime[4];
+    float vertexSpectrum[16][4];
+    renderpasscomposite::GpuProgram passProgram;
+    float surfaceCoating[4];
 };
 static_assert (offsetof (FixtureUniforms, objectMatrix) == 0
                && offsetof (FixtureUniforms, materialKind) == 1472
@@ -231,15 +246,28 @@ static_assert (offsetof (FixtureUniforms, objectMatrix) == 0
                && offsetof (FixtureUniforms, diffractionEvaluationSchedule) == 2080
                && offsetof (FixtureUniforms, noteInstanceTransforms) == 2096
                && offsetof (FixtureUniforms, geometryInstanceControl) == 4144
-               && sizeof (FixtureUniforms) == 4160,
+               && offsetof (FixtureUniforms, noteAppearanceLow) == 4160
+               && offsetof (FixtureUniforms, noteAppearanceHigh) == 4176
+               && offsetof (FixtureUniforms, noteMeshScale) == 4192
+               && offsetof (FixtureUniforms, imageOutput) == 4208
+               && offsetof (FixtureUniforms, diffractionEnvironment) == 4224
+               && offsetof(FixtureUniforms, rawIdentifiers) == 4240
+               && offsetof(FixtureUniforms, motion) == 5264
+               && offsetof (FixtureUniforms, vertexTime) == 5360
+               && offsetof (FixtureUniforms, vertexSpectrum) == 5376
+               && offsetof (FixtureUniforms, passProgram) == 5632
+               && offsetof (FixtureUniforms, surfaceCoating) == 6160
+               && sizeof (FixtureUniforms) == 6176,
                "Metal fixture uniform layout changed");
 
 struct MetalFixtureInstanceGpuRecord
 {
     std::array<float, 16> matrix {};
     std::array<float, 4> identityColor {};
+    std::array<float, 4> color {1,1,1,1};
+    std::array<float, 4> emission {};
 };
-static_assert (sizeof (MetalFixtureInstanceGpuRecord) == 20 * sizeof (float),
+static_assert (sizeof (MetalFixtureInstanceGpuRecord) == 28 * sizeof (float),
                "Metal fixture instance record layout changed");
 
 struct SceneAovUniforms
@@ -364,11 +392,13 @@ public:
     std::string backend_ = "metal";
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> snapshot;
     std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> materialProgram;
+    std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> materialProgramSource;
     sg_buffer vertexBuffer = {};
     sg_buffer indexBuffer = {};
     sg_buffer geometryInstanceBuffer = {};
     bool instancedSharedGeometry = false;
     bool diagnosticInstanceIdentityColors = false;
+    std::vector<videowire::geometry::InstanceAppearance> instanceAppearances;
     std::shared_ptr<const videohelper::geometry::AdmittedPlanValue> geometryAdmission;
     std::vector<sg_image> textureImages;
     std::vector<sg_view> textureViews;
@@ -412,9 +442,12 @@ public:
     arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
     {
         return { backend_, arbitgpu::NativeTextureViewKind::Texture2D,
-                 arbitgpu::NativeTexturePixelFormat::Bgra8Unorm, colorImage.id, colorTextureView.id,
+                 linearColor ? arbitgpu::NativeTexturePixelFormat::Rgba16Float : arbitgpu::NativeTexturePixelFormat::Bgra8Unorm,
+                 colorImage.id, colorTextureView.id,
                  width_, height_, 1, true,
-                 reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice), rendererGeneration_ };
+                 reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice), rendererGeneration_,
+                 linearColor ? colortransform::ColorSpace::LinearSRGB : colortransform::ColorSpace::Unspecified,
+                 linearColor ? colortransform::TransferFunction::Linear : colortransform::TransferFunction::Unspecified };
     }
     arbitgpu::NativeTextureViewDescriptor depthTextureDescriptor() const noexcept override
     {
@@ -422,6 +455,16 @@ public:
                  arbitgpu::NativeTexturePixelFormat::R32Float, depthImage.id, depthTextureView.id,
                  width_, height_, 1, true,
                  reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice), rendererGeneration_ };
+    }
+
+    arbitgpu::NativeTextureViewDescriptor passTextureDescriptor(renderpassoutput::Output output) const noexcept override
+    {
+        for (std::size_t i = 2; i < renderpasscomposite::kInputs.size(); ++i)
+            if (renderpasscomposite::kInputs[i] == output)
+                return { backend_, arbitgpu::NativeTextureViewKind::Texture2D, rawFormats[i - 2],
+                    rawImages[i - 2].id, rawTextureViews[i - 2].id, width_, height_, 1, true,
+                    reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice), rendererGeneration_ };
+        return NativeFixtureSceneFrame::passTextureDescriptor(output);
     }
 
     bool hasResources() const noexcept
@@ -434,6 +477,13 @@ public:
 
     void destroyUnlocked() noexcept
     {
+        for (std::size_t i = 0; i < rawImages.size(); ++i)
+        {
+            if (rawTextureViews[i].id) sg_destroy_view(rawTextureViews[i]);
+            if (rawAttachmentViews[i].id) sg_destroy_view(rawAttachmentViews[i]);
+            if (rawImages[i].id) sg_destroy_image(rawImages[i]);
+        }
+        rawImages = {}; rawTextureViews = {}; rawAttachmentViews = {};
         if (depthTextureView.id != 0) sg_destroy_view (depthTextureView);
         if (depthView.id != 0) sg_destroy_view (depthView);
         if (depthImage.id != 0) sg_destroy_image (depthImage);
@@ -456,6 +506,10 @@ public:
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
     std::shared_ptr<const MetalFixtureSceneResources> staticResources;
+    bool linearColor = false;
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> materialFrameTexture;
+    std::map<surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint,
+        std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>> materialFrameTextures;
     std::uint64_t rendererGeneration_ = 0;
     sg_image colorImage = {};
     sg_view colorAttachmentView = {};
@@ -465,6 +519,82 @@ public:
     sg_view depthTextureView = {};
     sg_image depthStencilImage = {};
     sg_view depthStencilView = {};
+    bool readRawPass(renderpassoutput::Output output, arbitgpu::NativeRawPassPixels& pixels,
+                     std::string& error) const override
+    {
+        pixels = {};
+        std::lock_guard<std::mutex> lock(sokolMutex());
+        const auto descriptor = passTextureDescriptor(output);
+        if (!descriptor.complete() || !arbitgpu::rawPassFormatMatches(output, descriptor.format)
+            || !arbitgpu::nativeFixtureDimensionsWithinBounds(width_, height_) || !staticResources)
+        { error = "Metal raw pass requires its live owner and supported attachment"; return false; }
+        sg_image image {}; image.id = static_cast<std::uint32_t>(descriptor.imageHandle);
+        const auto info = sg_mtl_query_image_info(image);
+        if (info.active_slot < 0 || info.active_slot >= SG_NUM_INFLIGHT_FRAMES)
+        { error = "Metal raw pass has no live texture slot"; return false; }
+        id<MTLTexture> texture = (__bridge id<MTLTexture>) info.tex[info.active_slot];
+        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) sg_mtl_command_queue();
+        MTLPixelFormat expectedFormat = MTLPixelFormatInvalid;
+        using F = arbitgpu::NativeTexturePixelFormat;
+        switch (descriptor.format)
+        {
+            case F::Bgra8Unorm: expectedFormat = MTLPixelFormatBGRA8Unorm; break;
+            case F::R32Float: expectedFormat = MTLPixelFormatR32Float; break;
+            case F::Rgba16Float: expectedFormat = MTLPixelFormatRGBA16Float; break;
+            case F::Rg16Float: expectedFormat = MTLPixelFormatRG16Float; break;
+            case F::R32Uint: expectedFormat = MTLPixelFormatR32Uint; break;
+            case F::R8Unorm: expectedFormat = MTLPixelFormatR8Unorm; break;
+            default: break;
+        }
+        if (texture == nil || queue == nil || texture.device != gMetalDevice
+            || queue.device != gMetalDevice || expectedFormat == MTLPixelFormatInvalid
+            || texture.pixelFormat != expectedFormat || texture.textureType != MTLTextureType2D
+            || texture.width != width_ || texture.height != height_ || texture.sampleCount != 1)
+        { error = "Metal raw pass texture ownership or extent mismatch"; return false; }
+        const auto tightRow = static_cast<std::size_t>(width_) * arbitgpu::rawPassChannels(descriptor.format)
+            * arbitgpu::rawPassScalarBytes(descriptor.format);
+        const auto rowBytes = (tightRow + 255u) & ~std::size_t(255u);
+        id<MTLBuffer> buffer = [gMetalDevice newBufferWithLength:rowBytes * height_
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = buffer != nil ? [command blitCommandEncoder] : nil;
+        bool ok = buffer != nil && command != nil && blit != nil;
+        if (ok)
+        {
+            [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                      sourceSize:MTLSizeMake(width_, height_, 1) toBuffer:buffer destinationOffset:0
+             destinationBytesPerRow:rowBytes destinationBytesPerImage:rowBytes * height_];
+            [blit endEncoding];
+            [command commit];
+            [command waitUntilCompleted];
+            ok = command.status == MTLCommandBufferStatusCompleted && buffer.contents != nullptr;
+        }
+        if (ok)
+        {
+            pixels = { descriptor.format, width_, height_, std::vector<std::uint8_t>(tightRow * height_) };
+            const auto* source = static_cast<const std::uint8_t*>(buffer.contents);
+            for (std::uint32_t y = 0; y < height_; ++y)
+                std::copy_n(source + y * rowBytes, tightRow, pixels.bytes.data() + y * tightRow);
+            if (pixels.format == arbitgpu::NativeTexturePixelFormat::Bgra8Unorm)
+            {
+                for (std::size_t i = 0; i < pixels.bytes.size(); i += 4)
+                    std::swap(pixels.bytes[i], pixels.bytes[i + 2]);
+                pixels.format = arbitgpu::NativeTexturePixelFormat::Rgba8Unorm;
+            }
+        }
+#if ! __has_feature(objc_arc)
+        [buffer release];
+#endif
+        error = ok ? "" : "Metal raw pass readback failed";
+        return ok;
+    }
+
+    std::array<sg_image, 6> rawImages {};
+    std::array<sg_view, 6> rawTextureViews {}, rawAttachmentViews {};
+    inline static constexpr std::array<arbitgpu::NativeTexturePixelFormat, 6> rawFormats {
+        arbitgpu::NativeTexturePixelFormat::Rgba16Float, arbitgpu::NativeTexturePixelFormat::Rgba16Float,
+        arbitgpu::NativeTexturePixelFormat::R8Unorm, arbitgpu::NativeTexturePixelFormat::R32Uint,
+        arbitgpu::NativeTexturePixelFormat::R32Uint, arbitgpu::NativeTexturePixelFormat::Rg16Float };
 };
 
 struct DeformationComputeUniforms
@@ -472,7 +602,7 @@ struct DeformationComputeUniforms
     std::uint32_t vertexCount = 0;
     std::uint32_t jointCount = 0;
     std::uint32_t morphTargetCount = 0;
-    std::uint32_t padding = 0;
+    std::uint32_t outputOffset = 0;
 };
 static_assert (sizeof (DeformationComputeUniforms) == 16,
                "Metal deformation uniform layout changed");
@@ -531,6 +661,7 @@ public:
 
     std::string backend_ = "metal";
     std::shared_ptr<const arbitgpu::NativeDeformationScene> source;
+    std::vector<std::shared_ptr<const MetalDeformationResources>> draws;
     std::shared_ptr<const MetalFixtureSceneResources> fixture;
     std::uint32_t vertexCount = 0;
     std::uint32_t indexCount = 0;
@@ -664,6 +795,14 @@ public:
     {
         return colorTextureView.id;
     }
+    arbitgpu::NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
+    {
+        return { backend_, arbitgpu::NativeTextureViewKind::Texture2D,
+                 arbitgpu::NativeTexturePixelFormat::Rgba16Float, colorImage.id, colorTextureView.id,
+                 width_, height_, 1, true, deviceIdentity_, lifecycle_.value,
+                 colortransform::ColorSpace::LinearSRGB, colortransform::TransferFunction::Linear,
+                 arbitgpu::NativeTextureRowOrder::TopFirst };
+    }
     const arbitgpu::FrameMemoryAdmission& frameMemoryAdmission() const noexcept override
     {
         return frameMemory_;
@@ -675,6 +814,26 @@ public:
 
     bool readColorPixels (std::vector<std::uint8_t>& output) const override
     {
+        output.clear();
+        std::vector<float> values;
+        if (! readColorFloatPixels (values)) return false;
+        output.resize (values.size());
+        for (std::size_t index = 0; index < values.size(); ++index)
+        {
+            if (! std::isfinite (values[index]))
+            {
+                output.clear();
+                return false;
+            }
+            output[index] = static_cast<std::uint8_t> (
+                std::lround (std::clamp (values[index], 0.0f, 1.0f) * 255.0f));
+        }
+        return true;
+    }
+
+    bool readColorFloatPixels (std::vector<float>& output) const override
+    {
+        output.clear();
         std::lock_guard<std::mutex> lock (sokolMutex());
         @autoreleasepool
         {
@@ -685,6 +844,8 @@ public:
                 native.tex[native.active_slot];
             id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)
                 sg_mtl_command_queue();
+            if (texture == nil || queue == nil)
+                return false;
             const auto sourceRowBytes = static_cast<NSUInteger> (width_) * 8u;
             const auto alignedRowBytes = (sourceRowBytes + 255u) & ~NSUInteger (255u);
             const auto bufferBytes = alignedRowBytes * static_cast<NSUInteger> (height_);
@@ -692,8 +853,14 @@ public:
                                                                options:MTLResourceStorageModeShared];
             id<MTLCommandBuffer> command = [queue commandBuffer];
             id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
-            if (texture == nil || readback == nil || command == nil || blit == nil)
+            if (readback == nil || command == nil || blit == nil)
+            {
+                if (blit != nil) [blit endEncoding];
+#if ! __has_feature(objc_arc)
+                [readback release];
+#endif
                 return false;
+            }
             [blit copyFromTexture:texture
                       sourceSlice:0
                       sourceLevel:0
@@ -708,7 +875,12 @@ public:
             [command waitUntilCompleted];
             if (command.status != MTLCommandBufferStatusCompleted
                 || readback.contents == nullptr)
+            {
+#if ! __has_feature(objc_arc)
+                [readback release];
+#endif
                 return false;
+            }
             output.resize (static_cast<std::size_t> (width_) * height_ * 4u);
             const auto* source = static_cast<const std::uint8_t*> (readback.contents);
             for (std::uint32_t row = 0; row < height_; ++row)
@@ -721,11 +893,8 @@ public:
                 {
                     for (std::size_t channel = 0; channel < 4; ++channel)
                     {
-                        const auto value = std::clamp (sdfHalfToFloat (
-                            sourcePixels[static_cast<std::size_t> (column) * 4u + channel]),
-                            0.0f, 1.0f);
                         destination[static_cast<std::size_t> (column) * 4u + channel]
-                            = static_cast<std::uint8_t> (std::lround (value * 255.0f));
+                            = sdfHalfToFloat (sourcePixels[static_cast<std::size_t> (column) * 4u + channel]);
                     }
                 }
             }
@@ -739,6 +908,7 @@ public:
     std::string backend_ = "metal";
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
+    std::uintptr_t deviceIdentity_ = 0;
     sg_image colorImage = {};
     sg_view colorAttachmentView = {};
     sg_view colorTextureView = {};
@@ -813,24 +983,176 @@ float3 childPoint(uint op,float3 p,float4 a,float4 b){
     if(op==26u)return p+float3(a.x*sin(a.w*p.y),a.y*sin(b.x*p.z),a.z*sin(b.y*p.x));
     return p;
 }
-float sceneDistance(float3 point,constant Uniforms& u){
-    int indices[32],stages[32];float3 points[32];float firstValues[32];int top=0;indices[0]=int(u.program.y);stages[0]=0;points[0]=point;float value=0.0;
-    for(int iteration=0;iteration<768;++iteration){int index=indices[top];Record record=u.records[index];uint op=record.header.x;float4 a=record.parameters0,b=record.parameters1;
-        if(op<=9u){value=primitiveDistance(op,points[top],a,b);if(top==0)return value;--top;continue;}
+float sceneDistanceWithMaterial(float3 point,thread int& contributor,constant Uniforms& u){
+    int indices[32],stages[32],firstContributors[32];
+    float3 points[32];float firstValues[32];
+    int top=0;indices[0]=int(u.program.y);stages[0]=0;points[0]=point;
+    float value=0.0;contributor=-1;
+    for(int iteration=0;iteration<768;++iteration){
+        int index=indices[top];Record record=u.records[index];
+        uint op=record.header.x;float4 a=record.parameters0,b=record.parameters1;
+        if(op<=9u){
+            value=primitiveDistance(op,points[top],a,b);contributor=index;
+            if(top==0)return value;--top;continue;
+        }
         bool binary=op>=10u&&op<=15u;
-        if(binary){if(stages[top]==0){stages[top]=1;++top;indices[top]=int(record.header.y);stages[top]=0;points[top]=points[top-1];continue;}if(stages[top]==1){firstValues[top]=value;stages[top]=2;++top;indices[top]=int(record.header.z);stages[top]=0;points[top]=points[top-1];continue;}float first=firstValues[top],second=value;if(op==10u)value=min(first,second);else if(op==11u)value=max(first,second);else if(op==12u)value=max(first,-second);else if(op==13u)value=smoothUnionDistance(first,second,a.x);else if(op==14u)value=-smoothUnionDistance(-first,-second,a.x);else value=-smoothUnionDistance(-first,second,a.x);}
-        else if(stages[top]==0){stages[top]=1;++top;indices[top]=int(record.header.y);stages[top]=0;points[top]=childPoint(op,points[top-1],a,b);continue;}
-        else{if(op==18u)value*=min(abs(a.x),min(abs(a.y),abs(a.z)));else if(op==25u){float3 q=points[top];value+=a.x*sin(a.y*q.x)*sin(a.y*q.y)*sin(a.y*q.z);}}
+        if(binary){
+            if(stages[top]==0){
+                stages[top]=1;++top;indices[top]=int(record.header.y);
+                stages[top]=0;points[top]=points[top-1];continue;
+            }
+            if(stages[top]==1){
+                firstContributors[top]=contributor;firstValues[top]=value;
+                stages[top]=2;++top;indices[top]=int(record.header.z);
+                stages[top]=0;points[top]=points[top-1];continue;
+            }
+            float first=firstValues[top],second=value;
+            // Dominant smooth contributor; B owns a cut and A wins a tie.
+            bool takeFirst=(op==10u||op==13u)?first<=second
+                :first>=((op==12u||op==15u)?-second:second);
+            if(takeFirst)contributor=firstContributors[top];
+            if(op==10u)value=min(first,second);
+            else if(op==11u)value=max(first,second);
+            else if(op==12u)value=max(first,-second);
+            else if(op==13u)value=smoothUnionDistance(first,second,a.x);
+            else if(op==14u)value=-smoothUnionDistance(-first,-second,a.x);
+            else value=-smoothUnionDistance(-first,second,a.x);
+        }else if(stages[top]==0){
+            stages[top]=1;++top;indices[top]=int(record.header.y);stages[top]=0;
+            points[top]=childPoint(op,points[top-1],a,b);continue;
+        }else{
+            if(op==18u)value*=min(abs(a.x),min(abs(a.y),abs(a.z)));
+            else if(op==25u){float3 q=points[top];value+=a.x*sin(a.y*q.x)*sin(a.y*q.y)*sin(a.y*q.z);}
+        }
         if(top==0)return value;--top;
-    }return u.raymarch.y;
+    }
+    return u.raymarch.y;
+}
+float sceneDistance(float3 point,constant Uniforms& u){
+    int contributor;return sceneDistanceWithMaterial(point,contributor,u);
 }
 float qualityScale(uint q){if(q==0u)return 4.0;if(q==1u)return 2.0;if(q==2u)return 1.0;return 0.5;}
-float3 sceneNormal(float3 p,constant Uniforms&u){float e=max(u.raymarch.x*qualityScale(u.quality.y),0.000001);return normalize(float3(sceneDistance(p+float3(e,0,0),u)-sceneDistance(p-float3(e,0,0),u),sceneDistance(p+float3(0,e,0),u)-sceneDistance(p-float3(0,e,0),u),sceneDistance(p+float3(0,0,e),u)-sceneDistance(p-float3(0,0,e),u)));}
-float sceneShadow(float3 origin,float3 direction,constant Uniforms&u){int limit=u.quality.z==0u?8:(u.quality.z==1u?16:(u.quality.z==2u?32:64));float travel=u.raymarch.x*4.0,visibility=1.0;for(int step=0;step<64;++step){if(step>=limit)break;float field=sceneDistance(origin+direction*travel,u);if(field<u.raymarch.x)return 0.0;visibility=min(visibility,12.0*field/max(travel,u.raymarch.x));travel+=clamp(field,u.raymarch.x*2.0,0.25);if(travel>min(u.raymarch.y,8.0))break;}return clamp(visibility,0.0,1.0);}
-fragment float4 _main(VertexOut in [[stage_in]],constant Uniforms&u [[buffer(0)]]){
-    float2 extent=u.raymarch.zw,uv=(2.0*in.position.xy-extent)/extent.y;float3 origin=float3(0,0,3),direction=normalize(float3(uv,-1.8));float travel=0.0;bool hit=false;
-    for(uint step=0u;step<512u;++step){if(step>=u.quality.x||travel>u.raymarch.y)break;float field=sceneDistance(origin+direction*travel,u);float threshold=max(u.raymarch.x*qualityScale(u.quality.w)*max(1.0,travel*0.05),0.000001);if(field<=threshold){hit=true;break;}travel+=field;}
-    if(!hit)return u.program.x==1u?float4(1.0):float4(0.02745,0.03922,0.07059,1.0);float3 point=origin+direction*travel,normal=sceneNormal(point,u);if(u.program.x==1u)return float4(float3(clamp(travel/u.raymarch.y,0.0,1.0)),1.0);if(u.program.x==2u)return float4(normal*0.5+0.5,1.0);float3 light=normalize(float3(-0.45,0.75,0.6));float diffuse=max(dot(normal,light),0.0),shadow=sceneShadow(point+normal*u.raymarch.x*4.0,light,u),rim=pow(1.0-max(dot(normal,-direction),0.0),3.0);return float4(float3(0.12,0.42,0.88)*(0.12+0.88*diffuse*shadow)+float3(0.18,0.35,0.65)*rim,1.0);
+float3 sceneNormal(float3 p,constant Uniforms& u){
+    float e=max(u.raymarch.x*qualityScale(u.quality.y),0.000001);
+    float3 gradient=float3(0.0);
+    for(int sampleIndex=0;sampleIndex<6;++sampleIndex){
+        int axis=sampleIndex/2;
+        float sign=(sampleIndex%2)==0?1.0:-1.0;
+        float3 offset=float3(0.0);offset[axis]=sign*e;
+        gradient[axis]+=sign*sceneDistance(p+offset,u);
+    }
+    float squaredLength=dot(gradient,gradient);
+    return squaredLength>0.0&&isfinite(squaredLength)?normalize(gradient):float3(0,0,1);
+}
+float sceneShadow(float3 origin,float3 direction,constant Uniforms& u){
+    int limit=u.quality.z==0u?8:(u.quality.z==1u?16:(u.quality.z==2u?32:64));
+    float travel=u.raymarch.x*4.0,visibility=1.0;
+    for(int step=0;step<64;++step){
+        if(step>=limit)break;
+        float field=sceneDistance(origin+direction*travel,u);
+        if(!isfinite(field)||field<u.raymarch.x)return 0.0;
+        visibility=min(visibility,12.0*field/max(travel,u.raymarch.x));
+        travel+=clamp(field,u.raymarch.x*2.0,0.25);
+        if(travel>min(u.raymarch.y,8.0))break;
+    }
+    return clamp(visibility,0.0,1.0);
+}
+float sceneCurvature(float3 point,constant Uniforms& u){
+    // Gradient/Hessian curvature uses one distance-call site, avoiding nested
+    // normal stencils and their duplicated traversal stacks.
+    float h=max(max(u.raymarch.x*qualityScale(u.quality.y)*4.0,0.002),length(point)*0.0001);
+    const float3 offsets[19]={float3(0),
+        float3(1,0,0),float3(-1,0,0),float3(0,1,0),float3(0,-1,0),float3(0,0,1),float3(0,0,-1),
+        float3(1,1,0),float3(1,-1,0),float3(-1,1,0),float3(-1,-1,0),
+        float3(1,0,1),float3(1,0,-1),float3(-1,0,1),float3(-1,0,-1),
+        float3(0,1,1),float3(0,1,-1),float3(0,-1,1),float3(0,-1,-1)};
+    float values[19];
+    for(int i=0;i<19;++i)values[i]=sceneDistance(point+offsets[i]*h,u);
+    float3 g=float3(values[1]-values[2],values[3]-values[4],values[5]-values[6])/(2.0*h);
+    float3 diagonal=(float3(values[1]+values[2],values[3]+values[4],values[5]+values[6])-2.0*values[0])/(h*h);
+    float3 crossTerms=float3(values[7]-values[8]-values[9]+values[10],
+        values[11]-values[12]-values[13]+values[14],values[15]-values[16]-values[17]+values[18])/(4.0*h*h);
+    float g2=dot(g,g);
+    if(g2<=0.000000000001||!isfinite(g2))return 0.5;
+    float directional=dot(g*g,diagonal)+2.0*dot(float3(g.x*g.y,g.x*g.z,g.y*g.z),crossTerms);
+    float curvature=(g2*(diagonal.x+diagonal.y+diagonal.z)-directional)/(2.0*g2*sqrt(g2));
+    if(!isfinite(curvature))return 0.5;
+    curvature=clamp(curvature,-1.0/h,1.0/h);
+    return 0.5+0.5*curvature/(1.0+abs(curvature));
+}
+float sceneAmbientVisibility(float3 point,float3 normal,constant Uniforms& u){
+    int count=4+4*int(u.quality.y);
+    float radius=min(u.raymarch.y,max(0.5,32.0*u.raymarch.x));
+    float occlusion=0.0,total=0.0,weight=1.0;
+    for(int i=0;i<16;++i){
+        if(i>=count)break;
+        float reach=radius*float(i+1)/float(count);
+        float field=sceneDistance(point+normal*reach,u);
+        if(!isfinite(field))return 0.0;
+        occlusion+=weight*clamp(1.0-field/reach,0.0,1.0);
+        total+=weight;weight*=0.75;
+    }
+    return clamp(1.0-occlusion/total,0.0,1.0);
+}
+bool traceSdf(float3 direction,thread float& travel,constant Uniforms& u){
+    float3 origin=float3(0,0,3);travel=0.0;
+    for(uint step=0u;step<512u;++step){
+        if(step>=u.quality.x||travel>u.raymarch.y)break;
+        float field=sceneDistance(origin+direction*travel,u);
+        if(!isfinite(field))break;
+        float threshold=max(u.raymarch.x*qualityScale(u.quality.w)*max(1.0,travel*0.05),0.000001);
+        if(field<=threshold)return true;
+        travel+=field;
+    }
+    return false;
+}
+float sceneEdgeDistance(float2 uv,constant Uniforms& u){
+    const float2 axes[8]={float2(1,0),float2(-1,0),float2(0,1),float2(0,-1),
+        float2(0.70710678,0.70710678),float2(-0.70710678,0.70710678),
+        float2(0.70710678,-0.70710678),float2(-0.70710678,-0.70710678)};
+    float distance=8.0;
+    for(int i=0;i<8;++i){
+        float low=0.0,high=8.0,travel;
+        float2 axis=axes[i]*2.0/u.raymarch.w;
+        if(traceSdf(normalize(float3(uv+axis*high,-1.8)),travel,u))continue;
+        for(int j=0;j<4;++j){
+            float middle=(low+high)*0.5;
+            if(traceSdf(normalize(float3(uv+axis*middle,-1.8)),travel,u))low=middle;
+            else high=middle;
+        }
+        distance=min(distance,high);
+    }
+    return distance/8.0;
+}
+fragment float4 _main(VertexOut in [[stage_in]],constant Uniforms& u [[buffer(0)]]){
+    float2 extent=u.raymarch.zw,uv=(2.0*in.position.xy-extent)/extent.y;
+    // Metal raster rows start at the top; positive scene Y points up.
+    uv.y=-uv.y;
+    float3 origin=float3(0,0,3),direction=normalize(float3(uv,-1.8));
+    float travel;
+    bool hit=traceSdf(direction,travel,u);
+    if(!hit)return u.program.x>=3u?float4(0,0,0,1)
+        :(u.program.x==1u?float4(1.0):float4(0.02745,0.03922,0.07059,1.0));
+    if(u.program.x==1u)return float4(float3(clamp(travel/u.raymarch.y,0.0,1.0)),1.0);
+    if(u.program.x==7u)return float4(float3(sceneEdgeDistance(uv,u)),1.0);
+    float3 point=origin+direction*travel;
+    if(u.program.x==3u){
+        int contributor;sceneDistanceWithMaterial(point,contributor,u);
+        uint code=contributor<0?0u:u.records[contributor].header.w;
+        return float4(float3(code&255u,(code>>8u)&255u,(code>>16u)&255u)/255.0,1.0);
+    }
+    if(u.program.x==4u)return float4(float3(sceneCurvature(point,u)),1.0);
+    float3 normal=sceneNormal(point,u);
+    if(u.program.x==2u)return float4(normal*0.5+0.5,1.0);
+    if(u.program.x==5u)return float4(float3(sceneAmbientVisibility(point,normal,u)),1.0);
+    float3 light=normalize(float3(-0.45,0.75,0.6));
+    if(u.program.x==6u){
+        float visibility=dot(normal,light)<=0.0?0.0:sceneShadow(point+normal*u.raymarch.x*4.0,light,u);
+        return float4(float3(visibility),1.0);
+    }
+    float diffuse=max(dot(normal,light),0.0),shadow=sceneShadow(point+normal*u.raymarch.x*4.0,light,u);
+    float rim=pow(1.0-max(dot(normal,-direction),0.0),3.0);
+    return float4(float3(0.12,0.42,0.88)*(0.12+0.88*diffuse*shadow)+float3(0.18,0.35,0.65)*rim,1.0);
 }
 )metal";
 
@@ -885,6 +1207,26 @@ struct Uniforms {
     uint4 diffractionEvaluationSchedule;
     float4 noteInstanceTransforms[128];
     uint4 geometryInstanceControl;
+    float4 noteAppearanceLow;
+    float4 noteAppearanceHigh;
+    float4 noteMeshScale;
+    float4 imageOutput;
+    float4 diffractionEnvironment;
+    float4 rawIdentifiers[64];
+    float4 motionRotation;
+    float4 motionTranslationScale;
+    float4 previousCameraRotation;
+    float4 previousCameraTranslation;
+    float4 previousProjection;
+    float4 motionViewport;
+    float4 vertexTime;
+    float4 vertexSpectrum[16];
+    float4 passProgramControl;
+    float4 passModes[8];
+    float4 passColors[8];
+    float4 passReferences[8];
+    float4 passTransforms[8];
+    float4 surfaceCoating;
 };
 struct VertexIn {
     float3 position [[attribute(0)]];
@@ -897,6 +1239,8 @@ struct VertexIn {
     float4 instanceMatrix2 [[attribute(7)]];
     float4 instanceMatrix3 [[attribute(8)]];
     float4 instanceIdentityColor [[attribute(9)]];
+    float4 instanceColor [[attribute(10)]];
+    float4 instanceEmission [[attribute(11)]];
 };
 struct VertexOut {
     float4 position [[position]];
@@ -911,6 +1255,10 @@ struct VertexOut {
     float2 metallicRoughness;
     float linearDepth;
     float opacity;
+    float4 noteAppearance [[flat]];
+    float4 rawIdentifiers [[flat]];
+    float4 motionCurrentClip;
+    float4 motionPreviousClip;
 };
 float3 rotateQuaternion(float4 q, float3 value) {
     return value + 2.0f * cross(q.xyz, cross(q.xyz, value) + q.w * value);
@@ -920,15 +1268,18 @@ vertex VertexOut _main(VertexIn in [[stage_in]],
                        uint instance [[instance_id]]) {
     VertexOut out;
     const bool useGeometryInstance = u.geometryInstanceControl.x != 0u;
+    out.rawIdentifiers = u.rawIdentifiers[useGeometryInstance ? instance : u.geometryInstanceControl.z];
     const uint noteIndex = useGeometryInstance
         ? u.geometryInstanceControl.y : instance;
     const float4 noteInstance = u.noteInstanceTransforms[noteIndex];
+    out.noteAppearance = mix(u.noteAppearanceLow, u.noteAppearanceHigh, noteInstance.w);
     const float4x4 objectMatrix = useGeometryInstance
         ? float4x4(in.instanceMatrix0, in.instanceMatrix1,
                    in.instanceMatrix2, in.instanceMatrix3)
         : u.objectMatrix;
+    // ARBIT_VERTEX_MODIFIER
     const float3 worldPosition = (objectMatrix
-        * float4(in.position * noteInstance.w + noteInstance.xyz, 1.0f)).xyz;
+        * float4(modifiedPosition * u.noteMeshScale.x + noteInstance.xyz, 1.0f)).xyz;
     const float3x3 objectLinear = float3x3(
         objectMatrix[0].xyz, objectMatrix[1].xyz, objectMatrix[2].xyz);
     const float objectDeterminant = determinant(objectLinear);
@@ -950,6 +1301,16 @@ vertex VertexOut _main(VertexIn in [[stage_in]],
                           distance * farPlane / (farPlane - nearPlane)
                               - nearPlane * farPlane / (farPlane - nearPlane), distance);
     out.uv = in.uv;
+    out.motionCurrentClip = out.position;
+    const float3 previousWorld = rotateQuaternion(u.motionRotation, worldPosition)
+        * u.motionTranslationScale.w + u.motionTranslationScale.xyz;
+    const float3 previousCamera = rotateQuaternion(
+        float4(-u.previousCameraRotation.xyz, u.previousCameraRotation.w),
+        previousWorld - u.previousCameraTranslation.xyz);
+    out.motionPreviousClip = u.previousProjection.w > 0.5f && -previousCamera.z > u.previousProjection.z
+        ? float4(previousCamera.x / (u.previousProjection.x * u.previousProjection.y),
+                 previousCamera.y / u.previousProjection.x, 0.0f, -previousCamera.z)
+        : out.motionCurrentClip;
     out.baseColor = (u.materialParams.w > 0.5f
         ? mix(u.baseColor.xyz, u.timeMixEndColorAndTime.xyz,
               clamp(u.timeMixEndColorAndTime.w, 0.0f, 1.0f))
@@ -958,8 +1319,9 @@ vertex VertexOut _main(VertexIn in [[stage_in]],
             ? mix(float3(1.0f), in.instanceIdentityColor.rgb,
                   step(0.5f, in.instanceIdentityColor.a))
             : float3(1.0f));
+    if (useGeometryInstance) out.baseColor *= in.instanceColor.rgb;
     out.litBase = out.baseColor * u.ambient.xyz;
-    out.emissive = u.emissive.xyz;
+    out.emissive = u.emissive.xyz + (useGeometryInstance ? in.instanceEmission.rgb : float3(0.0f));
     out.worldPosition = worldPosition;
     out.worldNormal = worldNormal;
     out.worldTangent = normalize(objectLinear * in.tangent.xyz);
@@ -967,7 +1329,7 @@ vertex VertexOut _main(VertexIn in [[stage_in]],
     out.metallicRoughness = u.materialParams.xy;
     out.linearDepth = clamp((distance - nearPlane)
         / max(farPlane - nearPlane, 0.000001f), 0.0f, 1.0f);
-    out.opacity = u.baseColor.w * in.color.a;
+    out.opacity = u.baseColor.w * in.color.a * (useGeometryInstance ? in.instanceColor.a : 1.0f);
     return out;
 }
 )metal";
@@ -1010,6 +1372,26 @@ struct Uniforms {
     uint4 diffractionEvaluationSchedule;
     float4 noteInstanceTransforms[128];
     uint4 geometryInstanceControl;
+    float4 noteAppearanceLow;
+    float4 noteAppearanceHigh;
+    float4 noteMeshScale;
+    float4 imageOutput;
+    float4 diffractionEnvironment;
+    float4 rawIdentifiers[64];
+    float4 motionRotation;
+    float4 motionTranslationScale;
+    float4 previousCameraRotation;
+    float4 previousCameraTranslation;
+    float4 previousProjection;
+    float4 motionViewport;
+    float4 vertexTime;
+    float4 vertexSpectrum[16];
+    float4 passProgramControl;
+    float4 passModes[8];
+    float4 passColors[8];
+    float4 passReferences[8];
+    float4 passTransforms[8];
+    float4 surfaceCoating;
 };
 struct VertexOut {
     float4 position [[position]];
@@ -1024,6 +1406,10 @@ struct VertexOut {
     float2 metallicRoughness;
     float linearDepth;
     float opacity;
+    float4 noteAppearance [[flat]];
+    float4 rawIdentifiers [[flat]];
+    float4 motionCurrentClip;
+    float4 motionPreviousClip;
 };
 
 constant float pi = 3.14159265358979323846f;
@@ -1175,6 +1561,99 @@ float diffractionOrderContribution(int primaryOrder,
     return efficiency * lobe;
 }
 
+// Integrate discrete reciprocal orders. The environment is affine on the unit
+// sphere. A five-point angular rule follows the admitted roughness width.
+float diffractionEnvironmentSample(float3 direction, float3 position, constant Uniforms& u) {
+    bool hit = false;
+    if (direction.y < -1.0e-6f && position.y > u.diffractionEnvironment.y) {
+        float distance = (u.diffractionEnvironment.y - position.y) / direction.y;
+        hit = distance > 0.0f && distance <= u.diffractionEnvironment.z;
+    }
+    float3 axis = u.diffractionIncidentDirectionAndIntensity.xyz;
+    if (u.diffractionPathKindAndBounce.x == 3u)
+        return hit ? 0.625f + 0.25f * axis.y : 0.0f;
+    return hit ? 0.0f : 0.625f + 0.375f * dot(axis, direction);
+}
+
+float3 integrateDiffractionEnvironment(float3 outgoing, float3 tangent,
+                                    float3 bitangent, float3 normal, VertexOut in, constant Uniforms& u) {
+    float4 geometry;
+    float4 secondaryGeometry;
+    geometry = u.diffractionGeometry;
+    secondaryGeometry = u.diffractionSecondaryGeometry;
+    if (u.diffractionSpatialCounts.x > 0u) {
+        float4 lower = mix(u.diffractionFoilField[0], u.diffractionFoilField[1], clamp(in.uv.x, 0.0f, 1.0f));
+        float4 upper = mix(u.diffractionFoilField[2], u.diffractionFoilField[3], clamp(in.uv.x, 0.0f, 1.0f));
+        float4 local = mix(lower, upper, clamp(in.uv.y, 0.0f, 1.0f));
+        geometry.xyz = float3(normalize(local.xy), local.z);
+    } else if (int(u.diffractionGrooveField.x + 0.5f) != 1) {
+        float2 offset = in.uv - u.diffractionGrooveField.yz;
+        float coordinate = int(u.diffractionGrooveField.x + 0.5f) == 2
+            ? dot(offset, u.diffractionGrooveVariation.xy) : length(offset);
+        geometry.z += coordinate * u.diffractionGrooveVariation.z;
+        secondaryGeometry.z += coordinate * u.diffractionGrooveVariation.w;
+        float angle = coordinate * u.diffractionGrooveField.w * degreesToRadians;
+        float2x2 rotation = float2x2(float2(cos(angle), sin(angle)), float2(-sin(angle), cos(angle)));
+        geometry.xy = rotation * geometry.xy;
+        secondaryGeometry.xy = rotation * secondaryGeometry.xy;
+    }
+    bool crossed = int(secondaryGeometry.w + 0.5f) == 2;
+    int firstOrder = int(round(u.diffractionMicrostructure.w));
+    int lastOrder = int(u.diffractionControl.x + 0.5f);
+    int profile = int(u.diffractionControl.y + 0.5f);
+    float duty = u.diffractionMicrostructure.x;
+    float sigma = max(2.0f * u.diffractionRoughness.y, 1.0e-4f);
+    float3 xyz = float3(0.0f);
+    float whiteY = 0.0f;
+    for (int wavelengthIndex = 0; wavelengthIndex < 8; ++wavelengthIndex) {
+        float4 spectral = u.diffractionSpectral[wavelengthIndex];
+        float4 spectralZ = u.diffractionSpectralZ[wavelengthIndex];
+        float wavelength = spectral.x;
+        float radiance = 0.0f;
+        float totalEfficiency = 0.0f;
+        for (int primary = -lastOrder; primary <= lastOrder; ++primary) {
+            if (primary != 0 && abs(primary) < firstOrder) continue;
+            int secondaryLimit = crossed ? lastOrder : 0;
+            for (int secondary = -secondaryLimit; secondary <= secondaryLimit; ++secondary) {
+                if (secondary != 0 && abs(secondary) < firstOrder) continue;
+                float2 xy = -outgoing.xy + float(primary) * wavelength / geometry.z * geometry.xy;
+                if (crossed)
+                    xy += float(secondary) * wavelength / secondaryGeometry.z * secondaryGeometry.xy;
+                if (dot(xy, xy) >= 1.0f) continue;
+                float z = sqrt(max(0.0f, 1.0f - dot(xy, xy)));
+                float phase = 2.0f * pi * geometry.w * (outgoing.z + z) / wavelength;
+                float2 terrace = float2(cos(phase), sin(phase));
+                float efficiency = profileEfficiency(profile, primary, duty, phase, terrace);
+                if (crossed) efficiency *= profileEfficiency(profile, secondary, duty, phase, terrace);
+                if (primary != 0 || secondary != 0) efficiency *= z / outgoing.z;
+                float height = 2.0f * pi * u.diffractionRoughness.x * (outgoing.z + z) / wavelength;
+                efficiency *= exp(-height * height);
+                float3 direction = xy.x * tangent + xy.y * bitangent + z * normal;
+                float3 side = normalize(cross(abs(direction.y) < 0.9f
+                    ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f), direction));
+                float3 up = cross(direction, side);
+                float lighting = 0.5f * diffractionEnvironmentSample(direction, in.worldPosition, u);
+                lighting += 0.125f * diffractionEnvironmentSample(normalize(direction + sigma * side), in.worldPosition, u);
+                lighting += 0.125f * diffractionEnvironmentSample(normalize(direction - sigma * side), in.worldPosition, u);
+                lighting += 0.125f * diffractionEnvironmentSample(normalize(direction + sigma * up), in.worldPosition, u);
+                lighting += 0.125f * diffractionEnvironmentSample(normalize(direction - sigma * up), in.worldPosition, u);
+                radiance += efficiency * lighting;
+                totalEfficiency += efficiency;
+            }
+        }
+        float reflectance = spectralReflectance(wavelength, int(u.diffractionControl.w + 0.5f),
+            u.diffractionMicrostructure.y, u.diffractionMicrostructure.z, u);
+        float energy = u.diffractionIncidentDirectionAndIntensity.w * spectral.y
+            * reflectance * spectralZ.y * radiance / max(1.0f, totalEfficiency);
+        xyz += energy * float3(spectral.z, spectral.w, spectralZ.x);
+        whiteY += spectralZ.y * spectral.w;
+    }
+    xyz /= max(whiteY, 1.0e-8f);
+    return float3(3.2406f * xyz.x - 1.5372f * xyz.y - 0.4986f * xyz.z,
+                -0.9689f * xyz.x + 1.8758f * xyz.y + 0.0415f * xyz.z,
+                0.0557f * xyz.x - 0.2040f * xyz.y + 1.0570f * xyz.z);
+}
+
 float3 evaluateDiffraction(VertexOut in, constant Uniforms& u) {
     const float3 normal = normalize(in.worldNormal);
     const float3 dpdx = dfdx(in.worldPosition);
@@ -1193,12 +1672,19 @@ float3 evaluateDiffraction(VertexOut in, constant Uniforms& u) {
     const float3 toLightWorld = normalize(rotateQuaternion(
         u.lightRotations[0], float3(0.0f, 0.0f, 1.0f)));
     const float3 toViewWorld = normalize(u.cameraTranslation.xyz - in.worldPosition);
-    const float3 incident = u.diffractionIncidentDirectionAndIntensity.xyz;
+    float3 incident = u.diffractionIncidentDirectionAndIntensity.xyz;
     const float3 outgoing = float3(dot(toViewWorld, tangent),
                                   dot(toViewWorld, bitangent),
                                   dot(toViewWorld, normal));
-    if (incident.z <= 0.0f || outgoing.z <= 0.0f)
+    if (outgoing.z <= 0.0f)
         return float3(0.0f);
+    if (u.diffractionEnvironment.x == 2.0f && u.diffractionPathKindAndBounce.x != 1u)
+        return integrateDiffractionEnvironment(outgoing, tangent, bitangent, normal, in, u);
+    if (u.diffractionEnvironment.x == 2.0f) {
+        if (u.ambient.w == 0.0f) return float3(0.0f);
+        incident = float3(dot(toLightWorld, tangent), dot(toLightWorld, bitangent), dot(toLightWorld, normal));
+    }
+    if (incident.z <= 1.0e-6f) return float3(0.0f);
 
     const float duty = u.diffractionMicrostructure.x;
     const float substrateN = u.diffractionMicrostructure.y;
@@ -1305,9 +1791,10 @@ float3 evaluateDiffraction(VertexOut in, constant Uniforms& u) {
         }
         const float pathTransport = u.diffractionPathKindAndBounce.x == 3u
             ? 1.0f / float(1u + u.diffractionPathKindAndBounce.y) : 1.0f;
-        const float energy = u.diffractionIncidentDirectionAndIntensity.w
+        float energy = u.diffractionIncidentDirectionAndIntensity.w
                            * spectral.y * pathTransport * quadrature * reflectance
                            * wavelengthRadiance * incident.z;
+        if (u.diffractionEnvironment.x == 2.0f) energy *= u.lightColors[0].w;
         xyz += energy * float3(spectral.z, spectral.w, spectralZ.x);
         referenceWhiteY += quadrature * spectral.w;
     }
@@ -1320,7 +1807,61 @@ float3 evaluateDiffraction(VertexOut in, constant Uniforms& u) {
 struct FragmentOut {
     float4 color [[color(0)]];
     float linearDepth [[color(1)]];
+    float4 rawNormal [[color(2)]];
+    float4 rawEmission [[color(3)]];
+    float rawMask [[color(4)]];
+    uint rawMaterialId [[color(5)]];
+    uint rawObjectId [[color(6)]];
+    float2 rawMotion [[color(7)]];
 };
+float4 compositePass(FragmentOut value, constant Uniforms& u) {
+    const int count = int(u.passProgramControl.x);
+    if (count == 0) return value.color;
+    float4 values[8];
+    for (int i = 0; i < 8; ++i) {
+        if (i >= count) break;
+        const float4 p = u.passModes[i];
+        const int mode = int(p.x);
+        const float depth = clamp((value.linearDepth - p.y) / (p.z - p.y), 0.0f, 1.0f);
+        float3 fog = u.passColors[i].rgb;
+        if (u.passTransforms[i].y > 0.5f)
+            fog = select(pow((fog + 0.055f) / 1.055f, float3(2.4f)), fog / 12.92f,
+                fog <= float3(0.04045f));
+        const uint identity = uint(u.passReferences[i].x) | (uint(u.passReferences[i].y) << 16u);
+        float4 result = float4(value.color.rgb, value.rawMask);
+        if (mode == 1) result = float4(mix(value.color.rgb, fog, depth * p.w), value.rawMask);
+        const float inspectionAlpha = u.passTransforms[i].w > 0.5f ? 1.0f : value.rawMask;
+        if (mode == 2) result = float4(float3(u.passTransforms[i].w > 1.5f ? 1.0f - depth : depth), inspectionAlpha);
+        if (mode == 3) result = float4(value.rawNormal.xyz * 0.5f + 0.5f, inspectionAlpha);
+        if (mode == 4) result = float4(value.rawEmission.rgb, value.rawMask);
+        if (mode >= 5 && mode <= 7) {
+            float matte = value.rawMask;
+            if (mode == 6) matte *= value.rawMaterialId == identity ? 1.0f : 0.0f;
+            if (mode == 7) matte *= value.rawObjectId == identity ? 1.0f : 0.0f;
+            result = float4(float3(matte), 1.0f);
+        }
+        if (mode == 8) result = float4(clamp(float2(0.5f) + value.rawMotion / u.motionViewport.xy
+            * (1.0f + 63.0f * p.w), 0.0f, 1.0f), 0.5f, value.rawMask);
+        if (mode == 9 || mode == 10) {
+            const float4 a = values[int(u.passReferences[i].z) - 1];
+            const float4 b = values[int(u.passReferences[i].w) - 1];
+            result = mode == 9 ? mix(a, b, p.w)
+                : float4(a.rgb + b.rgb * p.w, max(a.a, b.a));
+        }
+        result.rgb *= exp2(u.passTransforms[i].x);
+        values[i] = result;
+    }
+    const int selected = int(u.passProgramControl.y);
+    float4 result = values[selected];
+    const int transform = int(u.passTransforms[selected].z);
+    if (transform > 0 && u.passProgramControl.z < 0.5f) {
+        float3 rgb = max(result.rgb, float3(0.0f));
+        if (transform == 2) rgb /= float3(1.0f) + rgb;
+        result.rgb = select(1.055f * pow(rgb, float3(1.0f / 2.4f)) - 0.055f, rgb * 12.92f,
+            rgb <= float3(0.0031308f));
+    }
+    return u.passProgramControl.z > 0.5f ? result : clamp(result, 0.0f, 1.0f);
+}
 fragment FragmentOut _main(VertexOut in [[stage_in]],
                            texture2d<float> baseTexture [[texture(0)]],
                            texture2d<float> metallicRoughnessTexture [[texture(1)]],
@@ -1335,6 +1876,14 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
                            constant Uniforms& u [[buffer(0)]]) {
     FragmentOut out;
     out.linearDepth = in.linearDepth;
+    out.rawNormal = float4(normalize(in.worldNormal), 1.0f);
+    out.rawEmission = float4(0.0f);
+    out.rawMask = 1.0f;
+    out.rawMaterialId = uint(in.rawIdentifiers.x) | (uint(in.rawIdentifiers.y) << 16u);
+    out.rawObjectId = uint(in.rawIdentifiers.z) | (uint(in.rawIdentifiers.w) << 16u);
+    out.rawMotion = clamp((in.motionCurrentClip.xy / in.motionCurrentClip.w
+        - in.motionPreviousClip.xy / in.motionPreviousClip.w) * 0.5f * u.motionViewport.xy,
+        float2(-65504.0f), float2(65504.0f));
     if (u.materialKind.x == materialDiffractionReflective)
     {
         const float coverage = u.diffractionSpatialCounts.y == 0u
@@ -1360,12 +1909,32 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
         out.color = float4(mix(in.litBase,
             diffraction,
             clamp(coverage * occupancy, 0.0f, 1.0f)), 1.0f);
+        if (u.materialKind.y & 16u) {
+            const float2 frameUv = u.materialKind.y & 32u ? float2(in.uv.x, 1.0f - in.uv.y) : in.uv;
+            float4 imagery = baseTexture.sample(baseSampler, frameUv);
+            if (imagery.a <= 0.0f) discard_fragment();
+            imagery.rgb = select(pow((imagery.rgb + 0.055f) / 1.055f, float3(2.4f)),
+                                 imagery.rgb / 12.92f, imagery.rgb <= float3(0.04045f));
+            out.color *= imagery;
+        }
     }
     else
     {
-        const float4 baseTexel = baseTexture.sample(baseSampler, in.uv);
-        const float alpha = in.opacity * baseTexel.a;
-        if (u.materialKind.z == 1u && alpha < as_type<float>(u.materialKind.w))
+        const float2 baseUv = u.materialKind.y & 32u ? float2(in.uv.x, 1.0f - in.uv.y) : in.uv;
+        float4 baseTexel = baseTexture.sample(baseSampler, baseUv);
+        // Imported color images use hardware sRGB views. Graph Frames retain
+        // their RGBA8/BGRA8 unorm storage, so decode only this binding here.
+        if (u.materialKind.y & 16u)
+            baseTexel.rgb = select(pow((baseTexel.rgb + 0.055f) / 1.055f, float3(2.4f)),
+                                   baseTexel.rgb / 12.92f, baseTexel.rgb <= float3(0.04045f));
+        // Normal-incidence thin dielectric, matching the GL compositing model.
+        const float interfaceRatio = (u.surfaceCoating.y - 1.0f) / (u.surfaceCoating.y + 1.0f);
+        const float dielectric = u.surfaceCoating.w > 0.5f ? interfaceRatio * interfaceRatio : 0.04f;
+        const float transmission = u.surfaceCoating.w > 0.5f ? u.surfaceCoating.x : 0.0f;
+        const float coat = u.surfaceCoating.w > 0.5f ? 0.04f * u.surfaceCoating.z : 0.0f;
+        const float coverage = 1.0f - transmission * (1.0f - dielectric);
+        const float alpha = in.opacity * baseTexel.a * coverage;
+        if (alpha <= 0.0f || (u.materialKind.z == 1u && alpha < as_type<float>(u.materialKind.w)))
             discard_fragment();
         const float4 metallicRoughnessTexel
             = metallicRoughnessTexture.sample(metallicRoughnessSampler, in.uv);
@@ -1381,6 +1950,28 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
             float3 tangentNormal = normalTexture.sample(normalSampler, in.uv).xyz * 2.0f - 1.0f;
             tangentNormal.xy *= u.materialParams.z;
             normal = normalize(float3x3(tangent, bitangent, normal) * tangentNormal);
+        }
+        const float3 emissive = in.emissive * (u.materialKind.y & 8u
+            ? emissiveTexture.sample(emissiveSampler, in.uv).rgb : float3(1.0f));
+        out.rawNormal = float4(normal, 1.0f);
+        out.rawEmission = float4(in.noteAppearance.rgb * (emissive + float3(in.noteAppearance.a)), 1.0f);
+        out.rawMask = clamp(alpha, 0.0f, 1.0f);
+        const uint imageOutput = uint(u.imageOutput.x);
+        if (imageOutput != 0u) {
+            float3 image = u.imageOutput.yzw;
+            if (imageOutput == 1u) image = float3(in.linearDepth);
+            if (imageOutput == 2u) image = normal * 0.5f + 0.5f;
+            if (imageOutput == 3u) image = float3(clamp(float2(0.5f) + out.rawMotion / u.motionViewport.xy, 0.0f, 1.0f), 0.5f);
+            if (imageOutput == 4u) image = in.noteAppearance.rgb * (emissive + float3(in.noteAppearance.a));
+            if (imageOutput == 5u) image = float3(1.0f);
+            if (imageOutput == 6u || imageOutput == 7u) {
+                uint hash = (imageOutput == 6u ? out.rawMaterialId : out.rawObjectId) * 0x9e3779b9u;
+                hash ^= hash >> 16u;
+                image = float3(32u + (hash & 191u), 32u + ((hash >> 8u) & 191u),
+                               32u + ((hash >> 16u) & 191u)) / 255.0f;
+            }
+            out.color = float4(image, alpha);
+            return out;
         }
         float3 lighting = u.ambient.xyz;
         for (uint lightIndex = 0u; lightIndex < 16u; ++lightIndex) {
@@ -1413,16 +2004,17 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
             lighting += u.lightColors[lightIndex].rgb * u.lightColors[lightIndex].a
                 * max(dot(normal, normalize(toLight)), 0.0f) * attenuation;
         }
-        const float diffuseWeight = (1.0f - metallic) * (1.0f - 0.5f * roughness);
-        const float specularWeight = mix(0.04f, 1.0f, metallic) * (1.0f - roughness);
+        const float diffuseWeight = (1.0f - metallic) * (1.0f - 0.5f * roughness) * (1.0f - transmission);
+        const float specularWeight = mix(dielectric, 1.0f, metallic) * (1.0f - roughness);
         const float occlusion = u.materialKind.y & 4u
             ? occlusionTexture.sample(occlusionSampler, in.uv).r : 1.0f;
-        const float3 emissive = in.emissive * (u.materialKind.y & 8u
-            ? emissiveTexture.sample(emissiveSampler, in.uv).rgb : float3(1.0f));
-        out.color = float4(in.baseColor * baseTexel.rgb * lighting
-            * (diffuseWeight + specularWeight) * occlusion + emissive, alpha);
+        out.color = float4((in.baseColor * baseTexel.rgb * lighting
+            * (diffuseWeight + specularWeight) * (1.0f - coat) * occlusion
+            + lighting * coat + emissive) / max(coverage, 0.000001f), alpha);
 
     }
+    out.color.rgb = in.noteAppearance.rgb * (out.color.rgb + float3(in.noteAppearance.a));
+    out.color = compositePass(out, u);
     return out;
 }
 )metal";
@@ -1433,13 +2025,15 @@ using namespace metal;
 struct SceneVertex {
     packed_float3 position;
     packed_float3 normal;
+    packed_float4 tangent;
     packed_float2 uv;
+    packed_float4 color;
 };
 struct Params {
     uint vertexCount;
     uint jointCount;
     uint morphTargetCount;
-    uint padding;
+    uint outputOffset;
 };
 kernel void _main(const device SceneVertex* source [[buffer(8)]],
                   device SceneVertex* destination [[buffer(9)]],
@@ -1480,11 +2074,11 @@ kernel void _main(const device SceneVertex* source [[buffer(8)]],
         position = skinnedPosition;
         normal = skinnedNormal;
     }
-    SceneVertex output;
+    SceneVertex output = input;
     output.position = packed_float3(position);
     output.normal = packed_float3(normalize(normal));
     output.uv = input.uv;
-    destination[vertexIndex] = output;
+    destination[vertexIndex + params.outputOffset] = output;
 }
 )metal";
 
@@ -2389,9 +2983,7 @@ public:
                 || ! validQuality (request.adaptiveQuality)
                 || ! validQuality (request.normalQuality)
                 || ! validQuality (request.shadowQuality)
-                || (request.output != NativeSdfOutput::color
-                    && request.output != NativeSdfOutput::depth
-                    && request.output != NativeSdfOutput::normal))
+                || ! available.supports (request.output))
             {
                 result.error = "Metal native SDF raymarch controls exceed backend limits";
                 return result;
@@ -2431,6 +3023,7 @@ public:
             auto frame = std::make_shared<MetalSdfSceneFrame>();
             frame->width_ = request.width;
             frame->height_ = request.height;
+            frame->deviceIdentity_ = reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice);
             frame->outputBackend_ = &outputBackend;
             frame->lifecycle_ = outputAdmission.lifecycle;
             frame->frameMemory_ = outputAdmission.frameMemory;
@@ -2478,7 +3071,7 @@ public:
                 destination.header[0] = source.operation;
                 destination.header[1] = source.input0;
                 destination.header[2] = source.input1;
-                destination.header[3] = source.parameterCount;
+                destination.header[3] = videohelper::sdf::nativeSdfMaterialColorCode (source.stableId);
                 std::copy_n (source.parameters.data(), 4, destination.parameters0);
                 std::copy_n (source.parameters.data() + 4, 4, destination.parameters1);
             }
@@ -2587,6 +3180,16 @@ private:
             NativeSdfOutput::depth)] = true;
         result.supportedOutputs[static_cast<std::size_t> (
             NativeSdfOutput::normal)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::materialId)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::curvature)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::ambientOcclusion)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::softShadow)] = true;
+        result.supportedOutputs[static_cast<std::size_t> (
+            NativeSdfOutput::edgeDistance)] = true;
         result.maxOperations = kNativeSdfMaximumRecords;
         result.maxDepth = kNativeSdfMaximumDepth;
         result.maxExtent = static_cast<std::uint32_t> (
@@ -2620,6 +3223,7 @@ public:
         if (! available.available) return capabilities;
         capabilities.immutableSourceBuffers = true;
         capabilities.stableElementIds = true;
+        capabilities.typedFieldEvaluation = true;
         capabilities.gpuInstancingWithoutMeshExpansion = true;
         capabilities.supportedCarriers = (1u << static_cast<unsigned> (
             videowire::geometry::CarrierKind::geometry3D))
@@ -2631,7 +3235,7 @@ public:
         capabilities.maxCurvePoints = 1;
         capabilities.maxSplines = 1;
         capabilities.maxInstances = HarmonicMIDI::grid::Visual3DScene::kMaxObjects;
-        capabilities.maxFieldElements = 1;
+        capabilities.maxFieldElements = HarmonicMIDI::grid::Visual3DScene::kMaxVertices;
         capabilities.maxAttributes = videowire::geometry::kMaximumAttributes;
         capabilities.maxOperations = videowire::geometry::kMaximumOperations;
         capabilities.maxDispatches = videowire::geometry::kMaximumDispatches;
@@ -2650,15 +3254,13 @@ public:
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& requestedMaterialProgram,
         const std::shared_ptr<const videohelper::geometry::AdmittedPlanValue>& geometryAdmission,
-        bool diagnosticInstanceIdentityColors) override
+        bool diagnosticInstanceIdentityColors,
+        const std::vector<videowire::geometry::AttributeData>* frameAttributes = nullptr) override
     {
         using namespace HarmonicMIDI::grid;
 
         NativeFixtureScenePreparation result;
-        const auto materialProgram = requestedMaterialProgram == nullptr
-            ? std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> {}
-            : std::make_shared<const NativeFixtureSurfaceMaterialProgram> (
-                *requestedMaterialProgram);
+        const auto materialProgram = snapshotNativeSurfaceProgram(requestedMaterialProgram);
         if (scene == nullptr || ! validateVisual3DScene (*scene).valid()
             || scene->objectCount == 0 || scene->materialCount == 0
             || scene->lightCount > Visual3DScene::kMaxLights
@@ -2671,6 +3273,9 @@ public:
         }
         const auto& sceneMaterial = scene->materials[0];
         const auto& firstObject = scene->objects[0];
+        if (frameAttributes && (!geometryAdmission
+            || !videowire::geometry::validInstanceAppearanceAttributes(*frameAttributes,scene->objectCount,result.error)))
+            return result;
         bool instancedSharedGeometry = false;
         if (geometryAdmission != nullptr)
         {
@@ -2683,7 +3288,7 @@ public:
             const auto& admittedInstances = std::get<videowire::geometry::InstancesData>(
                 geometryAdmission->value().descriptor().data).instances;
             instancedSharedGeometry = admittedInstances.size() == scene->objectCount
-                && scene->objectCount > 1 && materialProgram == nullptr
+                && scene->objectCount > 0 && materialProgram == nullptr
                 && !firstObject.parent.isValid()
                 && firstObject.material == sceneMaterial.id
                 && sceneMaterial.alphaMode != SceneAlphaMode::Blend;
@@ -2703,6 +3308,13 @@ public:
                 result.error = "Metal Geometry Core authority does not match the retained instance scene";
                 return result;
             }
+            instancedSharedGeometry = scene->objectCount>1;
+            for (std::size_t index=0;index<scene->objectCount;++index) {
+                const auto appearance=videowire::geometry::instanceAppearance(
+                    frameAttributes ? *frameAttributes : geometryAdmission->value().descriptor().attributes,index);
+                if (appearance.color[3]<1.0f || appearance.metallic>=0 || appearance.roughness>=0)
+                    instancedSharedGeometry=false;
+            }
         }
         const bool materialKindValid = materialProgram == nullptr
             || (materialProgram->kind == NativeFixtureMaterialKind::SurfacePbr
@@ -2716,7 +3328,12 @@ public:
                 || materialProgram->backend != NativeFixtureMaterialBackend::Metal
                 || materialProgram->programIdentity.empty()
                 || materialProgram->bindingDigest.empty()
-                || materialProgram->object != scene->objects[0].id
+                || (materialProgram->kind != NativeFixtureMaterialKind::SurfacePbr
+                    && materialProgram->object != scene->objects[0].id)
+                || (materialProgram->vertexProgram
+                    && (materialProgram->kind != NativeFixtureMaterialKind::SurfacePbr
+                        || scene->objectCount != 1
+                        || materialProgram->vertexProgram->programIdentity() != materialProgram->programIdentity))
                 || ! materialKindValid))
         {
             result.error = "Metal fixture preparation requires an exact bounded material binding";
@@ -2741,11 +3358,9 @@ public:
                 result.error = "Metal fixture preparation requires a bounded renderable scene";
                 return result;
             }
-            const auto& sceneMaterial = scene->materials[0];
             const bool materialKindValid = materialProgram == nullptr
                 || (materialProgram->kind == NativeFixtureMaterialKind::SurfacePbr
-                    && materialProgram->parameters.identifiers[0] == sceneMaterial.id.value
-                    && validNativeFixtureSurfaceParameters (materialProgram->parameters))
+                    && validNativeSurfaceObjectPrograms(*materialProgram, *scene, NativeFixtureMaterialBackend::Metal))
                 || validNativeFixtureDiffractionProgram (
                     *materialProgram, NativeFixtureMaterialBackend::Metal,
                     scene->objects[0].id);
@@ -2756,16 +3371,73 @@ public:
                         != NativeFixtureMaterialBackend::Metal
                     || materialProgram->programIdentity.empty()
                     || materialProgram->bindingDigest.empty()
-                    || materialProgram->object != scene->objects[0].id
+                    || (materialProgram->kind != NativeFixtureMaterialKind::SurfacePbr
+                        && (materialProgram->object != scene->objects[0].id || !materialProgram->objectPrograms.empty()))
                     || ! materialKindValid))
             {
                 result.error = "Metal fixture preparation requires an exact bounded material binding";
                 return result;
             }
+            static_assert (fixturetexture::kMaximumMipLevels <= SG_MAX_MIPMAPS,
+                           "fixture mip layout exceeds Sokol image data capacity");
+            const auto maximumTextureExtent = sg_query_limits().max_image_size_2d;
+            const auto linearFormat = sg_query_pixelformat (SG_PIXELFORMAT_RGBA8);
+            const auto colorFormat = sg_query_pixelformat (SG_PIXELFORMAT_SRGB8A8);
+            if (maximumTextureExtent <= 0 || ! linearFormat.sample || ! linearFormat.filter
+                || ! colorFormat.sample || ! colorFormat.filter)
+            {
+                result.error = "Metal fixture texture formats or extents are unsupported";
+                return result;
+            }
+            const SceneTexelRgba8 whiteTexel { 255, 255, 255, 255 };
+            const auto* fallbackTexels = &whiteTexel;
+            fixturetexture::MipLayout fallbackLayout;
+            if (! fixturetexture::mipLayout (1, 1, 9728,
+                    static_cast<std::uint32_t> (maximumTextureExtent), fallbackLayout))
+            {
+                result.error = "Metal fixture fallback texture extent is unsupported";
+                return result;
+            }
+            if (materialProgram != nullptr && materialProgram->baseColorSource
+                    == NativeFixtureSurfaceMaterialProgram::BaseColorSource::ImportedSrgbTexture)
+            {
+                if (! materialProgram->importedBaseColorTexture)
+                {
+                    result.error = "Metal fixture material program has no owned imported texture";
+                    return result;
+                }
+                const auto& imported = *materialProgram->importedBaseColorTexture;
+                if (! imported.valid()
+                    || ! fixturetexture::mipLayout (imported.width, imported.height, 9728,
+                        static_cast<std::uint32_t> (maximumTextureExtent), fallbackLayout)
+                    || imported.texelCount != fallbackLayout.bytes / sizeof (SceneTexelRgba8)
+                    || imported.texelCount > imported.texels.size())
+                {
+                    result.error = "Metal fixture imported texture has invalid storage or extent";
+                    return result;
+                }
+                fallbackTexels = imported.texels.data();
+            }
+            std::size_t textureBytes = 0;
+            fixturetexture::SceneMipLayouts textureLayouts;
+            if (! fixturetexture::accountBytes (fallbackLayout, 1,
+                    fixturetexture::kMaximumTextureBytes, textureBytes)
+                || ! fixturetexture::sceneMipLayouts (*scene, 2,
+                    static_cast<std::uint32_t> (maximumTextureExtent),
+                    fixturetexture::kMaximumTextureBytes, textureBytes, textureLayouts))
+            {
+                result.error = "Metal fixture texture bounds, sampler settings or allocation budget are invalid";
+                return result;
+            }
             auto resources = std::make_shared<MetalFixtureSceneResources>();
             resources->snapshot = scene;
             resources->materialProgram = materialProgram;
+            resources->materialProgramSource = requestedMaterialProgram;
             resources->geometryAdmission = geometryAdmission;
+            if (geometryAdmission != nullptr)
+                for (std::size_t index=0;index<scene->objectCount;++index)
+                    resources->instanceAppearances.push_back(videowire::geometry::instanceAppearance(
+                        frameAttributes ? *frameAttributes : geometryAdmission->value().descriptor().attributes,index));
             resources->instancedSharedGeometry = instancedSharedGeometry;
             resources->diagnosticInstanceIdentityColors = diagnosticInstanceIdentityColors;
             resources->rendererGeneration = nextMetalRendererGeneration();
@@ -2812,32 +3484,18 @@ public:
                 : "arbit-metal-fixture-unused-instance-attributes";
             resources->geometryInstanceBuffer = sg_make_buffer (&instanceDesc);
 
-            const SceneTexelRgba8 whiteTexel { 255, 255, 255, 255 };
-            std::size_t textureBytes = sizeof (whiteTexel);
-            if (materialProgram != nullptr)
-            {
-                using Source = arbitgpu::NativeFixtureSurfaceMaterialProgram::BaseColorSource;
-                if (materialProgram->baseColorSource == Source::ImportedSrgbTexture)
-                {
-                    if (! materialProgram->importedBaseColorTexture
-                        || materialProgram->importedBaseColorTexture->texelCount == 0)
-                    {
-                        return fail ("Metal fixture material program has no owned imported texture");
-                    }
-                    const auto& imported = *materialProgram->importedBaseColorTexture;
-                    textureBytes += imported.texelCount * sizeof (SceneTexelRgba8);
-                }
-            }
             // Upload separate linear and sRGB images because one glTF image can serve
             // both color and data roles. Each role also keeps its glTF sampler state.
-            resources->textureImages.resize (1 + scene->textureCount * 2);
-            resources->textureViews.resize (resources->textureImages.size());
-            resources->samplers.resize (resources->textureImages.size());
-            const auto filter = [] (std::uint32_t value)
+            try
             {
-                return value == 9728 || value == 9984 || value == 9986
-                    ? SG_FILTER_NEAREST : SG_FILTER_LINEAR;
-            };
+                resources->textureImages.resize (1 + scene->textureCount * 2);
+                resources->textureViews.resize (resources->textureImages.size());
+                resources->samplers.resize (resources->textureImages.size());
+            }
+            catch (const std::bad_alloc&)
+            {
+                return fail ("Metal fixture texture handle allocation failed");
+            }
             const auto wrap = [] (std::uint32_t value)
             {
                 if (value == 33071) return SG_WRAP_CLAMP_TO_EDGE;
@@ -2848,58 +3506,70 @@ public:
             {
                 const auto* source = slot > 0 ? &scene->textures[(slot - 1) / 2] : nullptr;
                 const auto colorRole = source != nullptr && ((slot - 1) % 2 == 1);
-                const void* data = &whiteTexel;
-                std::size_t bytes = sizeof (whiteTexel);
-                int textureWidth = 1, textureHeight = 1;
-                if (source != nullptr)
-                {
-                    data = scene->textureTexels.data() + source->firstTexel;
-                    bytes = static_cast<std::size_t> (source->width) * source->height
-                        * sizeof (SceneTexelRgba8);
-                    textureWidth = static_cast<int> (source->width);
-                    textureHeight = static_cast<int> (source->height);
-                    textureBytes += bytes;
-                }
-                else if (materialProgram != nullptr
-                         && materialProgram->baseColorSource
-                            == NativeFixtureSurfaceMaterialProgram::BaseColorSource::ImportedSrgbTexture)
-                {
-                    const auto& imported = *materialProgram->importedBaseColorTexture;
-                    data = imported.texels.data();
-                    bytes = imported.texelCount * sizeof (SceneTexelRgba8);
-                    textureWidth = static_cast<int> (imported.width);
-                    textureHeight = static_cast<int> (imported.height);
-                }
+                const auto& layout = source != nullptr
+                    ? textureLayouts[(slot - 1) / 2] : fallbackLayout;
+                const auto* data = source != nullptr
+                    ? scene->textureTexels.data() + source->firstTexel : fallbackTexels;
+                std::vector<SceneTexelRgba8> mipData;
+                if (layout.levelCount > 1 && ! fixturetexture::mipTexels (data,
+                        layout.levels[0].bytes / sizeof (SceneTexelRgba8),
+                        layout, colorRole, mipData))
+                    return fail ("Metal fixture mipmap staging failed");
                 sg_image_desc textureDesc = {};
-                textureDesc.width = textureWidth;
-                textureDesc.height = textureHeight;
-                textureDesc.num_mipmaps = source != nullptr && source->minFilter >= 9984 ? 0 : 1;
+                textureDesc.width = static_cast<int> (layout.levels[0].width);
+                textureDesc.height = static_cast<int> (layout.levels[0].height);
+                textureDesc.num_mipmaps = static_cast<int> (layout.levelCount);
+                textureDesc.usage.immutable = true;
                 textureDesc.pixel_format = colorRole || slot == 0
                     ? SG_PIXELFORMAT_SRGB8A8 : SG_PIXELFORMAT_RGBA8;
-                textureDesc.data.mip_levels[0] = { data, bytes };
+                for (std::size_t level = 0; level < layout.levelCount; ++level)
+                    textureDesc.data.mip_levels[level] = {
+                        mipData.empty() ? data : mipData.data()
+                            + layout.levels[level].offsetBytes / sizeof (SceneTexelRgba8),
+                        layout.levels[level].bytes
+                    };
                 textureDesc.label = colorRole ? "arbit-metal-fixture-srgb-texture"
                                               : "arbit-metal-fixture-linear-texture";
                 resources->textureImages[slot] = sg_make_image (&textureDesc);
+                if (! resourceValid (sg_query_image_state (resources->textureImages[slot])))
+                    return fail ("Metal fixture texture image creation failed: " + lastSokolLog());
                 sg_view_desc textureViewDesc = {};
                 textureViewDesc.texture.image = resources->textureImages[slot];
                 resources->textureViews[slot] = sg_make_view (&textureViewDesc);
+                if (! resourceValid (sg_query_view_state (resources->textureViews[slot])))
+                    return fail ("Metal fixture texture view creation failed: " + lastSokolLog());
+                fixturetexture::Minification sampling;
+                fixturetexture::minification (source != nullptr ? source->minFilter : 9728, sampling);
                 sg_sampler_desc samplerDesc = {};
-                samplerDesc.min_filter = source != nullptr ? filter (source->minFilter) : SG_FILTER_NEAREST;
-                samplerDesc.mag_filter = source != nullptr ? filter (source->magFilter) : SG_FILTER_NEAREST;
-                samplerDesc.mipmap_filter = source != nullptr && source->minFilter >= 9984
-                    ? filter (source->minFilter) : SG_FILTER_NEAREST;
+                samplerDesc.min_filter = sampling.linear ? SG_FILTER_LINEAR : SG_FILTER_NEAREST;
+                samplerDesc.mag_filter = source != nullptr && source->magFilter == 9729
+                    ? SG_FILTER_LINEAR : SG_FILTER_NEAREST;
+                samplerDesc.mipmap_filter = sampling.linearMipmap ? SG_FILTER_LINEAR : SG_FILTER_NEAREST;
                 samplerDesc.wrap_u = source != nullptr ? wrap (source->wrapS) : SG_WRAP_REPEAT;
                 samplerDesc.wrap_v = source != nullptr ? wrap (source->wrapT) : SG_WRAP_REPEAT;
+                if (slot == 0 && materialProgram != nullptr
+                    && materialProgram->baseColorSource
+                        == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture)
+                {
+                    samplerDesc.min_filter = samplerDesc.mag_filter = SG_FILTER_LINEAR;
+                    samplerDesc.wrap_u = samplerDesc.wrap_v = SG_WRAP_CLAMP_TO_EDGE;
+                }
                 samplerDesc.label = "arbit-metal-fixture-sampler";
                 resources->samplers[slot] = sg_make_sampler (&samplerDesc);
+                if (! resourceValid (sg_query_sampler_state (resources->samplers[slot])))
+                    return fail ("Metal fixture sampler creation failed: " + lastSokolLog());
             }
 
             sg_shader_desc shaderDesc = {};
-            shaderDesc.vertex_func.source = kFixtureVertexShader;
+            const auto vertexSource = fixtureVertexModifierShader (kFixtureVertexShader,
+                materialProgram != nullptr ? materialProgram->vertexProgram.get() : nullptr,
+                videohelper::materialprogram::BackendTarget::Metal, result.error);
+            if (vertexSource.empty()) return fail (result.error);
+            shaderDesc.vertex_func.source = vertexSource.c_str();
             shaderDesc.fragment_func.source = kFixtureFragmentShader;
             std::string shaderError;
             if (! compileMetalShaderStage (
-                    kFixtureVertexShader, "vertex", shaderError)
+                    vertexSource.c_str(), "vertex", shaderError)
                 || ! compileMetalShaderStage (
                     kFixtureFragmentShader, "fragment", shaderError))
             {
@@ -2915,6 +3585,8 @@ public:
             shaderDesc.attrs[7].base_type = SG_SHADERATTRBASETYPE_FLOAT;
             shaderDesc.attrs[8].base_type = SG_SHADERATTRBASETYPE_FLOAT;
             shaderDesc.attrs[9].base_type = SG_SHADERATTRBASETYPE_FLOAT;
+            shaderDesc.attrs[10].base_type = SG_SHADERATTRBASETYPE_FLOAT;
+            shaderDesc.attrs[11].base_type = SG_SHADERATTRBASETYPE_FLOAT;
             shaderDesc.uniform_blocks[0].stage = SG_SHADERSTAGE_VERTEX;
             shaderDesc.uniform_blocks[0].size = sizeof (FixtureUniforms);
             shaderDesc.uniform_blocks[0].msl_buffer_n = 0;
@@ -2960,14 +3632,20 @@ public:
             pipelineDesc.layout.attrs[9] = {
                 1, static_cast<int> (offsetof (MetalFixtureInstanceGpuRecord, identityColor)),
                 SG_VERTEXFORMAT_FLOAT4 };
+            pipelineDesc.layout.attrs[10] = {
+                1, static_cast<int> (offsetof (MetalFixtureInstanceGpuRecord, color)), SG_VERTEXFORMAT_FLOAT4 };
+            pipelineDesc.layout.attrs[11] = {
+                1, static_cast<int> (offsetof (MetalFixtureInstanceGpuRecord, emission)), SG_VERTEXFORMAT_FLOAT4 };
             pipelineDesc.depth.pixel_format = SG_PIXELFORMAT_DEPTH_STENCIL;
             const bool diffractionProgram = resources->materialProgram != nullptr
                 && resources->materialProgram->kind
                     == NativeFixtureMaterialKind::DiffractionReflective;
+            const bool diffractionFrame = diffractionProgram && resources->materialProgram->baseColorSource
+                == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture;
             pipelineDesc.depth.compare = diffractionProgram
                 ? SG_COMPAREFUNC_LESS_EQUAL : SG_COMPAREFUNC_LESS;
             pipelineDesc.depth.write_enabled = true;
-            pipelineDesc.color_count = 2;
+            pipelineDesc.color_count = 8;
             pipelineDesc.colors[0].pixel_format = SG_PIXELFORMAT_BGRA8;
             pipelineDesc.colors[0].blend.enabled = diffractionProgram;
             pipelineDesc.colors[0].blend.src_factor_rgb = SG_BLENDFACTOR_ONE;
@@ -2975,19 +3653,27 @@ public:
             pipelineDesc.colors[0].blend.src_factor_alpha = SG_BLENDFACTOR_ZERO;
             pipelineDesc.colors[0].blend.dst_factor_alpha = SG_BLENDFACTOR_ONE;
             pipelineDesc.colors[1].pixel_format = SG_PIXELFORMAT_R32F;
+            pipelineDesc.colors[2].pixel_format = SG_PIXELFORMAT_RGBA16F;
+            pipelineDesc.colors[3].pixel_format = SG_PIXELFORMAT_RGBA16F;
+            pipelineDesc.colors[4].pixel_format = SG_PIXELFORMAT_R8;
+            pipelineDesc.colors[5].pixel_format = SG_PIXELFORMAT_R32UI;
+            pipelineDesc.colors[6].pixel_format = SG_PIXELFORMAT_R32UI;
+            pipelineDesc.colors[7].pixel_format = SG_PIXELFORMAT_RG16F;
             pipelineDesc.primitive_type = SG_PRIMITIVETYPE_TRIANGLES;
             pipelineDesc.index_type = SG_INDEXTYPE_UINT32;
             pipelineDesc.sample_count = 1;
-            resources->pipelines.resize (diffractionProgram ? 3 : 6);
-            const auto modeCount = diffractionProgram ? 1 : 2;
+            const auto modeCount = diffractionProgram && !diffractionFrame ? 1 : 2;
+            resources->pipelines.resize (modeCount * 6);
+            for (int linear = 0; linear < 2; ++linear)
             for (int blend = 0; blend < modeCount; ++blend)
                 for (int winding = 0; winding < 3; ++winding)
                 {
+                    pipelineDesc.colors[0].pixel_format = linear != 0 ? SG_PIXELFORMAT_RGBA16F : SG_PIXELFORMAT_BGRA8;
                     pipelineDesc.depth.write_enabled = blend == 0;
                     pipelineDesc.cull_mode = winding == 0 ? SG_CULLMODE_NONE : SG_CULLMODE_BACK;
                     pipelineDesc.face_winding = winding == 2 ? SG_FACEWINDING_CW
                                                              : SG_FACEWINDING_CCW;
-                    pipelineDesc.colors[0].blend.enabled = diffractionProgram || blend != 0;
+                    pipelineDesc.colors[0].blend.enabled = (diffractionProgram && !diffractionFrame) || blend != 0;
                     pipelineDesc.colors[0].blend.src_factor_rgb = diffractionProgram
                         ? SG_BLENDFACTOR_ONE : SG_BLENDFACTOR_SRC_ALPHA;
                     pipelineDesc.colors[0].blend.dst_factor_rgb = diffractionProgram
@@ -3000,7 +3686,7 @@ public:
                         ? "arbit-metal-fixture-diffraction-pipeline"
                         : (blend != 0 ? "arbit-metal-fixture-blend-pipeline"
                                       : "arbit-metal-fixture-opaque-pipeline");
-                    resources->pipelines[blend * 3 + winding] = sg_make_pipeline (&pipelineDesc);
+                    resources->pipelines[linear * modeCount * 3 + blend * 3 + winding] = sg_make_pipeline (&pipelineDesc);
                 }
 
             const char* failedResource = nullptr;
@@ -3075,36 +3761,94 @@ public:
                 result.error = "Metal fixture render dimensions exceed backend limits";
                 return result;
             }
-            if (resources->materialProgram != nullptr
+            std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> materialProgram;
+            if (!resolveDiffractionRuntimeProgram(resources->materialProgram, resources->materialProgramSource, runtimeInputs,
+                    materialProgram, result.error)) return result;
+            if (materialProgram != nullptr
                 && ! nativeFixtureDiffractionWorkWithinBudget (
-                    *resources->materialProgram, width, height))
+                    *materialProgram, width, height))
             {
                 result.error = "Metal fixture diffraction workload exceeds backend limits";
                 return result;
             }
             diffractivefoil::EvaluationSchedule spatialSchedule;
-            if (resources->materialProgram != nullptr
-                && resources->materialProgram->diffractionFoilMaximumEvaluations != 0
+            if (materialProgram != nullptr
+                && materialProgram->diffractionFoilMaximumEvaluations != 0
                 && !nativeFixtureSpatialFoilEvaluationSchedule(
-                    *resources->materialProgram, width, height, spatialSchedule))
+                    *materialProgram, width, height, spatialSchedule))
             {
                 result.error = "Metal fixture diffraction workload exceeds backend limits";
                 return result;
             }
+            if (!validateMaterialFrameForDraw(materialProgram, runtimeInputs, "metal",
+                    reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice), result.error))
+                return result;
+            sg_view materialFrameView = {};
+            std::vector<std::shared_ptr<const NativeFixtureSceneFrame>> inputFrames;
+            if (runtimeInputs.materialFrameTexture) inputFrames.push_back(runtimeInputs.materialFrameTexture);
+            for (const auto& entry : runtimeInputs.materialFrameTextures) inputFrames.push_back(entry.second);
+            for (const auto& inputFrame : inputFrames)
+            {
+                const auto descriptor = inputFrame->colorTextureDescriptor();
+                if (descriptor.imageHandle > std::numeric_limits<std::uint32_t>::max()
+                    || descriptor.textureViewHandle > std::numeric_limits<std::uint32_t>::max())
+                { result.error = "Metal material Frame handle exceeds native identity width"; return result; }
+                const sg_image image { static_cast<std::uint32_t>(descriptor.imageHandle) };
+                materialFrameView.id = static_cast<std::uint32_t>(descriptor.textureViewHandle);
+                if (!resourceValid(sg_query_image_state(image))
+                    || !resourceValid(sg_query_view_state(materialFrameView))
+                    || sg_query_view_type(materialFrameView) != SG_VIEWTYPE_TEXTURE)
+                { result.error = "Metal material Frame image or view is stale"; return result; }
+                const auto actual = sg_query_image_desc(image);
+                const auto view = sg_query_view_desc(materialFrameView);
+                const auto format = descriptor.format == NativeTexturePixelFormat::Rgba8Unorm
+                    ? SG_PIXELFORMAT_RGBA8 : SG_PIXELFORMAT_BGRA8;
+                if (view.texture.image.id != image.id || actual.type != SG_IMAGETYPE_2D
+                    || actual.width != static_cast<int>(descriptor.width)
+                    || actual.height != static_cast<int>(descriptor.height)
+                    || actual.sample_count != 1 || actual.pixel_format != format)
+                { result.error = "Metal material Frame no longer matches its descriptor"; return result; }
+            }
+            const auto rootFrame = materialFrameForProgram(materialProgram.get(),runtimeInputs);
+            materialFrameView.id = rootFrame ? static_cast<std::uint32_t>(rootFrame->colorTextureViewHandle()) : 0;
             if (!validFixtureRuntimeInputs(runtimeInputs))
             {
-                result.error = "Metal fixture scene modulation is non-finite or out of bounds";
+                result.error = !render3dimage::supported(runtimeInputs.imageOutput)
+                    ? "Render 3D requested image output is unavailable on this backend"
+                    : "Metal fixture scene modulation is non-finite or out of bounds";
                 return result;
             }
-            if (resources->materialProgram != nullptr
-                && resources->materialProgram->baseColorSource
-                    == NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix
+            if ((runtimeInputs.imageOutput != renderpassoutput::Output::Color || runtimeInputs.passComposite)
+                && materialProgram != nullptr
+                && materialProgram->kind == NativeFixtureMaterialKind::DiffractionReflective)
+            {
+                result.error = "Render 3D pass inspection/compositing is unavailable for diffraction materials";
+                return result;
+            }
+            if (runtimeInputs.imageOutput == renderpassoutput::Output::ObjectId
+                && resources->instancedSharedGeometry)
+            {
+                result.error = "Render 3D Object ID inspection requires individual scene draws";
+                return result;
+            }
+            if (materialProgram != nullptr
+                && nativeSurfaceUsesTime(*materialProgram)
                 && (! std::isfinite (runtimeInputs.timeSeconds)
                     || std::abs (runtimeInputs.timeSeconds)
                         > surfacematerial::kMaximumEvaluationMagnitude))
             {
                 result.error = "Metal fixture material time input is non-finite or out of bounds";
                 return result;
+            }
+            if (materialProgram != nullptr && materialProgram->vertexProgram)
+            {
+                if (runtimeInputs.imageOutput == renderpassoutput::Output::Motion
+                    || sceneUsesMotionPass(runtimeInputs))
+                {
+                    result.error = "Motion output is unavailable for graph vertex deformation";
+                    return result;
+                }
+                runtimeInputs.previousMotion.reset();
             }
             const auto noteInstances = prepareNativeNoteInstances(runtimeInputs);
 
@@ -3113,6 +3857,8 @@ public:
             frame->height_ = height;
             frame->rendererGeneration_ = resources->rendererGeneration;
             frame->staticResources = resources;
+            frame->materialFrameTexture = runtimeInputs.materialFrameTexture;
+            frame->materialFrameTextures = runtimeInputs.materialFrameTextures;
             auto fail = [&] (const char* error)
             {
                 frame->destroyUnlocked();
@@ -3122,19 +3868,20 @@ public:
 
             const auto* selectedCamera = visual3d_detail::findById (
                 scene->cameras, scene->cameraCount, scene->activeCamera);
-            if (!runtimeInputs.cameraOverride.has_value() && selectedCamera == nullptr)
+            if (!runtimeInputs.cameraOverride && !runtimeInputs.animatedCamera && selectedCamera == nullptr)
             {
                 result.error = "Metal fixture render cannot resolve the active camera";
                 return result;
             }
-            const auto& camera = runtimeInputs.cameraOverride.has_value()
-                ? *runtimeInputs.cameraOverride : *selectedCamera;
+            const auto& camera = runtimeInputs.cameraOverride ? *runtimeInputs.cameraOverride
+                : runtimeInputs.animatedCamera ? *runtimeInputs.animatedCamera : *selectedCamera;
 
             sg_image_desc colorDesc = {};
             colorDesc.usage.color_attachment = true;
             colorDesc.width = static_cast<int> (width);
             colorDesc.height = static_cast<int> (height);
-            colorDesc.pixel_format = SG_PIXELFORMAT_BGRA8;
+            frame->linearColor = runtimeInputs.linearColor;
+            colorDesc.pixel_format = runtimeInputs.linearColor ? SG_PIXELFORMAT_RGBA16F : SG_PIXELFORMAT_BGRA8;
             colorDesc.sample_count = 1;
             colorDesc.label = "arbit-metal-fixture-color";
             frame->colorImage = sg_make_image (&colorDesc);
@@ -3163,6 +3910,25 @@ public:
             sg_view_desc depthTextureViewDesc = {};
             depthTextureViewDesc.texture.image = frame->depthImage;
             frame->depthTextureView = sg_make_view (&depthTextureViewDesc);
+            const std::array<sg_pixel_format, 6> rawFormats { SG_PIXELFORMAT_RGBA16F,
+                SG_PIXELFORMAT_RGBA16F, SG_PIXELFORMAT_R8, SG_PIXELFORMAT_R32UI, SG_PIXELFORMAT_R32UI, SG_PIXELFORMAT_RG16F };
+            for (std::size_t i = 0; i < rawFormats.size(); ++i)
+            {
+                sg_image_desc rawDesc = depthDesc;
+                rawDesc.pixel_format = rawFormats[i];
+                rawDesc.label = "arbit-metal-fixture-raw-pass";
+                frame->rawImages[i] = sg_make_image(&rawDesc);
+                sg_view_desc attachment = {};
+                attachment.color_attachment.image = frame->rawImages[i];
+                frame->rawAttachmentViews[i] = sg_make_view(&attachment);
+                sg_view_desc texture = {};
+                texture.texture.image = frame->rawImages[i];
+                frame->rawTextureViews[i] = sg_make_view(&texture);
+                if (!resourceValid(sg_query_image_state(frame->rawImages[i]))
+                    || !resourceValid(sg_query_view_state(frame->rawAttachmentViews[i]))
+                    || !resourceValid(sg_query_view_state(frame->rawTextureViews[i])))
+                    return fail("Metal raw Render 3D pass allocation failed");
+            }
 
             sg_image_desc depthStencilDesc = {};
             depthStencilDesc.usage.depth_stencil_attachment = true;
@@ -3189,9 +3955,28 @@ public:
                 return fail ("Metal fixture GPU resource creation failed");
 
             FixtureUniforms uniforms {};
+            for (std::size_t i = 0; i < scene->objectCount; ++i)
+            {
+                const auto& object = scene->objects[i];
+                uniforms.rawIdentifiers[i][0] = static_cast<float>(object.material.value & 65535u);
+                uniforms.rawIdentifiers[i][1] = static_cast<float>(object.material.value >> 16u);
+                uniforms.rawIdentifiers[i][2] = static_cast<float>(object.id.value & 65535u);
+                uniforms.rawIdentifiers[i][3] = static_cast<float>(object.id.value >> 16u);
+            }
+            uniforms.passProgram = renderpasscomposite::gpuProgram(scenePassProgram(runtimeInputs));
+            uniforms.passProgram.control[2] = runtimeInputs.linearColor ? 1.0f : 0.0f;
+            uniforms.vertexTime[0] = runtimeInputs.timeSeconds;
+            std::memcpy(uniforms.vertexSpectrum, runtimeInputs.vertexSpectrum.data(),
+                        sizeof(uniforms.vertexSpectrum));
+            const auto noteTransforms = noteInstanceShaderTransforms(noteInstances);
             std::memcpy(uniforms.noteInstanceTransforms,
-                        noteInstances.transforms.data(),
+                        noteTransforms.data(),
                         sizeof(uniforms.noteInstanceTransforms));
+            std::copy(noteInstances.appearanceLow.begin(), noteInstances.appearanceLow.end(),
+                      uniforms.noteAppearanceLow);
+            std::copy(noteInstances.appearanceHigh.begin(), noteInstances.appearanceHigh.end(),
+                      uniforms.noteAppearanceHigh);
+            uniforms.noteMeshScale[0] = noteInstances.meshScale;
             storeQuaternion (uniforms.cameraRotation, camera.transform.rotation);
             storeVec3 (uniforms.cameraTranslation, camera.transform.translation);
             for (std::size_t axis = 0; axis < 3; ++axis)
@@ -3200,14 +3985,19 @@ public:
             uniforms.projection[1] = static_cast<float> (width) / static_cast<float> (height);
             uniforms.projection[2] = camera.nearPlane;
             uniforms.projection[3] = camera.farPlane;
-            if (resources->materialProgram != nullptr)
+            uniforms.motion = sceneMotionUniforms(runtimeInputs, camera, width, height);
+            if (materialProgram != nullptr)
             {
                 uniforms.materialKind[0] = static_cast<std::uint32_t> (
-                    resources->materialProgram->kind);
-                if (resources->materialProgram->kind
+                    materialProgram->kind);
+                if (materialProgram->kind
                     == NativeFixtureMaterialKind::DiffractionReflective)
                 {
-                    const auto& path = resources->materialProgram->diffractionPaths[0];
+                    const auto& path = materialProgram->diffractionPaths[0];
+                    const auto& lighting = materialProgram->diffractionLightingAdmission->description();
+                    uniforms.diffractionEnvironment[0] = static_cast<float>(lighting.version);
+                    uniforms.diffractionEnvironment[1] = lighting.bouncePlaneHeight;
+                    uniforms.diffractionEnvironment[2] = lighting.bounceMaximumDistance;
                     uniforms.diffraction = path.material;
                     std::memcpy(uniforms.diffractionIncidentDirectionAndIntensity,
                                 &path.incidentDirectionAndIntensity, 4 * sizeof(float));
@@ -3215,32 +4005,38 @@ public:
                               path.kindBounceAndReserved.end(),
                               uniforms.diffractionPathKindAndBounce);
                     std::memcpy(uniforms.diffractionFoilField,
-                                resources->materialProgram->diffractionFoilField.data(),
+                                materialProgram->diffractionFoilField.data(),
                                 sizeof(uniforms.diffractionFoilField));
                     std::memcpy(uniforms.diffractionOccupancyRectangles,
-                                resources->materialProgram->diffractionOccupancyRectangles.data(),
+                                materialProgram->diffractionOccupancyRectangles.data(),
                                 sizeof(uniforms.diffractionOccupancyRectangles));
                     uniforms.diffractionSpatialCounts[0]
-                        = resources->materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4u : 0u;
+                        = materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4u : 0u;
                     uniforms.diffractionSpatialCounts[1]
-                        = resources->materialProgram->diffractionOccupancyRectangleCount;
+                        = materialProgram->diffractionOccupancyRectangleCount;
                     uniforms.diffractionEvaluationSchedule[0] = spatialSchedule.width;
                     uniforms.diffractionEvaluationSchedule[1] = spatialSchedule.height;
                     uniforms.diffractionEvaluationSchedule[2]
                         = spatialSchedule.maximumEvaluations;
                 }
-                const auto& pbr = resources->materialProgram->parameters;
+                const auto& pbr = materialProgram->parameters;
+                if (materialProgram->kind == NativeFixtureMaterialKind::SurfacePbr)
+                {
+                    std::copy(pbr.transmissionIorClearcoat.begin(), pbr.transmissionIorClearcoat.begin() + 3,
+                              uniforms.surfaceCoating);
+                    uniforms.surfaceCoating[3] = 1.0f;
+                }
                 std::copy (pbr.baseColorMetallic.begin(), pbr.baseColorMetallic.begin() + 3,
                            uniforms.baseColor);
                 uniforms.baseColor[3] = pbr.normalOpacity[3];
                 uniforms.materialParams[0] = pbr.baseColorMetallic[3];
                 uniforms.materialParams[1] = pbr.emissionRoughness[3];
                 uniforms.materialParams[2] = 1.0f;
-                if (resources->materialProgram->baseColorSource
+                if (materialProgram->baseColorSource
                     == NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix)
                 {
-                    std::copy (resources->materialProgram->timeMixEndColor.begin(),
-                               resources->materialProgram->timeMixEndColor.end(),
+                    std::copy (materialProgram->timeMixEndColor.begin(),
+                               materialProgram->timeMixEndColor.end(),
                                uniforms.timeMixEndColorAndTime);
                     uniforms.timeMixEndColorAndTime[3] = runtimeInputs.timeSeconds;
                     uniforms.materialParams[3] = 1.0f;
@@ -3250,11 +4046,14 @@ public:
             }
             for (std::size_t channel = 0; channel < 3; ++channel)
                 uniforms.emissive[channel] *= runtimeInputs.emissionGain;
+            const auto lightCount = runtimeInputs.lightOverride ? std::size_t { 1 }
+                : !runtimeInputs.animatedLights.empty() ? runtimeInputs.animatedLights.size() : scene->lightCount;
             storeVec3 (uniforms.ambient, scene->ambientColor,
-                       static_cast<float> (scene->lightCount));
-            for (std::size_t lightIndex = 0; lightIndex < scene->lightCount; ++lightIndex)
+                       static_cast<float> (lightCount));
+            for (std::size_t lightIndex = 0; lightIndex < lightCount; ++lightIndex)
             {
-                const auto& light = scene->lights[lightIndex];
+                const auto& light = runtimeInputs.lightOverride ? *runtimeInputs.lightOverride
+                    : !runtimeInputs.animatedLights.empty() ? runtimeInputs.animatedLights[lightIndex] : scene->lights[lightIndex];
                 storeQuaternion (uniforms.lightRotations[lightIndex], light.transform.rotation);
                 storeVec3 (uniforms.lightColors[lightIndex], light.color, light.intensity);
                 storeVec3 (uniforms.lightPositions[lightIndex], light.transform.translation,
@@ -3291,6 +4090,8 @@ public:
                 {
                     instanceRecords[index].matrix = multiplyMetalFixtureMatrices (
                         runtimeMatrix, metalFixtureWorldMatrix (*scene, scene->objects[index]));
+                    if (!runtimeTargetsObject(runtimeInputs, scene->objects[index]))
+                        instanceRecords[index].matrix = metalFixtureWorldMatrix(*scene, scene->objects[index]);
                     const auto colorSlot = videohelper::geometry::diagnosticColorSlot (
                         stableIdentities, scene->objects[index].id.value);
                     instanceRecords[index].identityColor = {
@@ -3298,6 +4099,10 @@ public:
                         static_cast<float>((colorSlot >> 8) & 0xffu) / 255.0f,
                         static_cast<float>(colorSlot & 0xffu) / 255.0f,
                         resources->diagnosticInstanceIdentityColors ? 1.0f : 0.0f };
+                    instanceRecords[index].color=resources->instanceAppearances[index].color;
+                    instanceRecords[index].emission=resources->instanceAppearances[index].emission;
+                    for (std::size_t channel=0;channel<3;++channel)
+                        instanceRecords[index].emission[channel]*=runtimeInputs.emissionGain;
                 }
                 const sg_range instanceRange = { instanceRecords.data(),
                     scene->objectCount * sizeof (MetalFixtureInstanceGpuRecord) };
@@ -3308,11 +4113,25 @@ public:
             sg_pass pass = {};
             pass.attachments.colors[0] = frame->colorAttachmentView;
             pass.attachments.colors[1] = frame->depthView;
+            for (std::size_t i = 0; i < frame->rawAttachmentViews.size(); ++i)
+            {
+                pass.attachments.colors[i + 2] = frame->rawAttachmentViews[i];
+                pass.action.colors[i + 2].load_action = SG_LOADACTION_CLEAR;
+                pass.action.colors[i + 2].store_action = SG_STOREACTION_STORE;
+                pass.action.colors[i + 2].clear_value = { 0, 0, 0, 0 };
+            }
             pass.attachments.depth_stencil = frame->depthStencilView;
             pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
             pass.action.colors[0].store_action = SG_STOREACTION_STORE;
             pass.action.colors[0].clear_value = {
                 7.0f / 255.0f, 10.0f / 255.0f, 18.0f / 255.0f, 1.0f };
+            if (runtimeInputs.imageOutput != renderpassoutput::Output::Color || runtimeInputs.passComposite)
+                pass.action.colors[0].clear_value = { 0.0f, 0.0f, 0.0f, 0.0f };
+            if (runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage)
+            {
+                const auto clear = renderpasscomposite::inspectionClear(*runtimeInputs.passComposite);
+                pass.action.colors[0].clear_value = {clear[0], clear[1], clear[2], clear[3]};
+            }
             pass.action.colors[1].load_action = SG_LOADACTION_CLEAR;
             pass.action.colors[1].store_action = SG_STOREACTION_STORE;
             pass.action.colors[1].clear_value = { 1.0f, 0.0f, 0.0f, 1.0f };
@@ -3327,9 +4146,10 @@ public:
             bindings.vertex_buffers[0] = resources->vertexBuffer;
             bindings.vertex_buffers[1] = resources->geometryInstanceBuffer;
             bindings.index_buffer = resources->indexBuffer;
-            const bool diffractionDraw = resources->materialProgram != nullptr
-                && resources->materialProgram->kind == NativeFixtureMaterialKind::DiffractionReflective;
+            const bool diffractionDraw = materialProgram != nullptr
+                && materialProgram->kind == NativeFixtureMaterialKind::DiffractionReflective;
             std::size_t submittedDiffractionDrawCount = 0;
+            const auto colorPipelineOffset = runtimeInputs.linearColor ? resources->pipelines.size() / 2u : 0u;
             if (diffractionDraw)
             {
                 const auto& drawObject = scene->objects[0];
@@ -3340,6 +4160,7 @@ public:
                 runtimeTransform = applyRuntimeObjectTransform (
                     runtimeTransform, runtimeInputs.objectRotationDegrees,
                     runtimeInputs.objectScale);
+                if (!runtimeTargetsObject(runtimeInputs, drawObject)) runtimeTransform = {};
                 const auto objectMatrix = multiplyMetalFixtureMatrices (
                     metalFixtureTransformMatrix (runtimeTransform),
                     metalFixtureWorldMatrix (*scene, drawObject));
@@ -3348,7 +4169,7 @@ public:
                     scene->materials, scene->materialCount, drawObject.material);
                 const auto winding = drawMaterial != nullptr && drawMaterial->doubleSided ? 0u
                     : (metalFixtureDeterminant3x3 (objectMatrix) < 0.0f ? 2u : 1u);
-                sg_apply_pipeline (resources->pipelines[winding]);
+                sg_apply_pipeline (resources->pipelines[colorPipelineOffset + winding]);
                 bindings.vertex_buffer_offsets[0] = static_cast<int> (
                     drawObject.firstVertex * sizeof (SceneVertex));
                 bindings.index_buffer_offset = static_cast<int> (
@@ -3363,21 +4184,33 @@ public:
                         }
                 bindings.views[0] = resources->textureViews[baseColorSlot];
                 bindings.samplers[0] = resources->samplers[baseColorSlot];
+                uniforms.materialKind[1] = materialFrameView.id != 0
+                    ? (16u | (materialFrameIsBottomFirst(rootFrame) ? 32u : 0u)) : 0u;
+                if (materialFrameView.id != 0)
+                {
+                    bindings.views[0] = materialFrameView;
+                    bindings.samplers[0] = resources->samplers[0];
+                }
                 for (std::size_t slot = 1; slot < 5; ++slot)
                 {
                     bindings.views[slot] = resources->textureViews[0];
                     bindings.samplers[slot] = resources->samplers[0];
                 }
                 sg_apply_bindings (&bindings);
-                const auto pathCount = resources->materialProgram != nullptr
-                        && resources->materialProgram->kind
+                const auto pathCount = materialProgram != nullptr
+                        && materialProgram->kind
                             == NativeFixtureMaterialKind::DiffractionReflective
-                    ? resources->materialProgram->diffractionPathCount : 1u;
+                    ? materialProgram->diffractionPathCount : 1u;
                 for (std::uint8_t pathIndex = 0; pathIndex < pathCount; ++pathIndex)
                 {
+                    if (materialFrameView.id != 0)
+                    {
+                        sg_apply_pipeline(resources->pipelines[(pathIndex == 0 ? 0u : 3u) + winding]);
+                        sg_apply_bindings(&bindings);
+                    }
                     if (pathCount > 1)
                     {
-                        const auto& path = resources->materialProgram->diffractionPaths[pathIndex];
+                        const auto& path = materialProgram->diffractionPaths[pathIndex];
                         uniforms.diffraction = path.material;
                         std::memcpy(uniforms.diffractionIncidentDirectionAndIntensity,
                                     &path.incidentDirectionAndIntensity, 4 * sizeof(float));
@@ -3385,15 +4218,15 @@ public:
                                   path.kindBounceAndReserved.end(),
                                   uniforms.diffractionPathKindAndBounce);
                         std::memcpy(uniforms.diffractionFoilField,
-                                    resources->materialProgram->diffractionFoilField.data(),
+                                    materialProgram->diffractionFoilField.data(),
                                     sizeof(uniforms.diffractionFoilField));
                         std::memcpy(uniforms.diffractionOccupancyRectangles,
-                                    resources->materialProgram->diffractionOccupancyRectangles.data(),
+                                    materialProgram->diffractionOccupancyRectangles.data(),
                                     sizeof(uniforms.diffractionOccupancyRectangles));
                         uniforms.diffractionSpatialCounts[0]
-                            = resources->materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4u : 0u;
+                            = materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4u : 0u;
                         uniforms.diffractionSpatialCounts[1]
-                            = resources->materialProgram->diffractionOccupancyRectangleCount;
+                            = materialProgram->diffractionOccupancyRectangleCount;
                         uniforms.diffractionEvaluationSchedule[0] = spatialSchedule.width;
                         uniforms.diffractionEvaluationSchedule[1] = spatialSchedule.height;
                         uniforms.diffractionEvaluationSchedule[2]
@@ -3425,7 +4258,9 @@ public:
                 {
                     const auto* queuedMaterial = visual3d_detail::findById (
                         scene->materials, scene->materialCount, scene->objects[objectIndex].material);
-                    if (queuedMaterial == nullptr || queuedMaterial->alphaMode != SceneAlphaMode::Blend)
+                    const bool transparentInstance=!resources->instanceAppearances.empty()
+                        && resources->instanceAppearances[objectIndex].color[3]<1.0f;
+                    if (!nativeSurfaceRequiresBlend(nativeSurfaceForObject(materialProgram.get(), scene->objects[objectIndex].id)) && !transparentInstance && (queuedMaterial == nullptr || queuedMaterial->alphaMode != SceneAlphaMode::Blend))
                         drawOrder.push_back (objectIndex);
                     else
                     {
@@ -3442,7 +4277,13 @@ public:
                 for (const auto& blend : blendedDraws) drawOrder.push_back (blend.second);
                 for (const auto objectIndex : drawOrder)
                 {
+                    uniforms.geometryInstanceControl[2] = static_cast<std::uint32_t>(objectIndex);
                     const auto& drawObject = scene->objects[objectIndex];
+                    const auto identityColor = render3dimage::identityColor (
+                        runtimeInputs.imageOutput == renderpassoutput::Output::MaterialId
+                            ? drawObject.material.value : drawObject.id.value);
+                    uniforms.imageOutput[0] = static_cast<float> (runtimeInputs.imageOutput);
+                    std::copy (identityColor.begin(), identityColor.end(), uniforms.imageOutput + 1);
                     if (drawObject.indexCount == 0)
                         continue;
                     const auto* drawMaterial = visual3d_detail::findById (
@@ -3454,11 +4295,13 @@ public:
                     runtimeTransform = applyRuntimeObjectTransform (
                         runtimeTransform, runtimeInputs.objectRotationDegrees,
                         runtimeInputs.objectScale);
+                    if (!runtimeTargetsObject(runtimeInputs, drawObject)) runtimeTransform = {};
                     const auto objectMatrix = multiplyMetalFixtureMatrices (
                         metalFixtureTransformMatrix (runtimeTransform),
                         metalFixtureWorldMatrix (*scene, drawObject));
                     std::copy (objectMatrix.begin(), objectMatrix.end(), uniforms.objectMatrix);
-                    if (resources->materialProgram == nullptr && drawMaterial != nullptr)
+                    const auto* drawProgram = nativeSurfaceForObject(materialProgram.get(), drawObject.id);
+                    if (drawMaterial != nullptr)
                     {
                         storeVec3 (uniforms.baseColor, drawMaterial->baseColor, drawMaterial->opacity);
                         uniforms.materialParams[0] = drawMaterial->metallic;
@@ -3466,16 +4309,57 @@ public:
                         uniforms.materialParams[2] = drawMaterial->normalScale;
                         uniforms.materialParams[3] = 0.0f;
                         storeVec3 (uniforms.emissive, drawMaterial->emissive);
+                        std::fill_n(uniforms.timeMixEndColorAndTime, 4, 0.0f);
+                        std::fill_n(uniforms.surfaceCoating, 4, 0.0f);
+                        if (drawProgram != nullptr)
+                        {
+                            const auto& pbr = drawProgram->parameters;
+                            std::copy_n(pbr.baseColorMetallic.begin(), 3, uniforms.baseColor);
+                            uniforms.baseColor[3] = pbr.normalOpacity[3];
+                            uniforms.materialParams[0] = pbr.baseColorMetallic[3];
+                            uniforms.materialParams[1] = pbr.emissionRoughness[3];
+                            uniforms.materialParams[2] = 1.0f;
+                            std::copy_n(pbr.emissionRoughness.begin(), 3, uniforms.emissive);
+                            std::copy_n(pbr.transmissionIorClearcoat.begin(), 3, uniforms.surfaceCoating);
+                            uniforms.surfaceCoating[3] = 1.0f;
+                            if (drawProgram->baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix)
+                            {
+                                std::copy_n(drawProgram->timeMixEndColor.begin(), 3, uniforms.timeMixEndColorAndTime);
+                                uniforms.timeMixEndColorAndTime[3] = runtimeInputs.timeSeconds;
+                                uniforms.materialParams[3] = 1.0f;
+                            }
+                        }
+                        if (!resources->instancedSharedGeometry && !resources->instanceAppearances.empty()) {
+                            const auto& appearance=resources->instanceAppearances[objectIndex];
+                            for (std::size_t channel=0;channel<3;++channel) {
+                                uniforms.baseColor[channel]*=appearance.color[channel];
+                                uniforms.timeMixEndColorAndTime[channel]*=appearance.color[channel];
+                                uniforms.emissive[channel]+=appearance.emission[channel];
+                            }
+                            uniforms.baseColor[3]*=appearance.color[3];
+                            if (appearance.metallic>=0) uniforms.materialParams[0]=appearance.metallic;
+                            if (appearance.roughness>=0) uniforms.materialParams[1]=appearance.roughness;
+                        }
                         for (std::size_t channel = 0; channel < 3; ++channel)
                             uniforms.emissive[channel] *= runtimeInputs.emissionGain;
                     }
-                    const std::array<SceneTextureId, 5> textureIds {
+                    std::array<SceneTextureId, 5> textureIds {
                         drawMaterial != nullptr ? drawMaterial->baseColorTexture : SceneTextureId {},
                         drawMaterial != nullptr ? drawMaterial->metallicRoughnessTexture : SceneTextureId {},
                         drawMaterial != nullptr ? drawMaterial->normalTexture : SceneTextureId {},
                         drawMaterial != nullptr ? drawMaterial->occlusionTexture : SceneTextureId {},
                         drawMaterial != nullptr ? drawMaterial->emissiveTexture : SceneTextureId {}
                     };
+                    if (drawProgram != nullptr) {
+                        const auto baseTextureId = textureIds[0];
+                        textureIds = {};
+                        if (drawProgram->baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::ImportedSrgbTexture)
+                            textureIds[0] = baseTextureId;
+                    }
+                    const bool drawFrame = drawProgram && drawProgram->baseColorSource
+                        == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture;
+                    const auto selectedFrame = materialFrameForProgram(drawProgram,runtimeInputs);
+                    const sg_view selectedView {selectedFrame ? static_cast<std::uint32_t>(selectedFrame->colorTextureViewHandle()) : 0};
                     for (std::size_t unit = 0; unit < textureIds.size(); ++unit)
                     {
                         const auto slot = textureSlot (textureIds[unit], unit == 0 || unit == 4);
@@ -3485,16 +4369,24 @@ public:
                     uniforms.materialKind[1] = (textureIds[1].isValid() ? 1u : 0u)
                         | (textureIds[2].isValid() ? 2u : 0u)
                         | (textureIds[3].isValid() ? 4u : 0u)
-                        | (textureIds[4].isValid() ? 8u : 0u);
-                    const auto alphaMode = drawMaterial != nullptr
-                        ? drawMaterial->alphaMode : SceneAlphaMode::Opaque;
+                        | (textureIds[4].isValid() ? 8u : 0u)
+                        | (drawFrame && selectedView.id != 0
+                            ? (16u | (materialFrameIsBottomFirst(selectedFrame) ? 32u : 0u)) : 0u);
+                    if (drawFrame && selectedView.id != 0)
+                    {
+                        bindings.views[0] = selectedView;
+                        bindings.samplers[0] = resources->samplers[0];
+                    }
+                    const auto alphaMode = nativeSurfaceRequiresBlend(drawProgram) || (!resources->instanceAppearances.empty()
+                        && resources->instanceAppearances[objectIndex].color[3]<1.0f) ? SceneAlphaMode::Blend
+                        : drawMaterial != nullptr ? drawMaterial->alphaMode : SceneAlphaMode::Opaque;
                     uniforms.materialKind[2] = alphaMode == SceneAlphaMode::Mask ? 1u : 0u;
                     const auto alphaCutoff = drawMaterial != nullptr ? drawMaterial->alphaCutoff : 0.5f;
                     std::memcpy (&uniforms.materialKind[3], &alphaCutoff, sizeof (alphaCutoff));
                     const auto blend = alphaMode == SceneAlphaMode::Blend ? 1u : 0u;
                     const auto winding = drawMaterial != nullptr && drawMaterial->doubleSided ? 0u
                         : (metalFixtureDeterminant3x3 (objectMatrix) < 0.0f ? 2u : 1u);
-                    sg_apply_pipeline (resources->pipelines[blend * 3u + winding]);
+                    sg_apply_pipeline (resources->pipelines[colorPipelineOffset + blend * 3u + winding]);
                     bindings.vertex_buffer_offsets[0] = static_cast<int> (
                         drawObject.firstVertex * sizeof (SceneVertex));
                     bindings.index_buffer_offset = static_cast<int> (
@@ -3562,7 +4454,7 @@ public:
                 : submittedNoteInstanceCount;
             result.stats.materialBytes = sizeof (uniforms) * result.stats.drawCount;
             result.stats.reusedStaticResources = true;
-            result.stats.reusedMaterialProgram = resources->materialProgram != nullptr;
+            result.stats.reusedMaterialProgram = materialProgram != nullptr;
             result.stats.diffractionEvaluationBudget = diffractionDraw ? spatialSchedule.maximumEvaluations : 0;
             result.stats.diffractionEvaluationCount = diffractionDraw ? spatialSchedule.requiredEvaluations : 0;
             return result;
@@ -3582,6 +4474,37 @@ public:
         const std::shared_ptr<const NativeDeformationScene>& source,
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram) override
     {
+        if (!source || source->draws.empty()) return prepareDraw(source, materialProgram, {});
+        NativeDeformationPreparation result;
+        if (source->draws.size() > HarmonicMIDI::grid::Visual3DScene::kMaxObjects)
+        { result.error = "native Metal deformation draw capacity exceeded"; return result; }
+        MetalFixtureSceneBackend fixtureBackend;
+        const auto fixture = fixtureBackend.prepare(source->scene, materialProgram);
+        if (!fixture.prepared) { result.error = fixture.error; return result; }
+        auto resources = std::make_shared<MetalDeformationResources>();
+        resources->source = source;
+        resources->fixture = std::dynamic_pointer_cast<const MetalFixtureSceneResources>(fixture.resources);
+        if (!resources->fixture) { result.error = "native Metal scene batch has no vertex buffer"; return result; }
+        for (const auto& draw : source->draws)
+        {
+            if (!draw || !draw->draws.empty() || !draw->batchMember || draw->scene != source->scene)
+            { result.error = "native Metal scene batch has an invalid draw owner"; return result; }
+            auto prepared = prepareDraw(draw, {}, resources->fixture);
+            if (!prepared.prepared) { result.error = prepared.error; return result; }
+            resources->draws.push_back(std::dynamic_pointer_cast<const MetalDeformationResources>(prepared.resources));
+            result.stats.staticVertexBytes += prepared.stats.staticVertexBytes;
+            result.stats.staticDeformationBytes += prepared.stats.staticDeformationBytes;
+        }
+        result.prepared = true; result.resources = std::move(resources);
+        result.stats.staticUploadCount = 1;
+        return result;
+    }
+
+    NativeDeformationPreparation prepareDraw (
+        const std::shared_ptr<const NativeDeformationScene>& source,
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram,
+        std::shared_ptr<const MetalFixtureSceneResources> fixture)
+    {
         using namespace HarmonicMIDI::grid;
 
         NativeDeformationPreparation result;
@@ -3598,17 +4521,22 @@ public:
             || ! source->clip.isValid() || ! source->mesh.isValid()
             || ! source->object.isValid() || ! source->scene || ! source->deformation
             || ! validateVisual3DScene (*source->scene).valid()
-            || source->scene->objectCount != 1 || source->scene->materialCount != 1
+            || (!source->batchMember && (source->scene->objectCount != 1 || source->scene->materialCount != 1
             || source->scene->lightCount != 1 || source->scene->cameraCount != 1
             || source->scene->objects[0].id != source->object
             || source->scene->objects[0].firstVertex != 0
-            || source->scene->objects[0].vertexCount != source->scene->vertexCount)
+            || source->scene->objects[0].vertexCount != source->scene->vertexCount)))
         {
             result.error = "native Metal deformation requires one exact bounded scene owner";
             return result;
         }
         const auto* mesh = source->deformation->findMesh (source->mesh);
-        if (mesh == nullptr || mesh->vertexCount() != source->scene->vertexCount
+        const auto object = std::find_if(source->scene->objects.begin(),
+            source->scene->objects.begin() + source->scene->objectCount,
+            [&](const auto& value) { return value.id == source->object; });
+        if (mesh == nullptr || object == source->scene->objects.begin() + source->scene->objectCount
+            || object->firstVertex > source->scene->vertexCount
+            || mesh->vertexCount() > source->scene->vertexCount - object->firstVertex
             || mesh->vertexCount() == 0
             || mesh->vertexCount() > kNativeDeformationMaxVertices
             || mesh->jointWeightSets().size() > 1
@@ -3624,19 +4552,22 @@ public:
                 return result;
             }
 
-        MetalFixtureSceneBackend fixtureBackend;
-        auto fixturePreparation = fixtureBackend.prepare (source->scene, materialProgram);
-        if (! fixturePreparation.prepared)
+        if (!fixture)
         {
-            result.error = fixturePreparation.error;
-            return result;
-        }
-        auto fixture = std::dynamic_pointer_cast<const MetalFixtureSceneResources> (
-            fixturePreparation.resources);
-        if (fixture == nullptr)
-        {
-            result.error = "native Metal deformation did not receive fixture GPU resources";
-            return result;
+            MetalFixtureSceneBackend fixtureBackend;
+            auto fixturePreparation = fixtureBackend.prepare (source->scene, materialProgram);
+            if (! fixturePreparation.prepared)
+            {
+                result.error = fixturePreparation.error;
+                return result;
+            }
+            fixture = std::dynamic_pointer_cast<const MetalFixtureSceneResources> (
+                fixturePreparation.resources);
+            if (fixture == nullptr)
+            {
+                result.error = "native Metal deformation did not receive fixture GPU resources";
+                return result;
+            }
         }
 
         std::lock_guard<std::mutex> lock (sokolMutex());
@@ -3656,9 +4587,9 @@ public:
             resources->indexCount = source->scene->objects[0].indexCount;
             resources->morphTargetCount
                 = static_cast<std::uint32_t> (mesh->morphTargets().size());
-            if (mesh->skin().isValid())
+            if (source->skin.value_or(mesh->skin()).isValid())
             {
-                const auto* skin = source->deformation->findSkin (mesh->skin());
+                const auto* skin = source->deformation->findSkin (source->skin.value_or(mesh->skin()));
                 if (skin == nullptr || skin->joints().size() > kNativeDeformationMaxJoints)
                 {
                     result.error = "native Metal deformation skin exceeds the bounded GPU subset";
@@ -3714,7 +4645,7 @@ public:
                 view = sg_make_view (&viewDesc);
             };
             makeStorage (resources->baseVertices, resources->baseVerticesView,
-                source->scene->vertices.data(), vertexBytes, false,
+                source->scene->vertices.data() + object->firstVertex, vertexBytes, false,
                 "arbit-metal-deformation-base-vertices");
             sg_view_desc outputViewDesc = {};
             outputViewDesc.storage_buffer.buffer = fixture->vertexBuffer;
@@ -3816,7 +4747,7 @@ public:
             result.stats.deformationStableId = source->deformationStableId;
             result.stats.clipId = source->clip.value;
             result.stats.meshId = source->mesh.value;
-            result.stats.skinId = mesh->skin().value;
+            result.stats.skinId = source->skin.value_or(mesh->skin()).value;
             result.stats.revision = source->structuralRevision;
             return result;
         }
@@ -3843,6 +4774,51 @@ public:
         NativeDeformationFrameData frameData;
         if (! prepareNativeDeformationFrame (*source, *snapshot, frameData, result.error))
             return result;
+        if (!source->draws.empty())
+        {
+            if (resources->draws.size() != source->draws.size())
+            { result.error = "native Metal scene batch topology changed"; return result; }
+            if (source->retainDeformedGeometry)
+                for (std::size_t index=0;index<source->scene->vertexCount;++index) {
+                    const auto& vertex=source->scene->vertices[index];
+                    result.deformedVertices.insert(result.deformedVertices.end(),{
+                        vertex.position.x,vertex.position.y,vertex.position.z,
+                        vertex.normal.x,vertex.normal.y,vertex.normal.z,vertex.uv.x,vertex.uv.y});
+                }
+            for (std::size_t index = 0; index < source->draws.size(); ++index)
+            {
+                auto drawInputs = runtimeInputs;
+                if (snapshot->pose().morphEnabled && snapshot->pose().nodeStableId != source->draws[index]->animationNodeStableId
+                    && snapshot->combinationMode() != visualanimation::CombinationMode::WeightedBlend)
+                    drawInputs.morphWeight = static_cast<float>(snapshot->combinationWeight());
+                auto draw = render(source->draws[index], snapshot, resources->draws[index], width, height, drawInputs);
+                if (!draw.rendered) { result.error = draw.error; return result; }
+                if (source->retainDeformedGeometry) {
+                    const auto object=std::find_if(source->scene->objects.begin(),
+                        source->scene->objects.begin()+source->scene->objectCount,
+                        [&](const auto& value) { return value.id==source->draws[index]->object; });
+                    const auto* mesh=source->deformation->findMesh(source->draws[index]->mesh);
+                    if (draw.deformedVertices.size()!=mesh->vertexCount()*8u) {
+                        result.error="native Metal scene geometry readback changed topology"; return result;
+                    }
+                    std::copy(draw.deformedVertices.begin(),draw.deformedVertices.end(),
+                        result.deformedVertices.begin()+object->firstVertex*8u);
+                }
+                result.stats.dispatchCount += draw.stats.dispatchCount;
+                result.stats.dynamicUniformBytes += draw.stats.dynamicUniformBytes;
+            }
+            auto frame = nativeFixtureSceneBackend().render(source->scene, resources->fixture, width, height, runtimeInputs);
+            if (!frame.rendered) { result.error = frame.error; return result; }
+            result.rendered = true; result.frame = std::move(frame.frame);
+            result.stats.drawCount = frame.stats.drawCount;
+            result.stats.reusedStaticResources = true;
+            result.stats.sourceStableId = source->sourceStableId;
+            result.stats.deformationStableId = source->deformationStableId;
+            result.stats.clipId = source->clip.value;
+            result.stats.revision = source->structuralRevision;
+            result.stats.time = snapshot->time();
+            return result;
+        }
         for (std::size_t index = 0; index < frameData.morphTargetCount; ++index)
         {
             const auto base = source->morphBaseWeights.empty()
@@ -3872,6 +4848,10 @@ public:
                 uniforms.vertexCount = frameData.vertexCount;
                 uniforms.jointCount = frameData.jointCount;
                 uniforms.morphTargetCount = frameData.morphTargetCount;
+                const auto object = std::find_if(source->scene->objects.begin(),
+                    source->scene->objects.begin() + source->scene->objectCount,
+                    [&](const auto& value) { return value.id == source->object; });
+                uniforms.outputOffset = object->firstVertex;
                 sg_pass pass = {};
                 pass.compute = true;
                 pass.label = "arbit-metal-deformation-compute-pass";
@@ -3892,9 +4872,53 @@ public:
                 sg_dispatch (static_cast<int> ((frameData.vertexCount + 63u) / 64u), 1, 1);
                 sg_end_pass();
                 sg_commit();
+                if (source->retainDeformedGeometry)
+                {
+                    const sg_mtl_buffer_info info = sg_mtl_query_buffer_info(resources->fixture->vertexBuffer);
+                    id<MTLBuffer> computed = (__bridge id<MTLBuffer>) info.buf[info.active_slot];
+                    const auto count = static_cast<std::size_t>(frameData.vertexCount);
+                    const auto bytes = static_cast<NSUInteger>(count * sizeof(HarmonicMIDI::grid::SceneVertex));
+                    id<MTLBuffer> copy = [gMetalDevice newBufferWithLength:bytes
+                        options:MTLResourceStorageModeShared];
+                    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) sg_mtl_command_queue();
+                    id<MTLCommandBuffer> command = [queue commandBuffer];
+                    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+                    if (computed == nil || copy == nil || encoder == nil)
+                    {
+                        result.error = "native Metal deformed geometry readback allocation failed";
+                        return result;
+                    }
+                    [encoder copyFromBuffer:computed
+                        sourceOffset:static_cast<NSUInteger>(object->firstVertex*sizeof(HarmonicMIDI::grid::SceneVertex))
+                        toBuffer:copy destinationOffset:0 size:bytes];
+                    [encoder endEncoding];
+                    [command commit];
+                    [command waitUntilCompleted];
+                    if (command.status != MTLCommandBufferStatusCompleted)
+                    {
+                        result.error = "native Metal deformed geometry readback failed";
+                        return result;
+                    }
+                    const auto* values = static_cast<const HarmonicMIDI::grid::SceneVertex*>([copy contents]);
+                    result.deformedVertices.reserve(count * 8u);
+                    for (std::size_t index=0;index<count;++index) {
+                        const auto& vertex=values[index];
+                        result.deformedVertices.insert(result.deformedVertices.end(),{
+                            vertex.position.x,vertex.position.y,vertex.position.z,
+                            vertex.normal.x,vertex.normal.y,vertex.normal.z,vertex.uv.x,vertex.uv.y});
+                    }
+                }
             }
         }
 
+        if (source->batchMember)
+        {
+            result.rendered = true;
+            result.stats.dispatchCount = 1;
+            result.stats.dynamicUniformBytes = frameData.jointCount * 16u * sizeof(float)
+                + frameData.morphTargetCount * sizeof(float);
+            return result;
+        }
         auto fixtureSubmission = nativeFixtureSceneBackend().render (
             source->scene, resources->fixture, width, height, runtimeInputs);
         if (! fixtureSubmission.rendered)
@@ -3915,7 +4939,7 @@ public:
         result.stats.deformationStableId = source->deformationStableId;
         result.stats.clipId = source->clip.value;
         result.stats.meshId = source->mesh.value;
-        result.stats.skinId = mesh != nullptr ? mesh->skin().value : 0;
+        result.stats.skinId = mesh != nullptr ? source->skin.value_or(mesh->skin()).value : 0;
         result.stats.revision = source->structuralRevision;
         result.stats.time = snapshot->time();
         return result;
@@ -4159,6 +5183,7 @@ NativeOpticalFlowExecutionBackend& nativeOpticalFlowExecutionBackend()
     static auto* backend = new MetalOpticalFlowExecutionBackend();
     return *backend;
 }
+void invalidateNativeOpticalFlowExecutionContext (std::uintptr_t) noexcept {}
 
 NativeFixtureSceneBackend& nativeFixtureSceneBackend()
 {
@@ -4196,9 +5221,19 @@ struct MetalComputeParams
     int32_t noteCount;
     float aspect;
     float lifetime;
-    float padding[3];
+    int32_t motionMode;
+    float elapsed, drag;
+    float attraction, rmsForce, onsetImpulse, onsetAge;
+    int32_t seed;
+    float linkSpring, padding[2];
+    int32_t collisionMode;
+    float bodyRadius, restitution, collisionPadding;
+    int32_t geometryCount;
+    float geometryPadding[3];
+    std::array<std::array<float,4>,64> geometryAnchors;
+    std::array<std::array<float,4>,64> bodyReplay;
 };
-static_assert (sizeof (MetalComputeParams) == 48, "MSL compute uniform layout changed");
+static_assert (sizeof (MetalComputeParams) == 2160, "MSL compute uniform layout changed");
 
 struct MetalDrawParams
 {
@@ -4225,9 +5260,13 @@ using namespace metal;
 struct Params {
     int count; int spawnTrack; float gravity; float force;
     float dt; int frame; int noteCount; float aspect;
-    // Scalar padding keeps this MSL block byte-identical to the 48-byte C++ wire
-    // block. float3 would align to 16 and silently make Params 64 bytes.
-    float lifetime; float padding0; float padding1; float padding2;
+    float lifetime; int motionMode; float elapsed; float drag;
+    float attraction; float rmsForce; float onsetImpulse; float onsetAge;
+    int seed; float linkSpring; float padding1; float padding2;
+    int collisionMode; float bodyRadius; float restitution; float collisionPadding;
+    int geometryCount; float geometryPadding0; float geometryPadding1; float geometryPadding2;
+    float4 geometryAnchors[64];
+    float4 bodyReplay[64];
 };
 struct Particle {
     float2 pos; float2 vel; float life; float maxLife; float hue; float pad;
@@ -4237,6 +5276,94 @@ float hash11(uint n) {
     n = n * (n * n * 15731u + 789221u) + 1376312589u;
     return float(n & 0x7fffffffu) / float(0x7fffffffu);
 }
+float2 motionResponse(float t, float attraction, constant Params& u)
+{
+    const float h = u.drag * 0.5f;
+    if (attraction < 0.0001f) {
+        const float impulse = u.drag < 0.0001f ? t : (1.0f - exp(-u.drag * t)) / u.drag;
+        return float2(impulse, u.drag < 0.0001f ? 0.5f * t * t : (t - impulse) / u.drag);
+    }
+    const float q = h * h - attraction;
+    if (abs(q) < 0.0001f)
+        return float2(t * exp(-h * t), (1.0f - exp(-h * t) * (1.0f + h * t)) / attraction);
+    if (q < 0.0f) {
+        const float w = sqrt(-q);
+        const float impulse = exp(-h * t) * sin(w * t) / w;
+        return float2(impulse, (1.0f - exp(-h * t) * cos(w * t) - h * impulse) / attraction);
+    }
+    const float w = sqrt(q), a = exp((-h + w) * t), b = exp((-h - w) * t);
+    return float2((a - b) / (2.0f * w),
+        (1.0f + ((-h - w) * a - (-h + w) * b) / (2.0f * w)) / attraction);
+}
+float4 timelineParticle(uint i, constant Params& u, const device float4* notes)
+{
+    if (u.motionMode == 2) return i < 64u ? u.bodyReplay[i] : float4(-10.0f, -10.0f, 0.0f, 0.0f);
+    if (u.elapsed < 0.0f) return float4(-10.0f, -10.0f, 0.0f, 0.0f);
+    int matches = 0;
+    for (int r = 0; r < min(u.noteCount, 128); ++r) {
+        const float4 t0 = notes[r * 4], t1 = notes[r * 4 + 1];
+        if (int(t1.z + 0.5f) == u.spawnTrack && t0.y > 0.001f && t0.z >= 0.0f && t0.w > 0.0f)
+            ++matches;
+    }
+    if (matches == 0 && u.geometryCount == 0) return float4(-10.0f, -10.0f, 0.0f, 0.0f);
+    const uint seed = uint(u.seed);
+    int pick = min(int(hash11(i * 747u + seed) * float(matches)), matches - 1);
+    float4 note = float4(60.0f, 1.0f, 0.0f, 1.0f);
+    float4 links = float4(0.0f);
+    for (int r = 0; r < min(u.noteCount, 128); ++r) {
+        const float4 t0 = notes[r * 4], t1 = notes[r * 4 + 1];
+        if (int(t1.z + 0.5f) == u.spawnTrack && t0.y > 0.001f && t0.z >= 0.0f && t0.w > 0.0f)
+        { if (pick-- == 0) { note = t0; links = notes[r * 4 + 2]; break; } }
+    }
+    const float duration = max(u.lifetime, 0.1f);
+    const float age = fmod(u.elapsed + hash11(i * 97u + seed) * duration, duration);
+    const float angle = (hash11(i * 31u + seed) - 0.5f) * (u.geometryCount>0 ? 6.2831853f : 2.2f);
+    const float speed = (0.25f + note.y * 0.75f) * u.force * (1.0f + u.rmsForce);
+    const float2 velocity = float2(sin(angle) / max(u.aspect, 0.001f), cos(angle)) * speed;
+    const float stiffness = u.attraction + u.linkSpring * links.z;
+    const float2 response = motionResponse(age, stiffness, u);
+    float2 anchor = float2(clamp((note.x - 36.0f) / 60.0f, 0.0f, 1.0f) * 0.8f + 0.1f, 0.12f);
+    float2 target = anchor;
+    if (u.geometryCount>0) {
+        const int point=min(int(hash11(i*193u+seed)*float(u.geometryCount)),u.geometryCount-1);
+        anchor=u.geometryAnchors[point].xy; target=u.geometryAnchors[point].zw;
+    }
+    float2 position = anchor
+        + velocity * response.x
+        + (u.attraction*(target-anchor)+u.linkSpring * links.xy - float2(0.0f, u.gravity)) * response.y;
+    if (u.onsetAge <= u.elapsed && u.onsetAge < duration)
+        position.y += u.onsetImpulse * motionResponse(u.onsetAge, stiffness, u).x;
+    if (u.collisionMode == 1)
+    {
+        position = anchor;
+        float2 bodyVelocity = velocity;
+        const float impulseTime = age - u.onsetAge;
+        if (impulseTime == 0.0f && u.onsetAge <= u.elapsed)
+            bodyVelocity.y += u.onsetImpulse;
+        float elapsed = 0.0f;
+        for (int step = 0; step < 1200; ++step)
+        {
+            const float dt = min(1.0f / 120.0f, age - elapsed);
+            if (dt <= 0.0f) break;
+            if (impulseTime > elapsed && impulseTime <= elapsed + dt
+                && u.onsetAge <= u.elapsed)
+                bodyVelocity.y += u.onsetImpulse;
+            const float2 acceleration = -stiffness * (position - anchor)
+                + u.attraction*(target-anchor)+u.linkSpring * links.xy - float2(0.0f, u.gravity);
+            bodyVelocity = (bodyVelocity + acceleration * dt) / (1.0f + u.drag * dt);
+            position += bodyVelocity * dt;
+            for (int axis = 0; axis < 2; ++axis)
+            {
+                if (position[axis] < u.bodyRadius)
+                { position[axis] = u.bodyRadius; bodyVelocity[axis] = abs(bodyVelocity[axis]) * u.restitution; }
+                if (position[axis] > 1.0f - u.bodyRadius)
+                { position[axis] = 1.0f - u.bodyRadius; bodyVelocity[axis] = -abs(bodyVelocity[axis]) * u.restitution; }
+            }
+            elapsed += dt;
+        }
+    }
+    return float4(position, 1.0f - age / duration, fract(note.x / 12.0f));
+}
 kernel void _main(constant Params& u [[buffer(0)]],
                   device Particle* particles [[buffer(8)]],
                   const device float4* notes [[buffer(9)]],
@@ -4244,6 +5371,13 @@ kernel void _main(constant Params& u [[buffer(0)]],
 {
     if (i >= uint(u.count)) return;
     Particle p = particles[i];
+    if (u.motionMode != 0) {
+        const float4 value = timelineParticle(i, u, notes);
+        p.pos = value.xy; p.vel = float2(0.0f); p.life = value.z;
+        p.maxLife = max(u.lifetime, 0.1f); p.hue = value.w; p.pad = 0.0f;
+        particles[i] = p;
+        return;
+    }
     p.life -= u.dt / max(p.maxLife, 1.0e-3f);
     if (p.life <= 0.0f) {
         int matches = 0;
@@ -4715,6 +5849,11 @@ uint32_t MetalParticleEngine::renderViewUnlocked (
 {
     if (width <= 0 || height <= 0)
         return 0;
+    if (params.simulationSpace!=0)
+    { impl_->error="Solid 3D must be submitted through the native retained-scene renderer"; return 0; }
+    if (params.geometryBinding && !params.preparedBodies)
+    { impl_->error="Particle geometry requires replay preparation before native rendering"; return 0; }
+    if (!particleHistoryReady(params, impl_->error, clock.timeSec)) return 0;
     if (! ensureSokolMetal())
     {
         impl_->error = gSokolError;
@@ -4726,7 +5865,7 @@ uint32_t MetalParticleEngine::renderViewUnlocked (
     int count = params.count;
     if (count < 1) count = 1;
     if (count > ParticleEngine::kMaxParticles) count = ParticleEngine::kMaxParticles;
-    if (impl_->simSeeded && clock.frame < impl_->lastSimFrame)
+    if (params.motionMode == 0 && impl_->simSeeded && clock.frame < impl_->lastSimFrame)
     {
         if (impl_->particleView.id != 0) sg_destroy_view (impl_->particleView);
         if (impl_->particleBuffer.id != 0) sg_destroy_buffer (impl_->particleBuffer);
@@ -4740,11 +5879,10 @@ uint32_t MetalParticleEngine::renderViewUnlocked (
         || ! impl_->ensureTarget (gl, width, height, nativeOnly))
         return 0;
 
-    std::array<float, 4 * 128 * 4> noteData = {};
+    auto noteData = particleNoteUpload(notes, params.motionMode == 1, params.linkRatioInfluence);
     int noteCount = 0;
     if (notes != nullptr && notes->noteTexture().size() >= noteData.size())
     {
-        std::copy_n (notes->noteTexture().data(), noteData.size(), noteData.data());
         noteCount = notes->noteRows();
     }
     impl_->diagnostics = {};
@@ -4753,7 +5891,7 @@ uint32_t MetalParticleEngine::renderViewUnlocked (
     sg_update_buffer (impl_->notesBuffer, &noteRange);
 
     int firstFrame = clock.frame;
-    const int steps = impl_->planSteps (clock, firstFrame);
+    const int steps = params.motionMode != 0 ? 1 : impl_->planSteps (clock, firstFrame);
     if (steps < 0)
     {
         impl_->error = "Metal particle replay exceeds deterministic bound";
@@ -4776,11 +5914,30 @@ uint32_t MetalParticleEngine::renderViewUnlocked (
             params.gravity,
             params.force > 0.0f ? params.force : 0.0f,
             clock.playing ? static_cast<float> (clock.timeDelta) : 0.0f,
-            firstFrame + step + params.seed,
+            params.motionMode == 1 ? params.seed : firstFrame + step + params.seed,
             noteCount,
             height > 0 ? static_cast<float> (width) / static_cast<float> (height) : 1.0f,
             params.lifetime,
-            { 0.0f, 0.0f, 0.0f },
+            params.motionMode,
+            static_cast<float>(clock.timeSec - params.resetTime),
+            params.drag,
+            params.attraction,
+            params.rmsGain * params.rms,
+            params.onsetGain * params.onset,
+            params.onsetAge,
+            params.seed,
+            params.linkSpring,
+            { 0.0f, 0.0f },
+            params.collisionMode,
+            params.bodyRadius,
+            params.restitution,
+            0.0f,
+            params.geometryCount,
+            {0.0f,0.0f,0.0f},
+            params.geometryAnchors,
+            params.motionMode == 2
+                ? replayParticleBodies(params, clock.timeSec, float(width) / float(height), notes)
+                : std::array<std::array<float,4>,64>{},
         };
         const sg_range range = { &uniforms, sizeof (uniforms) };
         sg_apply_uniforms (0, &range);
@@ -5463,6 +6620,22 @@ vertex Out _main(uint vertexId [[vertex_id]])
 }
 )metal";
 
+// Metal's viewport starts at the top edge. The compositor's intermediate
+// fullscreen passes invert their sampled rows, so the final IOSurface pass
+// must sample the opposite row to publish image-top as IOSurface row zero.
+const char* kMetalDirectOutputVertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+struct Out { float4 position [[position]]; float2 uv [[user(locn0)]]; };
+vertex Out _main(uint vertexId [[vertex_id]])
+{
+    const float2 pos[3] = { float2(-1,-1), float2(3,-1), float2(-1,3) };
+    const float2 uv[3] = { float2(0,1), float2(2,1), float2(0,-1) };
+    Out out; out.position = float4(pos[vertexId], 0, 1); out.uv = uv[vertexId];
+    return out;
+}
+)metal";
+
 const char* kMetalColorTransformFragment = R"metal(
 #include <metal_stdlib>
 using namespace metal;
@@ -5485,6 +6658,8 @@ float3 decodeTransfer(float3 value, int transfer, float sourceReferenceWhite)
                       value / 12.92f, low);
     }
     if (transfer == 3) return pow(value, float3(2.2f));
+    if (transfer == 6) return select(pow((value + 0.099f) / 1.099f, float3(1.0f / 0.45f)),
+                                    value / 4.5f, value < float3(0.081f));
     if (transfer == 4) {
         const float m1 = 2610.0f / 16384.0f;
         const float m2 = 2523.0f / 32.0f;
@@ -5514,6 +6689,8 @@ float3 encodeTransfer(float3 value, int transfer, float outputReferenceWhite)
                       12.92f * value, low);
     }
     if (transfer == 3) return pow(value, float3(1.0f / 2.2f));
+    if (transfer == 6) return select(1.099f * pow(value, float3(0.45f)) - 0.099f,
+                                    4.5f * value, value < float3(0.018f));
     if (transfer == 4) {
         const float m1 = 2610.0f / 16384.0f;
         const float m2 = 2523.0f / 32.0f;
@@ -5753,6 +6930,18 @@ fragment float4 _main(In in [[stage_in]],
                       texture2d<float> image [[texture(0)]],
                       sampler imageSampler [[sampler(0)]])
 { return image.sample(imageSampler, in.uv); }
+)metal";
+
+// Copy CPU-uploaded raster rows without the fullscreen quad's Y inversion.
+// Frame Blend already writes an inverted render target, so its lease uses
+// the ordinary blit below to return to the same top-row texture convention.
+const char* kMetalFrameLeaseFragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+struct In { float4 position [[position]]; float2 uv [[user(locn0)]]; };
+fragment float4 _main(In in [[stage_in]], texture2d<float> image [[texture(0)]],
+                      sampler imageSampler [[sampler(0)]])
+{ return image.sample(imageSampler, float2(in.uv.x, 1.0f - in.uv.y)); }
 )metal";
 
 const char* kMetalPreviewFragment = R"metal(
@@ -6123,7 +7312,8 @@ fragment float4 _main(In in [[stage_in]], constant Params& p [[buffer(0)]],
     const float3 glow = bloom.sample(imageSampler, in.uv).rgb;
     const float3 hdr = (base + glow * p.intensity) * p.exposure;
     float3 ldr = clamp(hdr, 0.0f, 1.0f);
-    if (p.tonemap == 1) ldr = hdr / (hdr + 1.0f);
+    if (p.tonemap == -1) ldr = hdr;
+    else if (p.tonemap == 1) ldr = hdr / (hdr + 1.0f);
     else if (p.tonemap == 2) ldr = aces(hdr);
     return float4(ldr, 1.0f);
 }
@@ -6389,6 +7579,7 @@ struct MetalFrameRenderer::Impl
 
     sg_sampler sampler = {};
     sg_shader layerShader = {}, blendShader = {}, frameMixShader = {}, transitionShader = {}, blitShader = {};
+    sg_shader frameLeaseShader = {};
     sg_shader blurShader = {}, sharpenShader = {}, productionFilterShader = {};
     sg_shader colorTransformShader = {};
     sg_shader lutShader = {}, uvEffectShader = {};
@@ -6396,13 +7587,16 @@ struct MetalFrameRenderer::Impl
     sg_shader bloomThresholdShader = {}, postCombineShader = {};
     sg_shader canvasShader = {}, previewShader = {}, drawShapeShader = {};
     sg_pipeline layerPipeline = {}, blendPipeline = {}, frameMixPipeline = {}, transitionPipeline = {}, blitPipeline = {};
+    sg_pipeline frameLeasePipeline = {};
     sg_pipeline blurPipeline = {}, sharpenPipeline = {}, productionFilterPipeline = {};
     sg_pipeline colorTransformPipeline = {};
     sg_pipeline lutPipeline = {}, uvEffectPipeline = {};
     sg_pipeline feedbackPipeline = {};
     sg_pipeline bloomThresholdPipeline = {}, postCombinePipeline = {};
     sg_pipeline canvasPipeline = {}, previewPipeline = {}, drawShapePipeline = {};
-    Target layerTarget, transitionFrom, effect[2], accum[2], inspectionTarget;
+    Target layerTarget, transitionFrom, particleComposite, effect[2], accum[2], inspectionTarget;
+    sg_image lastCompositeFloatImage = {};
+    bool hdrImageCapture = false;
     int inspectionClipId = -1;
     unsigned inspectionRequestedHandle = 0;
     unsigned inspectionRetainedHandle = 0;
@@ -6548,6 +7742,7 @@ struct MetalFrameRenderer::Impl
         }
         feedback.clear();
         destroyTarget (layerTarget);
+        destroyTarget (particleComposite);
         destroyTarget (transitionFrom);
         destroyTarget (effect[0]);
         destroyTarget (effect[1]);
@@ -6774,9 +7969,15 @@ struct MetalFrameRenderer::Impl
         blitPipelineDesc.depth.pixel_format = SG_PIXELFORMAT_NONE;
         blitPipelineDesc.label = "arbit-metal-frame-blit-pipeline";
         blitPipeline = sg_make_pipeline (&blitPipelineDesc);
+        blitDesc.fragment_func.source = kMetalFrameLeaseFragment;
+        blitDesc.label = "arbit-metal-frame-lease";
+        frameLeaseShader = sg_make_shader(&blitDesc);
+        blitPipelineDesc.shader = frameLeaseShader;
+        blitPipelineDesc.label = "arbit-metal-frame-lease-pipeline";
+        frameLeasePipeline = sg_make_pipeline(&blitPipelineDesc);
 
         sg_shader_desc previewDesc = {};
-        previewDesc.vertex_func.source = kMetalFullscreenVertex;
+        previewDesc.vertex_func.source = kMetalDirectOutputVertex;
         previewDesc.fragment_func.source = kMetalPreviewFragment;
         previewDesc.uniform_blocks[0].stage = SG_SHADERSTAGE_FRAGMENT;
         previewDesc.uniform_blocks[0].size = sizeof (MetalPreviewParams);
@@ -6987,7 +8188,7 @@ struct MetalFrameRenderer::Impl
                   2, postCombineShader, postCombinePipeline);
 
         sg_shader_desc canvasDesc = {};
-        canvasDesc.vertex_func.source = kMetalFullscreenVertex;
+        canvasDesc.vertex_func.source = kMetalDirectOutputVertex;
         canvasDesc.fragment_func.source = kMetalCanvasFragment;
         canvasDesc.uniform_blocks[0].stage = SG_SHADERSTAGE_FRAGMENT;
         canvasDesc.uniform_blocks[0].size = sizeof (MetalCanvasParams);
@@ -7036,6 +8237,8 @@ struct MetalFrameRenderer::Impl
             && resourceValid (sg_query_pipeline_state (transitionPipeline))
             && resourceValid (sg_query_shader_state (blitShader))
             && resourceValid (sg_query_pipeline_state (blitPipeline))
+            && resourceValid (sg_query_shader_state (frameLeaseShader))
+            && resourceValid (sg_query_pipeline_state (frameLeasePipeline))
             && resourceValid (sg_query_shader_state (previewShader))
             && resourceValid (sg_query_pipeline_state (previewPipeline))
             && resourceValid (sg_query_shader_state (blurShader))
@@ -7067,6 +8270,209 @@ struct MetalFrameRenderer::Impl
         return programsReady;
     }
 
+    bool prepareSources()
+    {
+        // Shared by composition and pre-3D material leases. A lease commits
+        // its copy before the next native draw on the same Metal queue.
+        for (auto& item : sources)
+        {
+            auto& source = item.second;
+            if (!source.dirty) continue;
+            sg_image_data data = {};
+            data.mip_levels[0] = { source.pixels.data(), source.pixels.size() };
+            sg_update_image(source.image, &data);
+            source.dirty = false;
+        }
+        for (auto& item : sources)
+        {
+            auto& source = item.second;
+            if (!source.frameBlend) continue;
+            const auto earlier = sources.find(source.textureA);
+            const auto later = sources.find(source.textureB);
+            if (earlier == sources.end() || later == sources.end()
+                || earlier->second.frameBlend || later->second.frameBlend)
+            { error = "Metal frame blend has invalid source textures"; return false; }
+            if (source.blendTarget.image.id == 0
+                && !makeTarget(source.blendTarget, source.width, source.height, "arbit-metal-frame-mix-target"))
+            { error = "Metal frame blend target creation failed"; return false; }
+            sg_pass pass = {};
+            pass.attachments.colors[0] = source.blendTarget.attachment;
+            pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
+            pass.action.colors[0].store_action = SG_STOREACTION_STORE;
+            sg_begin_pass(&pass);
+            sg_apply_pipeline(frameMixPipeline);
+            sg_bindings bindings = {};
+            bindings.views[0] = earlier->second.view;
+            bindings.views[1] = later->second.view;
+            bindings.samplers[0] = sampler;
+            sg_apply_bindings(&bindings);
+            const MetalFrameMixParams params = { source.blendMix, { 0.0f, 0.0f, 0.0f } };
+            const sg_range range = { &params, sizeof(params) };
+            sg_apply_uniforms(0, &range);
+            sg_draw(0, 3, 1);
+            sg_end_pass();
+        }
+        return true;
+    }
+
+    sg_view renderShaderOperations(const LayerDesc& layer,
+        const std::unordered_map<int, sg_view>* generatedSources = nullptr)
+    {
+#if ARBIT_HAVE_METAL_GENERATORS
+        if (!layer.shaderOperationPlan || layer.shaderOperationPlan->operations.empty())
+        { error = "Material Frame requires an admitted shader operation plan"; return {}; }
+        struct Resource { sg_view view {}; std::uintptr_t texture = 0; };
+        std::map<int, Resource> resources;
+        const auto sourceResource = [&](const LayerDesc& owner) -> Resource
+        {
+            sg_view view {};
+            if (generatedSources != nullptr && owner.shaderSource
+                && owner.clipId > 0 && owner.clipId != layer.clipId)
+            {
+                const auto generated = generatedSources->find(owner.clipId);
+                if (generated != generatedSources->end()) view = generated->second;
+            }
+            const auto found = sources.find(owner.texture);
+            if (view.id == 0 && found != sources.end())
+                view = found->second.frameBlend ? found->second.blendTarget.texture : found->second.view;
+            else if (view.id == 0 && owner.nativeTextureOwner && owner.nativeTextureBackend == "metal"
+                && owner.nativeTextureDescriptor.complete()
+                && owner.nativeTextureDescriptor.deviceOrContextIdentity
+                    == reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice)
+                && owner.nativeTextureView <= std::numeric_limits<std::uint32_t>::max())
+                view.id = static_cast<std::uint32_t>(owner.nativeTextureView);
+            if (!resourceValid(sg_query_view_state(view))) return {};
+            const auto native = sg_mtl_query_image_info(sg_query_view_desc(view).texture.image);
+            return {view,reinterpret_cast<std::uintptr_t>(native.tex[native.active_slot])};
+        };
+        for (const auto& operation : layer.shaderOperationPlan->operations)
+            for (std::size_t input = 0; input < operation.inputCount; ++input)
+                if (resources.count(operation.inputNodeIds[input]) == 0)
+                {
+                    const auto* owner = input == 0 && operation.kind == videowire::ShaderOperationKind::transition
+                        ? layer.fromLayer : &layer;
+                    if (owner) resources[operation.inputNodeIds[input]] = sourceResource(*owner);
+                }
+        Resource last;
+        for (const auto& operation : layer.shaderOperationPlan->operations)
+        {
+            const auto key = std::to_string(layer.clipId) + ":"
+                + std::to_string(layer.visualPlanStructuralRevision) + ":" + layer.shaderOperationPlan->digest
+                + ":" + std::to_string(operation.nodeId) + ":" + operation.payload.sourceSha256;
+            const auto found = operationGenerators.find(key);
+            if (found == operationGenerators.end() || !found->second)
+            { error = "Metal shader operation was not admitted"; return {}; }
+            std::map<std::string,std::uintptr_t> images;
+            if (operation.kind == videowire::ShaderOperationKind::filter)
+                images["inputImage"] = resources[operation.inputNodeIds[0]].texture;
+            else if (operation.kind == videowire::ShaderOperationKind::transition)
+            { images["startImage"] = resources[operation.inputNodeIds[0]].texture;
+              images["endImage"] = resources[operation.inputNodeIds[1]].texture; }
+            if (std::any_of(images.begin(),images.end(),[](const auto& image) { return image.second == 0; }))
+            { error = "Metal shader operation references an unknown resource"; return {}; }
+            const auto values = layer.shaderOperationParameters.find(operation.nodeId);
+            last.view.id = found->second->renderViewUnlocked(layer.shaderClock,width,height,
+                layer.audioPresent ? &layer.audioFeatures : nullptr,
+                canonicalblockc::valid(layer.canonicalBlockCFrame) ? layer.canonicalBlockCFrame.get() : nullptr,
+                values == layer.shaderOperationParameters.end() ? nullptr : &values->second,&images);
+            last.texture = found->second->outputTextureHandle();
+            if (last.view.id == 0 || last.texture == 0) { error = found->second->log(); return {}; }
+            resources[operation.outputNodeId] = resources[operation.nodeId] = last;
+        }
+        return last.view;
+#else
+        (void)layer; error = "Metal shader Frame execution is unavailable in this build"; return {};
+#endif
+    }
+
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseFrameView(
+        sg_view sourceView, int w, int h, bool flip, std::string& failure)
+    {
+        if (!resourceValid(sg_query_view_state(sourceView)))
+        { failure = "Frame texture lease source view is stale"; return {}; }
+        auto frame = std::make_shared<MetalFixtureSceneFrame>();
+        frame->width_ = w; frame->height_ = h; frame->rendererGeneration_ = nextMetalRendererGeneration();
+        sg_image_desc image = {};
+        image.width = w; image.height = h; image.pixel_format = SG_PIXELFORMAT_BGRA8;
+        image.usage.color_attachment = true; image.sample_count = 1; image.label = "arbit-metal-owned-frame-texture";
+        frame->colorImage = sg_make_image(&image);
+        sg_view_desc attachment = {}; attachment.color_attachment.image = frame->colorImage;
+        frame->colorAttachmentView = sg_make_view(&attachment);
+        sg_view_desc texture = {}; texture.texture.image = frame->colorImage;
+        frame->colorTextureView = sg_make_view(&texture);
+        if (!resourceValid(sg_query_image_state(frame->colorImage))
+            || !resourceValid(sg_query_view_state(frame->colorAttachmentView))
+            || !resourceValid(sg_query_view_state(frame->colorTextureView)))
+        { frame->destroyUnlocked(); failure = "Frame texture lease target allocation failed"; return {}; }
+        sg_pass pass = {}; pass.attachments.colors[0] = frame->colorAttachmentView;
+        pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
+        pass.action.colors[0].store_action = SG_STOREACTION_STORE;
+        sg_begin_pass(&pass); sg_apply_pipeline(flip ? frameLeasePipeline : blitPipeline);
+        sg_bindings bindings = {}; bindings.views[0] = sourceView; bindings.samplers[0] = sampler;
+        sg_apply_bindings(&bindings); sg_draw(0,3,1); sg_end_pass(); sg_commit();
+        failure.clear(); return frame;
+    }
+
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseLinearImageForDisplay(
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& failure)
+    {
+        failure.clear();
+        if (!frame || !programsReady) { failure = "Linear image conversion requires a native Metal frame"; return {}; }
+        const auto descriptor = frame->colorTextureDescriptor();
+        if (!arbitgpu::isLinearSceneColor(descriptor) || descriptor.backend != "metal"
+            || descriptor.imageHandle != frame->colorImageHandle()
+            || descriptor.textureViewHandle != frame->colorTextureViewHandle()
+            || descriptor.width != frame->width() || descriptor.height != frame->height()
+            || descriptor.imageHandle > std::numeric_limits<std::uint32_t>::max()
+            || descriptor.textureViewHandle > std::numeric_limits<std::uint32_t>::max()
+            || descriptor.rowOrder != arbitgpu::NativeTextureRowOrder::TopFirst
+            || descriptor.deviceOrContextIdentity != reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice)
+            || !arbitgpu::nativeFixtureDimensionsWithinBounds(descriptor.width, descriptor.height))
+        { failure = "Linear image conversion requires an exact top-first RGBA16F source on this Metal device"; return {}; }
+        const sg_image image {static_cast<std::uint32_t>(descriptor.imageHandle)};
+        const sg_view view {static_cast<std::uint32_t>(descriptor.textureViewHandle)};
+        if (!resourceValid(sg_query_image_state(image)) || !resourceValid(sg_query_view_state(view))
+            || sg_query_view_type(view) != SG_VIEWTYPE_TEXTURE)
+        { failure = "Linear image conversion source has expired"; return {}; }
+        const auto storage = sg_query_image_desc(image);
+        const auto binding = sg_query_view_desc(view);
+        if (binding.texture.image.id != image.id || storage.type != SG_IMAGETYPE_2D
+            || storage.width != static_cast<int>(descriptor.width) || storage.height != static_cast<int>(descriptor.height)
+            || storage.sample_count != 1 || storage.pixel_format != SG_PIXELFORMAT_RGBA16F)
+        { failure = "Linear image storage does not match its native descriptor"; return {}; }
+        colortransform::AdmissionFailure admissionFailure;
+        const auto admitted = nativeLinearImageToSrgb({descriptor.width, descriptor.height}, admissionFailure);
+        if (!admitted)
+        { failure = "Linear image display transform was rejected: " + std::string(colortransform::token(admissionFailure)); return {}; }
+        Target target;
+        if (!makeTarget(target, descriptor.width, descriptor.height, "arbit-metal-linear-image-display"))
+        { failure = "Linear image display target allocation failed"; return {}; }
+        const auto& transform = admitted->description();
+        MetalColorTransformParams params = {};
+        const auto input = colortransform::gpumath::inputToWorking(transform);
+        const auto output = colortransform::gpumath::workingToOutput(transform);
+        const auto luma = colortransform::gpumath::workingLuma(transform);
+        std::copy(input.begin(), input.end(), params.inputToWorking);
+        std::copy(output.begin(), output.end(), params.workingToOutput);
+        std::copy(luma.begin(), luma.end(), params.workingLuma);
+        params.luminance[0] = params.luminance[1] = params.luminance[2] = params.luminance[3] = 100;
+        params.options[0] = static_cast<int>(transform.input.transfer);
+        params.options[1] = static_cast<int>(transform.output.transfer);
+        params.options[2] = params.options[3] = static_cast<int>(colortransform::AlphaMode::Straight);
+        params.rendering[1] = 1;
+        sg_pass pass = {}; pass.attachments.colors[0] = target.attachment;
+        pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
+        pass.action.colors[0].store_action = SG_STOREACTION_STORE;
+        sg_begin_pass(&pass); sg_apply_pipeline(colorTransformPipeline);
+        sg_bindings bindings = {}; bindings.views[0] = view; bindings.samplers[0] = sampler;
+        sg_apply_bindings(&bindings);
+        const sg_range range {&params, sizeof(params)}; sg_apply_uniforms(0, &range);
+        sg_draw(0, 3, 1); sg_end_pass();
+        auto result = leaseFrameView(target.texture, descriptor.width, descriptor.height, false, failure);
+        destroyTarget(target);
+        return arbitgpu::declaredSrgbMaterialFrame(std::move(result));
+    }
+
     bool ensureOutputs (const arbitgl::GlFuncs* gl, int w, int h)
     {
         if (accum[0].image.id != 0 && width == w && height == h
@@ -7074,6 +8480,7 @@ struct MetalFrameRenderer::Impl
             return true;
         destroyOutputs (gl);
         if (! makeTarget (layerTarget, w, h, "arbit-metal-frame-layer-target")
+            || ! makeTarget (particleComposite, w, h, "arbit-metal-particle-composite")
             || ! makeTarget (transitionFrom, w, h, "arbit-metal-frame-transition-from")
             || ! makeTarget (effect[0], w, h, "arbit-metal-frame-effect-a")
             || ! makeTarget (effect[1], w, h, "arbit-metal-frame-effect-b")
@@ -7220,7 +8627,8 @@ struct MetalFrameRenderer::Impl
                     || layer.nativeTextureView > std::numeric_limits<std::uint32_t>::max()
                     || ! descriptor.complete() || descriptor.backend != "metal"
                     || descriptor.viewKind != arbitgpu::NativeTextureViewKind::Texture2D
-                    || descriptor.format != arbitgpu::NativeTexturePixelFormat::Bgra8Unorm
+                    || (descriptor.format != arbitgpu::NativeTexturePixelFormat::Bgra8Unorm
+                        && !arbitgpu::isLinearSceneColor(descriptor))
                     || descriptor.textureViewHandle != layer.nativeTextureView
                     || descriptor.width != static_cast<std::uint32_t>(layer.texWidth)
                     || descriptor.height != static_cast<std::uint32_t>(layer.texHeight)
@@ -7230,6 +8638,17 @@ struct MetalFrameRenderer::Impl
                 const sg_view nativeView {
                     static_cast<std::uint32_t> (layer.nativeTextureView) };
                 if (! resourceValid (sg_query_view_state (nativeView)))
+                    return false;
+                if (descriptor.imageHandle > std::numeric_limits<std::uint32_t>::max()
+                    || sg_query_view_type(nativeView) != SG_VIEWTYPE_TEXTURE) return false;
+                const sg_image image { static_cast<std::uint32_t>(descriptor.imageHandle) };
+                if (!resourceValid(sg_query_image_state(image))) return false;
+                const auto actual = sg_query_image_desc(image);
+                const auto view = sg_query_view_desc(nativeView);
+                if (view.texture.image.id != image.id || actual.type != SG_IMAGETYPE_2D
+                    || actual.width != layer.texWidth || actual.height != layer.texHeight
+                    || actual.sample_count != 1 || actual.pixel_format
+                        != (arbitgpu::isLinearSceneColor(descriptor) ? SG_PIXELFORMAT_RGBA16F : SG_PIXELFORMAT_BGRA8))
                     return false;
             }
             if (! layer.isAdjustment && ! hasNativeTexture && layer.texture != 0
@@ -7368,6 +8787,8 @@ bool MetalFrameRenderer::initialize (const arbitgl::GlFuncs* gl, int width, int 
 void MetalFrameRenderer::shutdown (const arbitgl::GlFuncs* gl)
 {
     std::lock_guard<std::mutex> lock (sokolMutex());
+    impl_->lastCompositeFloatImage = {};
+    impl_->hdrImageCapture = false;
 #if ARBIT_HAVE_METAL_GENERATORS
     for (auto& item : impl_->generators)
         if (item.second != nullptr) item.second->shutdownUnlocked();
@@ -7393,6 +8814,8 @@ void MetalFrameRenderer::shutdown (const arbitgl::GlFuncs* gl)
     if (impl_->frameMixPipeline.id != 0) sg_destroy_pipeline (impl_->frameMixPipeline);
     if (impl_->transitionPipeline.id != 0) sg_destroy_pipeline (impl_->transitionPipeline);
     if (impl_->blitPipeline.id != 0) sg_destroy_pipeline (impl_->blitPipeline);
+    if (impl_->frameLeasePipeline.id != 0) sg_destroy_pipeline(impl_->frameLeasePipeline);
+    if (impl_->frameLeaseShader.id != 0) sg_destroy_shader(impl_->frameLeaseShader);
     if (impl_->blurPipeline.id != 0) sg_destroy_pipeline (impl_->blurPipeline);
     if (impl_->sharpenPipeline.id != 0) sg_destroy_pipeline (impl_->sharpenPipeline);
     if (impl_->productionFilterPipeline.id != 0)
@@ -7429,6 +8852,7 @@ void MetalFrameRenderer::shutdown (const arbitgl::GlFuncs* gl)
     if (impl_->sampler.id != 0) sg_destroy_sampler (impl_->sampler);
     impl_->layerPipeline = impl_->blendPipeline = impl_->frameMixPipeline = {};
     impl_->transitionPipeline = impl_->blitPipeline = {};
+    impl_->frameLeasePipeline = {}; impl_->frameLeaseShader = {};
     impl_->layerShader = impl_->blendShader = impl_->frameMixShader = {};
     impl_->transitionShader = impl_->blitShader = {};
     impl_->blurPipeline = impl_->sharpenPipeline = impl_->lutPipeline = {};
@@ -7457,6 +8881,7 @@ void MetalFrameRenderer::setOutputSize (const arbitgl::GlFuncs* gl, int width, i
 {
     if (width == impl_->width && height == impl_->height) return;
     std::lock_guard<std::mutex> lock (sokolMutex());
+    impl_->lastCompositeFloatImage = {};
     @autoreleasepool { impl_->ensureOutputs (gl, width, height); }
 }
 
@@ -7613,6 +9038,133 @@ void MetalFrameRenderer::deleteTexture (unsigned handle)
         impl_->destroyDepth (depth->second);
         impl_->depths.erase (depth);
     }
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::leaseRgbaTexture(
+    unsigned handle, int width, int height, std::string& error)
+{
+    std::lock_guard<std::mutex> lock(sokolMutex());
+    error.clear();
+    const auto found = impl_->sources.find(handle);
+    if (!impl_->programsReady || found == impl_->sources.end()
+        || !arbitgpu::nativeFixtureDimensionsWithinBounds(width, height)
+        || found->second.width != width || found->second.height != height)
+    { error = "Frame texture lease requires a live bounded Metal source"; return {}; }
+    if (!impl_->prepareSources()) { error = impl_->error; return {}; }
+    const auto sourceView = found->second.frameBlend ? found->second.blendTarget.texture : found->second.view;
+    return impl_->leaseFrameView(sourceView,width,height,!found->second.frameBlend,error);
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::leaseShaderFrame(
+    const LayerDesc& layer, std::string& error)
+{
+    if (!prepareShaderOperationPlan(layer,error)) return {};
+    std::lock_guard<std::mutex> lock(sokolMutex());
+    if (!impl_->programsReady || !impl_->prepareSources())
+    { error = impl_->error.empty() ? "Metal material Frame renderer is unavailable" : impl_->error; return {}; }
+    sg_commit();
+    const auto view = impl_->renderShaderOperations(layer);
+    if (view.id == 0) { error = impl_->error; return {}; }
+    auto result = impl_->leaseFrameView(view,impl_->width,impl_->height,false,error);
+    const bool declared = (!layer.nativeTextureOwner || arbitgpu::materialFrameIsSrgb(layer.nativeTextureDescriptor))
+        && (!layer.fromLayer || !layer.fromLayer->nativeTextureOwner || arbitgpu::materialFrameIsSrgb(layer.fromLayer->nativeTextureDescriptor));
+    return declared ? arbitgpu::declaredSrgbMaterialFrame(std::move(result)) : result;
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::leaseDecodedFrame(
+    unsigned texture, int width, int height, decodedframecolor::Declaration color, std::string& error)
+{
+    if (color.primaries == colortransform::ColorSpace::Unspecified
+        && color.transfer == colortransform::TransferFunction::Unspecified)
+        return leaseRgbaTexture(texture,width,height,error);
+    colortransform::AdmissionFailure failure;
+    const auto admitted = decodedframecolor::toMaterialSrgb(color,
+        {static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height)},failure);
+    if (!admitted) {
+        error = "Decoded Surface Frame needs declared SDR primaries/transfer; PQ/HLG requires an unavailable float decode path: ";
+        error += colortransform::token(failure); return {};
+    }
+    auto source = leaseRgbaTexture(texture,width,height,error);
+    if (!source) return {};
+    std::lock_guard<std::mutex> lock(sokolMutex());
+    Impl::Target target;
+    if (!impl_->makeTarget(target,width,height,"arbit-metal-decoded-color"))
+    { error = "Decoded Surface color target allocation failed"; return {}; }
+    const auto& transform = admitted->description();
+    MetalColorTransformParams params = {};
+    const auto input = colortransform::gpumath::inputToWorking(transform);
+    const auto output = colortransform::gpumath::workingToOutput(transform);
+    const auto luma = colortransform::gpumath::workingLuma(transform);
+    std::copy(input.begin(),input.end(),params.inputToWorking);
+    std::copy(output.begin(),output.end(),params.workingToOutput);
+    std::copy(luma.begin(),luma.end(),params.workingLuma);
+    params.luminance[0] = params.luminance[1] = params.luminance[2] = params.luminance[3] = 100;
+    params.options[0] = static_cast<int>(transform.input.transfer);
+    params.options[1] = static_cast<int>(transform.output.transfer);
+    params.options[2] = params.options[3] = static_cast<int>(colortransform::AlphaMode::Straight);
+    params.rendering[1] = 1;
+    sg_pass pass = {}; pass.attachments.colors[0] = target.attachment;
+    pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
+    pass.action.colors[0].store_action = SG_STOREACTION_STORE;
+    sg_begin_pass(&pass); sg_apply_pipeline(impl_->colorTransformPipeline);
+    sg_bindings bindings = {}; bindings.views[0] = {static_cast<std::uint32_t>(source->colorTextureViewHandle())};
+    bindings.samplers[0] = impl_->sampler; sg_apply_bindings(&bindings);
+    const sg_range range {&params,sizeof(params)}; sg_apply_uniforms(0,&range);
+    sg_draw(0,3,1); sg_end_pass();
+    auto result = impl_->leaseFrameView(target.texture,width,height,false,error);
+    impl_->destroyTarget(target); return arbitgpu::declaredSrgbMaterialFrame(std::move(result));
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::leaseLinearImageForDisplay(
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error)
+{
+    std::lock_guard<std::mutex> lock(sokolMutex());
+    return impl_->leaseLinearImageForDisplay(frame, error);
+}
+
+std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::leaseTemporalFrame(
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& current,
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& previous,
+    const visualtemporaloperation::Payload& payload, float mix, std::string& error)
+{
+    std::lock_guard<std::mutex> lock(sokolMutex());
+    const auto valid = [&](const auto& frame) {
+        if (!arbitgpu::validMaterialFrameTexture(frame) || frame->backend() != "metal") return false;
+        const auto descriptor = frame->colorTextureDescriptor();
+        return descriptor.deviceOrContextIdentity == reinterpret_cast<std::uintptr_t>((__bridge void*)gMetalDevice)
+            && resourceValid(sg_query_view_state(sg_view{static_cast<std::uint32_t>(descriptor.textureViewHandle)}));
+    };
+    if (!impl_->programsReady || !valid(current) || (previous && !valid(previous))
+        || !visualtemporaloperation::validate(payload,&error) || !std::isfinite(mix) || mix < 0 || mix > 1)
+    { if (error.empty()) error = "Temporal Frame requires owned images on the active Metal device"; return {}; }
+    Impl::Target target;
+    if (!impl_->makeTarget(target,impl_->width,impl_->height,"arbit-metal-material-temporal"))
+    { error = "Temporal Frame target allocation failed"; return {}; }
+    sg_pass pass = {}; pass.attachments.colors[0] = target.attachment;
+    pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+    pass.action.colors[0].clear_value = {0,0,0,0};
+    pass.action.colors[0].store_action = SG_STOREACTION_STORE;
+    sg_begin_pass(&pass);
+    if (previous)
+    {
+        const bool feedback = payload.mode == visualtemporaloperation::Mode::feedback;
+        sg_apply_pipeline(feedback ? impl_->feedbackPipeline : impl_->frameMixPipeline);
+        sg_bindings bindings = {};
+        bindings.views[0] = {static_cast<std::uint32_t>(current->colorTextureViewHandle())};
+        bindings.views[1] = {static_cast<std::uint32_t>(previous->colorTextureViewHandle())};
+        bindings.samplers[0] = impl_->sampler; sg_apply_bindings(&bindings);
+        // GLSL's column-major mat2 is the established feedback rotation.
+        const MetalFeedbackParams feedbackParams {payload.decay,payload.zoom,-payload.swirl,0};
+        const MetalFrameMixParams mixParams {mix,{0,0,0}};
+        const sg_range range = feedback ? sg_range{&feedbackParams,sizeof(feedbackParams)}
+            : sg_range{&mixParams,sizeof(mixParams)};
+        sg_apply_uniforms(0,&range); sg_draw(0,3,1);
+    }
+    sg_end_pass();
+    auto result = impl_->leaseFrameView(target.texture,impl_->width,impl_->height,false,error);
+    impl_->destroyTarget(target);
+    return arbitgpu::materialFrameIsSrgb(current) && (!previous || arbitgpu::materialFrameIsSrgb(previous))
+        ? arbitgpu::declaredSrgbMaterialFrame(std::move(result)) : result;
 }
 
 bool MetalFrameRenderer::setClipShader (int clipId, const std::string& source,
@@ -7816,7 +9368,16 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                                               const LayerDesc* layers, int numLayers,
                                               const ImageLayerDesc* overlays, int numOverlays)
 {
+    SdrNativeImageLayers displayInputs;
     std::lock_guard<std::mutex> lock (sokolMutex());
+    impl_->lastCompositeFloatImage = {};
+    impl_->error.clear();
+    if (!displayInputs.prepare(layers, numLayers, impl_->hdrImageCapture,
+            [&](const auto& frame, auto& error) { return impl_->leaseLinearImageForDisplay(frame, error); }, impl_->error))
+        return 0;
+    if (!displayInputs.layers.empty()) layers = displayInputs.layers.data();
+    if (!validateLinearSceneComposite(layers, numLayers, numOverlays, impl_->hdrImageCapture, impl_->error))
+        return 0;
     @autoreleasepool
     {
         const bool direct = impl_->requestedDirectSurface != nullptr;
@@ -7869,60 +9430,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
 
 #endif
 
-        // Apply the latest CPU decode for each source once in this sokol frame.
-        // Upload calls may outnumber composites while the GL recovery path is
-        // active; deferring here avoids sokol's one-update-per-image-per-frame
-        // rule without adding extra commits or stalling the decode thread.
-        for (auto& item : impl_->sources)
-        {
-            auto& source = item.second;
-            if (! source.dirty) continue;
-            sg_image_data data = {};
-            data.mip_levels[0] = { source.pixels.data(), source.pixels.size() };
-            sg_update_image (source.image, &data);
-            source.dirty = false;
-        }
-
-        // Tier-1 retiming remains GPU-resident in Metal-only mode. Decoded
-        // bracket frames are sampled directly into a reusable RGBA16F target;
-        // no GL texture, framebuffer, or CPU blend is created.
-        for (auto& item : impl_->sources)
-        {
-            auto& source = item.second;
-            if (! source.frameBlend) continue;
-            const auto earlier = impl_->sources.find (source.textureA);
-            const auto later = impl_->sources.find (source.textureB);
-            if (earlier == impl_->sources.end() || later == impl_->sources.end()
-                || earlier->second.frameBlend || later->second.frameBlend)
-            {
-                impl_->error = "Metal frame blend has invalid source textures";
-                return 0;
-            }
-            if (source.blendTarget.image.id == 0
-                && ! impl_->makeTarget (source.blendTarget, source.width, source.height,
-                                        "arbit-metal-frame-mix-target"))
-            {
-                impl_->error = "Metal frame blend target creation failed";
-                return 0;
-            }
-            sg_pass pass = {};
-            pass.attachments.colors[0] = source.blendTarget.attachment;
-            pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
-            pass.action.colors[0].store_action = SG_STOREACTION_STORE;
-            sg_begin_pass (&pass);
-            sg_apply_pipeline (impl_->frameMixPipeline);
-            sg_bindings bindings = {};
-            bindings.views[0] = earlier->second.view;
-            bindings.views[1] = later->second.view;
-            bindings.samplers[0] = impl_->sampler;
-            sg_apply_bindings (&bindings);
-            const MetalFrameMixParams params = {
-                source.blendMix, { 0.0f, 0.0f, 0.0f } };
-            const sg_range range = { &params, sizeof (params) };
-            sg_apply_uniforms (0, &range);
-            sg_draw (0, 3, 1);
-            sg_end_pass();
-        }
+        if (!impl_->prepareSources()) return 0;
 
         // Ordered operations use explicit Metal command buffers. Submit all
         // current-frame Sokol uploads and blends first. Both paths use the same
@@ -7934,63 +9442,9 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
         {
             const auto& layer = layers[layerIndex];
             if (layer.shaderOperationPlan == nullptr) continue;
-            struct Resource { sg_view view {}; std::uintptr_t texture = 0; };
-            std::map<int, Resource> resources;
-            auto sourceResource = [&] (const LayerDesc& owner) -> Resource
-            {
-                const auto found = impl_->sources.find(owner.texture);
-                if (found == impl_->sources.end()) return {};
-                const auto& source = found->second;
-                const sg_view view = source.frameBlend ? source.blendTarget.texture : source.view;
-                const sg_image image = source.frameBlend ? source.blendTarget.image : source.image;
-                const auto native = sg_mtl_query_image_info(image);
-                return { view, reinterpret_cast<std::uintptr_t>(native.tex[native.active_slot]) };
-            };
-            for (const auto& operation : layer.shaderOperationPlan->operations)
-                for (std::size_t input = 0; input < operation.inputCount; ++input)
-                    if (resources.count(operation.inputNodeIds[input]) == 0)
-                    {
-                        const LayerDesc* owner = input == 0
-                            && operation.kind == videowire::ShaderOperationKind::transition
-                            ? layer.fromLayer : &layer;
-                        if (owner != nullptr)
-                            resources[operation.inputNodeIds[input]] = sourceResource(*owner);
-                    }
-            Resource last;
-            for (const auto& operation : layer.shaderOperationPlan->operations)
-            {
-                const std::string key = std::to_string(layer.clipId) + ":"
-                    + std::to_string(layer.visualPlanStructuralRevision) + ":"
-                    + layer.shaderOperationPlan->digest + ":"
-                    + std::to_string(operation.nodeId) + ":" + operation.payload.sourceSha256;
-                const auto found = impl_->operationGenerators.find(key);
-                if (found == impl_->operationGenerators.end() || found->second == nullptr)
-                { impl_->error = "Metal shader operation was not admitted"; return 0; }
-                std::map<std::string, std::uintptr_t> images;
-                if (operation.kind == videowire::ShaderOperationKind::filter)
-                    images["inputImage"] = resources[operation.inputNodeIds[0]].texture;
-                else if (operation.kind == videowire::ShaderOperationKind::transition)
-                {
-                    images["startImage"] = resources[operation.inputNodeIds[0]].texture;
-                    images["endImage"] = resources[operation.inputNodeIds[1]].texture;
-                }
-                if (std::any_of(images.begin(), images.end(),
-                    [] (const auto& image) { return image.second == 0; }))
-                { impl_->error = "Metal shader operation references an unknown resource"; return 0; }
-                const auto values = layer.shaderOperationParameters.find(operation.nodeId);
-                last.view.id = found->second->renderViewUnlocked(layer.shaderClock,
-                    impl_->width, impl_->height,
-                    layer.audioPresent ? &layer.audioFeatures : nullptr,
-                    canonicalblockc::valid(layer.canonicalBlockCFrame) ? layer.canonicalBlockCFrame.get() : nullptr,
-                    values == layer.shaderOperationParameters.end() ? nullptr : &values->second,
-                    &images);
-                last.texture = found->second->outputTextureHandle();
-                if (last.view.id == 0 || last.texture == 0)
-                { impl_->error = found->second->log(); return 0; }
-                resources[operation.outputNodeId] = last;
-                resources[operation.nodeId] = last;
-            }
-            generatedViews[layer.clipId] = last.view;
+            const auto view = impl_->renderShaderOperations(layer, &generatedViews);
+            if (view.id == 0) return 0;
+            generatedViews[layer.clipId] = view;
         }
         auto sourceViewFor = [&] (unsigned handle) -> sg_view
         {
@@ -8042,17 +9496,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                 }
                 else if (layer.particleSource)
                 {
-                    ParticleParams params;
-                    auto value = [&layer] (const char* key, double fallback)
-                    {
-                        const auto item = layer.genParams.find (key);
-                        return item != layer.genParams.end() ? item->second : fallback;
-                    };
-                    params.count = static_cast<int> (value ("count", 512.0) + 0.5);
-                    params.spawnTrack = static_cast<int> (value ("spawnTrack", 0.0) + 0.5);
-                    params.size = static_cast<float> (value ("size", 2.0));
-                    params.gravity = static_cast<float> (value ("gravity", 0.0));
-                    params.force = static_cast<float> (value ("force", 1.0));
+                    const ParticleParams params = particleParamsForLayer(layer);
                     auto& engine = impl_->particles[layer.clipId];
                     if (engine == nullptr)
                         engine = std::make_unique<MetalParticleEngine>();
@@ -8078,6 +9522,28 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                         return false;
                     }
                     impl_->particleBackend = "metal-compute";
+                    if (layer.importedParticleOverlay)
+                    {
+                        if (layer.nativeTextureBackend != "metal" || layer.nativeTextureView == 0)
+                        { impl_->error = "Imported particle rig has no retained Metal scene image"; return false; }
+                        sg_pass overlayPass = {};
+                        overlayPass.attachments.colors[0] = impl_->particleComposite.attachment;
+                        overlayPass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
+                        overlayPass.action.colors[0].store_action = SG_STOREACTION_STORE;
+                        sg_begin_pass(&overlayPass);
+                        sg_apply_pipeline(impl_->blendPipeline);
+                        sg_bindings bindings = {};
+                        bindings.views[0] = sourceView;
+                        bindings.views[1].id = static_cast<std::uint32_t>(layer.nativeTextureView);
+                        bindings.samplers[0] = impl_->sampler;
+                        sg_apply_bindings(&bindings);
+                        const MetalBlendParams blend = { 1.0f, 0, { 0, 0 } };
+                        const sg_range range = { &blend, sizeof(blend) };
+                        sg_apply_uniforms(0, &range);
+                        sg_draw(0, 3, 1);
+                        sg_end_pass();
+                        sourceView = impl_->particleComposite.texture;
+                    }
                 }
                 else if (layer.nativeTextureBackend == "metal")
                     sourceView.id = static_cast<std::uint32_t> (layer.nativeTextureView);
@@ -8992,7 +10458,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
         {
             const MetalPostParams params = {
                 impl_->bloomThreshold, bloomOn ? impl_->bloomIntensity : 0.0f,
-                impl_->exposure, impl_->tonemap };
+                impl_->exposure, impl_->hdrImageCapture ? -1 : impl_->tonemap };
             sg_pass pass = {};
             pass.attachments.colors[0] = impl_->layerTarget.attachment;
             pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
@@ -9011,6 +10477,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
             finalView = impl_->layerTarget.texture;
         }
 
+        const sg_image finalFloatImage = sg_query_view_desc(finalView).texture.image;
         Impl::DirectOutput* directOutput = direct
             ? impl_->directOutput (impl_->requestedDirectSurface,
                                    impl_->requestedDirectWidth,
@@ -9045,7 +10512,9 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
         const bool frameCanvas = direct && ! showPreview
             && impl_->canvasWidth > 0 && impl_->canvasHeight > 0;
         sg_apply_pipeline (showPreview ? impl_->previewPipeline
-                                      : (frameCanvas ? impl_->canvasPipeline : impl_->blitPipeline));
+                                      : (frameCanvas ? impl_->canvasPipeline
+                                                     : (direct ? impl_->frameLeasePipeline
+                                                               : impl_->blitPipeline)));
         sg_bindings outputBindings = {};
         outputBindings.views[0] = finalView;
         if (showPreview) outputBindings.views[1] = previewView;
@@ -9104,6 +10573,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                 return 0;
             }
             IOSurfaceUnlock (sharedSurface, kIOSurfaceLockReadOnly, nullptr);
+            impl_->lastCompositeFloatImage = finalFloatImage;
             impl_->error.clear();
             return 1;
         }
@@ -9113,8 +10583,69 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                              0, 0, impl_->width, impl_->height,
                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
         gl->BindFramebuffer (GL_FRAMEBUFFER, 0);
+        impl_->lastCompositeFloatImage = finalFloatImage;
         impl_->error.clear();
         return impl_->outputTexture;
+    }
+}
+
+void MetalFrameRenderer::setHdrImageCapture(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(sokolMutex());
+    impl_->hdrImageCapture = enabled;
+    impl_->lastCompositeFloatImage = {};
+}
+
+bool MetalFrameRenderer::readLastCompositeFloat(std::vector<float>& rgba, std::string& error)
+{
+    rgba.clear();
+    std::lock_guard<std::mutex> lock(sokolMutex());
+    @autoreleasepool
+    {
+        if (impl_->lastCompositeFloatImage.id == 0
+            || !arbitgpu::nativeFixtureDimensionsWithinBounds(impl_->width, impl_->height))
+        { error = "HDR readback requires the current live Metal compositor result"; return false; }
+        const auto info = sg_mtl_query_image_info(impl_->lastCompositeFloatImage);
+        if (info.active_slot < 0 || info.active_slot >= SG_NUM_INFLIGHT_FRAMES)
+        { error = "HDR compositor has no live Metal texture slot"; return false; }
+        id<MTLTexture> texture = (__bridge id<MTLTexture>) info.tex[info.active_slot];
+        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) sg_mtl_command_queue();
+        if (texture == nil || queue == nil || texture.device != gMetalDevice || queue.device != gMetalDevice
+            || texture.pixelFormat != MTLPixelFormatRGBA16Float || texture.textureType != MTLTextureType2D
+            || texture.width != impl_->width || texture.height != impl_->height || texture.sampleCount != 1)
+        { error = "HDR compositor requires its owned RGBA16F Metal target"; return false; }
+        const auto tightRow = static_cast<std::size_t>(impl_->width) * 8;
+        const auto rowBytes = (tightRow + 255u) & ~std::size_t(255u);
+        id<MTLBuffer> buffer = [gMetalDevice newBufferWithLength:rowBytes * impl_->height
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = buffer != nil ? [command blitCommandEncoder] : nil;
+        bool ok = buffer != nil && command != nil && blit != nil;
+        if (ok)
+        {
+            [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                      sourceSize:MTLSizeMake(impl_->width, impl_->height, 1) toBuffer:buffer destinationOffset:0
+             destinationBytesPerRow:rowBytes destinationBytesPerImage:rowBytes * impl_->height];
+            [blit endEncoding]; [command commit]; [command waitUntilCompleted];
+            ok = command.status == MTLCommandBufferStatusCompleted && buffer.contents != nullptr;
+        }
+        if (ok)
+        {
+            rgba.resize(static_cast<std::size_t>(impl_->width) * impl_->height * 4);
+            const auto* source = static_cast<const std::uint8_t*>(buffer.contents);
+            for (int y = 0; y < impl_->height; ++y)
+                for (int x = 0; x < impl_->width * 4; ++x)
+                {
+                    std::uint16_t half = 0;
+                    std::memcpy(&half, source + y * rowBytes + x * 2, sizeof(half));
+                    rgba[static_cast<std::size_t>(y) * impl_->width * 4 + x] = hdrimage::halfToFloat(half);
+                }
+        }
+#if !__has_feature(objc_arc)
+        [buffer release];
+#endif
+        if (!ok) { rgba.clear(); error = "HDR Metal compositor readback failed"; return false; }
+        error.clear(); return true;
     }
 }
 

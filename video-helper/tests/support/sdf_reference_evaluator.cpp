@@ -83,7 +83,8 @@ public:
         for (const auto& record : geometry.records()) records.emplace (record.stableId, &record);
     }
 
-    double at (videowire::SdfStableId id, Point3 point) const
+    double at (videowire::SdfStableId id, Point3 point,
+               videowire::SdfStableId* contributor = nullptr) const
     {
         const auto found = records.find (id);
         if (found == records.end()) throw std::logic_error ("admitted SDF record is missing");
@@ -91,8 +92,9 @@ public:
         const auto& p = record.parameters;
         const auto child = [&] (std::size_t index, Point3 query)
         {
-            return at (record.inputs[index], query);
+            return at (record.inputs[index], query, contributor);
         };
+        if (contributor != nullptr && record.inputCount == 0) *contributor = id;
 
         switch (record.operation)
         {
@@ -154,17 +156,44 @@ public:
                 return std::abs (field) / p[0] - p[1];
             }
             case videowire::SdfOperation::unionOp:
-                return std::min (child (0, point), child (1, point));
             case videowire::SdfOperation::intersection:
-                return std::max (child (0, point), child (1, point));
             case videowire::SdfOperation::subtraction:
-                return std::max (child (0, point), -child (1, point));
             case videowire::SdfOperation::smoothUnion:
-                return smoothUnion (child (0, point), child (1, point), p[0]);
             case videowire::SdfOperation::smoothIntersection:
-                return -smoothUnion (-child (0, point), -child (1, point), p[0]);
             case videowire::SdfOperation::smoothSubtraction:
-                return -smoothUnion (-child (0, point), child (1, point), p[0]);
+            {
+                videowire::SdfStableId firstId = 0, secondId = 0;
+                const auto a = at (record.inputs[0], point, &firstId);
+                const auto b = at (record.inputs[1], point, &secondId);
+                const auto op = record.operation;
+                const bool minimum = op == videowire::SdfOperation::unionOp
+                    || op == videowire::SdfOperation::smoothUnion;
+                const bool cut = op == videowire::SdfOperation::subtraction
+                    || op == videowire::SdfOperation::smoothSubtraction;
+                if (contributor != nullptr)
+                {
+                    if (op == videowire::SdfOperation::smoothUnion
+                        || op == videowire::SdfOperation::smoothIntersection
+                        || op == videowire::SdfOperation::smoothSubtraction)
+                    {
+                        // Calculate the smooth blend weight independently of
+                        // the native evaluator's equivalent distance ordering.
+                        const auto blendA = minimum ? a : -a;
+                        const auto blendB = minimum || cut ? b : -b;
+                        const auto firstWeight = std::clamp (
+                            0.5 + 0.5 * (blendB - blendA) / p[0], 0.0, 1.0);
+                        *contributor = firstWeight >= 0.5 ? firstId : secondId;
+                    }
+                    else
+                        *contributor = (minimum ? a <= b : a >= (cut ? -b : b)) ? firstId : secondId;
+                }
+                if (op == videowire::SdfOperation::unionOp) return std::min (a, b);
+                if (op == videowire::SdfOperation::intersection) return std::max (a, b);
+                if (op == videowire::SdfOperation::subtraction) return std::max (a, -b);
+                if (op == videowire::SdfOperation::smoothUnion) return smoothUnion (a, b, p[0]);
+                if (op == videowire::SdfOperation::smoothIntersection) return -smoothUnion (-a, -b, p[0]);
+                return -smoothUnion (-a, b, p[0]);
+            }
             case videowire::SdfOperation::translate:
                 return child (0, point - Point3 { p[0], p[1], p[2] });
             case videowire::SdfOperation::rotate:
@@ -235,10 +264,208 @@ public:
 private:
     std::unordered_map<videowire::SdfStableId, const videowire::SdfRecord*> records;
 };
+
+void validateOutputControls (const NativeSdfRenderControls& controls)
+{
+    if (controls.normalQuality >= arbitgpu::NativeSdfQuality::count
+        || controls.shadowQuality >= arbitgpu::NativeSdfQuality::count
+        || controls.adaptiveQuality >= arbitgpu::NativeSdfQuality::count
+        || controls.output >= arbitgpu::NativeSdfOutput::count
+        || controls.maximumSteps == 0 || controls.maximumSteps > 512
+        || ! std::isfinite (controls.epsilon) || controls.epsilon < 1.0e-6 || controls.epsilon > 0.1
+        || ! std::isfinite (controls.maximumDistance)
+        || controls.maximumDistance < controls.epsilon || controls.maximumDistance > 1000.0)
+        throw std::invalid_argument ("SDF output oracle requires valid bounded controls");
+}
+
+class OutputEvaluator final
+{
+public:
+    OutputEvaluator (const AdmittedSdfIr& geometry, const NativeSdfRenderControls& settings)
+        : field (geometry), root (geometry.rootId()), controls (settings) {}
+
+    double distance (Point3 p) const { return field.at (root, p); }
+    static double qualityScale (arbitgpu::NativeSdfQuality q)
+    {
+        constexpr double scales[] { 4.0, 2.0, 1.0, 0.5 };
+        return scales[static_cast<unsigned> (q)];
+    }
+    Point3 normal (Point3 p) const
+    {
+        const auto e = std::max (controls.epsilon * qualityScale (controls.normalQuality), 1.0e-6);
+        Point3 gradient {
+            distance (p + Point3 {e,0,0}) - distance (p - Point3 {e,0,0}),
+            distance (p + Point3 {0,e,0}) - distance (p - Point3 {0,e,0}),
+            distance (p + Point3 {0,0,e}) - distance (p - Point3 {0,0,e}) };
+        const auto squared = dot (gradient, gradient);
+        return squared > 0.0 && std::isfinite (squared) ? normalized (gradient) : Point3 {0,0,1};
+    }
+    double curvature (Point3 p) const
+    {
+        const auto h = std::max ({controls.epsilon * qualityScale (controls.normalQuality) * 4.0,
+                                 0.002, length (p) * 0.0001});
+        const auto divergence = normal (p + Point3 {h,0,0}).x - normal (p - Point3 {h,0,0}).x
+            + normal (p + Point3 {0,h,0}).y - normal (p - Point3 {0,h,0}).y
+            + normal (p + Point3 {0,0,h}).z - normal (p - Point3 {0,0,h}).z;
+        const auto value = divergence / (4.0 * h);
+        return std::isfinite (value) ? std::clamp (value, -1.0/h, 1.0/h) : 0.0;
+    }
+    double ambient (Point3 p, Point3 n) const
+    {
+        const auto count = 4u + 4u * static_cast<unsigned> (controls.normalQuality);
+        const auto radius = std::min (controls.maximumDistance, std::max (0.5, 32.0*controls.epsilon));
+        double occlusion = 0.0, total = 0.0, weight = 1.0;
+        for (unsigned i = 0; i < count; ++i)
+        {
+            const auto reach = radius * (i+1) / count;
+            const auto d = distance (p + n * reach);
+            if (! std::isfinite (d)) return 0.0;
+            occlusion += weight * std::clamp (1.0 - d/reach, 0.0, 1.0);
+            total += weight;
+            weight *= 0.75;
+        }
+        return std::clamp (1.0 - occlusion/total, 0.0, 1.0);
+    }
+    double shadow (Point3 p, Point3 n) const
+    {
+        const auto light = normalized ({-0.45,0.75,0.6});
+        if (dot (n, light) <= 0.0) return 0.0;
+        const auto origin = p + n * (controls.epsilon * 4.0);
+        const auto limit = 8u << static_cast<unsigned> (controls.shadowQuality);
+        double travel = controls.epsilon * 4.0, visibility = 1.0;
+        for (unsigned step = 0; step < limit; ++step)
+        {
+            const auto d = distance (origin + light * travel);
+            if (! std::isfinite (d) || d < controls.epsilon) return 0.0;
+            visibility = std::min (visibility, 12.0*d/std::max (travel, controls.epsilon));
+            travel += std::clamp (d, controls.epsilon * 2.0, 0.25);
+            if (travel > std::min (controls.maximumDistance, 8.0)) break;
+        }
+        return std::clamp (visibility, 0.0, 1.0);
+    }
+    bool trace (Point3 direction, double& travel) const
+    {
+        travel = 0.0;
+        for (unsigned step = 0; step < controls.maximumSteps && step < 512; ++step)
+        {
+            if (travel > controls.maximumDistance) break;
+            const auto d = distance (Point3 {0,0,3} + direction * travel);
+            if (! std::isfinite (d)) break;
+            const auto threshold = std::max (controls.epsilon * qualityScale (controls.adaptiveQuality)
+                * std::max (1.0, travel * 0.05), 1.0e-6);
+            if (d <= threshold) return true;
+            travel += d;
+        }
+        return false;
+    }
+    double edgeDistance (double u, double v, std::uint32_t height) const
+    {
+        constexpr std::array<std::array<double, 2>, 8> axes {{
+            {{1,0}},{{-1,0}},{{0,1}},{{0,-1}},
+            {{0.70710678,0.70710678}},{{-0.70710678,0.70710678}},
+            {{0.70710678,-0.70710678}},{{-0.70710678,-0.70710678}} }};
+        double nearest = 8.0;
+        for (const auto& axis : axes)
+        {
+            const auto hitAt = [&] (double pixels)
+            {
+                double travel;
+                return trace (normalized ({u + axis[0]*pixels*2.0/height,
+                                            v + axis[1]*pixels*2.0/height, -1.8}), travel);
+            };
+            double low = 0.0, high = 8.0;
+            if (hitAt (high)) continue;
+            for (unsigned iteration = 0; iteration < 4; ++iteration)
+            {
+                const auto middle = (low + high) * 0.5;
+                if (hitAt (middle)) low = middle;
+                else high = middle;
+            }
+            nearest = std::min (nearest, high);
+        }
+        return nearest;
+    }
+    std::array<double, 4> pixel (std::uint32_t width, std::uint32_t height, double x, double y) const
+    {
+        const auto u = (2.0*(x+0.5) - width)/height;
+        const auto v = (2.0*(y+0.5) - height)/height;
+        const auto direction = normalized ({u,v,-1.8});
+        double travel;
+        const bool hit = trace (direction, travel);
+        using Output = arbitgpu::NativeSdfOutput;
+        const auto gray = [] (double value) { return std::array<double,4> {value,value,value,1.0}; };
+        if (! hit)
+        {
+            if (controls.output >= Output::materialId) return gray (0.0);
+            if (controls.output == Output::depth) return gray (1.0);
+            return {0.02745,0.03922,0.07059,1.0};
+        }
+        const auto point = Point3 {0,0,3} + direction * travel;
+        if (controls.output == Output::depth) return gray (std::clamp (travel/controls.maximumDistance,0.0,1.0));
+        if (controls.output == Output::materialId)
+        {
+            // Independent 64-bit visualization oracle; no native program or
+            // native color helper is consulted here.
+            videowire::SdfStableId id = 0;
+            field.at (root, point, &id);
+            id = (id ^ (id >> 30u)) * UINT64_C(0xbf58476d1ce4e5b9);
+            id = (id ^ (id >> 27u)) * UINT64_C(0x94d049bb133111eb);
+            const auto color = static_cast<std::uint32_t> (id ^ (id >> 31u)) | 0x00202020u;
+            return {(color & 255u)/255.0, ((color >> 8u) & 255u)/255.0,
+                    ((color >> 16u) & 255u)/255.0, 1.0};
+        }
+        if (controls.output == Output::curvature)
+        {
+            const auto h = curvature (point);
+            return gray (0.5 + 0.5*h/(1.0+std::abs (h)));
+        }
+        if (controls.output == Output::edgeDistance) return gray (edgeDistance (u,v,height)/8.0);
+        const auto n = normal (point);
+        if (controls.output == Output::normal) return {n.x*0.5+0.5,n.y*0.5+0.5,n.z*0.5+0.5,1.0};
+        if (controls.output == Output::ambientOcclusion) return gray (ambient (point,n));
+        if (controls.output == Output::softShadow) return gray (shadow (point,n));
+        const auto diffuse = std::max (dot (n, normalized ({-0.45,0.75,0.6})),0.0);
+        const auto rim = std::pow (1.0-std::max (dot (n,direction*-1.0),0.0),3.0);
+        const auto shaded = 0.12+0.88*diffuse*shadow (point,n);
+        return {0.12*shaded+0.18*rim,0.42*shaded+0.35*rim,0.88*shaded+0.65*rim,1.0};
+    }
+private:
+    Evaluator field;
+    videowire::SdfStableId root;
+    const NativeSdfRenderControls& controls;
+};
 } // namespace
 
 double evaluatePoint (const AdmittedSdfIr& geometry, Point3 point)
 {
     return Evaluator (geometry).at (geometry.rootId(), point);
+}
+
+PointSample evaluateSample (const AdmittedSdfIr& geometry, Point3 point)
+{
+    PointSample result;
+    result.distance = Evaluator (geometry).at (geometry.rootId(), point, &result.primitiveId);
+    return result;
+}
+
+SurfaceSample evaluateSurface (const AdmittedSdfIr& geometry, Point3 point,
+                               const NativeSdfRenderControls& controls)
+{
+    validateOutputControls (controls);
+    const OutputEvaluator evaluator (geometry, controls);
+    const auto normal = evaluator.normal (point);
+    return {normal, evaluator.curvature (point), evaluator.ambient (point,normal),
+            evaluator.shadow (point,normal)};
+}
+
+std::array<double, 4> evaluateOutputPixel (const AdmittedSdfIr& geometry,
+                                        const NativeSdfRenderControls& controls,
+                                        std::uint32_t width, std::uint32_t height,
+                                        double x, double y)
+{
+    validateOutputControls (controls);
+    if (width == 0 || height == 0 || ! std::isfinite (x) || ! std::isfinite (y))
+        throw std::invalid_argument ("SDF output oracle requires valid controls and extent");
+    return OutputEvaluator (geometry,controls).pixel (width,height,x,y);
 }
 } // namespace videohelper::sdf::reference

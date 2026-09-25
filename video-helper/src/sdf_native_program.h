@@ -13,6 +13,19 @@
 
 namespace videohelper::sdf
 {
+// Material ID is an RGB diagnostic on the existing Image port, not a raw ID
+// attachment. Hash the full primitive stable ID, never a draw/record index.
+// The three low bytes are R,G,B; the fixed bits keep black reserved for misses.
+inline std::uint32_t nativeSdfMaterialColorCode (videowire::SdfStableId id) noexcept
+{
+    id ^= id >> 30u;
+    id *= UINT64_C(0xbf58476d1ce4e5b9);
+    id ^= id >> 27u;
+    id *= UINT64_C(0x94d049bb133111eb);
+    id ^= id >> 31u;
+    return (static_cast<std::uint32_t> (id) & 0x00ffffffu) | 0x00202020u;
+}
+
 inline std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram> compileNativeSdfProgram (
     const videowire::SdfIr& source, std::string& error)
 {
@@ -36,6 +49,7 @@ inline std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram> compileNativeSd
     for (const auto& sourceRecord : admitted->records())
     {
         arbitgpu::NativeSdfCompiledRecord record;
+        record.stableId = sourceRecord.stableId;
         record.operation = static_cast<std::uint32_t> (sourceRecord.operation);
         record.parameterCount = sourceRecord.parameterCount;
         if (sourceRecord.inputCount > 0) record.input0 = indices.at (sourceRecord.inputs[0]);
@@ -103,7 +117,8 @@ inline bool validateNativeSdfProgram (
     for (std::size_t index = 0; index < program.records().size(); ++index)
     {
         const auto& record = program.records()[index];
-        if (record.operation < static_cast<std::uint32_t> (videowire::SdfOperation::sphere)
+        if (record.stableId == 0
+            || record.operation < static_cast<std::uint32_t> (videowire::SdfOperation::sphere)
             || record.operation > static_cast<std::uint32_t> (videowire::SdfOperation::domainWarp))
         {
             error = "native GPU SDF compiled payload has an invalid operation";
@@ -207,7 +222,8 @@ inline bool validateNativeSdfProgram (
     {
         const auto& sourceRecord = admitted->records()[index];
         const auto& record = program.records()[index];
-        if (record.operation != static_cast<std::uint32_t> (sourceRecord.operation)
+        if (record.stableId != sourceRecord.stableId
+            || record.operation != static_cast<std::uint32_t> (sourceRecord.operation)
             || record.parameterCount != sourceRecord.parameterCount
             || (sourceRecord.inputCount > 0 && record.input0 != indices.at (sourceRecord.inputs[0]))
             || (sourceRecord.inputCount > 1 && record.input1 != indices.at (sourceRecord.inputs[1])))

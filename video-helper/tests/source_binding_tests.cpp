@@ -74,6 +74,21 @@ int main()
     check (videowire::resolveTransitionFrom (segments, segments[1]) == &segments[0],
            "legacy transition falls back to previous overlapping track segment");
 
-    std::printf ("source-binding: %d/13 checks passed\n", 13 - failures);
+    std::vector<Segment> splitClip {
+        { 40, 0, 2.0, 4.0, 1.0, 5.0, -1, -1 },
+        { 40, 0, 8.0, 12.0, 2.0, 7.0, -1, -1 },
+    };
+    const auto* firstSplit = videowire::resolveClipSegmentAtDisplayTime(splitClip, 40, 6.0);
+    const auto* secondSplit = videowire::resolveClipSegmentAtDisplayTime(splitClip, 40, 7.5);
+    check (firstSplit == &splitClip[0]
+               && firstSplit->inSec + (6.0 - firstSplit->displayStartSec) * firstSplit->rate == 3.0,
+           "Layer Source resolves the exact first trim segment at display time");
+    check (secondSplit == &splitClip[1]
+               && secondSplit->inSec + (7.5 - secondSplit->displayStartSec) * secondSplit->rate == 9.0,
+           "Layer Source resolves the exact speed-ramp segment at display time");
+    check (videowire::resolveClipSegmentAtDisplayTime(splitClip, 40, 9.0) == nullptr,
+           "Layer Source rejects a referenced clip outside every saved display segment");
+
+    std::printf ("source-binding: %d/16 checks passed\n", 16 - failures);
     return failures;
 }

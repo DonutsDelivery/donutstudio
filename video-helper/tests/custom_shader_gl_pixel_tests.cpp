@@ -1,6 +1,8 @@
 #include "flat_shader_bridge.h"
 #include "gl_loader.h"
 #include "renderer.h"
+#include "render_snapshot.h"
+#include "../../shared/BuiltinGeneratorShader.h"
 
 #include <GLFW/glfw3.h>
 
@@ -82,6 +84,15 @@ videowire::ShaderOperation curatedGenerator(int nodeId, const std::string& sourc
     value.customGrant.reset();
     value.payload.catalogPackId = "donutstudio-3d-raymarch-v1";
     value.payload.catalogProgramId = "fractal-bass-temple";
+    const auto* catalog = shadercatalog::find(value.payload.catalogPackId, value.payload.catalogProgramId);
+    if (catalog != nullptr)
+    {
+        std::string error;
+        value.payload.parameters = shadercatalog::defaultParameterWire(*catalog);
+        shadercatalog::validateParameterWire(*catalog, value.payload.parameters,
+                                             value.payload.parameterValues, error);
+        value.generatedParameters = value.payload.parameterValues;
+    }
     return value;
 }
 
@@ -191,14 +202,32 @@ bool templePixelsHaveContent(const std::vector<std::uint8_t>& pixels)
     }
     const bool spatiallyNonuniform = maximum[0] - minimum[0] >= 20
         || maximum[1] - minimum[1] >= 20 || maximum[2] - minimum[2] >= 20;
+    std::size_t structuredRows = 0;
+    for (std::size_t y = 0; y < kTempleHeight; ++y)
+    {
+        std::array<std::uint8_t, 3> rowMinimum {255, 255, 255}, rowMaximum {};
+        for (std::size_t x = 0; x < kTempleWidth; ++x)
+            for (std::size_t channel = 0; channel < 3; ++channel)
+            {
+                const auto value = pixels[(y * kTempleWidth + x) * 4 + channel];
+                rowMinimum[channel] = std::min(rowMinimum[channel], value);
+                rowMaximum[channel] = std::max(rowMaximum[channel], value);
+            }
+        if (rowMaximum[0] - rowMinimum[0] >= 12 || rowMaximum[1] - rowMinimum[1] >= 12
+            || rowMaximum[2] - rowMinimum[2] >= 12) ++structuredRows;
+    }
+    // The previous broken SDF rendered only its vertical sky gradient. A colour
+    // range or nonblack-count assertion alone mistakenly accepted that output.
+    const bool hasGeometry = structuredRows >= kTempleHeight / 5;
     const auto minimumCoveredPixels =
         static_cast<std::size_t>(kTempleWidth * kTempleHeight * 3 / 4);
-    if (nonBlack < minimumCoveredPixels || !spatiallyNonuniform)
+    if (nonBlack < minimumCoveredPixels || !spatiallyNonuniform || !hasGeometry)
         std::cerr << "Temple coverage=" << nonBlack << " ranges="
                   << static_cast<int>(maximum[0] - minimum[0]) << ','
                   << static_cast<int>(maximum[1] - minimum[1]) << ','
-                  << static_cast<int>(maximum[2] - minimum[2]) << '\n';
-    return nonBlack >= minimumCoveredPixels && spatiallyNonuniform;
+                  << static_cast<int>(maximum[2] - minimum[2])
+                  << " structuredRows=" << structuredRows << '\n';
+    return nonBlack >= minimumCoveredPixels && spatiallyNonuniform && hasGeometry;
 }
 
 std::string readTextFile(const std::string& path)
@@ -540,8 +569,91 @@ int main()
     ok &= check(preview.compositorBackend() == "opengl",
                 "OpenGL fixture reports the OpenGL compositor backend");
 #endif
-    ok &= check(pixelNear(chainPixels, { 25, 0, 0, 255 }),
+    // Reverse 0.25 gives 0.75. The contract's cubic ease-in-out gives
+    // 1 - (2 - 2*0.75)^3/2 = 0.9375. Mixing (0.1,0.2,0.3) with
+    // (204,26,13)/255, then filtering, gives (39.28125,48.2109375,12.7265625).
+    ok &= check(pixelNear(chainPixels, { 39, 48, 13, 255 }),
                 "generator, two-source reverse ease-in-out transition, and filter execute once in order");
+
+    {
+        const auto camera = operation(videowire::ShaderOperationKind::generator, 79, 79,
+            "void mainImage(out vec4 c,in vec2 p){vec3 ro,rd;"
+            "arbitCameraRay(vec2(0.5*uResolution.x,uResolution.y),ro,rd);"
+            "c=vec4(degrees(atan(rd.y,-rd.z))/90.0,ro.z/10.0,length(rd)/2.0,1.0);}", 79);
+        std::vector<std::uint8_t> cameraPixels;
+        ok &= checkRender(preview, layerFor(79, finishPlan({ camera }, 79)),
+                          cameraPixels, error, "default shader camera ray renders");
+        // A 45-degree vertical field puts the upper edge 22.5 degrees above
+        // forward. The previous half-sized image plane produced only 11.7 degrees.
+        ok &= check(pixelNear(cameraPixels, { 64, 128, 128, 255 }, 2),
+                    "shader camera preserves its vertical field of view, eye, and unit ray");
+    }
+
+    {
+        const auto animated = operation(videowire::ShaderOperationKind::generator,94,94,
+            "void mainImage(out vec4 c,in vec2 p){c=vec4(clamp(uTime,0.0,1.0),0.2,0.3,1.0);}",94);
+        auto post = filter; post.nodeId = post.outputNodeId = 95; post.inputNodeIds = {94,0};
+        const auto framePlan = finishPlan({animated,post},94);
+        auto frameLayer = layerFor(94,framePlan);
+        auto first = preview.leaseShaderFrame(frameLayer,error);
+        frameLayer.shaderClock.timeSec = 1;
+        auto later = preview.leaseShaderFrame(frameLayer,error);
+        frameLayer.shaderClock.timeSec = 0;
+        auto sought = preview.leaseShaderFrame(frameLayer,error);
+        ok &= check(arbitgpu::validMaterialFrameTexture(first) && arbitgpu::validMaterialFrameTexture(later)
+            && arbitgpu::validMaterialFrameTexture(sought),"generated and filtered material Frames return owned native leases");
+        const auto readLease = [&](const auto& image) {
+            std::vector<std::uint8_t> pixels;
+            if (!image) return pixels;
+            videorender::LayerDesc native;
+            native.clipId = 96; native.texWidth = image->width(); native.texHeight = image->height();
+            native.nativeTextureBackend = image->backend(); native.nativeTextureView = image->colorTextureViewHandle();
+            native.nativeTextureDescriptor = image->colorTextureDescriptor(); native.nativeTextureOwner = image;
+            if (image->backend() == "opengl") native.texture = static_cast<unsigned>(native.nativeTextureView);
+            if (!preview.renderToPixels(&native,1,pixels,error)) {
+                std::cerr << "Native lease readback failed: " << error << '\n';
+                pixels.clear();
+            }
+            return pixels;
+        };
+        const auto a = readLease(first), b = readLease(later), c = readLease(sought);
+        ok &= check(!a.empty() && !b.empty() && a != b && a == c,
+            "material shader leases retain earlier pixels after subsequent timeline draws and seek replay");
+        auto decoded = preview.leaseRgbaTexture(sourceTexture,kWidth,kHeight,error);
+        auto decodeFilter = filter; decodeFilter.nodeId = decodeFilter.outputNodeId = 97; decodeFilter.inputNodeIds = {98,0};
+        auto filtered = layerFor(97,finishPlan({decodeFilter},97));
+        if (decoded) {
+            filtered.nativeTextureBackend = decoded->backend(); filtered.nativeTextureView = decoded->colorTextureViewHandle();
+            filtered.nativeTextureDescriptor = decoded->colorTextureDescriptor(); filtered.nativeTextureOwner = decoded;
+            if (decoded->backend() == "opengl") filtered.texture = static_cast<unsigned>(filtered.nativeTextureView);
+        }
+        auto filteredFrame = preview.leaseShaderFrame(filtered,error);
+        ok &= check(arbitgpu::validMaterialFrameTexture(filteredFrame) && !readLease(filteredFrame).empty(),
+            "shader Frame filters consume an owned decoded source without borrowing a mutable upload handle");
+        auto declared = preview.leaseDecodedFrame(sourceTexture,kWidth,kHeight,
+            {colortransform::ColorSpace::Rec709,colortransform::TransferFunction::Rec709},error);
+        ok &= check(arbitgpu::materialFrameIsSrgb(declared) && !readLease(declared).empty()
+            && readLease(declared) != readLease(decoded),
+            "decoded Rec709 transfer is converted natively before a declared sRGB Surface Frame is published");
+        ok &= check(!preview.leaseDecodedFrame(sourceTexture,kWidth,kHeight,
+            {colortransform::ColorSpace::Rec2020,colortransform::TransferFunction::PQ},error),
+            "PQ cannot silently pass through the SDR decoded texture lease");
+        visualtemporaloperation::Payload temporal;
+        temporal.mode = visualtemporaloperation::Mode::echo; temporal.historyLength = 2;
+        temporal.decay = 0; temporal.zoom = 1;
+        auto blendA = preview.leaseTemporalFrame(first,later,temporal,0.25f,error);
+        auto blendB = preview.leaseTemporalFrame(first,later,temporal,0.75f,error);
+        auto blendAgain = preview.leaseTemporalFrame(first,later,temporal,0.25f,error);
+        ok &= check(arbitgpu::materialFrameIsSrgb(blendA) && !readLease(blendA).empty()
+            && readLease(blendA) != readLease(blendB) && readLease(blendA) == readLease(blendAgain),
+            "temporal Frame intermediates have isolated owned leases and deterministic native replay");
+        temporal.mode = visualtemporaloperation::Mode::frameDelay;
+        auto startup = preview.leaseTemporalFrame(first,{},temporal,0,error);
+        std::vector<std::uint8_t> emptyCanvas;
+        preview.renderToPixels(nullptr,0,emptyCanvas,error);
+        ok &= check(startup && !emptyCanvas.empty() && readLease(startup) == emptyCanvas,
+            "Frame Delay initializes unavailable clip history as transparent on both native backends");
+    }
 
     const auto templeSource = readFile(
         std::string(ARBIT_SHADER_PACK_ROOT)
@@ -569,11 +681,116 @@ int main()
                 "Raymarched Temple returns one complete bounded RGBA frame");
     ok &= check(templePixelsHaveContent(templePreviewPixels),
                 "Raymarched Temple has opaque nonblack coverage and spatially nonuniform RGB");
-    const auto templePixelDigest = pixelSha256(templePreviewPixels);
-    if (templePixelDigest != "c062d7635faec31f88fad2617eb4f27a8ea6faa419bcc1addd1c437b7a3dd60c")
-        std::cerr << "Temple pixel digest: " << templePixelDigest << '\n';
-    ok &= check(templePixelDigest == "c062d7635faec31f88fad2617eb4f27a8ea6faa419bcc1addd1c437b7a3dd60c",
-                "Raymarched Temple matches the independent native pixel fixture digest");
+    std::cout << "Temple pixel digest (diagnostic only): "
+              << pixelSha256(templePreviewPixels) << '\n';
+
+    {
+        constexpr int framingWidth = 64, framingHeight = 36;
+        videorender::FrameRenderer framingRenderer;
+        ok &= check(framingRenderer.initialize(&gl, framingWidth, framingHeight, error,
+#if defined(ARBIT_STRICT_METAL_FIXTURE)
+                                               true
+#else
+                                               false
+#endif
+                                               ), "temple framing renderer initializes");
+        auto framingLayer = templePreviewLayer;
+        framingLayer.texWidth = framingWidth;
+        framingLayer.texHeight = framingHeight;
+        framingLayer.audioPresent = true;
+        framingLayer.audioFeatures.onsetAge = 1.0f;
+        std::vector<std::uint8_t> framingPixels;
+        ok &= checkRender(framingRenderer, framingLayer, framingPixels, error,
+                          "temple renders at the editor's 16:9 aspect ratio");
+        const bool completeFrame = framingPixels.size() == framingWidth * framingHeight * 4u;
+        ok &= check(completeFrame, "temple framing fixture returns every pixel");
+        // Framing only; the separate cavity probes below test the carved shape.
+        // Independently evaluated sky rays and the front-plane intersection at
+        // t=3.547675, with no transient light. The two side rays must miss the
+        // finite block; the old 23.4-degree view hit its wall at all five points.
+        constexpr std::array<std::array<int, 5>, 5> samples {{
+            { 0, 0, 54, 60, 79 }, { 63, 0, 54, 60, 79 },
+            { 0, 18, 42, 46, 61 }, { 32, 18, 72, 76, 89 }, { 63, 18, 42, 46, 61 }
+        }};
+        if (completeFrame)
+            for (const auto& sample : samples)
+            {
+                const auto offset = (static_cast<std::size_t>(sample[1]) * framingWidth
+                                     + sample[0]) * 4u;
+                bool matches = framingPixels[offset + 3] == 255;
+                for (std::size_t channel = 0; channel < 3; ++channel)
+                    matches &= std::abs(static_cast<int>(framingPixels[offset + channel])
+                                        - sample[channel + 2]) <= 3;
+                if (!matches)
+                    std::cerr << "Temple framing mismatch at " << sample[0] << ',' << sample[1] << '\n';
+                ok &= check(matches, "temple framing separates the finite stone face from its sky");
+            }
+        framingRenderer.shutdown();
+    }
+
+    {
+        constexpr int cavityWidth = 128, cavityHeight = 72;
+        videorender::FrameRenderer cavityRenderer;
+        ok &= check(cavityRenderer.initialize(&gl, cavityWidth, cavityHeight, error,
+#if defined(ARBIT_STRICT_METAL_FIXTURE)
+                                              true
+#else
+                                              false
+#endif
+                                              ), "temple cavity renderer initializes");
+        auto cavityLayer = templePreviewLayer;
+        cavityLayer.texWidth = cavityWidth;
+        cavityLayer.texHeight = cavityHeight;
+        cavityLayer.shaderClock = videorender::ShaderClock {};
+        cavityLayer.audioPresent = true;
+        cavityLayer.audioFeatures.onsetAge = 1.0f;
+        std::vector<std::uint8_t> cavityPixels;
+        ok &= checkRender(cavityRenderer, cavityLayer, cavityPixels, error,
+                          "temple renders its carved opening without a transient pulse");
+        const bool completeFrame = cavityPixels.size() == cavityWidth * cavityHeight * 4u;
+        ok &= check(completeFrame, "temple cavity fixture returns every pixel");
+
+        // At time/beat zero the opening is |x|<0.32, |y-0.30|<0.2304.
+        // Let f=tan(22.5 degrees). Normalize ((2*x+1-128)*f/72, (71-2*y)*f/72, -1)
+        // for each ray from (0,0,5). These rays enter the front at z=1.45,
+        // then reach x=-0.32, x=0.32, or y=0.5304 before the interior cells,
+        // whose frontmost z is (1.12+1.45)/2.35. Plane distances are 3.735744,
+        // 3.735744, and 3.725844; inward normals are +X, -X, and -Y.
+        // The shader's stone lighting, fog, and gamma give the pinned RGB below.
+        // Sky-only and uncarved-front RGB are independent counterfactual values.
+        struct CavityProbe
+        {
+            int x, y;
+            std::array<int, 3> carved, sky, solid;
+        };
+        constexpr std::array<CavityProbe, 3> probes {{
+            { 56, 28, { 82, 87, 101 }, { 46, 51, 67 }, { 72, 77, 90 } },
+            { 71, 28, { 57, 60, 71 }, { 46, 51, 67 }, { 72, 77, 90 } },
+            { 63, 23, { 30, 32, 41 }, { 49, 54, 71 }, { 72, 77, 90 } }
+        }};
+        if (completeFrame)
+            for (const auto& probe : probes)
+            {
+                const auto offset = (static_cast<std::size_t>(probe.y) * cavityWidth + probe.x) * 4u;
+                const auto matches = [&](const std::array<int, 3>& expected)
+                {
+                    if (cavityPixels[offset + 3] != 255) return false;
+                    for (std::size_t channel = 0; channel < 3; ++channel)
+                        if (std::abs(static_cast<int>(cavityPixels[offset + channel])
+                                     - expected[channel]) > 3) return false;
+                    return true;
+                };
+                if (!matches(probe.carved))
+                    std::cerr << "Temple cavity mismatch at " << probe.x << ',' << probe.y
+                              << ": " << static_cast<int>(cavityPixels[offset]) << ','
+                              << static_cast<int>(cavityPixels[offset + 1]) << ','
+                              << static_cast<int>(cavityPixels[offset + 2]) << '\n';
+                ok &= check(matches(probe.carved), "temple cavity matches its analytic wall normal and lighting");
+                ok &= check(!matches(probe.sky), "temple cavity cannot pass as a sky-only gradient");
+                ok &= check(!matches(probe.solid), "temple cavity cannot pass as an uncarved solid box");
+            }
+        cavityRenderer.shutdown();
+    }
 
     videorender::FrameRenderer secondRenderer;
     ok &= check(secondRenderer.initialize(&gl, kTempleWidth, kTempleHeight, error,
@@ -653,7 +870,8 @@ int main()
     auto skippedLayer = layerFor(32, skippedFilter, sourceTexture);
     std::vector<std::uint8_t> skippedPixels;
     ok &= checkRender(preview, skippedLayer, skippedPixels, error, "skipped control renders");
-    ok &= check(pixelNear(skippedPixels, { 31, 3, 10, 255 }),
+    // The generator alone through the filter is (0.2,0.025,0.225) * 255.
+    ok &= check(pixelNear(skippedPixels, { 51, 6, 57, 255 }),
                 "control fixture distinguishes a skipped transition");
 
     auto duplicate = filter;
@@ -905,6 +1123,100 @@ void main() {
             ok &= check(!pixelsNear(previewPixels, plainDissolve, 7),
                         "Cross Zoom pixels reject a plain dissolve implementation");
         }
+    }
+
+    // Resolve an overlapping raw gradient through the production source lookup,
+    // then render each starter with independent preview and export shader owners.
+    {
+        constexpr int generatorClip = 590;
+        videowire::RenderSegment outgoing;
+        outgoing.clipId = generatorClip;
+        outgoing.sourceKind = videowire::SourceKind::Shader;
+        outgoing.sourcePath = "gen://shader";
+        outgoing.outSec = 3.0;
+        outgoing.shaderSource =
+            "void mainImage(out vec4 o, in vec2 fc){\n"
+            "  vec2 uv = fc / uResolution;\n"
+            "  float t = clamp(dot(uv - vec2(0.5), vec2(1.000000,0.000000)) + 0.5, 0.0, 1.0);\n"
+            "  o = mix(vec4(0.800000,0.200000,0.101961,1.000000), "
+            "vec4(0.101961,0.600000,0.901961,1.000000), t);\n}";
+        ok &= check(builtingeneratorshader::validSource("gradient", outgoing.shaderSource),
+                    "native fixture uses the admitted application gradient template");
+        auto incoming = outgoing;
+        incoming.clipId = 600;
+        incoming.sourceKind = videowire::SourceKind::Media;
+        incoming.sourcePath = "incoming-fixture.mkv";
+        incoming.shaderSource.clear();
+        incoming.outSec = 4.0;
+        const std::vector<videowire::RenderSegment> segments { outgoing, incoming };
+        const auto* source = videowire::resolveClipSegmentAtDisplayTime(segments, generatorClip, 0.5);
+        ok &= check(source == &segments[0], "overlap lookup retains the exact outgoing generator clip");
+        ok &= check(videowire::resolveClipSegmentAtDisplayTime(segments, generatorClip, 3.0) == nullptr
+                    && videowire::resolveClipSegmentAtDisplayTime(segments, 591, 0.5) == nullptr,
+                    "missing or expired Layer Source cannot borrow the still-active incoming clip");
+        std::array<std::uint8_t, kWidth * kHeight * 4> generatedPixels {};
+        for (int y = 0; y < kHeight; ++y)
+            for (int x = 0; x < kWidth; ++x)
+            {
+                const double t = (x + 0.5) / kWidth;
+                const auto offset = static_cast<std::size_t>((y * kWidth + x) * 4);
+                generatedPixels[offset] = channelByte((204.0 * (1.0 - t) + 26.0 * t) / 255.0);
+                generatedPixels[offset + 1] = channelByte((51.0 * (1.0 - t) + 153.0 * t) / 255.0);
+                generatedPixels[offset + 2] = channelByte((26.0 * (1.0 - t) + 230.0 * t) / 255.0);
+                generatedPixels[offset + 3] = 255;
+            }
+        std::uint64_t revision = 700;
+        for (const auto& fixture : starterTransitions)
+        {
+            const auto transitionSource = readTextFile(std::string(ARBIT_SHADER_PACK_ROOT)
+                + "/vidvox-isf/ISF/" + fixture.file);
+            preview.clearClipShader(generatorClip);
+            exported.clearClipShader(generatorClip);
+            for (const double progress : {0.0, 0.5, 1.0})
+            {
+                error.clear();
+                const auto plan = curatedTransitionPlan(fixture.id, transitionSource, progress, 0.4,
+                                                        revision++, error);
+                ok &= check(plan != nullptr, "generated-source transition plan is admitted");
+                if (!plan || !source) continue;
+                videorender::LayerDesc from;
+                from.clipId = source->clipId;
+                from.shaderSource = true;
+                from.texWidth = kWidth;
+                from.texHeight = kHeight;
+                auto layer = layerFor(incoming.clipId, plan, previewPair[1]);
+                layer.shaderTransitionFromClipId = source->clipId;
+                from.shaderClock = layer.shaderClock;
+                layer.fromLayer = &from;
+                std::vector<std::uint8_t> actual, exportedPixels;
+                if (progress == 0.0)
+                {
+                    ok &= check(!render(preview, layer, actual, error)
+                                && error.find("startImage has no prepared frame from clip 590") != std::string::npos,
+                                "cold exact generator source fails with its identity before preparation");
+                    std::vector<videorender::GenParam> discovered;
+                    ok &= check(preview.setClipShader(source->clipId, source->shaderSource, error, discovered)
+                                && exported.setClipShader(source->clipId, source->shaderSource, error, discovered),
+                                "preview and export prepare the resolved raw generator through the production API");
+                }
+                ok &= checkRender(preview, layer, actual, error, "generated Layer Source produces a transition image");
+                const auto expected = transitionOracle(fixture.id, progress, 0.4, generatedPixels, toPixels);
+                ok &= check(pixelsNear(actual, expected, fixture.id == std::string("crosszoom") ? 7 : 4),
+                            "generated-source endpoints and midpoint match the independent pixel oracle");
+                auto exportedLayer = layer;
+                exportedLayer.texture = exportPair[1];
+                ok &= checkRender(exported, exportedLayer, exportedPixels, error,
+                                  "independent export owner renders the same raw Layer Source");
+                ok &= check(actual == exportedPixels, "raw generator transition preview and export pixels agree");
+                from.clipId = 591;
+                error.clear();
+                ok &= check(!render(preview, layer, actual, error)
+                            && error.find("startImage has no prepared frame from clip 591") != std::string::npos,
+                            "missing referenced generator cannot borrow another active clip's texture");
+            }
+        }
+        preview.clearClipShader(generatorClip);
+        exported.clearClipShader(generatorClip);
     }
 
     const unsigned exportTexture = exported.uploadRgba(sourcePixels.data(), kWidth, kHeight,

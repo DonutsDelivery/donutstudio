@@ -2,6 +2,7 @@
 #include "../../shared/ProgrammableRuntimeGrant.h"
 #include "../../shared/PrivateInheritedPayload.h"
 #include "../../shared/ShaderCatalogManifest.h"
+#include "../../shared/BuiltinGeneratorShader.h"
 #include <chrono>
 #include <mutex>
 #include <deque>
@@ -176,6 +177,13 @@ inline SessionVerifier& verifier() { static SessionVerifier value; return value;
 inline programmableruntime::PayloadKind identifyCatalogGpuPayload (
     const programmableruntime::Grant& grant, const std::string& payload, std::string& error)
 {
+    if (grant.catalogPackId == builtingeneratorshader::catalogPackId)
+    {
+        if (builtingeneratorshader::validSource(grant.catalogProgramId, payload))
+            return programmableruntime::PayloadKind::shader;
+        error = "built-in generator source differs from its bounded application template";
+        return programmableruntime::PayloadKind::invalid;
+    }
     const auto* entry = shadercatalog::find(grant.catalogPackId, grant.catalogProgramId);
     if (entry == nullptr)
     {

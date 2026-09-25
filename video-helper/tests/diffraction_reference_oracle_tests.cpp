@@ -469,7 +469,10 @@ int main()
                   == GrooveFieldMode::Linear,
           "Trading Card Foil nests coating, embossed spatial grooves, and a pattern mask");
     const auto lighting = AdmittedLightingPlan::admit(spatialFoil.lighting, error);
-    check(lighting && lighting->description().pathCount == 3
+    check(lighting && lighting->description().version == 2
+              && lighting->description().pathCount == 3
+              && lighting->description().bouncePlaneHeight == -1.0f
+              && lighting->description().bounceMaximumDistance == 20.0f
               && lighting->hasIndirectBounce(),
           "reference lighting admits bounded direct, environment, and one-bounce paths");
     double transportIncident = 0.0;

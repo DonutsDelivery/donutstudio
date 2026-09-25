@@ -45,6 +45,9 @@ namespace arbitgl
 #define ARBIT_GL33_FUNCS(X)                                          \
     X (PFNGLACTIVETEXTUREPROC,           ActiveTexture)              \
     X (PFNGLBLENDFUNCSEPARATEPROC,       BlendFuncSeparate)          \
+    X (PFNGLDISABLEIPROC,               Disablei)                   \
+    X (PFNGLENABLEIPROC,                Enablei)                    \
+    X (PFNGLISENABLEDIPROC,             IsEnabledi)                 \
     X (PFNGLGENBUFFERSPROC,              GenBuffers)                 \
     X (PFNGLBINDBUFFERPROC,              BindBuffer)                 \
     X (PFNGLBUFFERDATAPROC,              BufferData)                 \

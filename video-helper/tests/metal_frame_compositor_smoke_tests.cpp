@@ -2,6 +2,8 @@
 #include "gpu_backend/frame_renderer_metal.h"
 #include "renderer.h"
 #include "visual_plan_executor.h"
+#include "support/hdr_image_readback_checks.h"
+#include "support/sdf_display_oracle.h"
 
 #include <GLFW/glfw3.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -51,6 +53,61 @@ std::array<uint8_t, 4> readPixel (arbitgl::GlFuncs& gl, unsigned texture,
     gl.BindFramebuffer (GL_FRAMEBUFFER, 0);
     gl.DeleteFramebuffers (1, &fbo);
     return pixel;
+}
+
+bool sdfDisplay(videorender::MetalFrameRenderer& renderer, arbitgl::GlFuncs& gl,
+                IOSurfaceRef surface, std::string& error)
+{
+    using namespace videohelper::sdf;
+    NativeSdfRenderer native(arbitgpu::nativeSdfExecutionBackend());
+    renderer.setHdrImageCapture(false);
+    for (const std::uint8_t output : {std::uint8_t{0}, std::uint8_t{1}})
+        for (const auto use : {NativeSdfRenderUse::Preview, NativeSdfRenderUse::Export})
+        {
+            const auto plan = sdfdisplayoracle::plan(output);
+            videorender::LayerDesc layer;
+            std::vector<NativeSdfRenderedFrame> owners;
+            if (prepareVisualSdfLayer({plan}, plan.clipId, 64, 36, use, native, layer, owners, error)
+                    != VisualSdfPreparation::rendered || owners.size() != 1) return false;
+            auto source = owners.front().nativeFrame;
+            std::vector<float> rawBefore, rawAfter;
+            if (!source->readColorFloatPixels(rawBefore)) return false;
+            owners.clear();
+            const auto texture = renderer.renderComposite(&gl, &layer, 1, nullptr, 0);
+            if (!texture || !sdfdisplayoracle::verify([&](int x, int y) {
+                    return readPixel(gl, texture, x, y);
+                }, output == 1, error)) return false;
+            // Ordinary video export receives the same SDR IOSurface, without
+            // enabling HDR capture or relabelling the linear source texture.
+            if (!renderer.renderCompositeToIOSurface(&gl, surface, 64, 36, &layer, 1, nullptr, 0))
+            { error = renderer.lastError(); return false; }
+            IOSurfaceLock(surface, kIOSurfaceLockReadOnly, nullptr);
+            const auto* bytes = static_cast<const std::uint8_t*>(IOSurfaceGetBaseAddress(surface));
+            const auto stride = IOSurfaceGetBytesPerRow(surface);
+            const bool exportOk = bytes && sdfdisplayoracle::verify([&](int x, int y) {
+                const auto* pixel = bytes + y * stride + x * 4;
+                return std::array<std::uint8_t,4>{pixel[2], pixel[1], pixel[0], pixel[3]};
+            }, output == 1, error);
+            IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, nullptr);
+            if (!exportOk) return false;
+            renderer.setHdrImageCapture(true);
+            std::vector<float> hdr;
+            const bool captured = renderer.renderComposite(&gl, &layer, 1, nullptr, 0) != 0
+                && renderer.readLastCompositeFloat(hdr, error);
+            renderer.setHdrImageCapture(false);
+            if (!captured || hdr.size() != rawBefore.size()) return false;
+            for (std::size_t i = 0; i < hdr.size(); ++i)
+                if (std::abs(hdr[i] - rawBefore[i]) > 0.002f)
+                { error = "Metal SDF HDR capture used the display copy"; return false; }
+            if (!source->readColorFloatPixels(rawAfter) || rawAfter != rawBefore
+                || !arbitgpu::isLinearSceneColor(layer.nativeTextureDescriptor))
+            { error = "Metal SDF display mutated its half-float source"; return false; }
+            auto stale = layer;
+            ++stale.nativeTextureDescriptor.rendererGeneration;
+            if (renderer.renderComposite(&gl, &stale, 1, nullptr, 0) != 0)
+            { error = "Metal SDF display accepted a stale source generation"; return false; }
+        }
+    return true;
 }
 
 bool isRed (const std::array<uint8_t, 4>& pixel)
@@ -167,6 +224,32 @@ int main (int argc, char** argv)
     renderer.setCanvas (width, height);
     renderer.setPresentSize (width, height);
     renderer.setBackgroundColor (0, 0, 0, 1);
+
+    {
+        videorender::MetalFrameRenderer sdfRenderer;
+        if (!sdfRenderer.initialize(&gl, 64, 36, error)) return 1;
+        auto properties = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        setSurfaceInt(properties, kIOSurfaceWidth, 64);
+        setSurfaceInt(properties, kIOSurfaceHeight, 36);
+        setSurfaceInt(properties, kIOSurfaceBytesPerElement, 4);
+        setSurfaceInt(properties, kIOSurfacePixelFormat, static_cast<int32_t>('BGRA'));
+        const auto surface = IOSurfaceCreate(properties);
+        CFRelease(properties);
+        const bool passed = surface && sdfDisplay(sdfRenderer, gl, surface, error);
+        sdfRenderer.shutdown(&gl);
+        if (surface) CFRelease(surface);
+        if (!passed) { std::cerr << "SDF Metal SDR composition: " << error << '\n'; return 1; }
+    }
+
+    if (!hdrimagechecks::readback(renderer,
+            [&] { return renderer.renderComposite(&gl, nullptr, 0, nullptr, 0) != 0; }, error)
+        || !hdrimagechecks::sceneComposite(renderer, [&](const auto* layers, int count)
+            { return renderer.renderComposite(&gl, layers, count, nullptr, 0) != 0; }, error, width, height))
+    {
+        std::cerr << error << '\n';
+        renderer.shutdown(&gl); glfwDestroyWindow(window); glfwTerminate(); return 1;
+    }
 
     std::vector<uint8_t> red (static_cast<size_t> (width) * height * 4, 255);
     for (size_t i = 0; i < red.size(); i += 4)
@@ -689,8 +772,67 @@ int main (int argc, char** argv)
     setSurfaceInt (properties, kIOSurfacePixelFormat, static_cast<int32_t> ('BGRA'));
     IOSurfaceRef metalOnlySurface = IOSurfaceCreate (properties);
     CFRelease (properties);
-    if (metalOnlySurface == nullptr
-        || ! directRenderer.renderCompositeToIOSurface (
+    if (metalOnlySurface == nullptr)
+    {
+        std::cerr << "Metal-only compositor could not allocate its IOSurface\n";
+        return 1;
+    }
+
+    // Decoded RGBA rows and the GUI's imported IOSurface both start at image-top.
+    // Sample each quadrant of the actual direct target; a solid center sample
+    // cannot detect a vertical flip at the final Metal pass.
+    constexpr unsigned quadrantHandle = 0x80000004u;
+    std::vector<uint8_t> quadrants (static_cast<size_t> (width) * height * 4, 255);
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+        {
+            const size_t offset = (static_cast<size_t> (y) * width + x) * 4;
+            quadrants[offset] = (x < width / 2) == (y < height / 2) ? 255 : 0;
+            quadrants[offset + 1] = x >= width / 2 ? 255 : 0;
+            quadrants[offset + 2] = y >= height / 2 && x < width / 2 ? 255 : 0;
+        }
+    directRenderer.uploadRgba (quadrantHandle, quadrants.data(), width, height, width * 4);
+    videorender::LayerDesc quadrantLayer;
+    quadrantLayer.texture = quadrantHandle;
+    quadrantLayer.texWidth = width;
+    quadrantLayer.texHeight = height;
+    for (const bool canvas : { false, true })
+    {
+        directRenderer.setCanvas (canvas ? width : 0, canvas ? height : 0);
+        if (! directRenderer.renderCompositeToIOSurface (
+                nullptr, metalOnlySurface, width, height, &quadrantLayer, 1, nullptr, 0))
+        {
+            std::cerr << "Metal-only quadrant composition failed: "
+                      << directRenderer.lastError() << '\n';
+            return 1;
+        }
+        IOSurfaceLock (metalOnlySurface, kIOSurfaceLockReadOnly, nullptr);
+        const auto* quadrantBytes = static_cast<const uint8_t*> (
+            IOSurfaceGetBaseAddress (metalOnlySurface));
+        const size_t quadrantStride = IOSurfaceGetBytesPerRow (metalOnlySurface);
+        const auto sample = [&] (int x, int y)
+        {
+            const auto* bgra = quadrantBytes + static_cast<size_t> (y) * quadrantStride
+                                             + static_cast<size_t> (x) * 4;
+            return std::array<uint8_t, 4> { bgra[2], bgra[1], bgra[0], bgra[3] };
+        };
+        const bool oriented = quadrantBytes != nullptr
+            && isRed (sample (width / 4, height / 4))
+            && isGreen (sample (3 * width / 4, height / 4))
+            && isBlue (sample (width / 4, 3 * height / 4))
+            && isYellow (sample (3 * width / 4, 3 * height / 4));
+        IOSurfaceUnlock (metalOnlySurface, kIOSurfaceLockReadOnly, nullptr);
+        if (! oriented)
+        {
+            std::cerr << "Metal-only direct IOSurface quadrants lost top-first order"
+                      << (canvas ? " with canvas\n" : " without canvas\n");
+            return 1;
+        }
+    }
+    directRenderer.setCanvas (0, 0);
+    directRenderer.deleteTexture (quadrantHandle);
+
+    if (! directRenderer.renderCompositeToIOSurface (
             nullptr, metalOnlySurface, width, height, &mixedLayer, 1, nullptr, 0))
     {
         std::cerr << "Metal-only compositor did not render its frame blend\n";
