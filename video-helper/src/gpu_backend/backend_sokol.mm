@@ -9389,11 +9389,11 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
         impl_->inspectionAdmitted = false;
         impl_->inspectionRetainedHandle = 0;
 
+        std::unordered_map<int, sg_view> generatedViews;
 #if ARBIT_HAVE_METAL_GENERATORS
         // Submit dynamic generators before the first Sokol draw/update opens
         // this frame's compositor command buffer. Both use Sokol's Metal queue,
         // so commit order provides GPU-side synchronization without a CPU wait.
-        std::unordered_map<int, sg_view> generatedViews;
         auto renderGenerator = [&] (const LayerDesc& layer) -> bool
         {
             if (! layer.shaderSource || generatedViews.count (layer.clipId) != 0)
