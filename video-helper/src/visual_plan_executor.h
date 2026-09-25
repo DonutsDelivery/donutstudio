@@ -2724,14 +2724,15 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 materialFieldTopology = materialfield::topology(*request.materialField, field->descriptor());
                 for (const auto& [id, kind] : materialFieldTopology.nodes)
                 {
+                    const auto fieldNodeId = id;
                     const auto operation = std::find_if(plan.operations.begin(), plan.operations.end(),
-                        [&](const auto& item) { return item.nodeId == id; });
+                        [&, fieldNodeId](const auto& item) { return item.nodeId == fieldNodeId; });
                     const auto output = materialFieldTopology.outputPorts.at(id);
                     const bool score = materialFieldTopology.scoreSources.count(id) != 0;
                     if (operation == plan.operations.end() || operation->kind != kind
                         || operation->backendCapability != "control-eval" || !operation->runtimeGrantJson.empty()
                         || std::count_if(plan.ports.begin(), plan.ports.end(),
-                            [&](const auto& port) { return port.nodeId == id; }) != output + 1
+                            [&, fieldNodeId](const auto& port) { return port.nodeId == fieldNodeId; }) != output + 1
                         || !exactControlPort(id, output, "out", score ? "noteCollection" : "field"))
                     { error = "Material Field node differs from its canonical operation"; return false; }
                     for (int port = 0; port < output; ++port)

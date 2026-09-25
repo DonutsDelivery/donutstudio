@@ -404,6 +404,11 @@ std::string encodeAndWrite (AVFormatContext* fmt, AVStream* stream,
     AVPacket* pkt = av_packet_alloc();
     while ((ret = avcodec_receive_packet (enc, pkt)) >= 0)
     {
+        // Every video caller uses one encoder time-base tick per output frame.
+        // A delayed encoder may leave duration unknown even for its final packet;
+        // MP4 then ends the track at that packet's PTS and discards the frame.
+        if (enc->codec_type == AVMEDIA_TYPE_VIDEO && pkt->duration <= 0)
+            pkt->duration = 1;
         av_packet_rescale_ts (pkt, enc->time_base, stream->time_base);
         pkt->stream_index = stream->index;
         if (av_interleaved_write_frame (fmt, pkt) < 0)
