@@ -25,7 +25,7 @@ bool sceneComposite(Renderer& renderer, Draw&& draw, std::string& error, int wid
     const auto center = (static_cast<std::size_t>(height / 2) * width + width / 2) * 4;
     if (!draw(&layer, 1) || !renderer.readLastCompositeFloat(first, error)
         || first.size() != static_cast<std::size_t>(width) * height * 4
-        || !linearscenechecks::near(std::vector<float>(first.begin() + center, first.begin() + center + 4), error)
+        || !linearscenechecks::nearPixels(std::vector<float>(first.begin() + center, first.begin() + center + 4), error)
         || !draw(&layer, 1)
         || !renderer.readLastCompositeFloat(repeat, error) || first != repeat) return false;
     std::vector<float> wide;

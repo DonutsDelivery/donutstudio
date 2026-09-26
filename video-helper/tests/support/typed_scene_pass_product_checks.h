@@ -32,9 +32,14 @@ inline bool run(const std::string& file, const arbitgl::GlFuncs& gl, std::string
     const std::string inspectionWire = "RenderPassCompositeV3 2 0.25 0.75 1 0.5 0.5 0.5 0 0 0 0 1";
     if (renderpasscomposite::encode(parameters) != inspectionWire
         || !renderpasscomposite::decode(inspectionWire, decoded)
-        || !decoded.inspectionImage || !decoded.invertDepth
-        || renderpasscomposite::gpuProgram(renderpasscomposite::single(decoded)).transforms[0][3] != 3)
+        || !decoded.inspectionImage || !decoded.invertDepth)
         return reject("Typed inspection lost opaque-image or invert semantics across pass serialization");
+    renderpasscomposite::Program single;
+    single.count = 1;
+    single.output = 0;
+    single.steps[0].parameters = decoded;
+    if (renderpasscomposite::gpuProgram(single).transforms[0][3] != 3)
+        return reject("Typed inspection lost opaque-image or invert semantics across GPU lowering");
     decoded.mode = renderpasscomposite::Mode::NormalView;
     if (renderpasscomposite::valid(decoded)
         || renderpasscomposite::decode("RenderPassCompositeV3 2 0.25 0.75 1 0.5 0.5 0.5 0 0 0 0 2", decoded))
