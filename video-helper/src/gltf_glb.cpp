@@ -2366,6 +2366,7 @@ struct OwnedSkin
     std::vector<visualdeformation::JointView> joints;
     std::vector<float> inverseBindMatrices;
     std::vector<std::size_t> jointNodes;
+    std::size_t authoredJointCount = 0;
 };
 
 struct OwnedJointWeightSet
@@ -2859,6 +2860,7 @@ bool parseSkins(const Json& root,
         }
 
         skin.jointNodes = jointNodes;
+        skin.authoredJointCount = jointNodes.size();
         skin.joints.reserve(jointNodes.size());
         for (const auto jointNode : jointNodes)
         {
@@ -3760,7 +3762,7 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
             result.nodeMeshes.push_back(node.mesh ? visualdeformation::MeshId{oneBasedId(*node.mesh)}
                                                 : visualdeformation::MeshId{});
         std::unordered_set<std::uint64_t> sceneTransformNodes;
-        if (options.retainGeometryHierarchy)
+        if (options.retainGeometryHierarchy && metadata->scenes != 0)
         {
             const auto selectedScene = options.admission.sceneIndex.value_or(metadata->defaultScene.value_or(0));
             std::vector<std::size_t> pending;
@@ -3835,6 +3837,7 @@ std::optional<GlbAnimationDocument> detail::decodeGlbAnimationsWithFactories(
                     {
                         const auto skinIndex = static_cast<std::size_t>(binding.skin.value - 1u);
                         if (skinIndex >= skins.size()) continue;
+                        binding.authoredJointCount = skins[skinIndex].authoredJointCount;
                         for (std::size_t joint = 0; joint < skins[skinIndex].joints.size(); ++joint)
                         {
                             const auto baseNode = skins[skinIndex].jointNodes[joint];

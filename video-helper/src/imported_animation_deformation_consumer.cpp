@@ -187,7 +187,8 @@ bool validateSelectedPose(const gltf::GlbAnimationDocument& document,
     if (resolved != nullptr) resolved->nodeStableId = selected->nodeIndex + 1u;
     const auto* skin = document.deformation->findSkin(selected->skin);
     if (pose.boneEnabled && (skin == nullptr
-        || std::none_of(skin->joints().begin(), skin->joints().end(),
+        || std::none_of(skin->joints().begin(),
+            skin->joints().begin() + std::min(selected->authoredJointCount, skin->joints().size()),
             [&pose] (const auto& joint) { return joint.id().value == pose.boneStableId; })))
     {
         error = "selected bone does not belong to the imported mesh skin";

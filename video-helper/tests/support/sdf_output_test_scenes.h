@@ -100,11 +100,16 @@ inline videowire::SdfIr outputTestSource (OutputScene scene)
     return source;
 }
 
-inline std::shared_ptr<const AdmittedSdfIr> outputTestGeometry (OutputScene scene, std::string& error)
+inline SdfAdmissionLimits outputTestAdmissionLimits()
 {
     SdfAdmissionLimits limits;
     limits.maxStableId = std::numeric_limits<videowire::SdfStableId>::max();
-    auto admitted = admitSdfIr (outputTestSource (scene), limits, error);
+    return limits;
+}
+
+inline std::shared_ptr<const AdmittedSdfIr> outputTestGeometry (OutputScene scene, std::string& error)
+{
+    auto admitted = admitSdfIr (outputTestSource (scene), outputTestAdmissionLimits(), error);
     return admitted ? std::make_shared<const AdmittedSdfIr> (std::move (*admitted)) : nullptr;
 }
 } // namespace videohelper::sdf::test

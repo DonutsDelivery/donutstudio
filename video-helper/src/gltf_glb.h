@@ -382,6 +382,7 @@ struct GlbDeformationRenderBinding
     std::vector<GlbJointBaseTransform> jointBaseTransforms;
     std::vector<float> morphBaseWeights;
     visualdeformation::SkinId skin;
+    std::size_t authoredJointCount = 0;
 };
 
 struct GlbNamedAnimationClip

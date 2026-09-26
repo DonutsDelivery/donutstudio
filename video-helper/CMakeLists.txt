@@ -2221,6 +2221,12 @@ if(APPLE AND ARBIT_WITH_METAL)
         tests/support/fixture_scene.cpp
         tests/support/sdf_native_backend_parity.cpp
         tests/support/sdf_reference_evaluator.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/imported_animation_deformation_consumer.cpp
         src/sdf_native_renderer.cpp
         src/deformation_contract.cpp
         src/native_animation_deformation.cpp
@@ -2230,12 +2236,15 @@ if(APPLE AND ARBIT_WITH_METAL)
         third_party/sokol
         ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
     target_link_libraries(arbit-metal-backend-tests PRIVATE
-        "-framework Metal" "-framework QuartzCore" "-framework Cocoa")
+        "-framework Metal" "-framework QuartzCore" "-framework Cocoa"
+        nlohmann_json::nlohmann_json PkgConfig::AV)
     add_test(NAME metal_backend COMMAND arbit-metal-backend-tests)
 
     add_executable(arbit-optical-flow-native-metal-tests
         tests/optical_flow_native_metal_tests.mm
         src/optical_flow_native_executor.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
         src/gpu_backend/backend_sokol.mm)
     target_include_directories(arbit-optical-flow-native-metal-tests PRIVATE
         src
@@ -2386,6 +2395,8 @@ if(APPLE AND ARBIT_WITH_METAL)
             tests/metal_particle_smoke_tests.cpp
             src/particle_engine.cpp
             src/gl_loader.cpp
+            src/deformation_contract.cpp
+            src/native_animation_deformation.cpp
             src/gpu_backend/backend_sokol.mm)
         target_include_directories(arbit-metal-particle-smoke PRIVATE src third_party/sokol)
         target_compile_definitions(arbit-metal-particle-smoke PRIVATE
@@ -2466,7 +2477,12 @@ if(APPLE AND ARBIT_WITH_METAL)
         add_executable(arbit-metal-frame-compositor-smoke
             tests/metal_frame_compositor_smoke_tests.cpp
             src/sdf_native_renderer.cpp
+            src/geometry_core_backend.cpp
+            src/fixture_scene_renderer.cpp
+            src/visual_plan_execution_telemetry.cpp
             src/gl_loader.cpp
+            src/deformation_contract.cpp
+            src/native_animation_deformation.cpp
             src/gpu_backend/metal_shader_generator.mm
             src/gpu_backend/backend_sokol.mm)
         target_include_directories(arbit-metal-frame-compositor-smoke PRIVATE

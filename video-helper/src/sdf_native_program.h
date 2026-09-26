@@ -6,9 +6,11 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace videohelper::sdf
@@ -26,28 +28,51 @@ inline std::uint32_t nativeSdfMaterialColorCode (videowire::SdfStableId id) noex
     return (static_cast<std::uint32_t> (id) & 0x00ffffffu) | 0x00202020u;
 }
 
+inline std::vector<const videowire::SdfRecord*> nativeSdfTopologicalRecords (
+    const AdmittedSdfIr& geometry)
+{
+    std::unordered_map<videowire::SdfStableId, const videowire::SdfRecord*> byId;
+    for (const auto& record : geometry.records())
+        byId.emplace (record.stableId, &record);
+    std::unordered_set<videowire::SdfStableId> visited;
+    std::vector<const videowire::SdfRecord*> ordered;
+    std::function<void (videowire::SdfStableId)> visit = [&] (auto id)
+    {
+        if (! visited.insert (id).second) return;
+        const auto* record = byId.at (id);
+        for (std::size_t input = 0; input < record->inputCount; ++input)
+            visit (record->inputs[input]);
+        ordered.push_back (record);
+    };
+    visit (geometry.rootId());
+    return ordered;
+}
+
 inline std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram> compileNativeSdfProgram (
     const videowire::SdfIr& source, std::string& error)
 {
     SdfAdmissionLimits limits;
     limits.maxOperations = arbitgpu::kNativeSdfMaximumRecords;
     limits.maxDepth = arbitgpu::kNativeSdfMaximumDepth;
+    limits.maxStableId = std::numeric_limits<videowire::SdfStableId>::max();
     auto admitted = admitSdfIr (source, limits, error);
     if (! admitted) return {};
 
+    const auto ordered = nativeSdfTopologicalRecords (*admitted);
     std::shared_ptr<arbitgpu::NativeSdfCompiledProgram> program (
         new arbitgpu::NativeSdfCompiledProgram());
     program->maximumDepth_ = static_cast<std::uint32_t> (admitted->maximumDepth());
     program->structuralDigest_ = admitted->structuralDigest();
-    program->records_.reserve (admitted->records().size());
+    program->records_.reserve (ordered.size());
 
     std::unordered_map<videowire::SdfStableId, std::uint32_t> indices;
-    indices.reserve (admitted->records().size());
-    for (std::size_t index = 0; index < admitted->records().size(); ++index)
-        indices.emplace (admitted->records()[index].stableId, static_cast<std::uint32_t> (index));
+    indices.reserve (ordered.size());
+    for (std::size_t index = 0; index < ordered.size(); ++index)
+        indices.emplace (ordered[index]->stableId, static_cast<std::uint32_t> (index));
 
-    for (const auto& sourceRecord : admitted->records())
+    for (const auto* source : ordered)
     {
+        const auto& sourceRecord = *source;
         arbitgpu::NativeSdfCompiledRecord record;
         record.stableId = sourceRecord.stableId;
         record.operation = static_cast<std::uint32_t> (sourceRecord.operation);
@@ -194,6 +219,7 @@ inline bool validateNativeSdfProgram (
     SdfAdmissionLimits limits;
     limits.maxOperations = arbitgpu::kNativeSdfMaximumRecords;
     limits.maxDepth = arbitgpu::kNativeSdfMaximumDepth;
+    limits.maxStableId = std::numeric_limits<videowire::SdfStableId>::max();
     const auto admitted = admitSdfIr (source, limits, error);
     if (! admitted
         || program.structuralDigest() != admitted->structuralDigest()
@@ -204,9 +230,10 @@ inline bool validateNativeSdfProgram (
             error = "native GPU SDF compiled payload does not match admitted geometry";
         return false;
     }
+    const auto ordered = nativeSdfTopologicalRecords (*admitted);
     std::unordered_map<videowire::SdfStableId, std::uint32_t> indices;
-    for (std::size_t index = 0; index < admitted->records().size(); ++index)
-        indices.emplace (admitted->records()[index].stableId, static_cast<std::uint32_t> (index));
+    for (std::size_t index = 0; index < ordered.size(); ++index)
+        indices.emplace (ordered[index]->stableId, static_cast<std::uint32_t> (index));
     std::vector<std::size_t> steps (program.records().size(), 0);
     std::function<std::size_t (std::uint32_t)> countSteps = [&] (std::uint32_t index)
     {
@@ -218,9 +245,9 @@ inline bool validateNativeSdfProgram (
         if (schema.inputCount > 1) result += countSteps (program.records()[index].input1);
         return steps[index] = result;
     };
-    for (std::size_t index = 0; index < admitted->records().size(); ++index)
+    for (std::size_t index = 0; index < ordered.size(); ++index)
     {
-        const auto& sourceRecord = admitted->records()[index];
+        const auto& sourceRecord = *ordered[index];
         const auto& record = program.records()[index];
         if (record.stableId != sourceRecord.stableId
             || record.operation != static_cast<std::uint32_t> (sourceRecord.operation)

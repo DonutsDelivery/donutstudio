@@ -475,7 +475,7 @@ bool verifyNativeUtilityOutputs (const NativeSdfFloatReader& readPixels, std::st
         {
             auto reversed = outputTestSource (test.scene);
             std::swap (reversed.records.back().inputs[0],reversed.records.back().inputs[1]);
-            auto admitted = admitSdfIr (reversed,{},error);
+            auto admitted = admitSdfIr (reversed, outputTestAdmissionLimits(), error);
             if (!admitted) return false;
             const auto reverseGeometry = std::make_shared<const AdmittedSdfIr> (std::move (*admitted));
             NativeSdfRenderedFrame reverseFrame;
@@ -508,7 +508,7 @@ bool verifyNativeUtilityOutputs (const NativeSdfFloatReader& readPixels, std::st
         return reject ("distinct 64-bit primitive contributors share an invented constant material color");
     auto reordered = outputTestSource (OutputScene::Pair);
     std::reverse (reordered.records.begin(),reordered.records.end());
-    auto admittedReordered = admitSdfIr (reordered,{},error);
+    auto admittedReordered = admitSdfIr (reordered, outputTestAdmissionLimits(), error);
     if (!admittedReordered) return false;
     const auto geometry = std::make_shared<const AdmittedSdfIr> (std::move (*admittedReordered));
     controls.output = Output::materialId;

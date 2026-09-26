@@ -1463,6 +1463,8 @@ int main()
         videohelper::gltf::GlbAnimationDecodeOptions options;
         options.retainGeometryHierarchy=true;
         const auto decoded=videohelper::gltf::decodeGlbAnimations(makeGlb(root,animatedBin),options,error);
+        check(decoded && error.empty() && decoded->sceneMeshes.empty(),
+              "scene-less animated GLB retains its hierarchy without inventing a scene");
         check(decoded && decoded->deformation->skins()[0].joints().size()==3
             && decoded->deformation->skins()[0].joints()[0].id().value==2
             && decoded->deformation->skins()[0].joints()[0].parent().value==1

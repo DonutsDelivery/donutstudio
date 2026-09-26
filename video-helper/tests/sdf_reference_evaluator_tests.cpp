@@ -370,24 +370,26 @@ int main()
         auto operation = record (3,op,{kLeftPrimitive,kRightPrimitive},{});
         if (isSmooth) { operation.parameterCount = 1; operation.parameters[0] = 0.1; }
         source.records.push_back (operation);
-        const auto admitted = admitSdfIr (source,{},error);
+        SdfAdmissionLimits limits;
+        limits.maxStableId = std::numeric_limits<SdfStableId>::max();
+        const auto admitted = admitSdfIr (source,limits,error);
         const bool isUnion = op == SdfOperation::unionOp || op == SdfOperation::smoothUnion;
         check (admitted && evaluateSample (*admitted,{0,0,0.5}).primitiveId
                    == (isUnion ? kLeftPrimitive : kRightPrimitive),
                "hard and smooth Boolean ownership agrees with the dominant signed distance");
         source.records[1].parameters[0] = 1;
-        const auto tied = admitSdfIr (source,{},error);
+        const auto tied = admitSdfIr (source,limits,error);
         check (tied && evaluateSample (*tied,{0,0,1}).primitiveId == kLeftPrimitive,
                "ordered A wins an equal-weight tie in every hard and smooth Boolean");
         std::swap (source.records.back().inputs[0],source.records.back().inputs[1]);
-        const auto reversedTie = admitSdfIr (source,{},error);
+        const auto reversedTie = admitSdfIr (source,limits,error);
         check (reversedTie && evaluateSample (*reversedTie,{0,0,1}).primitiveId == kRightPrimitive,
                "reversing Boolean inputs reverses tied ownership without sorting primitive IDs");
         // Distances differ by less than the smooth radius. The larger blend
         // weight must select a leaf even when both leaves affect the field.
         std::swap (source.records.back().inputs[0],source.records.back().inputs[1]);
         source.records[1].parameters[0] = 0.96;
-        const auto blended = admitSdfIr (source,{},error);
+        const auto blended = admitSdfIr (source,limits,error);
         const bool cut = op == SdfOperation::subtraction || op == SdfOperation::smoothSubtraction;
         check (blended && evaluateSample (*blended,{0,0,0.99}).primitiveId
                    == (isUnion || cut ? kLeftPrimitive : kRightPrimitive)
