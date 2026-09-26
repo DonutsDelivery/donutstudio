@@ -10612,7 +10612,8 @@ bool MetalFrameRenderer::readLastCompositeFloat(std::vector<float>& rgba, std::s
         id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) sg_mtl_command_queue();
         if (texture == nil || queue == nil || texture.device != gMetalDevice || queue.device != gMetalDevice
             || texture.pixelFormat != MTLPixelFormatRGBA16Float || texture.textureType != MTLTextureType2D
-            || texture.width != impl_->width || texture.height != impl_->height || texture.sampleCount != 1)
+            || texture.width != static_cast<NSUInteger> (impl_->width)
+            || texture.height != static_cast<NSUInteger> (impl_->height) || texture.sampleCount != 1)
         { error = "HDR compositor requires its owned RGBA16F Metal target"; return false; }
         const auto tightRow = static_cast<std::size_t>(impl_->width) * 8;
         const auto rowBytes = (tightRow + 255u) & ~std::size_t(255u);
