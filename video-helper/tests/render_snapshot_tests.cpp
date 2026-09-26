@@ -276,7 +276,12 @@ int main()
     };
     sourcelessLegacy.edges = { { 61, 1, 62, 0 } };
     error.clear();
-    check (! videowire::validateCompiledVisualLayerPlans({}, { sourcelessLegacy }, false, error)
+    const bool sourcelessLegacyAccepted = videowire::validateCompiledVisualLayerPlans(
+        {}, { sourcelessLegacy }, false, error);
+    if (sourcelessLegacyAccepted || error != "visual layer plan has an unsupported production terminal")
+        std::fprintf (stderr, "sourceless legacy plan: accepted=%d error=%s\n",
+                      sourcelessLegacyAccepted, error.c_str());
+    check (! sourcelessLegacyAccepted
            && error == "visual layer plan has an unsupported production terminal",
            "video.out alone does not classify a sourceless regular graph as a collapsed native plan");
 
@@ -305,13 +310,20 @@ int main()
         { 203, "visual.3d.camera.perspective", "control-eval", "" },
         { 204, "visual.3d.light.directional", "control-eval", "" },
         { 205, "visual.3d.render", "native-gpu", "" } };
-    importedTyped.ports.clear(); importedTyped.edges.clear();
+    importedTyped.ports = {
+        { 201, 0, 1, "out", "control", "scene3D", "unspecified", "unspecified" },
+        { 205, 0, 1, "in", "control", "scene3D", "unspecified", "unspecified" },
+        { 205, 1, 1, "out", "frame", "image", "rgba8", "sRGB" }
+    };
+    importedTyped.edges = { { 201, 0, 205, 0 } };
+    error.clear();
     check (videowire::validateCompiledVisualLayerPlans({}, { importedTyped }, false, error),
            "snapshot whitelist admits imported transform camera and directional-light operations");
     importedTyped.nodeKinds.insert(importedTyped.nodeKinds.begin() + 1, "visual.3d.light.point");
     importedTyped.nodeIds.insert(importedTyped.nodeIds.begin() + 1, 206);
     importedTyped.operations.insert(importedTyped.operations.begin() + 1,
         { 206, "visual.3d.light.point", "control-eval", "" });
+    error.clear();
     check (! videowire::validateCompiledVisualLayerPlans({}, { importedTyped }, false, error)
            && error == "visual layer plan contains unsupported typed operation: visual.3d.light.point",
            "snapshot whitelist rejects imported operation without native executor admission");

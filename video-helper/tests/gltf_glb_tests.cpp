@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -538,10 +539,19 @@ bool decodeRejected(const nlohmann::json& root,
                     GlbAdmissionOptions options = {})
 {
     std::string error;
-    const auto result = videohelper::gltf::decodeStaticGlb(makeGlb(root, bin), options, error);
-    if (diagnostic != nullptr)
-        *diagnostic = error;
-    return !result.has_value() && !error.empty();
+    try
+    {
+        const auto result = videohelper::gltf::decodeStaticGlb(makeGlb(root, bin), options, error);
+        if (diagnostic != nullptr)
+            *diagnostic = error;
+        return !result.has_value() && !error.empty();
+    }
+    catch (const std::exception& exception)
+    {
+        if (diagnostic != nullptr)
+            *diagnostic = exception.what();
+        return false;
+    }
 }
 
 bool near(float left, float right)
@@ -1197,7 +1207,11 @@ int main()
 
         auto duplicateImage = root;
         duplicateImage["images"].push_back(duplicateImage["images"][0]);
-        check(decodeRejected(duplicateImage, bin, &diagnostic, native.admission)
+        const bool duplicateRejected = decodeRejected(duplicateImage, bin, &diagnostic, native.admission);
+        if (!duplicateRejected || diagnostic != "decoded embedded image bytes exceed the image admission limit")
+            std::fprintf(stderr, "repeated image decode: rejected=%d diagnostic=%s\n",
+                         duplicateRejected, diagnostic.c_str());
+        check(duplicateRejected
               && diagnostic == "decoded embedded image bytes exceed the image admission limit",
               "decoded image bounds remain aggregate across repeated embedded images");
         const auto imageOffset = root["bufferViews"][6]["byteOffset"].get<std::size_t>();

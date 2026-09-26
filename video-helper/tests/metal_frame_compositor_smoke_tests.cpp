@@ -2,6 +2,7 @@
 #include "gpu_backend/frame_renderer_metal.h"
 #include "renderer.h"
 #include "visual_plan_executor.h"
+#include "../src/canonical_block_c_frame.h"
 #include "support/hdr_image_readback_checks.h"
 #include "support/sdf_display_oracle.h"
 
@@ -1070,12 +1071,25 @@ int main (int argc, char** argv)
     particleLayer.genParams["count"] = 512;
     particleLayer.genParams["size"] = 4.0;
     particleLayer.genParams["force"] = 1.0;
-    particleLayer.notesPresent = true;
-    particleLayer.noteFeatures.notesTex.resize (128u * 4u * 4u, 0.0f);
-    particleLayer.noteFeatures.notesTex[0] = 60.0f;
-    particleLayer.noteFeatures.notesTex[1] = 1.0f;
-    particleLayer.noteFeatures.notesTex[4] = 261.625565f;
-    particleLayer.noteFeatures.noteCount = 1;
+    auto particleScore = std::make_shared<arbitmod::Score>();
+    particleScore->notationVersion = particleScore->scoreRevision = 1;
+    particleScore->rootFreq = 440.0f;
+    arbitmod::Note particleNote;
+    particleNote.id = 77;
+    particleNote.trackId = 0;
+    particleNote.startBeat = 0.0f;
+    particleNote.lengthBeats = 4.0f;
+    particleNote.durationSeconds = 2.0f;
+    particleNote.velocity = 100.0f;
+    particleNote.freqHz = 261.625565f;
+    particleScore->notes.push_back(particleNote);
+    canonicalblockc::FrameKey particleKey;
+    particleKey.projectGeneration = particleKey.sourceGeneration = particleKey.helperGeneration = 1;
+    particleKey.backendGeneration = particleKey.deviceGeneration = particleKey.scoreGeneration = 1;
+    particleKey.beatMapGeneration = particleKey.fpsGeneration = particleKey.loopGeneration = particleKey.seekGeneration = 1;
+    particleKey.fps = 60.0;
+    canonicalblockc::FrameProducer particleProducer;
+    particleLayer.canonicalBlockCFrame = particleProducer.evaluate(particleKey, particleScore, 0.0f);
     particleLayer.shaderClock.playing = true;
     particleLayer.shaderClock.timeDelta = 1.0 / 30.0;
     videorender::EffectSlotState particleBlur;

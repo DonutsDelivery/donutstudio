@@ -298,7 +298,13 @@ int main()
     const auto carved = outputTestGeometry (OutputScene::CarvedBox,error);
     const auto pair = outputTestGeometry (OutputScene::Pair,error);
     const auto cube = outputTestGeometry (OutputScene::Box,error);
-    check (plane && sphere && corner && blocked && carved && pair && cube, "utility oracle scenes admit");
+    check (plane != nullptr, "plane oracle scene admits");
+    check (sphere != nullptr, "sphere oracle scene admits");
+    check (corner != nullptr, "corner oracle scene admits");
+    check (blocked != nullptr, "occluded plane oracle scene admits");
+    check (carved != nullptr, "carved box oracle scene admits");
+    check (pair != nullptr, "pair oracle scene admits");
+    check (cube != nullptr, "box oracle scene admits");
     if (!plane || !sphere || !corner || !blocked || !carved || !pair || !cube) return EXIT_FAILURE;
     const auto flat = evaluateSurface (*plane,{0,0,0},controls);
     const auto convex = evaluateSurface (*sphere,{0,0,1},controls);

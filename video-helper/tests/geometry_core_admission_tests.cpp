@@ -1912,7 +1912,7 @@ void orderedAudioGeometryReplay() {
   const auto curve=timelineCurveFixture(error);
   spectrum::Binding binding; binding.firstBand=binding.lastBand=0; binding.gain=0.2f;
   binding.deformer.mode=spectrum::Deformation::vector;
-  const auto combined=curve ? lowerAudioDeformer(*curve,9720,binding,timelineContract(CarrierKind::geometry3D),error)
+  const auto combined=curve ? lowerAudioDeformer(*curve,9722,binding,timelineContract(CarrierKind::geometry3D),error)
                             : std::nullopt;
   check(combined.has_value(),error.c_str()); if (!combined) return;
   RuntimeFieldEvaluation clock; clock.timelineSeconds=1;

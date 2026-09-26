@@ -78,7 +78,7 @@ class MetalStaticGlbSourceContractTests(unittest.TestCase):
     def test_fixture_metal_uses_current_layout_and_resource_collections(self):
         for token in (
             "offsetof (FixtureUniforms, diffractionEnvironment) == 4224",
-            "sizeof (FixtureUniforms) == 5680",
+            "sizeof (FixtureUniforms) == 6176",
             "offsetof (FixtureUniforms, imageOutput) == 4208",
             "offsetof (FixtureUniforms, diffractionEvaluationSchedule) == 2080",
             "offsetof (FixtureUniforms, noteInstanceTransforms) == 2096",
@@ -86,12 +86,14 @@ class MetalStaticGlbSourceContractTests(unittest.TestCase):
             "offsetof (FixtureUniforms, noteAppearanceLow) == 4160",
             "offsetof (FixtureUniforms, noteAppearanceHigh) == 4176",
             "offsetof (FixtureUniforms, noteMeshScale) == 4192",
+            "offsetof (FixtureUniforms, passProgram) == 5632",
+            "offsetof (FixtureUniforms, surfaceCoating) == 6160",
         ):
             self.assertIn(token, self.source)
         for token in (
             "validNativeFixtureDiffractionProgram (",
             "static_cast<std::uint8_t> (slot)",
-            "resources->pipelines[winding]",
+            "resources->pipelines[colorPipelineOffset + winding]",
             "return 1 + index * 2 + (srgb ? 1 : 0)",
             "const auto slot = textureSlot (textureIds[unit], unit == 0 || unit == 4)",
             "bindings.views[unit] = resources->textureViews[slot]",
