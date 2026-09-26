@@ -1205,16 +1205,19 @@ int main()
               && diagnostic == "decoded embedded image bytes exceed the image admission limit",
               "a one-byte-short RGBA budget rejects the full image before allocation");
 
+        const auto imageOffset = root["bufferViews"][6]["byteOffset"].get<std::size_t>();
         auto duplicateImage = root;
         duplicateImage["images"].push_back(duplicateImage["images"][0]);
-        const bool duplicateRejected = decodeRejected(duplicateImage, bin, &diagnostic, native.admission);
+        auto duplicateImageAdmission = native.admission;
+        duplicateImageAdmission.limits.maxContainerBytes = makeGlb(duplicateImage, bin).size();
+        const bool duplicateRejected = decodeRejected(
+            duplicateImage, bin, &diagnostic, duplicateImageAdmission);
         if (!duplicateRejected || diagnostic != "decoded embedded image bytes exceed the image admission limit")
             std::fprintf(stderr, "repeated image decode: rejected=%d diagnostic=%s\n",
                          duplicateRejected, diagnostic.c_str());
         check(duplicateRejected
               && diagnostic == "decoded embedded image bytes exceed the image admission limit",
               "decoded image bounds remain aggregate across repeated embedded images");
-        const auto imageOffset = root["bufferViews"][6]["byteOffset"].get<std::size_t>();
         auto oversized = bin;
         oversized[imageOffset + 19] = 1; // Header width 1025, still within dimension cap.
         check(decodeRejected(root, oversized, &diagnostic, native.admission)

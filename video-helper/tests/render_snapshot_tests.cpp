@@ -264,6 +264,7 @@ int main()
 
     videowire::CompiledVisualLayerPlan sourcelessLegacy;
     sourcelessLegacy.producerValidated = true;
+    sourcelessLegacy.clipId = 1;
     sourcelessLegacy.nodeKinds = { "video.effects", "video.out" };
     sourcelessLegacy.nodeIds = { 61, 62 };
     sourcelessLegacy.operations = {

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 
 namespace videohelper::sdf::test
@@ -101,7 +102,9 @@ inline videowire::SdfIr outputTestSource (OutputScene scene)
 
 inline std::shared_ptr<const AdmittedSdfIr> outputTestGeometry (OutputScene scene, std::string& error)
 {
-    auto admitted = admitSdfIr (outputTestSource (scene), {}, error);
+    SdfAdmissionLimits limits;
+    limits.maxStableId = std::numeric_limits<videowire::SdfStableId>::max();
+    auto admitted = admitSdfIr (outputTestSource (scene), limits, error);
     return admitted ? std::make_shared<const AdmittedSdfIr> (std::move (*admitted)) : nullptr;
 }
 } // namespace videohelper::sdf::test
