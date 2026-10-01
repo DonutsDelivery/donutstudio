@@ -7,7 +7,6 @@
 **A free harmonic composition workstation where every note is defined by its relationship.**
 Use it standalone or inside your DAW — then upgrade to DonutStudio Pro for sampling, vocals, and audio transformation.
 
-[**⬇ Download DonutStudio**](https://github.com/DonutsDelivery/donutstudio/releases/latest) ·
 [Website](https://donutsdelivery.online/donutstudio) ·
 [DonutStudio Pro](https://donutsdelivery.online/donutstudio/buy) ·
 [Developer docs ↓](#for-developers--ai-agents)
@@ -18,27 +17,9 @@ Use it standalone or inside your DAW — then upgrade to DonutStudio Pro for sam
 
 ## Download
 
-**Latest release → [github.com/DonutsDelivery/donutstudio/releases/latest](https://github.com/DonutsDelivery/donutstudio/releases/latest)**
+Binary downloads are temporarily unavailable. All previous downloadable versions have been withdrawn while the video helper's dependencies are replaced. Downloads will return after a new build is ready.
 
-| Platform | Download | Notes |
-|---|---|---|
-| **Windows** 10+ | [DonutStudio-Windows-Setup.exe](https://github.com/DonutsDelivery/donutstudio/releases/latest/download/DonutStudio-Windows-Setup.exe) | Installer (VST3 · CLAP · standalone) |
-| | [DonutStudio-Windows.zip](https://github.com/DonutsDelivery/donutstudio/releases/latest/download/DonutStudio-Windows.zip) | Portable |
-| **macOS** 11+ <br>(Intel & Apple Silicon) | [DonutStudio-macOS.zip](https://github.com/DonutsDelivery/donutstudio/releases/latest/download/DonutStudio-macOS.zip) | |
-| **Linux** | [DonutStudio-Linux-Installer.sh](https://github.com/DonutsDelivery/donutstudio/releases/latest/download/DonutStudio-Linux-Installer.sh) | Installer |
-| | [DonutStudio-x86_64.AppImage](https://github.com/DonutsDelivery/donutstudio/releases/latest/download/DonutStudio-x86_64.AppImage) | Portable |
-| | [DonutStudio-Linux.zip](https://github.com/DonutsDelivery/donutstudio/releases/latest/download/DonutStudio-Linux.zip) | Portable |
-
-<details>
-<summary><b>Install notes</b></summary>
-
-- **Windows** — Run `DonutStudio-Windows-Setup.exe`. Choose VST3, CLAP, and standalone components in the wizard, then restart your DAW.
-- **macOS** — Extract `DonutStudio-macOS.zip`, open Terminal in that folder, and run `chmod +x install-macos.sh && ./install-macos.sh`. If macOS still warns, right-click DonutStudio → **Open**.
-- **Linux** — Run `chmod +x DonutStudio-Linux-Installer.sh && ./DonutStudio-Linux-Installer.sh`. AppImage users: `chmod +x DonutStudio-x86_64.AppImage`, then run it.
-
-</details>
-
-DonutStudio is in **open beta**. Downloading is free — the DonutStudio Free unlock happens inside the app on first launch (email), or enter an DonutStudio Pro license code. The same `.arbit` project files work across all three platforms.
+See the [DonutStudio website](https://donutsdelivery.online/donutstudio) for updates.
 
 ---
 
@@ -112,19 +93,19 @@ AI coding agents can drive DonutStudio directly through its MCP server or the po
 
 ---
 
-## Video-helper source code (GPL)
+## Previous video-helper source
 
-The DonutStudio installers bundle a separate sidecar executable, **arbit-video-helper**, which powers video decode, beat detection, GL rendering, and export. Unlike the main application, the helper is free software licensed under the **GPL-2.0-or-later**, and its corresponding source lives in this repository at [`video-helper/`](video-helper/) — build instructions in [`video-helper/README.md`](video-helper/README.md), license text in [`video-helper/COPYING`](video-helper/COPYING), and source pointers for the bundled third-party libraries (FFmpeg, x264/x265, and friends) in [`video-helper/NOTICE.md`](video-helper/NOTICE.md).
+The video helper has been removed from the current repository tree while dependency replacement continues in private development. Previously published source remains in [Git history at commit c1148eb](https://github.com/DonutsDelivery/donutstudio/tree/c1148ebdccf8f36ce9209ae57aaf9a8c672bccf0/video-helper) and in existing source tags. Those versions retain their original licenses and third-party notices. Removing the current directory does not change those rights.
 
 ---
 
 ## About
 
-DonutStudio is **closed source** — built by one person, in Denmark. This repository contains the public installers (Releases), documentation, examples, and integration resources. It does **not** contain the application source, build system, license server, DSP engines, or model integrations.
+DonutStudio is **closed source** — built by one person, in Denmark. This repository contains documentation, examples, integration resources, and historical release records. Binary downloads are currently withdrawn. It does **not** contain the application source, build system, license server, DSP engines, or model integrations.
 
 - 🌐 [donutsdelivery.online/donutstudio](https://donutsdelivery.online/donutstudio)
 - 🛒 [DonutStudio Pro](https://donutsdelivery.online/donutstudio/buy)
 
 ## License
 
-Documentation and example scripts in this repository are MIT licensed unless a file states otherwise. The [`video-helper/`](video-helper/) directory is GPL-2.0-or-later (see its `COPYING`). The DonutStudio application itself is proprietary; see the in-app EULA.
+Documentation and example scripts in this repository are MIT licensed unless a file states otherwise. Previously published video-helper source retains the licenses recorded with each version. The DonutStudio application itself is proprietary; see the in-app EULA.
