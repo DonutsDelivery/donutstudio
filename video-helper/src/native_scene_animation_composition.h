@@ -437,10 +437,10 @@ private:
             2*(x*z+w*y)*sz, 2*(y*z-w*x)*sz, (1-2*(x*x+y*y))*sz, 0,
             transform.translation.x, transform.translation.y, transform.translation.z, 1};
     }
-    static bool nearAxisValue(float a, float b) noexcept
+    static bool near(float a, float b) noexcept
     { return std::abs(a-b) <= .0001f * std::max({1.0f, std::abs(a), std::abs(b)}); }
     static bool sameMatrix(const Matrix& a, const Matrix& b) noexcept
-    { for (std::size_t i=0; i<a.size(); ++i) if (!nearAxisValue(a[i], b[i])) return false; return true; }
+    { for (std::size_t i=0; i<a.size(); ++i) if (!near(a[i], b[i])) return false; return true; }
     static bool inverseAffine(const Matrix& value, Matrix& result) noexcept
     {
         if (!std::all_of(value.begin(), value.end(), [](float x) { return std::isfinite(x); }) || value[3] != 0 || value[7] != 0 || value[11] != 0 || value[15] != 1)
@@ -486,14 +486,14 @@ private:
         {
             return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
         };
-        if (!nearAxisValue(dot(x, y), 0.0f) || !nearAxisValue(dot(x, z), 0.0f)
-            || !nearAxisValue(dot(y, z), 0.0f))
+        if (!near(dot(x, y), 0.0f) || !near(dot(x, z), 0.0f)
+            || !near(dot(y, z), 0.0f))
             return false;
 
         auto determinant = x[0] * (y[1] * z[2] - y[2] * z[1])
                          - y[0] * (x[1] * z[2] - x[2] * z[1])
                          + z[0] * (x[1] * y[2] - x[2] * y[1]);
-        if (!nearAxisValue(std::abs(determinant), 1.0f))
+        if (!near(std::abs(determinant), 1.0f))
             return false;
         if (determinant < 0.0f)
         {
@@ -501,7 +501,7 @@ private:
             for (auto& value : x) value = -value;
             determinant = -determinant;
         }
-        if (!nearAxisValue(determinant, 1.0f))
+        if (!near(determinant, 1.0f))
             return false;
 
         const auto r00 = x[0], r01 = y[0], r02 = z[0];

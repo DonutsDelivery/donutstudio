@@ -98,7 +98,7 @@ const char* validationCodeName(Visual3DSceneValidationCode code)
     return "Unknown";
 }
 
-bool nearAxisValue(float left, float right)
+bool near(float left, float right)
 {
     const auto scale = std::max({1.0f, std::abs(left), std::abs(right)});
     return std::abs(left - right) <= 0.0001f * scale;
@@ -115,8 +115,8 @@ bool finiteMatrix(const std::array<float, 16>& matrix)
 bool affineMatrix(const std::array<float, 16>& matrix)
 {
     return finiteMatrix(matrix)
-        && nearAxisValue(matrix[3], 0.0f) && nearAxisValue(matrix[7], 0.0f)
-        && nearAxisValue(matrix[11], 0.0f) && nearAxisValue(matrix[15], 1.0f);
+        && near(matrix[3], 0.0f) && near(matrix[7], 0.0f)
+        && near(matrix[11], 0.0f) && near(matrix[15], 1.0f);
 }
 
 std::array<float, 16> multiply(const std::array<float, 16>& left,
@@ -135,7 +135,7 @@ bool sameMatrix(const std::array<float, 16>& left,
                 const std::array<float, 16>& right)
 {
     for (std::size_t index = 0; index < left.size(); ++index)
-        if (!nearAxisValue(left[index], right[index]))
+        if (!near(left[index], right[index]))
             return false;
     return true;
 }
@@ -191,14 +191,14 @@ bool decompose(const std::array<float, 16>& matrix,
     {
         return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
     };
-    if (!nearAxisValue(dot(x, y), 0.0f) || !nearAxisValue(dot(x, z), 0.0f)
-        || !nearAxisValue(dot(y, z), 0.0f))
+    if (!near(dot(x, y), 0.0f) || !near(dot(x, z), 0.0f)
+        || !near(dot(y, z), 0.0f))
         return false;
 
     auto determinant = x[0] * (y[1] * z[2] - y[2] * z[1])
                      - y[0] * (x[1] * z[2] - x[2] * z[1])
                      + z[0] * (x[1] * y[2] - x[2] * y[1]);
-    if (!nearAxisValue(std::abs(determinant), 1.0f))
+    if (!near(std::abs(determinant), 1.0f))
         return false;
     if (determinant < 0.0f)
     {
@@ -206,7 +206,7 @@ bool decompose(const std::array<float, 16>& matrix,
         for (auto& value : x) value = -value;
         determinant = -determinant;
     }
-    if (!nearAxisValue(determinant, 1.0f))
+    if (!near(determinant, 1.0f))
         return false;
 
     const auto r00 = x[0], r01 = y[0], r02 = z[0];
@@ -743,8 +743,8 @@ static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
                 fail(error, "Visual3DScene adaptation requires finite perspective cameras");
                 return nullptr;
             }
-            if (!nearAxisValue(transform.scale.x, 1.0f) || !nearAxisValue(transform.scale.y, 1.0f)
-                || !nearAxisValue(transform.scale.z, 1.0f))
+            if (!near(transform.scale.x, 1.0f) || !near(transform.scale.y, 1.0f)
+                || !near(transform.scale.z, 1.0f))
             {
                 fail(error, "Visual3DScene cameras cannot inherit scale");
                 return nullptr;
@@ -1011,8 +1011,8 @@ bool sampleGlbCameraLights(const GlbStaticMeshDocument& asset,
     };
     for (auto& camera : cameras)
     {
-        if (!update(camera) || !nearAxisValue(camera.transform.scale.x,1) || !nearAxisValue(camera.transform.scale.y,1)
-            || !nearAxisValue(camera.transform.scale.z,1))
+        if (!update(camera) || !near(camera.transform.scale.x,1) || !near(camera.transform.scale.y,1)
+            || !near(camera.transform.scale.z,1))
             return fail(error,"animated imported camera requires a finite unscaled world transform");
         camera.transform.scale = {1.0f,1.0f,1.0f};
     }
