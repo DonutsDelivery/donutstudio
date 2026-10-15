@@ -257,8 +257,6 @@ public:
                 return child (0, { point.x + p[0] * std::sin (p[3] * point.y),
                                    point.y + p[1] * std::sin (p[4] * point.z),
                                    point.z + p[2] * std::sin (p[5] * point.x) });
-            case videowire::SdfOperation::textExtrusion:
-                throw std::logic_error ("admitted SDF operation is unknown");
         }
         throw std::logic_error ("admitted SDF operation is unknown");
     }
