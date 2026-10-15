@@ -1,0 +1,131 @@
+#pragma once
+
+#include "render_snapshot.h"
+#include "../../shared/CompositeFrameArtifact.h"
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+// Composite render diagnostics, defined in composite_render_diagnostic.h:
+// backend 0=unknown, 1=OpenGL, 2=Metal. phase 1=request, 2=admission begin,
+// 3=snapshot admitted, 4/5=source admission begin/end, 6/7=context begin/ready,
+// 8=plan admitted, 9=frame loop begin, 10/11=frame preparation begin/end,
+// 12=renderer begin, 13/14=Metal lock begin/acquired, 15=Metal encoding begin,
+// 16/17=sg_commit begin/end, 18=fence commit begin, 19/20=fence wait begin/end,
+// 21/22=IOSurface pixel readback begin/end, 23/24=final readback drain begin/end,
+// 25=frame loop end, 26/27=context shutdown begin/end, 28/29=request success/failure.
+// commandBufferStatus is the native MTLCommandBufferStatus 0..5 at phases 19/20;
+// zero elsewhere or when no native command buffer exists. generation is the
+// supplied processor snapshotGeneration; revision is the parsed authoringRevision.
+namespace videohelper
+{
+struct SnapshotClipIdentity
+{
+    int clipId = -1;
+    uint64_t revision = 0;
+    std::string mode;
+    bool compiledExportable = false;
+};
+
+inline bool validateSnapshotClipIdentities (
+    const std::vector<videowire::CompiledVisualLayerPlan>& plans,
+    const std::vector<SnapshotClipIdentity>& records, std::string& error)
+{
+    if (plans.size() != records.size())
+    {
+        error = "snapshot clip revision records do not match compiled plans";
+        return false;
+    }
+    for (const auto& plan : plans)
+    {
+        const auto record = std::find_if(records.begin(), records.end(), [&plan](const auto& value)
+        { return value.clipId == plan.clipId; });
+        if (record == records.end() || ! record->compiledExportable
+            || record->mode != plan.identityMode || record->revision != plan.structuralRevision
+            || (record->mode == "authoredGraph" && record->revision == 0)
+            || (record->mode == "transientLegacyProjection" && record->revision != 0))
+        {
+            error = "snapshot clip revision record is invalid or not exportable";
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool validateCompositeProbeContract (
+    const videowire::ResolvedVisualSnapshot& snapshot,
+    uint64_t snapshotGeneration, double timelineSec, int width, int height,
+    double fps, std::string& error, bool artifact = false)
+{
+    error.clear();
+    if (! std::isfinite (timelineSec) || timelineSec < 0.0)
+    {
+        error = "timelineSec must be finite and non-negative";
+        return false;
+    }
+    if (! std::isfinite (fps) || fps <= 0.0)
+    {
+        error = "fps must be finite and positive";
+        return false;
+    }
+    if (artifact ? (width != compositeartifact::width || height != compositeartifact::height)
+                 : (width < 1 || height < 1 || width > 1920 || height > 1920))
+    {
+        error = artifact ? "artifact width/height must be exactly 3840x2160"
+                         : "width/height must be between 1 and 1920";
+        return false;
+    }
+    if (snapshotGeneration == 0)
+    {
+        error = "composite probe requires a processor-owned snapshot generation";
+        return false;
+    }
+    if (snapshot.authoringRevision == 0)
+    {
+        error = "composite probe requires a processor-owned authoring revision";
+        return false;
+    }
+    if (snapshot.segments.empty() || snapshot.visualLayerPlans.empty())
+    {
+        error = "composite probe requires a compiled production snapshot";
+        return false;
+    }
+    for (const auto& plan : snapshot.visualLayerPlans)
+        if (! plan.producerValidated
+            || (plan.identityMode != "authoredGraph" && plan.identityMode != "transientLegacyProjection")
+            || (plan.identityMode == "authoredGraph" && plan.structuralRevision == 0)
+            || (plan.identityMode == "transientLegacyProjection" && plan.structuralRevision != 0))
+        {
+            error = "current authored clip plan is invalid or not exportable in this snapshot";
+            return false;
+        }
+    return true;
+}
+
+inline bool validateRecipePreviewPixels (int width, int height,
+                                         size_t rgbaBytes,
+                                         const std::string& compositorBackend,
+                                         std::string& error)
+{
+    error.clear();
+    if (width < 1 || height < 1 || width > 640 || height > 360)
+    {
+        error = "recipe preview dimensions are outside the bounded GPU preview size";
+        return false;
+    }
+    if (compositorBackend.empty())
+    {
+        error = "recipe preview produced no production GPU backend receipt";
+        return false;
+    }
+    if (rgbaBytes != static_cast<size_t>(width) * static_cast<size_t>(height) * 4)
+    {
+        error = "recipe preview produced incomplete production GPU pixels";
+        return false;
+    }
+    return true;
+}
+} // namespace videohelper

@@ -1,0 +1,9 @@
+build/
+
+# Source-profile helper caches, including maintained build-directory overrides
+/build*-lgpl-*/
+
+# Opt-in Windows source dependency candidate
+dependency-cache-windows/
+build-win-mingw-lgpl-*/
+.windows-lgpl-dependency-selection

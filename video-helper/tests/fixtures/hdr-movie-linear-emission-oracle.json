@@ -1,0 +1,110 @@
+{
+  "format": "authored-linear-emission-v1",
+  "width": 128,
+  "height": 64,
+  "frameRate": "30000/1001",
+  "frames": 17,
+  "peakNits": 1000,
+  "source": "Opaque unlit Scene3D emissive panels, authored linear-sRGB. Disable ambient, lights, post effects, textures, alpha and tone mapping. Samples are interior points in the left, center and right panels.",
+  "samples": [
+    {
+      "role": "reference-white",
+      "frame": 0,
+      "x": 16,
+      "y": 32,
+      "linearSrgb": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "role": "peak",
+      "frame": 0,
+      "x": 64,
+      "y": 32,
+      "linearSrgb": [
+        4.5,
+        4.5,
+        4.5
+      ]
+    },
+    {
+      "role": "color",
+      "frame": 0,
+      "x": 112,
+      "y": 32,
+      "linearSrgb": [
+        2,
+        0.5,
+        0.125
+      ]
+    },
+    {
+      "role": "reference-white",
+      "frame": 8,
+      "x": 16,
+      "y": 32,
+      "linearSrgb": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "role": "peak",
+      "frame": 8,
+      "x": 64,
+      "y": 32,
+      "linearSrgb": [
+        4.5,
+        4.5,
+        4.5
+      ]
+    },
+    {
+      "role": "color",
+      "frame": 8,
+      "x": 112,
+      "y": 32,
+      "linearSrgb": [
+        2,
+        0.5,
+        0.125
+      ]
+    },
+    {
+      "role": "reference-white",
+      "frame": 16,
+      "x": 16,
+      "y": 32,
+      "linearSrgb": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "role": "peak",
+      "frame": 16,
+      "x": 64,
+      "y": 32,
+      "linearSrgb": [
+        4.5,
+        4.5,
+        4.5
+      ]
+    },
+    {
+      "role": "color",
+      "frame": 16,
+      "x": 112,
+      "y": 32,
+      "linearSrgb": [
+        2,
+        0.5,
+        0.125
+      ]
+    }
+  ]
+}

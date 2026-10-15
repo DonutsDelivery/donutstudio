@@ -1,0 +1,52 @@
+DONUTSTUDIO VIDEO HELPER FIRST-PARTY LICENSE
+
+Effective 1 October 2026
+Copyright (c) 2026 DonutsDelivery. All rights reserved.
+
+Scope
+
+This license applies to future privately distributed helper code authored and
+owned by DonutsDelivery, including owner-authored shared headers compiled into
+the helper, regardless of their source directory. It does not apply to
+third-party code, libraries, models, assets or other material, including
+vendored RIFE, ncnn, QuickJS,
+SPIRV-Cross, Sokol and codec dependencies. Their copyright notices and licenses
+remain in force, including for third-party material compiled from shared source
+directories.
+
+Previously distributed copies and versions granted under GPL-2.0-or-later retain
+those grants. This license does not withdraw recipients' rights in those copies
+or change licenses in public source history. It does not relicense third-party
+GPL code or make an existing GPL-linked binary proprietary.
+
+Grant and restrictions
+
+A recipient of a future private helper bundled with a licensed DonutStudio
+product may install and use it with that product under the accompanying
+DonutStudio Commercial End User License Agreement. No separate permission to
+redistribute, sublicense, publish source, or create derivative works of the
+covered first-party code is granted. Separate written permission from
+DonutsDelivery is required for those uses, except where applicable law or an
+applicable third-party license permits them.
+
+Third-party rights take precedence over conflicting restrictions in this
+license or the product agreement. This includes any applicable rights to
+modify LGPL components and the work for the recipient's own use, replace those
+components or relink the work with modified versions, and reverse engineer the
+work to debug those modifications.
+
+Distribution conditions
+
+Selecting this first-party license for a future private helper package requires
+an audited non-GPL dependency closure and the package's required license,
+notice, source and replacement/relink materials. Process separation alone does
+not establish compliance. Transitional builds using GPL dependencies remain
+subject to their applicable GPL obligations. This file is first-party license
+metadata, not a dependency audit, package approval or release authorization.
+
+Warranty and liability
+
+The accompanying DonutStudio Commercial End User License Agreement governs
+warranty and liability for the covered first-party code, subject to applicable
+law. Third-party warranty and liability terms remain governed by their own
+licenses.

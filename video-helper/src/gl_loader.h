@@ -1,0 +1,207 @@
+// gl_loader.h — hand-rolled OpenGL 3.3 core function-pointer table.
+//
+// The helper links only the system GL library, which portably exports GL 1.x
+// entry points; everything modern (shaders, VAOs, FBOs, PBOs) must be
+// resolved at runtime from the driver. GLFW is already the platform layer,
+// so the loader uses glfwGetProcAddress — no GLAD/GLEW vendoring (decision
+// documented in artifacts/planning/missing-features/plans/video-parity/verify-gl.md). Function-pointer
+// typedefs come from the Khronos <GL/glext.h> shipped with the GL headers.
+//
+// GL 1.1 functions (glTexImage2D, glClear, glDrawElements, glReadPixels, …)
+// keep resolving at link time as before; only >1.1 entry points live here.
+//
+// Only compiled when ARBIT_HAVE_VIEWPORT (GLFW + OpenGL found at configure
+// time); the headless build never includes this header.
+#pragma once
+
+#if ARBIT_HAVE_VIEWPORT
+
+#if defined(_WIN32)
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+ #include <GL/gl.h>
+ #include <GL/glext.h>
+#elif defined(__APPLE__)
+ // Apple ships no Khronos <GL/glext.h>; the core-profile header declares
+ // prototypes for every GL 3.2 core function, so GlFuncs derives the
+ // pointer types with decltype below (loading still goes through
+ // glfwGetProcAddress, same as the other platforms).
+ #define GL_SILENCE_DEPRECATION 1
+ #include <OpenGL/gl3.h>
+#else
+ #include <GL/gl.h>
+ #include <GL/glext.h>
+#endif
+
+// Tokens of KHR_parallel_shader_compile. The ARB extension uses the same values.
+#ifndef GL_MAX_SHADER_COMPILER_THREADS_KHR
+ #define GL_MAX_SHADER_COMPILER_THREADS_KHR 0x91B0
+#endif
+#ifndef GL_COMPLETION_STATUS_KHR
+ #define GL_COMPLETION_STATUS_KHR 0x91B1
+#endif
+// Some GL headers leave APIENTRY undefined. The Khronos headers define it empty there.
+#ifndef APIENTRY
+ #define APIENTRY
+#endif
+
+#include <string>
+
+#include "gpu_caps.h"
+
+namespace arbitgl
+{
+
+// X-macro list of every GL > 1.1 function the FrameRenderer needs.
+// X(typedef, Name) — loaded as "gl" #Name via glfwGetProcAddress.
+#define ARBIT_GL33_FUNCS(X)                                          \
+    X (PFNGLACTIVETEXTUREPROC,           ActiveTexture)              \
+    X (PFNGLBLENDFUNCSEPARATEPROC,       BlendFuncSeparate)          \
+    X (PFNGLDISABLEIPROC,               Disablei)                   \
+    X (PFNGLENABLEIPROC,                Enablei)                    \
+    X (PFNGLISENABLEDIPROC,             IsEnabledi)                 \
+    X (PFNGLGENBUFFERSPROC,              GenBuffers)                 \
+    X (PFNGLBINDBUFFERPROC,              BindBuffer)                 \
+    X (PFNGLBUFFERDATAPROC,              BufferData)                 \
+    X (PFNGLDELETEBUFFERSPROC,           DeleteBuffers)              \
+    X (PFNGLMAPBUFFERRANGEPROC,          MapBufferRange)             \
+    X (PFNGLUNMAPBUFFERPROC,             UnmapBuffer)                \
+    X (PFNGLFENCESYNCPROC,               FenceSync)                  \
+    X (PFNGLCLIENTWAITSYNCPROC,          ClientWaitSync)             \
+    X (PFNGLDELETESYNCPROC,              DeleteSync)                 \
+    X (PFNGLCREATESHADERPROC,            CreateShader)               \
+    X (PFNGLSHADERSOURCEPROC,            ShaderSource)               \
+    X (PFNGLCOMPILESHADERPROC,           CompileShader)              \
+    X (PFNGLGETSHADERIVPROC,             GetShaderiv)                \
+    X (PFNGLGETSHADERINFOLOGPROC,        GetShaderInfoLog)           \
+    X (PFNGLDELETESHADERPROC,            DeleteShader)               \
+    X (PFNGLCREATEPROGRAMPROC,           CreateProgram)              \
+    X (PFNGLATTACHSHADERPROC,            AttachShader)               \
+    X (PFNGLLINKPROGRAMPROC,             LinkProgram)                \
+    X (PFNGLGETPROGRAMIVPROC,            GetProgramiv)               \
+    X (PFNGLGETPROGRAMINFOLOGPROC,       GetProgramInfoLog)          \
+    X (PFNGLGETACTIVEUNIFORMPROC,        GetActiveUniform)           \
+    X (PFNGLDELETEPROGRAMPROC,           DeleteProgram)              \
+    X (PFNGLUSEPROGRAMPROC,              UseProgram)                 \
+    X (PFNGLGETUNIFORMLOCATIONPROC,      GetUniformLocation)         \
+    X (PFNGLSAMPLERPARAMETERIPROC,       SamplerParameteri)          \
+    X (PFNGLUNIFORM1IPROC,               Uniform1i)                  \
+    X (PFNGLUNIFORM1UIPROC,              Uniform1ui)                 \
+    X (PFNGLUNIFORM1FPROC,               Uniform1f)                  \
+    X (PFNGLUNIFORM2FPROC,               Uniform2f)                  \
+    X (PFNGLUNIFORM3FPROC,               Uniform3f)                  \
+    X (PFNGLUNIFORM4FPROC,               Uniform4f)                  \
+    X (PFNGLUNIFORM4FVPROC,              Uniform4fv)                 \
+    X (PFNGLUNIFORMMATRIX4FVPROC,        UniformMatrix4fv)           \
+    X (PFNGLGENVERTEXARRAYSPROC,         GenVertexArrays)            \
+    X (PFNGLGENSAMPLERSPROC,             GenSamplers)                \
+    X (PFNGLBINDVERTEXARRAYPROC,         BindVertexArray)            \
+    X (PFNGLBINDSAMPLERPROC,             BindSampler)                \
+    X (PFNGLDELETEVERTEXARRAYSPROC,      DeleteVertexArrays)         \
+    X (PFNGLDELETESAMPLERSPROC,          DeleteSamplers)             \
+    X (PFNGLVERTEXATTRIBPOINTERPROC,     VertexAttribPointer)        \
+    X (PFNGLENABLEVERTEXATTRIBARRAYPROC, EnableVertexAttribArray)    \
+    X (PFNGLGETVERTEXATTRIBIVPROC,       GetVertexAttribiv)          \
+    X (PFNGLGETVERTEXATTRIBPOINTERVPROC, GetVertexAttribPointerv)    \
+    X (PFNGLVERTEXATTRIBDIVISORPROC,     VertexAttribDivisor)        \
+    X (PFNGLDRAWELEMENTSINSTANCEDPROC,   DrawElementsInstanced)      \
+    X (PFNGLGENFRAMEBUFFERSPROC,         GenFramebuffers)            \
+    X (PFNGLBINDFRAMEBUFFERPROC,         BindFramebuffer)            \
+    X (PFNGLFRAMEBUFFERTEXTURE2DPROC,    FramebufferTexture2D)       \
+    X (PFNGLCHECKFRAMEBUFFERSTATUSPROC,  CheckFramebufferStatus)     \
+    X (PFNGLDELETEFRAMEBUFFERSPROC,      DeleteFramebuffers)         \
+    X (PFNGLBLITFRAMEBUFFERPROC,         BlitFramebuffer)            \
+    X (PFNGLDRAWBUFFERSPROC,             DrawBuffers)                \
+    X (PFNGLCLEARBUFFERFVPROC,           ClearBufferfv)              \
+    X (PFNGLCLEARBUFFERUIVPROC,          ClearBufferuiv)             \
+    X (PFNGLTEXIMAGE3DPROC,              TexImage3D)
+
+// Optional GL 4.3 entry points for compute / SSBO / image load-store (P1 of
+// the visual-engine plan). Loaded *soft*: a missing one just leaves the
+// matching GpuCaps flag false, never a hard failure. macOS ships no desktop
+// GL above 4.1 and none of these prototypes — so the table is empty there and
+// the decltype-based GlFuncs declaration below stays well-formed.
+#if ! defined (__APPLE__)
+ #define ARBIT_GL43_FUNCS(X)                                          \
+    X (PFNGLDISPATCHCOMPUTEPROC,           DispatchCompute)            \
+    X (PFNGLMEMORYBARRIERPROC,             MemoryBarrier)              \
+    X (PFNGLBINDIMAGETEXTUREPROC,          BindImageTexture)           \
+    X (PFNGLBINDBUFFERBASEPROC,            BindBufferBase)             \
+    X (PFNGLSHADERSTORAGEBLOCKBINDINGPROC, ShaderStorageBlockBinding)  \
+    X (PFNGLGETPROGRAMRESOURCEINDEXPROC,   GetProgramResourceIndex)    \
+    X (PFNGLGETINTEGER64VPROC,            GetInteger64v)             \
+    X (PFNGLGETINTEGER64I_VPROC,          GetInteger64i_v)           \
+    X (PFNGLGETBUFFERPARAMETERI64VPROC,   GetBufferParameteri64v)    \
+    X (PFNGLBINDBUFFERRANGEPROC,          BindBufferRange)           \
+    X (PFNGLGETINTEGERI_VPROC,             GetIntegeri_v)
+#else
+ #define ARBIT_GL43_FUNCS(X)
+#endif
+
+// Optional ARB_get_program_binary entry points (core in GL 4.1) for the fixture
+// program binary cache. Soft-loaded like the GL 4.3 list, so a context without
+// them still runs and simply compiles every program. Empty on macOS.
+#if ! defined (__APPLE__)
+ #define ARBIT_GL41_PROGRAM_BINARY_FUNCS(X)                           \
+    X (PFNGLPROGRAMBINARYPROC,           ProgramBinary)              \
+    X (PFNGLGETPROGRAMBINARYPROC,        GetProgramBinary)           \
+    X (PFNGLPROGRAMPARAMETERIPROC,       ProgramParameteri)
+#else
+ #define ARBIT_GL41_PROGRAM_BINARY_FUNCS(X)
+#endif
+
+// Explicit signatures for glGetStringi and the parallel shader compile entry
+// point. glext.h typedefs for the KHR name appear only in newer revisions, and
+// macOS ships neither typedef, so both types are spelled out here.
+using GlGetStringiFn = const GLubyte* (APIENTRY*) (GLenum name, GLuint index);
+using GlMaxShaderCompilerThreadsFn = void (APIENTRY*) (GLuint count);
+
+struct GlFuncs
+{
+#if defined(__APPLE__)
+ #define ARBIT_GL_DECL(type, name) decltype (&::gl##name) name = nullptr;
+#else
+ #define ARBIT_GL_DECL(type, name) type name = nullptr;
+#endif
+    ARBIT_GL33_FUNCS (ARBIT_GL_DECL)
+    ARBIT_GL43_FUNCS (ARBIT_GL_DECL)
+    ARBIT_GL41_PROGRAM_BINARY_FUNCS (ARBIT_GL_DECL)
+#undef ARBIT_GL_DECL
+    // Soft-loaded by loadGlParallelShaderCompileFunctions. Null when absent.
+    GlGetStringiFn GetStringi = nullptr;
+    GlMaxShaderCompilerThreadsFn MaxShaderCompilerThreads = nullptr;
+};
+
+// Resolves every table entry via glfwGetProcAddress. A GLFW GL context must
+// be current on the calling thread. Returns false and fills missingOut with
+// a comma-separated list of unresolved symbols on failure.
+bool loadGlFunctions (GlFuncs& gl, std::string& missingOut);
+
+// Soft-loads the optional GL 4.3 entry points into the same table. Never
+// fails: returns true iff every 4.3 entry point resolved (always false on
+// macOS, where the table is empty). Call after loadGlFunctions with a context
+// current.
+bool loadGl43Functions (GlFuncs& gl);
+
+// Soft-loads the ARB_get_program_binary entry points. Returns true iff all three
+// resolved. Always false on macOS. Call with a GL context current.
+bool loadGlProgramBinaryFunctions (GlFuncs& gl);
+
+// Soft-loads glGetStringi and the parallel shader compile entry point. The KHR
+// name is tried first, then the ARB name. Never fails: returns true iff both
+// resolved. Always false on macOS. Call with a GL context current.
+bool loadGlParallelShaderCompileFunctions (GlFuncs& gl);
+
+// True when the current context advertises GL_KHR_parallel_shader_compile or
+// GL_ARB_parallel_shader_compile. Needs the functions loaded by
+// loadGlParallelShaderCompileFunctions. The caller caches the answer per context.
+bool hasParallelShaderCompile (const GlFuncs& gl);
+
+// Populates caps from the current context. A GL context must be current; the
+// version comes from link-time glGetIntegerv, the indexed compute limits from
+// the soft-loaded glGetIntegeri_v (only when computeShaders is true).
+void queryGpuCaps (const GlFuncs& gl, GpuCaps& caps);
+
+} // namespace arbitgl
+
+#endif // ARBIT_HAVE_VIEWPORT

@@ -1,0 +1,1023 @@
+#include "glb_scene_adapter.h"
+#include "../../shared/VisualImportedSceneIdentity.h"
+#include "../../shared/Visual3DSceneComposition.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace videohelper::gltf
+{
+namespace
+{
+using namespace HarmonicMIDI::grid;
+
+static_assert(GlbLimits {}.maxPrimitives
+                  < visualimportedsceneidentity::kObjectPrimitiveStride,
+              "GLB primitive indices must fit the stable object identity stride");
+static_assert((GlbLimits {}.maxNodes - 1)
+                  * visualimportedsceneidentity::kObjectPrimitiveStride
+                  + GlbLimits {}.maxPrimitives
+              <= std::numeric_limits<std::uint32_t>::max(),
+              "admitted GLB node and primitive indices must fit SceneObjectId");
+
+bool fail(std::string& error, const std::string& message)
+{
+    error = message;
+    return false;
+}
+
+bool checkedMultiply(std::size_t left, std::size_t right, std::size_t& result)
+{
+    if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left)
+        return false;
+    result = left * right;
+    return true;
+}
+
+template <typename Value>
+bool appendFits(std::size_t current, std::size_t addition, Value capacity)
+{
+    const auto available = static_cast<std::size_t>(capacity);
+    return current <= available && addition <= available - current;
+}
+
+const char* validationCodeName(Visual3DSceneValidationCode code)
+{
+    using Code = Visual3DSceneValidationCode;
+    switch (code)
+    {
+        case Code::Valid: return "Valid";
+        case Code::UnsupportedSchema: return "UnsupportedSchema";
+        case Code::MissingSceneIdentity: return "MissingSceneIdentity";
+        case Code::VertexCapacityExceeded: return "VertexCapacityExceeded";
+        case Code::IndexCapacityExceeded: return "IndexCapacityExceeded";
+        case Code::ObjectCapacityExceeded: return "ObjectCapacityExceeded";
+        case Code::MaterialCapacityExceeded: return "MaterialCapacityExceeded";
+        case Code::TextureCapacityExceeded: return "TextureCapacityExceeded";
+        case Code::TextureTexelCapacityExceeded: return "TextureTexelCapacityExceeded";
+        case Code::LightCapacityExceeded: return "LightCapacityExceeded";
+        case Code::CameraCapacityExceeded: return "CameraCapacityExceeded";
+        case Code::InvalidAmbientColor: return "InvalidAmbientColor";
+        case Code::InvalidObjectIdentity: return "InvalidObjectIdentity";
+        case Code::DuplicateObjectIdentity: return "DuplicateObjectIdentity";
+        case Code::InvalidParentObject: return "InvalidParentObject";
+        case Code::CyclicObjectHierarchy: return "CyclicObjectHierarchy";
+        case Code::InvalidObjectTransform: return "InvalidObjectTransform";
+        case Code::InvalidObjectHierarchyTransform: return "InvalidObjectHierarchyTransform";
+        case Code::InvalidGeometryRange: return "InvalidGeometryRange";
+        case Code::InvalidTriangleIndexCount: return "InvalidTriangleIndexCount";
+        case Code::IndexOutsideObjectVertexRange: return "IndexOutsideObjectVertexRange";
+        case Code::InvalidVertexValue: return "InvalidVertexValue";
+        case Code::InvalidMaterialIdentity: return "InvalidMaterialIdentity";
+        case Code::DuplicateMaterialIdentity: return "DuplicateMaterialIdentity";
+        case Code::InvalidTextureIdentity: return "InvalidTextureIdentity";
+        case Code::DuplicateTextureIdentity: return "DuplicateTextureIdentity";
+        case Code::InvalidTextureRange: return "InvalidTextureRange";
+        case Code::MissingBaseColorTexture: return "MissingBaseColorTexture";
+        case Code::MissingObjectMaterial: return "MissingObjectMaterial";
+        case Code::InvalidMaterialValue: return "InvalidMaterialValue";
+        case Code::InvalidLightIdentity: return "InvalidLightIdentity";
+        case Code::DuplicateLightIdentity: return "DuplicateLightIdentity";
+        case Code::InvalidLightKind: return "InvalidLightKind";
+        case Code::InvalidLightValue: return "InvalidLightValue";
+        case Code::InvalidCameraIdentity: return "InvalidCameraIdentity";
+        case Code::DuplicateCameraIdentity: return "DuplicateCameraIdentity";
+        case Code::InvalidCameraTransform: return "InvalidCameraTransform";
+        case Code::InvalidCameraProjection: return "InvalidCameraProjection";
+        case Code::MissingActiveCamera: return "MissingActiveCamera";
+        case Code::InvalidObjectInstances: return "InvalidObjectInstances";
+    }
+    return "Unknown";
+}
+
+bool nearAxisValue(float left, float right)
+{
+    const auto scale = std::max({1.0f, std::abs(left), std::abs(right)});
+    return std::abs(left - right) <= 0.0001f * scale;
+}
+
+bool finiteMatrix(const std::array<float, 16>& matrix)
+{
+    return std::all_of(matrix.begin(), matrix.end(), [] (float value)
+    {
+        return std::isfinite(value);
+    });
+}
+
+bool affineMatrix(const std::array<float, 16>& matrix)
+{
+    return finiteMatrix(matrix)
+        && nearAxisValue(matrix[3], 0.0f) && nearAxisValue(matrix[7], 0.0f)
+        && nearAxisValue(matrix[11], 0.0f) && nearAxisValue(matrix[15], 1.0f);
+}
+
+std::array<float, 16> multiply(const std::array<float, 16>& left,
+                               const std::array<float, 16>& right)
+{
+    std::array<float, 16> result {};
+    for (std::size_t column = 0; column < 4; ++column)
+        for (std::size_t row = 0; row < 4; ++row)
+            for (std::size_t inner = 0; inner < 4; ++inner)
+                result[column * 4 + row] += left[inner * 4 + row]
+                                               * right[column * 4 + inner];
+    return result;
+}
+
+bool sameMatrix(const std::array<float, 16>& left,
+                const std::array<float, 16>& right)
+{
+    for (std::size_t index = 0; index < left.size(); ++index)
+        if (!nearAxisValue(left[index], right[index]))
+            return false;
+    return true;
+}
+
+std::array<float, 16> compose(const SceneTransform3D& transform)
+{
+    const auto x = transform.rotation.x;
+    const auto y = transform.rotation.y;
+    const auto z = transform.rotation.z;
+    const auto w = transform.rotation.w;
+    const auto xx = x * x, yy = y * y, zz = z * z;
+    const auto xy = x * y, xz = x * z, yz = y * z;
+    const auto wx = w * x, wy = w * y, wz = w * z;
+    return {
+        (1.0f - 2.0f * (yy + zz)) * transform.scale.x,
+        (2.0f * (xy + wz)) * transform.scale.x,
+        (2.0f * (xz - wy)) * transform.scale.x, 0.0f,
+        (2.0f * (xy - wz)) * transform.scale.y,
+        (1.0f - 2.0f * (xx + zz)) * transform.scale.y,
+        (2.0f * (yz + wx)) * transform.scale.y, 0.0f,
+        (2.0f * (xz + wy)) * transform.scale.z,
+        (2.0f * (yz - wx)) * transform.scale.z,
+        (1.0f - 2.0f * (xx + yy)) * transform.scale.z, 0.0f,
+        transform.translation.x, transform.translation.y,
+        transform.translation.z, 1.0f
+    };
+}
+
+bool decompose(const std::array<float, 16>& matrix,
+               SceneTransform3D& transform)
+{
+    if (!affineMatrix(matrix))
+        return false;
+
+    transform.translation = {matrix[12], matrix[13], matrix[14]};
+    std::array<float, 3> x {matrix[0], matrix[1], matrix[2]};
+    std::array<float, 3> y {matrix[4], matrix[5], matrix[6]};
+    std::array<float, 3> z {matrix[8], matrix[9], matrix[10]};
+    const auto length = [] (const std::array<float, 3>& value)
+    {
+        return std::sqrt(value[0] * value[0] + value[1] * value[1]
+                         + value[2] * value[2]);
+    };
+    auto sx = length(x), sy = length(y), sz = length(z);
+    if (!std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(sz)
+        || sx <= 0.000001f || sy <= 0.000001f || sz <= 0.000001f)
+        return false;
+    for (auto& value : x) value /= sx;
+    for (auto& value : y) value /= sy;
+    for (auto& value : z) value /= sz;
+
+    const auto dot = [] (const auto& left, const auto& right)
+    {
+        return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
+    };
+    if (!nearAxisValue(dot(x, y), 0.0f) || !nearAxisValue(dot(x, z), 0.0f)
+        || !nearAxisValue(dot(y, z), 0.0f))
+        return false;
+
+    auto determinant = x[0] * (y[1] * z[2] - y[2] * z[1])
+                     - y[0] * (x[1] * z[2] - x[2] * z[1])
+                     + z[0] * (x[1] * y[2] - x[2] * y[1]);
+    if (!nearAxisValue(std::abs(determinant), 1.0f))
+        return false;
+    if (determinant < 0.0f)
+    {
+        sx = -sx;
+        for (auto& value : x) value = -value;
+        determinant = -determinant;
+    }
+    if (!nearAxisValue(determinant, 1.0f))
+        return false;
+
+    const auto r00 = x[0], r01 = y[0], r02 = z[0];
+    const auto r10 = x[1], r11 = y[1], r12 = z[1];
+    const auto r20 = x[2], r21 = y[2], r22 = z[2];
+    SceneQuaternion rotation;
+    const auto trace = r00 + r11 + r22;
+    if (trace > 0.0f)
+    {
+        const auto scale = 2.0f * std::sqrt(trace + 1.0f);
+        rotation.w = 0.25f * scale;
+        rotation.x = (r21 - r12) / scale;
+        rotation.y = (r02 - r20) / scale;
+        rotation.z = (r10 - r01) / scale;
+    }
+    else if (r00 > r11 && r00 > r22)
+    {
+        const auto scale = 2.0f * std::sqrt(1.0f + r00 - r11 - r22);
+        rotation.w = (r21 - r12) / scale;
+        rotation.x = 0.25f * scale;
+        rotation.y = (r01 + r10) / scale;
+        rotation.z = (r02 + r20) / scale;
+    }
+    else if (r11 > r22)
+    {
+        const auto scale = 2.0f * std::sqrt(1.0f + r11 - r00 - r22);
+        rotation.w = (r02 - r20) / scale;
+        rotation.x = (r01 + r10) / scale;
+        rotation.y = 0.25f * scale;
+        rotation.z = (r12 + r21) / scale;
+    }
+    else
+    {
+        const auto scale = 2.0f * std::sqrt(1.0f + r22 - r00 - r11);
+        rotation.w = (r10 - r01) / scale;
+        rotation.x = (r02 + r20) / scale;
+        rotation.y = (r12 + r21) / scale;
+        rotation.z = 0.25f * scale;
+    }
+
+    const auto quaternionLength = std::sqrt(rotation.x * rotation.x
+                                          + rotation.y * rotation.y
+                                          + rotation.z * rotation.z
+                                          + rotation.w * rotation.w);
+    if (!std::isfinite(quaternionLength) || quaternionLength <= 0.000001f)
+        return false;
+    rotation.x /= quaternionLength;
+    rotation.y /= quaternionLength;
+    rotation.z /= quaternionLength;
+    rotation.w /= quaternionLength;
+    if (rotation.w < 0.0f)
+    {
+        rotation.x = -rotation.x;
+        rotation.y = -rotation.y;
+        rotation.z = -rotation.z;
+        rotation.w = -rotation.w;
+    }
+    transform.rotation = rotation;
+    transform.scale = {sx, sy, sz};
+    return sameMatrix(matrix, compose(transform));
+}
+
+bool collectSelectedNodes(const GlbStaticMeshDocument& asset,
+                          std::vector<std::uint8_t>& selected,
+                          std::string& error)
+{
+    if (asset.selectedScene >= asset.scenes.size())
+        return fail(error, "selected GLB scene index is out of range");
+    if (asset.nodes.size() > GlbLimits {}.maxNodes)
+        return fail(error, "GLB node count exceeds the adapter bound");
+
+    selected.assign(asset.nodes.size(), 0);
+    std::vector<std::uint8_t> state(asset.nodes.size(), 0);
+    struct Frame { std::size_t node; std::size_t nextChild; std::size_t depth; };
+    std::vector<Frame> stack;
+    stack.reserve(std::min(asset.nodes.size(), GlbLimits {}.maxNodeDepth));
+
+    for (const auto root : asset.scenes[asset.selectedScene].rootNodes)
+    {
+        if (root >= asset.nodes.size())
+            return fail(error, "selected GLB scene root node is out of range");
+        if (asset.nodes[root].parent || state[root] != 0)
+            return fail(error, "selected GLB scene roots do not form an independent tree");
+        stack.push_back({root, 0, 1});
+        while (!stack.empty())
+        {
+            auto& frame = stack.back();
+            if (state[frame.node] == 0)
+            {
+                if (frame.depth > GlbLimits {}.maxNodeDepth)
+                    return fail(error, "selected GLB scene hierarchy exceeds the adapter depth bound");
+                state[frame.node] = 1;
+                selected[frame.node] = 1;
+            }
+            const auto& children = asset.nodes[frame.node].children;
+            if (frame.nextChild == children.size())
+            {
+                state[frame.node] = 2;
+                stack.pop_back();
+                continue;
+            }
+            const auto child = children[frame.nextChild++];
+            if (child >= asset.nodes.size())
+                return fail(error, "selected GLB node child is out of range");
+            if (asset.nodes[child].parent != std::optional<std::size_t>(frame.node))
+                return fail(error, "selected GLB node parent and child references disagree");
+            if (state[child] != 0)
+                return fail(error, "selected GLB node hierarchy is cyclic or shared");
+            stack.push_back({child, 0, frame.depth + 1});
+        }
+    }
+
+    for (std::size_t index = 0; index < asset.nodes.size(); ++index)
+    {
+        if (selected[index] == 0)
+            continue;
+        const auto& node = asset.nodes[index];
+        if (!affineMatrix(node.localTransform) || !affineMatrix(node.worldTransform))
+            return fail(error, "selected GLB node has a non-finite or non-affine transform");
+        const auto expected = node.parent
+            ? multiply(asset.nodes[*node.parent].worldTransform, node.localTransform)
+            : node.localTransform;
+        if (!sameMatrix(expected, node.worldTransform))
+            return fail(error, "selected GLB node world transform disagrees with its hierarchy");
+    }
+    return true;
+}
+
+bool copyMaterials(const GlbStaticMeshDocument& asset,
+                   Visual3DScene& scene,
+                   std::string& error)
+{
+    if (asset.materials.size() > scene.materials.size())
+        return fail(error, "GLB material count exceeds Visual3DScene capacity");
+
+    std::vector<SceneTextureId> adaptedTextureIds(asset.textures.size());
+    const auto copyTexture = [&] (const GlbTextureInfo& info) -> bool
+    {
+        const auto textureIndex = info.texture;
+        if (textureIndex >= asset.textures.size())
+            return fail(error, "GLB material texture index is out of range");
+        if (info.texCoord != 0)
+            return fail(error, "GLB material texture requires unsupported TEXCOORD set");
+        if (adaptedTextureIds[textureIndex].isValid())
+            return true;
+        if (scene.textureCount >= Visual3DScene::kMaxTextures)
+            return fail(error, "GLB material textures exceed Visual3DScene capacity");
+
+        const auto& sourceTexture = asset.textures[textureIndex];
+        if (sourceTexture.source >= asset.images.size())
+            return fail(error, "GLB texture image source is out of range");
+        if (!sourceTexture.sampler || *sourceTexture.sampler >= asset.samplers.size())
+            return fail(error, "GLB material texture requires an explicit admitted sampler");
+        const auto& sourceSampler = asset.samplers[*sourceTexture.sampler];
+
+        const auto& sourceImage = asset.images[sourceTexture.source];
+        std::size_t texelCount = 0;
+        std::size_t expectedBytes = 0;
+        if (sourceImage.width == 0 || sourceImage.height == 0
+            || sourceImage.width > Visual3DScene::kMaxTextureDimension
+            || sourceImage.height > Visual3DScene::kMaxTextureDimension
+            || !checkedMultiply(static_cast<std::size_t>(sourceImage.width),
+                                static_cast<std::size_t>(sourceImage.height), texelCount)
+            || !checkedMultiply(texelCount, 4u, expectedBytes)
+            || expectedBytes != sourceImage.decodedRgba8.size())
+            return fail(error, "GLB decoded image texels are malformed or exceed Visual3DScene dimensions");
+        if (texelCount > Visual3DScene::kMaxTextureTexels - scene.textureTexelCount)
+            return fail(error, "GLB decoded image texels exceed Visual3DScene capacity");
+
+        SceneTextureRecord texture;
+        texture.id = SceneTextureId {static_cast<std::uint32_t>(textureIndex + 1)};
+        texture.width = sourceImage.width;
+        texture.height = sourceImage.height;
+        texture.magFilter = sourceSampler.magFilter;
+        texture.minFilter = sourceSampler.minFilter;
+        texture.wrapS = sourceSampler.wrapS;
+        texture.wrapT = sourceSampler.wrapT;
+        texture.firstTexel = scene.textureTexelCount;
+#if defined(ARBIT_TEST_IMPORTED_PARENT_STAGING_FAILURES)
+        const auto oldCapacity = scene.textureTexels.capacity();
+#endif
+        scene.textureTexels.reserve(scene.textureTexelCount + texelCount);
+#if defined(ARBIT_TEST_IMPORTED_PARENT_STAGING_FAILURES)
+        auto& growth = GlbTextureGrowthProbe::state();
+        growth.oldCapacity = oldCapacity; growth.newCapacity = scene.textureTexels.capacity();
+        if (growth.newCapacity > oldCapacity)
+        {
+            if (growth.growths == std::numeric_limits<std::size_t>::max()) growth.overflow = true;
+            else ++growth.growths;
+            if (oldCapacity > std::numeric_limits<std::size_t>::max() - growth.newCapacity)
+                growth.overflow = true;
+            else
+                growth.maxOverlapTexels = std::max(growth.maxOverlapTexels, oldCapacity + growth.newCapacity);
+            if (growth.observer) growth.observer(growth, growth.context);
+        }
+#endif
+        scene.textureTexels.resize(scene.textureTexelCount + texelCount);
+        for (std::size_t texelIndex = 0; texelIndex < texelCount; ++texelIndex)
+        {
+            const auto byte = texelIndex * 4u;
+            scene.textureTexels[scene.textureTexelCount + texelIndex] = {
+                sourceImage.decodedRgba8[byte],
+                sourceImage.decodedRgba8[byte + 1],
+                sourceImage.decodedRgba8[byte + 2],
+                sourceImage.decodedRgba8[byte + 3]
+            };
+        }
+        scene.textureTexelCount += texelCount;
+        scene.textures[scene.textureCount++] = texture;
+        adaptedTextureIds[textureIndex] = texture.id;
+        return true;
+    };
+
+    for (const auto& material : asset.materials)
+    {
+        const std::array<const std::optional<GlbTextureInfo>*, 5> infos {{
+            &material.baseColorTexture, &material.metallicRoughnessTexture,
+            &material.normalTexture, &material.occlusionTexture,
+            &material.emissiveTexture
+        }};
+        for (const auto* info : infos)
+            if (*info && !copyTexture(**info))
+                return false;
+    }
+
+    for (std::size_t index = 0; index < asset.materials.size(); ++index)
+    {
+        const auto& source = asset.materials[index];
+        auto& target = scene.materials[index];
+        target.id = SceneMaterialId {static_cast<std::uint32_t>(index + 1)};
+        target.baseColor = {source.baseColorFactor[0], source.baseColorFactor[1],
+                            source.baseColorFactor[2]};
+        if (source.baseColorTexture)
+            target.baseColorTexture = adaptedTextureIds[source.baseColorTexture->texture];
+        if (source.metallicRoughnessTexture)
+            target.metallicRoughnessTexture = adaptedTextureIds[source.metallicRoughnessTexture->texture];
+        if (source.normalTexture)
+            target.normalTexture = adaptedTextureIds[source.normalTexture->texture];
+        if (source.occlusionTexture)
+            target.occlusionTexture = adaptedTextureIds[source.occlusionTexture->texture];
+        if (source.emissiveTexture)
+            target.emissiveTexture = adaptedTextureIds[source.emissiveTexture->texture];
+        target.opacity = source.alphaMode == GlbAlphaMode::Opaque
+            ? 1.0f : source.baseColorFactor[3];
+        target.metallic = source.metallicFactor;
+        target.roughness = source.roughnessFactor;
+        target.emissive = {source.emissiveFactor[0], source.emissiveFactor[1],
+                           source.emissiveFactor[2]};
+        target.normalScale = source.normalScale;
+        target.occlusionStrength = source.occlusionStrength;
+        target.alphaMode = source.alphaMode == GlbAlphaMode::Mask
+            ? SceneAlphaMode::Mask
+            : source.alphaMode == GlbAlphaMode::Blend
+                ? SceneAlphaMode::Blend : SceneAlphaMode::Opaque;
+        target.alphaCutoff = source.alphaCutoff;
+        target.doubleSided = source.doubleSided;
+    }
+    scene.materialCount = asset.materials.size();
+    return true;
+}
+
+bool copyPrimitive(const GlbPrimitiveRecord& primitive,
+                   std::size_t nodeIndex,
+                   std::size_t primitiveIndex,
+                   const SceneTransform3D& transform,
+                   SceneObjectId parent,
+                   Visual3DScene& scene,
+                   std::string& error)
+{
+    if (!primitive.material || *primitive.material >= scene.materialCount)
+        return fail(error, "GLB primitive material reference is missing or out of range");
+
+    if ((!primitive.normalAccessor && !primitive.generatedFlatNormals) || primitive.normals.empty())
+        return fail(error, "Visual3DScene adaptation requires a NORMAL attribute");
+    if (primitive.positions.empty() || primitive.positions.size() % 3 != 0)
+        return fail(error, "GLB POSITION data has invalid cardinality");
+
+    const auto vertexCount = primitive.positions.size() / 3;
+    if (primitive.normals.size() != vertexCount * 3)
+        return fail(error, "GLB NORMAL cardinality does not match POSITION");
+    if ((primitive.texCoord0Accessor && primitive.texCoords0.size() != vertexCount * 2)
+        || (!primitive.texCoord0Accessor && !primitive.texCoords0.empty()))
+        return fail(error, "GLB TEXCOORD_0 cardinality does not match POSITION");
+    if ((primitive.tangentAccessor && primitive.tangents.size() != vertexCount * 4)
+        || (!primitive.tangentAccessor && !primitive.tangents.empty()))
+        return fail(error, "GLB TANGENT cardinality does not match POSITION");
+    if ((primitive.color0Accessor && primitive.colors0.size() != vertexCount * 4)
+        || (!primitive.color0Accessor && !primitive.colors0.empty()))
+        return fail(error, "GLB COLOR_0 cardinality does not match POSITION");
+    if (primitive.indices.empty() || primitive.indices.size() % 3 != 0)
+        return fail(error, "GLB primitive topology is not a non-empty triangle list");
+    if (!appendFits(scene.vertexCount, vertexCount, scene.vertices.size()))
+        return fail(error, "GLB vertex data exceeds Visual3DScene capacity");
+    if (!appendFits(scene.indexCount, primitive.indices.size(), scene.indices.size()))
+        return fail(error, "GLB index data exceeds Visual3DScene capacity");
+    if (primitive.generatedFlatNormals)
+    {
+        if (primitive.normalAccessor || primitive.tangentAccessor
+            || !primitive.tangents.empty() || primitive.indices.size() != vertexCount)
+            return fail(error, "generated flat GLB normals require consecutive triangle corners");
+        if ((primitive.indexAccessor && primitive.cornerSources.size() != vertexCount)
+            || (!primitive.indexAccessor && !primitive.cornerSources.empty()))
+            return fail(error, "generated flat GLB normals have invalid source-corner correspondence");
+        for (std::size_t index = 0; index < primitive.indices.size(); ++index)
+            if (primitive.indices[index] != index)
+                return fail(error, "generated flat GLB normals require sequential triangle indices");
+    }
+    if (scene.objectCount == scene.objects.size())
+        return fail(error, "GLB primitive count exceeds Visual3DScene object capacity");
+
+    const auto identity = visualimportedsceneidentity::objectId(nodeIndex, primitiveIndex);
+    if (!identity)
+        return fail(error, "GLB node and primitive indices exceed the stable object identity range");
+
+    auto& object = scene.objects[scene.objectCount];
+    object.id = *identity;
+    object.parent = parent;
+    object.material = SceneMaterialId {static_cast<std::uint32_t>(*primitive.material + 1)};
+    object.transform = transform;
+    object.firstVertex = static_cast<std::uint32_t>(scene.vertexCount);
+    object.vertexCount = static_cast<std::uint32_t>(vertexCount);
+    object.firstIndex = static_cast<std::uint32_t>(scene.indexCount);
+    object.indexCount = static_cast<std::uint32_t>(primitive.indices.size());
+
+    for (std::size_t index = 0; index < vertexCount; ++index)
+    {
+        auto& vertex = scene.vertices[scene.vertexCount + index];
+        vertex.position = {primitive.positions[index * 3], primitive.positions[index * 3 + 1],
+                           primitive.positions[index * 3 + 2]};
+        vertex.normal = {primitive.normals[index * 3], primitive.normals[index * 3 + 1],
+                         primitive.normals[index * 3 + 2]};
+        if (!primitive.tangents.empty())
+            vertex.tangent = {primitive.tangents[index * 4], primitive.tangents[index * 4 + 1],
+                              primitive.tangents[index * 4 + 2], primitive.tangents[index * 4 + 3]};
+        if (!primitive.texCoords0.empty())
+            vertex.uv = {primitive.texCoords0[index * 2], primitive.texCoords0[index * 2 + 1]};
+        if (!primitive.colors0.empty())
+            vertex.color = {primitive.colors0[index * 4], primitive.colors0[index * 4 + 1],
+                            primitive.colors0[index * 4 + 2], primitive.colors0[index * 4 + 3]};
+    }
+    for (std::size_t index = 0; index < primitive.indices.size(); ++index)
+    {
+        if (primitive.indices[index] >= vertexCount)
+            return fail(error, "GLB primitive index is outside its POSITION range");
+        scene.indices[scene.indexCount + index] = primitive.indices[index];
+    }
+
+    scene.vertexCount += vertexCount;
+    scene.indexCount += primitive.indices.size();
+    ++scene.objectCount;
+    return true;
+}
+} // namespace
+
+std::shared_ptr<const Visual3DScene> composeImportedVisual3DScene(
+    const Visual3DScene& procedural, const Visual3DScene& imported, std::string& error)
+{
+    static_assert(GlbLimits{}.maxNodes <= 32768, "Imported object IDs must remain outside the procedural namespace");
+    if (!validateVisual3DScene(procedural).valid() || !validateVisual3DScene(imported).valid())
+    { fail(error, "Scene Compose requires valid procedural and imported scene owners"); return {}; }
+    for (std::size_t index = 0; index < imported.materialCount; ++index)
+    {
+        const auto& material = imported.materials[index];
+        const auto* existing = visual3d_detail::findById(procedural.materials, procedural.materialCount, material.id);
+        if (existing && (!scenecomposition::sameMaterialRecord(*existing, material)
+            || existing->metallicRoughnessTexture != material.metallicRoughnessTexture
+            || existing->normalTexture != material.normalTexture || existing->occlusionTexture != material.occlusionTexture
+            || existing->emissiveTexture != material.emissiveTexture || existing->normalScale != material.normalScale
+            || existing->occlusionStrength != material.occlusionStrength || existing->alphaMode != material.alphaMode
+            || existing->alphaCutoff != material.alphaCutoff || existing->doubleSided != material.doubleSided))
+        { fail(error, "Scene Compose has a conflicting imported material identity"); return {}; }
+    }
+    if (!scenecomposition::distinctComposedProceduralObjects(procedural))
+    { fail(error, "Scene Compose procedural identities collide in the composed namespace"); return {}; }
+    auto candidate = std::make_shared<Visual3DScene>(procedural);
+    for (std::size_t index = 0; index < candidate->objectCount; ++index)
+    {
+        auto& object = candidate->objects[index];
+        const auto mapped = scenecomposition::composedProceduralObjectId(object.id);
+        const auto parent = object.parent.isValid() ? scenecomposition::composedProceduralObjectId(object.parent)
+                                                   : std::optional<SceneObjectId>{SceneObjectId{}};
+        if (!mapped || !parent)
+        { fail(error, "Scene Compose procedural identity exceeds its structural namespace"); return {}; }
+        object.id = *mapped;
+        object.parent = *parent;
+    }
+    // glTF has no ambient authoring field. The composed graph owns ambient and
+    // the explicit Render camera/light replacement, while the import owner and
+    // source document retain their original camera and light records.
+    auto leaf = std::make_unique<Visual3DScene>(imported);
+    leaf->ambientColor = procedural.ambientColor;
+    if (!scenecomposition::appendScene(*leaf, *candidate, false, error)) return {};
+    candidate->cameras = procedural.cameras;
+    candidate->cameraCount = procedural.cameraCount;
+    candidate->activeCamera = procedural.activeCamera;
+    candidate->lights = procedural.lights;
+    candidate->lightCount = procedural.lightCount;
+    if (!validateVisual3DScene(*candidate).valid())
+    { fail(error, "Scene Compose merged scene is invalid"); return {}; }
+    error.clear();
+    return candidate;
+}
+
+static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
+    const GlbStaticMeshDocument& asset,
+    std::string& error,
+    std::optional<std::size_t> meshIndex)
+{
+    error.clear();
+    if (meshIndex && *meshIndex >= asset.meshes.size())
+    {
+        fail(error, "selected GLB mesh identity is unavailable");
+        return nullptr;
+    }
+    std::vector<std::uint8_t> selected;
+    if (!collectSelectedNodes(asset, selected, error))
+        return nullptr;
+
+    // Keep the fixed-capacity scene off the video helper's limited thread stack.
+    auto scene = std::make_unique<Visual3DScene>();
+    const auto sceneIdentity = visualimportedsceneidentity::sceneId(asset.selectedScene);
+    if (!sceneIdentity)
+    {
+        fail(error, "selected GLB scene index exceeds the stable scene identity range");
+        return nullptr;
+    }
+    scene->id = *sceneIdentity;
+    if (!copyMaterials(asset, *scene, error))
+        return nullptr;
+
+    std::vector<std::uint8_t> retainedObjectNodes(asset.nodes.size(), 0);
+    for (std::size_t nodeIndex = 0; nodeIndex < asset.nodes.size(); ++nodeIndex)
+    {
+        const auto& node = asset.nodes[nodeIndex];
+        if (selected[nodeIndex] == 0 || !node.mesh || !node.parent
+            || (meshIndex && *node.mesh != *meshIndex))
+            continue;
+        for (auto retained = std::optional<std::size_t>(nodeIndex); retained;
+             retained = asset.nodes[*retained].parent)
+            retainedObjectNodes[*retained] = 1;
+    }
+
+    for (std::size_t nodeIndex = 0; nodeIndex < asset.nodes.size(); ++nodeIndex)
+    {
+        if (retainedObjectNodes[nodeIndex] == 0)
+            continue;
+        if (scene->objectCount == scene->objects.size())
+        {
+            fail(error, "GLB node hierarchy exceeds Visual3DScene object capacity");
+            return nullptr;
+        }
+        const auto identity = visualimportedsceneidentity::nodeTransformObjectId(nodeIndex);
+        if (!identity)
+        {
+            fail(error, "GLB node index exceeds the stable hierarchy identity range");
+            return nullptr;
+        }
+        auto& object = scene->objects[scene->objectCount++];
+        object.id = *identity;
+        if (!decompose(asset.nodes[nodeIndex].localTransform, object.transform))
+        {
+            fail(error, "selected GLB node local transform cannot be represented as Visual3DScene TRS");
+            return nullptr;
+        }
+        if (asset.nodes[nodeIndex].parent
+            && retainedObjectNodes[*asset.nodes[nodeIndex].parent] != 0)
+        {
+            const auto parent = visualimportedsceneidentity::nodeTransformObjectId(
+                *asset.nodes[nodeIndex].parent);
+            if (!parent)
+            {
+                fail(error, "GLB parent node index exceeds the stable hierarchy identity range");
+                return nullptr;
+            }
+            object.parent = *parent;
+        }
+    }
+
+    for (std::size_t nodeIndex = 0; nodeIndex < asset.nodes.size(); ++nodeIndex)
+    {
+        if (selected[nodeIndex] == 0)
+            continue;
+        const auto& node = asset.nodes[nodeIndex];
+        SceneTransform3D transform;
+        if (!decompose(node.worldTransform, transform))
+        {
+            fail(error, "selected GLB node transform cannot be represented as Visual3DScene TRS");
+            return nullptr;
+        }
+
+        if (node.mesh && (!meshIndex || *node.mesh == *meshIndex))
+        {
+            if (*node.mesh >= asset.meshes.size())
+            {
+                fail(error, "selected GLB node mesh reference is out of range");
+                return nullptr;
+            }
+            const auto& mesh = asset.meshes[*node.mesh];
+            SceneObjectId parentObject;
+            SceneTransform3D objectTransform = transform;
+            if (retainedObjectNodes[nodeIndex] != 0)
+            {
+                const auto nodeObject
+                    = visualimportedsceneidentity::nodeTransformObjectId(nodeIndex);
+                if (!nodeObject)
+                {
+                    fail(error, "GLB node index exceeds the stable hierarchy identity range");
+                    return nullptr;
+                }
+                parentObject = *nodeObject;
+                objectTransform = {};
+            }
+            for (std::size_t primitiveIndex = 0; primitiveIndex < mesh.primitives.size(); ++primitiveIndex)
+                if (!copyPrimitive(mesh.primitives[primitiveIndex], nodeIndex, primitiveIndex,
+                                   objectTransform, parentObject, *scene, error))
+                    return nullptr;
+        }
+
+        if (node.camera)
+        {
+            if (*node.camera >= asset.cameras.size())
+            {
+                fail(error, "selected GLB node camera reference is out of range");
+                return nullptr;
+            }
+            if (scene->cameraCount == scene->cameras.size())
+            {
+                fail(error, "GLB camera instances exceed Visual3DScene capacity");
+                return nullptr;
+            }
+            const auto& source = asset.cameras[*node.camera];
+            if (source.type != GlbCameraType::Perspective || !source.farPlane)
+            {
+                fail(error, "Visual3DScene adaptation requires finite perspective cameras");
+                return nullptr;
+            }
+            if (!nearAxisValue(transform.scale.x, 1.0f) || !nearAxisValue(transform.scale.y, 1.0f)
+                || !nearAxisValue(transform.scale.z, 1.0f))
+            {
+                fail(error, "Visual3DScene cameras cannot inherit scale");
+                return nullptr;
+            }
+            auto& target = scene->cameras[scene->cameraCount++];
+            target.id = SceneCameraId {static_cast<std::uint32_t>(nodeIndex + 1)};
+            target.transform = transform;
+            target.transform.scale = {1.0f, 1.0f, 1.0f};
+            target.verticalFovRadians = source.verticalFovRadians;
+            target.nearPlane = source.nearPlane;
+            target.farPlane = *source.farPlane;
+            if (!scene->activeCamera)
+                scene->activeCamera = target.id;
+        }
+
+        if (node.light)
+        {
+            if (*node.light >= asset.lights.size())
+            {
+                fail(error, "selected GLB node light reference is out of range");
+                return nullptr;
+            }
+            if (scene->lightCount == scene->lights.size())
+            {
+                fail(error, "GLB light instances exceed Visual3DScene capacity");
+                return nullptr;
+            }
+            const auto& source = asset.lights[*node.light];
+            auto& target = scene->lights[scene->lightCount++];
+            target.id = SceneLightId {static_cast<std::uint32_t>(nodeIndex + 1)};
+            target.kind = source.type == GlbLightType::Directional
+                ? SceneLightKind::Directional
+                : source.type == GlbLightType::Spot
+                    ? SceneLightKind::Spot : SceneLightKind::Point;
+            target.transform = transform;
+            target.color = {source.color[0], source.color[1], source.color[2]};
+            target.intensity = source.intensity;
+            target.range = source.range.value_or(0.0f);
+            target.innerConeAngle = source.innerConeAngle;
+            target.outerConeAngle = source.outerConeAngle;
+        }
+    }
+
+    if (scene->cameraCount == 0)
+    {
+        // A mesh-only import still needs a view in the editor. Frame its selected
+        // world-space geometry; an authored camera remains authoritative above.
+        std::array<double, 3> low {std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
+        std::array<double, 3> high {-low[0], -low[1], -low[2]};
+        for (std::size_t nodeIndex = 0; nodeIndex < asset.nodes.size(); ++nodeIndex)
+        {
+            const auto& node = asset.nodes[nodeIndex];
+            if (!selected[nodeIndex] || !node.mesh || (meshIndex && *node.mesh != *meshIndex)) continue;
+            const auto& matrix = node.worldTransform;
+            for (const auto& primitive : asset.meshes[*node.mesh].primitives)
+                for (std::size_t vertex = 0; vertex < primitive.positions.size(); vertex += 3)
+                    for (std::size_t axis = 0; axis < 3; ++axis)
+                    {
+                        const double value = matrix[axis] * static_cast<double>(primitive.positions[vertex])
+                            + matrix[4 + axis] * static_cast<double>(primitive.positions[vertex + 1])
+                            + matrix[8 + axis] * static_cast<double>(primitive.positions[vertex + 2])
+                            + matrix[12 + axis];
+                        low[axis] = std::min(low[axis], value);
+                        high[axis] = std::max(high[axis], value);
+                    }
+        }
+        if (!std::all_of(low.begin(), low.end(), [](double v) { return std::isfinite(v); })
+            || !std::all_of(high.begin(), high.end(), [](double v) { return std::isfinite(v); }))
+        { fail(error, "selected GLB scene has no finite geometry to frame"); return nullptr; }
+        const double radius = std::max(0.01, 0.5 * std::sqrt(
+            (high[0] - low[0]) * (high[0] - low[0])
+            + (high[1] - low[1]) * (high[1] - low[1])
+            + (high[2] - low[2]) * (high[2] - low[2])));
+        const double distance = radius * 3.5;
+        auto& camera = scene->cameras[0];
+        camera.id = SceneCameraId {static_cast<std::uint32_t>(asset.nodes.size() + 1)};
+        camera.transform.translation = {static_cast<float>((low[0] + high[0]) * 0.5),
+            static_cast<float>((low[1] + high[1]) * 0.5),
+            static_cast<float>((low[2] + high[2]) * 0.5 + distance)};
+        camera.verticalFovRadians = 0.7853981634f;
+        camera.nearPlane = static_cast<float>(std::max(0.0001, radius * 0.001));
+        camera.farPlane = static_cast<float>(distance + radius * 4.0 + 1.0);
+        scene->activeCamera = camera.id;
+        scene->cameraCount = 1;
+    }
+    const auto validation = validateVisual3DScene(*scene);
+    if (!validation.valid())
+    {
+        fail(error, "translated GLB scene failed Visual3DScene validation: "
+                    + std::string(validationCodeName(validation.code)) + " at record "
+                    + std::to_string(validation.recordIndex));
+        return nullptr;
+    }
+    return scene;
+}
+
+std::optional<Visual3DScene> adaptStaticGlbToVisual3DScene(
+    const GlbStaticMeshDocument& asset,
+    std::string& error,
+    std::optional<std::size_t> meshIndex)
+{
+    auto scene = adaptStaticGlbToVisual3DSceneHeap(asset, error, meshIndex);
+    if (!scene) return std::nullopt;
+    return std::optional<Visual3DScene> {std::in_place, std::move(*scene)};
+}
+
+std::unique_ptr<Visual3DScene> adaptAnimatedGlbMeshToVisual3DSceneHeap(
+    const GlbStaticMeshDocument& asset,
+    std::string& error,
+    std::optional<std::size_t> meshIndex, bool multipleDraws)
+{
+    auto scene = adaptStaticGlbToVisual3DSceneHeap(asset, error, meshIndex);
+    if (!scene) return nullptr;
+
+    if (multipleDraws)
+    {
+        std::size_t count = 0;
+        for (std::size_t index = 0; index < scene->objectCount; ++index)
+        {
+            auto object = scene->objects[index];
+            if (object.indexCount == 0) continue;
+            const auto node = static_cast<std::size_t>((object.id.value - 1u)
+                / visualimportedsceneidentity::kObjectPrimitiveStride);
+            if (node >= asset.nodes.size() || !decompose(asset.nodes[node].worldTransform, object.transform))
+            { fail(error, "animated mesh world transform cannot be represented as TRS"); return nullptr; }
+            object.parent = {};
+            scene->objects[count++] = object;
+        }
+        scene->objectCount = static_cast<std::uint32_t>(count);
+        if (count == 0 || !validateVisual3DScene(*scene).valid())
+        { fail(error, "animated scene has no valid bounded mesh draws"); return nullptr; }
+        return scene;
+    }
+    std::optional<SceneObjectRecord> draw;
+    for (std::size_t index = 0; index < scene->objectCount; ++index)
+    {
+        const auto& object = scene->objects[index];
+        if (object.vertexCount == 0 && object.indexCount == 0) continue;
+        if (draw)
+        {
+            fail(error, "imported animated scene requires one renderable mesh primitive");
+            return nullptr;
+        }
+        draw = object;
+    }
+    if (!draw)
+    {
+        fail(error, "imported animated scene has no selected renderable mesh");
+        return nullptr;
+    }
+    const auto nodeIndex = static_cast<std::size_t>(
+        (draw->id.value - 1u) / visualimportedsceneidentity::kObjectPrimitiveStride);
+    if (nodeIndex >= asset.nodes.size()
+        || !decompose(asset.nodes[nodeIndex].worldTransform, draw->transform))
+    {
+        fail(error, "imported animated mesh world transform cannot be represented as TRS");
+        return nullptr;
+    }
+    draw->parent = {};
+    scene->objects = {};
+    scene->objects[0] = *draw;
+    scene->objectCount = 1;
+    if (!validateVisual3DScene(*scene).valid())
+    {
+        fail(error, "imported animated single-draw scene failed validation");
+        return nullptr;
+    }
+    return scene;
+}
+
+std::optional<Visual3DScene> adaptAnimatedGlbMeshToVisual3DScene(
+    const GlbStaticMeshDocument& asset,
+    std::string& error,
+    std::optional<std::size_t> meshIndex, bool multipleDraws)
+{
+    auto scene = adaptAnimatedGlbMeshToVisual3DSceneHeap(asset, error, meshIndex, multipleDraws);
+    if (!scene) return std::nullopt;
+    return std::optional<Visual3DScene> {std::in_place, std::move(*scene)};
+}
+
+bool sampleGlbCameraLights(const GlbStaticMeshDocument& asset,
+    const visualanimation::Sample& sample, visualanimation::CombinationMode mode, float weight,
+    const Visual3DScene& scene, std::vector<SceneCameraRecord>& cameras,
+    std::vector<SceneLightRecord>& lights, std::string& error)
+{
+    using Mode = visualanimation::CombinationMode;
+    std::vector<std::array<float,16>> local, world(asset.nodes.size());
+    std::vector<bool> required(asset.nodes.size(),false);
+    const auto require=[&](std::uint32_t id) {
+        if (id==0 || id>asset.nodes.size()) return false;
+        for (std::optional<std::size_t> node=id-1u;node;node=asset.nodes[*node].parent) required[*node]=true;
+        return true;
+    };
+    for (std::size_t index=0;index<scene.cameraCount;++index)
+        if (!require(scene.cameras[index].id.value)) return fail(error,"imported camera node identity is invalid");
+    for (std::size_t index=0;index<scene.lightCount;++index)
+        if (!require(scene.lights[index].id.value)) return fail(error,"imported light node identity is invalid");
+    for (const auto& node : asset.nodes) local.push_back(node.localTransform);
+    const auto rotationProduct = [](const SceneQuaternion& a, const SceneQuaternion& b) {
+        return SceneQuaternion{a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+            a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x, a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,
+            a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};
+    };
+    const auto rotationBlend = [](SceneQuaternion a, SceneQuaternion b, float amount) {
+        if (a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w<0) b={-b.x,-b.y,-b.z,-b.w};
+        SceneQuaternion q{a.x+(b.x-a.x)*amount,a.y+(b.y-a.y)*amount,
+            a.z+(b.z-a.z)*amount,a.w+(b.w-a.w)*amount};
+        const auto length=std::sqrt(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w);
+        return SceneQuaternion{q.x/length,q.y/length,q.z/length,q.w/length};
+    };
+    for (const auto& track : sample.tracks())
+    {
+        if (track.channel()==visualanimation::Channel::MorphWeights) continue;
+        if (!track.target().isValid() || track.target().value>asset.nodes.size())
+            return fail(error,"camera/light animation target is outside the exact scene");
+        const auto index=static_cast<std::size_t>(track.target().value-1u);
+        if (!required[index]) continue;
+        SceneTransform3D transform;
+        if (!decompose(local[index],transform))
+            return fail(error,"animated camera/light ancestor cannot be represented as TRS");
+        const auto& values=track.values();
+        if (track.channel()==visualanimation::Channel::Rotation)
+        {
+            const SceneQuaternion sampled{values[0],values[1],values[2],values[3]};
+            if (mode==Mode::Replace) transform.rotation=sampled;
+            else if (mode==Mode::WeightedBlend) transform.rotation=rotationBlend(transform.rotation,sampled,weight);
+            else {
+                const auto delta=rotationBlend({},sampled,weight);
+                transform.rotation=mode==Mode::Add ? rotationProduct(delta,transform.rotation)
+                    : rotationProduct(transform.rotation,delta);
+            }
+        }
+        else
+        {
+            const bool scale=track.channel()==visualanimation::Channel::Scale;
+            auto& target=scale ? transform.scale : transform.translation;
+            const auto combine=[&](float base,float value) {
+                const float identity=scale ? 1.0f : 0.0f;
+                if (mode==Mode::WeightedBlend) return base+(value-base)*weight;
+                if (mode==Mode::Multiply) return base*(identity+(value-identity)*weight);
+                if (mode==Mode::Add || mode==Mode::AddAfterImportedAnimation) return base+(value-identity)*weight;
+                return value;
+            };
+            target={combine(target.x,values[0]),combine(target.y,values[1]),combine(target.z,values[2])};
+        }
+        local[index]=compose(transform);
+    }
+    std::vector<std::uint8_t> state(asset.nodes.size(),0);
+    std::function<bool(std::size_t)> resolve=[&](std::size_t index) {
+        if (index>=asset.nodes.size() || state[index]==1) return false;
+        if (state[index]==2) return true;
+        state[index]=1;
+        const auto parent=asset.nodes[index].parent;
+        if (parent && !resolve(*parent)) return false;
+        world[index]=parent ? multiply(world[*parent],local[index]) : local[index];
+        state[index]=2; return true;
+    };
+    cameras.assign(scene.cameras.begin(),scene.cameras.begin()+scene.cameraCount);
+    lights.assign(scene.lights.begin(),scene.lights.begin()+scene.lightCount);
+    const auto update=[&](auto& record) {
+        const auto index=static_cast<std::size_t>(record.id.value-1u);
+        return resolve(index) && decompose(world[index],record.transform);
+    };
+    for (auto& camera : cameras)
+    {
+        if (!update(camera) || !nearAxisValue(camera.transform.scale.x,1) || !nearAxisValue(camera.transform.scale.y,1)
+            || !nearAxisValue(camera.transform.scale.z,1))
+            return fail(error,"animated imported camera requires a finite unscaled world transform");
+        camera.transform.scale = {1.0f,1.0f,1.0f};
+    }
+    for (auto& light : lights)
+        if (!update(light)) return fail(error,"animated imported light requires a finite world TRS transform");
+    error.clear(); return true;
+}
+} // namespace videohelper::gltf

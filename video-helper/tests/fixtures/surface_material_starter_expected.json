@@ -1,0 +1,331 @@
+{
+  "materials": [
+    {
+      "id": "visual.material.matte-clay",
+      "pbrParameterBlock": [
+        0.55,
+        0.18,
+        0.08,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.82,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.45,
+        0.0,
+        0.0,
+        1,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          122,
+          73,
+          50,
+          255
+        ],
+        [
+          10,
+          3,
+          1,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        49,
+        17,
+        8,
+        255
+      ]
+    },
+    {
+      "id": "visual.material.polished-metal",
+      "pbrParameterBlock": [
+        0.72,
+        0.78,
+        0.86,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.18,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.45,
+        0.0,
+        0.0,
+        2,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          79,
+          82,
+          86,
+          255
+        ],
+        [
+          18,
+          20,
+          22,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        20,
+        22,
+        24,
+        255
+      ]
+    },
+    {
+      "id": "visual.material.frosted-glass",
+      "pbrParameterBlock": [
+        0.88,
+        0.95,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.28,
+        0.0,
+        0.0,
+        1.0,
+        0.35,
+        0.92,
+        1.5,
+        0.0,
+        0.0,
+        3,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          89
+        ],
+        [
+          54,
+          63,
+          80,
+          255
+        ],
+        [
+          8,
+          11,
+          18,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        10,
+        13,
+        20,
+        255
+      ]
+    },
+    {
+      "id": "visual.material.clearcoat-plastic",
+      "pbrParameterBlock": [
+        0.04,
+        0.18,
+        0.72,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.32,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.46,
+        1.0,
+        0.0,
+        4,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          68,
+          92,
+          149,
+          255
+        ],
+        [
+          2,
+          6,
+          19,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        15,
+        27,
+        77,
+        255
+      ]
+    },
+    {
+      "id": "visual.material.emissive-neon",
+      "pbrParameterBlock": [
+        0.01,
+        0.08,
+        0.12,
+        0.0,
+        0.0,
+        8.0,
+        12.0,
+        0.4,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.45,
+        0.0,
+        0.0,
+        5,
+        0,
+        0,
+        0
+      ],
+      "rejectedWrongShadingRgba8": [
+        [
+          0,
+          0,
+          0,
+          255
+        ],
+        [
+          24,
+          255,
+          255,
+          255
+        ],
+        [
+          0,
+          255,
+          255,
+          255
+        ]
+      ],
+      "directionalLitCenterRgba8": [
+        2,
+        255,
+        255,
+        255
+      ]
+    }
+  ],
+  "provenance": {
+    "constants": "Independent authored constants, separate from production module and generated-program tables",
+    "independence": "This Python binary64 model computes JSON pixels without reading native output or production starter definitions.",
+    "model": "Quaternion-rotated fixture normal and directional light; center view +Z at 65x65; direct GGX/Smith/Schlick base with Lambert energy partner; existing ambient metallic/roughness weights, thin transmission coverage and constant coat layering; emission, straight-alpha blending and linear RGBA8 quantization",
+    "fixture": {
+      "extent": [
+        65,
+        65
+      ],
+      "samplePixelXy": [
+        32,
+        32
+      ],
+      "sampleWindowXy": [
+        32.5,
+        32.5
+      ],
+      "sampleNdcXy": [
+        0.0,
+        0.0
+      ],
+      "sampleWorldPosition": [
+        0.0,
+        0.0,
+        1.2288066863723182
+      ],
+      "sampleWorldNormal": [
+        0.46984633961473377,
+        0.34202014592178664,
+        0.8137976633870829
+      ],
+      "frontPlaneOffset": 1.0000000101242166,
+      "centerViewDirection": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "cameraPosition": [
+        0.0,
+        0.0,
+        5.0
+      ],
+      "objectRotationXyzw": [
+        -0.16773126,
+        0.254887,
+        0.04494346,
+        0.95125124
+      ],
+      "lightRotationXyzw": [
+        -0.16773126,
+        0.254887,
+        0.04494346,
+        0.95125124
+      ],
+      "rotationInputPrecision": "Authored quaternion components rounded to binary32 before independent binary64 plane intersection and inverse-transpose normal evaluation; shader arithmetic rounds to binary32.",
+      "ambientRgb": [
+        0.12,
+        0.12,
+        0.12
+      ],
+      "lightColorRgb": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "lightIntensity": 0.88
+    }
+  },
+  "sampledRgba8Fnv1a64": "0e9c2ea7d4278846",
+  "sampledRgba8Sha256": "6a0572637f38f4fb1eff1b128991c4f0ddce31dd6237d03326cb7b511be6365c",
+  "schema": 4,
+  "truthBoundary": "The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, transmission, IOR and clearcoat. Direct base reflection uses view-dependent GGX with Schlick Fresnel from normal-incidence IOR F0. Ambient and constant environment retain the existing approximation; coat is a constant legacy layer and transmission is thin alpha coverage. This does not establish reflective environments, full clearcoat, volumetric refraction, screen-space distortion, absorption or multilayer path tracing."
+}
