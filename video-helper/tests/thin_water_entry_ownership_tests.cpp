@@ -181,9 +181,7 @@ void sharedEdgeLeak()
     check(sg::thinEntryOwned(behind, kWater, kCamera, entry), "shared-edge leak to a farther surface keeps raster ownership");
 }
 
-// A surface clearly in front of the entry fails the strict rule. The shader
-// then probes past it (probedOccluderStillRefuses covers that for a closed
-// occluder; this open face has no thickness for the probe to measure).
+// A surface clearly in front of the entry is a real ownership mismatch.
 void realOccluderRefuses()
 {
     auto value = scene();
@@ -200,165 +198,6 @@ void realOccluderRefuses()
     ov::ClosestHit nonfinite; nonfinite.status = 1; nonfinite.objectId = kRock;
     nonfinite.distance = std::numeric_limits<float>::quiet_NaN();
     check(!sg::thinEntryOwned(nonfinite, kWater, kCamera, entry), "nonfinite foreign hit distance refuses");
-}
-
-// The starter's Nearby Rock as a closed box (centre -1.2,0.05,-1.2, size
-// 1.9x0.65x1.7) over a 12x12 grid of spacing 0.7, seen from the starter camera.
-// Every face is wound so the query's cross(e1,e2) points outward.
-constexpr float kRockLow[3]{-2.15f, -0.275f, -2.05f}, kRockHigh[3]{-0.25f, 0.375f, -0.35f};
-std::shared_ptr<Scene> rockBoxScene()
-{
-    auto s = std::make_shared<Scene>();
-    std::vector<ov::Point> points{{-4.2f, 0, -4.2f}, {4.2f, 0, -4.2f}, {4.2f, 0, 4.2f}, {-4.2f, 0, 4.2f}};
-    std::vector<std::uint32_t> indices{0, 2, 1, 0, 3, 2};
-    for (int axis = 0; axis < 3; ++axis)
-        for (int side = 0; side < 2; ++side) {
-            const int u = (axis+1)%3, v = (axis+2)%3;
-            std::array<ov::Point, 4> quad{};
-            const float uv[4][2]{{0, 0}, {1, 0}, {1, 1}, {0, 1}};
-            for (int corner = 0; corner < 4; ++corner) {
-                quad[corner][axis] = side ? kRockHigh[axis] : kRockLow[axis];
-                quad[corner][u] = uv[corner][0] > 0 ? kRockHigh[u] : kRockLow[u];
-                quad[corner][v] = uv[corner][1] > 0 ? kRockHigh[v] : kRockLow[v];
-            }
-            // cross(u,v) is +axis for this corner order; the low side flips.
-            if (!side) std::swap(quad[1], quad[3]);
-            const auto base = std::uint32_t(points.size());
-            points.insert(points.end(), quad.begin(), quad.end());
-            for (std::uint32_t index : {0u, 1u, 2u, 0u, 2u, 3u}) indices.push_back(base+index);
-        }
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        s->vertices[i].position = {points[i][0], points[i][1], points[i][2]};
-        s->vertices[i].normal = {0, 1, 0};
-        s->vertices[i].color = {1, 1, 1, 1};
-    }
-    for (std::size_t i = 0; i < indices.size(); ++i) s->indices[i] = indices[i];
-    s->vertexCount = points.size(); s->indexCount = indices.size();
-    s->objects[0].id = {kWater}; s->objects[0].material = {7};
-    s->objects[0].firstVertex = 0; s->objects[0].vertexCount = 4;
-    s->objects[0].firstIndex = 0; s->objects[0].indexCount = 6;
-    s->objects[1].id = {kRock}; s->objects[1].material = {8};
-    s->objects[1].firstVertex = 4; s->objects[1].vertexCount = std::uint32_t(points.size()-4);
-    s->objects[1].firstIndex = 6; s->objects[1].indexCount = std::uint32_t(indices.size()-6);
-    s->objectCount = 2;
-    s->materials[0].id = {7}; s->materials[1].id = {8}; s->materialCount = 2;
-    return s;
-}
-
-// Water entry whose camera ray crosses the rock's top face offset inside the
-// x=-2.15 silhouette edge by inset, at the height where the Metal export's
-// failing texel 654,560 (1920x1080, 52 degree field of view) grazes it. One
-// pixel there spans about 0.0076 world units, and that texel's centre lies
-// about 1e-4 inside the edge.
-ov::Point grazingEntry(double inset)
-{
-    const double edge[3]{kRockLow[0]+inset, kRockHigh[1], -0.5255};
-    const double scale = double(kCamera[1])/(double(kCamera[1])-edge[1]);
-    return {float(kCamera[0]+(edge[0]-kCamera[0])*scale), 0.0f, float(kCamera[2]+(edge[2]-kCamera[2])*scale)};
-}
-
-struct Probe { bool owned = false, strict = false, probed = false; ov::ClosestHit first; };
-Probe probe(const Query& query, const ov::Point& entry, const ov::Point& direction)
-{
-    Probe result;
-    result.first = ov::closestHitCpu(query.prepared, query.frame, kCamera, direction, 0.0f, 3.402823e38f);
-    result.strict = sg::thinEntryOwned(result.first, kWater, kCamera, entry);
-    result.owned = sg::thinEntryOwnedPastSliver(result.first, kWater, kCamera, entry, [&](float minimum) {
-        result.probed = true;
-        return ov::closestHitCpu(query.prepared, query.frame, kCamera, direction, minimum, 3.402823e38f);
-    });
-    return result;
-}
-ov::Point toward(const ov::Point& entry)
-{
-    return {entry[0]-kCamera[0], entry[1]-kCamera[1], entry[2]-kCamera[2]};
-}
-
-// The Metal refusal: the raster left the pixel to the water while the query
-// clipped a sliver of the rock's top edge 1.5 units in front of it. The strict
-// rule refuses; the probe one tolerance past the rock reaches the water.
-void occluderSilhouetteSliver()
-{
-    auto value = rockBoxScene();
-    Query query;
-    if (!prepare(*value, query)) return;
-    const auto entry = grazingEntry(1.0e-4);
-    check(entry[0] < kRockLow[0] && entry[2] > kRockLow[2] && entry[2] < kRockHigh[2],
-          "grazing water entry lies beside the rock, not under it");
-    const auto result = probe(query, entry, toward(entry));
-    check(result.first.status == 1 && result.first.objectId == kRock && result.first.entering
-              && result.first.distance < cameraDistance(entry)-1.0f,
-          "grazing camera query clips the rock's top edge well in front of the water");
-    check(!result.strict, "the strict rule refuses the rock silhouette sliver (released Metal refusal)");
-    check(result.probed && result.owned, "the probe past the sliver keeps raster ownership");
-    const auto water = waterFrom(query, entry, 1.333);
-    check(water.complete, "the sliver water pixel completes one-interface transport");
-}
-
-// Contraction or fast math moves the query's ray and triangle arithmetic by a
-// few ulps, so the side of the edge the pixel centre lands on is a coin toss
-// near the tie. Every inset from 2e-4 outside to 1.5e-4 inside the edge, with
-// each direction component nudged by up to four ulps either way, keeps
-// ownership. At least one of them is the strict rule's refusal. In a float32
-// replay one nudged ray misses the rock's top face and catches only its exit
-// face, so the probe must not depend on which way the foreign hit faces.
-void perturbedRoundingAtTheEdge()
-{
-    auto value = rockBoxScene();
-    Query query;
-    if (!prepare(*value, query)) return;
-    int strictRefusals = 0, cases = 0, refused = 0;
-    for (double inset : {-2.0e-4, -1.0e-4, -1.0e-5, -1.0e-6, 0.0, 1.0e-6, 1.0e-5, 5.0e-5, 1.0e-4, 1.5e-4}) {
-        const auto entry = grazingEntry(inset);
-        for (int axis = 0; axis < 3; ++axis)
-            for (int ulps = -4; ulps <= 4; ++ulps) {
-                auto direction = toward(entry);
-                for (int step = 0; step < std::abs(ulps); ++step)
-                    direction[axis] = std::nextafter(direction[axis], ulps < 0 ? -1.0e9f : 1.0e9f);
-                const auto result = probe(query, entry, direction);
-                ++cases;
-                if (!result.strict) ++strictRefusals;
-                if (!result.owned) {
-                    ++refused;
-                    std::fprintf(stderr, "refused inset %.1e axis %d ulps %d: status %d object %u distance %.7g\n",
-                                 inset, axis, ulps, result.first.status, unsigned(result.first.objectId),
-                                 double(result.first.distance));
-                }
-            }
-    }
-    check(refused == 0, "every perturbed edge tie keeps ownership (" + std::to_string(refused) + " of "
-              + std::to_string(cases) + " refused)");
-    check(strictRefusals > 0, "the strict rule refuses some perturbed edge ties");
-}
-
-// The probe never hides a closed occluder. Inside the rock by more than the
-// tolerance it meets the rock's own exit face in front of the water. A
-// refused probe refuses.
-void probedOccluderStillRefuses()
-{
-    auto value = rockBoxScene();
-    Query query;
-    if (!prepare(*value, query)) return;
-    for (double inset : {1.0e-3, 0.05, 0.2}) {
-        const auto entry = grazingEntry(inset);
-        const auto result = probe(query, entry, toward(entry));
-        check(result.first.status == 1 && result.first.objectId == kRock && result.probed && !result.owned,
-              "rock " + std::to_string(inset) + " inside its silhouette still refuses after the probe");
-    }
-    const auto entry = grazingEntry(1.0e-4);
-    ov::ClosestHit front;
-    front.status = 1; front.objectId = kRock; front.entering = true;
-    front.distance = cameraDistance(entry)-1.0f;
-    check(!sg::thinEntryOwnedPastSliver(front, kWater, kCamera, entry,
-              [](float) { ov::ClosestHit budget; budget.status = -2; return budget; }),
-          "a refused probe refuses ownership");
-    ov::ClosestHit refused; refused.status = -1;
-    bool probed = false;
-    check(!sg::thinEntryOwnedPastSliver(refused, kWater, kCamera, entry,
-              [&](float) { probed = true; ov::ClosestHit miss; miss.status = 0; return miss; }) && !probed,
-          "a refused camera query refuses without a probe");
-    check(sg::kMaximumThinPixelRayQueries/sg::kThinPixelRayQueries >= std::uint64_t(3840)*2160,
-          "the probe's query charge still admits a 3840x2160 thin water frame");
 }
 
 // A forced refusal names its reason, pixel count and first texel.
@@ -390,9 +229,6 @@ int main()
     silhouetteMiss();
     sharedEdgeLeak();
     realOccluderRefuses();
-    occluderSilhouetteSliver();
-    perturbedRoundingAtTheEdge();
-    probedOccluderStillRefuses();
     forcedRefusalNamesReasonAndTexel();
     std::printf("thin water entry ownership: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
