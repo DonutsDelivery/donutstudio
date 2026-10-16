@@ -1556,9 +1556,6 @@ bool ImportedScenePayloadExecution::execute(
         if (!request.surfacePrograms.empty())
             deformationRequest.runtimeInputs.canonicalBlockCFrame = request.runtimeInputs.canonicalBlockCFrame;
         ImportedAnimatedSceneReceipt deformationFrame;
-        // The animated route admits, samples, skins and draws inside this call.
-        // Its own scopes name the part that runs long.
-        loopstep::Scope deformationScope ("advance:imported-scene:animated-delegate");
         if (parentPayloadIdentity)
         {
             ImportedSceneExecutionReceipt candidate;

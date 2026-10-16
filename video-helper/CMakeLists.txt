@@ -2292,13 +2292,6 @@ if(NOT MSVC)
 endif()
 add_test(NAME viewport_plan_concurrency COMMAND arbit-viewport-plan-concurrency-tests)
 
-add_executable(arbit-loop-step-probe-tests tests/loop_step_probe_tests.cpp)
-target_link_libraries(arbit-loop-step-probe-tests PRIVATE Threads::Threads)
-if(NOT MSVC)
-    target_compile_options(arbit-loop-step-probe-tests PRIVATE -Wall -Wextra)
-endif()
-add_test(NAME loop_step_probe COMMAND arbit-loop-step-probe-tests)
-
 # CPU path tracer foundation (Plan 3, PT-A1): scene ingest, BVH, tile pool and
 # progressive accumulation. No GPU, display or backend dependency.
 add_executable(arbit-pathtrace-core-tests

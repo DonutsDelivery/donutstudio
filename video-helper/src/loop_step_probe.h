@@ -5,9 +5,7 @@
 // scope also publishes its label into the sink, so the loop-step probe that
 // viewport_info reports names the innermost call. On exit the scope restores
 // the enclosing label and prints one stderr line when the call took 200 ms or
-// more. A sink with a slow record also keeps that label and its duration, so a
-// status reader can name the slow call after it has returned. No allocation and
-// no locks on the timing path.
+// more. No allocation and no locks on the timing path.
 
 #include <atomic>
 #include <chrono>
@@ -22,22 +20,7 @@ struct Sink
 {
     std::atomic<const char*>* label = nullptr;
     std::atomic<std::int64_t>* enterNs = nullptr;
-    // The last scope that ran for kReportNs or longer, and its duration in
-    // milliseconds. Null pointers leave the record off.
-    std::atomic<const char*>* slowLabel = nullptr;
-    std::atomic<std::int64_t>* slowMs = nullptr;
 };
-
-// Stores one slow-call record in the sink, when the sink keeps one. The two
-// stores are relaxed, so a reader can briefly pair a new label with an old
-// duration. That is acceptable for a diagnostic.
-inline void recordSlow (Sink* sink, const char* label, std::int64_t elapsedMs) noexcept
-{
-    if (sink == nullptr || sink->slowLabel == nullptr || sink->slowMs == nullptr)
-        return;
-    sink->slowMs->store (elapsedMs, std::memory_order_relaxed);
-    sink->slowLabel->store (label, std::memory_order_relaxed);
-}
 
 // The sink for the current thread. Null means no sink is installed here, and
 // scopes then only time and print.
@@ -94,19 +77,15 @@ public:
         }
         const std::int64_t elapsedNs = toNs (end) - toNs (start_);
         if (elapsedNs >= kReportNs)
-        {
             std::fprintf (stderr, "[viewport] step %s took %lld ms\n", label_,
                           static_cast<long long> (elapsedNs / 1000000));
-            recordSlow (sink_, label_, elapsedNs / 1000000);
-        }
     }
 
     Scope (const Scope&) = delete;
     Scope& operator= (const Scope&) = delete;
 
-    static constexpr std::int64_t kReportNs = 200000000; // 200 ms
-
 private:
+    static constexpr std::int64_t kReportNs = 200000000; // 200 ms
 
     static std::int64_t toNs (std::chrono::steady_clock::time_point at) noexcept
     {

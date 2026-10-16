@@ -9,8 +9,6 @@
 #include "metal_lambertian_source.h"
 #include "metal_resource_pools.h"
 #include "../composite_render_diagnostic.h"
-#include "../loop_step_probe.h"
-#include <optional>
 #include "fixture_vertex_modifier_shader.h"
 #include "fixture_texture_upload.h"
 #include "fixture_opaque_visibility.h"
@@ -8290,11 +8288,6 @@ public:
                 && materialProgram->diffractionLightingAdmission->description().version == 3
                 && !diffractiontransportnative::prepareScene(*scene, *materialProgram,
                     materialProgram->sceneRevision, resources->spectralTransport, result.error)) return fail(result.error);
-            // The scene shader compile and the pipeline variants below run
-            // synchronously here on the render thread. Each gets its own scope,
-            // so a long cold prepare names the half that took the time.
-            std::optional<loopstep::Scope> prepareStageScope;
-            prepareStageScope.emplace ("metal:fixture-scene-shader-compile");
             sg_shader_desc shaderDesc = {};
             shaderDesc.vertex_func.source=sourceCreation ? sourceCreation->sources->vertex() : vertexSource.c_str();
             shaderDesc.fragment_func.source=sourceCreation ? sourceCreation->sources->fragment() : fragmentSource.c_str();
@@ -8421,8 +8414,6 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     return fail("Metal rough glass receipt shader creation failed: " + lastSokolLog());
             }
 
-            prepareStageScope.reset();
-            prepareStageScope.emplace ("metal:fixture-scene-pipeline-create");
             sg_pipeline_desc pipelineDesc = {};
             pipelineDesc.shader = resources->shader;
             pipelineDesc.layout.buffers[0].stride = sizeof (SceneVertex);
@@ -8605,7 +8596,6 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 }
             }
 
-            prepareStageScope.reset();
             const char* failedResource = nullptr;
             if (! resourceValid (sg_query_buffer_state (resources->vertexBuffer)))
                 failedResource = "vertex buffer";
