@@ -32,7 +32,7 @@ inline std::optional<videowire::geometry::AdmittedValue> prepareAnimatedGeometry
     error="Animated Geometry3D requires one triangle primitive with stable topology"; return std::nullopt;
   }
   const auto selected=request.meshStableId==0 ? std::nullopt : std::optional<std::size_t>{meshIndex};
-  const auto native=gltf::adaptAnimatedGlbMeshToVisual3DScene(*base,error,selected,objectScope!=0);
+  const auto native=gltf::adaptAnimatedGlbMeshToVisual3DSceneHeap(*base,error,selected,objectScope!=0);
   if (!native) return std::nullopt;
   auto admitted=objectScope==0
       ? gltf::adaptGlbMeshToGeometryCore(*base,meshIndex,geometryId,request.sourceStableId,request.asset.version,error,true)
@@ -87,7 +87,7 @@ public:
           || base->meshes[selected].primitives.size()!=1) {
         error="Animated Geometry3D requires one selected mesh and one stable triangle primitive"; return false;
       }
-      auto scene=gltf::adaptAnimatedGlbMeshToVisual3DScene(*base,error,selected);
+      auto scene=gltf::adaptAnimatedGlbMeshToVisual3DSceneHeap(*base,error,selected);
       if (!scene) return false;
       ImportedAnimationDeformationEvaluation initial;
       if (!consumer.evaluatePreview(request,frame,revision,initial,error)) return false;
@@ -97,7 +97,7 @@ public:
       source->structuralRevision=revision;
       source->clip=initial.deformation ? initial.deformation->clip() : initial.sceneAnimation->clip();
       source->object=scene->objects[0].id;
-      source->scene=std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(std::move(*scene));
+      source->scene=std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>(std::move(scene));
       source->retainDeformedGeometry=true;
       std::shared_ptr<const arbitgpu::NativeDeformationResources> resources;
       if (binding!=document->renderBindings.end()) {
@@ -238,7 +238,7 @@ private:
           : std::optional<std::size_t>{static_cast<std::size_t>(request.meshStableId-1u)};
       const auto expected=gltf::adaptGlbObjectsToGeometryCore(*base,selected,nodeId,1,request.sourceStableId,
           request.asset.version,error);
-      auto scene=gltf::adaptAnimatedGlbMeshToVisual3DScene(*base,error,selected,true);
+      auto scene=gltf::adaptAnimatedGlbMeshToVisual3DSceneHeap(*base,error,selected,true);
       if (!expected || !scene) return false;
       for (const auto& binding : document->renderBindings) {
         if (nodeId!=0 && binding.nodeIndex+1u!=nodeId) continue;
@@ -250,7 +250,7 @@ private:
       source->sourceStableId=request.sourceStableId; source->deformationStableId=request.deformationStableId;
       source->structuralRevision=revision;
       source->clip=initial.deformation ? initial.deformation->clip() : initial.sceneAnimation->clip();
-      source->scene=std::make_shared<const HarmonicMIDI::grid::Visual3DScene>(std::move(*scene));
+      source->scene=std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>(std::move(scene));
       source->deformation=document->deformation; source->retainDeformedGeometry=true;
       for (const auto& binding : document->renderBindings) {
         const auto object=std::find_if(source->scene->objects.begin(),source->scene->objects.begin()+source->scene->objectCount,

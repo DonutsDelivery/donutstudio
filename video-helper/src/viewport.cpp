@@ -189,6 +189,22 @@ constexpr const char* kLoopPhaseNames[] = {
 static_assert (sizeof (kLoopPhaseNames) / sizeof (kLoopPhaseNames[0])
                == static_cast<size_t> (LoopPhase::Count), "loop phase names out of step");
 
+// Phases that produce a frame. Time spent in one of them delays the next
+// present, so a long stay there is a stall. Idle and waiting phases are not.
+constexpr bool isFrameWorkPhase (int phase) noexcept
+{
+    return phase == static_cast<int> (LoopPhase::Advance)
+        || phase == static_cast<int> (LoopPhase::Composite)
+        || phase == static_cast<int> (LoopPhase::Render)
+        || phase == static_cast<int> (LoopPhase::Present)
+        || phase == static_cast<int> (LoopPhase::Publish);
+}
+
+// A frame-work step this old is reported as a stall in viewport_info: its name
+// and age go to stalledStep/stalledStepMs and into rendererError. The harness waits 12 s for a seek and Arbit 15 s for an
+// open, so 5 s names the step well before either gives up.
+constexpr double kViewportStallReportMs = 5000.0;
+
 void applyAlphaMatte (DecodedFrame& frame, MediaContext& matte, double sourceSec)
 {
     DecodedFrame matteFrame;
@@ -573,6 +589,13 @@ struct Viewport::Impl
     // and its entry time. Written only by the render thread.
     std::atomic<const char*> loopStep { "idle" };
     std::atomic<int64_t> loopStepEnterNs { 0 };
+    // The last loop step or scoped call that ran long, and its duration. They
+    // stay set after the call returns, so viewport_info still names it when the
+    // stall has ended. Written only by the render thread.
+    std::atomic<const char*> lastSlowStep { "" };
+    std::atomic<int64_t> lastSlowStepMs { 0 };
+    std::atomic<const char*> lastSlowScope { "" };
+    std::atomic<int64_t> lastSlowScopeMs { 0 };
     std::atomic<uint64_t> loopTicks { 0 };
     std::atomic<uint64_t> sharedReleasesReceived { 0 };
     std::atomic<uint64_t> sharedReleasesInvalid { 0 };
@@ -835,7 +858,7 @@ std::string Viewport::open (int width, int height, int x, int y,
     glfwMakeContextCurrent (nullptr);
 #endif
     running_ = true;
-    thread_ = std::thread ([this, width, height, x, y, alwaysOnTop, targetFps]
+    thread_ = videohelper::RenderThread ([this, width, height, x, y, alwaysOnTop, targetFps]
                            { renderLoop (width, height, x, y, alwaysOnTop, targetFps); });
 
     // Wait for the window to come up (or fail) so the RPC reply is accurate.
@@ -884,7 +907,7 @@ std::string Viewport::openShared (int width, int height, double targetFps,
     glfwMakeContextCurrent (nullptr);
 #endif
     running_ = true;
-    thread_ = std::thread ([this, width, height, targetFps]
+    thread_ = videohelper::RenderThread ([this, width, height, targetFps]
                            { renderLoop (width, height, -1, -1, false, targetFps); });
 
     while (! impl_->openDone.load())
@@ -978,7 +1001,7 @@ std::string Viewport::openShm (int width, int height, double targetFps,
 #endif
 
     running_ = true;
-    thread_ = std::thread ([this, width, height, targetFps]
+    thread_ = videohelper::RenderThread ([this, width, height, targetFps]
                            { renderLoop (width, height, -1, -1, false, targetFps); });
 
     while (! impl_->openDone.load())
@@ -1007,11 +1030,24 @@ std::string Viewport::resizeShm (int width, int height)
 
 void Viewport::close()
 {
+    // The step the render thread is in now. The join below waits for it to
+    // return, and every later RPC (the next open included) waits behind it.
+    const char* stepAtClose = impl_ != nullptr
+        ? impl_->loopStep.load (std::memory_order_relaxed) : "";
     if (impl_ != nullptr)
         impl_->wantClose = true;
     running_ = false;
     if (thread_.joinable())
+    {
+        const int64_t joinStart = nowNs();
         thread_.join();
+        const int64_t waitedMs = (nowNs() - joinStart) / 1000000;
+        lastCloseWaitStep_ = stepAtClose != nullptr ? stepAtClose : "";
+        lastCloseWaitMs_ = (double) waitedMs;
+        if (waitedMs >= 1000)
+            std::fprintf (stderr, "[viewport] close waited %lld ms for the render thread (step %s)\n",
+                          (long long) waitedMs, lastCloseWaitStep_.c_str());
+    }
 #if defined (__APPLE__)
     if (impl_ != nullptr && impl_->macPrecreatedWindow != nullptr)
     {
@@ -1958,6 +1994,8 @@ ViewportInfo Viewport::info() const
     vi.viewZoom = viewZoom_.load();
     vi.viewPanX = viewPanX_.load();
     vi.viewPanY = viewPanY_.load();
+    vi.lastCloseWaitStep = lastCloseWaitStep_;
+    vi.lastCloseWaitMs = lastCloseWaitMs_;
     if (impl_ == nullptr) return vi;
     std::lock_guard<std::mutex> lock (impl_->mutex);
     vi.open = impl_->windowOpen.load();
@@ -2028,6 +2066,20 @@ ViewportInfo Viewport::info() const
         vi.loopStep = step;
         vi.loopStepAgeMs = stepNs > 0 ? (double) (nowNs() - stepNs) * 1e-6 : 0.0;
         vi.loopTicks = impl_->loopTicks.load (std::memory_order_relaxed);
+        vi.lastSlowStep = impl_->lastSlowStep.load (std::memory_order_relaxed);
+        vi.lastSlowStepMs = (double) impl_->lastSlowStepMs.load (std::memory_order_relaxed);
+        vi.lastSlowScope = impl_->lastSlowScope.load (std::memory_order_relaxed);
+        vi.lastSlowScopeMs = (double) impl_->lastSlowScopeMs.load (std::memory_order_relaxed);
+        // A frame-work step that has not returned blocks every later present,
+        // seek and close. Name it as a renderer error instead of a silent hang.
+        if (vi.open && isFrameWorkPhase (phase) && vi.loopStepAgeMs >= kViewportStallReportMs)
+        {
+            vi.stalledStep = vi.loopStep;
+            vi.stalledStepMs = vi.loopStepAgeMs;
+            const std::string stall = "viewport render stalled: " + vi.loopStep + " has run for "
+                + std::to_string ((long long) vi.loopStepAgeMs) + " ms without returning";
+            vi.rendererError = vi.rendererError.empty() ? stall : vi.rendererError + "; " + stall;
+        }
     }
     vi.dmabufCapable = impl_->dmabufCapable.load();
     vi.sharedFramesSent = impl_->sharedFramesSent.load();
@@ -2166,7 +2218,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     auto& im = *impl_;
     // This thread owns the advance sub-step atomics, so loopstep::Scope names
     // the inner call there. The guard restores the previous sink on every return.
-    loopstep::Sink loopSink { &im.loopStep, &im.loopStepEnterNs };
+    loopstep::Sink loopSink { &im.loopStep, &im.loopStepEnterNs,
+                              &im.lastSlowScope, &im.lastSlowScopeMs };
     loopstep::SinkInstall loopSinkInstall (&loopSink);
     const bool shared = im.sharedMode;
     const bool shm = im.shmMode;
@@ -3310,10 +3363,28 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     arbitviewport::PublishGate publishGate;
     arbitviewport::PublishGate::Snapshot gateSnapshot;
 
+    // Records the frame-work step being left when it ran 200 ms or longer. A
+    // scope inside the step keeps its own record (lastSlowScope), which names
+    // the inner call; this one names the loop step around it.
+    const auto recordSlowLoopStep = [&im] (int64_t now)
+    {
+        const int64_t since = im.loopStepEnterNs.load (std::memory_order_relaxed);
+        if (since <= 0 || now - since < loopstep::Scope::kReportNs
+            || ! isFrameWorkPhase (im.loopPhase.load (std::memory_order_relaxed)))
+            return;
+        const int64_t elapsedMs = (now - since) / 1000000;
+        const char* step = im.loopStep.load (std::memory_order_relaxed);
+        im.lastSlowStepMs.store (elapsedMs, std::memory_order_relaxed);
+        im.lastSlowStep.store (step, std::memory_order_relaxed);
+        if (elapsedMs >= 2000)
+            std::fprintf (stderr, "[viewport] loop step %s took %lld ms\n",
+                          step, (long long) elapsedMs);
+    };
+
     // Loop-phase probe: stamp the phase being entered. The phase that just
     // ended is logged when it ran longer than 2 s. A phase that never ends
     // logs nothing here; loopPhaseAgeMs over RPC is the signal for that case.
-    const auto enterLoopPhase = [&im] (LoopPhase next)
+    const auto enterLoopPhase = [&im, &recordSlowLoopStep] (LoopPhase next)
     {
         const int64_t now = nowNs();
         const int64_t since = im.loopPhaseEnterNs.load (std::memory_order_relaxed);
@@ -3322,6 +3393,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         if (since > 0 && now - since > 2000000000ll)
             std::fprintf (stderr, "[viewport] loop phase %s took %lld ms (last step %s)\n",
                           kLoopPhaseNames[prev], (long long) ((now - since) / 1000000), lastStep);
+        recordSlowLoopStep (now);
         im.loopPhase.store ((int) next, std::memory_order_relaxed);
         im.loopPhaseEnterNs.store (now, std::memory_order_relaxed);
         // A new phase starts at its own step label.
@@ -3330,9 +3402,11 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     };
 
     // Advance sub-step probe: stamp the call about to run inside the phase.
-    const auto enterLoopStep = [&im] (const char* step)
+    const auto enterLoopStep = [&im, &recordSlowLoopStep] (const char* step)
     {
-        im.loopStepEnterNs.store (nowNs(), std::memory_order_relaxed);
+        const int64_t now = nowNs();
+        recordSlowLoopStep (now);
+        im.loopStepEnterNs.store (now, std::memory_order_relaxed);
         im.loopStep.store (step, std::memory_order_relaxed);
     };
     // Diagnostics for deferred frames: the run length, and the source and time of the last log line.
@@ -5014,8 +5088,13 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     videohelper::importedscene::NativeImportedSceneRenderUse::Preview>(renderer,
                     *importedFramePlan,*importedFrameCompiled,segment,std::move(savedSegments),displaySec,sourceSec,valueFps,
                     importedFrameInputs,&params.visualParams,invocationContext,temporalSamplingTransaction,activity,
-                    [&](const auto& selected,double at,const auto&,std::string&) { return decodeLayer(selected,at,true,valueFps,true); },
+                    [&](const auto& selected,double at,const auto&,std::string&) {
+                        // An exact-time decode after a seek can run long; name it.
+                        loopstep::Scope decodeScope ("advance:imported-scene:frame-decode");
+                        return decodeLayer(selected,at,true,valueFps,true);
+                    },
                     [&](const auto& decoded,const auto& policy,std::string& failure) {
+                        loopstep::Scope leaseScope ("advance:imported-scene:frame-lease");
                         return decoded.hdrFrame.width > 0
                             ? renderer.leaseDecodedHdrFrameForMaterial(decoded.hdrFrame,policy,failure)
                             : renderer.leaseDecodedFrame(decoded.tex,decoded.texW,decoded.texH,decoded.frameColor,failure);

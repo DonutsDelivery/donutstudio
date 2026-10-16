@@ -102,6 +102,8 @@ for line in thin_exits:
     if re.search(r"if\(!(reflected|transmitted)Complete\) return vec3\(0\.0\);", line):
         forwarded += 1
         continue
+    if line.strip() == "if(entryStatus!=0) {status=entryStatus;return vec3(0.0);}":
+        continue
     assert re.search(r"status=[^;]*GLASS_SMOOTH_STATUS_", line), line
 assert forwarded == 2
 assert "reflectedComplete,status GX_PASS" in thin and "transmittedComplete,status GX_PASS" in thin
@@ -114,11 +116,28 @@ owned = function_body("bool thinEntryOwned(GlassClosestHit first,uint water,vec3
 assert "if(first.status==1&&first.objectId==water) return true;" in owned
 assert "if(first.status==0) return true;" in owned
 assert "if(first.status!=1) return false;" in owned
-assert "float tolerance=max(4.0*glassBias(entry),1.0e-4*distance);" in owned
+assert "float tolerance=thinEntryTolerance(camera,entry);" in owned
 assert "return glassSceneFinite(first.distance)&&first.distance>=distance-tolerance;" in owned
+tolerance = function_body("float thinEntryTolerance(vec3 camera,vec3 entry) {")
+assert "return max(4.0*glassBias(entry),1.0e-4*length(entry-camera));" in tolerance
 assert "inline constexpr float kThinEntryRelativeTolerance = 1.0e-4f;" in header
 assert "kThinEntryRelativeTolerance*distance" in header
-assert "if(!thinEntryOwned(first,water,camera,entry)) {status=GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;return vec3(0.0);}" in thin
+
+# An occluder silhouette tie gets one probe along the same ray, one tolerance
+# past the foreign hit. A closed occluder's exit or any other surface in front
+# of the entry still refuses.
+status = function_body("int thinEntryStatus(GlassClosestHit first,uint water,vec3 camera,vec3 incoming,vec3 entry GX_ARGS) {")
+assert "if(thinEntryOwned(first,water,camera,entry)) return 0;" in status
+assert "if(first.status!=1||!glassSceneFinite(first.distance)) return GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;" in status
+assert "GlassClosestHit beyond=glassSceneClosestHit(camera,incoming,first.distance+thinEntryTolerance(camera,entry),3.402823e38,GU_GlassControl GX_QUERY);" in status
+assert "if(beyond.status<0) return beyond.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;" in status
+assert "return thinEntryOwned(beyond,water,camera,entry)?0:GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;" in status
+assert status.count("glassSceneClosestHit(") == 1
+assert "int entryStatus=thinEntryStatus(first,water,camera,incoming,entry GX_PASS);" in thin
+assert "if(entryStatus!=0) {status=entryStatus;return vec3(0.0);}" in thin
+# The admitted thin pixel budget counts the probe.
+assert "inline constexpr std::uint64_t kThinPixelRayQueries = 4;" in header
+assert "kMaximumThinPixelRayQueries/kThinPixelRayQueries" in header
 assert "first.status!=1 || first.objectId!=water" not in thin
 
 # completeFrame names the first failing readback texel after the reason list.

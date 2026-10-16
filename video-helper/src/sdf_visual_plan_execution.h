@@ -26,7 +26,7 @@ enum class VisualSdfPreparation
 
 struct SdfDepthFog final
 {
-    float near = 0.0f, far = 1.0f, density = 1.0f;
+    float nearValue = 0.0f, farValue = 1.0f, density = 1.0f;
     float red = 1.0f, green = 1.0f, blue = 1.0f, alpha = 1.0f;
 };
 
@@ -59,8 +59,8 @@ inline bool decodeSdfDepthFog (const videowire::CompiledVisualLayerPlan& plan,
         target = number;
         return true;
     };
-    return value ("near", 0.0f, 1.0f, result.near)
-        && value ("far", 1.0f, 1.0f, result.far)
+    return value ("near", 0.0f, 1.0f, result.nearValue)
+        && value ("far", 1.0f, 1.0f, result.farValue)
         && value ("density", 1.0f, 32.0f, result.density)
         && value ("red", 1.0f, 1.0f, result.red)
         && value ("green", 1.0f, 1.0f, result.green)
@@ -403,7 +403,7 @@ inline VisualSdfPreparation prepareVisualSdfLayer (
         layer.depthHeight = height;
         layer.depthFog = true;
         layer.depthEffect = 1;
-        layer.fogNear = fog.near; layer.fogFar = fog.far; layer.fogDensity = fog.density;
+        layer.fogNear = fog.nearValue; layer.fogFar = fog.farValue; layer.fogDensity = fog.density;
         layer.fogRed = fog.red; layer.fogGreen = fog.green;
         layer.fogBlue = fog.blue; layer.fogAlpha = fog.alpha;
     }

@@ -10,10 +10,12 @@
 #include "gpu_backend/fixture_glass_caustics_opengl.h"
 #endif
 #include "../../shared/VisualImportedSceneRenderOperationContract.h"
+#include "loop_step_probe.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -1351,7 +1353,12 @@ bool FixtureSceneRenderer::render (
         const auto prepareUse = use == RenderUse::Preview
             ? arbitgpu::NativeFixturePrepareUse::Preview
             : arbitgpu::NativeFixturePrepareUse::Blocking;
+        // A cache miss builds the static GPU resources: buffers, textures and
+        // the scene shader and pipelines. The backend's own scopes split it.
+        std::optional<loopstep::Scope> prepareScope;
+        prepareScope.emplace ("advance:imported-scene:fixture-prepare");
         auto preparation = backend_.prepare (snapshot, nativeMaterial, prepareUse);
+        prepareScope.reset();
         if (preparation.pending)
         {
             // Pending is a retry state, not a failure. No cache or static resource changes.
@@ -1389,6 +1396,10 @@ bool FixtureSceneRenderer::render (
     }
 
     arbitgpu::NativeFixtureSceneSubmission submission;
+    // Encodes, submits and (for checked paths) waits on the frame's GPU work.
+    std::optional<loopstep::Scope> submitScope;
+    submitScope.emplace (sceneInputs.glassCaustic ? "advance:imported-scene:fixture-caustic-submit"
+                                                  : "advance:imported-scene:fixture-submit");
     if (sceneInputs.glassCaustic)
     {
         const auto& selection = *sceneInputs.glassCaustic;
@@ -1431,6 +1442,7 @@ bool FixtureSceneRenderer::render (
     else
         submission = backend_.render (
             snapshot, cache_.native, dimensions.width, dimensions.height, sceneInputs);
+    submitScope.reset();
     if (! submission.rendered || submission.frame == nullptr)
     {
         error = submission.error.empty()

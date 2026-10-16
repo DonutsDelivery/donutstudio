@@ -20,6 +20,7 @@
 #include "composite_render_diagnostic.h"
 #include "bounded_line.h"
 #include "compositor_ownership.h"
+#include "render_thread.h"
 #include "render_snapshot_json.h"
 #include "score_json_parser.h"
 #include "model_payload_transport.h"
@@ -440,7 +441,7 @@ struct ExportAsyncState
     std::mutex resultMutex;                 // guards error/result
     std::string error;
     json result;
-    std::thread worker;
+    videohelper::RenderThread worker;   // renders through FrameRenderer; explicit stack
 } g_export;
 
 // Async proxy transcode state (PROTOCOL.md §Proxy media): same deferred-reply
@@ -479,7 +480,7 @@ struct RenderCacheAsyncState
     std::string error;
     json result;
     std::mutex workerMutex;                 // guards join() callers
-    std::thread worker;
+    videohelper::RenderThread worker;       // same FrameRenderer path as export
 } g_renderCache;
 struct StabilizationAsyncState
 {
@@ -1219,7 +1220,7 @@ void handleExportAsync (const json& idVal, const json& params)
 
     try
     {
-        g_export.worker = std::thread ([idVal, job, compositorLease]
+        g_export.worker = videohelper::RenderThread ([idVal, job, compositorLease]
         {
         std::string usedEncoder, interpolationBackend;
         bool glCompositing = false;
@@ -1393,7 +1394,7 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
     std::lock_guard<std::mutex> wlock (g_renderCache.workerMutex);
     try
     {
-        g_renderCache.worker = std::thread ([idVal, job, compositorLease]
+        g_renderCache.worker = videohelper::RenderThread ([idVal, job, compositorLease]
         {
         std::string usedEncoder, interpolationBackend;
         bool glCompositing = false;
@@ -3306,6 +3307,14 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "loopStep", vi.loopStep },
             { "loopStepAgeMs", vi.loopStepAgeMs },
             { "loopTicks", vi.loopTicks },
+            { "lastSlowStep", vi.lastSlowStep },
+            { "lastSlowStepMs", vi.lastSlowStepMs },
+            { "lastSlowScope", vi.lastSlowScope },
+            { "lastSlowScopeMs", vi.lastSlowScopeMs },
+            { "stalledStep", vi.stalledStep },
+            { "stalledStepMs", vi.stalledStepMs },
+            { "lastCloseWaitStep", vi.lastCloseWaitStep },
+            { "lastCloseWaitMs", vi.lastCloseWaitMs },
             { "canvasWidth", vi.canvasWidth },
             { "canvasHeight", vi.canvasHeight },
             { "viewZoom", vi.viewZoom },

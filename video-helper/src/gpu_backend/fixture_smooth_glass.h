@@ -93,9 +93,11 @@ inline bool completeRoughEnergy(const RoughEnergyReceipt& receipt, std::string& 
     return true;
 }
 inline constexpr std::uint64_t kMaximumPixelRayQueries = 512ull * 1024ull * 1024ull;
-// Per pixel: one primary validation and at most two closest-hit queries.
-// Each admitted hit uses the existing receiver loop, capped at 16 shadow tests.
+// Per pixel: one primary validation, at most one sliver probe past a foreign
+// camera hit (thinEntryStatus) and at most two closest-hit queries. Each
+// admitted hit uses the existing receiver loop, capped at 16 shadow tests.
 inline constexpr std::uint64_t kMaximumThinPixelRayQueries = 32ull * 1024ull * 1024ull;
+inline constexpr std::uint64_t kThinPixelRayQueries = 4;
 // An explicit native implementation contract. Default callers cannot admit
 // rough glass. The backend owns shader selection, float32 storage and completed
 // readback from the exact same frame; none can be inferred from receipt pixels.
@@ -589,7 +591,7 @@ inline bool admitFrame(const Prepared& prepared, std::uint32_t width, std::uint3
         ? std::min(kMaximumPixelRayQueries/kMaximumRoughFrameRayQueries,kMaximumCameraMicroWork/kMaximumCameraPixelMicroWork)
         : rough ? kMaximumPixelRayQueries/kMaximumRoughFrameRayQueries
         : prepared.transport == surfacematerial::TransportMode::ThinInterface
-        ? kMaximumThinPixelRayQueries/3 : kMaximumPixelRayQueries/(3*kMaximumRayVisits+1);
+        ? kMaximumThinPixelRayQueries/kThinPixelRayQueries : kMaximumPixelRayQueries/(3*kMaximumRayVisits+1);
     const std::uint64_t pixels = std::uint64_t(width)*height;
     if (instanced || width == 0 || height == 0 || pixels > maximumPixels)
     { error = "Closed glass transport refuses dynamic instances or pixel ray-query budget overflow"; return false; }
@@ -726,6 +728,15 @@ inline constexpr IncompleteNormalReason kIncompleteNormalReasons[]{
 // over 720 rows it stays under a tenth of one pixel's footprint, so a visible
 // occluder in front of the water still refuses. The shader writes it as 1.0e-4.
 inline constexpr float kThinEntryRelativeTolerance = 1.0e-4f;
+// C++ twin of the shader's thinEntryTolerance.
+inline float thinEntryTolerance(const opaquevisibility::Point& camera, const opaquevisibility::Point& entry)
+{
+    const float dx = entry[0]-camera[0], dy = entry[1]-camera[1], dz = entry[2]-camera[2];
+    const float distance = std::sqrt(dx*dx+dy*dy+dz*dz);
+    // Same origin clearance as the shader's glassBias.
+    const float bias = std::max(1.0e-5f, 2.0e-6f*std::max(std::max(std::abs(entry[0]), std::abs(entry[1])), std::abs(entry[2])));
+    return std::max(4.0f*bias, kThinEntryRelativeTolerance*distance);
+}
 // C++ twin of the shader's thinEntryOwned, for deterministic CPU tests of the
 // raster/query ownership rule. first comes from opaquevisibility::closestHitCpu
 // along the normalized camera-to-entry ray.
@@ -737,10 +748,18 @@ inline bool thinEntryOwned(const opaquevisibility::ClosestHit& first, std::uint3
     if (first.status != 1) return false;
     const float dx = entry[0]-camera[0], dy = entry[1]-camera[1], dz = entry[2]-camera[2];
     const float distance = std::sqrt(dx*dx+dy*dy+dz*dz);
-    // Same origin clearance as the shader's glassBias.
-    const float bias = std::max(1.0e-5f, 2.0e-6f*std::max(std::max(std::abs(entry[0]), std::abs(entry[1])), std::abs(entry[2])));
-    const float tolerance = std::max(4.0f*bias, kThinEntryRelativeTolerance*distance);
-    return std::isfinite(first.distance) && first.distance >= distance-tolerance;
+    return std::isfinite(first.distance) && first.distance >= distance-thinEntryTolerance(camera, entry);
+}
+// C++ twin of the shader's thinEntryStatus: true when the raster entry stands.
+// beyond(minimum) runs the same camera ray query from minimum onward.
+template<class Beyond>
+inline bool thinEntryOwnedPastSliver(const opaquevisibility::ClosestHit& first, std::uint32_t water,
+                                     const opaquevisibility::Point& camera, const opaquevisibility::Point& entry,
+                                     Beyond&& beyond)
+{
+    if (thinEntryOwned(first, water, camera, entry)) return true;
+    if (first.status != 1 || !std::isfinite(first.distance)) return false;
+    return thinEntryOwned(beyond(first.distance+thinEntryTolerance(camera, entry)), water, camera, entry);
 }
 // The owned normal attachment marks incomplete ray paths with a reason code and
 // unrepresentable radiance with -2. Refuse the entire preview/export frame and
@@ -1064,13 +1083,35 @@ int glassRoughReason(int status) {
 // stands when the query hits the water, finds nothing, or finds another
 // surface no nearer than the entry less this tolerance. A surface clearly in
 // front of the entry still refuses. thinEntryOwned in C++ is the same test.
+float thinEntryTolerance(vec3 camera,vec3 entry) {
+    return max(4.0*glassBias(entry),1.0e-4*length(entry-camera));
+}
 bool thinEntryOwned(GlassClosestHit first,uint water,vec3 camera,vec3 entry) {
     if(first.status==1&&first.objectId==water) return true;
     if(first.status==0) return true;
     if(first.status!=1) return false;
     float distance=length(entry-camera);
-    float tolerance=max(4.0*glassBias(entry),1.0e-4*distance);
+    float tolerance=thinEntryTolerance(camera,entry);
     return glassSceneFinite(first.distance)&&first.distance>=distance-tolerance;
+}
+// The same tie on an occluder's silhouette: the pixel centre ray grazes the
+// edge of a closed surface in front of the water, the fixed-point raster left
+// the pixel to the water and the float32 query clipped a sliver of the
+// occluder. The Lighthouse and Ocean rock's top edge passes 0.01 pixel from
+// texel 654,560 of the 1920x1080 frame and refused it on Metal. A second query
+// along the same ray resumes one tolerance past the foreign hit. Inside a
+// closed occluder it meets that occluder's exit or another surface in front of
+// the entry and still refuses. Past a sliver no thicker than the tolerance it
+// finds the water, a miss or a farther surface, so the raster entry stands.
+// The foreign hit may face either way: at the tie the query can catch only
+// the sliver's exit face. Returns 0 when the entry stands, else the refusal
+// status. thinEntryOwnedPastSliver in C++ is the same test.
+int thinEntryStatus(GlassClosestHit first,uint water,vec3 camera,vec3 incoming,vec3 entry GX_ARGS) {
+    if(thinEntryOwned(first,water,camera,entry)) return 0;
+    if(first.status!=1||!glassSceneFinite(first.distance)) return GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;
+    GlassClosestHit beyond=glassSceneClosestHit(camera,incoming,first.distance+thinEntryTolerance(camera,entry),3.402823e38,GU_GlassControl GX_QUERY);
+    if(beyond.status<0) return beyond.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;
+    return thinEntryOwned(beyond,water,camera,entry)?0:GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;
 }
 vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool complete,out int status GX_ARGS) {
     complete=false;status=GLASS_SMOOTH_STATUS_UNCLASSIFIED;
@@ -1080,7 +1121,8 @@ vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool
     uint water=uint(GU_GlassTransport.z)|(uint(GU_GlassTransport.w)<<uint(16));
     GlassClosestHit first=glassSceneClosestHit(camera,incoming,0.0,3.402823e38,GU_GlassControl GX_QUERY);
     if(first.status<0) {status=first.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;return vec3(0.0);}
-    if(!thinEntryOwned(first,water,camera,entry)) {status=GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;return vec3(0.0);}
+    int entryStatus=thinEntryStatus(first,water,camera,incoming,entry GX_PASS);
+    if(entryStatus!=0) {status=entryStatus;return vec3(0.0);}
     bool entering=dot(incoming,normal)<0.0;
     if(!entering) normal=-normal;
     float ior=GU_SurfaceCoating.y;

@@ -62,7 +62,8 @@ std::vector<double> parametersFor (SdfOperation operation,
         case SdfOperation::domainWarp: return { 0.16, -0.12, 0.1, 1.2, 1.7, 2.1 };
         case SdfOperation::unionOp:
         case SdfOperation::intersection:
-        case SdfOperation::subtraction: return {};
+        case SdfOperation::subtraction:
+        case SdfOperation::textExtrusion: return {};
     }
     return {};
 }

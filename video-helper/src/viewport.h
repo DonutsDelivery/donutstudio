@@ -33,6 +33,7 @@
 #include "visual_plan_telemetry.h"
 #include "node_preview_presentation.h"
 #include "mix_analyze.h"
+#include "render_thread.h"
 
 #include <atomic>
 #include <cstdint>
@@ -163,6 +164,22 @@ struct ViewportInfo
     std::string loopStep = "idle";
     double loopStepAgeMs = 0.0;
     uint64_t loopTicks = 0;
+    // The last frame-work loop step, and the last scoped call inside one, that
+    // ran 200 ms or longer, with their durations. They stay set after the call
+    // returns, so a stall that has ended is still named.
+    std::string lastSlowStep;
+    double lastSlowStepMs = 0.0;
+    std::string lastSlowScope;
+    double lastSlowScopeMs = 0.0;
+    // Set while the render thread has stayed in one frame-work step for 5 s or
+    // more: that step and its age. rendererError carries the same stall.
+    std::string stalledStep;
+    double stalledStepMs = 0.0;
+    // How long the last close waited for the render thread to stop, and the
+    // step it was in when the close began. A long wait delays the next open,
+    // because RPCs run one at a time.
+    std::string lastCloseWaitStep;
+    double lastCloseWaitMs = 0.0;
 
     // Project canvas + viewport-only view transform (PROTOCOL.md §Project
     // canvas & view transform). canvas 0/0 = unset (composite at surface
@@ -443,8 +460,12 @@ private:
     std::unique_ptr<Impl> impl_;
     videohelper::modelpayload::Store* modelPayloadStore_ = nullptr;
     std::string depthCacheRoot_;
-    std::thread thread_;
+    // Explicit 8 MiB stack: deep visual-plan replay overflowed 512 KiB on macOS.
+    videohelper::RenderThread thread_;
     std::atomic<bool> running_ { false };
+    // Written by close() on the RPC thread and read by info() there.
+    std::string lastCloseWaitStep_;
+    double lastCloseWaitMs_ = 0.0;
     std::atomic<uint32_t> scopeMask_ { 0 };
     std::atomic<uint64_t> structuralRevision_ { 0 };
     std::atomic<uint64_t> runtimeRevision_ { 0 };

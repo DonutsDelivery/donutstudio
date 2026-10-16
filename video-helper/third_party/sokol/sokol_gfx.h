@@ -4427,6 +4427,7 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(D3D11_MAP_FOR_UPDATE_BUFFER_FAILED, "Map() failed when updating buffer (d3d11)") \
     _SG_LOGITEM_XMACRO(D3D11_MAP_FOR_APPEND_BUFFER_FAILED, "Map() failed when appending to buffer (d3d11)") \
     _SG_LOGITEM_XMACRO(D3D11_MAP_FOR_UPDATE_IMAGE_FAILED, "Map() failed when updating image (d3d11)") \
+    _SG_LOGITEM_XMACRO(METAL_IDPOOL_EXHAUSTED, "Metal resource id pool exhausted (metal)") \
     _SG_LOGITEM_XMACRO(METAL_CREATE_BUFFER_FAILED, "failed to create buffer object (metal)") \
     _SG_LOGITEM_XMACRO(METAL_TEXTURE_FORMAT_NOT_SUPPORTED, "pixel format not supported for texture (metal)") \
     _SG_LOGITEM_XMACRO(METAL_CREATE_TEXTURE_FAILED, "failed to create texture object (metal)") \
@@ -15081,6 +15082,24 @@ _SOKOL_PRIVATE int _sg_mtl_add_resource(id res) {
     return slot_index;
 }
 
+// ARBIT PATCH: refuse a Metal resource creation that needs more id slots than
+// the free queue holds. Upstream only asserts in _sg_mtl_alloc_pool_slot(), so
+// a release build decrements free_queue_top below zero, reads a garbage slot
+// index (NSRangeException in setObject:atIndexedSubscript:) and later writes
+// before the free_queue allocation (heap corruption). Destroyed resources keep
+// their slots until sg_commit() collects them, so a create/destroy loop with no
+// commit drains the queue. Every _sg_mtl_create_*() checks this before its
+// first _sg_mtl_add_resource() and fails the resource instead.
+_SOKOL_PRIVATE bool _sg_mtl_pool_has_room(int slots) {
+    if (_sg.mtl.idpool.free_queue_top >= slots) {
+        return true;
+    }
+    _sg_log(SG_LOGITEM_METAL_IDPOOL_EXHAUSTED, 1,
+        "Metal resource id pool exhausted: destroyed resources keep their id slots until sg_commit()",
+        __LINE__);
+    return false;
+}
+
 /*  mark an MTLResource for release, this will put the resource into the
     deferred-release queue, and the resource will then be released N frames later,
     the special pool index 0 will be ignored (this means that a nil
@@ -15425,6 +15444,9 @@ _SOKOL_PRIVATE void _sg_mtl_reset_state_cache(void) {
 _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_buffer(_sg_buffer_t* buf, const sg_buffer_desc* desc) {
     SOKOL_ASSERT(buf && desc);
     SOKOL_ASSERT(buf->cmn.size > 0);
+    if (!_sg_mtl_pool_has_room(buf->cmn.num_slots)) {
+        return SG_RESOURCESTATE_FAILED;
+    }
     const bool injected = (0 != desc->mtl_buffers[0]);
     MTLResourceOptions mtl_options = _sg_mtl_buffer_resource_options(&buf->cmn.usage);
     for (int slot = 0; slot < buf->cmn.num_slots; slot++) {
@@ -15556,6 +15578,9 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_image(_sg_image_t* img, const sg
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
         img->mtl.tex[i] = _sg_mtl_add_resource(nil);
     }
+    if (!_sg_mtl_pool_has_room(img->cmn.num_slots)) {
+        return SG_RESOURCESTATE_FAILED;
+    }
 
     // initialize a Metal texture descriptor
     MTLTextureDescriptor* mtl_desc = [[MTLTextureDescriptor alloc] init];
@@ -15601,6 +15626,9 @@ _SOKOL_PRIVATE void _sg_mtl_discard_image(_sg_image_t* img) {
 
 _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_sampler(_sg_sampler_t* smp, const sg_sampler_desc* desc) {
     SOKOL_ASSERT(smp && desc);
+    if (!_sg_mtl_pool_has_room(1)) {
+        return SG_RESOURCESTATE_FAILED;
+    }
     id<MTLSamplerState> mtl_smp;
     const bool injected = (0 != desc->mtl_sampler);
     if (injected) {
@@ -15771,6 +15799,10 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_shader(_sg_shader_t* shd, const 
     if (!_sg_mtl_ensure_msl_bindslot_ranges(desc)) {
         return SG_RESOURCESTATE_FAILED;
     }
+    // a library and a function for each of the vertex and fragment stages
+    if (!_sg_mtl_pool_has_room(4)) {
+        return SG_RESOURCESTATE_FAILED;
+    }
 
     shd->mtl.threads_per_threadgroup = MTLSizeMake(
         (NSUInteger)desc->mtl_threads_per_threadgroup.x,
@@ -15824,6 +15856,10 @@ _SOKOL_PRIVATE void _sg_mtl_discard_shader(_sg_shader_t* shd) {
 
 _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_pipeline(_sg_pipeline_t* pip, const sg_pipeline_desc* desc) {
     SOKOL_ASSERT(pip && desc);
+    // a compute pipeline state, or a render pipeline state and a depth-stencil state
+    if (!_sg_mtl_pool_has_room(3)) {
+        return SG_RESOURCESTATE_FAILED;
+    }
     _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     if (pip->cmn.is_compute) {
         NSError* err = NULL;
@@ -16026,6 +16062,9 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_view(_sg_view_t* view, const sg_
         const _sg_image_t* img = _sg_image_ref_ptr(&cmn->ref);
         SOKOL_ASSERT(cmn->mip_level_count >= 1);
         SOKOL_ASSERT(cmn->slice_count >= 1);
+        if (!_sg_mtl_pool_has_room(img->cmn.num_slots)) {
+            return SG_RESOURCESTATE_FAILED;
+        }
         for (int slot = 0; slot < img->cmn.num_slots; slot++) {
             SOKOL_ASSERT(img->mtl.tex[slot] != _SG_MTL_INVALID_SLOT_INDEX);
             id<MTLTexture> mtl_tex_view = [_sg_mtl_id(img->mtl.tex[slot])
@@ -16205,6 +16244,10 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
         }
         // pin the swapchain resources into memory so that they outlive their command buffer
         // (this is necessary because the command buffer doesn't retain references)
+        if (!_sg_mtl_pool_has_room(1)) {
+            _sg.cur_pass.valid = false;
+            return;
+        }
         int pass_desc_ref = _sg_mtl_add_resource(pass_desc);
         _sg_mtl_release_resource(_sg.frame_index, pass_desc_ref);
 

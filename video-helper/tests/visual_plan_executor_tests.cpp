@@ -3917,6 +3917,7 @@ struct FakeLayer
     int effectCount = 2;
     Effect graphFeedbackEffect;
     Effect graphKeyCleanupEffect;
+    Effect graphLumaKeyEffect;
     Effect graphCommonEffect;
     bool graphKeyCleanupActive = false;
     colortransform::Description graphColorTransform;

@@ -1340,6 +1340,20 @@ endif()
 add_test(NAME diffraction_order_bsdf
     COMMAND arbit-diffraction-order-bsdf-tests)
 
+add_executable(arbit-stam-diffraction-tests
+    tests/stam_diffraction_tests.cpp)
+target_include_directories(arbit-stam-diffraction-tests PRIVATE
+    src)
+target_compile_features(arbit-stam-diffraction-tests PRIVATE cxx_std_17)
+target_compile_definitions(arbit-stam-diffraction-tests PRIVATE
+    STAM_DIFFRACTION_HEADER_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_backend/stam_diffraction.h")
+if(NOT MSVC)
+    target_compile_options(arbit-stam-diffraction-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME stam_diffraction
+    COMMAND arbit-stam-diffraction-tests)
+
 add_executable(arbit-diffraction-grating-equation-tests
     tests/diffraction_grating_equation_tests.cpp
     src/diffraction_order_bsdf.cpp)
@@ -1412,6 +1426,19 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME thin_water_entry_ownership COMMAND arbit-thin-water-entry-ownership-tests)
+
+# The Metal SurfacePbr source ledger and Sokol Metal pool sizes, measured on
+# Linux. The OpenGL path never runs this ledger.
+add_executable(arbit-surface-source-recipe-budget-tests
+    tests/surface_source_recipe_budget_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-surface-source-recipe-budget-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-surface-source-recipe-budget-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME surface_source_recipe_budget COMMAND arbit-surface-source-recipe-budget-tests)
 
 add_executable(arbit-diffraction-published-grating-validation-tests
     tests/diffraction_published_grating_validation_tests.cpp
@@ -2163,6 +2190,10 @@ add_test(NAME export_telemetry_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/export_telemetry_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME metal_command_buffer_lifetime_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/metal_command_buffer_lifetime_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME viewport_backend_budget_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_backend_budget_source_contract.py
@@ -2242,6 +2273,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GLFW3_FOUND AND OpenGL_FOUND)
         RUN_SERIAL TRUE)
 endif()
 
+if(NOT WIN32)
+    add_executable(arbit-render-thread-stack-tests tests/render_thread_stack_tests.cpp)
+    target_include_directories(arbit-render-thread-stack-tests PRIVATE src)
+    target_link_libraries(arbit-render-thread-stack-tests PRIVATE Threads::Threads)
+    target_compile_options(arbit-render-thread-stack-tests PRIVATE -Wall -Wextra -Werror)
+    add_test(NAME render_thread_stack COMMAND arbit-render-thread-stack-tests)
+endif()
+add_test(NAME render_thread_stack_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/render_thread_stack_source_contract.py)
+
 add_executable(arbit-viewport-plan-concurrency-tests tests/viewport_plan_concurrency_tests.cpp)
 target_include_directories(arbit-viewport-plan-concurrency-tests PRIVATE src)
 target_link_libraries(arbit-viewport-plan-concurrency-tests PRIVATE Threads::Threads)
@@ -2249,6 +2291,80 @@ if(NOT MSVC)
     target_compile_options(arbit-viewport-plan-concurrency-tests PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME viewport_plan_concurrency COMMAND arbit-viewport-plan-concurrency-tests)
+
+add_executable(arbit-loop-step-probe-tests tests/loop_step_probe_tests.cpp)
+target_link_libraries(arbit-loop-step-probe-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-loop-step-probe-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME loop_step_probe COMMAND arbit-loop-step-probe-tests)
+
+# CPU path tracer foundation (Plan 3, PT-A1): scene ingest, BVH, tile pool and
+# progressive accumulation. No GPU, display or backend dependency.
+add_executable(arbit-pathtrace-core-tests
+    tests/pathtrace_core_tests.cpp
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp)
+target_include_directories(arbit-pathtrace-core-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-core-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-core-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-core-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_core COMMAND arbit-pathtrace-core-tests)
+
+# CPU path tracer integrator (Plan 3, PT-A2): sampler, BSDF, lights and the
+# unidirectional path tracer, checked with furnace, MIS and light-unit tests.
+add_executable(arbit-pathtrace-integrator-tests
+    tests/pathtrace_integrator_tests.cpp
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bsdf.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/environment_map.cpp
+    src/pathtrace/integrator.cpp
+    src/pathtrace/lights.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp)
+target_include_directories(arbit-pathtrace-integrator-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-integrator-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-integrator-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-integrator-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_integrator COMMAND arbit-pathtrace-integrator-tests)
+
+# CPU path tracer HDR environment images (Plan 3, PT-B): raster lookup
+# convention, power-weighted importance sampling, MIS and furnace checks, and
+# pixels shared from the helper's resident environment store.
+add_executable(arbit-pathtrace-environment-tests
+    tests/pathtrace_environment_tests.cpp
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bsdf.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/environment_map.cpp
+    src/pathtrace/environment_resident.cpp
+    src/pathtrace/integrator.cpp
+    src/pathtrace/lights.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp)
+target_include_directories(arbit-pathtrace-environment-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-environment-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-environment-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-environment-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_environment COMMAND arbit-pathtrace-environment-tests)
 
 if(GLFW3_FOUND AND OpenGL_FOUND)
     # Real Linux pixel acceptance for Depth Fog. This compiles the production

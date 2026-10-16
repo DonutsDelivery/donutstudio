@@ -36,13 +36,27 @@ struct Stage final
     { return capacity==b.capacity && scans==b.scans && copies==b.copies
         && comparisons==b.comparisons && formatting==b.formatting; }
 };
+// Stage budget of each part of the restricted Metal SurfacePbr recipe. A part
+// that grows past its budget makes every Metal fixture preparation refuse with
+// "Surface source setup exceeds admission"; surface_source_recipe_budget_tests
+// measures the header-only parts on Linux.
+struct StageBudget final
+{
+    static constexpr std::size_t nullVertex=2, finalFragment=8, opaque=24, sky=10,
+        environment=24, renamedQuery=6, spectral=4;
+    // 21 define stages, 7 for each of the twelve rough and seventeen smooth
+    // status tokens, 3 for each of the thirteen uniform tokens, and 30 for the
+    // remaining appends, replacements and the final concatenation (293), plus 10.
+    static constexpr std::size_t transport=303;
+};
 struct Plan final
 {
     static constexpr std::uint32_t version=1;
-    // Null vertex 2, final fragment 8, three opaque recipes 24 each,
-    // sky 10, environment 24, two renamed queries 6 each, spectral 4,
-    // and transport 180 including the twelve status and thirteen uniform tokens.
-    static constexpr std::size_t maximumStages=2+8+3*24+10+24+2*6+4+180;
+    // The opaque recipe runs three times (directly, in the glass query and in
+    // the spectral query) and the renamed query twice.
+    static constexpr std::size_t maximumStages=StageBudget::nullVertex+StageBudget::finalFragment
+        +3*StageBudget::opaque+StageBudget::sky+StageBudget::environment+2*StageBudget::renamedQuery
+        +StageBudget::spectral+StageBudget::transport;
     std::array<Stage,maximumStages> stages{};
     std::size_t count=0;
     std::uint64_t capacity=0, scans=0, copies=0, comparisons=0, formatting=0;

@@ -7,7 +7,10 @@
 #include "backend.h"
 #include "metal_lambertian_dispatch.h"
 #include "metal_lambertian_source.h"
+#include "metal_resource_pools.h"
 #include "../composite_render_diagnostic.h"
+#include "../loop_step_probe.h"
+#include <optional>
 #include "fixture_vertex_modifier_shader.h"
 #include "fixture_texture_upload.h"
 #include "fixture_opaque_visibility.h"
@@ -200,13 +203,16 @@ std::mutex& sokolLogMutex()
     return *mutex;
 }
 
-void captureSokolLog (const char*, std::uint32_t logLevel, std::uint32_t,
+void captureSokolLog (const char*, std::uint32_t logLevel, std::uint32_t logItem,
                       const char* message, std::uint32_t, const char*, void*)
 {
-    if (logLevel > 1 || message == nullptr)
+    if (logLevel > 1)
         return;
     std::lock_guard<std::mutex> lock (sokolLogMutex());
-    gSokolLastLog = message;
+    // Release builds of sokol_gfx pass no message text for named log items.
+    // Keep the item number so a refused creation is still identifiable.
+    gSokolLastLog = message != nullptr ? std::string (message)
+                                       : "sokol_gfx log item " + std::to_string (logItem);
 }
 
 std::string lastSokolLog()
@@ -353,9 +359,26 @@ bool ensureSokolMetal()
     // The viewport, frame probe, and export can retain compositors concurrently
     // (18 shaders and pipelines each). The process-wide pools also serve native
     // scene programs; Sokol's 32-shader default fails during the second one.
-    desc.shader_pool_size = 128;
-    desc.pipeline_pool_size = 128;
+    // Imported scenes need an image, view and sampler per texture role, so
+    // every pool is sized explicitly (metal_resource_pools.h).
+    desc.buffer_pool_size = arbitgpu::metalpools::kBufferPool;
+    desc.image_pool_size = arbitgpu::metalpools::kImagePool;
+    desc.sampler_pool_size = arbitgpu::metalpools::kSamplerPool;
+    desc.shader_pool_size = arbitgpu::metalpools::kShaderPool;
+    desc.pipeline_pool_size = arbitgpu::metalpools::kPipelinePool;
+    desc.view_pool_size = arbitgpu::metalpools::kViewPool;
     desc.environment.metal.device = (__bridge const void*) gMetalDevice;
+    // Sokol's default frame command buffer holds unretained references, so a
+    // Metal object stays alive only as long as Sokol's frame-count release
+    // queue or our own ARC owners say. Neither tracks GPU completion here:
+    // frames bind native buffers (spectral diagnostics, raster capture rings)
+    // into Sokol's encoders and release them on destroy, refusals leave the
+    // frame command buffer open for another thread's sg_commit(), and
+    // reclaimMetalIdPool() collects every pending release at once. Freeing an
+    // object an unretained buffer still referenced panicked the kernel on
+    // 15 Oct (IOGPUResource::free, AGXMetalG17P, during sg_commit). A retained
+    // command buffer keeps every object it encodes alive until it completes.
+    desc.metal.use_command_buffer_with_retained_references = true;
     desc.environment.defaults.color_format = SG_PIXELFORMAT_BGRA8;
     desc.environment.defaults.depth_format = SG_PIXELFORMAT_DEPTH_STENCIL;
     desc.environment.defaults.sample_count = 1;
@@ -367,6 +390,72 @@ bool ensureSokolMetal()
         return false;
     }
     return true;
+}
+
+int metalIdPoolFreeSlots() noexcept
+{
+    return sg_isvalid() ? std::max (_sg.mtl.idpool.free_queue_top, 0) : 0;
+}
+
+// Sokol returns a destroyed resource's Metal id slot to the free queue only in
+// sg_commit(), three commits after sg_destroy_*(). A refusal that creates and
+// destroys resources every frame without committing drains the queue. When no
+// Sokol command buffer or pass is open, a fence committed on Sokol's queue
+// proves every earlier command buffer has completed, so every pending release
+// can be collected without advancing the frame index. Collection only drops
+// the pool's reference: Sokol's command buffers retain what they encode
+// (ensureSokolMetal), so a buffer still in flight keeps its objects alive even
+// if the fence proves less than this assumes. Requires sokolMutex().
+bool reclaimMetalIdPool()
+{
+    if (! sg_isvalid() || _sg.mtl.cmd_buffer != nil || _sg.cur_pass.in_pass)
+        return false;
+    if (_sg.mtl.idpool.release_queue_back == _sg.mtl.idpool.release_queue_front)
+        return true;
+    id<MTLCommandBuffer> fence = [_sg.mtl.cmd_queue commandBuffer];
+    if (fence == nil)
+        return false;
+    [fence commit];
+    [fence waitUntilCompleted];
+    _sg_mtl_garbage_collect (std::numeric_limits<uint32_t>::max());
+    return true;
+}
+
+// Requires sokolMutex(). A refusal between sg_end_pass() and sg_commit()
+// leaves Sokol's frame command buffer open, and the next sg_commit() on any
+// thread would submit its stale passes. Submit it here, before the refusing
+// owner releases what those passes reference, and wait for it to finish.
+void settleOpenSokolCommandBufferUnlocked()
+{
+    if (! sg_isvalid() || _sg.cur_pass.in_pass || _sg.mtl.cmd_buffer == nil)
+        return;
+    // Sokol keeps the autoreleased buffer without a retain. The refusing
+    // caller's pool may already be drained, so hold it across the wait.
+    id<MTLCommandBuffer> open = _sg.mtl.cmd_buffer;
+#if ! __has_feature(objc_arc)
+    [open retain];
+#endif
+    sg_commit();
+    [open waitUntilCompleted];
+#if ! __has_feature(objc_arc)
+    [open release];
+#endif
+}
+
+// Requires sokolMutex(). Refuses by name instead of letting Sokol run out of
+// Metal id slots part way through a preparation.
+bool ensureMetalIdHeadroom (int required, std::string& error)
+{
+    required = std::max (required, arbitgpu::metalpools::kMinimumFreeIds);
+    if (metalIdPoolFreeSlots() >= required)
+        return true;
+    reclaimMetalIdPool();
+    const auto available = metalIdPoolFreeSlots();
+    if (available >= required)
+        return true;
+    error = "Metal resource id pool exhausted: " + std::to_string (available)
+        + " free id slots, " + std::to_string (required) + " required";
+    return false;
 }
 
 uint32_t fnv1a (const void* data, size_t size)
@@ -562,6 +651,20 @@ struct MetalFixtureInstanceGpuRecord
 };
 static_assert (sizeof (MetalFixtureInstanceGpuRecord) == 28 * sizeof (float),
                "Metal fixture instance record layout changed");
+
+// Fixture renders run on render threads that may already be deep in particle
+// replay and imported deformation. macOS gives those threads 512 KiB, and these
+// copies once made renderCaustic's frame 60 KiB (crash 15 Oct, ___chkstk_darwin).
+// One heap block per render holds them instead.
+struct MetalFixtureRenderScratch final
+{
+    FixtureUniforms uniforms {};
+    FixtureUniforms frameUniforms {};
+    FixtureUniforms gratingUniforms {};
+    std::array<MetalFixtureInstanceGpuRecord, HarmonicMIDI::grid::Visual3DScene::kMaxObjectInstances> objectRecords {};
+    std::array<std::pair<float, std::size_t>, HarmonicMIDI::grid::Visual3DScene::kMaxObjectInstances> order {};
+    std::array<MetalFixtureInstanceGpuRecord, HarmonicMIDI::grid::Visual3DScene::kMaxObjects> instanceRecords {};
+};
 
 struct SceneAovUniforms
 {
@@ -1812,6 +1915,7 @@ public:
 
     void destroyUnlocked() noexcept
     {
+        settleOpenSokolCommandBufferUnlocked();
         selectedRough.reset();
         caustic.reset();
         if(roughTileDepthView.id) sg_destroy_view(roughTileDepthView);
@@ -7893,6 +7997,30 @@ public:
                 result.error))
             return result;
 
+        // Build the shader source before any Sokol resource exists. It needs no
+        // GPU state, and a refused source (for example the restricted SurfacePbr
+        // setup admission) must not create and destroy textures, views and
+        // samplers on every retried frame: Sokol frees their Metal id slots only
+        // in sg_commit(), and a refused frame never commits.
+        std::unique_ptr<MetalSurfaceSourceCreation> sourceCreation;
+        std::string fragmentSource,vertexSource;
+        const bool admittedNullSurface=(!materialProgram || !materialProgram->vertexProgram)
+            && (!materialProgram || materialProgram->kind==NativeFixtureMaterialKind::SurfacePbr);
+        if(admittedNullSurface) {
+            try {
+                auto archive=surfacesource::prepare([] { return restrictedSurfaceSourceRecipe<surfacesource::Source>(); },
+                    sizeof(MetalSurfaceSourceCreation));
+                sourceCreation=std::make_unique<MetalSurfaceSourceCreation>(std::move(archive));
+            } catch(const std::exception& exception) { result.error=exception.what(); return result; }
+        } else {
+            fragmentSource=kFixtureFragmentShader;
+            fragmentSource.insert(fragmentSource.find("fragment FragmentOut _main"),opaquevisibility::metalShader()+analyticsky::shader(true)+environmentimage::shader(true)+smoothglass::queryShader(true)+smoothglass::transportShader(true,true)+metalSpectralTransportShader());
+            vertexSource=fixtureVertexModifierShader(kFixtureVertexShader,
+                materialProgram ? materialProgram->vertexProgram.get() : nullptr,
+                videohelper::materialprogram::BackendTarget::Metal,result.error);
+            if(vertexSource.empty()) return result;
+        }
+
         std::lock_guard<std::mutex> lock (sokolMutex());
         @autoreleasepool
         {
@@ -7901,6 +8029,9 @@ public:
                 result.error = gSokolError;
                 return result;
             }
+            if (! ensureMetalIdHeadroom (arbitgpu::metalpools::fixturePreparationIds (
+                    scene != nullptr ? scene->textureCount : 0), result.error))
+                return result;
             if (scene == nullptr || ! validateVisual3DScene (*scene).valid()
                 || scene->objectCount == 0 || scene->materialCount == 0
                 || scene->lightCount > Visual3DScene::kMaxLights
@@ -7992,6 +8123,9 @@ public:
             auto fail = [&] (const std::string& error)
             {
                 resources->destroyUnlocked();
+                // Return the destroyed resources' Metal id slots now. A refusal
+                // retried every frame would otherwise hold them until a commit.
+                reclaimMetalIdPool();
                 result.error = error;
                 return result;
             };
@@ -8156,24 +8290,11 @@ public:
                 && materialProgram->diffractionLightingAdmission->description().version == 3
                 && !diffractiontransportnative::prepareScene(*scene, *materialProgram,
                     materialProgram->sceneRevision, resources->spectralTransport, result.error)) return fail(result.error);
-            std::unique_ptr<MetalSurfaceSourceCreation> sourceCreation;
-            std::string fragmentSource,vertexSource;
-            const bool admittedNullSurface=(!materialProgram || !materialProgram->vertexProgram)
-                && (!materialProgram || materialProgram->kind==NativeFixtureMaterialKind::SurfacePbr);
-            if(admittedNullSurface) {
-                try {
-                    auto archive=surfacesource::prepare([] { return restrictedSurfaceSourceRecipe<surfacesource::Source>(); },
-                        sizeof(MetalSurfaceSourceCreation));
-                    sourceCreation=std::make_unique<MetalSurfaceSourceCreation>(std::move(archive));
-                } catch(const std::exception& exception) { return fail(exception.what()); }
-            } else {
-                fragmentSource=kFixtureFragmentShader;
-                fragmentSource.insert(fragmentSource.find("fragment FragmentOut _main"),opaquevisibility::metalShader()+analyticsky::shader(true)+environmentimage::shader(true)+smoothglass::queryShader(true)+smoothglass::transportShader(true,true)+metalSpectralTransportShader());
-                vertexSource=fixtureVertexModifierShader(kFixtureVertexShader,
-                    materialProgram ? materialProgram->vertexProgram.get() : nullptr,
-                    videohelper::materialprogram::BackendTarget::Metal,result.error);
-                if(vertexSource.empty()) return fail(result.error);
-            }
+            // The scene shader compile and the pipeline variants below run
+            // synchronously here on the render thread. Each gets its own scope,
+            // so a long cold prepare names the half that took the time.
+            std::optional<loopstep::Scope> prepareStageScope;
+            prepareStageScope.emplace ("metal:fixture-scene-shader-compile");
             sg_shader_desc shaderDesc = {};
             shaderDesc.vertex_func.source=sourceCreation ? sourceCreation->sources->vertex() : vertexSource.c_str();
             shaderDesc.fragment_func.source=sourceCreation ? sourceCreation->sources->fragment() : fragmentSource.c_str();
@@ -8300,6 +8421,8 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     return fail("Metal rough glass receipt shader creation failed: " + lastSokolLog());
             }
 
+            prepareStageScope.reset();
+            prepareStageScope.emplace ("metal:fixture-scene-pipeline-create");
             sg_pipeline_desc pipelineDesc = {};
             pipelineDesc.shader = resources->shader;
             pipelineDesc.layout.buffers[0].stride = sizeof (SceneVertex);
@@ -8482,6 +8605,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 }
             }
 
+            prepareStageScope.reset();
             const char* failedResource = nullptr;
             if (! resourceValid (sg_query_buffer_state (resources->vertexBuffer)))
                 failedResource = "vertex buffer";
@@ -9119,7 +9243,8 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             if(frame->caustic && (!prepareMetalRasterCapture(*frame,runtimeInputs,
                 roughTiles?roughTiles->tiles().size():1,rasterDrawCount,rasterCaptureBudget,result.error)
                 ||!prepareMetalCausticRaster(*frame,result.error))) return fail(result.error);
-            FixtureUniforms uniforms {};
+            const auto scratch = std::make_unique<MetalFixtureRenderScratch>();
+            FixtureUniforms& uniforms = scratch->uniforms;
             uniforms.geometryInstanceControl[3] = static_cast<std::uint32_t>(noteInstances.count);
             for (std::size_t i = 0; i < scene->objectCount; ++i)
             {
@@ -9297,8 +9422,10 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 const auto world = multiplyMetalFixtureMatrices (
                     metalFixtureTransformMatrix (runtimeTransform),
                     metalFixtureWorldMatrix (*scene, *instanced));
-                std::array<MetalFixtureInstanceGpuRecord, Visual3DScene::kMaxObjectInstances> objectRecords {};
-                std::array<std::pair<float, std::size_t>, Visual3DScene::kMaxObjectInstances> order {};
+                auto& objectRecords = scratch->objectRecords;
+                auto& order = scratch->order;
+                objectRecords = {};
+                order = {};
                 for (std::size_t index = 0; index < scene->objectInstanceCount; ++index)
                 {
                     const auto matrix = nativeObjectInstanceMatrix (world, scene->objectInstances[index]);
@@ -9330,8 +9457,8 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             }
             if (resources->instancedSharedGeometry)
             {
-                std::array<MetalFixtureInstanceGpuRecord, Visual3DScene::kMaxObjects>
-                    instanceRecords {};
+                auto& instanceRecords = scratch->instanceRecords;
+                instanceRecords = {};
                 std::vector<videowire::geometry::StableId> stableIdentities;
                 stableIdentities.reserve (scene->objectCount);
                 for (std::size_t index = 0; index < scene->objectCount; ++index)
@@ -9522,7 +9649,8 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             std::uint32_t surfaceDrawCount = 0;
             roughglasstiles::Completion tileCompletion(roughTiles);
             uniforms.roughCameraControl[0]=float(resources->smoothGlass.roughConsumer.version);
-            const auto frameUniforms=uniforms;
+            scratch->frameUniforms=uniforms;
+            const FixtureUniforms& frameUniforms=scratch->frameUniforms;
             const auto jobCount=roughTiles?roughTiles->tiles().size():1;
             for(std::size_t job=0;job<jobCount;++job) {
                 uniforms=frameUniforms;
@@ -9579,7 +9707,8 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             const auto colorPipelineOffset = !diffractionDraw && runtimeInputs.linearColor
                 ? resources->pipelines.size() / 2u : 0u;
             const bool mixedMaterials = diffractionDraw && !materialProgram->objectPrograms.empty();
-            const auto gratingUniforms = uniforms;
+            scratch->gratingUniforms = uniforms;
+            const FixtureUniforms& gratingUniforms = scratch->gratingUniforms;
             struct RoughDraw final { FixtureUniforms uniforms; sg_bindings bindings; int count; std::size_t winding; };
             std::vector<RoughDraw> roughDraws, causticDraws;
             const auto drawSurfaces = [&](int stage) {
@@ -24130,8 +24259,17 @@ bool MetalFrameRenderer::initialize (const arbitgl::GlFuncs* gl, int width, int 
     @autoreleasepool
     {
         impl_->directOnly = directOnly;
-        if (! ensureSokolMetal() || ! impl_->ensurePrograms()
-            || ! impl_->ensureOutputs (gl, width, height))
+        if (! ensureSokolMetal())
+        {
+            errorOut = ! impl_->error.empty() ? impl_->error : gSokolError;
+            return false;
+        }
+        // A reopened viewport follows sessions that destroyed their resources
+        // without a later commit. Collect those Metal id slots before the
+        // compositor creates its programs and outputs.
+        if (! ensureMetalIdHeadroom (arbitgpu::metalpools::kMinimumFreeIds, errorOut))
+            return false;
+        if (! impl_->ensurePrograms() || ! impl_->ensureOutputs (gl, width, height))
         {
             errorOut = ! impl_->error.empty() ? impl_->error : gSokolError;
             return false;

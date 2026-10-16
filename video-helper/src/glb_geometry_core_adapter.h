@@ -31,7 +31,9 @@ inline std::optional<videowire::geometry::AdmittedValue> adaptGlbObjectsToGeomet
     std::uint32_t nodeStableId, videowire::geometry::StableId valueId,
     videowire::geometry::StableId sourceId, std::uint64_t revision, std::string& error) {
   using namespace videowire::geometry;
-  const auto scene=adaptAnimatedGlbMeshToVisual3DScene(asset,error,meshIndex,true);
+  // Visual3DScene holds about 330 KiB of fixed arrays. Keep it off the stack:
+  // this runs inside particle replay on render threads.
+  const auto scene=adaptAnimatedGlbMeshToVisual3DSceneHeap(asset,error,meshIndex,true);
   if (!scene) return std::nullopt;
   auto retained=std::make_shared<RetainedMeshData>();
   retained->attributes={

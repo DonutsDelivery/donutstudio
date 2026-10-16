@@ -4,6 +4,7 @@
 #include "geometry_score_field.h"
 #include "../../shared/Visual3DSceneComposition.h"
 #include "../../shared/GeometrySurfaceMaterial.h"
+#include "loop_step_probe.h"
 
 #include <algorithm>
 #include <cmath>
@@ -877,6 +878,8 @@ bool ImportedAnimatedScenePayloadExecution::executeSceneAnimationComposition(
     const auto material=materialScene_.lock()==scene_?lastGoodMaterial_:nullptr;
     surfacematerial::MaterialEvaluationInputs materialInputs;materialInputs.timeSeconds=runtime.timeSeconds;
     videorender::fixture3d::RenderedFrame rendered;
+    loopstep::Scope renderScope (use == ImportedAnimationEvaluationOwner::Preview
+        ? "advance:imported-scene:animated-render" : "advance:imported-scene:animated-export-render");
     const bool success=use==ImportedAnimationEvaluationOwner::Preview
         ?sceneRenderer_.renderPreview(scene_,material,materialInputs,runtime,{request.width,request.height},
             videorender::fixture3d::kNativeGpuCapability,rendered,error)
@@ -1775,7 +1778,11 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         compositionEpochPayload_=payload;compositionEpochIdentity_=epochIdentity;
         highestCompositionEvaluationRevision_=request.evaluationRevision;
     }
-    if (!admit(payload, request.operation, request.proceduralScene, request.sourceCameraNodeId, request, error)) return false;
+    {
+        // Cold admission decodes and adapts the GLB; a warm owner returns at once.
+        loopstep::Scope admitScope ("advance:imported-scene:animated-admit");
+        if (!admit(payload, request.operation, request.proceduralScene, request.sourceCameraNodeId, request, error)) return false;
+    }
     if (request.operation.pose.nodeStableId != 0
         && std::none_of(importedScene_->objects.begin(), importedScene_->objects.begin() + importedScene_->objectCount,
             [&](const auto& object) { return (object.id.value - 1u) / 65536u + 1u
@@ -1819,11 +1826,16 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         if (!sampleCharge) return false;
     }
     ImportedAnimationDeformationEvaluation evaluation;
-    const auto evaluated = owner == ImportedAnimationEvaluationOwner::Preview
-        ? consumer_.evaluatePreview(request.operation, request.frame,
-                                    request.structuralRevision, evaluation, error)
-        : consumer_.evaluateExport(request.operation, request.frame,
-                                   request.structuralRevision, evaluation, error);
+    bool evaluated = false;
+    {
+        // Samples the clip and evaluates the skin and morph deformation at this frame.
+        loopstep::Scope evaluateScope ("advance:imported-scene:animated-evaluate");
+        evaluated = owner == ImportedAnimationEvaluationOwner::Preview
+            ? consumer_.evaluatePreview(request.operation, request.frame,
+                                        request.structuralRevision, evaluation, error)
+            : consumer_.evaluateExport(request.operation, request.frame,
+                                       request.structuralRevision, evaluation, error);
+    }
     if (!evaluated) return false;
     if (sampleCharge && evaluation.sceneAnimation)
         evaluation.sceneAnimation=retainSceneAnimationAllocation(evaluation.sceneAnimation,sampleCharge);
@@ -2417,6 +2429,8 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     }
     bool renderPending = false;
     const auto renderFrame = [&]() {
+        loopstep::Scope renderScope (owner == ImportedAnimationEvaluationOwner::Preview
+            ? "advance:imported-scene:animated-render" : "advance:imported-scene:animated-export-render");
         if (bindings_.empty())
         {
             videorender::fixture3d::RenderedFrame sceneFrame;
