@@ -805,6 +805,10 @@ struct NativeFixtureSurfaceMaterialProgram final
     std::vector<std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>> objectPrograms;
     // Renderer-owned admitted companion, separate from the released GPU block.
     std::optional<surfacematerial::SpectralReflectanceDescription> spectralReflectance;
+    // Renderer-owned admitted companion: the Stam diffraction layer composed over
+    // this program's BSDF (stam_diffraction_layer.h). Absent for every program
+    // without a layer, which keeps their shaders and uniforms unchanged.
+    std::optional<surfacematerial::DiffractionLayerDescription> diffractionLayer;
     // Exact authored ownership for scene-receiver transport, outside GPU blocks.
     HarmonicMIDI::grid::Scene3DId authoredScene {};
     HarmonicMIDI::grid::SceneMaterialId authoredMaterial {};
@@ -907,6 +911,7 @@ inline bool validNativeSurfaceObjectPrograms(const NativeFixtureSurfaceMaterialP
             && (program.roughGlassScatteringVersion==1 || (program.roughGlassScatteringVersion==2
                 && program.parameters.identifiers[1]==static_cast<std::uint32_t>(surfacematerial::TransportMode::ClosedVolume)))
             && (!program.spectralReflectance || surfacematerial::validSpectralReflectance(*program.spectralReflectance))
+            && (!program.diffractionLayer || surfacematerial::validDiffractionLayer(*program.diffractionLayer))
             && static_cast<unsigned>(program.baseColorSource)
                 <= static_cast<unsigned>(NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture)
             && (root.objectPrograms.empty() || !program.vertexProgram);
@@ -1392,7 +1397,7 @@ inline bool validNativeFixtureMaterialPrograms(const NativeFixtureSurfaceMateria
     if (root.kind == NativeFixtureMaterialKind::SurfacePbr)
         return consumer==NativeFixtureDiffractionConsumer::FiniteLobe&&validNativeSurfaceObjectPrograms(root, scene, backend);
     const auto* object = visual3d_detail::findById(scene.objects, scene.objectCount, root.object);
-    if (!object || object->indexCount == 0 || root.vertexProgram || root.spectralReflectance
+    if (!object || object->indexCount == 0 || root.vertexProgram || root.spectralReflectance || root.diffractionLayer
         || !validNativeFixtureDiffractionProgram(root, backend, object->id, sceneReceiverConsumer,consumer)) return false;
     if (root.objectPrograms.empty()) return root.object == scene.objects[0].id;
     if (root.objectPrograms.size() >= Visual3DScene::kMaxObjects) return false;
@@ -2135,6 +2140,14 @@ struct NativeImportedSceneRuntimeInputs final
 {
     // Explicit HDR export working representation. Ordinary preview stays SDR.
     bool linearColor = false;
+    // A Preview draw keeps its pixels on the GPU: no host readback or CPU frame
+    // validation, the Preview camera walk budget, and no CPU wait between glass
+    // bands. Export and every other caller leave it false and keep each check.
+    // These sit in the padding after linearColor, so the struct size is unchanged.
+    bool previewUse = false;
+    // With previewUse, the caller fences the frame itself, so the draw ends
+    // without its final wait. The OpenGL caustic Preview sets it for its base.
+    bool previewCallerWaits = false;
     // Exact authored selection copied for this draw, never a native cache key.
     std::optional<visualimportedscenerender::GlassCausticSelection> glassCaustic;
     float timeSeconds = 0.0f;
@@ -3441,6 +3454,22 @@ public:
         (void) diagnosticInstanceIdentityColors;
         (void) frameAttributes;
         return prepare (scene, materialProgram, use);
+    }
+    // Preview only. A new snapshot that differs from the prepared one only in the
+    // vertex data of one admitted deformable mesh keeps the prepared static
+    // resources: buffers, BLASes, glass structure, material tables and programs.
+    // The backend uploads that mesh's vertex range and marks it for a GPU refit.
+    // False means "not admitted, take the full prepare"; resources are unchanged.
+    // Export never calls this.
+    virtual bool refreshPreviewDeformedVertices (
+        const std::shared_ptr<const NativeFixtureSceneResources>& resources,
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram)
+    {
+        (void) resources;
+        (void) scene;
+        (void) materialProgram;
+        return false;
     }
     virtual NativeFixtureSceneSubmission render (
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,

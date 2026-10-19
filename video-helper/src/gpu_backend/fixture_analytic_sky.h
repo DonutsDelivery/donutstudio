@@ -84,7 +84,10 @@ vec3 analyticSkyBase(vec3 base,float metallic,float roughness,float dielectric,
         vec3 projected=t1*disk.x+t2*disk.y+stretched*sqrt(max(0.0,1.0-dot(disk,disk)));
         vec3 localH=normalize(vec3(alpha*projected.x,alpha*projected.y,max(0.000001,projected.z)));
         vec3 h=tangent*localH.x+bitangent*localH.y+n*localH.z;
-        float vh=dot(v,h);
+        // A sample can land on the view itself (sample 3 does at n.v near
+        // 0.62), and float rounding then puts v.h a few ulps above one. pow()
+        // of the negative 1-v.h is undefined and returns NaN on NVIDIA GL.
+        float vh=min(dot(v,h),1.0);
         vec3 l=2.0*vh*h-v;
         float nl=clamp(dot(n,l),0.0,1.0);
         if(vh>0.0 && nl>0.0) {

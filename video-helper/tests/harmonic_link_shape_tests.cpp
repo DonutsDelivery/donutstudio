@@ -9,6 +9,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace
@@ -392,6 +393,29 @@ void testLinkMaterialIsBright()
     }
     require(videowire::geometry::admitValue(*value, contract::geometryContract(), {}, error).has_value(),
             "Geometry Core admits the bright link material");
+    require(((harmonic::kLinkMaterialId >> 24) & 1u) != 0u,
+            "the link material carries the self-lit flag that the backend turns into emission");
+}
+
+// A project without links still draws the resting ribbons. They use the same attribute layout as
+// real links, so Geometry Core admits them.
+void testRestingSculpture()
+{
+    contract::Mapping mapping;
+    mapping.stableId = 82;
+    std::string error;
+    const auto value = videohelper::harmonicgeometry::restingSculpture(mapping, error);
+    require(value.has_value(), "the resting sculpture lowers for a default mapping: " + error);
+    if (!value) return;
+    const auto& mesh = std::get<GeometryData>(value->data);
+    require(!mesh.positions.empty() && !mesh.indices.empty(), "the resting sculpture has geometry");
+    require(mesh.vertexIds.size() == mesh.positions.size(), "every resting corner has an identity");
+    bool indicesInRange = true;
+    for (const auto index : mesh.indices)
+        if (index >= mesh.positions.size()) indicesInRange = false;
+    require(indicesInRange, "every resting index names an emitted corner");
+    require(videowire::geometry::admitValue(*value, contract::geometryContract(), {}, error).has_value(),
+            "Geometry Core admits the resting sculpture: " + error);
 }
 } // namespace
 
@@ -406,6 +430,7 @@ int main()
     testTransportVersion();
     testTransportRoundTripAndLegacyDecode();
     testLinkMaterialIsBright();
+    testRestingSculpture();
     if (failures != 0)
     {
         std::cerr << failures << " harmonic link shape checks failed\n";

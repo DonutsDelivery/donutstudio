@@ -25,6 +25,7 @@ required = {
     "blit result checked": "blitSucceeded = im.exporter.blit (presentTex, *target)",
     "fence result checked": "const bool fenceSucceeded = ! fenceRequired || fenceFd >= 0",
     "socket handoff owner": "viewportTelemetry.zeroCopyHandoff (",
+    "consumer release owner": "viewportTelemetry.zeroCopyReleased()",
     "no-buffer owner": "viewportTelemetry.noFreeExportedBuffer()",
 }
 missing = [name for name, needle in required.items() if needle not in viewport]

@@ -1,5 +1,6 @@
 #include "exporter.h"
 #include "composite_render_diagnostic.h"
+#include "layer_failure_attribution.h"
 #include "block_c_frame_owner.h"
 #include "particle_history.h"
 #include "export_encoder_fallback.h"
@@ -15,6 +16,7 @@
 #include "optical_flow_product_receipt_json.h"
 #include "visual_parameter_history.h"
 #include "visual_plan_publication.h"
+#include "source_binding.h"
 #include "imported_animation_visual_plan_execution.h"
 #include "imported_scene_visual_plan_execution.h"
 #include "VisualAnimationPoseControls.h"
@@ -2019,6 +2021,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 arbitmod::evaluateRouting (r, routingStates[ri], 0.0f,
                                            job.score, clk, aud, (float) dtBeats);
             }
+            controlExecutor.setHarmonyContext(job.harmony.get(), &job.beatTimeline);
             const auto& sinks = controlExecutor.evaluate(
                 job.score, clk, aud, static_cast<float>(dtBeats),
                 static_cast<float>(1.0 / job.fps), f, job.fps);
@@ -2569,7 +2572,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     auto parameterTimeline=std::make_shared<videorender::VisualParameterTimeline>();
     if (!parameterTimeline->bind(simulationSamples,parameterHistoryError)) return parameterHistoryError;
     parameterHistory->bind(job.routings,job.controlPlan,particleHistory->score,job.beatTimeline,
-        job.fps,parameterDestinations,parameterHistoryError);
+        job.fps,parameterDestinations,parameterHistoryError,job.harmony);
     const auto historyAudio=*particleHistory;
     particleHistory->parameterAt=[parameterHistory,historyAudio,parameterHistoryError,parameterTimeline]
         (const std::string& destination,double seconds,double& value,std::string& error)
@@ -2825,9 +2828,13 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
     // Build the renderer layer list + overlays for display time t into the
     // shared descs/fromDescs/overlays buffers. Used by both the feedback
     // pre-roll and the main encode loop so they composite identical frames.
-    auto buildFrame = [&] (double t,
+    auto buildFrame = [&] (double frameTime,
                            videowire::TemporalSamplingCommitTransaction& temporalSamplingTransaction)
     {
+        // rangeStart + n / fps and a clip's tempo-map start can name the same
+        // seam a few ulps apart. Put the frame on the seam so the starting
+        // clip is active with local time exactly 0 on this frame.
+        const double t = videowire::snapDisplayTimeToSegmentStart (job.segments, frameTime);
         advanceRoutingsToFrame (t);   // M6: advance mod-matrix state to this frame
         advanceLuaToFrame (t);        // M8: advance/evaluate the Lua hook this frame
 
@@ -2864,8 +2871,10 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         act.clear();   // loop-scoped (see declaration): descs point into it.
         for (const auto& s : job.segments)
         {
-            const double segDur = (s.outSec - s.inSec) / std::max (s.rate, 1e-9);
-            if (! (t >= s.displayStartSec && t < s.displayStartSec + segDur))
+            // Snap both edges to the frame grid: frame n's time and a clip's
+            // start reach a seam through different float paths (see
+            // videowire::kDisplayBoundaryEpsilonSec).
+            if (! videowire::segmentCoversDisplayTime (s, t))
                 continue;
 
             ActiveLayer al;
@@ -2993,7 +3002,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                     ? segment.clockDurationSec : (segment.outSec - segment.inSec) / std::max(segment.rate, 1e-9);
                 desc.shaderClock = videorender::makeShaderClock(t, clockStart, clockDuration,
                     job.beatTimeline, job.fps, true,
-                    static_cast<int>(std::llround((t - clockStart) * job.fps)));
+                    static_cast<int>(std::llround((t - clockStart) * job.fps)), job.harmony.get());
             }
             desc.materialFrameStartSeconds = segment.displayStartSec;
             desc.materialInputsAt = [&](double at,videorender::LayerDesc& sampled,
@@ -3004,7 +3013,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const double duration = segment.clockDurationSec > 0 ? segment.clockDurationSec
                     : (segment.outSec-segment.inSec)/std::max(segment.rate,1e-9);
                 sampled.shaderClock = videorender::makeShaderClock(at,begin,duration,job.beatTimeline,
-                    job.fps,true,static_cast<int>(std::llround((at-begin)*job.fps)));
+                    job.fps,true,static_cast<int>(std::llround((at-begin)*job.fps)), job.harmony.get());
                 sampled.audioFeatures = audioFeatureAt(at-rangeStartSec);
                 sampled.audioPresent = !sampled.audioFeatures.bands.empty();
                 sampled.canonicalBlockCFrame.reset();
@@ -3075,7 +3084,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const double duration = segment.clockDurationSec > 0 ? segment.clockDurationSec
                     : (segment.outSec-segment.inSec)/std::max(segment.rate,1e-9);
                 desc.shaderClock = videorender::makeShaderClock(t,begin,duration,job.beatTimeline,
-                    job.fps,true,static_cast<int>(std::llround((t-begin)*job.fps)));
+                    job.fps,true,static_cast<int>(std::llround((t-begin)*job.fps)), job.harmony.get());
             }
             const auto importedFrameInputs = desc;
             std::optional<videohelper::importedscene::ImportedMaterialFrameResolver> importedFrameResolver;
@@ -3175,10 +3184,18 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 &visualEvaluationContext, &params.visualParams);
         };
 
+        // A failure about a layer's own plan, source or content names that clip, so the
+        // plugin can isolate it the way it isolates a clip whose plan failed to compile.
+        // layerClipId follows the clip being built: a shader transition's source or a
+        // crossfade's outgoing clip is named instead of the clip that uses it. Device,
+        // encoder and helper errors stay unnamed (see layer_failure_attribution.h).
+        const bool errorBeforeLayers = ! error.empty();
+        int layerClipId = -1;
         for (const auto& al : act)
         {
             if (al.params.visible < 0.5f || al.params.opacity <= 0.001f)
                 continue;
+            layerClipId = al.seg->clipId;
 
             if (videowire::isOpticalFlowPlan(visualLayerPlans, al.seg->clipId))
             {
@@ -3277,7 +3294,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const int frameIdx = (int) std::llround ((t - clockStart) * job.fps);
                 const videorender::ShaderClock clock = videorender::makeShaderClock (
                     t, clockStart, clockDuration, job.beatTimeline,
-                    job.fps, true, frameIdx);
+                    job.fps, true, frameIdx, job.harmony.get());
                 // Block B (M4): the mix WAV is range-scoped (sample 0 ==
                 // rangeStartSec), so sample its features at buffer-relative time.
                 const videorender::AudioFeatures af = audioFeatureAt (t - rangeStartSec);
@@ -3299,7 +3316,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const int frameIdx = (int) std::llround ((t - clockStart) * job.fps);
                 const videorender::ShaderClock clock = videorender::makeShaderClock (
                     t, clockStart, clockDuration, job.beatTimeline,
-                    job.fps, true, frameIdx);
+                    job.fps, true, frameIdx, job.harmony.get());
                 fillDesc (d, al.params, nullptr, t, al.seg->clipId, &clock,
                           nullptr, frameNotes, /*isAdjustment=*/false,
                           /*particleSource=*/true);
@@ -3330,7 +3347,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const int frameIdx = static_cast<int>(std::llround((t - clockStart) * job.fps));
                 const auto clock = videorender::makeShaderClock(
                     t, clockStart, clockDuration, job.beatTimeline,
-                    job.fps, true, frameIdx);
+                    job.fps, true, frameIdx, job.harmony.get());
                 fillDesc(d, al.params, nullptr, t, al.seg->clipId, &clock,
                          nullptr, frameNotes, false, false, true);
             }
@@ -3364,10 +3381,27 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             if (d.shaderOperationPlan != nullptr && d.shaderTransitionFromClipId > 0
                 && d.fromLayer == nullptr)
             {
-                const auto* source = videowire::resolveClipSegmentAtDisplayTime(
-                    job.segments, d.shaderTransitionFromClipId, t);
-                if (source == nullptr) { error = "shader transition Layer Source clip is unavailable"; break; }
-                const double sourceSec = source->inSec + (t-source->displayStartSec)*source->rate;
+                {
+                    const double clipStart = al.seg->clockStartSec >= 0.0
+                        ? al.seg->clockStartSec : al.seg->displayStartSec;
+                    const double clipSeconds = al.seg->clockDurationSec > 0.0
+                        ? al.seg->clockDurationSec
+                        : (al.seg->outSec - al.seg->inSec) / std::max(al.seg->rate, 1e-9);
+                    videowire::driveShaderTransitionProgress(d, videowire::shaderTransitionFraction(
+                        t, clipStart, videowire::shaderTransitionSpanSeconds(
+                            al.seg->transitionType != 0 ? al.seg->transitionDurationSec : 0.0, clipSeconds)));
+                }
+                const auto* source = videowire::resolveTransitionSourceSegmentAtDisplayTime(
+                    job.segments, d.shaderTransitionFromClipId, t, al.seg->displayStartSec);
+                if (source == nullptr)
+                {
+                    layerClipId = d.shaderTransitionFromClipId;
+                    error = "shader transition Layer Source clip is unavailable";
+                    break;
+                }
+                layerClipId = source->clipId;
+                const double sourceSec = videowire::transitionSourceSeconds(*source, t,
+                    videowire::transitionHeldFrameSeconds(source->sourceFps));
                 videorender::LayerDesc from;
                 const auto referencedKind = hasNativeVisualSource(visualLayerPlans, source->clipId)
                     ? videowire::SourceKind::Media
@@ -3376,21 +3410,21 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 {
                     if (shaderClips.count(source->clipId) == 0 || !glctx.renderer.hasClipShader(source->clipId))
                     {
-                        error = "shader transition Layer Source clip " + std::to_string(source->clipId)
-                            + ": generator program is unavailable";
+                        error = "shader transition Layer Source generator program is unavailable";
                         break;
                     }
                     const double begin=source->clockStartSec>=0?source->clockStartSec:source->displayStartSec;
                     const double duration=source->clockDurationSec>0?source->clockDurationSec
                         :(source->outSec-source->inSec)/std::max(source->rate,1e-9);
                     const auto clock=videorender::makeShaderClock(t,begin,duration,job.beatTimeline,
-                        job.fps,true,(int)std::llround((t-begin)*job.fps));
+                        job.fps,true,(int)std::llround((t-begin)*job.fps), job.harmony.get());
                     fillDesc(from, stateAt(source->clipId,t), nullptr, t, source->clipId,
                              &clock, nullptr, frameNotes);
                 }
                 else if (!prepareDecodedDesc(*source, stateAt(source->clipId,t), sourceSec, from))
                 { if (error.empty()) error = "shader transition Layer Source could not produce its exact export frame"; break; }
                 fromDescs.push_back(std::move(from)); d.fromLayer=&fromDescs.back();
+                layerClipId = al.seg->clipId;
             }
 
             if (al.transitionActive && d.fromLayer == nullptr)
@@ -3410,11 +3444,17 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                         fromDescs.push_back (fd);
                         d.fromLayer = &fromDescs.back();
                     }
-                    else if (! error.empty()) break;
+                    else if (! error.empty())
+                    {
+                        layerClipId = al.fromSeg->clipId;
+                        break;
+                    }
                 }
             }
             descs.push_back (d);
         }
+        if (! errorBeforeLayers && ! error.empty())
+            error = videoexport::attributeLayerError (layerClipId, error);
 
         // --- Text overlays active at t: static jobSpec values overlaid with
         // baked text<id>/<param> automation, same gathering/ordering as the
@@ -4713,15 +4753,15 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
             error = "cancelled";
             break;
         }
-        const double t = rangeStart + (double) n / job.fps;
+        const double t = videowire::snapDisplayTimeToSegmentStart (
+            job.segments, rangeStart + (double) n / job.fps);
 
         const ExportSegment* seg = nullptr;
         for (size_t i = segIdx; i < job.segments.size(); ++i)
         {
             const auto& s = job.segments[i];
-            const double segDur = (s.outSec - s.inSec) / std::max (1e-9, s.rate);
-            if (t < s.displayStartSec) break;
-            if (t < s.displayStartSec + segDur)
+            if (t < s.displayStartSec - videowire::kDisplayBoundaryEpsilonSec) break;
+            if (videowire::segmentCoversDisplayTime (s, t))
             {
                 seg = &s;
                 segIdx = i;
@@ -4881,6 +4921,10 @@ std::string RecorderSession::open (const std::string& outPath, int width, int he
         enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     if (videohelper::isSoftwareH264Encoder(encName))
     {
+        // Live push-frame recorder: x264 holds its whole thread and lookahead window
+        // before the first packet, and pushFrame holds recorderCodecMutex meanwhile.
+        // Cap libx264 at 4 threads (kept as the ceiling) instead of automatic.
+        if (encName == "libx264") enc->thread_count = 4;
         const auto error = videohelper::configureSoftwareH264(enc, encName, 20, "veryfast");
         if (!error.empty())
         {

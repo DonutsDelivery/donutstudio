@@ -24,6 +24,16 @@ bool reject(std::string& error, const char* message)
     return false;
 }
 
+// The 3D Render node's engine and Path Trace export samples (V27 wire).
+videorender::fixture3d::SceneEngineSelection sceneEngineSelection(const ImportedSceneRequest& request) noexcept
+{
+    videorender::fixture3d::SceneEngineSelection selection;
+    selection.engine = request.renderEngine == visualimportedscenerender::RenderEngine::PathTrace
+        ? videorender::fixture3d::SceneEngineKind::PathTrace : videorender::fixture3d::SceneEngineKind::Raster;
+    selection.exportSamples = request.pathTraceExportSamples;
+    return selection;
+}
+
 template <typename T>
 std::shared_ptr<const T> retainParentPayloadValue(std::shared_ptr<const T> value,
     const std::shared_ptr<const NativeCompositionRetentionBudget::Charge>& charge,
@@ -1116,6 +1126,9 @@ bool ImportedScenePayloadExecution::execute(
         }
         if (selecting > 1)
             return reject(error, "Scene Compose refused: more than one imported leaf selects an object");
+        // The animated execution refuses this on every frame too.
+        if (request.renderEngine == visualimportedscenerender::RenderEngine::PathTrace)
+            return reject(error, visualimportedscenerender::kPathTraceMultipleImportedLeavesUnavailable.data());
     }
     std::shared_ptr<const NativeCompositionRetentionBudget::Charge> parentPayloadCharge;
     std::shared_ptr<ImportedSceneExecutionReceipt::ParentPayloadIdentity> parentPayloadIdentity;
@@ -1555,7 +1568,14 @@ bool ImportedScenePayloadExecution::execute(
         deformationRequest.runtimeInputs = sceneInputs;
         if (!request.surfacePrograms.empty())
             deformationRequest.runtimeInputs.canonicalBlockCFrame = request.runtimeInputs.canonicalBlockCFrame;
+        // The node's engine choice, as on the static route below. The animated
+        // execution draws Path Trace where the fixture renderer draws and
+        // refuses it where the deformation renderer draws; it never draws Raster.
+        deformationExecution_->selectEngine(sceneEngineSelection(request));
         ImportedAnimatedSceneReceipt deformationFrame;
+        // The animated route admits, samples, skins and draws inside this call.
+        // Its own scopes name the part that runs long.
+        loopstep::Scope deformationScope ("advance:imported-scene:animated-delegate");
         if (parentPayloadIdentity)
         {
             ImportedSceneExecutionReceipt candidate;
@@ -1919,6 +1939,8 @@ bool ImportedScenePayloadExecution::execute(
     }
     gltf::GlbNativeFrameReceipt frame;
     bool rendered = false;
+    // The node's engine choice. Raster releases any path tracer caches.
+    seam.selectEngine(sceneEngineSelection(request));
     {
         loopstep::Scope renderScope (use == ImportedSceneUse::Preview
             ? "advance:imported-scene:preview-render" : "advance:imported-scene:export-render");

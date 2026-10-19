@@ -2,6 +2,9 @@
 
 #include "glass_caustic_oracle.h"
 
+#include <algorithm>
+#include <functional>
+
 namespace videohelper::tests::authoredroughcaustic
 {
 inline surfacematerialbinding::ImportedSceneMaterialRequest request(
@@ -50,11 +53,24 @@ inline arbitgpu::NativeFixtureSceneRuntimeInputs inputs(const HarmonicMIDI::grid
     return result;
 }
 
+// How a backend's Preview publishes its caustic. With receipts, every Preview frame carries
+// the completed native receipt. Without them (OpenGL), a Preview frame keeps no host receipt
+// and its first frame may publish the base Color while the caustic is still on the GPU. The
+// cases then render up to `frames` Preview frames until one names no degradation, calling
+// waitForGpu between them, and compare receipts on Export only.
+struct PreviewPublication
+{
+    bool receipts=true;
+    std::function<void()> waitForGpu;
+    unsigned frames=8;
+};
+
 // Reader adapts the backend's existing receipt API to an owned NativeReadback.
 // Native fixture owners invoke this with their real backend and context.
 template<class Reader>
 bool nativeCases(arbitgpu::NativeFixtureSceneBackend& backend,
-    videohelper::materialprogram::BackendTarget target, Reader read, std::string& error)
+    videohelper::materialprogram::BackendTarget target, Reader read, std::string& error,
+    const PreviewPublication& publication = {})
 {
     namespace renderer = videorender::fixture3d;
     namespace gc = arbitgpu::glasscaustics;
@@ -68,13 +84,36 @@ bool nativeCases(arbitgpu::NativeFixtureSceneBackend& backend,
         return fail("rough caustic renderer lost its exact authored material owner");
     auto runtime = inputs(*snapshot);
     renderer::FixtureSceneRenderer preview(backend), exporter(backend);
+    // A bounded poll: Preview frames until the caustic publishes, at most publication.frames.
+    // It returns false only when a frame fails to render. published reports the caustic.
+    const auto renderPublishedPreview = [&](const auto& owner, renderer::RenderedFrame& frame, bool& published) {
+        published = false;
+        for (unsigned attempt = 0; attempt < std::max(1u, publication.frames); ++attempt)
+        {
+            if (!preview.renderPreview(snapshot, owner, {}, runtime, {32,32}, renderer::kNativeGpuCapability, frame, error))
+                return false;
+            if (publication.receipts || (frame.nativeFrame && frame.causticDegradation.empty()))
+            {published = true;return true;}
+            if (publication.waitForGpu) publication.waitForGpu();
+        }
+        return true;
+    };
     renderer::RenderedFrame a, b;
-    if (!preview.renderPreview(snapshot, material, {}, runtime, {32,32}, renderer::kNativeGpuCapability, a, error)
+    bool previewPublished = false;
+    if (!renderPublishedPreview(material, a, previewPublished)
         || !exporter.renderExport(snapshot, material, {}, runtime, {32,32}, renderer::kNativeGpuCapability, b, error))
         return false;
+    if (!previewPublished)
+        return fail("authored rough Preview caustic did not publish within its bounded frames");
     gc::NativeReadback pa, pb;
     gc::EnergyLedger ea, eb;
-    if (!read(a.nativeFrame, pa, ea, error) || !read(b.nativeFrame, pb, eb, error)) return false;
+    if (!read(b.nativeFrame, pb, eb, error)) return false;
+    if (publication.receipts) {if (!read(a.nativeFrame, pa, ea, error)) return false;}
+    // Without receipts Preview has no readable spectrum, so pa aliases pb. Only the
+    // pa/pb equality and energy checks below then hold trivially, and only the
+    // receipts case compares Preview against Export. The later pc != pa check still
+    // bites: pc is the edited Export spectrum, so it must differ from the original.
+    else {pa = pb;ea = eb;}
     const auto positive = [](const gc::NativeReadback& receipt) {
         return !receipt.paths.empty() && !receipt.deposits.empty()
             && std::all_of(receipt.paths.begin(), receipt.paths.end(), [](const auto& path) {
@@ -93,22 +132,32 @@ bool nativeCases(arbitgpu::NativeFixtureSceneBackend& backend,
     renderer::RenderedFrame seek;
     if (!preview.renderPreview(snapshot, material, {}, runtime, {32,32}, renderer::kNativeGpuCapability, seek, error))
         return false;
-    gc::NativeReadback repeated; gc::EnergyLedger repeatedEnergy;
-    if (!read(seek.nativeFrame, repeated, repeatedEnergy, error)) return false;
-    if (repeated.spectralRadiance != pa.spectralRadiance || !seek.stats.reusedMaterialProgram)
-        return fail("repeated authored rough draw changed its native output or material owner");
+    if (publication.receipts)
+    {
+        gc::NativeReadback repeated; gc::EnergyLedger repeatedEnergy;
+        if (!read(seek.nativeFrame, repeated, repeatedEnergy, error)) return false;
+        if (repeated.spectralRadiance != pa.spectralRadiance || !seek.stats.reusedMaterialProgram)
+            return fail("repeated authored rough draw changed its native output or material owner");
+    }
+    // Without receipts, an unchanged Preview frame resolves its retained spectrum at once.
+    else if (!seek.nativeFrame || !seek.causticDegradation.empty() || !seek.stats.reusedMaterialProgram)
+        return fail("repeated authored rough Preview did not resolve its retained caustic or kept another material owner");
 
     const auto edited = renderer::admitSurfaceMaterialBinding(snapshot, request(snapshot, .75f, 2), target, error);
     if (!edited || edited->bindingDigest() == material->bindingDigest()
         || edited->nativeProgram()->programIdentity == material->nativeProgram()->programIdentity)
         return fail("roughness edit failed to revise the actual authored material binding");
     renderer::RenderedFrame changed;
-    if (!preview.renderPreview(snapshot, edited, {}, runtime, {32,32}, renderer::kNativeGpuCapability, changed, error)
+    bool editedPublished = false;
+    if (!renderPublishedPreview(edited, changed, editedPublished)
         || !exporter.renderExport(snapshot, edited, {}, runtime, {32,32}, renderer::kNativeGpuCapability, b, error))
         return false;
+    if (!editedPublished)
+        return fail("authored roughness edit did not publish its Preview caustic within its bounded frames");
     gc::NativeReadback pc, changedExport; gc::EnergyLedger ec, changedExportEnergy;
-    if (!read(changed.nativeFrame, pc, ec, error) || !read(b.nativeFrame, changedExport, changedExportEnergy, error))
-        return false;
+    if (!read(b.nativeFrame, changedExport, changedExportEnergy, error)) return false;
+    if (publication.receipts) {if (!read(changed.nativeFrame, pc, ec, error)) return false;}
+    else {pc = changedExport;ec = changedExportEnergy;}
     if (!positive(pc) || !positive(changedExport) || pc.spectralRadiance == pa.spectralRadiance
         || pc.spectralRadiance != changedExport.spectralRadiance || changed.stats.reusedMaterialProgram)
         return fail("authored roughness edit did not change completed native preview/export caustic radiance");
@@ -148,8 +197,11 @@ bool nativeCases(arbitgpu::NativeFixtureSceneBackend& backend,
         return fail("numerically unsupported authored roughness published prior or partial Color");
 
     const auto smooth = renderer::admitSurfaceMaterialBinding(snapshot, request(snapshot, 0, 3), target, error);
-    if (!smooth || !preview.renderPreview(snapshot, smooth, {}, inputs(*snapshot),
-            {32,32}, renderer::kNativeGpuCapability, changed, error)) return false;
+    // Without Preview receipts, the legacy path is read from its Export receipt.
+    if (!smooth || !(publication.receipts
+            ? preview.renderPreview(snapshot, smooth, {}, inputs(*snapshot), {32,32}, renderer::kNativeGpuCapability, changed, error)
+            : exporter.renderExport(snapshot, smooth, {}, inputs(*snapshot), {32,32}, renderer::kNativeGpuCapability, changed, error)))
+        return false;
     gc::NativeReadback legacy; gc::EnergyLedger legacyEnergy;
     if (!read(changed.nativeFrame, legacy, legacyEnergy, error)) return false;
     if (legacy.paths.empty() || !std::all_of(legacy.paths.begin(), legacy.paths.end(), [](const auto& path) {

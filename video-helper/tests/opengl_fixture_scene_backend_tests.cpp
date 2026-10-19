@@ -3008,6 +3008,39 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
         &&receipt->deposition.visibleCount>0,"native caustic has completed sorted visible-deposit ownership");
     ok&=expect(std::any_of(receipt->spectralRadiance.begin(),receipt->spectralRadiance.end(),[](float v){return v>0;}),
         "native eight-band accumulation contains visible receiver lighting");
+    // The GL render deposits ordinary frames through the kernel splat, so its
+    // receipt belongs to the splat-enabled copy of the CPU frame.
+    auto splatOwner=fixture.frame;
+    ok&=expect(gc::enableSplat(fixture.prepared,splatOwner,error)&&receipt->deposition.splatNormalisers.size()==receipt->deposits.size(),
+        "ordinary native caustics deposit through the kernel splat");
+    {
+        // Splat cap overflow: a gather cap lowered through the test hook makes the
+        // traced frame re-run as single-pixel deposits under its pre-splat identity,
+        // and the CPU reference overflows the same cap.
+        struct CapGuard {~CapGuard(){gc::splatGatherWorkCapOverride().store(0);}} guard;
+        gc::splatGatherWorkCapOverride().store(1);
+        auto crowded=render(fixture,preparation);
+        std::shared_ptr<const gc::NativeReadback> fallback;gc::EnergyLedger fallbackEnergy;arbitgpu::OpenGlGlassCausticDiagnostics fallbackDiagnostics;
+        const bool fell=crowded.rendered
+            &&arbitgpu::readOpenGlGlassCausticReceiptForFixture(*crowded.frame,fallback,fallbackEnergy,error,&fallbackDiagnostics)&&fallback;
+        ok&=expect(fell,"a splat cap overflow re-runs the frame as single-pixel deposits instead of failing it");
+        if(fell) {
+            ok&=expect(fallbackDiagnostics.splatFallback&&fallbackDiagnostics.splatVersion==0&&fallbackDiagnostics.splatGatherWork==0
+                &&fallback->frameIdentity==fixture.frame.identity&&fallback->deposition.splatNormalisers.empty()
+                &&fallback->deposition.keys.size()==fixture.frame.bounds.deposition.paddedKeyCount
+                &&fallback->deposits.size()==receipt->deposits.size(),
+                "the fallback receipt is the single-pixel frame's, with the same traced deposits");
+            gc::EnergyLedger checked;
+            ok&=expect(gc::validateNativeReadback(fixture.prepared,fixture.frame,*fallback,checked,error,&fallback->deposition.submission),
+                "the fallback passes the single-pixel per-pixel reference");
+            ok&=expect(gc::validateNativeReadback(fixture.prepared,splatOwner,*fallback,checked,error,&fallback->deposition.submission),
+                "the CPU splat reference overflows the same lowered cap and accepts the fallback");
+            gc::splatGatherWorkCapOverride().store(0);
+            ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,*fallback,checked,error,&fallback->deposition.submission)
+                &&error.find("without a cap overflow")!=std::string::npos,
+                "a single-pixel fallback without a CPU cap overflow refuses");
+        }
+    }
     const auto independent=gt::powerOracle(fixture);
     ok&=expect(independent.complete,"independent binary64 authored-triangle power oracle completes");
     const auto near=[](double a,double b,double tolerance=8e-4) {
@@ -3021,7 +3054,7 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
         ok&=expect(near(energy.launched[band],energy.deposited[band]+energy.absorbed[band]+energy.escaped[band]+energy.unresolved[band],3e-4),
             "native deposited/absorbed/escaped/unresolved band powers conserve launched flux");
     }
-    std::vector<double> expectedBands(32*32*8);
+    std::vector<double> expectedBands(32*32*8);std::array<double,8> visibleFlux{};
     const auto triangles=gt::worldTriangles(*fixture.scene);
     for(const auto& deposit:receipt->deposits)
     {
@@ -3059,11 +3092,29 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
         ok&=expect(near(pixelArea,deposit.footprint.worldArea,3e-4),"native receiver-plane pixel area matches independent binary64 corners");
         const auto* material=arbitgpu::nativeSurfaceForObject(fixture.program.get(),SceneObjectId{arrival->receiver.object});
         const double power=double(work.incidentPower)*arrival->fraction*material->spectralReflectance->coefficients[work.band];
-        if(x<32&&y<32)expectedBands[(y*32+x)*8+work.band]+=power/(std::acos(-1.0)*pixelArea);
+        visibleFlux[work.band]+=power;
     }
+    // Per pixel against the binary64 kernel reference, then each band's splatted
+    // flux against the independent camera-visible outgoing power.
+    gc::SplatReference splatReference;
+    if(!gc::buildSplatReference(splatOwner,receipt->deposits,gc::splatCpuQuery(fixture.prepared,splatOwner),splatReference,error))
+        return expect(false,error.c_str());
+    std::array<double,8> splattedFlux{};
     for(std::size_t pixelBand=0;pixelBand<expectedBands.size();++pixelBand)
-        ok&=expect(near(receipt->spectralRadiance[pixelBand],expectedBands[pixelBand],1.2e-3),
-            "completed GPU per-pixel eight-band radiance agrees with independent physical power/area oracle");
+    {
+        const auto found=splatReference.pixels.find(pixelBand);
+        const double expected=found==splatReference.pixels.end()?0:found->second.physical;
+        const double tolerance=found==splatReference.pixels.end()?0:found->second.tolerance+5e-4*expected;
+        expectedBands[pixelBand]=expected;
+        ok&=expect(std::abs(double(receipt->spectralRadiance[pixelBand])-expected)<=tolerance,
+            "completed GPU per-pixel eight-band splat radiance agrees with the binary64 kernel reference");
+        const auto area=splatReference.pixelAreas.find(pixelBand/8);
+        if(area!=splatReference.pixelAreas.end())
+            splattedFlux[pixelBand%8]+=double(receipt->spectralRadiance[pixelBand])*std::acos(-1.0)*area->second;
+    }
+    for(unsigned band=0;band<8;++band)
+        ok&=expect(near(splattedFlux[band],visibleFlux[band],2e-3),
+            "native splat pixels conserve each band's independent camera-visible outgoing power");
     auto base=backend.render(fixture.scene,preparation.resources,32,32,runtime);
     arbitgpu::NativeRawPassPixels before,after;
     if(!base.rendered||!base.frame->readRawPass(renderpassoutput::Output::Color,before,error)
@@ -3149,34 +3200,34 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
     ok&=expect(!stale.rendered&&!stale.frame&&!foreign.rendered&&!foreign.frame&&!oversized.rendered&&!oversized.frame,
         "stale scene, foreign source and overflow extent publish no native Color frame");
     gc::EnergyLedger validated;
-    ok&=expect(gc::validateNativeReadback(fixture.prepared,fixture.frame,*receipt,validated,error,&receipt->deposition.submission),
+    ok&=expect(gc::validateNativeReadback(fixture.prepared,splatOwner,*receipt,validated,error,&receipt->deposition.submission),
         "completed native canonical deposition passes its independent whole-frame owner gate");
     gc::EnergyLedger sentinel;sentinel.launched.fill(123);auto bad=*receipt;bad.frameIdentity+="stale";
-    ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
+    ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
         "stale completed native readback leaves whole-frame ledger unchanged");
     bad=*receipt;bad.spectralRadiance[0]=std::numeric_limits<float>::infinity();
-    ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
+    ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
         "nonfinite completed native accumulation refuses atomically");
     const auto visible=std::find_if(receipt->deposits.begin(),receipt->deposits.end(),[](const auto& d){return d.cameraVisible;});
     if(visible!=receipt->deposits.end())
     {
         bad=*receipt;bad.deposits[std::size_t(visible-receipt->deposits.begin())].raster.triangle^=1;
-        ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
+        ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
             "stale private raster triangle receipt refuses atomically");
     }
     bad=*receipt;bad.paths[0].queryWork=gc::kMaximumQueryWork+1;
-    ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
+    ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,bad,sentinel,error,&receipt->deposition.submission)&&sentinel.launched[0]==123,
         "over-budget measured native query receipt refuses atomically");
     bad=*receipt;bad.deposition.complete=false;
-    ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,bad,sentinel,error,&receipt->deposition.submission)
+    ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,bad,sentinel,error,&receipt->deposition.submission)
         &&sentinel.launched[0]==123,"partial sorted native deposition refuses atomically");
     bad=*receipt;bad.deposition.submission.scratchGeneration++;
-    ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,bad,sentinel,error,&receipt->deposition.submission)
+    ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,bad,sentinel,error,&receipt->deposition.submission)
         &&sentinel.launched[0]==123,"foreign native scratch submission refuses atomically");
     if(receipt->deposition.visibleCount>1)
     {
         bad=*receipt;std::swap(bad.deposition.keys[0],bad.deposition.keys[1]);
-        ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,bad,sentinel,error,&receipt->deposition.submission)
+        ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,bad,sentinel,error,&receipt->deposition.submission)
             &&sentinel.launched[0]==123,"reordered native canonical deposit keys refuse atomically");
     }
     auto coarse=render(fixture,preparation,1);auto medium=render(fixture,preparation,2);
@@ -3280,7 +3331,9 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
             &&near(fullEnergy.deposited[b],fullIndependent.energy.deposited[b])
             &&near(fullEnergy.absorbed[b],fullIndependent.energy.absorbed[b]),
             "full-resolution native per-band receiver energy matches independent binary64 optics");
-        std::map<std::uint64_t,double> expectedFull;
+        // On this fronto-parallel receiver every pixel has the deposit pixel's area,
+        // so each band's summed splat radiance is the deposits' outgoing/(pi*area).
+        std::array<double,8> expectedFull{};
         const double tangent=std::tan(double(fullFixture.frame.camera.verticalFovRadians)/2),aspect=double(extent[0])/extent[1];
         for(const auto& deposit:nativeFull->deposits)
         {
@@ -3308,15 +3361,14 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
                 "full-resolution native pixel area matches independent receiver-plane projection");
             const auto* receiver=arbitgpu::nativeSurfaceForObject(fullFixture.program.get(),SceneObjectId{arrival->receiver.object});
             const double outgoing=double(work.incidentPower)*arrival->fraction*receiver->spectralReflectance->coefficients[work.band];
-            expectedFull[(std::uint64_t(py)*extent[0]+px)*8+work.band]+=outgoing/(std::acos(-1.0)*area);
+            expectedFull[work.band]+=outgoing/(std::acos(-1.0)*area);
         }
-        bool spectraMatch=true;
+        std::array<double,8> nativeBands{};
         for(std::size_t bandPixel=0;bandPixel<nativeFull->spectralRadiance.size();++bandPixel)
-        {
-            const auto found=expectedFull.find(bandPixel);const double expected=found==expectedFull.end()?0:found->second;
-            if(!near(nativeFull->spectralRadiance[bandPixel],expected,1.2e-3)) {spectraMatch=false;break;}
-        }
-        ok&=expect(spectraMatch,"full-resolution GPU spatial eight-band radiance matches independent power and receiver area");
+            nativeBands[bandPixel%8]+=nativeFull->spectralRadiance[bandPixel];
+        bool spectraMatch=timing.splatVersion==gc::kSplatVersion&&timing.splatGatherWork>0;
+        for(unsigned band=0;band<8;++band)spectraMatch=spectraMatch&&near(nativeBands[band],expectedFull[band],2e-3);
+        ok&=expect(spectraMatch,"full-resolution GPU splat eight-band radiance sums to independent power over receiver area");
         const auto spectralHash=videohelper::sha256Bytes(nativeFull->spectralRadiance.data(),nativeFull->spectralRadiance.size()*sizeof(float));
         const auto firstSerial=nativeFull->deposition.submission.submissionSerial;
         nativeFull.reset();output.frame.reset();
@@ -3330,8 +3382,8 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
             repeatedFull->spectralRadiance.data(),repeatedFull->spectralRadiance.size()*sizeof(float))
             &&repeatedFull->deposition.submission.submissionSerial>firstSerial,
             "repeated full-resolution native submissions retain equal Color/spectral bytes with fresh ownership");
-        const double phases[]{timing.baseMilliseconds,timing.rasterMilliseconds,timing.traceMilliseconds,timing.sortMilliseconds,
-            timing.reduceMilliseconds,timing.readbackMilliseconds,timing.resolveMilliseconds,timing.frameMilliseconds};
+        const double phases[]{timing.baseMilliseconds,timing.rasterMilliseconds,timing.traceMilliseconds,timing.normaliserMilliseconds,
+            timing.sortMilliseconds,timing.reduceMilliseconds,timing.readbackMilliseconds,timing.resolveMilliseconds,timing.frameMilliseconds};
         ok&=expect(std::all_of(std::begin(phases),std::end(phases),[](double value){return std::isfinite(value)&&value>=0;})
             &&timing.frameMilliseconds>0,"full-resolution phase and frame timings describe completed native work");
         std::cout<<"native-caustic-full-resolution extent="<<extent[0]<<'x'<<extent[1]
@@ -3339,6 +3391,7 @@ bool glassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
             <<" query-work="<<timing.queryWork<<" deposition-work="<<timing.deposition.depositionWork
             <<" sort-passes="<<timing.deposition.sortPasses<<" base-ms="<<timing.baseMilliseconds
             <<" raster-ms="<<timing.rasterMilliseconds<<" trace-ms="<<timing.traceMilliseconds
+            <<" splat-gather-work="<<timing.splatGatherWork<<" normaliser-ms="<<timing.normaliserMilliseconds
             <<" sort-ms="<<timing.sortMilliseconds<<" reduce-ms="<<timing.reduceMilliseconds
             <<" readback-ms="<<timing.readbackMilliseconds<<" resolve-ms="<<timing.resolveMilliseconds
             <<" frame-ms="<<timing.frameMilliseconds<<'\n';
@@ -3437,7 +3490,9 @@ bool roughGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
                 "every rough GPU path preserves its stratum and refuses excess masked or unresolved flux");
         }
         const auto triangles=gt::worldTriangles(*fixture.scene);const auto light=gt::authoredSource(fixture);
-        std::vector<double> expected(std::size_t(width)*height*8);
+        // Splat frames: each band's summed radiance is the visible deposits'
+        // outgoing/(pi*area) on this fronto-parallel receiver.
+        std::array<double,8> expected{};
         bool roughnessMovedArrival=false;
         for(const auto& deposit:receipt->deposits) {
             const auto& work=fixture.frame.work[deposit.work];const auto& entry=fixture.frame.entries[work.entry];
@@ -3480,12 +3535,18 @@ bool roughGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
             const auto subdivisions=fixture.frame.scheduling.entrySubdivisions;
             const double incident=light.radiance[work.band]*std::max(0.0,gt::inner(triangle->normal,light.direction))
                 *triangle->area/(subdivisions*subdivisions*16);
-            if(x<width&&y<height)expected[(std::size_t(y)*width+x)*8+work.band]
+            if(x<width&&y<height)expected[work.band]
                 +=incident*arrival->fraction*material->spectralReflectance->coefficients[work.band]/(std::acos(-1.0)*area);
         }
         if(width==32)ok&=expect(roughnessMovedArrival,"nonzero authored roughness changes native caustic receiver footprints");
-        for(std::size_t band=0;band<expected.size();++band)ok&=expect(near(expected[band],receipt->spectralRadiance[band],2e-3),
-            "native rough per-pixel Li8 follows independent sampled branch power and pixel area");
+        auto splatOwner=fixture.frame;
+        ok&=expect(gc::enableSplat(fixture.prepared,splatOwner,error)
+            &&gc::validateSplatReadback(splatOwner,*receipt,gc::splatCpuQuery(fixture.prepared,splatOwner),error),
+            "native rough splat pixels agree with the binary64 kernel reference");
+        std::array<double,8> nativeBands{};
+        for(std::size_t band=0;band<receipt->spectralRadiance.size();++band)nativeBands[band%8]+=receipt->spectralRadiance[band];
+        for(unsigned band=0;band<8;++band)ok&=expect(near(expected[band],nativeBands[band],2e-3),
+            "native rough splat Li8 sums to independent sampled branch power over pixel area");
         std::shared_ptr<const arbitgpu::roughglasstiles::Schedule> tiles;arbitgpu::roughglasstiles::Aggregate aggregate;
         if(!arbitgpu::readOpenGlRoughGlassTileSummaryForFixture(*output.frame,tiles,aggregate,error))return expect(false,error.c_str());
         ok&=expect(aggregate.completedPixels==std::uint64_t(width)*height&&aggregate.completedTiles==tiles->tiles().size()
@@ -3497,14 +3558,14 @@ bool roughGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backend)
         ok&=expect(color.bytes==repeated.bytes,"rough caustic native Color is byte-repeatable across complete submissions");
         if(width==32) {
             roughEnergy=energy;gc::EnergyLedger checked;
-            if(!gc::validateNativeReadback(fixture.prepared,fixture.frame,*receipt,checked,error,&receipt->deposition.submission))
+            if(!gc::validateNativeReadback(fixture.prepared,splatOwner,*receipt,checked,error,&receipt->deposition.submission))
                 return expect(false,error.c_str());
             for(unsigned malformed=0;malformed<3;++malformed) {
                 auto corrupted=*receipt;
                 if(malformed==0)corrupted.paths[0].maskedPower=-1;
                 if(malformed==1)corrupted.paths[0].roughTransportVersion=0;
                 if(malformed==2)corrupted.paths[0].interfaceSample=16;
-                ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,corrupted,checked,error,&receipt->deposition.submission),
+                ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,corrupted,checked,error,&receipt->deposition.submission),
                     "rough native readback refuses malformed masking/version/stratum on the actual GPU owner");
             }
         }
@@ -3684,7 +3745,9 @@ bool multipleScatterGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend
             &&receipt->deposition.complete&&receipt->deposition.visibleCount>0,"v2 GPU walks publish complete owned receiver spectrum");
         const auto triangles=gt::worldTriangles(*fixture.scene);const auto source=gt::authoredSource(fixture);
         std::vector<MsPathReference> independent;std::vector<double> inputs;std::array<double,8> launch{},outgoing{},absorbed{},escaped{},tail{};
-        std::vector<double> expected(std::size_t(width)*height*8);
+        // Splat frames: each band's summed radiance is the visible deposits'
+        // outgoing/(pi*area) on this fronto-parallel receiver.
+        std::array<double,8> expected{};
         bool laterExit=false,reflectedReceiver=false,transmittedReceiver=false;
         for(std::size_t w=0;w<fixture.frame.work.size();++w) {
             const auto& work=fixture.frame.work[w];const auto& entry=fixture.frame.entries[work.entry];const auto& path=receipt->paths[w];
@@ -3734,7 +3797,7 @@ bool multipleScatterGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend
                 &&center.instance==deposit.raster.instance&&center.triangle==deposit.raster.triangle,
                 "v2 splats retain independent full-frame projected area and camera triangle identity");
             const auto* material=arbitgpu::nativeSurfaceForObject(fixture.program.get(),SceneObjectId{arrival->receiver.object});
-            if(x<width&&y<height)expected[(std::size_t(y)*width+x)*8+work.band]+=inputs[deposit.work]
+            if(x<width&&y<height)expected[work.band]+=inputs[deposit.work]
                 *arrival->fraction*material->spectralReflectance->coefficients[work.band]/(std::acos(-1.0)*area);
         }
         ok&=expect(laterExit&&reflectedReceiver&&transmittedReceiver,"rough v2 has later-event exits and causal reflected plus transmitted receivers");
@@ -3743,8 +3806,14 @@ bool multipleScatterGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend
             &&std::abs(energy.unresolved[band]-tail[band])<2e-6*launch[band]
             &&near(energy.launched[band],energy.deposited[band]+energy.absorbed[band]+energy.escaped[band]+energy.unresolved[band],3e-4),
             "v2 native per-band energy matches independent emitted branches and conserves launched flux");
-        for(std::size_t b=0;b<expected.size();++b)ok&=expect(near(expected[b],receipt->spectralRadiance[b],3e-3),
-            "v2 receiver radiance uses independent multi-exit power, rho8 and actual pixel area");
+        auto splatOwner=fixture.frame;
+        ok&=expect(gc::enableSplat(fixture.prepared,splatOwner,error)
+            &&gc::validateSplatReadback(splatOwner,*receipt,gc::splatCpuQuery(fixture.prepared,splatOwner),error),
+            "v2 splat pixels agree with the binary64 kernel reference");
+        std::array<double,8> nativeBands{};
+        for(std::size_t b=0;b<receipt->spectralRadiance.size();++b)nativeBands[b%8]+=receipt->spectralRadiance[b];
+        for(unsigned b=0;b<8;++b)ok&=expect(near(expected[b],nativeBands[b],3e-3),
+            "v2 splat radiance sums to independent multi-exit power, rho8 and actual pixel area");
         std::shared_ptr<const arbitgpu::roughglasstiles::Schedule> tiles;arbitgpu::roughglasstiles::Aggregate aggregate;
         if(!arbitgpu::readOpenGlRoughGlassTileSummaryForFixture(*output.frame,tiles,aggregate,error))return expect(false,error.c_str());
         std::uint64_t measured=0;for(const auto& path:receipt->paths)measured+=path.queryWork+path.microEvents+path.microDraws;
@@ -3826,7 +3895,7 @@ bool multipleScatterGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend
             if(malformed==5)corrupted.deposits[0].ancestry[0]^=64;
             if(malformed==6)corrupted.deposits[0].ancestry[0]=128;
             if(malformed==7)corrupted.deposits.push_back(corrupted.deposits[0]);
-            ok&=expect(!gc::validateNativeReadback(fixture.prepared,fixture.frame,corrupted,checked,error,&receipt->deposition.submission),
+            ok&=expect(!gc::validateNativeReadback(fixture.prepared,splatOwner,corrupted,checked,error,&receipt->deposition.submission),
                 "v2 actual native owner refuses version/count/residual/ancestry/parity/suffix/duplicate corruption atomically");
         }
     }
@@ -3878,9 +3947,13 @@ bool authoredRoughCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
         if(!frame||!arbitgpu::readOpenGlGlassCausticReceiptForFixture(*frame,receipt,energy,error)||!receipt)return false;
         output=*receipt;return true;
     };
+    // OpenGL Preview keeps no host receipt and publishes its caustic once the fenced
+    // submission completes on a later frame. The test, not the Preview, waits between frames.
+    videohelper::tests::authoredroughcaustic::PreviewPublication publication;
+    publication.receipts=false;publication.waitForGpu=[] {glFinish();};
     std::string error;
     const bool rendered=videohelper::tests::authoredroughcaustic::nativeCases(backend,
-        videohelper::materialprogram::BackendTarget::OpenGl,read,error);
+        videohelper::materialprogram::BackendTarget::OpenGl,read,error,publication);
     return expect(rendered,error.c_str());
 }
 
@@ -6244,32 +6317,50 @@ int main()
                          == foilEvaluationCount,
                  "OpenGL admits exact work below the immutable evaluation ceiling");
 
-    auto exhaustedFoilRequest = foilRequest;
-    exhaustedFoilRequest.spatialFoil->workBudget.maximumEvaluations
-        = foilEvaluationCount - 1u;
-    const auto exhaustedAdmission = diffractivefoil::admit(
-        *exhaustedFoilRequest.spatialFoil, diffractionError);
-    exhaustedFoilRequest.structuralDigest = exhaustedAdmission
-        ? exhaustedAdmission->structuralDigest() : std::string {};
-    const auto exhaustedBinding = videorender::fixture3d::admitDiffractionMaterialBinding(
-        diffractionScene, exhaustedFoilRequest,
-        videohelper::materialprogram::BackendTarget::OpenGl, diffractionError);
+    // A budget one slot short of the frame splits it into two scissored row
+    // bands, each an exact shared schedule, with unchanged pixels.
+    const auto foilRequestWithBudget = [&](std::uint32_t budget)
+    {
+        auto request = foilRequest;
+        request.spatialFoil->workBudget.maximumEvaluations = budget;
+        const auto admission = diffractivefoil::admit(*request.spatialFoil, diffractionError);
+        request.structuralDigest = admission ? admission->structuralDigest() : std::string {};
+        return videorender::fixture3d::admitDiffractionMaterialBinding(
+            diffractionScene, request,
+            videohelper::materialprogram::BackendTarget::OpenGl, diffractionError);
+    };
+    const auto splitBinding = foilRequestWithBudget(foilEvaluationCount - 1u);
+    videorender::fixture3d::FixtureSceneRenderer splitRenderer(backend);
+    videorender::fixture3d::RenderedFrame splitFrame;
+    const bool splitRendered = splitBinding != nullptr
+        && splitRenderer.renderPreview(diffractionScene, splitBinding, {},
+            { 320, 180 }, videorender::fixture3d::kNativeGpuCapability,
+            splitFrame, diffractionError);
+    ok &= expect(splitRendered
+                     && splitFrame.stats.diffractionEvaluationBudget == foilEvaluationCount - 1u
+                     && splitFrame.stats.diffractionEvaluationCount == foilEvaluationCount
+                     && splitFrame.stats.drawCount == 2u * foilLightingPathCount,
+                 "OpenGL splits a spatial foil one evaluation over its budget into two row bands");
+    // Twenty rows per band would need nine bands, past the eight-band cap.
+    const auto exhaustedBinding = foilRequestWithBudget(320u * 20u * foilLightingPathCount);
     videorender::fixture3d::FixtureSceneRenderer exhaustedRenderer(backend);
     videorender::fixture3d::RenderedFrame exhaustedFrame;
     const bool exhaustedRendered = exhaustedBinding != nullptr
         && exhaustedRenderer.renderPreview(diffractionScene, exhaustedBinding, {},
             { 320, 180 }, videorender::fixture3d::kNativeGpuCapability,
             exhaustedFrame, diffractionError);
-    ok &= expect(!exhaustedRendered && exhaustedFrame.nativeFrame == nullptr
+    ok &= expect(exhaustedBinding != nullptr && !exhaustedRendered && exhaustedFrame.nativeFrame == nullptr
                      && diffractionError
                          == "OpenGL fixture diffraction workload exceeds backend limits",
-                 "OpenGL rejects a spatial foil one evaluation over budget before frame allocation");
+                 "OpenGL rejects a spatial foil that needs more than eight bands before frame allocation");
     const auto foilPreviewPixels = foilRendered
         ? readRgba8(gl, foilPreviewFrame.nativeFrame) : std::vector<std::uint8_t> {};
     const auto foilExportPixels = foilRendered
         ? readRgba8(gl, foilExportFrame.nativeFrame) : std::vector<std::uint8_t> {};
     const auto belowCeilingPixels = belowCeilingRendered
         ? readRgba8(gl, belowCeilingFrame.nativeFrame) : std::vector<std::uint8_t> {};
+    const auto splitPixels = splitRendered
+        ? readRgba8(gl, splitFrame.nativeFrame) : std::vector<std::uint8_t> {};
     const auto disabledFoilPreparation = backend.prepare(diffractionScene, nullptr);
     const auto disabledFoilFrame = backend.render(
         diffractionScene, disabledFoilPreparation.resources, 320, 180, {});
@@ -6294,7 +6385,8 @@ int main()
 
     bool everyFoilCornerPerturbsPixels = foilRendered && !foilPreviewPixels.empty()
         && fnv1a64(foilPreviewPixels) == fnv1a64(foilExportPixels)
-        && fnv1a64(foilPreviewPixels) == fnv1a64(belowCeilingPixels);
+        && fnv1a64(foilPreviewPixels) == fnv1a64(belowCeilingPixels)
+        && fnv1a64(foilPreviewPixels) == fnv1a64(splitPixels);
     for (std::size_t corner = 0; corner < diffractivefoil::kFieldSampleCount; ++corner)
     {
         auto changed = foilRequest;
@@ -6656,7 +6748,9 @@ int main()
         ? readRgba8 (gl, primaryPeriodFrame.frame) : std::vector<std::uint8_t> {};
     reportCoverage ("diffraction-primary-period", primaryPeriodPixels);
 
-    const auto overBudgetCrossedFrame = backend.render (
+    // Crossed order-one lobes at 4K exceed one draw's cap but fit the frame
+    // cap, so the frame renders as two scissored row bands.
+    const auto bandedCrossedFrame = backend.render (
         diffractionScene, crossedPreparation.resources, 3840, 2160, {});
 
     const auto backgroundOnly = [] (const std::vector<std::uint8_t>& pixels)
@@ -6702,11 +6796,10 @@ int main()
                       && primaryPeriodPixels != crossedPixels
                       && crossedPeriodPixels != crossedPixels,
                   "physical OpenGL diffraction pixels must execute every admitted lighting path and depend on camera, local UV groove fields, crossed-lattice orientation, both periods, and topology");
-    ok &= expect (! overBudgetCrossedFrame.rendered
-                      && overBudgetCrossedFrame.frame == nullptr
-                      && overBudgetCrossedFrame.error
-                           == "OpenGL fixture diffraction workload exceeds backend limits",
-                  "OpenGL rejects over-budget crossed diffraction before frame allocation");
+    ok &= expect (bandedCrossedFrame.rendered
+                      && bandedCrossedFrame.frame != nullptr
+                      && bandedCrossedFrame.stats.drawCount == 2u,
+                  "OpenGL renders 4K crossed diffraction as two row bands");
     ok &= expect (! malformedDiffractionPreparation.prepared
                       && malformedDiffractionPreparation.resources == nullptr
                       && malformedDiffractionPreparation.stats.vertexBytes == 0

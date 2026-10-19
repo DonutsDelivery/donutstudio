@@ -59,6 +59,10 @@ inline bool metalOperationUniform (std::string_view type, std::string_view name,
     if (type == "float" && name == "progress") return true;
     for (const auto& param : wrap.params)
         if (name == param.name && type == inputTypeToGlsl (param.type)) return true;
+    // A harmony uniform the shader declares with the contract type joins the
+    // block like the prelude's own declaration would.
+    for (const auto& harmony : wrap.bodyHarmonyUniforms)
+        if (name == harmony) return true;
     return false;
 }
 

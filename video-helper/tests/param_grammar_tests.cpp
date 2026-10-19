@@ -13,13 +13,18 @@
 //   - bool grammar: visible/invert use the >= 0.5 threshold
 //   - effect slot: setting "type" seeds the table defaults; a param clamps to the
 //     effect's declared min/max; an out-of-range slot is rejected
+//   - layer transform (layer_transform.h, shared by the GL and Metal compositors): a
+//     rotated quad on a 16:9 canvas keeps right angles and edge lengths, in the
+//     export frame and in a viewport of another aspect; 0 degrees is unchanged
 //   - unknown node/param returns false (so a caller's extra namespace, e.g. "gen",
 //     still gets its turn)
 
 #include "../src/video_param_grammar.h"
+#include "../src/layer_transform.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 static int g_fail = 0;
@@ -39,6 +44,34 @@ static void checkNear (double a, double b, double eps, const std::string& what)
         ++g_fail;
         std::printf ("  FAIL: %s  (got %.6f, expected %.6f +/- %.6f)\n", what.c_str(), a, b, eps);
     }
+}
+
+// Apply a column-major layer transform to a quad corner (x,y in canvas NDC).
+static void applyLayerTransform (const float m[16], double x, double y, double& ox, double& oy)
+{
+    ox = m[0] * x + m[4] * y + m[12];
+    oy = m[1] * x + m[5] * y + m[13];
+}
+
+// Rotating the unit quad must give a rigid rectangle in pixel proportions: x scaled
+// by `pixelAspect` (the aspect of the space the corners are measured in).
+static void checkRigidRotation (const float m[16], double pixelAspect, double expectW,
+                                double expectH, const std::string& what)
+{
+    double px[4], py[4];
+    const double cx[4] = { -1, 1, 1, -1 }, cy[4] = { -1, -1, 1, 1 };
+    for (int i = 0; i < 4; ++i)
+    {
+        applyLayerTransform (m, cx[i], cy[i], px[i], py[i]);
+        px[i] *= pixelAspect;
+    }
+    const double abx = px[1] - px[0], aby = py[1] - py[0];
+    const double bcx = px[2] - px[1], bcy = py[2] - py[1];
+    const double cdx = px[3] - px[2], cdy = py[3] - py[2];
+    checkNear (abx * bcx + aby * bcy, 0.0, 1e-5, what + ": corner is a right angle");
+    checkNear (bcx * cdx + bcy * cdy, 0.0, 1e-5, what + ": opposite corner is a right angle");
+    checkNear (std::hypot (abx, aby), expectW, 1e-5, what + ": width preserved");
+    checkNear (std::hypot (bcx, bcy), expectH, 1e-5, what + ": height preserved");
 }
 
 // A minimal stand-in for ClipRenderState / ClipGraphParams (same field names + an
@@ -152,6 +185,63 @@ int main()
         check (! videoparam::applyGraphParam (c, "source", "bogusParam", 1.0), "unknown param -> false");
         double out = 0.0;
         check (! videoparam::getGraphParam (c, "transform2d", "bogusParam", out), "unknown get param -> false");
+    }
+
+    // Layer transform: rotation is a rigid turn on a 16:9 canvas, not a shear.
+    {
+        const double canvasAspect = 16.0 / 9.0;
+        // A 16:9 source in a 16:9 canvas at scale 0.8: letterbox 1 x 1.
+        const float sx = 0.8f, sy = 0.8f;
+        for (const float deg : { 0.0f, 30.0f, 90.0f, -45.0f, 137.0f })
+        {
+            float m[16];
+            videorender::buildLayerTransform (0.1f, -0.2f, deg, sx, sy, (float) canvasAspect, m);
+            checkRigidRotation (m, canvasAspect, 2.0 * sx * canvasAspect, 2.0 * sy,
+                                "16:9 canvas, " + std::to_string ((int) deg) + " deg");
+        }
+
+        // A 4:3 source letterboxed into 16:9: lbx = (4/3)/(16/9) = 0.75, lby = 1.
+        float m43[16];
+        videorender::buildLayerTransform (0.0f, 0.0f, 30.0f, 0.75f, 1.0f, (float) canvasAspect, m43);
+        checkRigidRotation (m43, canvasAspect, 2.0 * 0.75 * canvasAspect, 2.0, "4:3 source in 16:9, 30 deg");
+
+        // The viewport applies a fit (zx, zy) after the layer matrix, as
+        // FrameRenderer::viewMap does. Fit 16:9 into a 4:3 panel: zx = 1,
+        // zy = (4/3)/(16/9). Panel pixels see the same rigid rectangle, with the
+        // panel aspect as the pixel aspect and the same side lengths per canvas pixel.
+        const double panelAspect = 4.0 / 3.0;
+        const double zx = 1.0, zy = panelAspect / canvasAspect;
+        float m[16];
+        videorender::buildLayerTransform (0.0f, 0.0f, 30.0f, sx, sy, (float) canvasAspect, m);
+        float v[16];
+        std::memcpy (v, m, sizeof (v));
+        v[0] *= (float) zx; v[1] *= (float) zy; v[4] *= (float) zx; v[5] *= (float) zy;
+        v[12] *= (float) zx; v[13] *= (float) zy;
+        checkRigidRotation (v, panelAspect, 2.0 * sx * zx * panelAspect, 2.0 * sy * zy,
+                            "4:3 viewport of a 16:9 canvas, 30 deg");
+
+        // Export (no view fit) and viewport differ only by that fit: the unfitted
+        // matrix times (zx, zy) per row equals the viewport matrix element for element.
+        check (std::fabs (v[0] - m[0] * (float) zx) < 1e-6f && std::fabs (v[1] - m[1] * (float) zy) < 1e-6f
+               && std::fabs (v[4] - m[4] * (float) zx) < 1e-6f && std::fabs (v[5] - m[5] * (float) zy) < 1e-6f,
+               "viewport matrix is the export matrix plus the view fit");
+
+        // 0 degrees: scale + position only, so existing projects do not move.
+        float id[16];
+        videorender::buildLayerTransform (0.25f, -0.5f, 0.0f, 0.6f, 0.4f, (float) canvasAspect, id);
+        check (id[0] == 0.6f && id[5] == 0.4f && id[1] == 0.0f && id[4] == 0.0f
+               && id[12] == 0.25f && id[13] == -0.5f, "0 degrees: plain scale and position");
+
+        // A square canvas (aspect 1) is the old plain NDC rotation.
+        float sq[16];
+        videorender::buildLayerTransform (0.0f, 0.0f, 90.0f, 1.0f, 1.0f, 1.0f, sq);
+        checkNear (sq[1], 1.0, 1e-6, "square canvas: +90 maps x to y");
+        checkNear (sq[4], -1.0, 1e-6, "square canvas: +90 maps y to -x");
+
+        // A bad aspect falls back to 1 instead of poisoning the matrix.
+        float bad[16];
+        videorender::buildLayerTransform (0.0f, 0.0f, 30.0f, 1.0f, 1.0f, 0.0f, bad);
+        check (std::isfinite (bad[1]) && std::isfinite (bad[4]), "zero aspect stays finite");
     }
 
     std::printf ("video-param-grammar: %d/%d checks passed\n", g_total - g_fail, g_total);

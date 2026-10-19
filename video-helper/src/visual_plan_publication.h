@@ -24,7 +24,8 @@ inline bool makeVisualPlanExecutionSnapshot (
     std::shared_ptr<VisualPlanExecutionSnapshot>& snapshot,
     std::string& diagnostic, VisualPlanTelemetry* telemetryOwner,
     int canvasWidth, int canvasHeight,
-    const VisualBackendResourceLimits* backendLimits);
+    const VisualBackendResourceLimits* backendLimits,
+    bool containLayerFailures);
 
 class VisualPlanViewportPublicationOwner
 {
@@ -53,9 +54,11 @@ public:
                 int canvasWidth = 1920, int canvasHeight = 1080,
                 const VisualBackendResourceLimits* backendLimits = nullptr)
     {
+        // An export or probe refuses a clip whose plan does not lower only at
+        // the frames that build it, so one layer can't stop the whole project.
         return makeVisualPlanExecutionSnapshot(std::move(plans), snapshot_, diagnostic,
                                                telemetryOwner, canvasWidth, canvasHeight,
-                                               backendLimits);
+                                               backendLimits, true);
     }
     VisualPlanExecutionSnapshot* get() const noexcept { return snapshot_.get(); }
     std::shared_ptr<VisualPlanExecutionSnapshot> shared() const noexcept { return snapshot_; }
@@ -98,11 +101,13 @@ inline bool makeVisualPlanExecutionSnapshot (
     std::shared_ptr<VisualPlanExecutionSnapshot>& snapshot,
     std::string& diagnostic, VisualPlanTelemetry* telemetryOwner = nullptr,
     int canvasWidth = 1920, int canvasHeight = 1080,
-    const VisualBackendResourceLimits* backendLimits = nullptr)
+    const VisualBackendResourceLimits* backendLimits = nullptr,
+    bool containLayerFailures = false)
 {
     auto candidate = std::make_shared<VisualPlanExecutionSnapshot>(
         normalizedVisualLayerPlans(plans));
     if (telemetryOwner != nullptr) candidate->state.setTelemetryOwner(*telemetryOwner);
+    candidate->state.containLayerLoweringFailures(containLayerFailures);
     diagnostic.clear();
     if (! candidate->state.admitPlans(candidate->plans, &diagnostic,
                                       canvasWidth, canvasHeight, backendLimits))

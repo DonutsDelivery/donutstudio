@@ -4,6 +4,8 @@
 
 #include <GLFW/glfw3.h>
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 
 namespace arbitgl
@@ -119,6 +121,17 @@ void queryGpuCaps (const GlFuncs& gl, GpuCaps& caps)
         caps.deviceIdentity = renderer;
     else if (vendor != nullptr)
         caps.deviceIdentity = vendor;
+
+    // Name the driver once per process, so a slow software rasteriser (llvmpipe) is visible
+    // in the log next to any over-budget caustic submit.
+    static std::atomic<bool> contextLogged { false };
+    if (! contextLogged.exchange (true))
+    {
+        const auto* version = reinterpret_cast<const char*> (glGetString (GL_VERSION));
+        std::fprintf (stderr, "[gl] context GL_RENDERER=%s GL_VERSION=%s\n",
+                      renderer != nullptr ? renderer : "(null)",
+                      version != nullptr ? version : "(null)");
+    }
 
     const bool ver42 = caps.glMajor > 4 || (caps.glMajor == 4 && caps.glMinor >= 2);
     const bool ver43 = caps.glMajor > 4 || (caps.glMajor == 4 && caps.glMinor >= 3);

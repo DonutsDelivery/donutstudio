@@ -5,6 +5,7 @@
 #include "harmonic_link_shape.h"
 #include "../../shared/VisualHarmonicLinkGeometryContract.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -18,7 +19,9 @@ struct RenderedFrame final
 };
 
 // Light neutral link material. The backend maps each low byte to 0.2 + 0.7 * byte / 255, about 0.86 here.
-inline constexpr videowire::geometry::StableId kLinkMaterialId = 0x00F0F0F0ull;
+// Bit 24 marks the material self-lit: the fixed Geometry Core light misses most ribbon faces, so the
+// backend adds a tinted emission and the ribbons stay visible without any score or audio.
+inline constexpr videowire::geometry::StableId kLinkMaterialId = 0x01F0F0F0ull;
 
 // Frame rows and signed source identities are read from the same immutable
 // owner used by Note Instanced Mesh. Geometry IDs identify every emitted corner.
@@ -156,6 +159,60 @@ inline std::optional<videowire::geometry::ValueDescriptor> lower(
     return value;
 }
 
+// A project without links would otherwise draw nothing. These ten ribbons stand in until the score
+// supplies real ones. They use the mapping's own shape and detail, and a width of at least 0.34 so
+// the sculpture reads at the module's resting state. Identities are fixed, so repeated frames match.
+inline std::optional<videowire::geometry::ValueDescriptor> restingSculpture(
+    const visualharmonicgeometry::Mapping& mapping, std::string& error)
+{
+    using namespace videowire::geometry;
+    auto value = lower(mapping, nullptr, error);
+    if (!value) return std::nullopt;
+    static constexpr std::array<std::array<float, 3>, 7> points {{
+        { -2.4f, -0.9f, 0.0f }, { -1.2f, 0.5f, 0.3f }, { 0.0f, -0.6f, -0.2f },
+        { 1.1f, 0.9f, 0.2f }, { 2.3f, -0.2f, 0.0f }, { 0.2f, 1.1f, -0.3f },
+        { -0.4f, 0.1f, 0.4f } }};
+    static constexpr std::array<std::array<int, 2>, 10> pairs {{
+        { 0, 1 }, { 1, 2 }, { 2, 3 }, { 3, 4 }, { 1, 5 },
+        { 5, 3 }, { 0, 2 }, { 2, 4 }, { 6, 1 }, { 6, 3 } }};
+    struct RestingLink final { Vec3 start; Vec3 end; Vec3 side; };
+    const auto width = std::max(mapping.notes.meshScale, 0.34f);
+    std::vector<RestingLink> links;
+    links.reserve(pairs.size());
+    for (const auto& pair : pairs)
+    {
+        const auto& a = points[static_cast<std::size_t>(pair[0])];
+        const auto& b = points[static_cast<std::size_t>(pair[1])];
+        const Vec3 start { a[0], a[1], a[2] };
+        const Vec3 end { b[0], b[1], b[2] };
+        const Vec3 direction { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+        links.push_back({ start, end, linkSideHalfWidth(direction, width) });
+    }
+    if (!visualharmonicgeometry::admitLinkCount(mapping.shape, mapping.curvaturePercent,
+                                                mapping.segments, links.size(), error))
+        return std::nullopt;
+    const auto effective = visualharmonicgeometry::effectiveLinkLayout(
+        mapping.shape, mapping.curvaturePercent, mapping.segments, links.size());
+    const auto stride = static_cast<std::uint64_t>(visualharmonicgeometry::effectiveLinkLayout(
+        mapping.shape, mapping.curvaturePercent, mapping.segments, 1).layout.vertices);
+    const auto corners = static_cast<std::uint64_t>(effective.layout.vertices);
+    auto& mesh = std::get<GeometryData>(value->data);
+    for (std::size_t index = 0; index < links.size(); ++index)
+    {
+        appendLinkShape(mesh, mapping.shape, mapping.curvaturePercent, effective,
+                        links[index].start, links[index].end, links[index].side);
+        const auto unsignedIdentity = static_cast<std::uint64_t>(index + 1) * 2;
+        for (std::uint64_t corner = 0; corner < corners; ++corner)
+            mesh.vertexIds.push_back(unsignedIdentity * stride + corner + 1);
+        const double attributes[] { static_cast<double>(index + 1), static_cast<double>(index),
+            static_cast<double>(index + 1), 3.0, 2.0 };
+        for (std::size_t attribute = 0; attribute < 5; ++attribute)
+            for (std::size_t triangle = 0; triangle < effective.layout.triangles; ++triangle)
+                value->attributes[attribute].elements.push_back({{attributes[attribute], 0, 0, 0}});
+    }
+    return value;
+}
+
 template <typename LayerDesc>
 inline bool render(const visualharmonicgeometry::Mapping& mapping,
                    const geometry::PlanOwnerIdentity& owner, int width, int height,
@@ -173,8 +230,9 @@ inline bool render(const visualharmonicgeometry::Mapping& mapping,
     {
         if (harmonicprobe::activeReceipt != nullptr)
             ++harmonicprobe::activeReceipt->emptyLayerCount;
-        layer.opacity = 0.0f;
-        return true;
+        // No links yet. Draw the resting sculpture so a silent project still shows the module.
+        value = restingSculpture(mapping, error);
+        if (!value) return false;
     }
     auto& positions = std::get<videowire::geometry::GeometryData>(value->data).positions;
     auto minimum = positions.front();

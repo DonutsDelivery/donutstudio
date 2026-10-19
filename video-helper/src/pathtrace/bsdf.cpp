@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace videohelper::pathtrace
@@ -11,6 +13,8 @@ namespace
 {
 
 constexpr float kTwoPi = 6.28318530717958647692f;
+// Below this Fresnel reflectance a smooth dielectric never samples reflection.
+constexpr float kMinSampledFresnel = 1.0e-12f;
 
 float clampUnit (float x) noexcept
 {
@@ -36,12 +40,6 @@ float pow5 (float x) noexcept
 {
     const float x2 = x * x;
     return x2 * x2 * x;
-}
-
-Vec3 schlick (Vec3 f0, float cosine) noexcept
-{
-    const float s = pow5 (clampUnit (1.0f - cosine));
-    return { f0.x + (1.0f - f0.x) * s, f0.y + (1.0f - f0.y) * s, f0.z + (1.0f - f0.z) * s };
 }
 
 // GGX normal distribution for a unit half vector in the local frame.
@@ -207,60 +205,55 @@ const GgxAlbedoTable& ggxAlbedoTable() noexcept
     return table;
 }
 
-} // namespace
+template <class Color>
+constexpr int channelCount() noexcept;
+template <>
+constexpr int channelCount<Vec3>() noexcept { return 3; }
+template <>
+constexpr int channelCount<Spectrum>() noexcept { return kSpectrumChannels; }
 
-float materialCoverage (const Material& material) noexcept
+bool finiteColor (const Vec3& c) noexcept { return isFinite (c); }
+bool finiteColor (const Spectrum& c) noexcept { return c.finite(); }
+
+template <class Color>
+Color schlickColor (const Color& f0, float cosine) noexcept
 {
-    switch (material.alphaMode)
-    {
-        case MaterialAlphaMode::Opaque:
-            return 1.0f;
-        case MaterialAlphaMode::Mask:
-            return material.opacity >= material.alphaCutoff ? 1.0f : 0.0f;
-        case MaterialAlphaMode::Blend:
-            return std::isfinite (material.opacity) ? clampUnit (material.opacity) : 1.0f;
-    }
-    return 1.0f;
+    const float s = pow5 (clampUnit (1.0f - cosine));
+    Color out = f0;
+    for (int c = 0; c < channelCount<Color>(); ++c)
+        out[c] = f0[c] + (1.0f - f0[c]) * s;
+    return out;
 }
 
-Frame Frame::fromNormal (Vec3 n) noexcept
+template <class Color>
+Color uniformColor (float x) noexcept;
+template <>
+Vec3 uniformColor<Vec3> (float x) noexcept { return { x, x, x }; }
+template <>
+Spectrum uniformColor<Spectrum> (float x) noexcept { return Spectrum::constant (x); }
+
+// Keeps a ratio of indices finite, inside [1/3, 3], and away from exactly 1
+// where the rough transmission half vector degenerates.
+float sanitizeEta (float eta, bool rough) noexcept
 {
-    Frame frame;
-    const float sign = n.z >= 0.0f ? 1.0f : -1.0f;
-    const float a = -1.0f / (sign + n.z);
-    const float b = n.x * n.y * a;
-    frame.tangent = { 1.0f + sign * n.x * n.x * a, sign * b, -sign * n.x };
-    frame.bitangent = { b, sign + n.y * n.y * a, -n.y };
-    frame.normal = n;
-    return frame;
+    if (! std::isfinite (eta) || ! (eta > 0.0f))
+        return 1.5f;
+    eta = std::min (3.0f, std::max (1.0f / 3.0f, eta));
+    if (rough && std::fabs (eta - 1.0f) < 1.0e-4f)
+        eta = eta >= 1.0f ? 1.0f + 1.0e-4f : 1.0f - 1.0e-4f;
+    return eta;
 }
 
-float fresnelDielectric (float cosI, float eta) noexcept
+std::uint32_t lobeKindFlags (LobeKind kind) noexcept
 {
-    cosI = clampUnit (cosI);
-    const float sin2T = (1.0f - cosI * cosI) / (eta * eta);
-    if (sin2T >= 1.0f)
-        return 1.0f;
-    const float cosT = std::sqrt (1.0f - sin2T);
-    const float rs = (cosI - eta * cosT) / (cosI + eta * cosT);
-    const float rp = (eta * cosI - cosT) / (eta * cosI + cosT);
-    return clampUnit (0.5f * (rs * rs + rp * rp));
-}
-
-void ggxAlbedoScaleBias (float cosO, float alpha, float& scale, float& bias) noexcept
-{
-    ggxAlbedoTable().lookup (cosO, alpha, scale, bias);
-}
-
-std::uint32_t lobeFlags (const Lobe& lobe) noexcept
-{
-    switch (lobe.kind)
+    switch (kind)
     {
         case LobeKind::Lambert:
             return kBsdfReflection | kBsdfDiffuse;
         case LobeKind::GgxReflection:
             return kBsdfReflection | kBsdfGlossy;
         case LobeKind::SmoothDielectric:
+        case LobeKind::ThinSheet:
             return kBsdfReflection | kBsdfTransmission | kBsdfDelta;
         case LobeKind::RoughDielectric:
             return kBsdfReflection | kBsdfTransmission | kBsdfGlossy;
@@ -268,9 +261,10 @@ std::uint32_t lobeFlags (const Lobe& lobe) noexcept
     return 0;
 }
 
-BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept
+template <class Color>
+BasicBsdfEval<Color> evalLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, Vec3 wi) noexcept
 {
-    BsdfEval out;
+    BasicBsdfEval<Color> out;
     if (! (wo.z > 0.0f))
         return out;
     switch (lobe.kind)
@@ -296,11 +290,12 @@ BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept
             const float lambdaI = smithLambda (wi.z, lobe.alpha);
             const float g1 = 1.0f / (1.0f + lambdaO);
             const float g2 = 1.0f / (1.0f + lambdaO + lambdaI);
-            out.value = lobe.weight * schlick (lobe.f0, woh) * (d * g2 / (4.0f * wo.z));
+            out.value = lobe.weight * schlickColor (lobe.f0, woh) * (d * g2 / (4.0f * wo.z));
             out.pdf = g1 * d / (4.0f * wo.z);
             return out;
         }
         case LobeKind::SmoothDielectric:
+        case LobeKind::ThinSheet:
             return out;
         case LobeKind::RoughDielectric:
         {
@@ -349,7 +344,8 @@ BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept
     return out;
 }
 
-bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& out) noexcept
+template <class Color>
+bool sampleLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, float uChoice, Vec2 u, BasicBsdfSample<Color>& out) noexcept
 {
     out = {};
     if (! (wo.z > 0.0f))
@@ -380,19 +376,30 @@ bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& o
             const float g1 = 1.0f / (1.0f + lambdaO);
             const float ratio = (1.0f + lambdaO) / (1.0f + lambdaO + lambdaI);
             out.pdf = g1 * ggxD (h, lobe.alpha) / (4.0f * wo.z);
-            out.weight = lobe.weight * schlick (lobe.f0, woh) * ratio;
+            out.weight = lobe.weight * schlickColor (lobe.f0, woh) * ratio;
             out.flags = kBsdfReflection | kBsdfGlossy;
             return out.pdf > 0.0f;
         }
         case LobeKind::SmoothDielectric:
         {
             const float f = fresnelDielectric (wo.z, lobe.eta);
-            if (uChoice < f)
+            // A denormal reflectance (index ratio near 1) counts as none, so
+            // the channels' Fresnel over f below stays finite.
+            if (f >= kMinSampledFresnel && uChoice < f)
             {
                 out.wi = { -wo.x, -wo.y, wo.z };
                 out.weight = lobe.weight;
                 out.pdf = f;
                 out.flags = kBsdfReflection | kBsdfDelta;
+                if (lobe.dispersive)
+                    for (int c = 1; c < channelCount<Color>(); ++c)
+                    {
+                        // Each channel reflects its own Fresnel share; the
+                        // hero's choice probability f is shared.
+                        const float ratio = fresnelDielectric (wo.z, lobe.channelEta[static_cast<std::size_t> (c)]) / f;
+                        out.weight[c] *= ratio;
+                        out.channelPdfRatio[static_cast<std::size_t> (c)] = ratio;
+                    }
                 return true;
             }
             if (! refractThrough (wo, { 0.0f, 0.0f, 1.0f }, lobe.eta, out.wi) || ! (out.wi.z < 0.0f))
@@ -400,6 +407,17 @@ bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& o
             out.weight = lobe.transmissionTint;
             out.pdf = 1.0f - f;
             out.flags = kBsdfTransmission | kBsdfDelta;
+            if (lobe.dispersive)
+            {
+                // Other wavelengths leave in other directions; only the hero
+                // follows this one.
+                for (int c = 1; c < channelCount<Color>(); ++c)
+                {
+                    out.weight[c] = 0.0f;
+                    out.channelPdfRatio[static_cast<std::size_t> (c)] = 0.0f;
+                }
+                out.flags |= kBsdfHeroOnly;
+            }
             return out.pdf > 0.0f;
         }
         case LobeKind::RoughDielectric:
@@ -438,20 +456,278 @@ bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& o
             out.flags = kBsdfTransmission | kBsdfGlossy;
             return out.pdf > 0.0f;
         }
+        case LobeKind::ThinSheet:
+        {
+            const float r = thinSheetReflectance (wo.z, lobe.eta);
+            if (uChoice < r)
+            {
+                out.wi = { -wo.x, -wo.y, wo.z };
+                out.weight = lobe.weight;
+                out.pdf = r;
+                out.flags = kBsdfReflection | kBsdfDelta;
+                return true;
+            }
+            // No thickness, no bending: the ray carries on.
+            out.wi = -wo;
+            out.weight = lobe.transmissionTint;
+            out.pdf = 1.0f - r;
+            out.flags = kBsdfTransmission | kBsdfDelta | kBsdfStraight;
+            return out.pdf > 0.0f;
+        }
     }
     return false;
 }
 
-void Bsdf::reset (Vec3 shadingNormal, Vec3 geometricNormal) noexcept
+template <class Color, class ToColor>
+void buildBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal, Vec3 wo,
+                const DielectricSetup& setup, const ToColor& toColor, BasicBsdf<Color>& out) noexcept
+{
+    out.reset (shadingNormal, geometricNormal);
+    const Vec3 base = clampUnit (material.baseColor);
+    const Color baseColor = toColor (base);
+    const float metallic = clampUnit (material.metallic);
+    const float roughness = clampUnit (material.roughness);
+    const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
+    const float cosO = clampUnit (dot (shadingNormal, wo));
+    const float opaqueAlpha = std::max (roughness * roughness, kMinOpaqueGgxAlpha);
+    const float glassWeight = dielectricWeight (material);
+    const float transmission = clampUnit (material.transmission);
+
+    if (metallic > 0.0f)
+    {
+        float scale = 0.0f;
+        float bias = 0.0f;
+        ggxAlbedoScaleBias (cosO, opaqueAlpha, scale, bias);
+        BasicLobe<Color> metal;
+        metal.kind = LobeKind::GgxReflection;
+        metal.weight = uniformColor<Color> (metallic);
+        metal.f0 = baseColor;
+        metal.alpha = opaqueAlpha;
+        metal.selectWeight = metallic * average (base * scale + Vec3 { bias, bias, bias });
+        out.addLobe (metal);
+    }
+
+    if (glassWeight > 0.0f && material.transport == DielectricTransport::ThinSheet)
+    {
+        BasicLobe<Color> sheet;
+        sheet.kind = LobeKind::ThinSheet;
+        sheet.eta = sanitizeEta (setup.etaD, false);
+        sheet.weight = uniformColor<Color> (glassWeight);
+        sheet.transmissionTint = baseColor * glassWeight;
+        const float r = thinSheetReflectance (cosO, sheet.eta);
+        sheet.selectWeight = std::max (glassWeight * (r + (1.0f - r) * average (base)), glassWeight * 1.0e-3f);
+        out.addLobe (sheet);
+    }
+    else if (glassWeight > 0.0f)
+    {
+        BasicLobe<Color> glass;
+        const float alpha = roughness * roughness;
+        const bool rough = alpha >= kSmoothDielectricAlpha;
+        glass.kind = rough ? LobeKind::RoughDielectric : LobeKind::SmoothDielectric;
+        glass.alpha = std::max (alpha, kSmoothDielectricAlpha);
+        glass.eta = sanitizeEta (setup.eta[0], rough);
+        if (setup.dispersive)
+        {
+            if (rough)
+            {
+                out.requireHeroWavelength();
+            }
+            else
+            {
+                glass.dispersive = true;
+                for (std::size_t c = 0; c < glass.channelEta.size(); ++c)
+                    glass.channelEta[c] = sanitizeEta (setup.eta[c], false);
+            }
+        }
+        glass.weight = uniformColor<Color> (glassWeight);
+        // Beer-Lambert media take their colour inside the volume instead.
+        const bool absorbing = std::isfinite (material.absorptionDistance) && material.absorptionDistance > 0.0f;
+        const Vec3 tintRgb = absorbing ? Vec3 { 1.0f, 1.0f, 1.0f } : base;
+        glass.transmissionTint = (absorbing ? uniformColor<Color> (1.0f) : baseColor) * glassWeight;
+        const float f = fresnelDielectric (cosO, sanitizeEta (setup.etaD, false));
+        glass.selectWeight = glassWeight * (f + (1.0f - f) * average (tintRgb));
+        // A black tint still reflects, so keep the lobe selectable.
+        glass.selectWeight = std::max (glass.selectWeight, glassWeight * 1.0e-3f);
+        out.addLobe (glass);
+    }
+
+    const float opaqueWeight = (1.0f - metallic) * (1.0f - transmission);
+    if (opaqueWeight > 0.0f)
+    {
+        const float r = (ior - 1.0f) / (ior + 1.0f);
+        const float f0 = r * r;
+        float scale = 0.0f;
+        float bias = 0.0f;
+        ggxAlbedoScaleBias (cosO, opaqueAlpha, scale, bias);
+        const float specularAlbedo = clampUnit (f0 * scale + bias);
+
+        BasicLobe<Color> specular;
+        specular.kind = LobeKind::GgxReflection;
+        specular.weight = uniformColor<Color> (opaqueWeight);
+        specular.f0 = uniformColor<Color> (f0);
+        specular.alpha = opaqueAlpha;
+        specular.selectWeight = opaqueWeight * specularAlbedo;
+        out.addLobe (specular);
+
+        BasicLobe<Color> diffuse;
+        diffuse.kind = LobeKind::Lambert;
+        const float diffuseScale = opaqueWeight * (1.0f - specularAlbedo);
+        diffuse.weight = baseColor * diffuseScale;
+        diffuse.selectWeight = average (base * diffuseScale);
+        out.addLobe (diffuse);
+    }
+    out.finalize();
+}
+
+// Reflectance spectrum of an RGB colour clamped to [0, 1].
+Spectrum reflectanceSpectrum (Vec3 rgb, const Wavelengths& wavelengths) noexcept
+{
+    Spectrum s = upsampleRgb (clampUnit (rgb), wavelengths);
+    for (float& x : s.v)
+        x = std::min (x, 1.0f);
+    return s;
+}
+
+} // namespace
+
+float materialCoverage (const Material& material) noexcept
+{
+    switch (material.alphaMode)
+    {
+        case MaterialAlphaMode::Opaque:
+            return 1.0f;
+        case MaterialAlphaMode::Mask:
+            return material.opacity >= material.alphaCutoff ? 1.0f : 0.0f;
+        case MaterialAlphaMode::Blend:
+            return std::isfinite (material.opacity) ? clampUnit (material.opacity) : 1.0f;
+    }
+    return 1.0f;
+}
+
+float dielectricWeight (const Material& material) noexcept
+{
+    return (1.0f - clampUnit (material.metallic)) * clampUnit (material.transmission);
+}
+
+bool isMediumBoundary (const Material& material) noexcept
+{
+    return dielectricWeight (material) > 0.0f && material.transport != DielectricTransport::ThinSheet;
+}
+
+bool isThinSheet (const Material& material) noexcept
+{
+    return dielectricWeight (material) > 0.0f && material.transport == DielectricTransport::ThinSheet;
+}
+
+float materialCauchyB (const Material& material) noexcept
+{
+    // The surface material IR admits B in [0, 0.02]; allow some headroom.
+    if (std::isfinite (material.dispersion) && material.dispersion != 0.0f)
+        return std::min (0.05f, std::max (0.0f, material.dispersion));
+    const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
+    return std::min (0.05f, cauchyBFromAbbe (ior, material.abbe));
+}
+
+bool materialDispersive (const Material& material) noexcept
+{
+    return isMediumBoundary (material) && materialCauchyB (material) > 0.0f;
+}
+
+float materialIorAt (const Material& material, float nm, bool spectral) noexcept
+{
+    const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
+    if (! spectral)
+        return ior;
+    const float n = cauchyIor (ior, materialCauchyB (material), nm);
+    return std::isfinite (n) ? std::min (3.0f, std::max (1.0f, n)) : ior;
+}
+
+Spectrum mediumAbsorption (const Material& material, const Wavelengths& wavelengths) noexcept
+{
+    Spectrum sigma;
+    if (! isMediumBoundary (material) || ! std::isfinite (material.absorptionDistance)
+        || ! (material.absorptionDistance > 0.0f))
+        return sigma;
+    const Spectrum tint = reflectanceSpectrum (material.baseColor, wavelengths);
+    const int channels = wavelengths.spectral ? kSpectrumChannels : 3;
+    for (int c = 0; c < channels; ++c)
+        sigma[c] = -std::log (std::max (tint[c], 1.0e-4f)) / material.absorptionDistance;
+    return sigma;
+}
+
+Spectrum straightTransmittance (const Material& material, float cosine, float etaD,
+                                const Wavelengths& wavelengths) noexcept
+{
+    if (! isThinSheet (material))
+        return {};
+    const float r = thinSheetReflectance (std::fabs (cosine), sanitizeEta (etaD, false));
+    return reflectanceSpectrum (material.baseColor, wavelengths) * (dielectricWeight (material) * (1.0f - r));
+}
+
+Frame Frame::fromNormal (Vec3 n) noexcept
+{
+    Frame frame;
+    const float sign = n.z >= 0.0f ? 1.0f : -1.0f;
+    const float a = -1.0f / (sign + n.z);
+    const float b = n.x * n.y * a;
+    frame.tangent = { 1.0f + sign * n.x * n.x * a, sign * b, -sign * n.x };
+    frame.bitangent = { b, sign + n.y * n.y * a, -n.y };
+    frame.normal = n;
+    return frame;
+}
+
+float fresnelDielectric (float cosI, float eta) noexcept
+{
+    cosI = clampUnit (cosI);
+    const float sin2T = (1.0f - cosI * cosI) / (eta * eta);
+    if (sin2T >= 1.0f)
+        return 1.0f;
+    const float cosT = std::sqrt (1.0f - sin2T);
+    const float rs = (cosI - eta * cosT) / (cosI + eta * cosT);
+    const float rp = (eta * cosI - cosT) / (eta * cosI + cosT);
+    return clampUnit (0.5f * (rs * rs + rp * rp));
+}
+
+float thinSheetReflectance (float cosI, float eta) noexcept
+{
+    const float r = fresnelDielectric (cosI, eta);
+    return clampUnit (2.0f * r / (1.0f + r));
+}
+
+void ggxAlbedoScaleBias (float cosO, float alpha, float& scale, float& bias) noexcept
+{
+    ggxAlbedoTable().lookup (cosO, alpha, scale, bias);
+}
+
+std::uint32_t lobeFlags (const Lobe& lobe) noexcept { return lobeKindFlags (lobe.kind); }
+std::uint32_t lobeFlags (const SpectralLobe& lobe) noexcept { return lobeKindFlags (lobe.kind); }
+
+BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept { return evalLobeImpl (lobe, wo, wi); }
+SpectralBsdfEval evalLobe (const SpectralLobe& lobe, Vec3 wo, Vec3 wi) noexcept { return evalLobeImpl (lobe, wo, wi); }
+
+bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& out) noexcept
+{
+    return sampleLobeImpl (lobe, wo, uChoice, u, out);
+}
+
+bool sampleLobe (const SpectralLobe& lobe, Vec3 wo, float uChoice, Vec2 u, SpectralBsdfSample& out) noexcept
+{
+    return sampleLobeImpl (lobe, wo, uChoice, u, out);
+}
+
+template <class Color>
+void BasicBsdf<Color>::reset (Vec3 shadingNormal, Vec3 geometricNormal) noexcept
 {
     frame_ = Frame::fromNormal (shadingNormal);
     geometricNormal_ = geometricNormal;
     count_ = 0;
     nonDelta_ = false;
+    heroOnly_ = false;
     probability_.fill (0.0f);
 }
 
-bool Bsdf::addLobe (const Lobe& lobe) noexcept
+template <class Color>
+bool BasicBsdf<Color>::addLobe (const BasicLobe<Color>& lobe) noexcept
 {
     if (count_ >= kMaxLobes || ! finitePositive (lobe.selectWeight))
         return false;
@@ -460,7 +736,8 @@ bool Bsdf::addLobe (const Lobe& lobe) noexcept
     return true;
 }
 
-void Bsdf::finalize() noexcept
+template <class Color>
+void BasicBsdf<Color>::finalize() noexcept
 {
     float total = 0.0f;
     for (int i = 0; i < count_; ++i)
@@ -470,27 +747,29 @@ void Bsdf::finalize() noexcept
     {
         const auto slot = static_cast<std::size_t> (i);
         probability_[slot] = total > 0.0f ? lobes_[slot].selectWeight / total : 0.0f;
-        if ((lobeFlags (lobes_[slot]) & kBsdfDelta) == 0)
+        if ((lobeKindFlags (lobes_[slot].kind) & kBsdfDelta) == 0)
             nonDelta_ = true;
     }
 }
 
-BsdfEval Bsdf::evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept
+template <class Color>
+BasicBsdfEval<Color> BasicBsdf<Color>::evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept
 {
-    BsdfEval out;
+    BasicBsdfEval<Color> out;
     for (int i = 0; i < count_; ++i)
     {
         const auto slot = static_cast<std::size_t> (i);
-        if ((lobeFlags (lobes_[slot]) & kBsdfDelta) != 0)
+        if ((lobeKindFlags (lobes_[slot].kind) & kBsdfDelta) != 0)
             continue;
-        const BsdfEval e = evalLobe (lobes_[slot], woLocal, wiLocal);
+        const BasicBsdfEval<Color> e = evalLobeImpl (lobes_[slot], woLocal, wiLocal);
         out.value = out.value + e.value;
         out.pdf += probability_[slot] * e.pdf;
     }
     return out;
 }
 
-BsdfEval Bsdf::eval (Vec3 wo, Vec3 wi) const noexcept
+template <class Color>
+BasicBsdfEval<Color> BasicBsdf<Color>::eval (Vec3 wo, Vec3 wi) const noexcept
 {
     const Vec3 woLocal = frame_.toLocal (wo);
     const Vec3 wiLocal = frame_.toLocal (wi);
@@ -502,7 +781,8 @@ BsdfEval Bsdf::eval (Vec3 wo, Vec3 wi) const noexcept
     return evalLocal (woLocal, wiLocal);
 }
 
-bool Bsdf::sample (Vec3 wo, float uLobe, Vec2 uDirection, BsdfSample& out) const noexcept
+template <class Color>
+bool BasicBsdf<Color>::sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfSample<Color>& out) const noexcept
 {
     out = {};
     if (count_ == 0)
@@ -530,98 +810,56 @@ bool Bsdf::sample (Vec3 wo, float uLobe, Vec2 uDirection, BsdfSample& out) const
         return false;
     const float uChoice = std::min (std::max ((uLobe - lower) / probability, 0.0f), 0.99999994f);
 
-    BsdfSample local;
-    if (! sampleLobe (lobes_[slot], woLocal, uChoice, uDirection, local))
+    BasicBsdfSample<Color> local;
+    if (! sampleLobeImpl (lobes_[slot], woLocal, uChoice, uDirection, local))
         return false;
-    const Vec3 wi = normalizeOrZero (frame_.toWorld (local.wi));
+    // A straight sample is exactly the incoming ray, not a rotated copy.
+    const Vec3 wi = (local.flags & kBsdfStraight) != 0 ? -wo : normalizeOrZero (frame_.toWorld (local.wi));
     const float side = dot (geometricNormal_, wi);
     if (local.wi.z > 0.0f ? ! (side > 0.0f) : ! (side < 0.0f))
         return false;
 
     out.wi = wi;
     out.flags = local.flags;
+    out.channelPdfRatio = local.channelPdfRatio;
     if ((local.flags & kBsdfDelta) != 0)
     {
         out.weight = local.weight * (1.0f / probability);
         out.pdf = probability * local.pdf;
-        return isFinite (out.weight) && out.pdf > 0.0f;
+        return finiteColor (out.weight) && out.pdf > 0.0f;
     }
-    const BsdfEval mixture = evalLocal (woLocal, local.wi);
+    const BasicBsdfEval<Color> mixture = evalLocal (woLocal, local.wi);
     if (! (mixture.pdf > 0.0f) || ! std::isfinite (mixture.pdf))
         return false;
     out.weight = mixture.value * (1.0f / mixture.pdf);
     out.pdf = mixture.pdf;
-    return isFinite (out.weight);
+    return finiteColor (out.weight);
 }
+
+template class BasicBsdf<Vec3>;
+template class BasicBsdf<Spectrum>;
 
 void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
                         Vec3 wo, bool entering, Bsdf& out) noexcept
 {
-    out.reset (shadingNormal, geometricNormal);
-    const Vec3 base = clampUnit (material.baseColor);
-    const float metallic = clampUnit (material.metallic);
-    const float roughness = clampUnit (material.roughness);
-    const float transmission = clampUnit (material.transmission);
     const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
-    const float cosO = clampUnit (dot (shadingNormal, wo));
-    const float opaqueAlpha = std::max (roughness * roughness, kMinOpaqueGgxAlpha);
+    DielectricSetup setup;
+    // A sheet has the same medium on both sides; a volume or interface
+    // refracts into the material when entering and out of it otherwise.
+    const float eta = material.transport == DielectricTransport::ThinSheet || entering ? ior : 1.0f / ior;
+    setup.eta.fill (eta);
+    setup.etaD = eta;
+    buildBsdf (material, shadingNormal, geometricNormal, wo, setup, [] (Vec3 rgb) { return rgb; }, out);
+}
 
-    if (metallic > 0.0f)
-    {
-        float scale = 0.0f;
-        float bias = 0.0f;
-        ggxAlbedoScaleBias (cosO, opaqueAlpha, scale, bias);
-        Lobe metal;
-        metal.kind = LobeKind::GgxReflection;
-        metal.weight = { metallic, metallic, metallic };
-        metal.f0 = base;
-        metal.alpha = opaqueAlpha;
-        metal.selectWeight = metallic * average (base * scale + Vec3 { bias, bias, bias });
-        out.addLobe (metal);
-    }
-
-    const float glassWeight = (1.0f - metallic) * transmission;
-    if (glassWeight > 0.0f)
-    {
-        Lobe glass;
-        const float alpha = roughness * roughness;
-        glass.kind = alpha < kSmoothDielectricAlpha ? LobeKind::SmoothDielectric : LobeKind::RoughDielectric;
-        glass.alpha = std::max (alpha, kSmoothDielectricAlpha);
-        glass.eta = entering ? ior : 1.0f / ior;
-        glass.weight = { glassWeight, glassWeight, glassWeight };
-        glass.transmissionTint = base * glassWeight;
-        const float f = fresnelDielectric (cosO, glass.eta);
-        glass.selectWeight = glassWeight * (f + (1.0f - f) * average (base));
-        // A black tint still reflects, so keep the lobe selectable.
-        glass.selectWeight = std::max (glass.selectWeight, glassWeight * 1.0e-3f);
-        out.addLobe (glass);
-    }
-
-    const float opaqueWeight = (1.0f - metallic) * (1.0f - transmission);
-    if (opaqueWeight > 0.0f)
-    {
-        const float r = (ior - 1.0f) / (ior + 1.0f);
-        const float f0 = r * r;
-        float scale = 0.0f;
-        float bias = 0.0f;
-        ggxAlbedoScaleBias (cosO, opaqueAlpha, scale, bias);
-        const float specularAlbedo = clampUnit (f0 * scale + bias);
-
-        Lobe specular;
-        specular.kind = LobeKind::GgxReflection;
-        specular.weight = { opaqueWeight, opaqueWeight, opaqueWeight };
-        specular.f0 = { f0, f0, f0 };
-        specular.alpha = opaqueAlpha;
-        specular.selectWeight = opaqueWeight * specularAlbedo;
-        out.addLobe (specular);
-
-        Lobe diffuse;
-        diffuse.kind = LobeKind::Lambert;
-        diffuse.weight = base * (opaqueWeight * (1.0f - specularAlbedo));
-        diffuse.selectWeight = average (diffuse.weight);
-        out.addLobe (diffuse);
-    }
-    out.finalize();
+void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
+                        Vec3 wo, const Wavelengths& wavelengths, const DielectricSetup& setup,
+                        SpectralBsdf& out) noexcept
+{
+    DielectricSetup used = setup;
+    used.dispersive = setup.dispersive && wavelengths.spectral;
+    buildBsdf (material, shadingNormal, geometricNormal, wo, used,
+               [&wavelengths] (Vec3 rgb) { return reflectanceSpectrum (rgb, wavelengths); }, out);
 }
 
 } // namespace videohelper::pathtrace

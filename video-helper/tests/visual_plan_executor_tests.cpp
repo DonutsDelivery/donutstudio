@@ -3905,6 +3905,9 @@ struct FakeLayer
     float drawShapeCx = 0.5f, drawShapeCy = 0.5f, drawShapeW = 1.0f, drawShapeH = 1.0f;
     float drawShape2Cx = 0.5f, drawShape2Cy = 0.5f, drawShape2W = 0.0f, drawShape2H = 0.0f;
     float drawShapeR = 1.0f, drawShapeG = 1.0f, drawShapeB = 1.0f, drawShapeA = 1.0f;
+    bool drawShapeGradient = false;
+    float drawGradientCos = 1.0f, drawGradientSin = 0.0f;
+    float drawGradientR = 1.0f, drawGradientG = 1.0f, drawGradientB = 1.0f, drawGradientA = 1.0f;
     bool pathMatte = false;
     bool pathMatteEllipse = false, pathMatteHasSecondary = false;
     bool pathMatteSecondaryEllipse = false, pathMatteInvert = false;

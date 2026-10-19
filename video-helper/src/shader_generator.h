@@ -38,6 +38,9 @@
 
 #include <vector>
 
+namespace arbitharmony { struct HarmonyTimeline; }
+namespace videotime { class BeatTimeline; }
+
 namespace videorender
 {
 
@@ -56,7 +59,24 @@ struct ShaderClock
     double clipBeat    = 0.0;       // uClipBeat: beats since clip start
     double clipLength  = 0.0;       // uClipLength: clip duration in beats
     bool   playing     = true;      // uPlaying
+    // Harmony and structure (harmony_signals.h). makeShaderClock fills them
+    // from the score's harmony timeline; zero when the payload has none.
+    float  chord[4]    = { 0.0f, 0.0f, 0.0f, 0.0f };  // uChord: root, quality, tension, beats since change
+    float  key[4]      = { 0.0f, 0.0f, 0.0f, 0.0f };  // uKey: tonic, mode + 1, beats since change, brightness
+    float  phrase[4]   = { 0.0f, 0.0f, 0.0f, 0.0f };  // uPhrase: bar, phrase, phrase phase, song progress
+    float  lastOnsetBeat = 0.0f;    // uLastOnsetBeat: timeline beat of the latest note onset
 };
+
+// Derive the clock from the authoritative project beat timeline. Both render
+// paths call this exact function, including tempo ramps and meter changes.
+// `harmony` (optional) fills the harmony fields at the same beat; null leaves
+// them zero. Defined outside the viewport guard so headless tests can check
+// the uniform packing.
+ShaderClock makeShaderClock (double displaySec, double clipStartSec,
+                             double clipDurationSec,
+                             const videotime::BeatTimeline& timeline, double fps,
+                             bool playing, int frame,
+                             const arbitharmony::HarmonyTimeline* harmony = nullptr);
 
 // Block B audio features (master-plan §4.2 / M4) — the master-mix analysis
 // (RMS / peak / onset / 64 log bands) the generator uploads to uRMS / uPeak /
@@ -139,12 +159,7 @@ inline bool genParamIsIntScalar (int type)   // bool / long / event → glUnifor
     return type == 0 || type == 1 || type == 8;
 }
 
-// Derive the clock from the authoritative project beat timeline. Both render
-// paths call this exact function, including tempo ramps and meter changes.
-ShaderClock makeShaderClock (double displaySec, double clipStartSec,
-                             double clipDurationSec,
-                             const videotime::BeatTimeline& timeline, double fps,
-                             bool playing, int frame);
+// makeShaderClock is declared above, outside the viewport guard.
 
 // Block C score inputs are read only from CanonicalBlockCFrame. A null pointer
 // keeps the shader score uniforms and textures zero-fed.
@@ -228,6 +243,7 @@ private:
         int uNotes = -1, uLinks = -1, uNoteCount = -1, uLinkCount = -1;
         int uScoreHistoryBeats = -1, uScoreLookaheadBeats = -1;
         int uLastOnsetBeat = -1, uRootFreq = -1, uChord = -1;
+        int uKey = -1, uPhrase = -1;
         // Block D — camera (P5 raymarch); -1 when the shader doesn't read them.
         int uCamPos = -1, uCamTarget = -1, uCamUp = -1;
         int uCamFov = -1, uCamNear = -1, uCamFar = -1;

@@ -36,6 +36,11 @@ for value in range(-29, 0):
 enum = re.search(r"enum class SmoothTransportStatus : int\s*\{(.*?)\};", header, re.S)
 assert enum is not None, "SmoothTransportStatus enum is missing"
 codes = {name: int(value) for name, value in re.findall(r"(\w+)=(-?\d+)", enum.group(1))}
+# Trapped (+2) is the one non-refusal: a completed walk that absorbed the power
+# it could not trace within its visits.
+assert codes.pop("Trapped", None) == 2, "SmoothTransportStatus::Trapped must be +2"
+assert "inline constexpr std::uint16_t kTrappedNormalBits = 0x4000u;" in header
+assert struct.unpack("<H", struct.pack("<e", 2.0))[0] == 0x4000
 assert len(codes) == 17, codes
 assert sorted(codes.values()) == list(range(-19, -2)), codes
 assert len({negative_half_bits(v) for v in codes.values()}) == len(codes)
@@ -51,7 +56,7 @@ assert "constexpr int roughReasonCode(RoughTransportStatus status) { return kRou
 
 # The shader receives one define per code, and every shader use names a define.
 defined = dict(re.findall(r'\{"([A-Z_]+)",SmoothTransportStatus::(\w+)\}', header))
-assert set(defined.values()) == set(codes), (defined, codes)
+assert set(defined.values()) == set(codes) | {"Trapped"}, (defined, codes)
 for name in re.findall(r"GLASS_SMOOTH_STATUS_([A-Z_]+)", header):
     assert name in defined, name
 assert '#define GLASS_ROUGH_REASON_BASE " + surfacesource' in header
@@ -73,12 +78,26 @@ assert "{std::uint16_t(0), \"unrecognized normal value\"}" in table.group(1)
 assert 'result (";' in header, "completeFrame prefix changed"
 assert '"; also "' in header and '" pixel"' in header and '" pixels"' in header
 
-# Every early return in glassTransport sets a code. The function has 13 such exits.
+# Every early return in glassTransport sets a code. The function has 12 such
+# exits. Running out of visits is no longer one: the walk ends, absorbs the
+# untraced branches and reports TRAPPED on a complete pixel.
 start = header.index("vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_ARGS) {")
 body = header[start:header.index("// Native callers must retain", start)]
 assert "complete=false;status=GLASS_SMOOTH_STATUS_UNCLASSIFIED;" in body
 exits = [line for line in body.splitlines() if "return vec3(0.0);" in line]
-assert len(exits) == 13, len(exits)
+assert len(exits) == 12, len(exits)
+assert "if(pending!=0) trapped=true;" in body
+assert "if(complete&&trapped) status=GLASS_SMOOTH_STATUS_TRAPPED;" in body
+assert "GLASS_SMOOTH_STATUS_VISITS" not in body
+
+# completeFrame admits a few trapped pixels and refuses systemic trapping.
+assert "inline constexpr std::size_t kMaximumTrappedCameraPixels = 4096;" in header
+assert "inline constexpr double kMaximumTrappedCameraFraction = 0.005;" in header
+assert "if (alpha == kTrappedNormalBits) {" in header
+assert "if (admitTrappedCameraPixels(trapped,surface))" in header
+# Zero-roughness rough delegations keep refusing a trapped smooth walk, so the
+# rough receipt policy is unchanged.
+assert header.count("status=smoothComplete&&smoothStatus!=GLASS_SMOOTH_STATUS_TRAPPED?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;") == 3
 for line in exits:
     assert re.search(r"status=[^;]*GLASS_SMOOTH_STATUS_", line), line
 
@@ -102,6 +121,8 @@ for line in thin_exits:
     if re.search(r"if\(!(reflected|transmitted)Complete\) return vec3\(0\.0\);", line):
         forwarded += 1
         continue
+    if line.strip() == "if(entryStatus!=0) {status=entryStatus;return vec3(0.0);}":
+        continue
     assert re.search(r"status=[^;]*GLASS_SMOOTH_STATUS_", line), line
 assert forwarded == 2
 assert "reflectedComplete,status GX_PASS" in thin and "transmittedComplete,status GX_PASS" in thin
@@ -114,11 +135,28 @@ owned = function_body("bool thinEntryOwned(GlassClosestHit first,uint water,vec3
 assert "if(first.status==1&&first.objectId==water) return true;" in owned
 assert "if(first.status==0) return true;" in owned
 assert "if(first.status!=1) return false;" in owned
-assert "float tolerance=max(4.0*glassBias(entry),1.0e-4*distance);" in owned
+assert "float tolerance=thinEntryTolerance(camera,entry);" in owned
 assert "return glassSceneFinite(first.distance)&&first.distance>=distance-tolerance;" in owned
+tolerance = function_body("float thinEntryTolerance(vec3 camera,vec3 entry) {")
+assert "return max(4.0*glassBias(entry),1.0e-4*length(entry-camera));" in tolerance
 assert "inline constexpr float kThinEntryRelativeTolerance = 1.0e-4f;" in header
 assert "kThinEntryRelativeTolerance*distance" in header
-assert "if(!thinEntryOwned(first,water,camera,entry)) {status=GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;return vec3(0.0);}" in thin
+
+# An occluder silhouette tie gets one probe along the same ray, one tolerance
+# past the foreign hit. A closed occluder's exit or any other surface in front
+# of the entry still refuses.
+status = function_body("int thinEntryStatus(GlassClosestHit first,uint water,vec3 camera,vec3 incoming,vec3 entry GX_ARGS) {")
+assert "if(thinEntryOwned(first,water,camera,entry)) return 0;" in status
+assert "if(first.status!=1||!glassSceneFinite(first.distance)) return GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;" in status
+assert "GlassClosestHit beyond=glassSceneClosestHit(camera,incoming,first.distance+thinEntryTolerance(camera,entry),3.402823e38,GU_GlassControl GX_QUERY);" in status
+assert "if(beyond.status<0) return beyond.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;" in status
+assert "return thinEntryOwned(beyond,water,camera,entry)?0:GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;" in status
+assert status.count("glassSceneClosestHit(") == 1
+assert "int entryStatus=thinEntryStatus(first,water,camera,incoming,entry GX_PASS);" in thin
+assert "if(entryStatus!=0) {status=entryStatus;return vec3(0.0);}" in thin
+# The admitted thin pixel budget counts the probe.
+assert "inline constexpr std::uint64_t kThinPixelRayQueries = 4;" in header
+assert "kMaximumThinPixelRayQueries/kThinPixelRayQueries" in header
 assert "first.status!=1 || first.objectId!=water" not in thin
 
 # completeFrame names the first failing readback texel after the reason list.
@@ -135,11 +173,11 @@ assert opengl.count("int glassStatus=GLASS_SMOOTH_STATUS_UNCLASSIFIED;") == 1
 assert sokol.count("int glassStatus=GLASS_SMOOTH_STATUS_UNCLASSIFIED;") == 1
 assert "int glassStatus=-1;" not in opengl and "int glassStatus=-1;" not in sokol
 assert (
-    "outRawNormal.w = complete && representable ? 1.0 : representable ? float(glassStatus) : -2.0;"
+    "outRawNormal.w = complete && representable ? (glassStatus == GLASS_SMOOTH_STATUS_TRAPPED ? 2.0 : 1.0) : representable ? float(glassStatus) : -2.0;"
     in opengl
 )
 assert (
-    "out.rawNormal.w = complete && representable ? 1.0f : representable ? float(glassStatus) : -2.0f;"
+    "out.rawNormal.w = complete && representable ? (glassStatus == GLASS_SMOOTH_STATUS_TRAPPED ? 2.0f : 1.0f) : representable ? float(glassStatus) : -2.0f;"
     in sokol
 )
 assert "glassTransport(uCameraTranslation,vWorldPosition,complete,glassStatus);" in opengl
@@ -159,5 +197,33 @@ assert "representable?-1.0:-2.0" not in opengl and "representable?-1.0:-2.0" not
 assert "smoothComplete,smoothStatus GX_PASS" in header
 assert header.count("smoothComplete,smoothStatus GX_PASS") == 3
 assert "vec3 smoothColour=glassTransport(camera,entry,smoothComplete,smoothStatus GX_PASS);" in cases
+
+# Bright finite radiance is held at the RGBA16F ceiling. Only NaN or Inf
+# marks a glass pixel unrepresentable, and the Color funnel keeps NaN/Inf.
+assert opengl.count("bool representable = glassSceneFinite3(glass);") == 1
+assert sokol.count("bool representable = glassSceneFinite3(glass);") == 1
+assert "glass = clamp(glass, vec3(-65504.0), vec3(65504.0));" in opengl
+assert "glass = clamp(glass, float3(-65504.0f), float3(65504.0f));" in sokol
+assert "vec4 fixtureHalfRange(vec4 color) {" in opengl
+assert "float4 fixtureHalfRange(float4 color) {" in sokol
+assert "isnan(color)" in opengl and "isinf(color)" in opengl
+assert "isnan(color) || isinf(color)" in sokol
+assert "if (count == 0) return fixtureHalfRange(color);" in opengl
+assert "if (count == 0) return fixtureHalfRange(value.color);" in sokol
+assert "uPassProgramControl.z > 0.5 ? fixtureHalfRange(value) : clamp(value, 0.0, 1.0);" in opengl
+assert "u.passProgramControl.z > 0.5f ? fixtureHalfRange(result) : clamp(result, 0.0f, 1.0f);" in sokol
+assert "kMaximumClosedGlassFrameRayQueries = 2048ull * 1024ull * 1024ull" in header
+assert ": kMaximumClosedGlassFrameRayQueries/(3*kMaximumRayVisits+1);" in header
+
+# Smooth Dispersive Glass shades its receivers with the analytic sky. A GGX
+# sample on the view direction rounds v.h above one, and pow() of the negative
+# Schlick base made NaN on NVIDIA GL, so every export refused. v.h is clamped.
+sky = (root / "src/gpu_backend/fixture_analytic_sky.h").read_text()
+assert "float vh=min(dot(v,h),1.0);" in sky
+assert "float vh=dot(v,h);" not in sky
+assert sky.count("pow(1.0-vh,5.0)") == 2
+# -2 pixels and nonfinite Color values report a count and the first texel.
+assert "(NaN or infinite glass radiance; " in header
+assert '"NaN" : "infinity")+" in channel "' in header
 
 print("glass smooth refusal source contract: ok")

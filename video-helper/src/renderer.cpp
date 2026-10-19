@@ -11,6 +11,7 @@
 #include "visual_plan_executor.h"
 #include "native_texture_rows_gl.h"
 #include "hdr_movie_readback.h"
+#include "layer_transform.h"
 #include "../../shared/ColorTransformGpuMath.h"
 
 #include <algorithm>
@@ -426,6 +427,8 @@ uniform vec4 uShapeRect;   // cx, cy, signed width (ellipse < 0), height
 uniform vec4 uShapeRectB;
 uniform int uShapeOperation;
 uniform vec4 uShapeColor;
+uniform vec4 uShapeGradient; // x = 1 draws a gradient, yz = unit direction (cos, sin)
+uniform vec4 uShapeColorB;   // gradient end colour; uShapeColor is the start colour
 
 bool shapeContains(vec4 rect) {
     vec2 halfSize = max(abs(rect.zw) * 0.5, vec2(0.0));
@@ -446,6 +449,13 @@ bool shapeContains(vec4 rect) {
 }
 
 void main() {
+    if (uShapeGradient.x > 0.5) {
+        // Same ramp as the synthesised Gradient generator: 0 is left to right,
+        // positive angles turn toward the frame bottom (RawUV rows run down).
+        float t = clamp(dot(RawUV - vec2(0.5), uShapeGradient.yz) + 0.5, 0.0, 1.0);
+        FragColor = mix(uShapeColor, uShapeColorB, t);
+        return;
+    }
     bool insideA = shapeContains(uShapeRect);
     bool insideB = uShapeOperation == 0 ? false : shapeContains(uShapeRectB);
     bool inside = uShapeOperation == 1 ? (insideA || insideB)
@@ -1140,20 +1150,14 @@ const float kIdentity[16] = {
     0, 0, 0, 1,
 };
 
-// M = T(tx,ty) · R(deg) · S(sx,sy), column-major (compositor-spec §3.2).
+// M = T(tx,ty) · A^-1 · R(deg) · A · S(sx,sy), column-major, A = diag(aspect,1)
+// with aspect = canvas width / height (layer_transform.h). The rotation runs in
+// aspect-corrected space so a rotated frame stays a rigid rectangle; at 0 degrees
+// this is the compositor-spec §3.2 matrix unchanged.
 void buildTransform (float tx, float ty, float rotationDeg,
-                     float sx, float sy, float out[16])
+                     float sx, float sy, float aspect, float out[16])
 {
-    const float a = rotationDeg * 3.14159265358979323846f / 180.0f;
-    const float c = std::cos (a);
-    const float s = std::sin (a);
-    const float m[16] = {
-        sx * c,  sx * s,  0.0f, 0.0f,
-       -sy * s,  sy * c,  0.0f, 0.0f,
-        0.0f,    0.0f,    1.0f, 0.0f,
-        tx,      ty,      0.0f, 1.0f,
-    };
-    std::memcpy (out, m, sizeof (m));
+    videorender::buildLayerTransform (tx, ty, rotationDeg, sx, sy, aspect, out);
 }
 
 // Wire transition type (videofx::TransitionType: 0 none, 1 fade, 2 dissolve,
@@ -1560,7 +1564,10 @@ bool FrameRenderer::initializeForVisualPlans (
         *output = {};
     error.clear();
 
+    // One clip whose plan does not lower must not stop the renderer for the
+    // whole project. Its frames fail on their own, naming the clip.
     videowire::VisualPlanExecutionState state;
+    state.containLayerLoweringFailures(true);
     if (! state.admitPlans(plans, &error, outWidth, outHeight))
         return false;
 
@@ -1698,6 +1705,8 @@ bool FrameRenderer::initialize (const arbitgl::GlFuncs* gl, int outWidth, int ou
     drawShape_.uRectB     = loc (drawShape_.prog, "uShapeRectB");
     drawShape_.uOperation = loc (drawShape_.prog, "uShapeOperation");
     drawShape_.uColor     = loc (drawShape_.prog, "uShapeColor");
+    drawShape_.uGradient  = loc (drawShape_.prog, "uShapeGradient");
+    drawShape_.uColorB    = loc (drawShape_.prog, "uShapeColorB");
 
     blend_.uTransform = loc (blend_.prog, "uTransform");
     blend_.uCrop      = loc (blend_.prog, "uCrop");
@@ -3267,9 +3276,12 @@ void FrameRenderer::drawLayerGeometry (unsigned sourceTexture, const LayerDesc& 
     glClearColor (0.0f, 0.0f, 0.0f, 0.0f);
     glClear (GL_COLOR_BUFFER_BIT);
 
-    // Letterbox fit against the CANVAS aspect (the project's export frame;
-    // falls back to the output aspect when no canvas is set — the export
-    // path, where output == canvas). Then the user transform, then the
+    // Letterbox fit, and the aspect the rotation runs in, against the CANVAS
+    // aspect when a canvas is set (the live viewport). With no canvas (the
+    // exporter never sets one) both use the OUTPUT aspect, which is the export
+    // size and need not equal the project canvas: a 9:16 export of a 16:9
+    // project rotates in 9:16. The plugin's Image Transform composition is
+    // given that same aspect per render. Then the user transform, then the
     // viewport-only view transform mapping canvas NDC -> output NDC.
     const float outAspect = outH_ > 0 ? (float) outW_ / (float) outH_ : 1.0f;
     const float refAspect = (canvasW_ > 0 && canvasH_ > 0)
@@ -3282,7 +3294,7 @@ void FrameRenderer::drawLayerGeometry (unsigned sourceTexture, const LayerDesc& 
 
     float m[16];
     buildTransform (layer.translateX, layer.translateY, layer.rotationDeg,
-                    layer.scale * lbx, layer.scale * lby, m);
+                    layer.scale * lbx, layer.scale * lby, refAspect, m);
     // Final = V · M with V = T(pan) · S(zoom·fit) (column-major 2D affine).
     float zx, zy, cx, cy;
     viewMap (zx, zy, cx, cy);
@@ -3796,7 +3808,22 @@ unsigned FrameRenderer::buildLayerFrame (const LayerDesc& layer, float& blendOpa
     {
         const auto result = renderShaderOperationFrame(layer);
         if (result == 0) return 0;
-        drawLayerGeometry(result, layer, layerTexB_, 1.0f);
+        // A shader chain can end in the clip's Effects rack or a Feedback Trail.
+        // Run them on the shader result exactly as a generated source does,
+        // before the geometry pass places it.
+        unsigned processed = result;
+        if ((layer.effects != nullptr && layer.effectCount > 0) || layer.graphTemporalActive)
+        {
+            LayerDesc shaded = layer;
+            if (layer.effects == &layer.graphFeedbackEffect)
+                shaded.effects = &shaded.graphFeedbackEffect;
+            shaded.texture = result;
+            shaded.texWidth = outW_;
+            shaded.texHeight = outH_;
+            processed = runEffectChain(shaded);
+            if (processed == 0) return 0;
+        }
+        drawLayerGeometry(processed, layer, layerTexB_, 1.0f);
         blendOpacityOut = layer.opacity;
         return layerTexB_;
     }
@@ -3957,7 +3984,7 @@ void FrameRenderer::drawImageOverlay (const ImageLayerDesc& overlay, unsigned ta
     float m[16];
     buildTransform (overlay.posX, overlay.posY, 0.0f,
                     (float) overlay.width / refW,
-                    (float) overlay.height / refH, m);
+                    (float) overlay.height / refH, refW / refH, m);
     float zx, zy, cx, cy;
     viewMap (zx, zy, cx, cy);
     m[0] *= zx; m[1] *= zy; m[4] *= zx; m[5] *= zy;
@@ -4347,6 +4374,14 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
                             std::clamp (use->drawShapeG, 0.0f, 1.0f),
                             std::clamp (use->drawShapeB, 0.0f, 1.0f),
                             std::clamp (use->drawShapeA, 0.0f, 1.0f));
+            gl_->Uniform4f (drawShape_.uGradient,
+                            use->drawShapeGradient ? 1.0f : 0.0f,
+                            use->drawGradientCos, use->drawGradientSin, 0.0f);
+            gl_->Uniform4f (drawShape_.uColorB,
+                            std::clamp (use->drawGradientR, 0.0f, 1.0f),
+                            std::clamp (use->drawGradientG, 0.0f, 1.0f),
+                            std::clamp (use->drawGradientB, 0.0f, 1.0f),
+                            std::clamp (use->drawGradientA, 0.0f, 1.0f));
             drawQuad();
             if (visualTelemetry_ != nullptr && use->drawShapeNodeId != 0)
                 visualTelemetry_->recordNodeEvaluation(use->clipId,
@@ -4365,7 +4400,11 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
                 drawQuad();
                 transformInspectionReady_ = true;
             }
-            blendOnto (layerTexB_, accumTex_[read], accumTex_[read ^ 1], 1.0f, 0);
+            // A Draw Shape overlay composites normally. A Gradient overlay follows
+            // the layer's own blend mode and opacity, as the Blend node configures.
+            blendOnto (layerTexB_, accumTex_[read], accumTex_[read ^ 1],
+                       use->drawShapeGradient ? use->opacity : 1.0f,
+                       use->drawShapeGradient ? use->blendMode : 0);
             read ^= 1;
         }
     }

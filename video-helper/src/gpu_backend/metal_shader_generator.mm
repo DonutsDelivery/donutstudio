@@ -164,6 +164,7 @@ struct MetalShaderGenerator::Impl
     std::vector<MetalPassInfo> passes;
     bool multipass = false;
     std::vector<GenParam> params;
+    std::set<std::string> foreignHarmony;  // harmony names a parameter or another type owns
     std::string log;
     std::unordered_map<std::string, id<MTLTexture>> images;
     id<MTLTexture> black1D = nil, black2D = nil, bands1D = nil, bands2D = nil;
@@ -321,6 +322,13 @@ struct MetalShaderGenerator::Impl
             put (bytes, "uNoteCount", haveNotes ? notes->noteRows() : 0);
             put (bytes, "uLinkCount", haveNotes ? notes->linkRows() : 0);
             put (bytes, "uRootFreq", haveNotes ? notes->rootFrequencyHz : 0.0f);
+            // put() copies by size without a type check, so a harmony name a
+            // parameter owns (an ISF float named uKey) must not be written.
+            const auto harmony = [this] (const char* name) { return foreignHarmony.count (name) == 0; };
+            if (harmony ("uLastOnsetBeat")) put (bytes, "uLastOnsetBeat", clock.lastOnsetBeat);
+            if (harmony ("uChord")) put (bytes, "uChord", clock.chord);
+            if (harmony ("uKey")) put (bytes, "uKey", clock.key);
+            if (harmony ("uPhrase")) put (bytes, "uPhrase", clock.phrase);
             auto value = [values] (const char* name, float fallback)
             {
                 if (values != nullptr)
@@ -477,6 +485,8 @@ bool MetalShaderGenerator::setSource (const std::string& rawSource)
 #if ! __has_feature(objc_arc)
     [impl_->reflection retain];
 #endif
+    impl_->foreignHarmony.clear();
+    impl_->foreignHarmony.insert (wrap.foreignHarmonyUniforms.begin(), wrap.foreignHarmonyUniforms.end());
     impl_->params.clear();
     for (const auto& input : wrap.params)
     {

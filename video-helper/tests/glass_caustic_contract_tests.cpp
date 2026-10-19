@@ -3918,6 +3918,33 @@ void cameraAndAtomicReadback()
             && std::all_of(sentinel.deposited.begin(),sentinel.deposited.end(),[](double p){return p==123;}),
             "stale owner, endpoint, splat, rho, depth, duplicate or energy error refuses the whole readback atomically");
     }
+    {
+        // The ordered spectral sweep still checks bands before the first and
+        // after the last deposited band. Deposited bands are found here from
+        // the deposits, as in mode 10.
+        std::vector<bool> deposited(synthetic.spectralRadiance.size(),false);
+        for(const auto& d:synthetic.deposits)if(d.cameraVisible)
+            deposited[(std::size_t(d.footprint.y)*32+d.footprint.x)*8+fixture.frame.work[d.work].band]=true;
+        std::size_t first=0,last=deposited.size();
+        while(first<deposited.size()&&deposited[first])++first;
+        while(last>0&&deposited[last-1])--last;
+        check(first<deposited.size()&&last>0&&deposited.size()==32*32*8,"the camera fixture leaves undeposited bands at both ends");
+        if(first<deposited.size()&&last>0) {
+            gc::EnergyLedger energy;
+            for(const auto at:{first,last-1}) {
+                auto stray=synthetic;stray.spectralRadiance[at]=1e-3f;
+                check(!gc::validateNativeReadback(fixture.prepared,fixture.frame,stray,energy,error)
+                    &&error.find("spectral accumulation")!=std::string::npos,
+                    "radiance on an undeposited band at index "+std::to_string(at)+" refuses: "+error);
+                stray.spectralRadiance[at]=std::numeric_limits<float>::quiet_NaN();
+                check(!gc::validateNativeReadback(fixture.prepared,fixture.frame,stray,energy,error),
+                    "NaN on an undeposited band at index "+std::to_string(at)+" refuses");
+            }
+            auto signedZero=synthetic;signedZero.spectralRadiance[first]=-0.0f;signedZero.spectralRadiance[last-1]=-0.0f;
+            check(gc::validateNativeReadback(fixture.prepared,fixture.frame,signedZero,energy,error),
+                "negative zero on undeposited bands is still an exact zero: "+error);
+        }
+    }
     auto hidden=gt::ordinaryFixture();const bool hiddenReady=hidden.prepare(error);check(hiddenReady,error);
     if(hiddenReady)
     {
@@ -4699,6 +4726,761 @@ void gratingCellCoverageCases(const std::shared_ptr<const gc::GratingCellTranspo
     check(!gc::calculateGratingCellCoverageBounds(capped,4,sentinel,error)&&sentinel.bytes==42,"coverage cannot raise the hard whole-frame memory cap");
 }
 
+// float32 mirror of causticProjectReceiver in nativeMathSource (GLSL, and the
+// Metal translation of the same text). The host compiler may contract or round
+// it differently from a GPU. That is the point: verification must admit every
+// float32 evaluation of the shader, not one bit pattern.
+struct GpuMirrorFootprint {int status=0;std::uint32_t x=0,y=0;float depth=0,area=0;};
+GpuMirrorFootprint gpuMirrorFootprint(const gc::Frame& frame,gc::Point position,gc::Point normal)
+{
+    using V=std::array<float,3>;
+    const auto cross=[](V a,V b){return V{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]};};
+    const auto dot=[](V a,V b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];};
+    const auto sub=[](V a,V b){return V{a[0]-b[0],a[1]-b[1],a[2]-b[2]};};
+    const auto rotate=[&](std::array<float,4> q,V p) {
+        const V axis{q[0],q[1],q[2]};V inner=cross(axis,p);for(unsigned i=0;i<3;++i)inner[i]+=q[3]*p[i];
+        const V outer=cross(axis,inner);return V{p[0]+2.0f*outer[0],p[1]+2.0f*outer[1],p[2]+2.0f*outer[2]};
+    };
+    const auto& r=frame.camera.transform.rotation;const auto& t=frame.camera.transform.translation;
+    const std::array<float,4> q{r.x,r.y,r.z,r.w},inverse{-r.x,-r.y,-r.z,r.w};
+    const V camera{t.x,t.y,t.z},n{normal[0],normal[1],normal[2]};
+    const float tangent=std::tan(frame.camera.verticalFovRadians*.5f),aspect=float(frame.width)/float(frame.height);
+    const float w=float(frame.width),h=float(frame.height);
+    const auto ray=[&](float px,float py) {
+        const V v=rotate(q,V{(2.0f*px/w-1.0f)*tangent*aspect,(1.0f-2.0f*py/h)*tangent,-1.0f});
+        const float length=std::sqrt(dot(v,v));return V{v[0]/length,v[1]/length,v[2]/length};
+    };
+    GpuMirrorFootprint out;const V delta=sub(V{position[0],position[1],position[2]},camera);
+    const V local=rotate(inverse,delta);out.depth=-local[2];
+    if(out.depth<frame.camera.nearPlane||out.depth>frame.camera.farPlane)return out;
+    float px=(local[0]/(out.depth*tangent*aspect)+1.0f)*0.5f*w,py=(1.0f-local[1]/(out.depth*tangent))*0.5f*h;
+    if(!std::isfinite(px)||!std::isfinite(py)){out.status=-1;return out;}
+    if(px<0||py<0||px>=w||py>=h)return out;
+    px=std::floor(px);py=std::floor(py);out.x=std::uint32_t(px);out.y=std::uint32_t(py);
+    if(dot(n,ray(px+0.5f,py+0.5f))>=-1e-6f)return out;
+    std::array<V,4> corner;
+    for(unsigned k=0;k<4;++k) {
+        const V d=ray(px+float(k==1||k==2),py+float(k>=2));const float denominator=dot(n,d),distance=dot(n,delta)/denominator;
+        if(!std::isfinite(distance)||denominator>=-1e-6f||distance<=0||distance>frame.camera.farPlane*1e4f){out.status=-1;return out;}
+        corner[k]=V{camera[0]+d[0]*distance,camera[1]+d[1]*distance,camera[2]+d[2]*distance};
+    }
+    const auto length=[&](V a){return std::sqrt(dot(a,a));};
+    out.area=0.5f*length(cross(sub(corner[1],corner[0]),sub(corner[2],corner[0])))
+        +0.5f*length(cross(sub(corner[2],corner[0]),sub(corner[3],corner[0])));
+    out.status=1;return out;
+}
+// Starter visual.lighthouse-and-ocean camera at 3840x2160. The sphere lens hangs
+// in front of the lantern, clear of the tower and the rock, so the tower front z=-0.875
+// and the rock top y=0.375 are camera-visible caustic receivers. The test
+// uses those two planes only; no lens vertex enters it.
+void nativeFootprintPixelBoundary()
+{
+    constexpr double pi=3.14159265358979323846;
+    gc::Frame frame;frame.width=3840;frame.height=2160;frame.camera.id={17};
+    frame.camera.transform.translation={0,2.4f,7};
+    const double halfPitch=-14*pi/360;
+    frame.camera.transform.rotation={float(std::sin(halfPitch)),0,0,float(std::cos(halfPitch))};
+    frame.camera.verticalFovRadians=52*0.01745329251994329577f;frame.camera.nearPlane=.1f;frame.camera.farPlane=100;
+    const auto receiver=[](std::array<gc::Point,3> points,std::uint32_t object) {
+        gc::Triangle value;value.points=points;value.object=object;value.material=7;value.triangle=object;
+        const auto normal=gc::cross(gc::sub(points[1],points[0]),gc::sub(points[2],points[0]));
+        value.area=.5f*std::sqrt(gc::dot(normal,normal));value.normal=normal;gc::normalize(value.normal);
+        value.reflectance=surfacematerial::SpectralReflectanceDescription{};return value;
+    };
+    frame.triangles={receiver({gc::Point{-50,-50,-.875f},gc::Point{50,-50,-.875f},gc::Point{0,50,-.875f}},1),
+        receiver({gc::Point{-50,.375f,40},gc::Point{50,.375f,40},gc::Point{0,.375f,-60}},2)};
+    // Independent binary64 camera: the frame's float quaternion as an X-axis
+    // rotation matrix, not the quaternion sandwich used by the validator.
+    const double qx=frame.camera.transform.rotation.x,qw=frame.camera.transform.rotation.w;
+    const double cosine=qw*qw-qx*qx,sine=2*qw*qx,tangent=std::tan(double(frame.camera.verticalFovRadians)/2),aspect=3840.0/2160;
+    const double cameraY=frame.camera.transform.translation.y;
+    // Independent binary64 pixel footprint area from the same cos/sin camera:
+    // unnormalised corner rays from the camera to the receiver plane.
+    const auto independentArea=[&](unsigned which,std::uint32_t x,std::uint32_t y) {
+        std::array<std::array<double,3>,4> c{};
+        for(unsigned k=0;k<4;++k) {
+            const double px=double(x)+(k==1||k==2),py=double(y)+(k>=2);
+            const double vx=(2*px/3840-1)*tangent*aspect,vy=(1-2*py/2160)*tangent,vz=-1;
+            const double d[3]{vx,cosine*vy-sine*vz,sine*vy+cosine*vz};
+            const double travel=which==0?(-.875-7)/d[2]:(.375-cameraY)/d[1];
+            for(unsigned a=0;a<3;++a)c[k][a]=d[a]*travel;
+        }
+        const auto half=[&](unsigned a,unsigned b,unsigned e) {
+            double u[3],v[3];for(unsigned i=0;i<3;++i){u[i]=c[b][i]-c[a][i];v[i]=c[e][i]-c[a][i];}
+            const double n[3]{u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]};
+            return .5*std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+        };
+        return half(0,1,2)+half(0,2,3);
+    };
+    const auto pointAt=[&](unsigned which,double px,double py) {
+        const double vx=(2*px/3840-1)*tangent*aspect,vy=(1-2*py/2160)*tangent,vz=-1;
+        const double d[3]{vx,cosine*vy-sine*vz,sine*vy+cosine*vz},o[3]{0,cameraY,7};
+        const double travel=which==0?(-.875-o[2])/d[2]:(.375-o[1])/d[1];
+        gc::Point p{float(o[0]+d[0]*travel),float(o[1]+d[1]*travel),float(o[2]+d[2]*travel)};
+        if(which==0)p[2]=-.875f;else p[1]=.375f;return p;
+    };
+    const auto reference=[&](gc::Point p,double& px,double& py) {
+        const double x=p[0],y=double(p[1])-cameraY,z=double(p[2])-7;
+        const double ly=cosine*y+sine*z,lz=-sine*y+cosine*z,depth=-lz;
+        px=(x/(depth*tangent*aspect)+1)*1920;py=(1-ly/(depth*tangent))*1080;
+    };
+    const auto hitOn=[&](unsigned which,gc::Point position) {
+        arbitgpu::opaquevisibility::ClosestHit hit;const auto& t=frame.triangles[which];
+        hit.status=1;hit.position=position;hit.outwardNormal=t.normal;hit.objectId=t.object;hit.materialId=t.material;
+        hit.instanceId=t.instance;hit.triangleId=t.triangle;hit.entering=true;hit.distance=1;hit.work=1;return hit;
+    };
+    const double margin=gc::kNativeFootprintPixelMargin;
+    std::size_t points=0,admitted=0,windows=0,windowFailures=0,mirrorOutside=0,boundaryPixels=0;double widest=0;
+    const auto verify=[&](unsigned which,double px,double py) {
+        const auto position=pointAt(which,px,py);const auto hit=hitOn(which,position);
+        const auto mirror=gpuMirrorFootprint(frame,position,hit.outwardNormal);++points;
+        double rx=0,ry=0;reference(position,rx,ry);
+        if(mirror.status!=1){++mirrorOutside;return;}
+        if(mirror.x!=std::uint32_t(rx)||mirror.y!=std::uint32_t(ry))++boundaryPixels;
+        gc::PixelFootprint claim;claim.projected=true;claim.x=mirror.x;claim.y=mirror.y;
+        claim.linearDepth=mirror.depth;claim.worldArea=mirror.area;
+        gc::PixelFootprint out;double tolerance=0;std::string error;
+        const bool ran=gc::projectReceiverFootprint(frame,hit,&claim,out,tolerance,error);
+        const double exact=ran&&out.projected?independentArea(which,out.x,out.y):0;
+        auto scaled=claim;scaled.worldArea=float(double(claim.worldArea)*(1+3*tolerance));
+        if(ran&&gc::nativeFootprintMatches(claim,out,tolerance)&&tolerance<=gc::kNativeFootprintAreaToleranceCap
+            &&std::abs(double(out.worldArea)-exact)<=1e-6*exact&&!gc::nativeFootprintMatches(scaled,out,tolerance))++admitted;
+        else std::fprintf(stderr,"footprint (%.6f,%.6f) mirror %u,%u area %.9g cpu %u,%u area %.9g tolerance %.3g %s\n",
+            rx,ry,mirror.x,mirror.y,double(mirror.area),out.x,out.y,double(out.worldArea),tolerance,error.c_str());
+        widest=std::max(widest,tolerance);
+        // Every claimed neighbour is admitted exactly when the receiver point
+        // lies within the documented margin of that pixel.
+        for(int dx=-2;dx<=2;++dx)for(int dy=-1;dy<=1;++dy) {
+            const double x=double(claim.x)+dx,y=double(claim.y)+dy;
+            const auto atEdge=[](double value,double edge){return std::abs(value-edge)<1e-3;};
+            if(x<0||y<0||atEdge(rx,x-margin)||atEdge(rx,x+1+margin)||atEdge(ry,y-margin)||atEdge(ry,y+1+margin))continue;
+            auto neighbour=claim;neighbour.x=std::uint32_t(x);neighbour.y=std::uint32_t(y);
+            const bool expected=rx>=x-margin&&rx<=x+1+margin&&ry>=y-margin&&ry<=y+1+margin;
+            gc::PixelFootprint result;double ignored=0;++windows;
+            if(!gc::projectReceiverFootprint(frame,hit,&neighbour,result,ignored,error)||result.projected!=expected
+                ||(expected&&(result.x!=neighbour.x||result.y!=neighbour.y)))++windowFailures;
+        }
+    };
+    for(const double offset:{-1e-2,-1e-3,-1e-4,-1e-5,0.0,1e-5,1e-4,1e-3,1e-2}) {
+        verify(0,1700+offset,700.5);verify(0,1700.5,700+offset);verify(0,2100+offset,500+offset);
+        verify(1,1700+offset,1700.5);verify(1,1700.5,1700+offset);verify(1,1900+offset,1500+offset);
+    }
+    // The worst starter pixel: bottom-right rock corner, tolerance near 7.7e-3.
+    verify(1,3839.5,2159.5);
+    std::uint64_t state=0x9e3779b97f4a7c15ull;
+    const auto next=[&]{state=state*6364136223846793005ull+1442695040888963407ull;return double(state>>11)*0x1.0p-53;};
+    for(unsigned i=0;i<4000;++i) {
+        const unsigned which=i&1;
+        verify(which,200+3440*next(),which==0?100+900*next():1250+850*next());
+    }
+    check(mirrorOutside==0,"every 4K starter receiver sample projects in the float32 shader mirror");
+    check(admitted+mirrorOutside==points,"float32 shader footprints on the tower front and rock top pass native verification ("
+        +std::to_string(points-admitted)+" refused, widest area tolerance "+std::to_string(widest)+")");
+    check(windows>0&&windowFailures==0,"a claimed pixel is admitted only within the documented margin of the receiver point ("
+        +std::to_string(windowFailures)+" of "+std::to_string(windows)+")");
+    check(boundaryPixels<=points/50,"float32 pixel boundary disagreements stay rare ("+std::to_string(boundaryPixels)+")");
+    // Native unprojected claims are admitted only outside the frustum or image,
+    // on a depth or image-edge margin, or when the centre ray is not clearly
+    // front facing (threshold -1.1e-5).
+    const auto inner=pointAt(0,1700.5,700.5);gc::PixelFootprint none,out;double tolerance=0;std::string error;
+    check(gc::projectReceiverFootprint(frame,hitOn(0,inner),&none,out,tolerance,error)&&out.projected,
+        "an interior receiver cannot be claimed unprojected");
+    const auto edge=pointAt(0,3840-margin/4,700.5);
+    check(gc::projectReceiverFootprint(frame,hitOn(0,edge),&none,out,tolerance,error)&&!out.projected,
+        "a receiver within the margin of the image edge may be claimed unprojected");
+    const auto farSide=pointAt(0,3840-2*margin,700.5);
+    check(gc::projectReceiverFootprint(frame,hitOn(0,farSide),&none,out,tolerance,error)&&out.projected,
+        "a receiver two margins inside the last column cannot be claimed unprojected");
+    // Low rock rows have the widest area tolerance; a 1% area error still refuses.
+    const auto low=pointAt(1,1900.5,2000.5);const auto lowHit=hitOn(1,low);
+    const auto lowMirror=gpuMirrorFootprint(frame,low,lowHit.outwardNormal);
+    gc::PixelFootprint lowClaim;lowClaim.projected=lowMirror.status==1;lowClaim.x=lowMirror.x;lowClaim.y=lowMirror.y;
+    lowClaim.linearDepth=lowMirror.depth;lowClaim.worldArea=lowMirror.area;
+    const bool lowReady=gc::projectReceiverFootprint(frame,lowHit,&lowClaim,out,tolerance,error);
+    check(lowReady&&gc::nativeFootprintMatches(lowClaim,out,tolerance),"the low rock row float32 footprint is admitted: "+error);
+    auto offArea=lowClaim;offArea.worldArea*=1.01f;
+    check(lowReady&&!gc::nativeFootprintMatches(offArea,out,tolerance),
+        "a low rock row claim 1% off in area refuses (tolerance "+std::to_string(tolerance)+")");
+    // Far plane depth margin: max(1e-5 x far, 8 x 2^-24 x coordinate scale).
+    gc::PixelFootprint innerClaim;
+    if(gc::projectReceiver(frame,hitOn(0,inner),innerClaim,error)&&innerClaim.projected) {
+        const double depth=innerClaim.linearDepth,depthMargin=std::max(1e-5*depth,8*std::ldexp(1.0,-24)*7.0);
+        auto farFrame=frame;farFrame.camera.farPlane=float(depth-.5*depthMargin);
+        check(gc::projectReceiverFootprint(farFrame,hitOn(0,inner),&innerClaim,out,tolerance,error)&&out.projected
+            &&out.x==innerClaim.x&&out.y==innerClaim.y,"a projected claim within the depth margin beyond far is admitted");
+        check(gc::projectReceiverFootprint(farFrame,hitOn(0,inner),&none,out,tolerance,error)&&!out.projected,
+            "an unprojected claim beyond far is admitted");
+        farFrame.camera.farPlane=float(depth+.5*depthMargin);
+        check(gc::projectReceiverFootprint(farFrame,hitOn(0,inner),&none,out,tolerance,error)&&!out.projected,
+            "an unprojected claim within the depth margin inside far is admitted");
+        farFrame.camera.farPlane=float(depth-4*depthMargin);
+        check(gc::projectReceiverFootprint(farFrame,hitOn(0,inner),&innerClaim,out,tolerance,error)&&!out.projected,
+            "a projected claim well beyond far comes back unprojected");
+    } else check(false,"interior tower receiver projects on the CPU: "+error);
+    check(gc::projectReceiver(frame,hitOn(0,inner),out,error)&&out.projected&&out.x==1700&&out.y==700,
+        "CPU projection keeps the top-first floor pixel");
+}
+
+// Kernel splat deposition, CPU side only. The native GL and Metal splat passes
+// do not exist yet; these pins cover the reference, its tolerances and caps.
+void splatDeposition()
+{
+    constexpr double pi=3.14159265358979323846;
+    using Hit=arbitgpu::opaquevisibility::ClosestHit;
+    check(gc::Frame{}.splatVersion==0,"splat deposition is off by default");
+    gc::Frame frame;frame.width=64;frame.height=48;frame.camera.id={17};
+    frame.camera.transform.translation={0,0,7};frame.camera.transform.rotation={0,0,0,1};
+    frame.camera.verticalFovRadians=52*0.01745329251994329577f;frame.camera.nearPlane=.1f;frame.camera.farPlane=100;
+    const auto triangle=[](std::array<gc::Point,3> points,std::uint32_t object,bool glass) {
+        gc::Triangle value;value.points=points;value.object=object;value.material=7;value.triangle=object;value.glass=glass;
+        const auto normal=gc::cross(gc::sub(points[1],points[0]),gc::sub(points[2],points[0]));
+        value.area=.5f*std::sqrt(gc::dot(normal,normal));value.normal=normal;gc::normalize(value.normal);
+        if(!glass)value.reflectance=surfacematerial::SpectralReflectanceDescription{};
+        return value;
+    };
+    frame.triangles={triangle({gc::Point{-50,-50,-.875f},gc::Point{50,-50,-.875f},gc::Point{0,50,-.875f}},1,false),
+        triangle({gc::Point{-50,-50,-.5f},gc::Point{50,-50,-.5f},gc::Point{0,50,-.5f}},2,true)};
+    frame.entries.resize(1);frame.entries[0].area=.32f;
+    gc::EntryWork first;first.band=0;gc::EntryWork second;second.band=3;
+    frame.work={first,second};
+    constexpr std::uint64_t visits=4;frame.bounds.maximumDeposits=frame.work.size()*visits;
+    std::string error;
+    check(gc::calculateSplatSchedule(frame,frame.splat,error)&&frame.splat.keySlots==2,
+        "a small splat schedule is admitted and keys half of each path's slots: "+error);
+    frame.splatVersion=gc::kSplatVersion;
+    const auto origin=gc::cameraPosition(frame);
+    const auto hitAt=[&](unsigned which,float px,float py) {
+        const auto ray=gc::cameraRay(frame,px,py);const auto& t=frame.triangles[which];
+        const float distance=(t.points[0][2]-origin[2])/ray[2];
+        Hit hit;hit.status=1;hit.position=gc::advance(origin,ray,distance);hit.position[2]=t.points[0][2];
+        hit.outwardNormal=t.normal;hit.objectId=t.object;hit.materialId=t.material;hit.instanceId=t.instance;
+        hit.triangleId=t.triangle;hit.entering=true;hit.distance=distance;hit.work=3;return hit;
+    };
+    const gc::SplatPixelQuery wall=[&](std::uint32_t x,std::uint32_t y,Hit& hit,std::string&) {
+        hit=hitAt(0,float(x)+.5f,float(y)+.5f);return true;
+    };
+    // Column 18 sees the glass, not the wall: a neighbour owner mismatch.
+    const gc::SplatPixelQuery glassColumn=[&](std::uint32_t x,std::uint32_t y,Hit& hit,std::string&) {
+        hit=hitAt(x==18?1:0,float(x)+.5f,float(y)+.5f);return true;
+    };
+    const auto deposit=[&](std::uint32_t work,float px,float py,float power,bool visible) {
+        gc::NativeDeposit value;value.work=work;value.receiver=hitAt(0,px,py);value.outgoingPower=power;
+        std::string ignored;gc::projectReceiver(frame,value.receiver,value.footprint,ignored);
+        value.cameraVisible=visible&&value.footprint.projected;return value;
+    };
+    const std::vector<gc::NativeDeposit> deposits{deposit(0,20.3f,20.6f,2,true),deposit(0,40.5f,10.5f,5,false),
+        deposit(1,22.5f,19.5f,1,true),deposit(1,21.2f,20.1f,.5f,true)};
+    gc::SplatReference reference;
+    check(gc::buildSplatReference(frame,deposits,wall,reference,error),"the splat CPU reference builds: "+error);
+    // Flux conservation, per deposit and over the whole image.
+    double visibleFlux=0,imageFlux=0;bool conserved=true;
+    for(std::size_t i=0;i<deposits.size();++i) {
+        if(!deposits[i].cameraVisible){conserved=conserved&&reference.normalisers[i]==0&&reference.splattedFlux[i]==0;continue;}
+        visibleFlux+=deposits[i].outgoingPower;
+        conserved=conserved&&std::abs(reference.splattedFlux[i]-deposits[i].outgoingPower)<=1e-12*deposits[i].outgoingPower;
+    }
+    for(const auto& entry:reference.pixels)imageFlux+=entry.second.physical*pi*reference.pixelAreas.at(entry.first/8);
+    check(conserved,"each visible splat deposits exactly its outgoing flux; a hidden one deposits nothing");
+    check(std::abs(imageFlux-visibleFlux)<=1e-12*visibleFlux,"splatted image flux equals visible deposit flux");
+    std::size_t bandZero=0;for(const auto& entry:reference.pixels)bandZero+=entry.first%8==0;
+    check(bandZero>=20,"one deposit fills a patch of pixels, not one ("+std::to_string(bandZero)+")");
+    // Independent binary64 reference for the first deposit alone.
+    const double tangent=std::tan(double(frame.camera.verticalFovRadians)/2),aspect=64.0/48;
+    const double area=(2*tangent*aspect*7.875/64)*(2*tangent*7.875/48),radius=gc::kSplatEntryRadiusScale*std::sqrt(double(.32f)/pi);
+    // The radius is about five pixel sides here, so +-8 pixels cover its support.
+    check(radius<8*std::sqrt(area),"the lone deposit's kernel ends inside the independent sum");
+    const auto& lone=deposits[0];double normaliser=0;
+    for(int y=int(lone.footprint.y)-8;y<=int(lone.footprint.y)+8;++y)for(int x=int(lone.footprint.x)-8;x<=int(lone.footprint.x)+8;++x) {
+        const double px=(2*(x+.5)/64-1)*tangent*aspect*7.875,py=(1-2*(y+.5)/48)*tangent*7.875;
+        const double dx=px-lone.receiver.position[0],dy=py-lone.receiver.position[1];
+        const bool own=x==int(lone.footprint.x)&&y==int(lone.footprint.y);
+        normaliser+=(own?1:gc::splatKernel(std::sqrt(dx*dx+dy*dy),radius))*area;
+    }
+    gc::SplatReference single;
+    check(gc::buildSplatReference(frame,{lone},wall,single,error)&&close(single.normalisers[0],normaliser,1e-5),
+        "the splat normaliser matches an independent binary64 sum: "+error);
+    const auto centre=(std::uint64_t(lone.footprint.y)*64+lone.footprint.x)*8;
+    check(single.pixels.count(centre)&&close(single.pixels.at(centre).physical,2/(pi*normaliser),1e-5),
+        "the deposit's own pixel gets outgoing * 1 / (pi * N)");
+    // Kernel edge weight.
+    check(gc::splatKernel(0,.5)==1&&gc::splatKernel(.5,.5)==0&&gc::splatKernel(1,.5)==0&&gc::splatKernel(.5*(1-1e-6),.5)<1e-11
+        &&gc::splatKernel(.2,.5)>gc::splatKernel(.3,.5),"the splat kernel is one at the centre and reaches zero smoothly at r");
+    // A native readback that reproduces the reference validates.
+    const auto native=[&](const gc::SplatReference& source) {
+        gc::NativeReadback readback;readback.deposits=deposits;
+        readback.spectralRadiance.assign(std::size_t(64*48*8),0.0f);
+        for(const auto& entry:source.pixels)readback.spectralRadiance[entry.first]=float(entry.second.physical);
+        auto& receipt=readback.deposition;receipt.version=gc::kDepositionVersion;receipt.complete=true;
+        receipt.keys=source.keys;receipt.visibleCount=source.keys.size();receipt.keys.resize(frame.splat.paddedKeyCount);
+        for(const auto& value:source.normalisers)receipt.splatNormalisers.push_back(float(value));
+        receipt.splatGatherWork=source.gatherWork;return readback;
+    };
+    const auto exact=native(reference);
+    check(gc::validateSplatReadback(frame,exact,wall,error),"a splat readback matching the CPU reference validates: "+error);
+    auto tampered=exact;tampered.deposition.splatNormalisers[0]*=1.01f;
+    check(!gc::validateSplatReadback(frame,tampered,wall,error)&&error.find("normaliser")!=std::string::npos,
+        "a native normaliser 1% off refuses: "+error);
+    tampered=exact;tampered.spectralRadiance[centre]*=1.01f;
+    check(!gc::validateSplatReadback(frame,tampered,wall,error)&&error.find("pixel radiance")!=std::string::npos,
+        "a splat pixel 1% off refuses: "+error);
+    tampered=exact;std::swap(tampered.deposition.keys[0],tampered.deposition.keys[1]);
+    check(!gc::validateSplatReadback(frame,tampered,wall,error)&&error.find("tile keys")!=std::string::npos,
+        "reordered splat tile keys refuse: "+error);
+    // The native side treated column 18 as wall while the CPU sees glass there.
+    gc::SplatReference mismatched;
+    check(gc::buildSplatReference(frame,deposits,glassColumn,mismatched,error)
+        &&mismatched.normalisers[0]<reference.normalisers[0],"a glass neighbour is not a splat receiver: "+error);
+    check(!gc::validateSplatReadback(frame,exact,glassColumn,error)&&error.find("normaliser")!=std::string::npos,
+        "a native splat that accepted a neighbour the CPU sees as glass refuses: "+error);
+    check(!gc::validateSplatReadback(frame,native(mismatched),wall,error),
+        "a native splat that rejected a real receiver neighbour refuses: "+error);
+    // Refusal caps.
+    check(!gc::calculateSplatSchedule(64,48,0,1,1,frame.splat,error)
+        &&!gc::calculateSplatSchedule(64,48,std::uint64_t(gc::kMaximumEntrySamples)*8*gc::kMaximumBranchVisits+1,1,1,frame.splat,error)
+        &&!gc::calculateSplatSchedule(64,48,1,gc::kMaximumBranchVisits+1,1,frame.splat,error)
+        &&!gc::calculateSplatSchedule(64,48,1,4,0,frame.splat,error)&&!gc::calculateSplatSchedule(64,48,1,4,5,frame.splat,error),
+        "an empty or oversized splat deposit capacity or key slot count refuses");
+    gc::calculateSplatSchedule(frame,frame.splat,error);
+    {
+        // A third deposit on one path lies past the two keyed slots of a
+        // four-visit path, which a binary branch tree cannot produce.
+        auto third=deposits;third.insert(third.begin()+2,deposit(0,30.5f,30.5f,1,true));
+        gc::SplatReference refused;
+        check(!gc::buildSplatReference(frame,third,wall,refused,error)&&error.find("keyed slots")!=std::string::npos,
+            "a deposit past the keyed slots refuses: "+error);
+    }
+    auto staging=frame;staging.gratingStaging=true;
+    check(!gc::buildSplatReference(staging,deposits,wall,single,error),"grating staging frames keep single-pixel deposits");
+    auto crowded=frame;crowded.work.assign(gc::kMaximumSplatDepositsPerTile+1,first);
+    crowded.bounds.maximumDeposits=crowded.work.size();
+    check(gc::calculateSplatSchedule(crowded,crowded.splat,error),"a crowded splat schedule is admitted: "+error);
+    std::vector<gc::NativeDeposit> pile;
+    for(std::uint32_t w=0;w<crowded.work.size();++w){auto value=deposit(0,20.3f,20.6f,1e-3f,true);value.work=w;pile.push_back(value);}
+    check(gc::buildSplatReference(crowded,pile,wall,single,error)&&single.capOverflow&&single.pixels.empty()
+        &&single.keys.empty()&&single.gatherWork==0,"a tile over its deposit cap falls back to single-pixel deposits: "+error);
+    pile.pop_back();crowded.work.pop_back();crowded.bounds.maximumDeposits=crowded.work.size();
+    gc::calculateSplatSchedule(crowded,crowded.splat,error);
+    check(gc::buildSplatReference(crowded,pile,wall,single,error)&&!single.capOverflow&&!single.pixels.empty(),
+        "a tile at its deposit cap is admitted: "+error);
+    {
+        // The gather cap test hook: the same frame falls back once its measured
+        // gather work exceeds the lowered cap, and splats again once it is reset.
+        struct CapGuard {~CapGuard(){gc::splatGatherWorkCapOverride().store(0);}} guard;
+        gc::SplatReference lowered;
+        gc::splatGatherWorkCapOverride().store(single.gatherWork-1);
+        check(gc::splatGatherWorkCap()==single.gatherWork-1&&gc::buildSplatReference(crowded,pile,wall,lowered,error)&&lowered.capOverflow,
+            "a gather cap below the measured gather work falls back to single-pixel deposits: "+error);
+        gc::splatGatherWorkCapOverride().store(single.gatherWork);
+        check(gc::buildSplatReference(crowded,pile,wall,lowered,error)&&!lowered.capOverflow&&lowered.gatherWork==single.gatherWork,
+            "a gather cap equal to the measured gather work still splats: "+error);
+        gc::splatGatherWorkCapOverride().store(0);
+        check(gc::splatGatherWorkCap()==gc::kMaximumSplatGatherWork,"a cleared hook restores the product gather cap");
+    }
+    gc::Frame wide;wide.width=3840;wide.height=2160;
+    wide.splat.tilesX=(3840+gc::kSplatTile-1)/gc::kSplatTile;wide.splat.tilesY=(2160+gc::kSplatTile-1)/gc::kSplatTile;
+    const auto fullTiles=std::uint32_t(gc::kMaximumSplatGatherWork/(gc::kMaximumSplatDepositsPerTile*gc::kSplatTile*gc::kSplatTile));
+    bool gatherCapExceeded=false;
+    const auto gather=[&](std::uint32_t tiles) {
+        std::vector<gc::DepositionKey> keys;keys.reserve(std::size_t(tiles)*gc::kMaximumSplatDepositsPerTile);
+        for(std::uint32_t t=0;t<tiles;++t)for(std::uint32_t k=0;k<gc::kMaximumSplatDepositsPerTile;++k)keys.push_back({t,k,0,k});
+        std::uint64_t work=0;return gc::admitSplatGather(wide,keys,work,error,&gatherCapExceeded);
+    };
+    // Every tile tested lies above the partial bottom row, so each has 32x32 pixels.
+    check(fullTiles>0&&fullTiles+1<wide.splat.tilesX*(wide.splat.tilesY-1)&&gather(fullTiles)&&!gatherCapExceeded,
+        "full tiles up to the splat gather budget fit: "+error);
+    check(!gather(fullTiles+1)&&gatherCapExceeded&&error.find("gather work")!=std::string::npos,
+        "one more full tile exceeds the splat gather budget and marks a cap fallback: "+error);
+    {
+        std::vector<gc::DepositionKey> outside{{static_cast<std::uint32_t>(wide.splat.tilesX*wide.splat.tilesY),0,0,0}};
+        std::uint64_t work=0;bool capExceeded=true;
+        check(!gc::admitSplatGather(wide,outside,work,error,&capExceeded)&&!capExceeded,
+            "a tile key outside the image is a defect, not a cap fallback: "+error);
+        // A crowded tile under the lowered gather cap must not hide a later
+        // out-of-image key behind a cap fallback.
+        struct CapGuard {~CapGuard(){gc::splatGatherWorkCapOverride().store(0);}} guard;
+        gc::splatGatherWorkCapOverride().store(1);
+        std::vector<gc::DepositionKey> crowdedOutside{{0,0,0,0},{0,1,0,1},{static_cast<std::uint32_t>(wide.splat.tilesX*wide.splat.tilesY),2,0,2}};
+        capExceeded=true;
+        check(!gc::admitSplatGather(wide,crowdedOutside,work,error,&capExceeded)&&!capExceeded
+            &&error.find("outside the image")!=std::string::npos,
+            "an out-of-image key after an overfull tile refuses and is not a cap fallback: "+error);
+        gc::splatGatherWorkCapOverride().store(0);
+    }
+    const gc::SplatPixelQuery expensive=[&](std::uint32_t x,std::uint32_t y,Hit& hit,std::string&) {
+        hit=hitAt(0,float(x)+.5f,float(y)+.5f);hit.work=std::uint32_t(gc::kMaximumSplatCpuQueryWork/2+1);return true;
+    };
+    check(!gc::buildSplatReference(frame,deposits,expensive,single,error)&&error.find("CPU query work")!=std::string::npos,
+        "CPU splat query work over its budget refuses: "+error);
+    {
+        // The readback bound at 4K. Four deposits with disjoint 65x65 windows
+        // query 16900 distinct wall pixels. At 10000 work each that is 161 Mi,
+        // past the 128 Mi kMaximumQueryWork that used to cap the validator, so
+        // a 4K lens frame with that much measured work still validates.
+        auto big=frame;big.width=3840;big.height=2160;
+        check(gc::calculateSplatSchedule(big,big.splat,error),"a 4K splat schedule is admitted: "+error);
+        const auto bigOrigin=gc::cameraPosition(big);
+        const auto bigHit=[&](float px,float py) {
+            const auto ray=gc::cameraRay(big,px,py);const auto& t=big.triangles[0];
+            const float distance=(t.points[0][2]-bigOrigin[2])/ray[2];
+            Hit hit;hit.status=1;hit.position=gc::advance(bigOrigin,ray,distance);hit.position[2]=t.points[0][2];
+            hit.outwardNormal=t.normal;hit.objectId=t.object;hit.materialId=t.material;hit.instanceId=t.instance;
+            hit.triangleId=t.triangle;hit.entering=true;hit.distance=distance;hit.work=10000;return hit;
+        };
+        const gc::SplatPixelQuery bigWall=[&](std::uint32_t x,std::uint32_t y,Hit& hit,std::string&) {
+            hit=bigHit(float(x)+.5f,float(y)+.5f);return true;
+        };
+        const auto bigDeposit=[&](std::uint32_t work,float px,float py) {
+            gc::NativeDeposit value;value.work=work;value.receiver=bigHit(px,py);value.outgoingPower=1;
+            std::string ignored;gc::projectReceiver(big,value.receiver,value.footprint,ignored);
+            value.cameraVisible=value.footprint.projected;return value;
+        };
+        const std::vector<gc::NativeDeposit> spread{bigDeposit(0,200.5f,200.5f),bigDeposit(0,600.5f,200.5f),
+            bigDeposit(1,1000.5f,600.5f),bigDeposit(1,1400.5f,1000.5f)};
+        gc::SplatReference wide4k;
+        check(gc::buildSplatReference(big,spread,bigWall,wide4k,error)&&wide4k.pixelQueries>=4*gc::kSplatWindow*gc::kSplatWindow
+            &&wide4k.queryWork>gc::kMaximumQueryWork&&wide4k.queryWork<=gc::kMaximumSplatCpuQueryWork,
+            "4K splat validation past 128 Mi of CPU query work stays inside its own cap: "+error);
+        check(std::uint64_t(3400000)<=gc::kMaximumSplatCpuPixelQueries&&std::uint64_t(3400000)*80<=gc::kMaximumSplatCpuQueryWork,
+            "the 4K faceted lens estimate of 3.4 Mi pixels at 80 work fits the CPU splat caps");
+    }
+    check(gc::nativeSplatMathSource().find("float causticSplatKernel(")!=std::string::npos
+        &&gc::nativeMathSource().find("causticSplatKernel")==std::string::npos,
+        "splat GLSL helpers exist and stay out of the released programs");
+    check(gc::splatKernel(.5,1)==.5625,"the splat kernel is (1-q^2)^2: K(r/2)=0.5625");
+    // Admission bounds worst-case gather work at keyed deposits x 9 tiles x 1024 pixels.
+    gc::SplatSchedule bound;
+    const auto gatherLimit=gc::kMaximumSplatGatherWork/(std::uint64_t(gc::kSplatTilesPerDeposit)*gc::kSplatTile*gc::kSplatTile);
+    check(gc::calculateSplatSchedule(3840,2160,gatherLimit,1,1,bound,error)&&bound.paddedKeyCount<=(1u<<20)
+        &&bound.normaliserWork+bound.keyWork<=gc::kMaximumSplatPassWork,
+        "a 4K frame at the gather admission bound is admitted within one 2^20 key sort: "+error);
+    check(!gc::calculateSplatSchedule(3840,2160,gatherLimit+1,1,1,bound,error)&&error.find("worst-case gather")!=std::string::npos,
+        "a frame past the worst-case gather bound refuses at admission: "+error);
+    check(gc::calculateSplatSchedule(3840,2160,gatherLimit,2,1,bound,error)
+        &&!gc::calculateSplatSchedule(3840,2160,gatherLimit,2,2,bound,error)&&error.find("worst-case gather")!=std::string::npos,
+        "the gather bound counts keyed slots, not every trace slot: "+error);
+    // A wall tilted 60 degrees from the view axis with a large entry sample:
+    // the radius cap binds, and the kernel still ends inside the fixed window.
+    // A 10 degree view keeps the perspective change across the 65x65 window
+    // under the half pixel the window leaves; a 52 degree view at 64x48 clips.
+    auto tilted=frame;tilted.camera.verticalFovRadians=10*0.01745329251994329577f;
+    const gc::Point across{1,0,0},along{0,.5f,-.8660254f},anchor{0,0,-.875f};
+    const auto onPlane=[&](float u,float v){gc::Point p;for(unsigned a=0;a<3;++a)p[a]=anchor[a]+u*across[a]+v*along[a];return p;};
+    tilted.triangles={triangle({onPlane(-50,-50),onPlane(50,-50),onPlane(0,50)},1,false)};
+    tilted.entries[0].area=16;
+    const auto tiltedHit=[&](float px,float py) {
+        const auto ray=gc::cameraRay(tilted,px,py);const auto& t=tilted.triangles[0];
+        const float distance=gc::dot(t.normal,gc::sub(t.points[0],origin))/gc::dot(t.normal,ray);
+        Hit hit;hit.status=1;hit.position=gc::advance(origin,ray,distance);hit.outwardNormal=t.normal;
+        hit.objectId=t.object;hit.materialId=t.material;hit.instanceId=t.instance;hit.triangleId=t.triangle;
+        hit.entering=true;hit.distance=distance;hit.work=3;return hit;
+    };
+    const gc::SplatPixelQuery tiltedWall=[&](std::uint32_t x,std::uint32_t y,Hit& hit,std::string&) {
+        hit=tiltedHit(float(x)+.5f,float(y)+.5f);return true;
+    };
+    gc::NativeDeposit slanted;slanted.work=0;slanted.receiver=tiltedHit(32.3f,24.6f);slanted.outgoingPower=1;
+    gc::projectReceiver(tilted,slanted.receiver,slanted.footprint,error);slanted.cameraVisible=slanted.footprint.projected;
+    gc::SplatReference leaning;
+    const bool leaningBuilt=gc::buildSplatReference(tilted,{slanted},tiltedWall,leaning,error);
+    check(leaningBuilt,"a 60 degree wall splat builds: "+error);
+    if(leaningBuilt) {
+        const auto cx=int(slanted.footprint.x),cy=int(slanted.footprint.y);
+        constexpr int reach=int(gc::kMaximumSplatRadiusPixels)+1;
+        const double uncapped=gc::kSplatEntryRadiusScale*std::sqrt(16/pi);
+        const double r=leaning.radii[0],oldRadius=std::min(uncapped,
+            double(gc::kMaximumSplatRadiusPixels)*std::sqrt(leaning.pixelAreas.at(std::uint64_t(cy)*64+cx)));
+        check(r<uncapped,"the tilted splat radius is capped");
+        bool insideWindow=true,oldClipped=false;
+        for(int y=cy-reach;y<=cy+reach;++y)for(int x=cx-reach;x<=cx+reach;++x) {
+            if(std::abs(x-cx)<reach&&std::abs(y-cy)<reach)continue;
+            const auto ring=tiltedHit(float(x)+.5f,float(y)+.5f);double squared=0;
+            for(unsigned a=0;a<3;++a){const double e=double(ring.position[a])-slanted.receiver.position[a];squared+=e*e;}
+            insideWindow=insideWindow&&gc::splatKernel(std::sqrt(squared),r)==0;
+            oldClipped=oldClipped||gc::splatKernel(std::sqrt(squared),oldRadius)>0;
+        }
+        check(insideWindow,"no pixel outside the 65x65 window is inside the tilted splat radius");
+        check(oldClipped,"a radius of 32 square-root pixel areas would have reached past the window on this wall");
+        check(std::abs(leaning.splattedFlux[0]-1)<=1e-12,"the tilted splat conserves flux");
+    }
+}
+// The sixteen entry cells of one subdivided triangle land on a flat,
+// fronto-parallel receiver as the centroid lattice, h = 30 pixels apart as in
+// the 4K lighthouse starter. Their kernels must overlap: no pixel between two
+// neighbouring deposits, and none inside the lattice triangle, is left dark,
+// and the patch keeps its flux. The earlier 8 pixel radius cap left gaps here.
+void splatNeighbourCoverage()
+{
+    constexpr double pi=3.14159265358979323846;
+    using Hit=arbitgpu::opaquevisibility::ClosestHit;
+    constexpr std::uint32_t width=160,height=140;
+    gc::Frame frame;frame.width=width;frame.height=height;frame.camera.id={17};
+    frame.camera.transform.translation={0,0,7};frame.camera.transform.rotation={0,0,0,1};
+    frame.camera.verticalFovRadians=52*0.01745329251994329577f;frame.camera.nearPlane=.1f;frame.camera.farPlane=100;
+    gc::Triangle wallTriangle;wallTriangle.points={gc::Point{-50,-50,-.875f},gc::Point{50,-50,-.875f},gc::Point{0,50,-.875f}};
+    wallTriangle.object=1;wallTriangle.material=7;wallTriangle.triangle=1;wallTriangle.normal={0,0,1};wallTriangle.area=5000;
+    wallTriangle.reflectance=surfacematerial::SpectralReflectanceDescription{};
+    frame.triangles={wallTriangle};
+    constexpr unsigned n=4;constexpr double cell=30,left=20,top=8;
+    const double tangent=std::tan(double(frame.camera.verticalFovRadians)/2),side=2*tangent*7.875/height;
+    // One entry cell is half an h x h square.
+    frame.entries.resize(1);frame.entries[0].area=float(.5*(cell*side)*(cell*side));
+    frame.work.assign(n*n,gc::EntryWork{});
+    constexpr std::uint64_t visits=4;frame.bounds.maximumDeposits=frame.work.size()*visits;
+    std::string error;
+    check(gc::calculateSplatSchedule(frame,frame.splat,error),
+        "the coverage splat schedule is admitted: "+error);
+    frame.splatVersion=gc::kSplatVersion;
+    const auto origin=gc::cameraPosition(frame);
+    const auto hitAt=[&](float px,float py) {
+        const auto ray=gc::cameraRay(frame,px,py);const auto& t=frame.triangles[0];
+        const float distance=(t.points[0][2]-origin[2])/ray[2];
+        Hit hit;hit.status=1;hit.position=gc::advance(origin,ray,distance);hit.position[2]=t.points[0][2];
+        hit.outwardNormal=t.normal;hit.objectId=t.object;hit.materialId=t.material;hit.instanceId=t.instance;
+        hit.triangleId=t.triangle;hit.entering=true;hit.distance=distance;hit.work=3;return hit;
+    };
+    const gc::SplatPixelQuery wall=[&](std::uint32_t x,std::uint32_t y,Hit& hit,std::string&) {
+        hit=hitAt(float(x)+.5f,float(y)+.5f);return true;
+    };
+    // Centroids of the n x n subdivision, as appendEntrySamples orders them,
+    // with the lattice triangle's right angle at pixel (left, top).
+    std::vector<std::array<double,2>> centres;
+    for(unsigned u=0;u<n;++u)for(unsigned v=0;v<n-u;++v) {
+        centres.push_back({left+(u+1.0/3)*cell,top+(v+1.0/3)*cell});
+        if(u+v+1<n)centres.push_back({left+(u+2.0/3)*cell,top+(v+2.0/3)*cell});
+    }
+    check(centres.size()==n*n,"the lattice has one centroid per entry cell");
+    std::vector<gc::NativeDeposit> deposits;double outgoing=0;
+    for(std::uint32_t w=0;w<centres.size();++w) {
+        gc::NativeDeposit value;value.work=w;value.receiver=hitAt(float(centres[w][0]),float(centres[w][1]));
+        value.outgoingPower=1+.01f*float(w);outgoing+=value.outgoingPower;
+        gc::projectReceiver(frame,value.receiver,value.footprint,error);value.cameraVisible=value.footprint.projected;
+        check(value.cameraVisible,"every lattice deposit is camera visible");deposits.push_back(value);
+    }
+    gc::SplatReference reference;
+    const bool built=gc::buildSplatReference(frame,deposits,wall,reference,error);
+    check(built&&!reference.capOverflow,"the lattice splat builds: "+error);if(!built)return;
+    for(std::size_t i=0;i<deposits.size();++i)
+        check(std::abs(reference.radii[i]-cell*side)<=.01*cell*side,"each kernel radius is about the cell side h");
+    const auto lit=[&](int x,int y) {
+        const auto found=reference.pixels.find((std::uint64_t(y)*width+std::uint64_t(x))*8);
+        return found!=reference.pixels.end()&&found->second.physical>0?found->second.physical:0.0;
+    };
+    std::size_t pairs=0;bool bridged=true;
+    for(std::size_t a=0;a<centres.size();++a)for(std::size_t b=a+1;b<centres.size();++b) {
+        const double dx=centres[b][0]-centres[a][0],dy=centres[b][1]-centres[a][1];
+        if(std::sqrt(dx*dx+dy*dy)>cell*1.001)continue;
+        ++pairs;
+        for(unsigned step=0;step<=64;++step) {
+            const double t=step/64.0;
+            bridged=bridged&&lit(int(centres[a][0]+t*dx),int(centres[a][1]+t*dy))>0;
+        }
+    }
+    check(pairs>=3*n,"the lattice has neighbouring deposit pairs ("+std::to_string(pairs)+")");
+    check(bridged,"every pixel between two neighbouring deposits gets nonzero radiance");
+    // Inside the lattice triangle, more than h/2 from its edges, the patch is
+    // continuous and even: the dimmest pixel is at least half the brightest.
+    double dimmest=1e300,brightest=0;bool filled=true;
+    for(int y=int(top);y<int(top+n*cell);++y)for(int x=int(left);x<int(left+n*cell);++x) {
+        const double u=x+.5-left,v=y+.5-top;
+        if(u+v>=n*cell)continue;
+        const double value=lit(x,y);filled=filled&&value>0;
+        if(u>cell/2&&v>cell/2&&u+v<n*cell-cell/2) {dimmest=std::min(dimmest,value);brightest=std::max(brightest,value);}
+    }
+    check(filled,"every pixel inside the lattice triangle gets nonzero radiance");
+    check(brightest>0&&dimmest>=.5*brightest,"the interior of the splatted patch varies by less than 2:1 ("
+        +std::to_string(dimmest/std::max(brightest,1e-300))+")");
+    double imageFlux=0;
+    for(const auto& entry:reference.pixels)imageFlux+=entry.second.physical*pi*reference.pixelAreas.at(entry.first/8);
+    check(std::abs(imageFlux-outgoing)<=1e-12*outgoing,"the lattice splat conserves the deposits' total flux");
+}
+// Admission bounds a single-pixel frame. enableSplat keeps those bounds, so
+// the frozen table validation the GL and Metal consumers run must accept the
+// splat frame and its disableSplat fallback under the same reservation.
+void splatReservationStable()
+{
+    std::string error;
+    auto fixture=gt::ordinaryFixture();fixture.scene->cameras[0].transform.translation.x=6;
+    fixture.scene->cameras[0].verticalFovRadians=2;
+    const bool ready=fixture.prepare(error);check(ready,error);if(!ready)return;
+    check(gc::validateTables(fixture.prepared,fixture.frame,error),"the admitted single-pixel frame validates: "+error);
+    auto frame=fixture.frame;
+    const bool enabled=gc::enableSplat(fixture.prepared,frame,error);
+    check(enabled,"enableSplat admits the ordinary frame: "+error);if(!enabled)return;
+    check(frame.identity.size()==fixture.frame.identity.size()+gc::kSplatIdentityBytes,
+        "the splat identity adds exactly the reserved splat words");
+    gc::ResourceBounds splatBounds,singleBounds;
+    check(gc::calculateResourceBounds(fixture.prepared,frame,splatBounds,error)
+        &&gc::calculateResourceBounds(fixture.prepared,fixture.frame,singleBounds,error)
+        &&splatBounds.transientBytes==singleBounds.transientBytes&&splatBounds.transientBytes==frame.bounds.transientBytes,
+        "enabling the splat leaves the identity reservation unchanged: "+error);
+    check(gc::validateTables(fixture.prepared,frame,error),"a splat frame passes the native table validation: "+error);
+    auto single=frame;
+    check(gc::disableSplat(fixture.prepared,single,error)&&single.identity==fixture.frame.identity,
+        "disableSplat restores the pre-splat identity: "+error);
+    check(gc::validateTables(fixture.prepared,single,error),"the splat fallback frame passes the native table validation: "+error);
+}
+// enableSplat and the full native gate on the synthetic ordinary fixture.
+void splatNativeReadback()
+{
+    std::string error;
+    auto fixture=gt::ordinaryFixture();fixture.scene->cameras[0].transform.translation.x=6;
+    fixture.scene->cameras[0].verticalFovRadians=2;
+    const bool ready=fixture.prepare(error);check(ready,error);if(!ready)return;
+    // At 32x32 every 65x65 window keys the one 32x32 tile, and the default four
+    // entry subdivisions put more than kMaximumSplatDepositsPerTile visible
+    // deposits in a tile, so the CPU reference fell back and left no keys. One
+    // entry sample per triangle keeps every tile under its cap.
+    const auto instances=fixture.frame.instances;
+    const bool coarse=gc::buildScheduledFrame(fixture.prepared,instances,nullptr,32,32,
+        {gc::kScheduleVersion,1},fixture.frame,error);
+    check(coarse,"the splat fixture admits one entry sample per triangle: "+error);if(!coarse)return;
+    check(fixture.frame.splatVersion==0&&gc::frameIdentity(fixture.prepared,fixture.frame)==fixture.frame.identity,
+        "an ordinary frame keeps splat off and its identity");
+    auto ignored=fixture.frame;ignored.splat.tilesX=99;ignored.splat.paddedKeyCount=7;
+    check(gc::frameIdentity(fixture.prepared,ignored)==fixture.frame.identity,
+        "a splatVersion-0 identity is the pre-splat identity: splat fields add no bytes");
+    auto frame=fixture.frame;
+    check(gc::enableSplat(fixture.prepared,frame,error)&&frame.splatVersion==gc::kSplatVersion
+        &&frame.identity!=fixture.frame.identity&&frame.identity==gc::frameIdentity(fixture.prepared,frame),
+        "enableSplat versions the frame identity: "+error);
+    auto twice=frame;
+    check(!gc::enableSplat(fixture.prepared,twice,error),"enableSplat refuses a frame already splatting");
+    gc::NativeReadback synthetic;const bool made=gt::syntheticReadback(fixture,synthetic,error);check(made,error);if(!made)return;
+    synthetic.frameIdentity=frame.identity;
+    std::uint64_t visible=0;for(const auto& deposit:synthetic.deposits)visible+=deposit.cameraVisible?1:0;
+    check(visible>0&&visible<=gc::kMaximumSplatDepositsPerTile,"the splat fixture has visible deposits under the tile cap: "
+        +std::to_string(visible));
+    gc::SubmissionIdentity owner{frame.identity,1,2,3,4,5,6};
+    gc::SplatReference reference;
+    const bool built=gc::buildSplatReference(frame,synthetic.deposits,gc::splatCpuQuery(fixture.prepared,frame),reference,error);
+    check(built&&!reference.keys.empty(),"the fixture's visible deposits splat through CPU closest hits: "+error);
+    if(!built)return;
+    auto& receipt=synthetic.deposition;receipt=gc::DepositionReceipt{};
+    receipt.version=gc::kDepositionVersion;receipt.submission=owner;receipt.complete=true;
+    receipt.keys=reference.keys;receipt.visibleCount=reference.keys.size();receipt.keys.resize(frame.splat.paddedKeyCount);
+    for(const auto& value:reference.normalisers)receipt.splatNormalisers.push_back(float(value));
+    receipt.splatGatherWork=reference.gatherWork;
+    synthetic.spectralRadiance.assign(synthetic.spectralRadiance.size(),0.0f);
+    for(const auto& entry:reference.pixels)synthetic.spectralRadiance[entry.first]=float(entry.second.physical);
+    gc::EnergyLedger ledger;
+    check(gc::validateNativeReadback(fixture.prepared,frame,synthetic,ledger,error,&owner),
+        "a splat readback passes the full native gate: "+error);
+    check(!gc::validateNativeReadback(fixture.prepared,frame,synthetic,ledger,error),
+        "a splat frame without a submission owner refuses: "+error);
+    auto stray=synthetic;std::size_t unsplatted=0;
+    while(unsplatted<stray.spectralRadiance.size()&&reference.pixels.count(unsplatted))++unsplatted;
+    check(unsplatted<stray.spectralRadiance.size(),"some pixel and band of the splat fixture stays unsplatted");
+    if(unsplatted>=stray.spectralRadiance.size())return;
+    stray.spectralRadiance[unsplatted]=1e-3f;
+    check(!gc::validateNativeReadback(fixture.prepared,frame,stray,ledger,error,&owner)
+        &&error.find("pixel radiance")!=std::string::npos,"radiance on a pixel nobody splats refuses: "+error);
+    {
+        // The last unsplatted band lies past every reference key of the sweep.
+        auto tail=synthetic;std::size_t last=tail.spectralRadiance.size();
+        while(last>0&&reference.pixels.count(last-1))--last;
+        check(last>0,"some band after the last splatted band stays unsplatted");
+        if(last>0) {
+            tail.spectralRadiance[last-1]=-0.0f;
+            check(gc::validateNativeReadback(fixture.prepared,frame,tail,ledger,error,&owner),
+                "negative zero on an unsplatted band passes the splat gate: "+error);
+            tail.spectralRadiance[last-1]=1e-3f;
+            check(!gc::validateNativeReadback(fixture.prepared,frame,tail,ledger,error,&owner)
+                &&error.find("pixel radiance")!=std::string::npos,"radiance on the last unsplatted band refuses: "+error);
+        }
+    }
+    // Cap fallback: a receipt of the single-pixel frame, under its pre-splat
+    // identity, passes the splat frame's gate only while the CPU reference
+    // overflows the same cap.
+    gc::NativeReadback fallback;const bool fell=gt::syntheticReadback(fixture,fallback,error);check(fell,error);if(!fell)return;
+    gc::SubmissionIdentity singleOwner{fixture.frame.identity,1,2,3,4,5,6};
+    fallback.deposition=gt::syntheticDeposition(fixture.frame,fallback,singleOwner);
+    auto single=frame;
+    check(gc::disableSplat(fixture.prepared,single,error)&&single.identity==fixture.frame.identity&&single.splatVersion==0,
+        "disableSplat restores the single-pixel frame and its pre-splat identity: "+error);
+    {
+        struct CapGuard {~CapGuard(){gc::splatGatherWorkCapOverride().store(0);}} guard;
+        gc::splatGatherWorkCapOverride().store(reference.gatherWork-1);
+        gc::EnergyLedger fallbackLedger;
+        check(gc::validateNativeReadback(fixture.prepared,frame,fallback,fallbackLedger,error,&singleOwner),
+            "a single-pixel fallback passes the splat gate when the CPU reference overflows the cap: "+error);
+        check(!gc::validateNativeReadback(fixture.prepared,frame,synthetic,ledger,error,&owner)
+            &&error.find("fall back")!=std::string::npos,"a splat receipt under an overflowed cap refuses: "+error);
+        gc::splatGatherWorkCapOverride().store(0);
+        check(!gc::validateNativeReadback(fixture.prepared,frame,fallback,fallbackLedger,error,&singleOwner)
+            &&error.find("without a cap overflow")!=std::string::npos,"a single-pixel fallback without a cap overflow refuses: "+error);
+        auto stale=fallback;stale.frameIdentity=frame.identity+"x";
+        gc::splatGatherWorkCapOverride().store(reference.gatherWork-1);
+        check(!gc::validateNativeReadback(fixture.prepared,frame,stale,fallbackLedger,error,&singleOwner),
+            "a fallback receipt under another identity refuses: "+error);
+    }
+}
+
+// A faceted lens: a closed 12-segment cylinder of 48 triangles replaces the
+// slab. Under the ordinary sun 24 of its triangles face the source, so a 4K
+// frame traces 3072 paths at 64 visits, like the earlier lighthouse starter lens.
+void facetedLensAdmission()
+{
+    using HarmonicMIDI::grid::SceneVec3;
+    std::string error;
+    auto fixture=gt::ordinaryFixture();auto& scene=*fixture.scene;
+    constexpr std::uint32_t segments=12,vertices=2*segments+2;
+    const auto firstVertex=static_cast<std::uint32_t>(scene.vertexCount),firstIndex=static_cast<std::uint32_t>(scene.indexCount);
+    for(std::uint32_t v=0;v<vertices;++v) {
+        auto& vertex=scene.vertices[firstVertex+v];vertex={};
+        const double angle=2*3.14159265358979323846*(v%segments)/segments;
+        vertex.position=v<2*segments?SceneVec3{float(std::cos(angle)),float(std::sin(angle)),v<segments?-.5f:.5f}
+            :SceneVec3{0,0,v==2*segments?-.5f:.5f};
+        vertex.normal={0,0,1};vertex.tangent={1,0,0,1};vertex.color={1,1,1,1};
+    }
+    std::uint32_t count=0;
+    const auto face=[&](std::uint32_t a,std::uint32_t b,std::uint32_t c){for(auto i:{a,b,c})scene.indices[firstIndex+count++]=i;};
+    for(std::uint32_t k=0;k<segments;++k) {
+        const auto next=(k+1)%segments;
+        face(2*segments,next,k);face(2*segments+1,segments+k,segments+next);
+        face(k,next,segments+next);face(k,segments+next,segments+k);
+    }
+    auto& lens=scene.objects[0];
+    lens.firstVertex=firstVertex;lens.vertexCount=vertices;lens.firstIndex=firstIndex;lens.indexCount=count;
+    scene.vertexCount+=vertices;scene.indexCount+=count;
+    check(count==3*48,"the lens is 48 outward-wound triangles");
+    const bool ready=fixture.prepare(error);check(ready,"a closed 48-triangle lens prepares: "+error);if(!ready)return;
+    check(fixture.policy->description().maximumVisits==64&&fixture.policy->description().maximumUnresolvedFraction==1e-4f,
+        "the lens keeps 64 visits and the 1e-4 unresolved policy");
+    gc::Frame full;
+    const bool admitted=gc::buildScheduledFrame(fixture.prepared,fixture.frame.instances,nullptr,3840,2160,
+        fixture.frame.scheduling,full,error);
+    check(admitted,"a 4K lens frame at 64 visits passes admission: "+error);if(!admitted)return;
+    const auto paths=std::uint64_t(full.work.size());
+    check(paths==3072,"the lens traces 24 sunlit triangles x 16 entries x 8 bands");
+    check(full.bounds.maximumDeposits==paths*64&&full.bounds.queryWork<=gc::kMaximumFrameQueryWork,
+        "the lens frame reserves 64 trace slots per path inside the frame query cap");
+    auto splat=full;
+    const bool enabled=gc::enableSplat(fixture.prepared,splat,error);
+    check(enabled&&splat.splatVersion==gc::kSplatVersion,"the 4K lens frame schedules the splat, not single-pixel deposits: "+error);
+    if(!enabled)return;
+    const auto& schedule=splat.splat;
+    check(schedule.keySlots==32&&schedule.maximumKeys==paths*32*gc::kSplatTilesPerDeposit&&schedule.paddedKeyCount==(1u<<20)
+        &&schedule.paddedKeyCount/32<=65535&&schedule.normaliserWork+schedule.keyWork<=gc::kMaximumSplatPassWork
+        &&paths*32*gc::kSplatTilesPerDeposit*gc::kSplatTile*gc::kSplatTile<=gc::kMaximumSplatGatherWork,
+        "the lens keys 32 of 64 slots per path in one 2^20 key sort, inside the pass and gather caps");
+    std::uint64_t owned=0;gc::opengl::SplatScratchLayout layout;
+    check(gc::admitFrameMemory(splat,schedule.scratchBytes,owned,error)&&gc::opengl::splatScratchLayout(splat,layout),
+        "the lens splat scratch fits the frame memory budget and the scratch index range: "+error);
+    check(gc::validateTables(fixture.prepared,splat,error),"the lens splat frame passes the native table validation: "+error);
+    // The lighthouse lens sits in a bigger scene BVH, 514 to 624 work per query.
+    // Its native bound passes the frame cap while the CPU diagnostic trace of the
+    // same frame stays under kMaximumQueryWork and refuses on its own.
+    auto lighthouse=full;auto& allowance=lighthouse.query.texels[std::size_t(lighthouse.query.control[0])-1];
+    allowance[0]=624;allowance[1]=0;
+    gc::ResourceBounds bounds;
+    check(gc::calculateResourceBounds(fixture.prepared,lighthouse,bounds,error)&&bounds.queryWork==paths*194*624
+        &&bounds.queryWork>gc::kMaximumQueryWork,"lighthouse BVH work over the CPU diagnostic cap passes frame admission: "+error);
+    check(!gc::diagnosticQueryWorkWithinBudget(lighthouse,paths*(2*(gc::kMaximumInterfaces+3)+64),error)
+        &&error.find("CPU diagnostic")!=std::string::npos,"the CPU diagnostic trace of that frame keeps its own cap: "+error);
+    const auto over=gc::kMaximumFrameQueryWork/(paths*194)+1;
+    allowance[0]=float(over);
+    check(over<65536&&!gc::calculateResourceBounds(fixture.prepared,lighthouse,bounds,error)
+        &&error.find("path/camera query work")!=std::string::npos,"BVH work past the frame query cap refuses: "+error);
+}
 }
 void legacyLightRecordsAccepted()
 {
@@ -4721,9 +5503,265 @@ void legacyLightRecordsAccepted()
         "legacy source refuses a non-finite light record: "+error);
 }
 
+// checkSpectralBands visits referenced bands with their sums and unreferenced
+// bands only when nonzero, in band order, and never a key past the readback.
+void spectralBandSweep()
+{
+    const float nan=std::numeric_limits<float>::quiet_NaN();
+    const std::vector<float> bands{0.0f,-0.0f,2.0f,0.0f,1e-30f,0.0f,5.0f,nan,0.0f,-0.0f};
+    const std::map<std::uint64_t,int> reference{{2,20},{3,30},{6,60},{10,100},{40,400}};
+    std::vector<std::pair<float,int>> seen;
+    const auto collect=[&](float actual,const int* sum){seen.emplace_back(actual,sum?*sum:-1);return true;};
+    check(gc::checkSpectralBands(bands,reference,collect),"a sweep whose check accepts every band passes");
+    // Expected, by hand: band 2 (sum 20), band 3 (sum 30, value 0), band 4
+    // (1e-30, unreferenced), band 6 (sum 60), band 7 (NaN, unreferenced).
+    // Keys 10 and 40 lie past the ten bands.
+    const std::vector<std::pair<float,int>> expected{{2.0f,20},{0.0f,30},{1e-30f,-1},{5.0f,60},{nan,-1}};
+    bool same=seen.size()==expected.size();
+    for(std::size_t i=0;same&&i<seen.size();++i)
+        same=seen[i].second==expected[i].second&&(std::isnan(expected[i].first)?std::isnan(seen[i].first):seen[i].first==expected[i].first);
+    check(same,"the sweep visits referenced bands and nonzero unreferenced bands in order, and no key past the bands");
+    std::size_t calls=0;
+    const auto refuseFirstUnreferenced=[&](float,const int* sum){++calls;return sum!=nullptr;};
+    check(!gc::checkSpectralBands(bands,reference,refuseFirstUnreferenced)&&calls==3,
+        "a refused band stops the sweep at the third visit");
+    const std::vector<float> zeros(64,0.0f);calls=0;
+    const auto count=[&](float,const int*){++calls;return true;};
+    check(gc::checkSpectralBands(zeros,std::map<std::uint64_t,int>{},count)&&calls==0,
+        "an all-zero readback with no reference needs no per-band check");
+    check(gc::checkSpectralBands(std::vector<float>{},reference,count)&&calls==0,"an empty readback visits nothing");
+}
+// Preview traces a coarser entry schedule that launches the same power, keeps the
+// deposition its export frame would get, and skips the host receipt. Export keeps
+// the default schedule, every fence and the receipt. The spectrum reuse key moves
+// with extent, time, camera, context and prepared owner.
+void previewCausticPlan()
+{
+    namespace go=arbitgpu;
+    const gc::SchedulingDescription defaults;
+    for(const auto extent:{std::array<std::uint32_t,2>{3840,2160},std::array<std::uint32_t,2>{424,240},std::array<std::uint32_t,2>{160,90}})
+    {
+        const auto plan=go::openGlCausticRenderPlan(go::OpenGlCausticRenderUse::Export,extent[0],extent[1]);
+        check(plan.scheduling.version==defaults.version&&plan.scheduling.entrySubdivisions==defaults.entrySubdivisions
+            &&plan.scheduling.entrySubdivisions==gc::kEntrySubdivisions&&plan.hostReceipt&&plan.stageFences&&plan.bandFences
+            &&!plan.reuseSpectrum,"export keeps the default schedule, every stage and band fence and the host receipt, and reuses nothing");
+    }
+    const auto preview=go::openGlCausticRenderPlan(go::OpenGlCausticRenderUse::Preview,424,240);
+    check(preview.scheduling.entrySubdivisions==go::kPreviewCausticEntrySubdivisions&&gc::validScheduling(preview.scheduling)
+        &&!preview.hostReceipt&&!preview.stageFences&&!preview.bandFences&&preview.reuseSpectrum,
+        "a viewport preview traces the coarser schedule, flushes its stages, skips the host receipt and keeps its spectrum");
+    const auto large=go::openGlCausticRenderPlan(go::OpenGlCausticRenderUse::Preview,3840,2160);
+    check(!large.hostReceipt&&!large.stageFences&&large.bandFences&&!large.reuseSpectrum,
+        "a 4K preview still waits on each gather band and retains no spectrum");
+    std::string error;auto fixture=gt::fixture();
+    const bool prepared=fixture.prepare(error);check(prepared,"preview plan fixture prepares: "+error);if(!prepared)return;
+    gc::Frame full,coarse;
+    const bool built=gc::buildScheduledFrame(fixture.prepared,fixture.frame.instances,nullptr,424,240,
+            go::openGlCausticRenderPlan(go::OpenGlCausticRenderUse::Export,424,240).scheduling,full,error)
+        &&gc::buildScheduledFrame(fixture.prepared,fixture.frame.instances,nullptr,424,240,preview.scheduling,coarse,error);
+    check(built,"export and preview schedules build: "+error);if(!built)return;
+    check(!coarse.work.empty()&&coarse.work.size()*4==full.work.size()&&coarse.bounds.maximumDeposits*4==full.bounds.maximumDeposits,
+        "the preview schedule traces a quarter of the export paths and deposit slots");
+    std::array<double,8> fullPower{},coarsePower{};
+    for(const auto& work:full.work)fullPower[work.band]+=work.incidentPower;
+    for(const auto& work:coarse.work)coarsePower[work.band]+=work.incidentPower;
+    double launched=0;
+    for(unsigned b=0;b<8;++b) {launched+=fullPower[b];check(close(fullPower[b],coarsePower[b],1e-5),"each preview band launches the export band's power");}
+    check(launched>0,"the preview plan fixture launches power");
+    check(coarse.identity!=full.identity,"the preview schedule has its own frame identity");
+    gc::SplatSchedule fullSplat;
+    check(go::openGlCausticPreviewSplatAllowed(coarse)==gc::calculateSplatSchedule(full,fullSplat,error),
+        "a preview frame splats exactly when its export frame would");
+    // 1000 preview paths key 32000 deposits, inside the gather budget, but the export
+    // frame's 4000 paths key 128000, past the 116508 it admits.
+    gc::Frame crowded;crowded.width=424;crowded.height=240;crowded.scheduling=preview.scheduling;
+    crowded.work.resize(1000);crowded.bounds.maximumDeposits=1000*64;
+    gc::SplatSchedule crowdedSplat;
+    check(gc::calculateSplatSchedule(crowded,crowdedSplat,error)&&!go::openGlCausticPreviewSplatAllowed(crowded),
+        "a preview frame whose export schedule exceeds the splat budget keeps single-pixel deposits");
+    crowded.work.resize(100);crowded.bounds.maximumDeposits=100*64;
+    check(go::openGlCausticPreviewSplatAllowed(crowded),"a preview frame whose export frame splats may splat");
+    const auto key=go::openGlCausticSpectrumReuseKey(coarse,1.5,7,3);
+    check(key==go::openGlCausticSpectrumReuseKey(coarse,1.5,7,3),"an unchanged preview frame matches its retained spectrum");
+    check(!(key==go::openGlCausticSpectrumReuseKey(coarse,1.75,7,3)),"a new evaluation time traces again");
+    check(!(key==go::openGlCausticSpectrumReuseKey(coarse,1.5,8,3))&&!(key==go::openGlCausticSpectrumReuseKey(coarse,1.5,7,4)),
+        "another context or prepared owner generation traces again");
+    gc::Frame wider;
+    check(gc::buildScheduledFrame(fixture.prepared,fixture.frame.instances,nullptr,432,240,preview.scheduling,wider,error)
+        &&!(key==go::openGlCausticSpectrumReuseKey(wider,1.5,7,3)),"a new extent traces again: "+error);
+    auto moved=gt::fixture();moved.scene->cameras[0].transform.translation.x+=.25f;
+    gc::Frame movedFrame;
+    check(moved.prepare(error)&&gc::buildScheduledFrame(moved.prepared,moved.frame.instances,nullptr,424,240,preview.scheduling,movedFrame,error)
+        &&!(key==go::openGlCausticSpectrumReuseKey(movedFrame,1.5,7,3)),"a moved camera traces again: "+error);
+}
+
+// The Preview camera walk budget differs only for Preview, and the Export transport
+// text, visits and band waits stay the released ones.
+void previewCameraWalkBudget()
+{
+    namespace sg=arbitgpu::smoothglass;
+    for(const auto extent:{std::array<std::uint32_t,2>{3840,2160},std::array<std::uint32_t,2>{1000,560},std::array<std::uint32_t,2>{160,90}})
+    {
+        const auto exported=sg::cameraWalkBudget(false,extent[0],extent[1]);
+        check(!exported.sharedDispersionWalk&&exported.pairVisits==48&&exported.dispersivePairVisits==16&&exported.singleVisits==64
+            &&exported.singleChannelWalks==3&&exported.roughSamples==sg::kRoughInterfaceSamples&&exported.bandFinish,
+            "export keeps three dispersion walks, 48/16/64 visits, every rough sample and a finish per band");
+    }
+    const auto preview=sg::cameraWalkBudget(true,1000,560);
+    check(preview.sharedDispersionWalk&&preview.pairVisits==sg::kPreviewCameraVisits&&preview.dispersivePairVisits==sg::kPreviewCameraVisits
+        &&preview.singleVisits==sg::kPreviewCameraVisits&&preview.singleChannelWalks==1&&preview.roughSamples==sg::kRoughInterfaceSamples
+        &&!preview.bandFinish,"a viewport preview walks once with 12 visits and flushes its bands without a wait");
+    check(!sg::cameraWalkBudget(true,2560,1440).bandFinish&&sg::cameraWalkBudget(true,3840,2160).bandFinish,
+        "a preview above 2560x1440 still finishes each band");
+    for(const bool paired:{false,true})
+    {
+        const auto exported=sg::transportShader(false,true,false,paired);
+        check(exported==sg::transportShader(false,true,false,paired),"the export transport text is deterministic");
+        const auto previewText=sg::previewCameraTransportShader(exported);
+        check(!previewText.empty(),"every Preview anchor is present exactly once");
+        check(previewText.find("#define GLASS_PREVIEW_VISITS 12")!=std::string::npos
+            &&previewText.find("for(int visit=0;visit<GLASS_PREVIEW_VISITS;++visit) {")!=std::string::npos
+            &&previewText.find("for(int visit=0;visit<64;++visit) {")==std::string::npos,"the preview single walk is capped");
+        check(exported.find("GLASS_PREVIEW")==std::string::npos&&exported.find("for(int visit=0;visit<64;++visit) {")!=std::string::npos,
+            "the export text carries no preview define");
+        if(paired)check(previewText.find("int walks=1,visits=GLASS_PREVIEW_VISITS;")!=std::string::npos
+            &&exported.find("int walks=sharedPaths?1:3,visits=sharedPaths?48:16;")!=std::string::npos,
+            "the paired walk shares one walk in preview and keeps 1/3 walks and 48/16 visits in export");
+    }
+    check(sg::previewCameraTransportShader("vec3 unrelated();").empty(),"a text without the anchors builds no preview variant");
+}
+// The GL limit ladder: Full when the plan fits, Reduced one entry subdivision coarser
+// when only that fits, Off for Preview and Refused for Export when nothing fits.
+void causticLimitAdmission()
+{
+    namespace go=arbitgpu;
+    const auto mib=[](std::uint64_t value){return value*1024*1024;};
+    const auto demand=[](std::uint64_t work,std::uint64_t keys) {
+        go::OpenGlCausticStorageDemand value;value.workCount=work;value.depositionKeys=keys;value.textureExtent=1920;
+        value.bytes={work*gc::kPathReceiptStride*sizeof(gc::Texel),work*64*gc::kDepositReceiptStride*sizeof(gc::Texel),
+            1920ull*1080*16,work*64,work*64,keys*sizeof(gc::DepositionKey),1920ull*1080*16};
+        return value;
+    };
+    // 4000 paths at 64 visits reserve 125 MiB of deposit receipts; 1100 reserve 34.4 MiB.
+    const auto planned=demand(4000,262144),reduced=demand(1100,65536);
+    const auto limits=[&](std::uint64_t block,std::uint64_t groups) {
+        return go::OpenGlCausticDeviceLimits{block,groups,16384,1024,1024,16,16};
+    };
+    const auto generous=limits(mib(2048),65535),medium=limits(mib(64),65535),tiny=limits(mib(1),65535);
+    const auto preview=go::OpenGlCausticRenderUse::Preview,exporting=go::OpenGlCausticRenderUse::Export;
+    check(go::openGlCausticReducedEntrySubdivisions(4)==2&&go::openGlCausticReducedEntrySubdivisions(2)==1
+        &&go::openGlCausticReducedEntrySubdivisions(1)==0,"the preview ladder steps 4, 2, 1 and stops");
+    check(go::openGlCausticLimitFailure(generous,planned).empty()&&!go::openGlCausticLimitFailure(medium,planned).empty()
+        &&go::openGlCausticLimitFailure(medium,reduced).empty(),"the limit check separates the planned and reduced demand");
+    for(const auto use:{preview,exporting})
+    {
+        const auto full=go::decideOpenGlCausticAdmission(use,generous,2,planned,&reduced);
+        check(full.admission==go::OpenGlCausticAdmission::Full&&full.entrySubdivisions==2&&full.reason.empty(),
+            "generous limits render the planned caustic in full");
+    }
+    const auto stepped=go::decideOpenGlCausticAdmission(preview,medium,2,planned,&reduced);
+    check(stepped.admission==go::OpenGlCausticAdmission::Reduced&&stepped.entrySubdivisions==1
+        &&stepped.reason.find("deposit receipts need 125.0 MiB, max SSBO 64.0 MiB")!=std::string::npos,
+        "medium limits reduce a preview caustic one subdivision and name the limit: "+stepped.reason);
+    const auto exportMedium=go::decideOpenGlCausticAdmission(exporting,medium,4,planned,&reduced);
+    check(exportMedium.admission==go::OpenGlCausticAdmission::Refused
+        &&exportMedium.reason=="OpenGL caustic admitted storage exceeds native GL limits: deposit receipts need 125.0 MiB, max SSBO 64.0 MiB",
+        "export never reduces its caustic and names the failed limit: "+exportMedium.reason);
+    const auto off=go::decideOpenGlCausticAdmission(preview,tiny,2,planned,&reduced);
+    check(off.admission==go::OpenGlCausticAdmission::Off
+        &&off.reason=="caustic off: exceeds GL limits (deposit receipts need 34.4 MiB, max SSBO 1.0 MiB)",
+        "tiny limits render a preview without the caustic and say why: "+off.reason);
+    const auto refused=go::decideOpenGlCausticAdmission(exporting,tiny,4,planned,&reduced);
+    check(refused.admission==go::OpenGlCausticAdmission::Refused&&refused.reason.find("max SSBO 1.0 MiB")!=std::string::npos,
+        "tiny limits refuse an export: "+refused.reason);
+    check(go::decideOpenGlCausticAdmission(preview,medium,2,planned,nullptr).admission==go::OpenGlCausticAdmission::Off
+        &&go::decideOpenGlCausticAdmission(preview,medium,1,planned,&reduced).admission==go::OpenGlCausticAdmission::Off,
+        "a preview with no smaller schedule built renders without the caustic");
+    const auto dispatch=go::decideOpenGlCausticAdmission(preview,limits(mib(2048),64),2,planned,&reduced);
+    check(dispatch.admission==go::OpenGlCausticAdmission::Off&&dispatch.reason.find("max work group count 64")!=std::string::npos,
+        "a work group count limit is named: "+dispatch.reason);
+    auto texture=limits(mib(2048),65535);texture.maximumTextureSize=1024;
+    check(go::openGlCausticLimitFailure(texture,planned)=="texture extent 1920 exceeds max texture size 1024",
+        "a texture size limit is named");
+    auto splatLimits=limits(mib(2048),65535);splatLimits.maximumWorkGroupsY=65535;splatLimits.maximumLocalSizeY=1024;
+    const go::OpenGlCausticSplatDemand splatDemand{1024,4096,4096,4096,14,8};
+    check(go::openGlCausticSplatLimitFailure(splatLimits,splatDemand).empty(),"a splat frame inside every limit fits");
+    splatLimits.storageBindings=7;
+    check(go::openGlCausticSplatLimitFailure(splatLimits,splatDemand)=="splat needs 8 storage bindings, max 7",
+        "a splat binding limit is named with its need and max");
+    splatLimits.storageBindings=16;splatLimits.maximumWorkGroupsY=8;
+    check(go::openGlCausticSplatLimitFailure(splatLimits,splatDemand)=="splat gather needs 16 Y work groups, max 8",
+        "a splat gather dispatch limit is named with its need and max");
+    std::string error;auto fixture=gt::fixture();
+    const bool prepared=fixture.prepare(error);check(prepared,"limit fixture prepares: "+error);if(!prepared)return;
+    gc::Frame fine,coarse;
+    const bool built=gc::buildScheduledFrame(fixture.prepared,fixture.frame.instances,nullptr,424,240,{gc::kScheduleVersion,2},fine,error)
+        &&gc::buildScheduledFrame(fixture.prepared,fixture.frame.instances,nullptr,424,240,{gc::kScheduleVersion,1},coarse,error);
+    check(built,"limit fixture schedules build: "+error);if(!built)return;
+    const auto fineDemand=go::openGlCausticStorageDemand(fine,fine.bounds.deposition.paddedKeyCount);
+    const auto coarseDemand=go::openGlCausticStorageDemand(coarse,coarse.bounds.deposition.paddedKeyCount);
+    check(fineDemand.workCount==fine.work.size()&&fineDemand.textureExtent>=424
+        &&fineDemand.bytes[1]==fine.bounds.maximumDeposits*gc::kDepositReceiptStride*sizeof(gc::Texel)
+        &&fineDemand.bytes[2]==424ull*240*4*sizeof(float)&&coarseDemand.workCount*4==fineDemand.workCount
+        &&coarseDemand.bytes[1]*4==fineDemand.bytes[1],"a reduced schedule demands a quarter of the paths and deposit receipts");
+}
+// The Preview submit budget: a submission over 250 ms is over budget. Two in a row, or one
+// past four times the budget, step Full to Reduced to Off. Reduced retries Full after 120
+// within budget, and Off retries Reduced after 30 s, doubling to 480 s.
+void previewCausticSubmitBudget()
+{
+    namespace go=arbitgpu;
+    const double budget=go::kPreviewCausticSubmitBudgetMilliseconds;
+    check(budget==250&&go::kPreviewCausticOverBudgetSteps==2&&go::kPreviewCausticSevereBudgetFactor==4
+        &&go::kPreviewCausticRetryWithinSteps==120&&go::kPreviewCausticOffRetryMilliseconds==30000
+        &&go::kPreviewCausticOffRetryCapMilliseconds==480000,"the preview caustic budget values are pinned");
+    check(!go::decidePreviewCausticOverBudget(0,budget)&&!go::decidePreviewCausticOverBudget(249.9,budget)
+        &&!go::decidePreviewCausticOverBudget(250,budget),"a submission at or within the budget is not over it");
+    check(go::decidePreviewCausticOverBudget(250.1,budget)&&go::decidePreviewCausticOverBudget(21000,budget)
+        &&go::decidePreviewCausticOverBudget(std::numeric_limits<double>::infinity(),budget)
+        &&go::decidePreviewCausticOverBudget(std::numeric_limits<double>::quiet_NaN(),budget),
+        "a submission past the budget, or with a non-finite time, is over it");
+    check(!go::decidePreviewCausticOverBudget(21000,0)&&!go::decidePreviewCausticOverBudget(21000,-1),
+        "a zero or negative budget never reports over budget");
+    check(go::previewCausticOverBudgetReason(21437.4)=="caustic submit over budget (21437 ms)"
+        &&go::previewCausticOverBudgetReason(312.5)=="caustic submit over budget (313 ms)"
+        &&go::previewCausticOverBudgetReason(-5)=="caustic submit over budget (0 ms)"
+        &&go::previewCausticOverBudgetReason(std::numeric_limits<double>::quiet_NaN())=="caustic submit over budget (0 ms)",
+        "the over-budget reason names the whole milliseconds: "+go::previewCausticOverBudgetReason(21437.4));
+    using Level=go::OpenGlPreviewCausticLevel;
+    go::OpenGlPreviewCausticBudget state;
+    check(!go::stepPreviewCausticBudget(state,300,0)&&state.level==Level::Full,"one submission over budget keeps Full");
+    check(!go::stepPreviewCausticBudget(state,100,10)&&!go::stepPreviewCausticBudget(state,300,20)&&state.level==Level::Full,
+        "a submission within budget resets the over-budget count");
+    check(go::stepPreviewCausticBudget(state,400,30)&&state.level==Level::Reduced
+        &&state.reason=="caustic reduced: submit over budget (400 ms)","two in a row step Full to Reduced: "+state.reason);
+    for(unsigned i=0;i+1<go::kPreviewCausticRetryWithinSteps;++i)go::stepPreviewCausticBudget(state,10,40);
+    check(state.level==Level::Reduced,"Reduced holds before 120 submissions within budget");
+    check(go::stepPreviewCausticBudget(state,10,50)&&state.level==Level::Full&&state.reason.empty(),
+        "120 submissions within budget retry Full");
+    go::OpenGlPreviewCausticBudget severe;
+    check(go::stepPreviewCausticBudget(severe,1000,0)&&severe.level==Level::Reduced,"one submission at four times the budget steps at once");
+    check(go::stepPreviewCausticBudget(severe,21000,1000)&&severe.level==Level::Off&&severe.offSinceMs==1000
+        &&severe.reason=="caustic off: submit over budget (21000 ms)","a severe submission at Reduced steps to Off: "+severe.reason);
+    check(!go::stepPreviewCausticBudget(severe,10,2000)&&severe.level==Level::Off,"Off ignores submissions");
+    check(!go::retryPreviewCausticBudget(severe,30999)&&severe.level==Level::Off,"Off waits 30 s before it retries");
+    check(go::retryPreviewCausticBudget(severe,31000)&&severe.level==Level::Reduced&&severe.retrying
+        &&severe.reason=="caustic reduced: retrying after submit over budget","Off retries Reduced after 30 s: "+severe.reason);
+    go::stepPreviewCausticBudget(severe,5000,32000);
+    check(severe.level==Level::Off&&severe.offRetryMs==60000,"a failed retry doubles the wait before the next one");
+    for(int i=0;i<8;++i){go::retryPreviewCausticBudget(severe,1e9*(i+1));go::stepPreviewCausticBudget(severe,5000,1e9*(i+1));}
+    check(severe.level==Level::Off&&severe.offRetryMs==go::kPreviewCausticOffRetryCapMilliseconds,"the retry wait stops at 480 s");
+    check(!go::retryPreviewCausticBudget(state,1e12)&&state.level==Level::Full,"only Off retries");
+    const go::OpenGlCausticScheduleKey key{1,2,424,240,"fixture:schedule"};
+    auto other=key;check(other==key,"an equal schedule key matches");
+    other.scheduleIdentity="fixture:other";check(other!=key,"another schedule identity does not match");
+    other=key;other.width=425;check(other!=key,"another extent does not match");
+    other=key;other.rendererGeneration=3;check(other!=key,"another renderer generation does not match");
+    other=key;other.context=9;check(other!=key,"another context does not match");
+}
 int main()
 {
-    legacyLightRecordsAccepted();
+    previewCausticSubmitBudget();causticLimitAdmission();previewCausticPlan();previewCameraWalkBudget();spectralBandSweep();legacyLightRecordsAccepted();nativeFootprintPixelBoundary();splatDeposition();splatNeighbourCoverage();splatReservationStable();splatNativeReadback();facetedLensAdmission();
     cameraWideLinePredicatePreparation();cameraLinePredicatePreparation();cameraRayCoefficientPreparation();exactLinePredicatePreparation();gratingBoundaryDomainsV2();gratingCellCoveragePartitions();gratingCellTransport();gratingEntryCells();directionalIrradianceSources();directionalSourceNativeReceipts();physics();gratingAreaDifferentials();gratingIncidentContract();directGratingContributionContract();glassCameraGratingTraceContract();gratingCameraReceipts();roughPhysics();multipleScatterPhysics();multipleScatterReceipts();geometry();branches();ordinarySources();roughBranches();schedulesAndPower();stableDeposition();cameraCellGeometry();cameraAndAtomicReadback();refusals();
     std::printf("glass caustic contract: %d checks, %d failures\n",checks,failures);return failures?1:0;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../src/fixture_scene_renderer.h"
+#include "../../src/gpu_backend/fixture_diffraction_bands.h"
 #include "../../../shared/VisualImportedSceneRenderOperationContract.h"
 #include "diffraction_frame_cases.h"
 
@@ -103,8 +104,21 @@ bool run(Backend& backend,
                 *admittedStarter->nativeProgram(), 1920, 1080)
             && !arbitgpu::nativeFixtureDiffractionWorkWithinBudget(
                 *admittedStarter->nativeProgram(), 1921, 1080);
+        // One draw per path covers 1080p. The default 4K canvas renders the
+        // same card in four 540-row bands.
+        arbitgpu::NativeFixtureDiffractionBands cardBands;
+        const bool cardBandsWork = admittedStarter
+            && arbitgpu::nativeFixtureDiffractionBandSchedule(
+                *admittedStarter->nativeProgram(), 1920, 1080, true, cardBands)
+            && cardBands.bandCount == 1
+            && arbitgpu::nativeFixtureDiffractionBandSchedule(
+                *admittedStarter->nativeProgram(), 3840, 2160, true, cardBands)
+            && cardBands.bandCount == 4 && cardBands.bandHeight == 540;
         if (!starterWorks)
             std::cerr << "FAIL: card camera, key light, 1080p budget or preview/export parity\n";
+        if (!cardBandsWork)
+            std::cerr << "FAIL: card 4K row bands\n";
+        ok = cardBandsWork && ok;
         ok = starterWorks && ok;
     }
     const auto environment = render(request, false);

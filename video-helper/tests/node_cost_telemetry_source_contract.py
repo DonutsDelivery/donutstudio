@@ -6,7 +6,7 @@ telemetry = (root / "src/visual_plan_telemetry.h").read_text()
 executor = (root / "src/visual_plan_executor.h").read_text()
 renderer = (root / "src/renderer.cpp").read_text()
 metal = (root / "src/gpu_backend/backend_sokol.mm").read_text()
-hud = (root.parent / "plugin/Source/VideoEditor/VideoEditorWindow.h").read_text()
+hud = (root.parent / "plugin/Source/VideoEditor/VideoEditorContent.cpp").read_text()
 
 assert "recordNodeEvaluation" in telemetry
 assert "aggregate layer time is never split" in telemetry

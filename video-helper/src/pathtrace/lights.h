@@ -22,6 +22,27 @@
 // - Emissive triangles: Material::emission times coverage is the radiance
 //   leaving both faces, as the raster adds emissive to the shaded colour.
 //
+// Sizes. SceneLightRecord has no size field, so a caller passes one
+// LightShape per record (all 0 by default, the delta lights above):
+// - Point and Spot with radius r > 0 become uniformly emitting spheres. Their
+//   radiance is chosen so that a surface at distance d receives the same
+//   irradiance as from the point light, falloff, range window and spot cone
+//   included (all evaluated from the sphere centre): L = color * intensity *
+//   d^2 / max(d^2, 1) / (pi r^2). Inside the sphere the point light is used.
+// - Directional with angular radius a > 0 becomes a uniform sun disk of
+//   radiance E / (pi sin^2 a), which gives the same irradiance E at normal
+//   incidence.
+// AreaLightRecord adds rect and disk lights, which have no scene record kind.
+// Their radiance is color * intensity, along rotated local -Z (one-sided by
+// default, as the spot axis).
+//
+// Sized lights have no geometry: they never block rays and camera rays do not
+// see them. Bounce rays reach them through analyticHit and combine with light
+// sampling by MIS. Spheres and suns are sampled uniformly in the cone they
+// subtend, rects by solid angle (Urena, Fajardo and King, "An Area-Preserving
+// Parametrization for Spherical Rectangles", EGSR 2013) with an area-sampling
+// fallback for tiny solid angles, and disks uniformly by area.
+//
 // One light is chosen per shading point with probability proportional to an
 // estimate of the power it delivers to the scene. Directional, Point and Spot
 // lights are delta lights. Emissive triangles are sampled uniformly by area
@@ -32,7 +53,8 @@
 //
 // Behavioural reference (studied, not copied): Blender Cycles
 // intern/cycles/kernel/light/distribution.h, light/triangle.h,
-// light/background.h, light/point.h, light/spot.h and light/sun.h.
+// light/background.h, light/point.h, light/spot.h, light/sun.h and
+// light/area.h.
 
 #include "bsdf.h"
 #include "environment_map.h"
@@ -55,7 +77,39 @@ enum class LightType : std::uint8_t
     Point = 1,
     Spot = 2,
     Environment = 3,
-    Triangle = 4
+    Triangle = 4,
+    Rect = 5,
+    Disk = 6
+};
+
+// Size of the emitter behind one scene light record. 0 keeps the delta light.
+struct LightShape
+{
+    // Point and Spot: sphere radius in scene units.
+    float radius = 0.0f;
+    // Directional: angular radius of the sun disk in radians, at most 1.5.
+    float angularRadius = 0.0f;
+};
+
+enum class AreaLightShape : std::uint8_t
+{
+    Rect = 0,
+    Disk = 1
+};
+
+// A planar light that has no scene record kind.
+struct AreaLightRecord
+{
+    AreaLightShape shape = AreaLightShape::Rect;
+    Vec3 position {};  // centre
+    // Local X and Y span the light. It emits along rotated local -Z.
+    Quat rotation {};
+    // Rect: full width along X and height along Y. Disk: diameters.
+    float sizeX = 1.0f;
+    float sizeY = 1.0f;
+    Vec3 color { 1.0f, 1.0f, 1.0f };
+    float intensity = 1.0f;  // color * intensity is the emitted radiance
+    bool twoSided = false;
 };
 
 struct Light
@@ -73,8 +127,18 @@ struct Light
     Vec3 vertex0 {};              // Triangle corners: vertex0, vertex0 + edge1, vertex0 + edge2
     Vec3 edge1 {};
     Vec3 edge2 {};
-    Vec3 normal {};               // Triangle: unit front-face normal
-    float area = 0.0f;            // Triangle
+    Vec3 normal {};               // Triangle: unit front-face normal. Rect, Disk: emission side.
+    float area = 0.0f;            // Triangle, Rect, Disk
+    // Point and Spot: sphere radius, 0 for a point.
+    float radius = 0.0f;
+    // Directional with a disk: cos and 1 - cos of the angular radius, and
+    // radiance over irradiance, 1 / (pi sin^2). coneOneMinusCos 0 is delta.
+    float coneCos = 1.0f;
+    float coneOneMinusCos = 0.0f;
+    float coneRadianceScale = 0.0f;
+    // Rect: vertex0 is a corner, edge1 and edge2 the full sides. Disk:
+    // position is the centre, edge1 and edge2 the half axes.
+    bool twoSided = false;
 };
 
 // Radiance arriving from infinitely far away, by direction.
@@ -126,6 +190,8 @@ struct LightSetStats
     std::uint32_t environmentImages = 0;      // image records lighting the scene (at most 1)
     std::uint32_t supersededEnvironments = 0; // constant and analytic records an image replaced
     std::uint32_t emissiveTriangles = 0;
+    std::uint32_t sizedLights = 0;            // spheres and sun disks from LightShape
+    std::uint32_t areaLights = 0;             // rects and disks
     // Image records without matching valid pixels, with an invalid binding, a
     // black image, or after the first usable image. They light nothing.
     std::uint32_t ignoredEnvironmentImages = 0;
@@ -140,9 +206,13 @@ public:
     // TriangleAttributes::materialIndex; triangles outside it use fallback.
     // environmentImage holds the decoded pixels for the image record whose
     // asset identity it names; null or empty means no image is available.
+    // shapes, when given, holds the size of records[i] at index i; missing
+    // entries are delta lights. areaLights adds rects and disks.
     void build (const HarmonicMIDI::grid::SceneLightRecord* records, std::size_t count, Vec3 ambient,
                 const IngestedScene& geometry, const std::vector<Material>& materials,
-                const Material& fallback, const EnvironmentPixels* environmentImage = nullptr);
+                const Material& fallback, const EnvironmentPixels* environmentImage = nullptr,
+                const std::vector<LightShape>* shapes = nullptr,
+                const std::vector<AreaLightRecord>* areaLights = nullptr);
     void clear() noexcept;
 
     std::size_t size() const noexcept { return lights_.size(); }
@@ -163,11 +233,22 @@ public:
     float environmentPdf (Vec3 direction) const noexcept;
     Vec3 environmentRadiance (Vec3 direction) const noexcept { return environment_.radiance (direction); }
 
+    // Sized lights without geometry (spheres, sun disks, rects, disks).
+    std::size_t analyticCount() const noexcept { return analytic_.size(); }
+    // Whether the ray origin + t direction, 0 < t < tMax (direction unit),
+    // reaches analytic light `index`. On a hit, radiance is what the ray
+    // receives from it, pdf the density sample() gives that direction from
+    // origin, selection included, and distance the t of the hit (infinite
+    // for a sun).
+    bool analyticHit (std::size_t index, Vec3 origin, Vec3 direction, float tMax, Vec3& radiance,
+                      float& pdf, float& distance) const noexcept;
+
 private:
     std::vector<Light> lights_;
     std::vector<float> cdf_;                 // inclusive, normalized, back() == 1
     std::vector<float> probability_;
     std::vector<std::int32_t> triangleLight_;
+    std::vector<std::uint32_t> analytic_;    // indices into lights_
     EnvironmentField environment_ {};
     std::int32_t environmentLight_ = -1;
     LightSetStats stats_ {};

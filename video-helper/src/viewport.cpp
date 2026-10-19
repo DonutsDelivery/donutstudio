@@ -17,8 +17,10 @@
 #include "optical_flow_preview_decode.h"
 #include "optical_flow_product_receipt_json.h"
 #include "visual_parameter_history.h"
+#include "harmony_signals_json.h" // score.harmony timeline (uChord/uKey/uPhrase)
 #include "imported_animation_visual_plan_execution.h"
 #include "imported_scene_visual_plan_execution.h"
+#include "preview_render_extent.h"
 #include "fixture_scene_renderer.h"
 #include "VisualAnimationPoseControls.h"
 #include "imported_geometry_execution.h"
@@ -189,6 +191,22 @@ constexpr const char* kLoopPhaseNames[] = {
 static_assert (sizeof (kLoopPhaseNames) / sizeof (kLoopPhaseNames[0])
                == static_cast<size_t> (LoopPhase::Count), "loop phase names out of step");
 
+// Phases that produce a frame. Time spent in one of them delays the next
+// present, so a long stay there is a stall. Idle and waiting phases are not.
+constexpr bool isFrameWorkPhase (int phase) noexcept
+{
+    return phase == static_cast<int> (LoopPhase::Advance)
+        || phase == static_cast<int> (LoopPhase::Composite)
+        || phase == static_cast<int> (LoopPhase::Render)
+        || phase == static_cast<int> (LoopPhase::Present)
+        || phase == static_cast<int> (LoopPhase::Publish);
+}
+
+// A frame-work step this old is reported as a stall in viewport_info: its name
+// and age go to stalledStep/stalledStepMs and into rendererError. The harness waits 12 s for a seek and Arbit 15 s for an
+// open, so 5 s names the step well before either gives up.
+constexpr double kViewportStallReportMs = 5000.0;
+
 void applyAlphaMatte (DecodedFrame& frame, MediaContext& matte, double sourceSec)
 {
     DecodedFrame matteFrame;
@@ -309,6 +327,25 @@ std::string base64Encode (const uint8_t* data, size_t n)
     }
     return out;
 }
+
+// A contained admission still publishes when a clip's plan does not lower.
+// Count each refused clip and keep the first reason, "clip N: reason", as the
+// last lowering error, the same way a refused admission reports. The caller
+// holds the viewport mutex and calls this after the publication is replaced.
+template <typename ViewportImpl>
+void noteContainedPlanRefusals (ViewportImpl& impl, const std::vector<std::string>& refusals)
+{
+    for (const auto& refusal : refusals)
+    {
+        ++impl.failedPlanLowerings;
+        impl.visualTelemetry.recordFailedLowering(refusal);
+    }
+    if (! refusals.empty())
+        impl.lastPlanLoweringError = refusals.front();
+    // Kept for the next timeline reply, so the plugin hears about a refused
+    // clip when it publishes instead of from a later poll.
+    impl.containedPlanRefusals = refusals;
+}
 } // namespace
 
 struct Viewport::Impl
@@ -335,6 +372,7 @@ struct Viewport::Impl
     videowire::VisualPlanViewportPublicationOwner visualPlanPublication;
     uint64_t failedPlanLowerings = 0;
     std::string lastPlanLoweringError;
+    std::vector<std::string> containedPlanRefusals;
     int inspectionClipId = -1;
     uint64_t inspectionStructuralRevision = 0;
     int inspectionNodeId = 0;
@@ -378,6 +416,10 @@ struct Viewport::Impl
     // actually changes (not every frame). Empty score ⇒ shaders see the
     // zero-feed (uNoteCount 0), identical to never calling setScore.
     std::shared_ptr<const arbitmod::Score> scoreSnapshot = std::make_shared<const arbitmod::Score>();
+    // Harmony timeline parsed from the same push; swapped under the same
+    // mutex and generation so notes and harmony never disagree.
+    std::shared_ptr<const arbitharmony::HarmonyTimeline> harmonySnapshot
+        = std::make_shared<const arbitharmony::HarmonyTimeline>();
     uint64_t scoreGeneration = 0;
     uint64_t presentedScoreGeneration = 0;
     double publishedDisplaySec = 0.0;
@@ -573,6 +615,13 @@ struct Viewport::Impl
     // and its entry time. Written only by the render thread.
     std::atomic<const char*> loopStep { "idle" };
     std::atomic<int64_t> loopStepEnterNs { 0 };
+    // The last loop step or scoped call that ran long, and its duration. They
+    // stay set after the call returns, so viewport_info still names it when the
+    // stall has ended. Written only by the render thread.
+    std::atomic<const char*> lastSlowStep { "" };
+    std::atomic<int64_t> lastSlowStepMs { 0 };
+    std::atomic<const char*> lastSlowScope { "" };
+    std::atomic<int64_t> lastSlowScopeMs { 0 };
     std::atomic<uint64_t> loopTicks { 0 };
     std::atomic<uint64_t> sharedReleasesReceived { 0 };
     std::atomic<uint64_t> sharedReleasesInvalid { 0 };
@@ -602,6 +651,10 @@ struct Viewport::Impl
     std::string gpuPath = "opengl";
     std::string backendPolicy = "legacy-opengl";
     std::string rendererError;
+    // Why the last tick held its frame for a rejected visual plan, and the clip it
+    // came from. Guarded by mutex. The render loop clears both when a frame presents.
+    std::string planError;
+    int planErrorClipId = -1;
     // Written by the render loop once per frame and read by info().
     std::atomic<bool> importedScenePending { false };
     uint64_t fallbackCount = 0;
@@ -956,6 +1009,12 @@ std::string Viewport::openShm (int width, int height, double targetFps,
         impl_.reset();
         return "bad frame shm region: " + shmName;
     }
+    // Arbit reuses this ring across editor close/open and helper restarts, and
+    // this session's frame sequence starts again at 1. Old slots would outrank
+    // the new frames, so the reader would keep the previous project's picture
+    // and a seek would never present. No render thread runs yet: this is the
+    // only writer.
+    impl_->shmRing.retireFrameSequences();
 
 #if defined (__APPLE__)
     if (! initializeHelperGlfw())
@@ -1007,11 +1066,24 @@ std::string Viewport::resizeShm (int width, int height)
 
 void Viewport::close()
 {
+    // The step the render thread is in now. The join below waits for it to
+    // return, and every later RPC (the next open included) waits behind it.
+    const char* stepAtClose = impl_ != nullptr
+        ? impl_->loopStep.load (std::memory_order_relaxed) : "";
     if (impl_ != nullptr)
         impl_->wantClose = true;
     running_ = false;
     if (thread_.joinable())
+    {
+        const int64_t joinStart = nowNs();
         thread_.join();
+        const int64_t waitedMs = (nowNs() - joinStart) / 1000000;
+        lastCloseWaitStep_ = stepAtClose != nullptr ? stepAtClose : "";
+        lastCloseWaitMs_ = (double) waitedMs;
+        if (waitedMs >= 1000)
+            std::fprintf (stderr, "[viewport] close waited %lld ms for the render thread (step %s)\n",
+                          (long long) waitedMs, lastCloseWaitStep_.c_str());
+    }
 #if defined (__APPLE__)
     if (impl_ != nullptr && impl_->macPrecreatedWindow != nullptr)
     {
@@ -1126,9 +1198,12 @@ std::string Viewport::setTimeline (videowire::ResolvedVisualSnapshot snapshot)
         ? "Metal.MTLDevice.recommendedMaxWorkingSetSize" : "";
     const auto backendResourceLimits = videowire::VisualBackendResourceLimits::fromCapabilities(
         canvas.width, canvas.height, resourceCapabilities);
+    // A clip whose plan does not lower is refused on its own frames, with its
+    // reason, instead of holding the previous project on screen.
     if (! videowire::makeVisualPlanExecutionSnapshot(snapshot.visualLayerPlans, publication, diagnostic,
                                                      nullptr,
-                                                     canvas.width, canvas.height, &backendResourceLimits))
+                                                     canvas.width, canvas.height, &backendResourceLimits,
+                                                     true))
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ++impl_->failedPlanLowerings;
@@ -1153,11 +1228,13 @@ std::string Viewport::setTimeline (videowire::ResolvedVisualSnapshot snapshot)
     else
         impl_->opticalFlowSnapshot.reset();
     impl_->opticalFlowInspection = nullptr;
+    const auto containedRefusals = publication->state.containedLayerRefusals();
     publication->state.setTelemetryOwner(impl_->visualTelemetry);
     videowire::publishVisualPlanExecutionSnapshotTelemetry(
         *publication, impl_->visualTelemetry);
     impl_->visualPlanPublication.replace(std::move(publication));
     impl_->lastPlanLoweringError.clear();
+    noteContainedPlanRefusals(*impl_, containedRefusals);
     ++impl_->timelineGeneration;
     return {};
 }
@@ -1309,6 +1386,13 @@ bool Viewport::rejectSnapshot (uint64_t authoringRevision)
     return revisionLedger_.reject (authoringRevision);
 }
 
+std::vector<std::string> Viewport::containedPlanRefusals() const
+{
+    if (impl_ == nullptr) return {};
+    std::lock_guard<std::mutex> lock (impl_->mutex);
+    return impl_->containedPlanRefusals;
+}
+
 videowire::RevisionTuple Viewport::revisionState() const
 {
     std::lock_guard<std::mutex> lock (revisionMutex_);
@@ -1337,11 +1421,20 @@ void Viewport::acceptRuntimeRevision (uint64_t revision) noexcept
                seen, revision, std::memory_order_release, std::memory_order_relaxed)) {}
 }
 
-void Viewport::setScore (arbitmod::Score score, canonicalblockc::OwnerIdentity identity)
+void Viewport::setScore (arbitmod::Score score, canonicalblockc::OwnerIdentity identity,
+                         std::shared_ptr<const arbitharmony::HarmonyTimeline> harmony)
 {
     if (impl_ == nullptr) return;
+    if (harmony == nullptr)
+    {
+        // Callers without a parsed payload still get note onsets.
+        auto onsetsOnly = std::make_shared<arbitharmony::HarmonyTimeline>();
+        arbitharmony::collectOnsets (score, *onsetsOnly);
+        harmony = std::move (onsetsOnly);
+    }
     std::lock_guard<std::mutex> lock (impl_->mutex);
     impl_->scoreSnapshot = std::make_shared<const arbitmod::Score>(std::move(score));
+    impl_->harmonySnapshot = std::move (harmony);
     impl_->scoreIdentity = identity;
     ++impl_->scoreGeneration;
 }
@@ -1503,7 +1596,7 @@ std::string Viewport::setCanvas (int width, int height)
         std::shared_ptr<videowire::VisualPlanExecutionSnapshot> publication;
         std::string diagnostic;
         const bool admitted = videowire::makeVisualPlanExecutionSnapshot(
-            std::move(plans), publication, diagnostic, nullptr, width, height, &limits);
+            std::move(plans), publication, diagnostic, nullptr, width, height, &limits, true);
 
         const std::lock_guard<std::mutex> lock (impl_->mutex);
         const auto& currentCaps = impl_->gpuCaps;
@@ -1527,11 +1620,13 @@ std::string Viewport::setCanvas (int width, int height)
         canvasW_ = width;
         canvasH_ = height;
         ++canvasGeneration_;
+        const auto containedRefusals = publication->state.containedLayerRefusals();
         publication->state.setTelemetryOwner(impl_->visualTelemetry);
         videowire::publishVisualPlanExecutionSnapshotTelemetry(
             *publication, impl_->visualTelemetry);
         impl_->visualPlanPublication.replace(std::move(publication));
         impl_->lastPlanLoweringError.clear();
+        noteContainedPlanRefusals(*impl_, containedRefusals);
         impl_->contentRevision.fetch_add (1); // the idle gate wakes for the new canvas
         return {};
     }
@@ -1557,7 +1652,14 @@ std::string Viewport::setView (double zoom, double panX, double panY)
 {
     if (! std::isfinite (zoom) || ! std::isfinite (panX) || ! std::isfinite (panY))
         return "bad view transform";
-    viewZoom_ = std::clamp (zoom, 0.02, 32.0);
+    const double clampedZoom = std::clamp (zoom, 0.02, 32.0);
+    // The imported scene preview extent follows the zoom bucket, so a paused scene
+    // re-renders once when the zoom crosses into a new one.
+    const bool bucketChanged = videohelper::previewextent::zoomBucket (clampedZoom)
+        != videohelper::previewextent::zoomBucket (viewZoom_.load());
+    viewZoom_ = clampedZoom;
+    if (bucketChanged && impl_ != nullptr)
+        impl_->contentRevision.fetch_add (1);
     viewPanX_ = panX;
     viewPanY_ = panY;
     return {};
@@ -1958,6 +2060,8 @@ ViewportInfo Viewport::info() const
     vi.viewZoom = viewZoom_.load();
     vi.viewPanX = viewPanX_.load();
     vi.viewPanY = viewPanY_.load();
+    vi.lastCloseWaitStep = lastCloseWaitStep_;
+    vi.lastCloseWaitMs = lastCloseWaitMs_;
     if (impl_ == nullptr) return vi;
     std::lock_guard<std::mutex> lock (impl_->mutex);
     vi.open = impl_->windowOpen.load();
@@ -1989,6 +2093,8 @@ ViewportInfo Viewport::info() const
     vi.compositorBackend = impl_->compositorBackend;
     vi.particleBackend = impl_->particleBackend;
     vi.rendererError = impl_->rendererError;
+    vi.planError = impl_->planError;
+    vi.planErrorClipId = impl_->planErrorClipId;
     vi.importedScenePending = impl_->importedScenePending.load();
     vi.fallbackCount = impl_->fallbackCount;
     vi.framesPresented = impl_->framesPresented.load();
@@ -2028,6 +2134,20 @@ ViewportInfo Viewport::info() const
         vi.loopStep = step;
         vi.loopStepAgeMs = stepNs > 0 ? (double) (nowNs() - stepNs) * 1e-6 : 0.0;
         vi.loopTicks = impl_->loopTicks.load (std::memory_order_relaxed);
+        vi.lastSlowStep = impl_->lastSlowStep.load (std::memory_order_relaxed);
+        vi.lastSlowStepMs = (double) impl_->lastSlowStepMs.load (std::memory_order_relaxed);
+        vi.lastSlowScope = impl_->lastSlowScope.load (std::memory_order_relaxed);
+        vi.lastSlowScopeMs = (double) impl_->lastSlowScopeMs.load (std::memory_order_relaxed);
+        // A frame-work step that has not returned blocks every later present,
+        // seek and close. Name it as a renderer error instead of a silent hang.
+        if (vi.open && isFrameWorkPhase (phase) && vi.loopStepAgeMs >= kViewportStallReportMs)
+        {
+            vi.stalledStep = vi.loopStep;
+            vi.stalledStepMs = vi.loopStepAgeMs;
+            const std::string stall = "viewport render stalled: " + vi.loopStep + " has run for "
+                + std::to_string ((long long) vi.loopStepAgeMs) + " ms without returning";
+            vi.rendererError = vi.rendererError.empty() ? stall : vi.rendererError + "; " + stall;
+        }
     }
     vi.dmabufCapable = impl_->dmabufCapable.load();
     vi.sharedFramesSent = impl_->sharedFramesSent.load();
@@ -2166,7 +2286,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     auto& im = *impl_;
     // This thread owns the advance sub-step atomics, so loopstep::Scope names
     // the inner call there. The guard restores the previous sink on every return.
-    loopstep::Sink loopSink { &im.loopStep, &im.loopStepEnterNs };
+    loopstep::Sink loopSink { &im.loopStep, &im.loopStepEnterNs,
+                              &im.lastSlowScope, &im.lastSlowScopeMs };
     loopstep::SinkInstall loopSinkInstall (&loopSink);
     const bool shared = im.sharedMode;
     const bool shm = im.shmMode;
@@ -2396,7 +2517,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         std::string rendererAdmissionError;
         const bool admitted = videowire::makeVisualPlanExecutionSnapshot(
                 std::move(plansForRendererDevice), rendererSnapshot, rendererAdmissionError,
-                nullptr, canvas.width, canvas.height, &rendererLimits);
+                nullptr, canvas.width, canvas.height, &rendererLimits, true);
         {
             const std::scoped_lock lock (im.mutex, canvasMutex_);
             if (admitted)
@@ -3134,6 +3255,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     canonicalblockc::FrameOwner scoreFrameOwner;
     arbitmod::Score localScore;
     std::shared_ptr<const arbitmod::Score> canonicalScoreSource;
+    std::shared_ptr<const arbitharmony::HarmonyTimeline> localHarmony
+        = std::make_shared<const arbitharmony::HarmonyTimeline>();
     uint64_t scoreGenSeen = ~0ull;
     uint64_t pendingReadbackScoreGeneration = 0;
     canonicalblockc::OwnerIdentity scoreIdentity;
@@ -3142,6 +3265,12 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     // Error from a plan or binding failure that holds the frame. Cleared once a
     // frame presents without that failure.
     std::string planFrameError;
+    {
+        // A reopened viewport starts with no rejected plan, so a stale reason cannot outlive its frames.
+        std::lock_guard<std::mutex> lock(im.mutex);
+        im.planError.clear();
+        im.planErrorClipId = -1;
+    }
     // Reason for a device or resource failure that closes the channel. The
     // cleanup sends it to the consumer in the final BuffersGone message.
     std::string deviceCloseReason;
@@ -3310,10 +3439,28 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     arbitviewport::PublishGate publishGate;
     arbitviewport::PublishGate::Snapshot gateSnapshot;
 
+    // Records the frame-work step being left when it ran 200 ms or longer. A
+    // scope inside the step keeps its own record (lastSlowScope), which names
+    // the inner call; this one names the loop step around it.
+    const auto recordSlowLoopStep = [&im] (int64_t now)
+    {
+        const int64_t since = im.loopStepEnterNs.load (std::memory_order_relaxed);
+        if (since <= 0 || now - since < loopstep::Scope::kReportNs
+            || ! isFrameWorkPhase (im.loopPhase.load (std::memory_order_relaxed)))
+            return;
+        const int64_t elapsedMs = (now - since) / 1000000;
+        const char* step = im.loopStep.load (std::memory_order_relaxed);
+        im.lastSlowStepMs.store (elapsedMs, std::memory_order_relaxed);
+        im.lastSlowStep.store (step, std::memory_order_relaxed);
+        if (elapsedMs >= 2000)
+            std::fprintf (stderr, "[viewport] loop step %s took %lld ms\n",
+                          step, (long long) elapsedMs);
+    };
+
     // Loop-phase probe: stamp the phase being entered. The phase that just
     // ended is logged when it ran longer than 2 s. A phase that never ends
     // logs nothing here; loopPhaseAgeMs over RPC is the signal for that case.
-    const auto enterLoopPhase = [&im] (LoopPhase next)
+    const auto enterLoopPhase = [&im, &recordSlowLoopStep] (LoopPhase next)
     {
         const int64_t now = nowNs();
         const int64_t since = im.loopPhaseEnterNs.load (std::memory_order_relaxed);
@@ -3322,6 +3469,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         if (since > 0 && now - since > 2000000000ll)
             std::fprintf (stderr, "[viewport] loop phase %s took %lld ms (last step %s)\n",
                           kLoopPhaseNames[prev], (long long) ((now - since) / 1000000), lastStep);
+        recordSlowLoopStep (now);
         im.loopPhase.store ((int) next, std::memory_order_relaxed);
         im.loopPhaseEnterNs.store (now, std::memory_order_relaxed);
         // A new phase starts at its own step label.
@@ -3330,15 +3478,25 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     };
 
     // Advance sub-step probe: stamp the call about to run inside the phase.
-    const auto enterLoopStep = [&im] (const char* step)
+    const auto enterLoopStep = [&im, &recordSlowLoopStep] (const char* step)
     {
-        im.loopStepEnterNs.store (nowNs(), std::memory_order_relaxed);
+        const int64_t now = nowNs();
+        recordSlowLoopStep (now);
+        im.loopStepEnterNs.store (now, std::memory_order_relaxed);
         im.loopStep.store (step, std::memory_order_relaxed);
     };
     // Diagnostics for deferred frames: the run length, and the source and time of the last log line.
     std::uint64_t deferredConsecutive = 0;
     std::string_view lastDeferredSource;
     std::chrono::steady_clock::time_point lastDeferredLog {};
+    // A frame that a rejected plan keeps failing is retried a few times with a growing
+    // delay, then left alone until the revision, playhead or size changes. While
+    // playing, the playhead counts as changed only when the active clips change.
+    arbitviewport::FrameFailureGovernor planFailureGovernor;
+    const auto steadyMs = [] {
+        return static_cast<int64_t> (std::chrono::duration_cast<std::chrono::milliseconds> (
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
     // Retired-lifecycle commit retries: the run count, and the time of the last log line.
     std::uint64_t retiredPublishRetries = 0;
     std::chrono::steady_clock::time_point lastRetiredLog {};
@@ -3471,6 +3629,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     if (linearSharedActive && exact && gpusurf::validLinearRelease(release, sharedBufferGeneration,
                             static_cast<uint32_t>(im.buffers.size())))
                     {
+                        if (im.buffers[release.frame.bufferIndex].busy)
+                            viewportTelemetry.zeroCopyReleased();
                         im.buffers[release.frame.bufferIndex].busy = false;
                         im.sharedReleasesReceived.fetch_add(1);
                     }
@@ -3486,6 +3646,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     std::memcpy (&rel, msg.payload.data(), sizeof (rel));
                     if (rel.bufferIndex < im.buffers.size())
                     {
+                        if (im.buffers[rel.bufferIndex].busy)
+                            viewportTelemetry.zeroCopyReleased();
                         im.buffers[rel.bufferIndex].busy = false;
                         im.sharedReleasesReceived.fetch_add (1);
                     }
@@ -3627,8 +3789,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             {
                 for (const auto& segment : im.segments)
                 {
-                    const auto duration = (segment.outSec - segment.inSec) / std::max(segment.rate,1e-9);
-                    if (at < segment.displayStartSec || at >= segment.displayStartSec + duration) continue;
+                    if (! videowire::segmentCoversDisplayTime (segment, at)) continue;
                     if (segment.clipId == clipId) return true;
                     if (segment.transitionType != 0 && segment.transitionDurationSec > 0
                         && at < segment.displayStartSec + segment.transitionDurationSec)
@@ -3839,6 +4000,48 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
         }
 
+        // --- A frame whose plan was refused stays refused until its inputs change. The
+        // banner keeps the reason the failed attempt published, so the loop only waits.
+        // Paused, the exact frame is the key. Playing, the playhead moves every tick, so
+        // the key names the clips under it instead and a refused clip set stops
+        // retrying until the playhead leaves it (see FrameFailureGovernor).
+        arbitviewport::FrameFailureGovernor::Key planFailureKey {
+            im.contentRevision.load(), displaySec, fbW, fbH, 0 };
+        if (playing)
+        {
+            uint64_t clipSet = arbitviewport::FrameFailureGovernor::kEmptyClipSet;
+            {
+                std::lock_guard<std::mutex> lock (im.mutex);
+                for (const auto& s : im.segments)
+                {
+                    if (! videowire::segmentCoversDisplayTime (s, displaySec))
+                        continue;
+                    clipSet = arbitviewport::FrameFailureGovernor::foldClip (clipSet, s.clipId);
+                    // The clip a leading transition starts from is part of the frame too.
+                    if (s.transitionType != 0 && s.transitionDurationSec > 0.0
+                        && displaySec < s.displayStartSec + s.transitionDurationSec)
+                        if (const auto* from = videowire::resolveTransitionFrom (im.segments, s, 1e-3))
+                            clipSet = arbitviewport::FrameFailureGovernor::foldClip (clipSet, from->clipId);
+                }
+            }
+            planFailureKey.displaySec = 0.0;
+            planFailureKey.clipSet = clipSet;
+        }
+        if (planFailureGovernor.shouldHold (planFailureKey, steadyMs()))
+        {
+            if (! frameVisualEvents.empty())
+            {
+                std::lock_guard<std::mutex> lock (im.mutex);
+                im.visualEvents.insert (im.visualEvents.begin(),
+                                        frameVisualEvents.begin(), frameVisualEvents.end());
+                frameVisualEvents.clear();
+            }
+            enterLoopPhase (LoopPhase::FramePacing);
+            std::this_thread::sleep_for (std::chrono::duration<double> (std::min (frameBudgetSec, 0.05)));
+            nextTickNs = nowNs();
+            continue;
+        }
+
         // --- Gather every segment active at displaySec + transition sources.
         enterLoopPhase (LoopPhase::Advance);
         std::vector<ActiveLayer> act;
@@ -3890,6 +4093,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             {
                 canonicalScoreSource = im.scoreSnapshot;
                 localScore = *canonicalScoreSource;
+                localHarmony = im.harmonySnapshot;
                 scoreGenSeen = im.scoreGeneration;
                 scoreIdentity = im.scoreIdentity;
                 cachedCanonicalBlockCFrame.reset();
@@ -4053,6 +4257,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                         std::fprintf(stderr, "[viewport] video Signal window unavailable for frame/FPS; dependent sinks are inactive\n");
                     signalWindowMissing = missingWindow;
                     enterLoopStep ("advance:control-evaluate");
+                    controlExecutor.setHarmonyContext(localHarmony.get(), &activeBeatTimeline);
                     const auto& sinks = controlExecutor.evaluate(
                         localScore, clk, *audPtr, static_cast<float>(dtBeats),
                         static_cast<float>(1.0 / clkFps), f, clkFps);
@@ -4219,9 +4424,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             constexpr double kAbutEps = 1e-3;
             for (const auto& s : im.segments)
             {
-                const double segDur = (s.outSec - s.inSec) / std::max (s.rate, 1e-9);
-                if (! (displaySec >= s.displayStartSec
-                       && displaySec < s.displayStartSec + segDur))
+                if (! videowire::segmentCoversDisplayTime (s, displaySec))
                     continue;
 
                 ActiveLayer al;
@@ -4438,6 +4641,12 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         renderer.setView ((float) viewZoom_.load(),
                           (float) viewPanX_.load(),
                           (float) viewPanY_.load());
+        // The imported 3D scene is drawn at the size the panel shows the canvas, not at
+        // the canvas size (a 4K canvas in a 424x240 dock). The compositor scales the
+        // scene texture to the canvas. Export and the composite probe never use this.
+        const auto previewSceneExtent = videohelper::previewextent::fitToPresentation (
+            cw > 0 ? cw : fbW, ch > 0 ? ch : fbH, fbW, fbH,
+            videohelper::previewextent::zoomBucket (viewZoom_.load()));
         // Frame-global render settings mirrored from the export job so preview ==
         // export (master-plan principle #1): the canvas background colour and the
         // bloom/tonemap post stack. Neutral defaults skip the post pass and clear
@@ -4528,6 +4737,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         bool frameSettled = true;
         // A plan or binding failure holds the last presented frame and keeps the
         // channel open. The error stays on rendererError until a frame presents.
+        // planLayerClipId is the layer the loop below is building, so a plan error names its clip.
+        int planLayerClipId = -1;
         const auto holdFrameForPlanError = [&](const std::string& error)
         {
             if (geometryPendingThisFrame())
@@ -4541,6 +4752,9 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             planFrameError = error.empty() ? std::string("visual plan execution failed") : error;
             std::lock_guard<std::mutex> lock(im.mutex);
             im.rendererError = planFrameError;
+            // The editor shows this reason beside the stale frame, so it names the clip.
+            im.planError = planFrameError;
+            im.planErrorClipId = planLayerClipId;
             // A held plan error retries every tick until a frame presents. It is not a GL wait.
             deferredSource = "plan-error";
             frameDeferred = true;
@@ -4750,7 +4964,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             enterLoopStep ("advance:parameter-history-bind");
             parameterHistory->bind(localRoutings,localControlPlan,particleHistory->score,
                 activeBeatTimeline,valueFps,
-                videowire::simulationAutomationDestinations(frameVisualPlans->plans),parameterHistoryError);
+                videowire::simulationAutomationDestinations(frameVisualPlans->plans),parameterHistoryError,
+                localHarmony);
         }
         const auto historyAudio=*particleHistory;
         particleHistory->parameterAt=[parameterHistory,historyAudio,parameterHistoryError,localParameterTimeline]
@@ -4851,7 +5066,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     ? segment.clockDurationSec : (segment.outSec - segment.inSec) / std::max(segment.rate, 1e-9);
                 desc.shaderClock = videorender::makeShaderClock(displaySec, clockStart, clockDuration,
                     activeBeatTimeline, valueFps, playing,
-                    static_cast<int>(std::llround((displaySec - clockStart) * valueFps)));
+                    static_cast<int>(std::llround((displaySec - clockStart) * valueFps)), localHarmony.get());
             }
             attachGeometryAudio(desc);
             if (haveScore)
@@ -4873,7 +5088,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 const double duration = segment.clockDurationSec > 0 ? segment.clockDurationSec
                     : (segment.outSec-segment.inSec)/std::max(segment.rate,1e-9);
                 sampled.shaderClock = videorender::makeShaderClock(at,begin,duration,activeBeatTimeline,
-                    valueFps,playing,static_cast<int>(std::llround((at-begin)*valueFps)));
+                    valueFps,playing,static_cast<int>(std::llround((at-begin)*valueFps)), localHarmony.get());
                 sampled.audioFeatures = previewMixFeatureAt(at);
                 sampled.audioPresent = !sampled.audioFeatures.bands.empty();
                 sampled.canonicalBlockCFrame.reset();
@@ -4974,7 +5189,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 const double duration = segment.clockDurationSec > 0 ? segment.clockDurationSec
                     : (segment.outSec-segment.inSec)/std::max(segment.rate,1e-9);
                 desc.shaderClock = videorender::makeShaderClock(displaySec,begin,duration,activeBeatTimeline,
-                    valueFps,playing,static_cast<int>(std::llround((displaySec-begin)*valueFps)));
+                    valueFps,playing,static_cast<int>(std::llround((displaySec-begin)*valueFps)), localHarmony.get());
             }
             const auto importedFrameInputs = desc;
             std::optional<videohelper::importedscene::ImportedMaterialFrameResolver> importedFrameResolver;
@@ -5014,14 +5229,22 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     videohelper::importedscene::NativeImportedSceneRenderUse::Preview>(renderer,
                     *importedFramePlan,*importedFrameCompiled,segment,std::move(savedSegments),displaySec,sourceSec,valueFps,
                     importedFrameInputs,&params.visualParams,invocationContext,temporalSamplingTransaction,activity,
-                    [&](const auto& selected,double at,const auto&,std::string&) { return decodeLayer(selected,at,true,valueFps,true); },
+                    [&](const auto& selected,double at,const auto&,std::string&) {
+                        // An exact-time decode after a seek can run long; name it.
+                        loopstep::Scope decodeScope ("advance:imported-scene:frame-decode");
+                        return decodeLayer(selected,at,true,valueFps,true);
+                    },
                     [&](const auto& decoded,const auto& policy,std::string& failure) {
+                        loopstep::Scope leaseScope ("advance:imported-scene:frame-lease");
                         return decoded.hdrFrame.width > 0
                             ? renderer.leaseDecodedHdrFrameForMaterial(decoded.hdrFrame,policy,failure)
                             : renderer.leaseDecodedFrame(decoded.tex,decoded.texW,decoded.texH,decoded.frameColor,failure);
                     }));
             }
             enterLoopStep ("advance:imported-scene-exec");
+            std::optional<std::uint64_t> importedSceneRenderNs;
+            videohelper::previewextent::Extent importedSceneRenderedExtent;
+            std::string importedSceneCausticDegradation;
             const auto importedSceneResult =
                 videohelper::importedscene::prepareVisualImportedSceneLayerAtTime(
                     frameVisualPlans->plans, segment.clipId,
@@ -5032,7 +5255,16 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     importedSceneFrameOwners, planError, &params.visualParams,
                     { videohelper::viewportgeneration::projectGeneration(timelineGen), visualEvaluationContext.helperGeneration }, &materialFrameResolver,
                     linearSharedActive, &activeBeatTimeline, displaySec, nullptr,
-                    importedFrameResolver ? &*importedFrameResolver : nullptr);
+                    importedFrameResolver ? &*importedFrameResolver : nullptr, &importedSceneRenderNs,
+                    &previewSceneExtent, &importedSceneRenderedExtent,
+                    &importedSceneCausticDegradation);
+            if (importedSceneRenderNs)
+            {
+                im.visualTelemetry.recordImportedSceneRender (*importedSceneRenderNs);
+                im.visualTelemetry.recordImportedScenePreviewExtent (
+                    importedSceneRenderedExtent.width, importedSceneRenderedExtent.height);
+                im.visualTelemetry.recordImportedSceneCausticDegradation (importedSceneCausticDegradation);
+            }
             desc.materialInputsAt = {};
             if (importedSceneResult != videohelper::importedscene::
                                            VisualImportedScenePreparation::notApplicable)
@@ -5132,6 +5364,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         {
             if (al.params.visible < 0.5f || al.params.opacity <= 0.001f)
                 continue;
+            planLayerClipId = al.seg.clipId;
 
             if (videowire::isOpticalFlowPlan (frameVisualPlans->plans, al.seg.clipId))
             {
@@ -5440,7 +5673,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 d.shaderSource = true;
                 d.shaderClock = videorender::makeShaderClock (
                     displaySec, clockStart, clockDuration, activeBeatTimeline,
-                    clkFps, playing, frameIdx);
+                    clkFps, playing, frameIdx, localHarmony.get());
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
                     d.canonicalBlockCFrame = cachedCanonicalBlockCFrame;
@@ -5467,7 +5700,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 d.particleSource = true;
                 d.shaderClock = videorender::makeShaderClock (
                     displaySec, clockStart, clockDuration, activeBeatTimeline,
-                    clkFps, playing, frameIdx);
+                    clkFps, playing, frameIdx, localHarmony.get());
                 fillDescCommon (d, al.params, displaySec, al.seg.clipId);
                 if (haveScore)
                     d.canonicalBlockCFrame = cachedCanonicalBlockCFrame;
@@ -5477,6 +5710,9 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     const double sceneSeconds = al.seg.inSec
                         + (displaySec - al.seg.displayStartSec) * al.seg.rate;
                     enterLoopStep ("advance:imported-particle-scene-exec");
+                    std::optional<std::uint64_t> particleSceneRenderNs;
+                    videohelper::previewextent::Extent particleSceneRenderedExtent;
+                    std::string particleSceneCausticDegradation;
                     const auto prepared = videohelper::importedscene::prepareVisualImportedSceneLayerAtTime(
                         frameVisualPlans->plans, al.seg.clipId, cw > 0 ? cw : fbW, ch > 0 ? ch : fbH,
                         sceneSeconds, valueFps,
@@ -5484,7 +5720,16 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                         importedSceneExecution.get(), &importedScenePlanCache, d,
                         importedSceneFrameOwners, sceneError, &al.params.visualParams,
                         { videohelper::viewportgeneration::projectGeneration(timelineGen), visualEvaluationContext.helperGeneration }, nullptr,
-                        linearSharedActive, &activeBeatTimeline, displaySec);
+                        linearSharedActive, &activeBeatTimeline, displaySec, nullptr, nullptr,
+                        &particleSceneRenderNs, &previewSceneExtent, &particleSceneRenderedExtent,
+                        &particleSceneCausticDegradation);
+                    if (particleSceneRenderNs)
+                    {
+                        im.visualTelemetry.recordImportedSceneRender (*particleSceneRenderNs);
+                        im.visualTelemetry.recordImportedScenePreviewExtent (
+                            particleSceneRenderedExtent.width, particleSceneRenderedExtent.height);
+                        im.visualTelemetry.recordImportedSceneCausticDegradation (particleSceneCausticDegradation);
+                    }
                     if (prepared == videohelper::importedscene::VisualImportedScenePreparation::pending)
                     {
                         importedPendingThisFrame = true;
@@ -5513,7 +5758,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 d.canonicalBlockCFrame = cachedCanonicalBlockCFrame;
                 d.shaderClock = videorender::makeShaderClock(
                     displaySec, clockStart, clockDuration, activeBeatTimeline,
-                    clkFps, playing, frameIdx);
+                    clkFps, playing, frameIdx, localHarmony.get());
                 fillDescCommon(d, al.params, displaySec, al.seg.clipId);
             }
             else
@@ -5555,19 +5800,29 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             if (d.shaderOperationPlan != nullptr && d.shaderTransitionFromClipId > 0
                 && d.fromLayer == nullptr)
             {
+                {
+                    const double clipStart = al.seg.clockStartSec >= 0.0
+                        ? al.seg.clockStartSec : al.seg.displayStartSec;
+                    const double clipSeconds = al.seg.clockDurationSec > 0.0
+                        ? al.seg.clockDurationSec
+                        : (al.seg.outSec - al.seg.inSec) / std::max(al.seg.rate, 1e-9);
+                    videowire::driveShaderTransitionProgress(d, videowire::shaderTransitionFraction(
+                        displaySec, clipStart, videowire::shaderTransitionSpanSeconds(
+                            al.seg.transitionType != 0 ? al.seg.transitionDurationSec : 0.0, clipSeconds)));
+                }
                 ViewportSegment referenced;
                 bool found = false;
                 {
                     std::lock_guard<std::mutex> lock(im.mutex);
-                    const auto* source = videowire::resolveClipSegmentAtDisplayTime(
-                        im.segments, d.shaderTransitionFromClipId, displaySec);
+                    const auto* source = videowire::resolveTransitionSourceSegmentAtDisplayTime(
+                        im.segments, d.shaderTransitionFromClipId, displaySec, al.seg.displayStartSec);
                     if (source != nullptr) { referenced = *source; found = true; }
                 }
                 if (!found) { planError = "shader transition Layer Source clip is unavailable"; }
                 else
                 {
-                    const double sourceSec = referenced.inSec
-                        + (displaySec - referenced.displayStartSec) * referenced.rate;
+                    const double sourceSec = videowire::transitionSourceSeconds(referenced, displaySec,
+                        videowire::transitionHeldFrameSeconds(referenced.sourceFps));
                     ClipGraphParams referencedParams;
                     {
                         std::lock_guard<std::mutex> lock(im.mutex);
@@ -5595,7 +5850,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                             const double duration=referenced.clockDurationSec>0?referenced.clockDurationSec
                                 :(referenced.outSec-referenced.inSec)/std::max(referenced.rate,1e-9);
                             from.shaderClock=videorender::makeShaderClock(displaySec,begin,duration,
-                                activeBeatTimeline,valueFps,playing,(int)std::llround((displaySec-begin)*valueFps));
+                                activeBeatTimeline,valueFps,playing,(int)std::llround((displaySec-begin)*valueFps), localHarmony.get());
                         }
                     }
                     else if (!prepareDecodedDesc(referenced, referencedParams, sourceSec, from, referencedStream))
@@ -5708,6 +5963,14 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     std::fprintf (stderr, "[viewport] spectrum-bake cause: %s\n", im.rendererError.c_str());
                 }
             }
+            if (deferredSource == "plan-error")
+            {
+                if (planFailureGovernor.noteFailure (planFailureKey, steadyMs()))
+                    std::fprintf (stderr, "[viewport] plan error holds this frame: no more retries "
+                        "until the project, playhead or size changes\n");
+            }
+            else
+                planFailureGovernor.noteSuccess();
             temporalSamplingTransaction.discard();
             // The swap at the top of the tick moved the visual events out of
             // im.visualEvents. Hand them back for the next produce.
@@ -5724,12 +5987,15 @@ void Viewport::renderLoop (int width, int height, int x, int y,
         }
         deferredConsecutive = 0;
         lastDeferredSource = {};
+        planFailureGovernor.noteSuccess();
 
         if (!planFrameError.empty())
         {
             // This frame presents without a plan hold, so the earlier error has ended.
             std::lock_guard<std::mutex> lock(im.mutex);
             if (im.rendererError == planFrameError) im.rendererError.clear();
+            im.planError.clear();
+            im.planErrorClipId = -1;
             planFrameError.clear();
         }
 

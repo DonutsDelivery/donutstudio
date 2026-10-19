@@ -4773,8 +4773,13 @@ void testGlassCausticRequestHandoff()
             && actual.staticPayloadIdentity == exactImportedScenePayloadIdentity(plan)
             && actual.runtimeInputs.linearColor
             && layer.nativeLinearImage == execution.nextFrame
-            && layer.nativeTextureOwner == execution.nextFrame && owners.size() == 1;
+            && layer.nativeTextureOwner == execution.nextFrame && owners.size() == 1
+            && owners.back().frame == execution.nextFrame;
             check(conditionOk, "ordinary preview/export preserves exact caustic source, glass, policy, frame and linear ownership: " + error);
+            // The receipt moves into the owner list before the layer publishes its
+            // linear image. SDR composition converts only a layer that still holds it.
+            check(layer.nativeLinearImage != nullptr && arbitgpu::isLinearSceneColor(layer.nativeTextureDescriptor),
+                "caustic linear layer keeps its native linear image after the receipt moves to its owner");
         }
     }
     check(execution.staticGpuUploads == 1,
@@ -7032,6 +7037,122 @@ void testParentLightRecordIdentity()
         "a modulated light value does not reuse a parent frame rendered at another value");
     check(!sameParentLightRecords(stored, {}) && !sameParentLightRecords({}, stored),
         "a light set present on only one side does not reuse a parent frame");
+}
+
+// A placed Fade Transition saves progress 0. That value means "follow the timeline", and any
+// other saved progress is the user's fixed mix.
+void testShaderTransitionTimeDrivenProgress()
+{
+    struct TransitionLayer
+    {
+        videowire::ImmutableShaderOperationPlan shaderOperationPlan;
+        std::map<int, std::map<std::string, double>> shaderOperationParameters;
+    };
+    const auto makeLayer = [](double savedProgress, shadertransition::Easing easing,
+                              shadertransition::Direction direction)
+    {
+        auto plan = std::make_shared<videowire::ShaderOperationPlan>();
+        videowire::ShaderOperation operation;
+        operation.kind = videowire::ShaderOperationKind::transition;
+        operation.nodeId = 31;
+        shadertransition::Payload payload;
+        payload.progress = savedProgress;
+        payload.direction = direction;
+        payload.easing = easing;
+        operation.transitionPayload = payload;
+        plan->operations.push_back(std::move(operation));
+        TransitionLayer layer;
+        layer.shaderOperationPlan = plan;
+        layer.shaderOperationParameters[31]["progress"] = shadertransition::evaluateProgress(
+            savedProgress, direction, easing);
+        return layer;
+    };
+
+    auto timeDriven = makeLayer(0.0, shadertransition::Easing::linear, shadertransition::Direction::forward);
+    check(videowire::driveShaderTransitionProgress(timeDriven, 0.25)
+              && std::abs(timeDriven.shaderOperationParameters[31]["progress"] - 0.25) < 1e-12,
+          "a placed transition with saved progress 0 follows the timeline");
+    check(videowire::driveShaderTransitionProgress(timeDriven, 1.0)
+              && timeDriven.shaderOperationParameters[31]["progress"] == 1.0,
+          "a time-driven transition reaches its full mix at the end of its span");
+
+    auto eased = makeLayer(0.0, shadertransition::Easing::easeInOut, shadertransition::Direction::forward);
+    check(videowire::driveShaderTransitionProgress(eased, 0.5)
+              && std::abs(eased.shaderOperationParameters[31]["progress"] - 0.5) < 1e-12
+              && videowire::driveShaderTransitionProgress(eased, 0.25)
+              && eased.shaderOperationParameters[31]["progress"] < 0.25,
+          "a time-driven transition applies its saved easing");
+
+    auto reversed = makeLayer(0.0, shadertransition::Easing::linear, shadertransition::Direction::reverse);
+    check(videowire::driveShaderTransitionProgress(reversed, 0.25)
+              && std::abs(reversed.shaderOperationParameters[31]["progress"] - 0.75) < 1e-12,
+          "a time-driven transition applies its saved direction");
+
+    auto fixed = makeLayer(0.5, shadertransition::Easing::linear, shadertransition::Direction::forward);
+    check(! videowire::driveShaderTransitionProgress(fixed, 0.9)
+              && fixed.shaderOperationParameters[31]["progress"] == 0.5,
+          "a user-set progress overrides the timeline");
+
+    TransitionLayer none;
+    check(! videowire::driveShaderTransitionProgress(none, 0.5),
+          "a layer without a transition plan is left alone");
+}
+
+// The export pipeline builds frame n while frame n-1 still waits for its readback.
+// A clip that first appears after a cut has no lifecycle in the previous frame, so
+// its candidate must still expect the generation advance of that pending commit.
+void testPipelinedExportAcrossClipCut()
+{
+    const auto makePlan = [](int clipId)
+    {
+        videowire::CompiledVisualLayerPlan plan;
+        plan.clipId = clipId;
+        plan.structuralRevision = 4;
+        plan.producerValidated = true;
+        plan.nodeKinds = { "video.source", "video.out" };
+        plan.nodeIds = { 11, 12 };
+        plan.ports = {
+            { 11, 0, 1, "out", "frame", "image", "rgba8", "sRGB" },
+            { 12, 0, 1, "in", "frame", "image", "rgba8", "sRGB" }
+        };
+        plan.edges = { { 11, 0, 12, 0 } };
+        plan.operations = {
+            { 11, "video.source", "source-decode", "" },
+            { 12, "video.out", "native-gpu", "" }
+        };
+        return plan;
+    };
+    std::string error;
+    videowire::VisualPlanExecutionState state;
+    check(state.admitPlans({ makePlan(7), makePlan(8) }, &error, 320, 180),
+          "cut fixture admits both clip plans");
+    const auto addFrame = [&](videowire::TemporalSamplingCommitTransaction& transaction,
+                              int clipId, double timeSec)
+    {
+        visualtemporalsampling::LifecycleState lifecycle;
+        std::string addError;
+        return state.temporalLifecycleSnapshot(clipId, 4, lifecycle)
+            && transaction.add(state, clipId, 4, timeSec, std::move(lifecycle), addError);
+    };
+
+    // Same order as the exporter loop: build n, commit n-1, keep n pending.
+    videowire::TemporalSamplingCommitTransaction beforeCut;
+    check(addFrame(beforeCut, 7, 0.0), "frame before the cut prepares clip 7");
+
+    videowire::TemporalSamplingCommitTransaction firstAfterCut;
+    firstAfterCut.seedFrom(beforeCut);
+    check(addFrame(firstAfterCut, 8, 1.0 / 30.0),
+          "first frame after the cut prepares clip 8 while the earlier frame is pending");
+    check(beforeCut.commit(error), "the frame before the cut publishes");
+
+    videowire::TemporalSamplingCommitTransaction secondAfterCut;
+    secondAfterCut.seedFrom(firstAfterCut);
+    check(addFrame(secondAfterCut, 8, 2.0 / 30.0), "second frame after the cut prepares clip 8");
+    check(firstAfterCut.commit(error),
+          "a clip that starts at the cut publishes after the pending frame commits: " + error);
+    check(secondAfterCut.commit(error), "the next frame of the new clip publishes: " + error);
+    check(state.owner(7)->evaluationSequence == 1 && state.owner(8)->evaluationSequence == 2,
+          "each clip owner advances only for its own frames across the cut");
 }
 
 int main(int argc, char** argv)
@@ -9696,6 +9817,8 @@ int main(int argc, char** argv)
     }
 
     testMixedRetainedSceneSchedule();
+    testPipelinedExportAcrossClipCut();
+    testShaderTransitionTimeDrivenProgress();
 
     if (failures != 0)
     {

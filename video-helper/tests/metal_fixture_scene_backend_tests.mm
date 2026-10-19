@@ -474,7 +474,8 @@ bool metalMultipleScatterCausticCases(arbitgpu::NativeFixtureSceneBackend& backe
         if(rendered.stats.textureBytes<minimumStorage||rendered.stats.textureBytes>renderpassoutput::kMaximumTotalBytes)
             return fail("Metal multiple scatter larger native storage is not admitted");
         std::uint64_t combinedWork=0;
-        gc::EnergyLedger expected;std::vector<double> expectedSpectrum(receipt.spectralRadiance.size());
+        if(schedule.splatVersion!=gc::kSplatVersion)return fail("Metal ordinary multiple scatter frame did not opt into kernel splat deposition");
+        gc::EnergyLedger expected;std::array<double,8> visibleFlux{};
         const auto triangles=gt::worldTriangles(*fixture.scene);const auto source=gt::authoredSource(fixture);
         for(std::size_t w=0;w<schedule.work.size();++w) {
             const auto& work=schedule.work[w];const auto& entry=schedule.entries[work.entry];const auto& path=receipt.paths[w];
@@ -534,7 +535,7 @@ bool metalMultipleScatterCausticCases(arbitgpu::NativeFixtureSceneBackend& backe
                             if(deposit.footprint.x!=x||deposit.footprint.y!=y||!gc::nearPower(deposit.footprint.worldArea,footprint,3e-4)
                                 ||deposit.raster.object!=center.object||deposit.raster.material!=center.material||deposit.raster.instance!=center.instance||deposit.raster.triangle!=center.triangle)
                                 return fail("Metal multiple scatter pixel area or raster ownership differs from independent projection");
-                            expectedSpectrum[(std::size_t(y)*width+x)*8+band]+=power*rho/(std::acos(-1.0)*footprint);
+                            visibleFlux[band]+=power*rho;
                         }
                     }
                 }
@@ -569,10 +570,54 @@ bool metalMultipleScatterCausticCases(arbitgpu::NativeFixtureSceneBackend& backe
                 ||!gc::nearPower(energy.launched[band],energy.deposited[band]+energy.absorbed[band]+energy.escaped[band]+energy.unresolved[band]))
                 return fail("Metal multiple scatter frame energy is not conserved within its original tail");
         }
-        for(std::size_t at=0;at<expectedSpectrum.size();++at)
-            if(!gc::nearPower(receipt.spectralRadiance[at],expectedSpectrum[at],3e-3))
-                return fail("Metal multiple scatter spectrum differs from independent flux and pixel area");
+        // Per pixel against the binary64 kernel reference, then each band's
+        // splatted flux against the independent camera-visible outgoing power.
+        gc::SplatReference splatReference;
+        if(!gc::buildSplatReference(schedule,receipt.deposits,gc::splatCpuQuery(prepared,schedule),splatReference,error))return false;
+        std::array<double,8> splattedFlux{};
+        for(std::size_t at=0;at<receipt.spectralRadiance.size();++at) {
+            const auto found=splatReference.pixels.find(at);
+            const double physical=found==splatReference.pixels.end()?0:found->second.physical;
+            const double tolerance=found==splatReference.pixels.end()?0:found->second.tolerance+5e-4*physical;
+            if(std::abs(double(receipt.spectralRadiance[at])-physical)>tolerance)
+                return fail("Metal multiple scatter splat radiance differs from the binary64 kernel reference");
+            const auto area=splatReference.pixelAreas.find(at/8);
+            if(area!=splatReference.pixelAreas.end())splattedFlux[at%8]+=double(receipt.spectralRadiance[at])*std::acos(-1.0)*area->second;
+        }
+        for(unsigned band=0;band<8;++band)if(!gc::nearPower(splattedFlux[band],visibleFlux[band],3e-3))
+            return fail("Metal multiple scatter splat pixels do not conserve independent camera-visible outgoing power");
         if(test==0) {baseline=energy;baselineSpectrum=receipt.spectralRadiance;}
+        if(test==0) {
+            // Splat cap overflow: a gather cap lowered through the test hook makes
+            // the traced frame re-run as single-pixel deposits under its pre-splat
+            // identity, and the CPU reference overflows the same cap.
+            const auto splatOwner=schedule;
+            auto expectedSingle=splatOwner;
+            if(!gc::disableSplat(prepared,expectedSingle,error))return false;
+            struct CapGuard {~CapGuard(){gc::splatGatherWorkCapOverride().store(0);}} guard;
+            gc::splatGatherWorkCapOverride().store(1);
+            const auto crowded=arbitgpu::renderMetalGlassCausticFrame(fixture.scene,native.resources,width,height,runtime,prepared,scheduling,&micro);
+            if(!crowded.rendered||!crowded.frame)
+                return fail(("Metal splat cap overflow failed the frame instead of falling back: "+crowded.error).c_str());
+            gc::Frame single;gc::NativeReadback fallback;gc::EnergyLedger fallbackEnergy;
+            if(!arbitgpu::readMetalGlassCausticReceipt(crowded.frame,single,fallback,fallbackEnergy,error))return false;
+            arbitgpu::MetalGlassCausticMetrics crowdedMetrics;
+            if(!arbitgpu::readMetalGlassCausticMetrics(crowded.frame,crowdedMetrics,error))return false;
+            if(!crowdedMetrics.splatFallback||crowdedMetrics.splatVersion!=0||crowdedMetrics.splatGatherWork!=0
+                ||single.splatVersion!=0||single.identity!=expectedSingle.identity||fallback.frameIdentity!=expectedSingle.identity
+                ||!fallback.deposition.splatNormalisers.empty()||fallback.deposition.keys.size()!=single.bounds.deposition.paddedKeyCount
+                ||fallback.deposits.size()!=receipt.deposits.size())
+                return fail("Metal splat cap overflow did not re-run as the single-pixel frame with the same traced deposits");
+            gc::EnergyLedger checked;
+            if(!gc::validateNativeReadback(prepared,expectedSingle,fallback,checked,error,&fallback.deposition.submission))
+                return fail(("Metal single-pixel fallback differs from the single-pixel reference: "+error).c_str());
+            if(!gc::validateNativeReadback(prepared,splatOwner,fallback,checked,error,&fallback.deposition.submission))
+                return fail(("Metal single-pixel fallback differs from the CPU reference under the same cap: "+error).c_str());
+            gc::splatGatherWorkCapOverride().store(0);
+            if(gc::validateNativeReadback(prepared,splatOwner,fallback,checked,error,&fallback.deposition.submission))
+                return fail("Metal single-pixel fallback was accepted without a CPU cap overflow");
+            error.clear();
+        }
         if(test==1&&baselineSpectrum==receipt.spectralRadiance)return fail("Metal substantial roughness did not change the receiver footprint");
         if(test==2&&!gc::nearPower(energy.deposited[3],2*baseline.deposited[3],3e-3))return fail("Metal multiple scatter source Li control is not causal");
         if(test==3)bandResponse=energy.deposited[5]<baseline.deposited[5];
@@ -2996,7 +3041,7 @@ bool metalCausticCases(arbitgpu::NativeFixtureSceneBackend& backend,std::string&
         const auto triangles=oracle::worldTriangles(*fixture.scene);
         const oracle::D3 camera{fixture.frame.camera.transform.translation.x,fixture.frame.camera.transform.translation.y,fixture.frame.camera.transform.translation.z};
         const double tangent=std::tan(double(fixture.frame.camera.verticalFovRadians)/2),aspect=double(fixture.frame.width)/fixture.frame.height;
-        std::vector<double> pixels(receipt.spectralRadiance.size());
+        std::vector<double> pixels(receipt.spectralRadiance.size());std::array<double,8> visibleFlux{};
         for(std::size_t w=0;w<fixture.frame.work.size();++w) {
             const auto& work=fixture.frame.work[w];const auto branches=oracle::branchOracle(fixture,fixture.frame.entries[work.entry],work.band,fixture.policy->description().minimumBranchFraction,
                 fixture.policy->description().maximumVisits,fixture.policy->description().maximumInterfaces,{},work.interfaceSample);
@@ -3039,9 +3084,29 @@ bool metalCausticCases(arbitgpu::NativeFixtureSceneBackend& backend,std::string&
                 const auto* material=arbitgpu::nativeSurfaceForObject(fixture.program.get(),HarmonicMIDI::grid::SceneObjectId{h.object});
                 const double power=double(work.incidentPower)*arrival.fraction*material->spectralReflectance->coefficients[work.band];
                 pixels[(std::size_t(y)*fixture.frame.width+x)*8+work.band]+=power/(3.14159265358979323846*footprint);
+                visibleFlux[work.band]+=power;
             }
         }
-        for(std::size_t pixel=0;pixel<pixels.size();++pixel)
+        if(fixture.frame.splatVersion) {
+            // Splat frames: per pixel against the binary64 kernel reference, then
+            // each band's splatted flux against the independent visible power.
+            gc::SplatReference splatReference;
+            if(!gc::buildSplatReference(fixture.frame,receipt.deposits,gc::splatCpuQuery(fixture.prepared,fixture.frame),splatReference,error))return false;
+            std::array<double,8> splattedFlux{};
+            for(std::size_t pixel=0;pixel<pixels.size();++pixel) {
+                const auto found=splatReference.pixels.find(pixel);
+                const double physical=found==splatReference.pixels.end()?0:found->second.physical;
+                const double tolerance=found==splatReference.pixels.end()?0:found->second.tolerance+5e-4*physical;
+                if(std::abs(double(receipt.spectralRadiance[pixel])-physical)>tolerance)
+                    return fail("Metal caustic native eight-band splat pixel differs from the binary64 kernel reference");
+                const auto area=splatReference.pixelAreas.find(pixel/8);
+                if(area!=splatReference.pixelAreas.end())
+                    splattedFlux[pixel%8]+=double(receipt.spectralRadiance[pixel])*3.14159265358979323846*area->second;
+            }
+            for(unsigned band=0;band<8;++band)if(!gc::nearPower(splattedFlux[band],visibleFlux[band],2e-3))
+                return fail("Metal caustic native splat pixels do not conserve independent camera-visible power");
+        }
+        else for(std::size_t pixel=0;pixel<pixels.size();++pixel)
             if(!gc::nearPower(receipt.spectralRadiance[pixel],pixels[pixel],1e-3))
                 return fail("Metal caustic native eight-band pixel differs from independent branch/camera/plane-area oracle");
         arbitgpu::NativeRawPassPixels color;
@@ -3192,7 +3257,12 @@ bool metalCausticCases(arbitgpu::NativeFixtureSceneBackend& backend,std::string&
                         <<" band="<<band<<" receiverCentroidError="<<spatialError<<" spectralPowerError="<<powerError<<'\n';
                 }
             }
-            for(std::size_t at=0;at<receipt.spectralRadiance.size();++at) {
+            // Splat frames check the float32 gather against the binary64 kernel
+            // reference; single-pixel frames against the canonical deposition sum.
+            if(fixture.frame.splatVersion
+                &&!gc::validateSplatReadback(fixture.frame,receipt,gc::splatCpuQuery(prepared,fixture.frame),error))
+                return fail(("Metal full-resolution splat gather differs from the kernel reference: "+error).c_str());
+            if(!fixture.frame.splatVersion)for(std::size_t at=0;at<receipt.spectralRadiance.size();++at) {
                 const auto expected=spatial[level].radiance.find(at);
                 const float value=expected==spatial[level].radiance.end()?0:expected->second;
                 if(!gc::nearPower(receipt.spectralRadiance[at],value,1e-6))
@@ -5455,7 +5525,9 @@ int main()
         auto crossedPeriod = backend.render(
             scene, crossedPeriodPreparation.resources, 96, 96, {});
         const auto crossedPeriodPixels = readBgra8(crossedPeriod.frame);
-        const auto overBudgetCrossed = backend.render(
+        // Crossed order-one lobes at 4K exceed one draw's cap but fit the
+        // frame cap, so the frame renders as two scissored row bands.
+        const auto bandedCrossed = backend.render(
             scene, crossedPreparation.resources, 3840, 2160, {});
 
         const auto reportDraw = [](const char* name, const auto& prepared,
@@ -5512,11 +5584,10 @@ int main()
                           && primaryPeriodPixels != crossedPixels
                           && crossedPeriodPixels != crossedPixels,
                       "Metal crossed diffraction must independently respond to lattice orientation and both periods")
-            && expect(!overBudgetCrossed.rendered
-                          && overBudgetCrossed.frame == nullptr
-                          && overBudgetCrossed.error
-                               == "Metal fixture diffraction workload exceeds backend limits",
-                      "Metal rejects over-budget crossed diffraction before frame allocation");
+            && expect(bandedCrossed.rendered
+                          && bandedCrossed.frame != nullptr
+                          && bandedCrossed.stats.drawCount == 2u,
+                      "Metal renders 4K crossed diffraction as two row bands");
         const bool malformedRejected = expect(
             !malformedPreparation.prepared && malformedPreparation.resources == nullptr
                 && malformedPreparation.stats.vertexBytes == 0

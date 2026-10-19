@@ -128,6 +128,9 @@ public:
         return true;
     }
 
+    // The consumer sent FrameRelease for a buffer this owner handed off and still held busy.
+    bool zeroCopyReleased() { return telemetry_.recordTransportRelease(); }
+
     void noFreeExportedBuffer() { telemetry_.recordDrop (VisualDropReason::noBuffer); }
 
 private:

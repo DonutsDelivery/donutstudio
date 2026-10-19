@@ -423,6 +423,156 @@ inline bool frame(const Prepared& prepared, const std::vector<Instance>& matrice
     return true;
 }
 
+// The instance tree of tree(..., triangles=false), written into a vector that
+// holds only the texels from base on. Every stored index is absolute.
+inline std::size_t instanceTree(std::vector<Texel>& texels, std::size_t base, std::vector<Primitive>& primitives,
+                                std::size_t begin, std::size_t end)
+{
+    Bounds bounds;
+    for (auto i = begin; i < end; ++i)
+        bounds.add(primitives[i].bounds);
+    const auto node = texels.size();
+    texels.resize(node + 2);
+    std::size_t leaf = 0;
+    if (end - begin <= 1u)
+        leaf = primitives[begin].record + 1;
+    else
+    {
+        int axis = 0;
+        for (int a = 1; a < 3; ++a)
+            if (bounds.high[a] - bounds.low[a] > bounds.high[axis] - bounds.low[axis])
+                axis = a;
+        const auto middle = begin + (end - begin) / 2;
+        std::nth_element(
+            primitives.begin() + begin, primitives.begin() + middle, primitives.begin() + end,
+            [axis](const auto& a, const auto& b)
+            { return a.bounds.low[axis] + a.bounds.high[axis] < b.bounds.low[axis] + b.bounds.high[axis]; });
+        instanceTree(texels, base, primitives, begin, middle);
+        instanceTree(texels, base, primitives, middle, end);
+    }
+    texels[node] = {bounds.low[0], bounds.low[1], bounds.low[2], float(base + texels.size())};
+    texels[node + 1] = {bounds.high[0], bounds.high[1], bounds.high[2], float(leaf)};
+    return base + node;
+}
+
+// Preview resident query. frame() copies the static BLAS texels into every
+// frame. A resident texture keeps them on the GPU, so the tail holds only what
+// frame() appends after them: identities, instance records, the work allowance
+// and the TLAS. texels[i] is frame().texels[begin + i]. The world matrix of each
+// emitted instance record is kept, in record order, for a GPU TLAS refit.
+struct FrameTail
+{
+    std::size_t begin = 0;
+    std::size_t instanceBegin = 0;
+    std::vector<Texel> texels;
+    std::vector<Matrix> worlds;
+    std::array<float, 4> control{};
+    std::size_t height = 1;
+};
+inline bool frameTail(const Prepared& prepared, const std::vector<Instance>& matrices, FrameTail& output,
+                      std::string& error)
+{
+    if (matrices.size() > kMaximumInstances)
+    {
+        error = "Opaque visibility instance count exceeds budget";
+        return false;
+    }
+    FrameTail candidate;
+    const auto base = prepared.texels.size();
+    candidate.begin = base;
+    const auto metadata = base;
+    if (prepared.mode == AdmissionMode::allSurfaces)
+        candidate.texels.insert(candidate.texels.end(), prepared.identities.begin(), prepared.identities.end());
+    candidate.instanceBegin = base + candidate.texels.size();
+    std::vector<Primitive> instances;
+    std::size_t queryWork = 0;
+    for (std::size_t o = 0; o < matrices.size(); ++o)
+    {
+        if (matrices[o].object >= 64 ||
+            (prepared.mode == AdmissionMode::allSurfaces && matrices[o].object >= prepared.objectCount))
+        {
+            error = "Opaque visibility instance object is invalid";
+            return false;
+        }
+        const auto meshIndex = prepared.objectMesh[matrices[o].object];
+        if (meshIndex < 0)
+            continue;
+        if (std::size_t(meshIndex) >= prepared.meshes.size())
+        {
+            error = "Scene query mesh index is invalid";
+            return false;
+        }
+        const auto& mesh = prepared.meshes[std::size_t(meshIndex)];
+        queryWork += mesh.nodes + mesh.triangles;
+        if (mesh.root + 1 >= prepared.texels.size())
+        {
+            error = "Scene query mesh root is invalid";
+            return false;
+        }
+        const auto& world = matrices[o].world;
+        Matrix local;
+        if (prepared.mode == AdmissionMode::allSurfaces &&
+            (!std::all_of(world.begin(), world.end(), [](float v) { return std::isfinite(v); }) ||
+             world[3] != 0 || world[7] != 0 || world[11] != 0 || world[15] != 1))
+        { error = "Scene closest-hit transform is not finite affine"; return false; }
+        if (!inverse(world, local))
+        {
+            error = "Opaque visibility transform is singular or non-finite";
+            return false;
+        }
+        Primitive p;
+        p.record = base + candidate.texels.size();
+        for (int r = 0; r < 3; ++r)
+            candidate.texels.push_back({local[r], local[4 + r], local[8 + r], local[12 + r]});
+        candidate.texels.push_back({float(mesh.root), float(prepared.texels[mesh.root][3]),
+            prepared.mode == AdmissionMode::allSurfaces ? float(metadata + matrices[o].object) : 0.0f,
+            prepared.mode == AdmissionMode::allSurfaces ? float(o) : 0.0f});
+        candidate.worlds.push_back(world);
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            Point v;
+            for (int a = 0; a < 3; ++a)
+                v[a] = (corner & (1 << a)) ? mesh.bounds.high[a] : mesh.bounds.low[a];
+            const auto q = transform(world, v);
+            for (float c : q)
+                if (!std::isfinite(c))
+                {
+                    error = "Opaque visibility world bounds are non-finite";
+                    return false;
+                }
+            p.bounds.add(q);
+        }
+        instances.push_back(p);
+    }
+    if (prepared.mode == AdmissionMode::allSurfaces)
+        candidate.control = {float(base + candidate.texels.size()), float(base + candidate.texels.size()),
+                             float(kTextureWidth), 2};
+    if (!instances.empty())
+    {
+        if (prepared.mode == AdmissionMode::allSurfaces)
+        {
+            queryWork += treeNodes(instances.size(), 1);
+            if (queryWork == 0 || queryWork > kMaximumClosestHitWork)
+            { error = "Scene closest-hit topology exceeds its work budget"; return false; }
+            candidate.texels.push_back({float(queryWork & 65535u), float(queryWork >> 16),
+                                        float(kClosestHitStackCapacity), 3.0f});
+        }
+        const auto root = instanceTree(candidate.texels, base, instances, 0, instances.size());
+        candidate.control = {float(root), float(base + candidate.texels.size()), float(kTextureWidth),
+                             prepared.mode == AdmissionMode::allSurfaces ? 2.0f : 1.0f};
+    }
+    const auto total = base + candidate.texels.size();
+    if (total > kTextureWidth * kTextureHeight)
+    {
+        error = "Opaque visibility frame exceeds texture budget";
+        return false;
+    }
+    candidate.height = std::max(std::size_t(1), (total + kTextureWidth - 1) / kTextureWidth);
+    output = std::move(candidate);
+    error.clear();
+    return true;
+}
+
 // Float companion for the production query. The independent test oracle uses
 // double world triangles and does not consume this payload or intersection.
 struct ClosestHit
@@ -434,10 +584,16 @@ struct ClosestHit
     bool entering = false;
     std::uint32_t work = 0; // One unit per popped node or triangle intersection.
 };
+// preferred, when nonzero, is the shader's preferred object: its hits win over
+// any other object's hit in [minimum, maximum]. 0 is the ordinary closest hit.
+// avoid, when nonzero, is the shader's avoided object: its instances are
+// skipped before their mesh walk and never hit.
 inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Point origin,
-                                Point rayDirection, float minimum, float maximum)
+                                Point rayDirection, float minimum, float maximum, std::uint32_t preferred = 0,
+                                std::uint32_t avoid = 0)
 {
     ClosestHit hit; hit.distance = maximum;
+    float reach = maximum;
     auto finite = [](const Point& p) { return std::all_of(p.begin(), p.end(), [](float v) { return std::isfinite(v); }); };
     auto xyz = [](const Texel& p) -> Point { return {p[0], p[1], p[2]}; };
     auto dot = [](Point a, Point b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; };
@@ -490,7 +646,7 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
             const auto& low=frame.texels[node]; const auto& high=frame.texels[node+1];
             if (!range(low,high,node,limit)) return -1;
             const auto escape=std::size_t(low[3]); float nearT=0;
-            if (!bounds(localOrigin,localDirection,low,high,hit.distance,nearT)) continue;
+            if (!bounds(localOrigin,localDirection,low,high,reach,nearT)) continue;
             if (high[3]>0) { const auto status=leaf(node,escape,std::size_t(high[3])-1); if (status<0) return status; continue; }
             const auto left=node+2;
             if (left+1>=escape) return -1;
@@ -501,8 +657,8 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
             const auto& rl=frame.texels[right]; const auto& rh=frame.texels[right+1];
             if (!range(rl,rh,right,escape) || rl[3]!=float(escape)) return -1;
             float leftNear=0,rightNear=0;
-            const bool useLeft=bounds(localOrigin,localDirection,ll,lh,hit.distance,leftNear);
-            const bool useRight=bounds(localOrigin,localDirection,rl,rh,hit.distance,rightNear);
+            const bool useLeft=bounds(localOrigin,localDirection,ll,lh,reach,leftNear);
+            const bool useRight=bounds(localOrigin,localDirection,rl,rh,reach,rightNear);
             if (pending+std::size_t(useLeft)+std::size_t(useRight)>capacity) return -2;
             if (useLeft && useRight) {
                 nodes[pending++]=leftNear<=rightNear?right:left; nodes[pending++]=leftNear<=rightNear?left:right;
@@ -525,6 +681,7 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
         const auto materialId=std::uint32_t(ids[2])+(std::uint32_t(ids[3])<<16);
         const auto instanceId=std::uint32_t(mesh[3]);
         if (!objectId || !materialId) return -1;
+        if (avoid!=0 && objectId==avoid) return 0;
         const Point localOrigin{dot(xyz(r0),origin)+r0[3],dot(xyz(r1),origin)+r1[3],dot(xyz(r2),origin)+r2[3]};
         const Point localDirection{dot(xyz(r0),rayDirection),dot(xyz(r1),rayDirection),dot(xyz(r2),rayDirection)};
         if (!finite(localOrigin) || !finite(localDirection) || std::sqrt(dot(localDirection,localDirection))==0) return -1;
@@ -551,11 +708,14 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
                     if (v<0 || u+v>1) continue;
                     const float distance=dot(e2,q)/det;
                     if (!std::isfinite(distance)) return -1;
-                    if (distance<minimum || distance>hit.distance) continue;
+                    if (distance<minimum || distance>reach) continue;
                     const auto objectIndex=std::size_t(mesh[2]); const auto triangleId=std::uint32_t(triangle);
-                    const bool wins=hit.status==0 || distance<hit.distance || (distance==hit.distance &&
+                    const bool candidatePreferred=preferred!=0 && objectId==preferred;
+                    const bool bestPreferred=preferred!=0 && hit.status==1 && hit.objectId==preferred;
+                    const bool wins=hit.status==0 || (candidatePreferred && !bestPreferred) ||
+                        (candidatePreferred==bestPreferred && (distance<hit.distance || (distance==hit.distance &&
                         (objectIndex<bestObject || (objectIndex==bestObject && (instanceId<hit.instanceId ||
-                        (instanceId==hit.instanceId && triangleId<hit.triangleId)))));
+                        (instanceId==hit.instanceId && triangleId<hit.triangleId)))))));
                     if (!wins) continue;
                     Point worldNormal{r0[0]*normal[0]+r1[0]*normal[1]+r2[0]*normal[2],
                         r0[1]*normal[0]+r1[1]*normal[1]+r2[1]*normal[2],r0[2]*normal[0]+r1[2]*normal[1]+r2[2]*normal[2]};
@@ -564,6 +724,7 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
                     for (int axis=0;axis<3;++axis) { worldNormal[axis]/=length; hit.position[axis]=origin[axis]+rayDirection[axis]*distance; }
                     hit.status=1; hit.distance=distance; hit.outwardNormal=worldNormal; hit.entering=dot(rayDirection,worldNormal)<0;
                     hit.objectId=objectId; hit.materialId=materialId; hit.instanceId=instanceId; hit.triangleId=triangleId; bestObject=objectIndex;
+                    if (preferred==0 || candidatePreferred) reach=distance;
                 }
                 return 0;
             });
@@ -687,6 +848,15 @@ inline bool vertexDeformation(const NativeFixtureSurfaceMaterialProgram* program
 // require closed topology, or certify that an entering hit encloses a volume.
 // Outward normals preserve authored local winding through inverse transpose,
 // including mirrored transforms. Callers own volume/topology admission.
+// opaqueVisibility takes the receiver's outward normal, not a screen-derivative
+// one: raster callers pass the interpolated vertex normal, glass callers the hit
+// normal. A receiver whose normal is not strictly toward the light is unlit
+// before any ray. The origin moves 1e-4 * max(1, max|p|) along that normal.
+// Float32 epsilon is 1.19e-7, so this is about 840 ulps of the largest
+// coordinate. It covers varying interpolation, the world-to-local TLAS
+// transform and the Moller-Trumbore distance error, which all scale with the
+// coordinate (and triangle) magnitude. At metre scale it is 0.1-0.3 mm, well
+// below a 4K pixel, so contact shadows do not visibly detach.
 inline constexpr char shader[] = R"shader(
 SV4 opaqueRead(int index ST_ARGS) { return ST_READ; }
 bool opaqueBounds(SV3 origin,SV3 direction,SV3 low,SV3 high,float limit) {
@@ -730,8 +900,8 @@ bool opaqueMesh(SV3 origin,SV3 direction,float limit,int root,int end ST_ARGS) {
 float opaqueVisibility(SV3 position,SV3 geometricNormal,SV3 toLight,float limit,SV4 control ST_ARGS) {
     if(control.w<0.5) return 1.0;
     SV3 direction=normalize(toLight);
-    float bias=max(1.0e-5,2.0e-6*max(max(abs(position.x),abs(position.y)),abs(position.z)));
-    SV3 n=normalize(geometricNormal);if(dot(n,direction)<0.0) n=-n;
+    float bias=max(1.0e-4,1.0e-4*max(max(abs(position.x),abs(position.y)),abs(position.z)));
+    SV3 n=normalize(geometricNormal);if(!(dot(n,direction)>0.0)) return 0.0;
     SV3 origin=position+n*bias;
     limit=max(0.0,limit-bias);
     int node=int(control.x),end=int(control.y);
@@ -826,7 +996,14 @@ int sceneChildren(SV3 origin,SV3 direction,float limit,int node,int escape SC_ST
     else if(useRight) nodes[pending++]=right;
     return 0;
 }
-SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float maximum,SV4 control ST_ARGS) {
+// preferred, when nonzero, names an object whose hits win over any other
+// object's hit in [minimum, maximum], whatever their distances. Among hits of
+// the same kind the nearest wins and ties go to the lower object index. With
+// preferred 0 the query is the ordinary closest hit: reach is hit.distance.
+// avoid, when nonzero, names an object the query passes through: its instances
+// are skipped before their mesh walk, so they cost one TLAS node each and
+// never hit. closestHitCpu skips them at the same point.
+SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float maximum,SV4 control,uint preferred,uint avoid ST_ARGS) {
     SceneClosestHit hit=sceneEmptyHit(-1,maximum);
     float rayLength=length(rayDirection);
     if(!sceneFinite3(origin)||!sceneFinite3(rayDirection)||!sceneFinite(rayLength)||rayLength<=0.0||
@@ -848,6 +1025,7 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
     int capacity=int(allowance.z);
     int nodes[SC_STACK_CAPACITY];int pending=1;nodes[0]=root;
     int bestObject=2147483647;
+    float reach=maximum;
     while(pending>0) {
         if(work>=budget) return sceneEmptyHit(-2,maximum);
         ++work;int node=nodes[--pending];
@@ -855,9 +1033,9 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
         SV4 low=opaqueRead(node ST_PASS),high=opaqueRead(node+1 ST_PASS);
         if(!sceneRange(low,high,node,end)) return sceneEmptyHit(-1,maximum);
         int escape=int(low.w),leaf=int(high.w)-1;float nearDistance=0.0;
-        if(sceneBoundsNear(origin,direction,low.xyz,high.xyz,hit.distance,nearDistance)) {
+        if(sceneBoundsNear(origin,direction,low.xyz,high.xyz,reach,nearDistance)) {
             if(leaf<0) {
-                int pushed=sceneChildren(origin,direction,hit.distance,node,escape,nodes,pending,capacity ST_PASS);
+                int pushed=sceneChildren(origin,direction,reach,node,escape,nodes,pending,capacity ST_PASS);
                 if(pushed<0) return sceneEmptyHit(pushed,maximum);
                 continue;
             }
@@ -874,6 +1052,7 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
             uint objectId=uint(ids.x)+uint(ids.y)*uint(65536),materialId=uint(ids.z)+uint(ids.w)*uint(65536);
             uint instanceId=uint(mesh.w);
             if(objectId==uint(0)||materialId==uint(0)) return sceneEmptyHit(-1,maximum);
+            if(avoid!=uint(0)&&objectId==avoid) continue;
             SV3 localOrigin=SV3(dot(r0.xyz,origin)+r0.w,dot(r1.xyz,origin)+r1.w,dot(r2.xyz,origin)+r2.w);
             // Do not normalize this transformed direction. Its parameter is world distance.
             SV3 localDirection=SV3(dot(r0.xyz,direction),dot(r1.xyz,direction),dot(r2.xyz,direction));
@@ -888,9 +1067,9 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
                 SV4 ml=opaqueRead(at ST_PASS),mh=opaqueRead(at+1 ST_PASS);
                 if(!sceneRange(ml,mh,at,meshEnd)) return sceneEmptyHit(-1,maximum);
                 int next=int(ml.w),tri=int(mh.w)-1;
-                if(sceneBoundsNear(localOrigin,localDirection,ml.xyz,mh.xyz,hit.distance,nearDistance)) {
+                if(sceneBoundsNear(localOrigin,localDirection,ml.xyz,mh.xyz,reach,nearDistance)) {
                     if(tri<0) {
-                        int pushed=sceneChildren(localOrigin,localDirection,hit.distance,at,next,meshNodes,meshPending,capacity ST_PASS);
+                        int pushed=sceneChildren(localOrigin,localDirection,reach,at,next,meshNodes,meshPending,capacity ST_PASS);
                         if(pushed<0) return sceneEmptyHit(pushed,maximum);
                         continue;
                     }
@@ -907,15 +1086,18 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
                         if(!sceneFinite3(a.xyz)||!sceneFinite3(b.xyz)||!sceneFinite3(c.xyz)||!sceneIndex(b.w,SC_MAX_TRIANGLES))
                             return sceneEmptyHit(-1,maximum);
                         float distance=0.0;SV3 normal=SV3(0.0);
-                        int triangleStatus=sceneTriangle(localOrigin,localDirection,a.xyz,b.xyz,c.xyz,minimum,hit.distance,distance,normal);
+                        int triangleStatus=sceneTriangle(localOrigin,localDirection,a.xyz,b.xyz,c.xyz,minimum,reach,distance,normal);
                         if(triangleStatus<0) return sceneEmptyHit(-1,maximum);
                         if(triangleStatus>0) {
                             uint triangleId=uint(b.w);
                             int objectIndex=int(mesh.z);
-                            bool wins=hit.status==0||distance<hit.distance||
+                            bool candidatePreferred=preferred!=uint(0)&&objectId==preferred;
+                            bool bestPreferred=preferred!=uint(0)&&hit.status==1&&hit.objectId==preferred;
+                            bool wins=hit.status==0||(candidatePreferred&&!bestPreferred)||
+                                (candidatePreferred==bestPreferred&&(distance<hit.distance||
                                 (distance==hit.distance&&(objectIndex<bestObject||
                                 (objectIndex==bestObject&&(instanceId<hit.instanceId||
-                                (instanceId==hit.instanceId&&triangleId<hit.triangleId)))));
+                                (instanceId==hit.instanceId&&triangleId<hit.triangleId)))))));
                             if(wins) {
                                 SV3 worldNormal=SV3(r0.x*normal.x+r1.x*normal.y+r2.x*normal.z,
                                     r0.y*normal.x+r1.y*normal.y+r2.y*normal.z,
@@ -926,6 +1108,7 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
                                 hit.outwardNormal=worldNormal/normalLength;hit.entering=dot(direction,hit.outwardNormal)<0.0;
                                 hit.objectId=objectId;hit.materialId=materialId;hit.instanceId=instanceId;hit.triangleId=triangleId;
                                 bestObject=objectIndex;
+                                if(preferred==uint(0)||candidatePreferred) reach=distance;
                             }
                         }
                     }
@@ -934,6 +1117,12 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
         }
     }
     return hit;
+}
+SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float maximum,SV4 control,uint preferred ST_ARGS) {
+    return sceneClosestHit(origin,rayDirection,minimum,maximum,control,preferred,uint(0) ST_PASS);
+}
+SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float maximum,SV4 control ST_ARGS) {
+    return sceneClosestHit(origin,rayDirection,minimum,maximum,control,uint(0) ST_PASS);
 }
 
 )shader";

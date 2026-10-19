@@ -60,6 +60,16 @@ else:
 if "continue;" not in deferred:
     errors.append("deferred-frame branch no longer continues the tick")
 
+# A frame held by the plan-failure governor never evaluates, so it hands the events back too.
+held = region(viewport, "if (planFailureGovernor.shouldHold (planFailureKey, steadyMs()))",
+              "// --- Gather every segment active at displaySec")
+if HANDBACK not in normalized(held):
+    errors.append("plan-failure hold does not hand back frameVisualEvents")
+elif normalized(held).index(HANDBACK) > normalized(held).index("enterLoopPhase (LoopPhase::FramePacing);"):
+    errors.append("plan-failure hold handback must come before the frame pacing")
+if "continue;" not in held:
+    errors.append("plan-failure hold no longer continues the tick")
+
 # The retired-lifecycle retry hands the events back before it paces and continues.
 retired_branch = "if (commitError == kPreviewLifecycleRetired && ! im.wantClose.load())"
 retired = region(viewport, retired_branch, "closeForDeviceFailure(")

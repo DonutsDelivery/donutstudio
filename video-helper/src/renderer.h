@@ -11,7 +11,8 @@
 //        sharpen (Arbit extensions; the reference registered but never
 //        implemented blur/sharpen — see effects-spec §5)
 //     2. geometry pass  — crop TexCoord remap, letterbox fit against the
-//        output aspect, then user transform M = T(tx,ty)·R(deg)·S(scale)
+//        output aspect, then user transform
+//        M = T(tx,ty)·A^-1·R(deg)·A·S(scale), A = diag(canvas aspect, 1)
 //        into a transparent-cleared per-layer FBO at output resolution
 //     3. transition     — when the layer carries a leading-edge transition,
 //        the A side (previous segment or transparent/black) is rendered the
@@ -192,6 +193,13 @@ struct LayerDesc
     float drawShape2Cx = 0.5f, drawShape2Cy = 0.5f;
     float drawShape2W = 0.0f, drawShape2H = 0.0f;
     float drawShapeR = 1.0f, drawShapeG = 1.0f, drawShapeB = 1.0f, drawShapeA = 1.0f;
+    // The same native overlay pass can instead draw a typed visual.gradient: the
+    // pass mixes colour A (drawShapeR..A) to colour B along (cos, sin) in frame
+    // UV space, and the result composites with the layer's blend mode and
+    // opacity. Both native compositors evaluate it on-GPU; there is no CPU path.
+    bool drawShapeGradient = false;
+    float drawGradientCos = 1.0f, drawGradientSin = 0.0f;
+    float drawGradientR = 1.0f, drawGradientG = 1.0f, drawGradientB = 1.0f, drawGradientA = 1.0f;
 
     // One bounded typed Shape tree applied directly to this layer's alpha.
     // The admitted tree contains at most two rectangle/ellipse leaves, one
@@ -1058,7 +1066,8 @@ private:
                        uDepthTexture = -1, uDepthFog = -1, uFogRangeDensity = -1,
                        uFogColor = -1; } layer_;
     struct DrawShapeProg { unsigned prog = 0; int uTransform = -1, uCrop = -1,
-                           uRect = -1, uRectB = -1, uOperation = -1, uColor = -1; } drawShape_;
+                           uRect = -1, uRectB = -1, uOperation = -1, uColor = -1,
+                          uGradient = -1, uColorB = -1; } drawShape_;
     struct BlendProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uFrontTex = -1, uBackTex = -1, uOpacity = -1, uBlendMode = -1; } blend_;
     struct PreviewProg { unsigned prog = 0; int uFinal = -1, uPreview = -1, uLayout = -1,
                          uBackground = -1, uZoom = -1, uPan = -1, uSplit = -1; } preview_;

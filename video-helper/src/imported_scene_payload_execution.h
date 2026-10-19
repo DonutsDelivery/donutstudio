@@ -71,6 +71,10 @@ struct ImportedSceneRequest final
     // vertex order. Motion history then survives the per-frame snapshot and
     // retains vertex positions so the next frame can project them.
     bool deformedSceneMotion = false;
+    // The 3D Render node's engine (V27 wire). These sit in the padding before
+    // the next member, so the request's charge bytes are unchanged.
+    visualimportedscenerender::RenderEngine renderEngine = visualimportedscenerender::RenderEngine::Raster;
+    std::uint16_t pathTraceExportSamples = visualimportedscenerender::kDefaultPathTraceExportSamples;
     // Vertices whose positions that history keeps. Zero keeps every vertex.
     // Appended solid bodies past it take Motion from their own prior transforms.
     std::size_t retainedMotionVertexCount = 0;
@@ -183,6 +187,13 @@ public:
         return receipt.deformationFrame
             ? receipt.deformationFrame->frame.nativeFrame
             : receipt.frame.rendered.nativeFrame;
+    }
+    // Why the glass caustic of this Preview frame rendered reduced or not at all. Empty when as planned.
+    static const std::string& causticDegradation(const Receipt& receipt) noexcept
+    {
+        return receipt.deformationFrame
+            ? receipt.deformationFrame->causticDegradation
+            : receipt.frame.rendered.causticDegradation;
     }
     static std::uintptr_t nativeDepthTextureView(const Receipt& receipt) noexcept
     {

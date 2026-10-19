@@ -40,6 +40,8 @@ public:
     std::size_t maximumDepth() const noexcept { return maximumDepth_; }
     const std::optional<SpectralReflectanceDescription>& spectralReflectance() const noexcept
     { return program_.spectralReflectance; }
+    const std::optional<DiffractionLayerDescription>& diffractionLayer() const noexcept
+    { return program_.diffractionLayer; }
 
 private:
     friend std::optional<AdmittedSurfaceMaterialIR> admit(
@@ -316,6 +318,8 @@ inline bool validate(const ProgramDescription& program,
         return reject(error, "surface material transport mode is not canonical for its version");
     if (program.spectralReflectance && !validSpectralReflectance(*program.spectralReflectance))
         return reject(error, "surface material spectral reflectance requires version 1 and eight finite coefficients within [0, 1]");
+    if (program.diffractionLayer && !validDiffractionLayer(*program.diffractionLayer))
+        return reject(error, "surface material diffraction layer requires version 1 and finite values within its bounds");
     if (limits.textureSlots > kMaximumTextureSlots
         || limits.operations == 0 || limits.operations > kMaximumOperations
         || limits.depth == 0 || limits.depth > kMaximumDepth
@@ -458,6 +462,17 @@ inline std::string structuralDigest(const ProgramDescription& program)
         appendU32(bytes, program.spectralReflectance->version);
         for (const auto coefficient : program.spectralReflectance->coefficients)
             appendFloat(bytes, coefficient);
+    }
+    if (program.diffractionLayer)
+    {
+        static constexpr char layerDomain[] = "DonutStudio/SurfaceMaterialIR/DiffractionLayer/v1";
+        bytes.insert(bytes.end(), std::begin(layerDomain), std::end(layerDomain) - 1);
+        const auto& layer = *program.diffractionLayer;
+        appendU32(bytes, layer.version);
+        appendU32(bytes, layer.grooveMode);
+        appendU32(bytes, layer.baseMode);
+        appendU32(bytes, layer.maxOrder);
+        forEachDiffractionLayerFloat(layer, [&bytes](const char*, float value) { appendFloat(bytes, value); });
     }
     videohelper::Sha256 hash;
     hash.update(bytes.data(), bytes.size());

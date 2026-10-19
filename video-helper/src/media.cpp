@@ -47,6 +47,18 @@ double streamTimeToSec (const AVStream* st, int64_t ts)
     return (double) ts * st->time_base.num / st->time_base.den;
 }
 
+// Container time bases round frame timestamps. A 30 fps Matroska stream uses 1/1000
+// ticks, so frame 14 (really 466.67 ms) is stamped 467 and frame 15 is stamped 500.
+// Without slack, 467 + one frame period (33.3 ms) still passes a request for 0.5 s
+// and frame 14 wins. Frame selection allows one tick so that the frame whose window
+// starts at the request is chosen, not the one before it.
+double frameTimeToleranceSec (const AVStream* st, double frameDur)
+{
+    const double tick = st->time_base.num > 0 && st->time_base.den > 0
+        ? (double) st->time_base.num / st->time_base.den : 0.0;
+    return std::clamp (tick, 1.0e-6, frameDur * 0.25);
+}
+
 const AVHWDeviceType* preferredHwDeviceTypes()
 {
     static const AVHWDeviceType preferred[] = {
@@ -427,6 +439,7 @@ std::string MediaContext::decodeForwardUntil (double targetSec, AVFrame* frame, 
     AVPacket* pkt = av_packet_alloc();
     auto* st = fmt_->streams[videoStream_];
     const double frameDur = info_.fps > 0.0 ? 1.0 / info_.fps : 1.0 / 30.0;
+    const double tolerance = frameTimeToleranceSec (st, frameDur);
 
     std::string error;
     bool draining = false;
@@ -442,10 +455,10 @@ std::string MediaContext::decodeForwardUntil (double targetSec, AVFrame* frame, 
             downloadIfHw (frame);
             gotFrame = true;
             lastDecodedPts_ = streamTimeToSec (st, frame->best_effort_timestamp);
-            if (lastDecodedPts_ + frameDur > targetSec)
+            if (lastDecodedPts_ + frameDur - tolerance > targetSec)
                 break;
         }
-        if (gotFrame && lastDecodedPts_ + frameDur > targetSec)
+        if (gotFrame && lastDecodedPts_ + frameDur - tolerance > targetSec)
             break;
         if (receiveResult == AVERROR_EOF)
             break;
@@ -698,8 +711,9 @@ std::string MediaContext::selectFrame (double timeSec)
     const double frameDur = info_.fps > 0.0 ? 1.0 / info_.fps : 1.0 / 30.0;
 
     // Already showing the right frame?
-    if (lastFrame_->width > 0 && timeSec >= lastDecodedPts_
-        && timeSec < lastDecodedPts_ + frameDur)
+    const double tolerance = frameTimeToleranceSec (fmt_->streams[videoStream_], frameDur);
+    if (lastFrame_->width > 0 && timeSec >= lastDecodedPts_ - tolerance
+        && timeSec < lastDecodedPts_ + frameDur - tolerance)
         return {};
 
     // Backward jump, or forward jump beyond ~1s: seek to keyframe before target.
@@ -750,6 +764,9 @@ std::string MediaContext::decodePresentationFrame (
 
     uint64_t nextOrdinal = 0;
     bool found = false;
+    // Same slack as selectFrame, so this scan and the preview decode pick one frame.
+    const double scanTolerance = frameTimeToleranceSec (
+        fmt_->streams[videoStream_], info_.fps > 0.0 ? 1.0 / info_.fps : 1.0 / 30.0);
     std::unordered_set<int64_t> timestamps;
     std::string error;
     const auto drain = [&] () -> int
@@ -763,7 +780,7 @@ std::string MediaContext::decodePresentationFrame (
             else
             {
                 const double frameSec = streamTimeToSec (fmt_->streams[videoStream_], ticks);
-                const bool atOrBefore = frameSec <= timeSec;
+                const bool atOrBefore = frameSec <= timeSec + scanTolerance;
                 if (! found || atOrBefore)
                 {
                     av_frame_unref (selected);

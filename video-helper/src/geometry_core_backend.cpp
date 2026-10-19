@@ -787,6 +787,13 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     return 0.2f + 0.7f * static_cast<float>((materialId >> shift) & 0xffu) / 255.0f;
   };
   scene->materials[0].baseColor = {channel(0), channel(8), channel(16)};
+  // Bit 24 of a material identity marks a self-lit material. The three colour channels above read
+  // bits 0 to 23 only, so the flag leaves the hue alone. The fixed Geometry Core light does not
+  // reach most front faces, so a flagged material adds its own tinted emission to stay visible.
+  if (((materialId >> 24) & 1u) != 0u)
+    scene->materials[0].emissive = {scene->materials[0].baseColor.x * 0.35f,
+                                    scene->materials[0].baseColor.y * 0.62f,
+                                    scene->materials[0].baseColor.z * 0.70f};
   scene->materials[0].roughness = 0.55f;
   scene->materialCount = 1;
   const auto objectCount = instances == nullptr ? std::size_t{1}
@@ -885,7 +892,8 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
       if (!binding) return std::nullopt;
       auto native=std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*binding->nativeProgram());
       for (const auto& field : authoredSurface->fields)
-        if (!surfacematerialfield::evaluate(field,evaluation,instanceIndex,native->parameters,native->timeMixEndColor,error))
+        if (!surfacematerialfield::evaluate(field,evaluation,instanceIndex,native->parameters,native->timeMixEndColor,error,
+                native->diffractionLayer ? &*native->diffractionLayer : nullptr))
           return std::nullopt;
       // Table batching uses ordinary retained-scene draws; apply the same
       // canonical instance appearance once, after material Field modulation.

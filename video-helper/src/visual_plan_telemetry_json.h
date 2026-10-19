@@ -54,6 +54,10 @@ inline nlohmann::json visualTelemetryJson (const VisualTelemetrySnapshot& value)
         { "compositor", duration(value.compositor) }, { "presentation", duration(value.presentation) },
         { "presentationSemantic", value.presentationModeObserved ? nlohmann::json(presentationMode) : unavailable() },
         { "particles", duration(value.particles) }, { "generators", duration(value.generators) },
+        { "importedSceneRender", duration(value.importedSceneRender) },
+        { "importedScenePreviewExtent", value.importedScenePreviewWidth != 0 && value.importedScenePreviewHeight != 0
+            ? nlohmann::json::array({ value.importedScenePreviewWidth, value.importedScenePreviewHeight }) : unavailable() },
+        { "importedSceneCausticDegradation", value.importedSceneCausticDegradation },
         { "transport", {{"available",value.transportObserved},
             {"allocationAvailable",value.zeroCopyAllocationObserved},
             {"mode", value.transportObserved ? nlohmann::json(transport) : unavailable()},

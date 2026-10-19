@@ -9,6 +9,8 @@
 #include "metal_lambertian_source.h"
 #include "metal_resource_pools.h"
 #include "../composite_render_diagnostic.h"
+#include "../loop_step_probe.h"
+#include <optional>
 #include "fixture_vertex_modifier_shader.h"
 #include "fixture_texture_upload.h"
 #include "fixture_opaque_visibility.h"
@@ -17,6 +19,8 @@
 #include "metal_rough_glass_tiles.h"
 #include "metal_glass_caustic_consumer.h"
 #include "fixture_diffraction_transport.h"
+#include "fixture_diffraction_bands.h"
+#include "stam_diffraction_layer.h"
 #include "../geometry_core_admission.h"
 #include "../geometry_core_diagnostic_colors.h"
 #include "../sdf_native_program.h"
@@ -33,6 +37,7 @@
 #include "../particle_engine.h"
 #include "../particle_body_replay.h"
 #include "../renderer.h"
+#include "../layer_transform.h"
 #include "../hdr_movie_readback.h"
 #include "../media.h"
 #include "../shader_generator.h"
@@ -598,6 +603,14 @@ struct FixtureUniforms
     // Bounded displacement limits in instruction order. The shader reads them from here so
     // one program source serves every limit.
     float vertexDisplacementLimits[16][4];
+    // Surface Material diffraction layer, packed by arbitgpu::stamlayer::pack. All zero
+    // (lane 3, the enable flag, is 0) when the draw's program has no layer.
+    float stamLayer[arbitgpu::stamlayer::kUniformVec4Count][4];
+    // Partner dielectric of the paired water and caustic volume camera transport
+    // (smoothglass::cameraPartner). Only the paired fragment text declares it; every
+    // other shader reads a prefix of this block, and it stays zero without a volume.
+    // Last member, after the diffraction layer block.
+    float glassTransport2[4];
 };
 static_assert (offsetof (FixtureUniforms, objectMatrix) == 0
                && offsetof (FixtureUniforms, materialKind) == 1472
@@ -637,8 +650,19 @@ static_assert (offsetof (FixtureUniforms, objectMatrix) == 0
                && offsetof (FixtureUniforms, roughCameraControl) == 11008
                && offsetof (FixtureUniforms, previousVertexSpectrum) == 11024
                && offsetof (FixtureUniforms, vertexDisplacementLimits) == 11280
-               && sizeof (FixtureUniforms) == 11536,
+               && offsetof (FixtureUniforms, stamLayer) == 11536
+               && offsetof (FixtureUniforms, glassTransport2) == 11648
+               && sizeof (FixtureUniforms) == 11664,
                "Metal fixture uniform layout changed");
+
+// Packs the draw's diffraction layer, or zeros (layer off) when it has none.
+static void storeStamLayer(FixtureUniforms& uniforms,
+                           const surfacematerial::DiffractionLayerDescription* layer) noexcept
+{
+    const auto packed = arbitgpu::stamlayer::pack(layer);
+    for (std::size_t row = 0; row < packed.size(); ++row)
+        std::copy(packed[row].begin(), packed[row].end(), uniforms.stamLayer[row]);
+}
 
 struct MetalFixtureInstanceGpuRecord
 {
@@ -744,6 +768,8 @@ struct MetalSurfaceSourceCreation final
     std::array<id,2> vertexCompilation{},fragmentCompilation{};
     std::array<id,4> nativeOwners{};
     sg_shader shader={};
+    // The fragment carries the paired water and caustic volume camera transport.
+    bool pairedVolume=false;
     explicit MetalSurfaceSourceCreation(std::unique_ptr<const arbitgpu::surfacesource::Archive> s):sources(std::move(s)) {}
     ~MetalSurfaceSourceCreation() {
 #if ! __has_feature(objc_arc)
@@ -988,7 +1014,9 @@ static bool metalDirectGratingProgramMatches(
         ||std::memcmp(snapshot->diffractionPaths.data(),compiled->diffractionPaths.data(),sizeof(snapshot->diffractionPaths))
         ||std::memcmp(snapshot->diffractionFoilField.data(),compiled->diffractionFoilField.data(),sizeof(snapshot->diffractionFoilField))
         ||std::memcmp(snapshot->diffractionOccupancyRectangles.data(),compiled->diffractionOccupancyRectangles.data(),sizeof(snapshot->diffractionOccupancyRectangles))
-        ||snapshot->spectralReflectance.has_value()!=compiled->spectralReflectance.has_value())return false;
+        ||snapshot->spectralReflectance.has_value()!=compiled->spectralReflectance.has_value()
+        ||snapshot->diffractionLayer.has_value()!=compiled->diffractionLayer.has_value()
+        ||(snapshot->diffractionLayer&&!surfacematerial::sameDiffractionLayer(*snapshot->diffractionLayer,*compiled->diffractionLayer)))return false;
     return !snapshot->spectralReflectance||(snapshot->spectralReflectance->version==compiled->spectralReflectance->version
         &&std::memcmp(snapshot->spectralReflectance->coefficients.data(),compiled->spectralReflectance->coefficients.data(),
             sizeof(snapshot->spectralReflectance->coefficients))==0);
@@ -1514,6 +1542,9 @@ struct MetalCausticState final
     arbitgpu::glasscaustics::NativeDirectGratingTerminalLease* terminalLease=nullptr;
     arbitgpu::glasscaustics::Prepared prepared;
     arbitgpu::glasscaustics::Frame schedule;
+    // The schedule identity before the kernel splat opt-in. Grating bindings own
+    // the single-pixel frame, so their producers match this identity.
+    std::string singlePixelIdentity;
     arbitgpu::glasscaustics::NativeReadback receipt;
     arbitgpu::glasscaustics::EnergyLedger energy;
     arbitgpu::metalcaustic::Params params {};
@@ -1551,6 +1582,10 @@ struct MetalCausticState final
     id<MTLBuffer> work = nil, triangles = nil, paths = nil, deposits = nil, accumulation = nil, diagnostic = nil, keys = nil;
     id<MTLLibrary> library = nil;
     id<MTLComputePipelineState> trace = nil, initializeKeys = nil, sort = nil, reduce = nil, resolve = nil;
+    // Splat frames only. The scratch buffer lives from allocation to the
+    // completed normaliser readback, then the render releases it.
+    id<MTLBuffer> splat = nil;
+    id<MTLComputePipelineState> splatNormaliser = nil, splatKeys = nil, splatSegments = nil, splatGather = nil;
     arbitgpu::glasscaustics::SubmissionIdentity identity;
     arbitgpu::MetalGlassCausticMetrics metrics;
     std::uint64_t bytes = 0, nativeReservation = 0, submission = 0;
@@ -1567,6 +1602,7 @@ struct MetalCausticState final
     std::array<arbitgpu::residency::ResidencyCharge,2> rasterImageCharges {};
     arbitgpu::residency::ResidencyCharge workBufferCharge, trianglesBufferCharge, pathsBufferCharge, depositsBufferCharge;
     arbitgpu::residency::ResidencyCharge accumulationBufferCharge, diagnosticBufferCharge, keysBufferCharge, queryTextureCharge;
+    arbitgpu::residency::ResidencyCharge splatBufferCharge;
     arbitgpu::residency::ResidencyCharge directionalInputCharge, directionalEchoCharge;
     arbitgpu::residency::ResidencyCharge cameraSpectralCharge, cameraResolvedCharge;
     arbitgpu::residency::ResidencyCharge cellInputCharge, cellEchoCharge, cellPointNativeCharge;
@@ -1587,6 +1623,7 @@ struct MetalCausticState final
         [directionalInput release];[directionalEcho release];
         [accumulation release];[diagnostic release];[keys release];[trace release];[initializeKeys release];
         [sort release];[reduce release];[resolve release];[library release];
+        [splat release];[splatNormaliser release];[splatKeys release];[splatSegments release];[splatGather release];
 #endif
     }
 };
@@ -3003,7 +3040,7 @@ float4 shadeSdf(float2 uv,float3 direction,bool hit,float travel,float3 point,
         return float4(float3(visibility),1.0);
     }
     float diffuse=max(dot(normal,light),0.0),shadow=sceneShadow(point+normal*u.raymarch.x*4.0,light,u,t);
-    float rim=pow(1.0-max(dot(normal,-direction),0.0),3.0);
+    float rim=pow(clamp(1.0-dot(normal,-direction),0.0,1.0),3.0);
     return float4(float3(0.12,0.42,0.88)*(0.12+0.88*diffuse*shadow)+float3(0.18,0.35,0.65)*rim,1.0);
 }
 struct SdfOutputs { float4 color [[color(0)]]; float4 normal [[color(1)]]; };
@@ -3815,9 +3852,23 @@ struct FragmentOut {
     uint rawObjectId [[color(6)]];
     float2 rawMotion [[color(7)]];
 };
+// Scene-linear Color is stored as RGBA16F, whose largest finite value is 65504.
+// A brighter finite highlight is stored at that ceiling and stays finite.
+// NaN and infinity pass through unchanged, so readback checks still refuse them.
+float4 fixtureHalfRange(float4 color) {
+    return select(clamp(color, float4(-65504.0f), float4(65504.0f)), color,
+        isnan(color) || isinf(color));
+}
 float4 compositePass(FragmentOut value, constant Uniforms& u) {
     const int count = int(u.passProgramControl.x);
-    if (count == 0) return value.color;
+    if (count == 0 && u.passProgramControl.w > 0.5f) {
+        // Camera-only glass (Glass Caustics off) on the SDR target: the same
+        // sRGB transfer the compositor applies to the caustic route's linear Color.
+        const float3 rgb = clamp(value.color.rgb, 0.0f, 1.0f);
+        return float4(select(1.055f * pow(rgb, float3(1.0f / 2.4f)) - 0.055f, rgb * 12.92f,
+            rgb <= float3(0.0031308f)), clamp(value.color.a, 0.0f, 1.0f));
+    }
+    if (count == 0) return fixtureHalfRange(value.color);
     float4 values[8];
     for (int i = 0; i < 8; ++i) {
         if (i >= count) break;
@@ -3861,7 +3912,7 @@ float4 compositePass(FragmentOut value, constant Uniforms& u) {
         result.rgb = select(1.055f * pow(rgb, float3(1.0f / 2.4f)) - 0.055f, rgb * 12.92f,
             rgb <= float3(0.0031308f));
     }
-    return u.passProgramControl.z > 0.5f ? result : clamp(result, 0.0f, 1.0f);
+    return u.passProgramControl.z > 0.5f ? fixtureHalfRange(result) : clamp(result, 0.0f, 1.0f);
 }
 // Direct base GGX contract: shared/BaseSurfaceReflection.h. Ambient and coat
 // retain their existing independent approximations. No radiance/output clamp.
@@ -3988,7 +4039,10 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
         const float transmission = u.surfaceCoating.w > 0.5f ? u.surfaceCoating.x : 0.0f;
         const float coat = u.surfaceCoating.w > 0.5f ? 0.04f * u.surfaceCoating.z : 0.0f;
         const float coverage = u.glassTransport.x > 0.5f ? 1.0f : 1.0f - transmission * (1.0f - dielectric);
-        const float alpha = in.opacity * baseTexel.a * coverage;
+        float alpha = in.opacity * baseTexel.a * coverage;
+        // Same snap as OpenGL: an interpolated opacity of 1.0 can land a few ulps
+        // below 1.0, which dropped the alpha >= 1 sky and shadow terms per pixel.
+        if (alpha > 1.0f - 1.0e-5f && alpha < 1.0f) alpha = 1.0f;
         if (alpha <= 0.0f || (u.materialKind.z == 1u && alpha < as_type<float>(u.materialKind.w)))
             discard_fragment();
         const float4 metallicRoughnessTexel
@@ -4052,10 +4106,13 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
                     ? thinInterfaceTransport(u.cameraTranslation.xyz,in.worldPosition,normal,complete,glassStatus,u,opaqueTexture,glassTexture,environmentTexture)
                     : glassTransport(u.cameraTranslation.xyz,in.worldPosition,complete,glassStatus,u,opaqueTexture,glassTexture,environmentTexture);
             }
-            bool representable = glassSceneFinite3(glass)
-                && max(max(abs(glass.x),abs(glass.y)),abs(glass.z)) <= 65504.0f;
+            // Finite radiance past the RGBA16F maximum is a bright highlight, such
+            // as a dispersed sun or specular path. It is stored at the ceiling.
+            // Only NaN or infinity marks the pixel -2 and refuses the frame.
+            bool representable = glassSceneFinite3(glass);
+            glass = clamp(glass, float3(-65504.0f), float3(65504.0f));
             out.rawMask = complete && representable ? 1.0f : 0.0f;
-            out.rawNormal.w = complete && representable ? 1.0f : representable ? float(glassStatus) : -2.0f;
+            out.rawNormal.w = complete && representable ? (glassStatus == GLASS_SMOOTH_STATUS_TRAPPED ? 2.0f : 1.0f) : representable ? float(glassStatus) : -2.0f;
             out.color = float4(complete && representable ? glass : float3(0.0f),1.0f);
             out.color = compositePass(out,u);
             return out;
@@ -4101,7 +4158,7 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
             }
             float3 radiance = u.lightColors[lightIndex].rgb * u.lightColors[lightIndex].a * attenuation;
             float visibility = u.materialKind.z == 0u && transmission == 0.0f && alpha >= 1.0f
-                ? opaqueVisibility(in.worldPosition,cross(dfdx(in.worldPosition),dfdy(in.worldPosition)),
+                ? opaqueVisibility(in.worldPosition,in.worldNormal,
                     toLight,kind == 0u ? 3.402823e38f : length(delta),u.opaqueControl,opaqueTexture) : 1.0f;
             directBase += radiance * baseSurfaceDirect(in.baseColor * baseTexel.rgb, metallic, roughness,
                 dielectric, transmission, normal, toLight, toView) * visibility;
@@ -4422,13 +4479,89 @@ float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Unifo
 }
 std::string metalSpectralTransportShader() { return metalSpectralTransportShaderRecipe<std::string>(); }
 
-template<class String> auto restrictedSurfaceSourceRecipe()
+// The diffraction layer's _main blocks. kFixtureFragmentShader carries none of
+// them, so a program without a layer compiles the released pre-layer bytes.
+// composeLayeredFixtureMain puts each block after its unique anchor in the
+// fixture _main, before any module is inserted (the modules could repeat an
+// anchor). Each block (raw string bodies start with a newline, dropped here)
+// is gated on FIXTURE_STAM_LAYER, which stamlayer::metalShader() defines.
+constexpr char kFixtureStamLayerSetup[] = R"metal(
+#ifdef FIXTURE_STAM_LAYER
+        // Diffraction layer over the material's BSDF (stam_diffraction_layer.h).
+        const bool stamLayerOn = u.stamLayer[0].w > 0.5f;
+        const StamLayerParams stamParams = stamLayerUniformParams(u);
+        const StamSurface stamSurface = stamLayerSurface(u, normal, in.worldTangent, in.bitangentSign, in.uv);
+        const float3 stamView = baseSurfaceUnit(toView);
+        const float3 stamBaseSpecular = mix(float3(dielectric), in.baseColor * baseTexel.rgb, metallic);
+        const float stamStratum = stamLayerStratum(in.position.xy);
+#endif
+)metal";
+constexpr char kFixtureStamLayerSkyBefore[] = R"metal(
+#ifdef FIXTURE_STAM_LAYER
+                    const float3 stamSkyBefore = skyBase;
+#endif
+)metal";
+constexpr char kFixtureStamLayerSky[] = R"metal(
+#ifdef FIXTURE_STAM_LAYER
+                    // The sky term becomes coat + orders + base sky * specularScale.
+                    if (stamLayerOn && transmission==0.0f && u.materialKind.z==0u && alpha>=1.0f)
+                        skyBase = stamSkyBefore + stamLayerEnvironmentCompose(stamParams, stamSurface, stamView,
+                            stamBaseSpecular, skyBase - stamSkyBefore, stamStratum, u, environmentTexture);
+#endif
+)metal";
+constexpr char kFixtureStamLayerDirect[] = R"metal(
+#ifdef FIXTURE_STAM_LAYER
+            // The total becomes coat + orders + base * specularScale.
+            if (stamLayerOn)
+                directBase += radiance * stamLayerDirectDelta(stamParams, stamSurface, baseSurfaceUnit(toLight), stamView,
+                    stamBaseSpecular, baseSurfaceDirect(in.baseColor * baseTexel.rgb, metallic, roughness,
+                    dielectric, transmission, normal, toLight, toView)) * visibility;
+#endif
+)metal";
+inline bool composeLayeredFixtureMain(std::string& fragment)
+{
+    static constexpr std::pair<const char*,const char*> blocks[] = {
+        {"        const float3 toView = u.cameraTranslation.xyz - in.worldPosition;\n", kFixtureStamLayerSetup},
+        {"                if (u.sky[0].w>0.5f) {\n", kFixtureStamLayerSkyBefore},
+        {"                                normal,toView,u.sky[0],u.sky[1],u.sky[2],u.sky[3],u.sky[4]);\n", kFixtureStamLayerSky},
+        {"                dielectric, transmission, normal, toLight, toView) * visibility;\n", kFixtureStamLayerDirect}};
+    for(const auto& [anchor,block] : blocks) {
+        const auto at=fragment.find(anchor);
+        if(at==std::string::npos || fragment.find(anchor,at+1)!=std::string::npos) return false;
+        fragment.insert(at+std::strlen(anchor),block+1);
+    }
+    return true;
+}
+// The released vertex and fragment Uniforms end at vertexDisplacementLimits, the
+// pre-diffraction-layer prefix of FixtureUniforms. A Metal shader may declare a
+// prefix of the bound block, so the trailing members stay out of the text unless
+// the fragment reads them. Every program without a layer or a caustic volume
+// therefore compiles the same bytes as before the layer existed and keeps Metal's
+// shader cache entry for them; a text change costs a cold compile of every
+// fixture pipeline (about 12 s on the MacBook).
+// The diffraction layer module reads u.stamLayer; only a layered fragment declares it.
+template<class String> void declareLayeredFixtureUniform(String& fragment)
+{
+    arbitgpu::surfacesource::replace(fragment,"    float4 vertexDisplacementLimits[16];\n};",
+        "    float4 vertexDisplacementLimits[16];\n    float4 stamLayer[7];\n};");
+}
+// The paired water and caustic volume transport reads u.glassTransport2, the
+// last FixtureUniforms member, after the diffraction layer block. Only its
+// fragment declares both, so the released fragment text keeps its bytes.
+template<class String> void declarePairedFixtureUniform(String& fragment)
+{
+    arbitgpu::surfacesource::replace(fragment,"    float4 vertexDisplacementLimits[16];\n};",
+        "    float4 vertexDisplacementLimits[16];\n    float4 stamLayer[7];\n    float4 glassTransport2;\n};");
+}
+
+template<class String> auto restrictedSurfaceSourceRecipe(bool pairedVolume=false)
 {
     auto vertex=arbitgpu::fixtureNullVertexModifierRecipe<String>(kFixtureVertexShader);
     String fragment(kFixtureFragmentShader);
+    if(pairedVolume) declarePairedFixtureUniform(fragment);
     auto modules=arbitgpu::opaquevisibility::metalShaderRecipe<String>()+arbitgpu::analyticsky::shaderRecipe<String>(true)
         +arbitgpu::environmentimage::shaderRecipe<String>(true)+arbitgpu::smoothglass::queryShaderRecipe<String>(true)
-        +arbitgpu::smoothglass::transportShaderRecipe<String>(true,true,false)+metalSpectralTransportShaderRecipe<String>();
+        +arbitgpu::smoothglass::transportShaderRecipe<String>(true,true,false,pairedVolume)+metalSpectralTransportShaderRecipe<String>();
     const auto offset=fragment.find("fragment FragmentOut _main");
     if(offset==String::npos) throw std::length_error("Surface source fragment insertion marker missing");
     fragment.insert(offset,modules);
@@ -7498,6 +7631,18 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
     const auto& deposition=schedule.bounds.deposition;
     if(!glasscaustics::admitDepositionDevice(deposition,{std::uint64_t(gMetalDevice.maxBufferLength),
         std::uint64_t(std::numeric_limits<std::uint32_t>::max()),128},error))return false;
+    // A splat frame keys tiles instead of pixels in the same buffer 7, sized
+    // splat.paddedKeyCount, and adds the buffer 9 scratch and buffer 10 bases.
+    const bool splat=schedule.splatVersion==glasscaustics::kSplatVersion;
+    const std::uint64_t keyCount=splat?schedule.splat.paddedKeyCount:deposition.paddedKeyCount;
+    metalcaustic::SplatScratchLayout splatLayout;
+    const auto slots=std::uint64_t(schedule.work.size())*policy.maximumVisits;
+    if(splat&&(!metalcaustic::splatScratchLayout(schedule,splatLayout)||keyCount>std::numeric_limits<std::uint32_t>::max()
+        ||slots>schedule.bounds.maximumDeposits||schedule.splat.tilesX*schedule.splat.tilesY>std::numeric_limits<std::uint32_t>::max()
+        ||keyCount*sizeof(glasscaustics::DepositionKey)>gMetalDevice.maxBufferLength
+        ||splatLayout.words*sizeof(std::uint32_t)>gMetalDevice.maxBufferLength))
+        return refuse("Metal caustic splat storage exceeds native buffer or dispatch limits");
+    state.metrics.splatVersion=schedule.splatVersion;
     NSError* nativeError=nil;
     const bool multipleScatter=schedule.multipleScatterPolicy.has_value();
     if(multipleScatter) {
@@ -7507,8 +7652,11 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
         std::memcpy(&p.deposition[2],&micro.maximumResidual,sizeof(float));
         p.deposition[3]=glasscaustics::kPrivateMultipleScatterVersion;
     }
-    const auto source=multipleScatter?metalcaustic::multipleScatterShader():metalcaustic::shader(schedule.roughness>0);
+    auto source=multipleScatter?metalcaustic::multipleScatterShader():metalcaustic::shader(schedule.roughness>0);
     if(source.empty())return refuse("Metal multiple scatter source substitution is incomplete");
+    // The splat kernels follow the caustic structs, including the multiple
+    // scatter deposit stride. Single-pixel frames compile the released source.
+    if(splat)source+="\n"+metalcaustic::splatShader();
     MTLCompileOptions* options=[[MTLCompileOptions alloc] init];options.fastMathEnabled=NO;
     state.library=[gMetalDevice newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()] options:options error:&nativeError];
 #if ! __has_feature(objc_arc)
@@ -7527,6 +7675,12 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
     state.sort=pipeline(@"causticSort");state.reduce=pipeline(@"causticReduce");state.resolve=pipeline(@"causticResolve");
     if(state.trace==nil||state.initializeKeys==nil||state.sort==nil||state.reduce==nil||state.resolve==nil)
         return refuse("Metal caustic compute pipeline unavailable");
+    if(splat) {
+        state.splatNormaliser=pipeline(@"causticSplatNormaliser");state.splatKeys=pipeline(@"causticSplatKeys");
+        state.splatSegments=pipeline(@"causticSplatSegments");state.splatGather=pipeline(@"causticSplatGather");
+        if(state.splatNormaliser==nil||state.splatKeys==nil||state.splatSegments==nil||state.splatGather==nil)
+            return refuse("Metal caustic splat compute pipeline unavailable");
+    }
     const auto buffer=[&](const void* data,std::size_t bytes)->id<MTLBuffer> {
         if(!bytes||bytes>gMetalDevice.maxBufferLength)return nil;
         return data?[gMetalDevice newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared]
@@ -7539,9 +7693,17 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
     state.deposits=buffer(nullptr,schedule.bounds.maximumDeposits*depositStride);
     const auto pixels=std::uint64_t(frame.width_)*frame.height_;
     state.accumulation=buffer(nullptr,pixels*8*sizeof(float));state.diagnostic=buffer(nullptr,sizeof(std::uint32_t));
-    state.keys=buffer(nullptr,deposition.paddedKeyCount*sizeof(glasscaustics::DepositionKey));
+    state.keys=buffer(nullptr,keyCount*sizeof(glasscaustics::DepositionKey));
     if(state.work==nil||state.triangles==nil||state.paths==nil||state.deposits==nil||state.accumulation==nil||state.diagnostic==nil
         ||state.keys==nil||!state.keys.contents||!state.accumulation.contents||!state.diagnostic.contents) return refuse("Metal caustic storage allocation failed");
+    if(splat) {
+        std::vector<std::uint32_t> words;
+        try {words=metalcaustic::splatScratchWords(schedule,splatLayout);}
+        catch(const std::bad_alloc&) {return refuse("Metal caustic splat scratch allocation failed");}
+        state.splat=buffer(words.data(),words.size()*sizeof(std::uint32_t));
+        if(state.splat==nil||!state.splat.contents)return refuse("Metal caustic splat scratch allocation failed");
+        state.splatBufferCharge=arbitgpu::residency::ResidencyCharge(arbitgpu::residency::BackingClass::roughCausticTile,arbitgpu::residency::nominalBufferBytes(state.splat.length));
+    }
     state.workBufferCharge=arbitgpu::residency::ResidencyCharge(arbitgpu::residency::BackingClass::roughCausticTile,arbitgpu::residency::nominalBufferBytes(state.work.length));
     state.trianglesBufferCharge=arbitgpu::residency::ResidencyCharge(arbitgpu::residency::BackingClass::roughCausticTile,arbitgpu::residency::nominalBufferBytes(state.triangles.length));
     state.pathsBufferCharge=arbitgpu::residency::ResidencyCharge(arbitgpu::residency::BackingClass::roughCausticTile,arbitgpu::residency::nominalBufferBytes(state.paths.length));
@@ -7642,7 +7804,7 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
                 if(!chargeMetalRasterCaptureNative(caustic,charge))return false;
                 if(!charge(caustic.query,caustic.query.allocatedSize))return false;
                 for(id<MTLBuffer> input:{caustic.work,caustic.triangles,caustic.paths,caustic.deposits,
-                    caustic.accumulation,caustic.diagnostic,caustic.keys})
+                    caustic.accumulation,caustic.diagnostic,caustic.keys,caustic.splat})
                     if(input.length>gMetalDevice.maxBufferLength||!charge(input,input.length))return false;
                 for(auto image:caustic.rasterImages)if(!chargeImage(image))return false;
             }
@@ -7711,32 +7873,107 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
     state.metrics.traceMilliseconds=elapsed(phase);
     if(command.status!=MTLCommandBufferStatusCompleted||!state.paths.contents||!state.deposits.contents
         ||*static_cast<const std::uint32_t*>(state.diagnostic.contents)!=0) return refuse("Metal caustic native trace or completed readback refused");
-    phase=std::chrono::steady_clock::now();command=[queue commandBuffer];
-    encoder=[command computeCommandEncoder];
-    if(command==nil||encoder==nil)return refuse("Metal caustic deposition encoder unavailable");
-    bind(encoder,state.initializeKeys);dispatch(encoder,state.initializeKeys,deposition.paddedKeyCount);[encoder endEncoding];
-    for(std::uint64_t size=2;size<=deposition.paddedKeyCount;size*=2)for(std::uint64_t distance=size/2;distance;distance/=2) {
+    // A cap fallback clears splatGathered, keeps the splat frame in splatOwner
+    // for validation, and reads back the single-pixel key count.
+    std::uint32_t splatGatherWork=0;bool splatGathered=splat;std::uint64_t readbackKeyCount=keyCount;
+    std::optional<glasscaustics::Frame> splatOwner;
+    if(splat) {
+        // Pass order: normaliser, tile keys, bitonic sort, tile segments, the host
+        // overflow check, then the gather. The splat kernels and the shared sort
+        // read the tile key count from deposition.x of their own parameter copy,
+        // so the retained params keep the single-pixel count for grating reuse.
+        auto splatParams=p;splatParams.deposition[0]=std::uint32_t(keyCount);
+        metalcaustic::SplatParams splatBases{};
+        splatBases.bases={std::uint32_t(splatLayout.normaliserBase),std::uint32_t(splatLayout.rangeBase),
+            std::uint32_t(splatLayout.lookupBase),std::uint32_t(splatLayout.lookupCount)};
+        splatBases.tiles={std::uint32_t(splatLayout.counterBase),std::uint32_t(schedule.splat.tilesX),std::uint32_t(schedule.splat.tilesY),
+            std::uint32_t(schedule.splat.keySlots)};
+        const auto bindSplat=[&](id<MTLComputeCommandEncoder> encoder,id<MTLComputePipelineState> pipeline) {
+            bind(encoder,pipeline);[encoder setBytes:&splatParams length:sizeof(splatParams) atIndex:0];
+            [encoder setBuffer:state.splat offset:0 atIndex:9];[encoder setBytes:&splatBases length:sizeof(splatBases) atIndex:10];
+            [encoder setTexture:ids atIndex:1];[encoder setTexture:depth atIndex:2];
+        };
+        const auto completed=[&](id<MTLCommandBuffer> submitted) {
+            [submitted commit];[submitted waitUntilCompleted];
+            return submitted.status==MTLCommandBufferStatusCompleted&&*static_cast<const std::uint32_t*>(state.diagnostic.contents)==0;
+        };
+        phase=std::chrono::steady_clock::now();command=[queue commandBuffer];
+        encoder=command!=nil?[command computeCommandEncoder]:nil;
+        if(command==nil||encoder==nil)return refuse("Metal caustic splat normaliser encoder unavailable");
+        bindSplat(encoder,state.splatNormaliser);dispatch(encoder,state.splatNormaliser,slots);[encoder endEncoding];
+        if(!completed(command))return refuse("Metal caustic splat normaliser refused");
+        state.metrics.normaliserMilliseconds=elapsed(phase);
+        phase=std::chrono::steady_clock::now();command=[queue commandBuffer];
+        encoder=command!=nil?[command computeCommandEncoder]:nil;
+        if(command==nil||encoder==nil)return refuse("Metal caustic splat key encoder unavailable");
+        bindSplat(encoder,state.splatKeys);dispatch(encoder,state.splatKeys,keyCount);[encoder endEncoding];
+        for(std::uint64_t size=2;size<=keyCount;size*=2)for(std::uint64_t distance=size/2;distance;distance/=2) {
+            encoder=[command computeCommandEncoder];
+            if(encoder==nil)return refuse("Metal caustic splat sort encoder unavailable");
+            bindSplat(encoder,state.sort);const std::array<std::uint32_t,2> stage{std::uint32_t(size),std::uint32_t(distance)};
+            [encoder setBytes:stage.data() length:sizeof(stage) atIndex:8];
+            dispatch(encoder,state.sort,keyCount/2);[encoder endEncoding];
+        }
         encoder=[command computeCommandEncoder];
-        if(encoder==nil)return refuse("Metal caustic sort encoder unavailable");
-        bind(encoder,state.sort);const std::array<std::uint32_t,2> stage{std::uint32_t(size),std::uint32_t(distance)};
-        [encoder setBytes:stage.data() length:sizeof(stage) atIndex:8];
-        dispatch(encoder,state.sort,deposition.paddedKeyCount/2);[encoder endEncoding];
+        if(encoder==nil)return refuse("Metal caustic splat segment encoder unavailable");
+        bindSplat(encoder,state.splatSegments);dispatch(encoder,state.splatSegments,keyCount);[encoder endEncoding];
+        if(!completed(command))return refuse("Metal caustic splat tile keys or segments refused");
+        // The tile and gather caps are checked before any gather thread runs.
+        std::array<std::uint32_t,metalcaustic::kSplatCounterWords> counters{};
+        std::memcpy(counters.data(),static_cast<const std::uint32_t*>(state.splat.contents)+splatLayout.counterBase,sizeof(counters));
+        // On this and the other early returns, ~MetalCausticState releases the splat scratch.
+        if(counters[0]&metalcaustic::kSplatOverflowKeySlots)return refuse("Metal caustic splat path deposited past its keyed slots");
+        if(counters[0]&metalcaustic::kSplatOverflowTile)return refuse("Metal caustic splat tile key is outside the image");
+        if(counters[0]!=0||counters[1]>glasscaustics::splatGatherWorkCap()) {
+            // Crowded tiles: the traced deposits are kept and deposited again as the
+            // single-pixel frame, under the identity it had before enableSplat. The
+            // validator checks the CPU reference overflows the same caps. The
+            // retained params already carry the single-pixel key count.
+            splatOwner.emplace(state.schedule);
+            if(!glasscaustics::disableSplat(state.prepared,state.schedule,error))return false;
+            if(state.schedule.identity!=state.singlePixelIdentity)return refuse("Metal caustic splat fallback identity changed");
+            state.identity.frameIdentity=state.schedule.identity;
+            splatGathered=false;readbackKeyCount=deposition.paddedKeyCount;
+            state.metrics.splatVersion=0;state.metrics.splatFallback=true;
+        } else {
+            splatGatherWork=counters[1];state.metrics.splatGatherWork=splatGatherWork;
+            command=[queue commandBuffer];encoder=command!=nil?[command computeCommandEncoder]:nil;
+            if(command==nil||encoder==nil)return refuse("Metal caustic splat gather encoder unavailable");
+            bindSplat(encoder,state.splatGather);
+            [encoder dispatchThreads:MTLSizeMake(frame.width_,frame.height_,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+            [encoder endEncoding];
+            if(!completed(command))return refuse("Metal caustic splat gather or completed readback refused");
+            state.metrics.depositionMilliseconds=elapsed(phase);
+        }
     }
-    encoder=[command computeCommandEncoder];
-    if(encoder==nil)return refuse("Metal caustic reduction encoder unavailable");
-    bind(encoder,state.reduce);dispatch(encoder,state.reduce,deposition.paddedKeyCount);[encoder endEncoding];
-    // Ended encoders order tracked buffer writes between sort stages. The owned
-    // queue also orders the Sokol raster, tracing and completed deposition.
-    [command commit];[command waitUntilCompleted];state.metrics.depositionMilliseconds=elapsed(phase);
-    if(command.status!=MTLCommandBufferStatusCompleted||*static_cast<const std::uint32_t*>(state.diagnostic.contents)!=0)
-        return refuse("Metal caustic sorted deposition or completed readback refused");
+    if(!splatGathered) {
+        phase=std::chrono::steady_clock::now();command=[queue commandBuffer];
+        encoder=[command computeCommandEncoder];
+        if(command==nil||encoder==nil)return refuse("Metal caustic deposition encoder unavailable");
+        bind(encoder,state.initializeKeys);dispatch(encoder,state.initializeKeys,deposition.paddedKeyCount);[encoder endEncoding];
+        for(std::uint64_t size=2;size<=deposition.paddedKeyCount;size*=2)for(std::uint64_t distance=size/2;distance;distance/=2) {
+            encoder=[command computeCommandEncoder];
+            if(encoder==nil)return refuse("Metal caustic sort encoder unavailable");
+            bind(encoder,state.sort);const std::array<std::uint32_t,2> stage{std::uint32_t(size),std::uint32_t(distance)};
+            [encoder setBytes:stage.data() length:sizeof(stage) atIndex:8];
+            dispatch(encoder,state.sort,deposition.paddedKeyCount/2);[encoder endEncoding];
+        }
+        encoder=[command computeCommandEncoder];
+        if(encoder==nil)return refuse("Metal caustic reduction encoder unavailable");
+        bind(encoder,state.reduce);dispatch(encoder,state.reduce,deposition.paddedKeyCount);[encoder endEncoding];
+        // Ended encoders order tracked buffer writes between sort stages. The owned
+        // queue also orders the Sokol raster, tracing and completed deposition.
+        [command commit];[command waitUntilCompleted];state.metrics.depositionMilliseconds=elapsed(phase);
+        if(command.status!=MTLCommandBufferStatusCompleted||*static_cast<const std::uint32_t*>(state.diagnostic.contents)!=0)
+            return refuse("Metal caustic sorted deposition or completed readback refused");
+    }
     state.identity.completedFence=state.submission;phase=std::chrono::steady_clock::now();
     glasscaustics::NativeReadback receipt;receipt.frameIdentity=schedule.identity;
     receipt.paths.reserve(schedule.work.size());
     receipt.deposits.reserve(schedule.bounds.maximumDeposits);
     receipt.deposition.version=glasscaustics::kDepositionVersion;receipt.deposition.submission=state.identity;
     const auto* nativeKeys=static_cast<const glasscaustics::DepositionKey*>(state.keys.contents);
-    receipt.deposition.keys.assign(nativeKeys,nativeKeys+deposition.paddedKeyCount);
+    receipt.deposition.keys.assign(nativeKeys,nativeKeys+readbackKeyCount);
     receipt.deposition.visibleCount=std::count_if(receipt.deposition.keys.begin(),receipt.deposition.keys.end(),
         [](const auto& key){return key.pixel!=std::numeric_limits<std::uint32_t>::max();});
     receipt.deposition.complete=true;
@@ -7744,14 +7981,16 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
     const auto* nativeDeposits=static_cast<const std::uint8_t*>(state.deposits.contents);
     for(std::size_t w=0;w<schedule.work.size();++w) {
         const auto& native=nativePaths[w];
-        if(native.count>policy.maximumVisits)return refuse("Metal caustic deposit readback overflow");
+        if(native.count>policy.maximumVisits)
+        {error="Metal caustic deposit readback overflow (path "+std::to_string(w)+" of "+std::to_string(schedule.work.size())
+            +": deposit count "+std::to_string(native.count)+" exceeds the "+std::to_string(policy.maximumVisits)+" visit bound)";return false;}
         glasscaustics::NativePathReceipt path;
         path.work=native.work;path.depositCount=native.count;path.visits=native.visits;
         path.queryWork=native.queries;path.complete=native.complete!=0;path.sourceBlocked=native.blocked!=0;
         path.launchedPower=native.launched;path.depositedPower=native.deposited;path.absorbedPower=native.absorbed;
         path.escapedPower=native.escaped;path.unresolvedPower=native.unresolved;
         if(!metalcaustic::decodePathReceiptExtensions(native,multipleScatter,path))
-            return refuse("Metal caustic extension schema is invalid");
+        {error="Metal caustic extension schema is invalid (path "+std::to_string(w)+" of "+std::to_string(schedule.work.size())+")";return false;}
         path.sourceHit=metalcaustic::decode(native.source);path.entryHit=metalcaustic::decode(native.entry);
         receipt.paths.push_back(path);
         for(std::uint32_t d=0;d<native.count;++d) {
@@ -7776,8 +8015,25 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
         }
     }
     const auto* radiance=static_cast<const float*>(state.accumulation.contents);receipt.spectralRadiance.assign(radiance,radiance+pixels*8);
+    if(splatGathered) {
+        // One normaliser per readback deposit, in canonical work then slot order.
+        receipt.deposition.splatGatherWork=splatGatherWork;
+        receipt.deposition.splatNormalisers.reserve(receipt.deposits.size());
+        const auto* words=static_cast<const std::uint32_t*>(state.splat.contents)+splatLayout.normaliserBase;
+        for(std::size_t w=0;w<receipt.paths.size();++w)for(std::size_t d=0;d<receipt.paths[w].depositCount;++d) {
+            float normaliser=0;std::memcpy(&normaliser,words+w*policy.maximumVisits+d,sizeof(normaliser));
+            receipt.deposition.splatNormalisers.push_back(normaliser);
+        }
+    }
+    if(splat) {
+        // The scratch is transient: the frame never retains it past this readback.
+#if ! __has_feature(objc_arc)
+        [state.splat release];
+#endif
+        state.splat=nil;state.splatBufferCharge=arbitgpu::residency::ResidencyCharge();
+    }
     glasscaustics::EnergyLedger ledger;
-    if(!glasscaustics::validateNativeReadback(state.prepared,schedule,receipt,ledger,error,&state.identity))return false;
+    if(!glasscaustics::validateNativeReadback(state.prepared,splatOwner?*splatOwner:schedule,receipt,ledger,error,&state.identity))return false;
     state.metrics.readbackMilliseconds=elapsed(phase);phase=std::chrono::steady_clock::now();
     // Allocate a distinct target so no partial resolve can mutate public Color.
     MTLTextureDescriptor* resolvedDesc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
@@ -7911,7 +8167,8 @@ public:
         bool diagnosticInstanceIdentityColors,
         const std::vector<videowire::geometry::AttributeData>* frameAttributes,
         const smoothglass::DistinctGratingAdmission* distinctGrating,
-        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& discreteGratingProgram)
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& discreteGratingProgram,
+        const smoothglass::CausticVolumeSelection* causticVolume=nullptr)
     {
         using namespace HarmonicMIDI::grid;
         const auto diffractionConsumer=distinctGrating?NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders
@@ -8002,17 +8259,35 @@ public:
         // in sg_commit(), and a refused frame never commits.
         std::unique_ptr<MetalSurfaceSourceCreation> sourceCreation;
         std::string fragmentSource,vertexSource;
+        // The restricted archive has fixed stage accounting and no diffraction layer module,
+        // so a program with a layer anywhere takes the general source below.
+        const bool layered=materialProgram && (materialProgram->diffractionLayer
+            || std::any_of(materialProgram->objectPrograms.begin(),materialProgram->objectPrograms.end(),
+                [](const auto& object){return object && object->diffractionLayer.has_value();}));
         const bool admittedNullSurface=(!materialProgram || !materialProgram->vertexProgram)
-            && (!materialProgram || materialProgram->kind==NativeFixtureMaterialKind::SurfacePbr);
+            && (!materialProgram || materialProgram->kind==NativeFixtureMaterialKind::SurfacePbr) && !layered;
+        // A caustic volume preparation composes the paired camera transport. Without one
+        // both fragment paths keep the released single-dielectric text. A layered program
+        // with a volume composes both modules in the general source below, never in the
+        // restricted archive.
+        const bool pairedVolume=causticVolume!=nullptr && distinctGrating==nullptr;
         if(admittedNullSurface) {
             try {
-                auto archive=surfacesource::prepare([] { return restrictedSurfaceSourceRecipe<surfacesource::Source>(); },
+                auto archive=surfacesource::prepare([pairedVolume] { return restrictedSurfaceSourceRecipe<surfacesource::Source>(pairedVolume); },
                     sizeof(MetalSurfaceSourceCreation));
                 sourceCreation=std::make_unique<MetalSurfaceSourceCreation>(std::move(archive));
+                sourceCreation->pairedVolume=pairedVolume;
             } catch(const std::exception& exception) { result.error=exception.what(); return result; }
         } else {
             fragmentSource=kFixtureFragmentShader;
-            fragmentSource.insert(fragmentSource.find("fragment FragmentOut _main"),opaquevisibility::metalShader()+analyticsky::shader(true)+environmentimage::shader(true)+smoothglass::queryShader(true)+smoothglass::transportShader(true,true)+metalSpectralTransportShader());
+            if(layered && !composeLayeredFixtureMain(fragmentSource)) {
+                result.error="Metal fixture diffraction layer anchor is not unique";
+                return result;
+            }
+            if(pairedVolume) declarePairedFixtureUniform(fragmentSource);
+            else if(layered) declareLayeredFixtureUniform(fragmentSource);
+            fragmentSource.insert(fragmentSource.find("fragment FragmentOut _main"),opaquevisibility::metalShader()+analyticsky::shader(true)+environmentimage::shader(true)+smoothglass::queryShader(true)+smoothglass::transportShader(true,true,false,pairedVolume)+metalSpectralTransportShader()
+                +(layered ? arbitgpu::stamlayer::metalShader() : std::string()));
             vertexSource=fixtureVertexModifierShader(kFixtureVertexShader,
                 materialProgram ? materialProgram->vertexProgram.get() : nullptr,
                 videohelper::materialprogram::BackendTarget::Metal,result.error);
@@ -8254,7 +8529,8 @@ public:
             if (!smoothglass::prepare(scene,materialProgram,resources->instanceAppearances,
                     resources->smoothGlass,result.error,
                     {NativeFixtureMaterialBackend::Metal, true, true, true, smoothglass::kMultipleScatterVersion,
-                        gMetalDevice!=nil && sg_mtl_command_queue()!=nullptr},distinctGrating)) return fail(result.error);
+                        gMetalDevice!=nil && sg_mtl_command_queue()!=nullptr},distinctGrating,
+                    causticVolume)) return fail(result.error);
             environmentimage::Prepared environment;
             if (!environmentimage::prepare(*scene,materialProgram.get(),environment,result.error,
                     resources->smoothGlass.enabled ? environmentimage::SecondaryRayConsumer::SmoothTransport
@@ -8288,6 +8564,11 @@ public:
                 && materialProgram->diffractionLightingAdmission->description().version == 3
                 && !diffractiontransportnative::prepareScene(*scene, *materialProgram,
                     materialProgram->sceneRevision, resources->spectralTransport, result.error)) return fail(result.error);
+            // The scene shader compile and the pipeline variants below run
+            // synchronously here on the render thread. Each gets its own scope,
+            // so a long cold prepare names the half that took the time.
+            std::optional<loopstep::Scope> prepareStageScope;
+            prepareStageScope.emplace ("metal:fixture-scene-shader-compile");
             sg_shader_desc shaderDesc = {};
             shaderDesc.vertex_func.source=sourceCreation ? sourceCreation->sources->vertex() : vertexSource.c_str();
             shaderDesc.fragment_func.source=sourceCreation ? sourceCreation->sources->fragment() : fragmentSource.c_str();
@@ -8414,6 +8695,8 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     return fail("Metal rough glass receipt shader creation failed: " + lastSokolLog());
             }
 
+            prepareStageScope.reset();
+            prepareStageScope.emplace ("metal:fixture-scene-pipeline-create");
             sg_pipeline_desc pipelineDesc = {};
             pipelineDesc.shader = resources->shader;
             pipelineDesc.layout.buffers[0].stride = sizeof (SceneVertex);
@@ -8596,6 +8879,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 }
             }
 
+            prepareStageScope.reset();
             const char* failedResource = nullptr;
             if (! resourceValid (sg_query_buffer_state (resources->vertexBuffer)))
                 failedResource = "vertex buffer";
@@ -8725,9 +9009,11 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 result.error = "Metal static local object worlds do not yet admit diffraction gratings";
                 return result;
             }
-            if (materialProgram != nullptr && !resources->spectralTransport.scene
-                && ! nativeFixtureDiffractionWorkWithinBudget (
-                    *materialProgram, width, height))
+            // The spectral transport admits its own lobe work in buildFrame.
+            NativeFixtureDiffractionBands diffractionBands;
+            if (materialProgram != nullptr
+                && ! nativeFixtureDiffractionBandSchedule (*materialProgram, width, height,
+                    !resources->spectralTransport.scene, diffractionBands))
             {
                 result.error = "Metal fixture diffraction workload exceeds backend limits";
                 return result;
@@ -8735,8 +9021,12 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             diffractivefoil::EvaluationSchedule spatialSchedule;
             if (materialProgram != nullptr
                 && materialProgram->diffractionFoilMaximumEvaluations != 0
-                && !nativeFixtureSpatialFoilEvaluationSchedule(
-                    *materialProgram, width, height, spatialSchedule))
+                && (diffractionBands.bandCount == 1
+                    ? !nativeFixtureSpatialFoilEvaluationSchedule(
+                        *materialProgram, width, height, spatialSchedule)
+                    : !diffractivefoil::makeEvaluationSchedule(diffractionBands.maximumEvaluations,
+                        width, nativeFixtureDiffractionBandRows(diffractionBands, 0),
+                        diffractionBands.pathCount, spatialSchedule)))
             {
                 result.error = "Metal fixture diffraction workload exceeds backend limits";
                 return result;
@@ -9061,6 +9351,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 if(!roughglasstiles::admitMemory(*roughTiles,attachmentStride,retained,memory,result.error)) return result;
             }
             glasscaustics::Frame causticSchedule;
+            std::string causticSinglePixelIdentity;
             std::uint64_t causticBytes=0,causticNativeReservation=0;
             MetalRasterCaptureBudget rasterCaptureBudget;
             const auto rasterDrawCount=std::count_if(scene->objects.begin(),scene->objects.begin()+scene->objectCount,
@@ -9072,7 +9363,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     || causticPrepared->glass.sourceScene!=scene
                     || causticPrepared->glass.sourceMaterial!=resources->materialProgram
                     || materialProgram!=resources->materialProgram
-                    || causticPrepared->glass.object!=resources->smoothGlass.object) {
+                    || causticPrepared->glass.object!=smoothglass::causticObject(resources->smoothGlass)) {
                     result.error="Metal caustics require exact glass scene owners and scene-linear Color without composite or instancing";
                     return result;
                 }
@@ -9083,6 +9374,28 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     :glasscaustics::buildScheduledFrame(*causticPrepared,instances,&runtimeInputs,width,height,
                         causticScheduling,causticSchedule,result.error);
                 if(!scheduled)return result;
+                // Ordinary frames spread each visible deposit over a kernel footprint.
+                // A frame whose splat schedule exceeds its budget keeps single-pixel
+                // deposits. Grating staging frames never reach this consumer.
+                causticSinglePixelIdentity=causticSchedule.identity;
+                {
+                    std::string splatError;
+                    static std::atomic<bool> splatRefusalReported{false};
+                    if(!glasscaustics::enableSplat(*causticPrepared,causticSchedule,splatError)&&!splatRefusalReported.exchange(true))
+                        std::fprintf(stderr,"[metal] caustic splat unavailable, single-pixel deposits: %s\n",splatError.c_str());
+                }
+                const bool causticSplat=causticSchedule.splatVersion==glasscaustics::kSplatVersion;
+                metalcaustic::SplatScratchLayout splatLayout;
+                if(causticSplat&&!metalcaustic::splatScratchLayout(causticSchedule,splatLayout)) {
+                    result.error="Metal caustic splat scratch layout exceeds its index range";return result;
+                }
+                // A splat frame keys tiles instead of pixels in the same key buffer.
+                const std::uint64_t causticKeyCount=causticSplat?causticSchedule.splat.paddedKeyCount
+                    :causticSchedule.bounds.deposition.paddedKeyCount;
+                // Splat key arrays, tile ranges and normalisers, plus the scratch
+                // words' native and host copies and the host normaliser receipt.
+                const std::uint64_t splatExtra=causticSplat?causticSchedule.splat.scratchBytes+splatLayout.words*2*sizeof(std::uint32_t)
+                    +causticSchedule.bounds.maximumDeposits*sizeof(float):0;
                 if(!metalRasterCaptureBudget(*resources,causticSchedule,runtimeInputs,
                     roughTiles?roughTiles->tiles().size():1,rasterDrawCount,rasterCaptureBudget,result.error))return result;
                 // Private raster IDs/depth, resolve target, completed Color copy,
@@ -9122,7 +9435,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     +2*causticSchedule.entries.size()*sizeof(glasscaustics::EntrySample)
                     +causticSchedule.work.size()*(2*sizeof(glasscaustics::EntryWork)+64)
                     +causticSchedule.instances.size()*sizeof(opaquevisibility::Instance)
-                    +causticSchedule.bounds.maximumDeposits*128;
+                    +causticSchedule.bounds.maximumDeposits*128+splatExtra;
                 if(!glasscaustics::admitFrameMemory(causticSchedule,extra,causticBytes,result.error)) return result;
                 // Replace these conservative native estimates with actual Metal
                 // allocations at the gate. All host/readback reservations remain.
@@ -9133,7 +9446,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 causticNativeReservation=rasterCaptureBudget.native+selectedNative+roughNative+attachmentBytes+resources->permanentBytes+pixels*(glasscaustics::kAccumulatorBytesPerPixel+20+8)
                     +causticSchedule.work.size()*glasscaustics::kPathReceiptStride*sizeof(glasscaustics::Texel)
                     +causticSchedule.bounds.maximumDeposits*glasscaustics::kDepositReceiptStride*sizeof(glasscaustics::Texel)
-                    +causticSchedule.bounds.deposition.paddedKeyCount*sizeof(glasscaustics::DepositionKey)
+                    +causticKeyCount*sizeof(glasscaustics::DepositionKey)+splatLayout.words*sizeof(std::uint32_t)
                     +causticSchedule.workTexels.size()*16+causticSchedule.triangleTexels.size()*16+queryPadded;
                 if(causticNativeReservation>causticBytes) {
                     result.error="Metal caustic native reservation is inconsistent";return result;
@@ -9149,6 +9462,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 frame->caustic=std::make_unique<MetalCausticState>();
                 frame->caustic->prepared=*causticPrepared;
                 frame->caustic->schedule=std::move(causticSchedule);
+                frame->caustic->singlePixelIdentity=std::move(causticSinglePixelIdentity);
                 frame->caustic->bytes=causticBytes;frame->caustic->nativeReservation=causticNativeReservation;
                 frame->caustic->submission=nextMetalRendererGeneration();
             }
@@ -9246,6 +9560,14 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             }
             uniforms.passProgram = renderpasscomposite::gpuProgram(scenePassProgram(runtimeInputs));
             uniforms.passProgram.control[2] = runtimeInputs.linearColor ? 1.0f : 0.0f;
+            // Glass Caustics off: encode the camera-only SDR Color like the caustic
+            // route's linear Color reaches the compositor (see cameraOnlyDisplayEncode).
+            const bool cameraOnlyEncode = smoothglass::cameraOnlyDisplayEncode(resources->smoothGlass,
+                runtimeInputs.linearColor, runtimeInputs.imageOutput == renderpassoutput::Output::Color
+                    && !runtimeInputs.passComposite && !runtimeInputs.passProgram,
+                diffractionDraw || tiledRough || (resources->smoothGlass.enabled && resources->smoothGlass.roughness > 0.0f),
+                smoothglass::frameHasBlendedDraw(*scene, materialProgram.get(), resources->instanceAppearances));
+            uniforms.passProgram.control[3] = cameraOnlyEncode ? 1.0f : 0.0f;
             uniforms.imageOutput[0] = static_cast<float>(runtimeInputs.imageOutput);
             uniforms.vertexTime[0] = runtimeInputs.timeSeconds;
             std::memcpy(uniforms.vertexSpectrum, runtimeInputs.vertexSpectrum.data(),
@@ -9340,6 +9662,11 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     uniforms.glassTransport[1] = pbr.transmissionIorClearcoat[3];
                     uniforms.glassTransport[2] = float(resources->smoothGlass.object.value & 65535u);
                     uniforms.glassTransport[3] = float(resources->smoothGlass.object.value >> 16u);
+                    // Frame default. Each scene object draw names its own partner dielectric.
+                    const auto partner = smoothglass::cameraPartner(resources->smoothGlass, resources->smoothGlass.object);
+                    std::copy(partner.begin(), partner.end(), uniforms.glassTransport2);
+                    storeStamLayer(uniforms, materialProgram->diffractionLayer
+                        ? &*materialProgram->diffractionLayer : nullptr);
                 }
                 std::copy (pbr.baseColorMetallic.begin(), pbr.baseColorMetallic.begin() + 3,
                            uniforms.baseColor);
@@ -9616,6 +9943,9 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             pass.action.colors[0].store_action = SG_STOREACTION_STORE;
             pass.action.colors[0].clear_value = {
                 7.0f / 255.0f, 10.0f / 255.0f, 18.0f / 255.0f, 1.0f };
+            if (cameraOnlyEncode)
+                pass.action.colors[0].clear_value = { smoothglass::displayEncode(7.0f / 255.0f),
+                    smoothglass::displayEncode(10.0f / 255.0f), smoothglass::displayEncode(18.0f / 255.0f), 1.0f };
             if (runtimeInputs.imageOutput != renderpassoutput::Output::Color || runtimeInputs.passComposite)
                 pass.action.colors[0].clear_value = { 0.0f, 0.0f, 0.0f, 0.0f };
             if (runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage)
@@ -9791,6 +10121,9 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                         std::fill_n(uniforms.timeMixEndColorAndTime, 4, 0.0f);
                         std::fill_n(uniforms.surfaceCoating, 4, 0.0f);
                         std::fill_n(uniforms.glassTransport, 4, 0.0f);
+                        std::fill_n(uniforms.glassTransport2, 4, 0.0f);
+                        storeStamLayer(uniforms, drawProgram && drawProgram->diffractionLayer
+                            ? &*drawProgram->diffractionLayer : nullptr);
                         if (drawProgram != nullptr)
                         {
                             const auto& pbr = drawProgram->parameters;
@@ -9802,10 +10135,13 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                             std::copy_n(pbr.emissionRoughness.begin(), 3, uniforms.emissive);
                             std::copy_n(pbr.transmissionIorClearcoat.begin(), 3, uniforms.surfaceCoating);
                             uniforms.surfaceCoating[3] = 1.0f;
-                            uniforms.glassTransport[0] = float(pbr.identifiers[1]);
-                            uniforms.glassTransport[1] = pbr.transmissionIorClearcoat[3];
-                            uniforms.glassTransport[2] = float(resources->smoothGlass.object.value & 65535u);
-                            uniforms.glassTransport[3] = float(resources->smoothGlass.object.value >> 16u);
+                            // The caustic volume draw shades the volume with the water as its
+                            // partner. Without a volume these are the released values and zero.
+                            const auto transport = smoothglass::cameraTransport(resources->smoothGlass, drawObject.id,
+                                float(pbr.identifiers[1]), pbr.transmissionIorClearcoat[3]);
+                            const auto partner = smoothglass::cameraPartner(resources->smoothGlass, drawObject.id);
+                            std::copy(transport.begin(), transport.end(), uniforms.glassTransport);
+                            std::copy(partner.begin(), partner.end(), uniforms.glassTransport2);
                             if (drawProgram->baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::TimeLinearMix)
                             {
                                 std::copy_n(drawProgram->timeMixEndColor.begin(), 3, uniforms.timeMixEndColorAndTime);
@@ -10010,6 +10346,24 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                         && materialProgram->kind
                             == NativeFixtureMaterialKind::DiffractionReflective
                     ? materialProgram->diffractionPathCount : 1u;
+                // Each band is one scissored draw per lighting path. Bands
+                // cover disjoint rows, so path accumulation per pixel is unchanged.
+                const bool bandedDiffraction = diffractionBands.bandCount > 1;
+                for (std::uint32_t band = 0; band < std::max(1u, diffractionBands.bandCount); ++band)
+                {
+                const auto bandRows = nativeFixtureDiffractionBandRows(diffractionBands, band);
+                if (bandedDiffraction)
+                {
+                    sg_apply_scissor_rect(0, static_cast<int>(nativeFixtureDiffractionBandOrigin(diffractionBands, band)),
+                        static_cast<int>(width), static_cast<int>(bandRows), true);
+                    if (materialProgram->diffractionFoilMaximumEvaluations != 0
+                        && !diffractivefoil::makeEvaluationSchedule(diffractionBands.maximumEvaluations,
+                            width, bandRows, diffractionBands.pathCount, spatialSchedule))
+                        return fail("Metal fixture diffraction workload exceeds backend limits");
+                }
+                const auto bandEvaluationLimit = bandedDiffraction
+                    ? nativeFixtureDiffractionBandEvaluationLimit(diffractionBands, band)
+                    : spatialSchedule.maximumEvaluations;
                 for (std::uint8_t pathIndex = 0; pathIndex < pathCount; ++pathIndex)
                 {
                     if (mixedMaterials || materialFrameView.id != 0)
@@ -10037,11 +10391,10 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                             = materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4u : 0u;
                         uniforms.diffractionSpatialCounts[1]
                             = materialProgram->diffractionOccupancyRectangleCount;
-                        uniforms.diffractionEvaluationSchedule[0] = spatialSchedule.width;
-                        uniforms.diffractionEvaluationSchedule[1] = spatialSchedule.height;
-                        uniforms.diffractionEvaluationSchedule[2]
-                            = spatialSchedule.maximumEvaluations;
                     }
+                    uniforms.diffractionEvaluationSchedule[0] = spatialSchedule.width;
+                    uniforms.diffractionEvaluationSchedule[1] = spatialSchedule.height;
+                    uniforms.diffractionEvaluationSchedule[2] = bandEvaluationLimit;
                     uniforms.diffractionEvaluationSchedule[3] = pathIndex;
                     const sg_range uniformRange = { &uniforms, sizeof (uniforms) };
                     sg_apply_uniforms (0, &uniformRange);
@@ -10050,6 +10403,9 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                              static_cast<int>(noteInstances.count));
                     ++submittedDiffractionDrawCount;
                 }
+                }
+                if (bandedDiffraction)
+                    sg_apply_scissor_rect(0, 0, static_cast<int>(width), static_cast<int>(height), true);
             }
             else
             { drawSurfaces(-1); }
@@ -10283,8 +10639,8 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             result.stats.materialBytes = sizeof (uniforms) * result.stats.drawCount;
             result.stats.reusedStaticResources = true;
             result.stats.reusedMaterialProgram = materialProgram != nullptr;
-            result.stats.diffractionEvaluationBudget = diffractionDraw ? spatialSchedule.maximumEvaluations : 0;
-            result.stats.diffractionEvaluationCount = diffractionDraw ? spatialSchedule.requiredEvaluations : 0;
+            result.stats.diffractionEvaluationBudget = diffractionDraw ? diffractionBands.maximumEvaluations : 0;
+            result.stats.diffractionEvaluationCount = diffractionDraw ? diffractionBands.requiredEvaluations : 0;
             return result;
         }
     }
@@ -11370,8 +11726,9 @@ bool inspectMetalSurfaceSourceAdmissionForFixture(const std::shared_ptr<const Na
     const auto vertex=fixtureVertexModifierShader(kFixtureVertexShader,nullptr,
         videohelper::materialprogram::BackendTarget::Metal,vertexError);
     std::string fragment=kFixtureFragmentShader;
+    if(creation.pairedVolume) declarePairedFixtureUniform(fragment);
     fragment.insert(fragment.find("fragment FragmentOut _main"),opaquevisibility::metalShader()+analyticsky::shader(true)
-        +environmentimage::shader(true)+smoothglass::queryShader(true)+smoothglass::transportShader(true,true)
+        +environmentimage::shader(true)+smoothglass::queryShader(true)+smoothglass::transportShader(true,true,false,creation.pairedVolume)
         +metalSpectralTransportShader());
     if(vertex.size()!=archive.vertexLength||fragment.size()!=archive.fragmentLength
         ||std::memcmp(vertex.c_str(),archive.vertex(),vertex.size()+1)
@@ -11773,7 +12130,7 @@ bool prepareMetalGlassCaustic(const std::shared_ptr<const NativeFixtureSceneReso
     }
     glasscaustics::Prepared candidate;
     if(!glasscaustics::consumerCanRender(metalGlassCausticConsumerContract(),NativeFixtureMaterialBackend::Metal,
-        resources->smoothGlass.roughness)) {error="Metal caustic native consumer contract is unavailable";return false;}
+        smoothglass::causticRoughness(resources->smoothGlass))) {error="Metal caustic native consumer contract is unavailable";return false;}
     if(!glasscaustics::prepare(resources->smoothGlass,source,policy,candidate,error)) return false;
     // Shared re-admission checked snapshot contents. Keep the equivalent native
     // immutable owners so raster, query, source and readback have one lifetime.
@@ -11789,6 +12146,24 @@ NativeFixtureScenePreparation prepareMetalGlassGratingResources(
 {
     auto& backend=static_cast<MetalFixtureSceneBackend&>(nativeFixtureSceneBackend());
     return backend.prepareGrating(scene,root,admission,originalCompiledLeaf);
+}
+
+NativeFixtureScenePreparation prepareMetalGlassCausticVolumeResources(
+    NativeFixtureSceneBackend& owner,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& material,
+    const smoothglass::CausticVolumeSelection& selection,NativeFixturePrepareUse)
+{
+    // Same static preparation as prepare(), with the selected caustic volume
+    // carried in the smooth glass second slot beside the thin camera dielectric.
+    // A camera-only selection (Glass Caustics off) takes the same path: the
+    // paired camera walk and its budget, and no caustic resources.
+    auto* backend=dynamic_cast<MetalFixtureSceneBackend*>(&owner);
+    if(!backend) {
+        NativeFixtureScenePreparation refused;
+        refused.error="Metal caustic volume preparation has a foreign backend owner";return refused;
+    }
+    return backend->prepareGeometryInstancesOwned(scene,material,{},false,nullptr,nullptr,{},&selection);
 }
 
 // Fixture-only ownership inspection. Pending camera storage contains no image
@@ -12053,6 +12428,8 @@ static bool stageMetalGlassGratingFrameBound(const std::shared_ptr<const NativeF
         uniforms.rawIdentifiers[o][0]=float(object.material.value&65535u);uniforms.rawIdentifiers[o][1]=float(object.material.value>>16u);
         uniforms.rawIdentifiers[o][2]=float(object.id.value&65535u);uniforms.rawIdentifiers[o][3]=float(object.id.value>>16u);
     }
+    // buildFrameImpl admits instance i only for scene object i, so the object
+    // index written here is also the frame's triangle instance ID.
     for(const auto& instance:state.schedule.instances) {
         const auto& object=scene.objects[instance.object];uniforms.geometryInstanceControl[2]=std::uint32_t(instance.object);
         std::copy(instance.world.begin(),instance.world.end(),uniforms.objectMatrix);
@@ -12258,7 +12635,9 @@ static bool produceMetalGlassGratingReadback(const std::shared_ptr<const NativeF
         ||!frame||!frame->caustic||(!frame->caustic->validated&&!frame->caustic->gratingStagingCompleted)||!binding||!binding->material
         ||!frame->staticResources||frame->rendererGeneration_!=frame->staticResources->rendererGeneration
         ||frame->caustic->identity.completedFence!=frame->caustic->submission
-        ||frame->caustic->schedule.identity!=binding->frame.identity||binding->frame.roughness!=0
+        // A binding owns the single-pixel frame, also for a splat ordinary owner.
+        ||(frame->caustic->schedule.identity!=binding->frame.identity&&frame->caustic->singlePixelIdentity!=binding->frame.identity)
+        ||binding->frame.roughness!=0
         ||binding->frame.gratingIncidentBinding||binding->prepared.glass.sourceScene!=frame->staticResources->snapshot
         ||binding->prepared.glass.sourceMaterial!=frame->staticResources->materialProgram)
         return refuse("Metal grating producer requires its exact completed smooth staging owner");
@@ -21596,6 +21975,10 @@ struct MetalDrawShapeParams
     float color[4];
     int32_t operation;
     float padding[3];
+    // Gradient mode: gradient[0] = 1, gradient[1..2] = unit direction (cos, sin).
+    // colorB is the end colour; color is the start colour.
+    float colorB[4];
+    float gradient[4];
 };
 
 enum MetalFxValue
@@ -21640,7 +22023,7 @@ static_assert (sizeof (MetalUvEffectParams) == 32, "Metal UV effect uniforms cha
 static_assert (sizeof (MetalFeedbackParams) == 16, "Metal feedback uniforms changed");
 static_assert (sizeof (MetalPostParams) == 16, "Metal post uniforms changed");
 static_assert (sizeof (MetalCanvasParams) == 32, "Metal canvas uniforms changed");
-static_assert (sizeof (MetalDrawShapeParams) == 64, "Metal draw-shape uniforms changed");
+static_assert (sizeof (MetalDrawShapeParams) == 96, "Metal draw-shape uniforms changed");
 static_assert (sizeof (MetalEffectParams) == 208, "Metal effect uniforms changed");
 
 const char* kMetalLayerVertex = R"metal(
@@ -22169,6 +22552,33 @@ fragment float4 _main(In in [[stage_in]], constant Params& p [[buffer(0)]],
 }
 )metal";
 
+// Imported particle overlay: front is the particle image, back is the retained
+// Render 3D image, drawn with kMetalFullscreenVertex like every other blend.
+// MetalParticleEngine draws pos.y = 0 into the last row (NDC y = -1), so its
+// image holds the particle plane's y = 0 edge at the bottom row. OpenGL draws the
+// same plane into row zero of a top-first frame, so there y = 0 is the image top
+// and the halo starter's projection (v = centerY + s * z) is authored for that.
+// The compositor puts the overlay through three row inversions instead of two,
+// which lands the particles where OpenGL has them. The Render 3D image is a
+// top-first Metal texture (rowOrder TopFirst) and needs the third inversion
+// undone, so it is sampled at 1 - v. Normal mode at full opacity only.
+const char* kMetalOverlayBlendFragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+struct In { float4 position [[position]]; float2 uv [[user(locn0)]]; };
+struct Params { float opacity; int mode; float2 padding; };
+fragment float4 _main(In in [[stage_in]], constant Params& p [[buffer(0)]],
+                      texture2d<float> frontTex [[texture(0)]],
+                      texture2d<float> backTex [[texture(1)]],
+                      sampler imageSampler [[sampler(0)]])
+{
+    const float4 front = frontTex.sample(imageSampler, in.uv);
+    const float4 back = backTex.sample(imageSampler, float2(in.uv.x, 1.0f - in.uv.y));
+    const float alpha = front.a * p.opacity;
+    return float4(mix(back.rgb, front.rgb, alpha), max(back.a, alpha));
+}
+)metal";
+
 const char* kMetalFrameMixFragment = R"metal(
 #include <metal_stdlib>
 using namespace metal;
@@ -22680,7 +23090,7 @@ const char* kMetalDrawShapeFragment = R"metal(
 #include <metal_stdlib>
 using namespace metal;
 struct In { float4 position [[position]]; float2 uv [[user(locn0)]]; };
-struct ShapeParams { float4 rect; float4 rectB; float4 color; int4 operation; };
+struct ShapeParams { float4 rect; float4 rectB; float4 color; int4 operation; float4 colorB; float4 gradient; };
 bool shapeContains(float2 uv, float4 rect)
 {
     float2 halfSize = max(abs(rect.zw) * 0.5f, float2(0.0f));
@@ -22696,6 +23106,13 @@ bool shapeContains(float2 uv, float4 rect)
 }
 fragment float4 _main(In in [[stage_in]], constant ShapeParams& p [[buffer(0)]])
 {
+    if (p.gradient.x > 0.5f)
+    {
+        // Same ramp as the OpenGL compositor and the synthesised Gradient
+        // generator: 0 degrees runs left to right, positive angles turn down.
+        float t = clamp(dot(in.uv - float2(0.5f), p.gradient.yz) + 0.5f, 0.0f, 1.0f);
+        return mix(p.color, p.colorB, t);
+    }
     bool insideA = shapeContains(in.uv, p.rect);
     bool insideB = p.operation.x == 0 ? false : shapeContains(in.uv, p.rectB);
     bool inside = p.operation.x == 1 ? (insideA || insideB)
@@ -22732,18 +23149,13 @@ fragment float4 _main(In in [[stage_in]], constant Params& p [[buffer(0)]],
 }
 )metal";
 
+// Same matrix as the OpenGL compositor (layer_transform.h): the rotation runs
+// in aspect-corrected space, so a rotated frame stays a rigid rectangle and the
+// Metal and OpenGL paths agree. `aspect` is the canvas width / height.
 void makeTransform (float tx, float ty, float rotationDeg, float sx, float sy,
-                    float out[16])
+                    float aspect, float out[16])
 {
-    const float radians = rotationDeg * 0.01745329251994329577f;
-    const float c = std::cos (radians), s = std::sin (radians);
-    const float values[16] = {
-        c * sx, s * sx, 0.0f, 0.0f,
-       -s * sy, c * sy, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.0f, 0.0f,
-        tx, ty, 0.0f, 1.0f,
-    };
-    std::copy (std::begin (values), std::end (values), out);
+    videorender::buildLayerTransform (tx, ty, rotationDeg, sx, sy, aspect, out);
 }
 
 int metalTransitionType (int wireType)
@@ -22941,7 +23353,7 @@ struct MetalFrameRenderer::Impl
 
     sg_sampler sampler = {};
     sg_shader layerShader = {}, blendShader = {}, frameMixShader = {}, transitionShader = {}, blitShader = {};
-    sg_shader frameLeaseShader = {};
+    sg_shader frameLeaseShader = {}, overlayBlendShader = {};
     sg_shader blurShader = {}, sharpenShader = {}, productionFilterShader = {};
     sg_shader colorTransformShader = {};
     sg_shader lutShader = {}, uvEffectShader = {};
@@ -22949,7 +23361,7 @@ struct MetalFrameRenderer::Impl
     sg_shader bloomThresholdShader = {}, postCombineShader = {};
     sg_shader canvasShader = {}, previewShader = {}, drawShapeShader = {};
     sg_pipeline layerPipeline = {}, blendPipeline = {}, frameMixPipeline = {}, transitionPipeline = {}, blitPipeline = {};
-    sg_pipeline frameLeasePipeline = {}, linearFrameLeasePipeline = {};
+    sg_pipeline frameLeasePipeline = {}, linearFrameLeasePipeline = {}, overlayBlendPipeline = {};
     sg_pipeline blurPipeline = {}, sharpenPipeline = {}, productionFilterPipeline = {};
     sg_pipeline colorTransformPipeline = {};
     sg_pipeline lutPipeline = {}, uvEffectPipeline = {};
@@ -23305,6 +23717,17 @@ struct MetalFrameRenderer::Impl
         blendPipelineDesc.label = "arbit-metal-frame-blend-pipeline";
         blendPipeline = makeCheckedPipeline (blendPipelineDesc);
 
+        // The imported particle overlay blends the particle image and the
+        // retained Render 3D image before the ordinary layer pass. The two
+        // arrive in opposite row orders, so this variant reads the scene with
+        // v flipped. See kMetalOverlayBlendFragment.
+        blendDesc.fragment_func.source = kMetalOverlayBlendFragment;
+        blendDesc.label = "arbit-metal-frame-overlay-blend";
+        overlayBlendShader = makeCheckedShader (blendDesc);
+        blendPipelineDesc.shader = overlayBlendShader;
+        blendPipelineDesc.label = "arbit-metal-frame-overlay-blend-pipeline";
+        overlayBlendPipeline = makeCheckedPipeline (blendPipelineDesc);
+
         sg_shader_desc frameMixDesc = {};
         frameMixDesc.vertex_func.source = kMetalFullscreenVertex;
         frameMixDesc.fragment_func.source = kMetalFrameMixFragment;
@@ -23646,6 +24069,8 @@ struct MetalFrameRenderer::Impl
             && resourceValid (sg_query_pipeline_state (layerPipeline))
             && resourceValid (sg_query_shader_state (blendShader))
             && resourceValid (sg_query_pipeline_state (blendPipeline))
+            && resourceValid (sg_query_shader_state (overlayBlendShader))
+            && resourceValid (sg_query_pipeline_state (overlayBlendPipeline))
             && resourceValid (sg_query_shader_state (frameMixShader))
             && resourceValid (sg_query_pipeline_state (frameMixPipeline))
             && resourceValid (sg_query_shader_state (transitionShader))
@@ -24307,6 +24732,7 @@ void MetalFrameRenderer::shutdown (const arbitgl::GlFuncs* gl)
     impl_->destroyOutputs (gl);
     if (impl_->layerPipeline.id != 0) sg_destroy_pipeline (impl_->layerPipeline);
     if (impl_->blendPipeline.id != 0) sg_destroy_pipeline (impl_->blendPipeline);
+    if (impl_->overlayBlendPipeline.id != 0) sg_destroy_pipeline (impl_->overlayBlendPipeline);
     if (impl_->frameMixPipeline.id != 0) sg_destroy_pipeline (impl_->frameMixPipeline);
     if (impl_->transitionPipeline.id != 0) sg_destroy_pipeline (impl_->transitionPipeline);
     if (impl_->blitPipeline.id != 0) sg_destroy_pipeline (impl_->blitPipeline);
@@ -24329,6 +24755,7 @@ void MetalFrameRenderer::shutdown (const arbitgl::GlFuncs* gl)
     if (impl_->drawShapePipeline.id != 0) sg_destroy_pipeline (impl_->drawShapePipeline);
     if (impl_->layerShader.id != 0) sg_destroy_shader (impl_->layerShader);
     if (impl_->blendShader.id != 0) sg_destroy_shader (impl_->blendShader);
+    if (impl_->overlayBlendShader.id != 0) sg_destroy_shader (impl_->overlayBlendShader);
     if (impl_->frameMixShader.id != 0) sg_destroy_shader (impl_->frameMixShader);
     if (impl_->transitionShader.id != 0) sg_destroy_shader (impl_->transitionShader);
     if (impl_->blitShader.id != 0) sg_destroy_shader (impl_->blitShader);
@@ -24350,6 +24777,7 @@ void MetalFrameRenderer::shutdown (const arbitgl::GlFuncs* gl)
     impl_->layerPipeline = impl_->blendPipeline = impl_->frameMixPipeline = {};
     impl_->transitionPipeline = impl_->blitPipeline = {};
     impl_->frameLeasePipeline = {}; impl_->linearFrameLeasePipeline = {}; impl_->frameLeaseShader = {};
+    impl_->overlayBlendPipeline = {}; impl_->overlayBlendShader = {};
     impl_->layerShader = impl_->blendShader = impl_->frameMixShader = {};
     impl_->transitionShader = impl_->blitShader = {};
     impl_->blurPipeline = impl_->sharpenPipeline = impl_->lutPipeline = {};
@@ -25328,7 +25756,8 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                         overlayPass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
                         overlayPass.action.colors[0].store_action = SG_STOREACTION_STORE;
                         sg_begin_pass(&overlayPass);
-                        sg_apply_pipeline(impl_->blendPipeline);
+                        // Particles in front, scene behind with v flipped (see the fragment).
+                        sg_apply_pipeline(impl_->overlayBlendPipeline);
                         sg_bindings bindings = {};
                         bindings.views[0] = sourceView;
                         bindings.views[1].id = static_cast<std::uint32_t>(layer.nativeTextureView);
@@ -25709,8 +26138,12 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
             const int displayHeight = impl_->presentHeight > 0 ? impl_->presentHeight : impl_->height;
             const float outAspect = displayHeight > 0
                 ? static_cast<float> (displayWidth) / displayHeight : 1.0f;
+            // With no canvas the fallback is the render target (impl_->width /
+            // height), like the OpenGL path's outW_ / outH_, not the present size.
+            const float renderAspect = impl_->height > 0
+                ? static_cast<float> (impl_->width) / impl_->height : 1.0f;
             const float refAspect = impl_->canvasWidth > 0 && impl_->canvasHeight > 0
-                ? static_cast<float> (impl_->canvasWidth) / impl_->canvasHeight : outAspect;
+                ? static_cast<float> (impl_->canvasWidth) / impl_->canvasHeight : renderAspect;
             // Generated sources are rasterised into the compositor target and do
             // not carry decoded-media dimensions in LayerDesc. Match the OpenGL
             // path by treating them as full-canvas instead of falling back to a
@@ -25726,7 +26159,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
 
             MetalGeometryParams geometry = {};
             makeTransform (layer.translateX, layer.translateY, layer.rotationDeg,
-                           layer.scale * lbx, layer.scale * lby, geometry.transform);
+                           layer.scale * lbx, layer.scale * lby, refAspect, geometry.transform);
             float zx = impl_->zoom, zy = impl_->zoom;
             if (impl_->canvasWidth > 0 && impl_->canvasHeight > 0)
             {
@@ -25881,6 +26314,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
             makeTransform (overlay.posX, overlay.posY, 0.0f,
                            overlay.width / std::max (refWidth, 1.0f),
                            overlay.height / std::max (refHeight, 1.0f),
+                           std::max (refWidth, 1.0f) / std::max (refHeight, 1.0f),
                            geometry.transform);
             const int displayWidth = impl_->presentWidth > 0
                 ? impl_->presentWidth : impl_->width;
@@ -26072,7 +26506,13 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                       std::clamp(layer.drawShapeA, 0.0f, 1.0f) },
                     layer.drawShapeHasSecondary
                         ? std::clamp(layer.drawShapeOperation, 1, 3) : 0,
-                    { 0.0f, 0.0f, 0.0f } };
+                    { 0.0f, 0.0f, 0.0f },
+                    { std::clamp(layer.drawGradientR, 0.0f, 1.0f),
+                      std::clamp(layer.drawGradientG, 0.0f, 1.0f),
+                      std::clamp(layer.drawGradientB, 0.0f, 1.0f),
+                      std::clamp(layer.drawGradientA, 0.0f, 1.0f) },
+                    { layer.drawShapeGradient ? 1.0f : 0.0f,
+                      layer.drawGradientCos, layer.drawGradientSin, 0.0f } };
                 const sg_range shapeRange = { &shape, sizeof (shape) };
                 sg_apply_uniforms (0, &shapeRange);
                 sg_draw (0, 3, 1);
@@ -26116,7 +26556,11 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                 shapeBindings.views[1] = impl_->accum[read].texture;
                 shapeBindings.samplers[0] = impl_->sampler;
                 sg_apply_bindings (&shapeBindings);
-                const MetalBlendParams normal = { 1.0f, 0, { 0, 0 } };
+                // A Draw Shape overlay composites normally. A Gradient overlay
+                // follows the layer's own blend mode and opacity, like OpenGL.
+                const MetalBlendParams normal = {
+                    layer.drawShapeGradient ? layer.opacity : 1.0f,
+                    layer.drawShapeGradient ? layer.blendMode : 0, { 0, 0 } };
                 const sg_range normalRange = { &normal, sizeof (normal) };
                 sg_apply_uniforms (0, &normalRange);
                 sg_draw (0, 3, 1);
@@ -26146,6 +26590,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
             makeTransform (overlay.posX, overlay.posY, 0.0f,
                            overlay.width / std::max (refWidth, 1.0f),
                            overlay.height / std::max (refHeight, 1.0f),
+                           std::max (refWidth, 1.0f) / std::max (refHeight, 1.0f),
                            geometry.transform);
             const int displayWidth = impl_->presentWidth > 0
                 ? impl_->presentWidth : impl_->width;

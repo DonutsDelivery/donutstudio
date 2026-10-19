@@ -511,7 +511,8 @@ inline std::string digest(
             appendU8(bytes, static_cast<std::uint8_t>(texture.source));
             appendIdentity(bytes, texture.videoResource);
             if (description.version == kGraphFrameWireVersion
-                || description.version == kReflectanceWireVersion)
+                || description.version == kReflectanceWireVersion
+                || description.version == kDiffractionLayerWireVersion)
             {
                 appendU32(bytes, texture.graphFrame ? static_cast<std::uint32_t>(texture.graphFrame->node) : UINT32_MAX);
                 appendU32(bytes, texture.graphFrame ? static_cast<std::uint32_t>(texture.graphFrame->port) : UINT32_MAX);
@@ -568,7 +569,9 @@ inline std::optional<AdmittedMaterialBindings> admit(
         [](const auto& binding) { return hasGraphFrameInput(binding); });
     const bool hasReflectance = std::any_of(untrusted.programs.begin(), untrusted.programs.end(),
         [](const auto& receipt) { return receipt.program && receipt.program->spectralReflectance().has_value(); });
-    if (untrusted.version != requestVersion(hasFrame, hasReflectance))
+    const bool hasDiffractionLayer = std::any_of(untrusted.programs.begin(), untrusted.programs.end(),
+        [](const auto& receipt) { return receipt.program && receipt.program->diffractionLayer().has_value(); });
+    if (untrusted.version != requestVersion(hasFrame, hasReflectance, 1, hasDiffractionLayer))
     {
         detail::fail(AdmissionFailure::UnsupportedVersion, failure, diagnostic);
         return std::nullopt;

@@ -62,6 +62,14 @@ struct SlotHeader
     uint32_t reserved[3];
 };
 
+/** Frame sequence of a docked-viewport ring slot (PROTOCOL.md §shm-docked).
+    reserved[0] holds the low 32 bits and reserved[1] the high 32 bits. 0 means
+    the slot holds no frame of the current writer session. */
+inline uint64_t slotFrameSeq (const SlotHeader& s)
+{
+    return (uint64_t) s.reserved[0] | ((uint64_t) s.reserved[1] << 32);
+}
+
 static constexpr size_t kAlign = 64;
 inline size_t alignUp (size_t v) { return (v + (kAlign - 1)) & ~(kAlign - 1); }
 
@@ -195,6 +203,55 @@ public:
         auto* s = slot (index);
         if (s == nullptr) return nullptr;
         return reinterpret_cast<uint8_t*> (s) + alignUp (sizeof (SlotHeader));
+    }
+
+    /** Writer side, once, before a new writer session starts on a ring that an
+        earlier session already wrote. Arbit keeps the docked-viewport ring across
+        editor close/open and helper restarts, and every helper session restarts
+        its frame sequence at 1. A slot left from the old session would then
+        outrank the new frames: the reader shows the old project's picture and
+        hides the new session's frames until all slots are overwritten, which can
+        be never for a still, PTS-driven scene. This clears every slot's sequence.
+        A slot whose old writer died mid-write (odd generation) is made even again,
+        or the reader would skip it for good. Only the single writer may call it. */
+    void retireFrameSequences()
+    {
+        auto* h = header();
+        if (h == nullptr) return;
+        for (uint32_t i = 0; i < h->slotCount; ++i)
+        {
+            auto* s = slot (i);
+            const uint32_t odd = s->generation.load (std::memory_order_acquire) | 1u;
+            s->generation.store (odd, std::memory_order_relaxed);
+            std::atomic_thread_fence (std::memory_order_release);
+            s->reserved[0] = 0;
+            s->reserved[1] = 0;
+            s->ptsSec = 0.0;
+            s->generation.store (odd + 1u, std::memory_order_release);
+        }
+    }
+
+    /** Reader side: the stable slot (even generation) with the highest frame
+        sequence. Returns false when no stable slot holds a frame. */
+    bool newestFrameSlot (uint32_t& index, uint64_t& seq) const
+    {
+        auto* h = header();
+        index = 0;
+        seq = 0;
+        if (h == nullptr) return false;
+        for (uint32_t i = 0; i < h->slotCount; ++i)
+        {
+            auto* s = slot (i);
+            if ((s->generation.load (std::memory_order_acquire) & 1u) != 0)
+                continue;
+            const uint64_t slotSeq = slotFrameSeq (*s);
+            if (slotSeq > seq)
+            {
+                seq = slotSeq;
+                index = i;
+            }
+        }
+        return seq != 0;
     }
 
     /** Reader-side: copy a frame out of a slot, validating the seqlock.

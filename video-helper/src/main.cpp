@@ -23,6 +23,7 @@
 #include "render_thread.h"
 #include "render_snapshot_json.h"
 #include "score_json_parser.h"
+#include "harmony_signals_json.h"
 #include "model_payload_transport.h"
 #include "environment_image_payload_transport.h"
 #include "glb_geometry_core_adapter.h"
@@ -1069,6 +1070,9 @@ std::string parseExportJob (const json& params, ExportJob& job)
         std::string scoreError;
         if (!videohelper::scorejson::parseScoreJson(params["score"], job.score, scoreError))
             return scoreError;
+        // Optional harmony feed; absent or malformed entries never fail the score.
+        job.harmony = std::make_shared<const arbitharmony::HarmonyTimeline>(
+            arbitharmony::parseHarmonyJson(params["score"], job.score));
     }
 
     // Cross-domain modulation matrix (M6). Each routing maps a musical source
@@ -2785,6 +2789,7 @@ json handle (const std::string& method, const json& params, std::string& error)
         }
         const auto revisions = g_viewport.revisionState();
         return json { { "ok", true },
+                      { "containedRefusals", g_viewport.containedPlanRefusals() },
                       { "authoringRevision", revisions.authoring },
                       { "acceptedRevision", revisions.accepted },
                       { "rejectedRevision", revisions.rejected },
@@ -2861,6 +2866,7 @@ json handle (const std::string& method, const json& params, std::string& error)
         // `score`. Empty/absent ⇒ clears the live score (shaders zero-feed).
         arbitmod::Score score;
         std::string scoreError;
+        auto harmony = std::make_shared<arbitharmony::HarmonyTimeline>();
         if (params.contains ("score") && params["score"].is_object())
         {
             if (!videohelper::scorejson::parseScoreJson(params["score"], score, scoreError))
@@ -2868,6 +2874,7 @@ json handle (const std::string& method, const json& params, std::string& error)
                 error = scoreError;
                 return {};
             }
+            *harmony = arbitharmony::parseHarmonyJson(params["score"], score);
         }
         else if (params.contains ("notes") || params.contains ("rootFreq"))
         {
@@ -2876,6 +2883,7 @@ json handle (const std::string& method, const json& params, std::string& error)
                 error = scoreError;
                 return {};
             }
+            *harmony = arbitharmony::parseHarmonyJson(params, score);
         }
         const canonicalblockc::OwnerIdentity identity {
             params.value("projectGeneration", uint64_t { 0 }),
@@ -2889,7 +2897,7 @@ json handle (const std::string& method, const json& params, std::string& error)
             params.value("loopGeneration", uint64_t { 0 }),
             params.value("seekGeneration", uint64_t { 0 })
         };
-        g_viewport.setScore (std::move (score), identity);
+        g_viewport.setScore (std::move (score), identity, std::move (harmony));
         return json { { "ok", true } };
     }
 
@@ -3274,6 +3282,8 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "compositorBackend", vi.compositorBackend },
             { "particleBackend", vi.particleBackend },
             { "rendererError", vi.rendererError },
+            { "planError", vi.planError },
+            { "planErrorClipId", vi.planErrorClipId },
             { "importedScenePending", vi.importedScenePending },
             { "fallbackCount", vi.fallbackCount },
             { "framesPresented", vi.framesPresented },
@@ -3307,6 +3317,14 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "loopStep", vi.loopStep },
             { "loopStepAgeMs", vi.loopStepAgeMs },
             { "loopTicks", vi.loopTicks },
+            { "lastSlowStep", vi.lastSlowStep },
+            { "lastSlowStepMs", vi.lastSlowStepMs },
+            { "lastSlowScope", vi.lastSlowScope },
+            { "lastSlowScopeMs", vi.lastSlowScopeMs },
+            { "stalledStep", vi.stalledStep },
+            { "stalledStepMs", vi.stalledStepMs },
+            { "lastCloseWaitStep", vi.lastCloseWaitStep },
+            { "lastCloseWaitMs", vi.lastCloseWaitMs },
             { "canvasWidth", vi.canvasWidth },
             { "canvasHeight", vi.canvasHeight },
             { "viewZoom", vi.viewZoom },

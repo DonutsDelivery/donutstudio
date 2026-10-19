@@ -125,6 +125,8 @@ struct ImportedAnimatedSceneReceipt final
     std::optional<std::uint32_t> sourceCameraNodeId {};
     bool usedLastGoodMaterial = false;
     std::string materialDiagnostic;
+    // Preview only. Why the glass caustic rendered reduced or not at all; empty when as planned.
+    std::string causticDegradation;
     std::shared_ptr<const NativeSceneAnimationCompositionFrame> sceneAnimationComposition;
     // Preview only. The frame is still compiling, so the receipt carries no frame and
     // the caller retries. A pending receipt is not valid(), and no history is committed.
@@ -200,6 +202,12 @@ public:
     bool executeExport(const ImportedAnimatedSceneRequest& request,
                        ImportedAnimatedSceneReceipt& output,
                        std::string& error);
+    // The 3D Render node's engine for the following executions. The fixture
+    // scene renderer draws a Path Trace selection (camera/light animation and
+    // compositions without mesh deformation). Routes the deformation renderer
+    // draws, animated meshes and multi-leaf Scene Compose, refuse it by name.
+    void selectEngine(videorender::fixture3d::SceneEngineSelection selection) { sceneRenderer_.selectEngine(selection); }
+    videorender::fixture3d::SceneEngineSelection selectedEngine() const noexcept { return sceneRenderer_.selectedEngine(); }
     bool chargeParentInspection() const noexcept;
     bool inspectParentReceipt(const ImportedAnimatedSceneReceipt& receipt,
         const ImportedAnimatedSceneRequest& expected,ImportedAnimationEvaluationOwner use) const noexcept;

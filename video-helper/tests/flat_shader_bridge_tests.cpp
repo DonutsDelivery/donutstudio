@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -256,6 +257,63 @@ videowire::CompiledVisualLayerPlan chainedTransitionPlan(
         { 73, "visual.shader.filter", "native-gpu", filterXml },
         { 74, "video.out", "native-gpu", "" }
     };
+    return plan;
+}
+
+std::string temporalWire(visualtemporaloperation::Mode mode)
+{
+    visualtemporaloperation::Payload payload;
+    payload.mode = mode;
+    if (mode == visualtemporaloperation::Mode::feedback)
+    {
+        payload.decay = 0.8f;
+        payload.zoom = 1.02f;
+        payload.swirl = 0.05f;
+    }
+    else
+    {
+        payload.historyLength = 4;
+        payload.mix = 0.5f;
+        payload.decay = 0.0f;
+        payload.zoom = 1.0f;
+        payload.swirl = 0.0f;
+    }
+    return visualtemporaloperation::serialize(payload);
+}
+
+// A generator followed by single-image passes the clip runs after the shader
+// (Image Transform, Effects, Feedback Trail, Shape Mask), then Output.
+videowire::CompiledVisualLayerPlan shaderTailPlan(const std::string& generatorXml,
+                                                   const std::vector<std::string>& tail,
+                                                   const std::string& tailPayload = {})
+{
+    videowire::CompiledVisualLayerPlan plan;
+    plan.clipId = 35;
+    plan.structuralRevision = 13;
+    plan.producerValidated = true;
+    plan.nodeKinds = { "visual.shader.generator" };
+    plan.nodeIds = { 80 };
+    plan.operations = { { 80, "visual.shader.generator", "native-gpu", generatorXml } };
+    int previous = 80;
+    int previousPort = 0;
+    int nextId = 81;
+    for (const auto& kind : tail)
+    {
+        const int id = nextId++;
+        plan.nodeKinds.push_back(kind);
+        plan.nodeIds.push_back(id);
+        plan.operations.push_back({ id, kind, "native-gpu",
+            visualtemporaloperation::isTemporalKind(kind) ? tailPayload : std::string {} });
+        plan.edges.push_back({ previous, previousPort, id, 0 });
+        plan.ports.push_back({ id, 0, 1, "in", "frame", "image", "rgba8", "srgb" });
+        plan.ports.push_back({ id, 1, 1, "out", "frame", "image", "rgba8", "srgb" });
+        previous = id;
+        previousPort = 1;
+    }
+    plan.nodeKinds.push_back("video.out");
+    plan.nodeIds.push_back(nextId);
+    plan.operations.push_back({ nextId, "video.out", "native-gpu", "" });
+    plan.edges.push_back({ previous, previousPort, nextId, 0 });
     return plan;
 }
 
@@ -511,6 +569,193 @@ int main()
               && execution.shaderOperationPlan->operations[0].inputNodeIds[0] == 60
               && execution.shaderOperationPlan->operations[1].inputNodeIds[0] == 61,
           "Source to filter A to filter B to Output retains each resource identity");
+
+    // Passes after a shader chain run inside the clip's own LayerDesc stages.
+    {
+        const auto feedbackWire = temporalWire(visualtemporaloperation::Mode::feedback);
+        check(videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "video.transform", "visual.feedback" }, feedbackWire),
+                  execution, error),
+              "shader to Image Transform to Feedback Trail to Output lowers");
+        check(execution.shaderOperationPlan != nullptr
+                  && execution.shaderOperationPlan->operations.size() == 1
+                  && execution.shaderOperationPlan->operations.front().nodeId == 80
+                  && execution.transform && ! execution.effects && ! execution.mask
+                  && execution.feedback && execution.temporalNodeId == 82
+                  && execution.feedbackDecay == 0.8f && execution.feedbackZoom == 1.02f
+                  && execution.feedbackSwirl == 0.05f,
+              "shader tail keeps the shader operation and enables the clip transform and feedback");
+
+        check(videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "video.transform" }), execution, error)
+                  && execution.transform && ! execution.feedback
+                  && execution.shaderOperationPlan != nullptr,
+              "shader to Image Transform to Output lowers");
+        check(videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "visual.feedback" }, feedbackWire), execution, error)
+                  && ! execution.transform && execution.feedback,
+              "shader to Feedback Trail to Output lowers");
+        check(videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "video.transform", "video.effects", "video.mask.shape" }),
+                  execution, error)
+                  && execution.transform && execution.effects && execution.mask && ! execution.feedback,
+              "shader to Transform to Effects to Shape Mask to Output lowers");
+
+        check(! videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "visual.feedback", "video.transform" }, feedbackWire),
+                  execution, error)
+                  && error.find("Transform, Effects, Feedback Trail, then Shape Mask") != std::string::npos,
+              "a Transform placed after Feedback Trail is refused with the stage order");
+        check(! videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "video.effects", "video.effects" }),
+                  execution, error)
+                  && error.find("at most once") != std::string::npos,
+              "a repeated tail pass is refused");
+        check(videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "video.transform", "video.transform" }),
+                  execution, error)
+                  && execution.transform && ! execution.feedback,
+              "consecutive Image Transforms after a shader are one stage");
+        check(! videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "video.effects", "visual.feedback" }, feedbackWire),
+                  execution, error)
+                  && error.find("cannot be combined with video.effects") != std::string::npos,
+              "Feedback Trail with the Effects rack stays refused");
+        check(! videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "visual.echo" },
+                                 temporalWire(visualtemporaloperation::Mode::echo)),
+                  execution, error)
+                  && error.find("only the Feedback Trail") != std::string::npos,
+              "other temporal passes after a shader are refused with their own reason");
+        check(! videowire::compileVisualLayerExecution(
+                  shaderTailPlan(generatorXml, { "visual.effect.glow" },
+                                 "<CommonEffect schemaVersion=\"1\" effect=\"glow\" intensity=\"0.5\" radius=\"6.0\"/>"),
+                  execution, error),
+              "a common effect after a shader is still refused");
+
+        auto filterAfterTransform = shaderTailPlan(generatorXml, { "video.transform", "visual.shader.filter" });
+        filterAfterTransform.operations[2].payloadXml = filterXml;
+        check(! videowire::compileVisualLayerExecution(filterAfterTransform, execution, error)
+                  && error == "shader operation plan has unsupported production topology",
+              "a shader filter after the clip transform stays an unsupported topology");
+
+        auto branched = shaderTailPlan(generatorXml, { "video.transform", "visual.feedback" }, feedbackWire);
+        branched.edges.push_back({ 80, 0, 82, 0 });
+        check(! videowire::compileVisualLayerExecution(branched, execution, error),
+              "a tail pass with a second input cable is refused");
+        auto incompatible = shaderTailPlan(generatorXml, { "video.transform" });
+        incompatible.ports[1].pixelFormat = "rgba16f";
+        check(! videowire::compileVisualLayerExecution(incompatible, execution, error)
+                  && error.find("exact native Frame<Image>") != std::string::npos,
+              "a tail pass with mismatched image descriptors is refused");
+    }
+
+    // A Feedback Trail placed on a decoded layer chain joins it between Effects
+    // and Shape Mask, in front of the Blend, and that chain lowers.
+    {
+        videowire::CompiledVisualLayerPlan chain;
+        chain.clipId = 37;
+        chain.structuralRevision = 3;
+        chain.producerValidated = true;
+        chain.nodeKinds = { "video.source", "video.transform", "video.effects", "visual.feedback",
+                            "video.mask.shape", "video.blend", "video.out" };
+        chain.nodeIds = { 101, 102, 103, 104, 105, 106, 107 };
+        for (size_t i = 0; i < chain.nodeIds.size(); ++i)
+        {
+            const int id = chain.nodeIds[i];
+            const auto& kind = chain.nodeKinds[i];
+            chain.operations.push_back({ id, kind, kind == "video.source" ? "source-decode" : "native-gpu",
+                kind == "visual.feedback" ? temporalWire(visualtemporaloperation::Mode::feedback)
+                                          : std::string {} });
+            if (kind != "video.source")
+                chain.ports.push_back({ id, 0, 1, "in", "frame", "image", "rgba8", "sRGB" });
+            if (kind != "video.out")
+                chain.ports.push_back({ id, kind == "video.source" ? 0 : 1, 1, "out", "frame", "image",
+                                        "rgba8", "sRGB" });
+            if (i > 0)
+                chain.edges.push_back({ chain.nodeIds[i - 1], i == 1 ? 0 : 1, id, 0 });
+        }
+        videowire::VisualLayerExecution chained;
+        const bool lowered = videowire::compileVisualLayerExecution(chain, chained, error);
+        if (! lowered) std::cerr << "decoded trail chain: " << error << '\n';
+        check(lowered && chained.transform && chained.effects && chained.feedback && chained.mask
+                  && chained.temporalNodeId == 104,
+              "Source, Transform, Effects, Feedback Trail, Shape Mask, Blend, Output lowers");
+    }
+
+    // Consecutive Image Transforms on a decoded layer chain are one stage. The
+    // plugin multiplies their matrices into the layer's single transform, so the
+    // helper only has to accept the pair. Anything out of order stays refused.
+    {
+        const auto buildChain = [&] (std::vector<std::string> kinds)
+        {
+            videowire::CompiledVisualLayerPlan chain;
+            chain.clipId = 38;
+            chain.structuralRevision = 4;
+            chain.producerValidated = true;
+            chain.nodeKinds = std::move(kinds);
+            for (size_t i = 0; i < chain.nodeKinds.size(); ++i)
+            {
+                const int id = 201 + (int) i;
+                const auto& kind = chain.nodeKinds[i];
+                chain.nodeIds.push_back(id);
+                chain.operations.push_back({ id, kind, kind == "video.source" ? "source-decode" : "native-gpu",
+                    kind == "visual.feedback" ? temporalWire(visualtemporaloperation::Mode::feedback)
+                                              : std::string {} });
+                if (kind != "video.source")
+                    chain.ports.push_back({ id, 0, 1, "in", "frame", "image", "rgba8", "sRGB" });
+                if (kind != "video.out")
+                    chain.ports.push_back({ id, kind == "video.source" ? 0 : 1, 1, "out", "frame", "image",
+                                            "rgba8", "sRGB" });
+                if (i > 0)
+                    chain.edges.push_back({ chain.nodeIds[i - 1], i == 1 ? 0 : 1, id, 0 });
+            }
+            return chain;
+        };
+        videowire::VisualLayerExecution twoTransforms;
+        const bool lowered = videowire::compileVisualLayerExecution(
+            buildChain({ "video.source", "video.transform", "video.transform", "video.blend", "video.out" }),
+            twoTransforms, error);
+        if (! lowered) std::cerr << "two transforms: " << error << '\n';
+        check(lowered && twoTransforms.transform && ! twoTransforms.feedback,
+              "Source, Transform, Transform, Blend, Output lowers");
+        videowire::VisualLayerExecution transformThenTrail;
+        const bool trailLowered = videowire::compileVisualLayerExecution(
+            buildChain({ "video.source", "video.transform", "video.transform", "visual.feedback",
+                         "video.blend", "video.out" }),
+            transformThenTrail, error);
+        if (! trailLowered) std::cerr << "two transforms and trail: " << error << '\n';
+        check(trailLowered && transformThenTrail.transform && transformThenTrail.feedback,
+              "consecutive Image Transforms followed by a Feedback Trail lower");
+        videowire::VisualLayerExecution trailThenTransform;
+        check(! videowire::compileVisualLayerExecution(
+                  buildChain({ "video.source", "visual.feedback", "video.transform", "video.blend",
+                               "video.out" }),
+                  trailThenTransform, error),
+              "an Image Transform after a Feedback Trail is still refused");
+    }
+
+    // One layer that does not lower is contained when the caller asks for it:
+    // the other layers admit and the refused one keeps its reason.
+    {
+        auto good = shaderTailPlan(generatorXml, { "video.transform" });
+        auto bad = shaderTailPlan(generatorXml, { "video.effects", "video.effects" });
+        bad.clipId = 36;
+        videowire::VisualPlanExecutionState strict;
+        check(! strict.admitPlans({ good, bad }),
+              "a plan that does not lower still refuses an uncontained admission");
+        videowire::VisualPlanExecutionState contained;
+        contained.containLayerLoweringFailures(true);
+        std::string diagnostic;
+        const bool admitted = contained.admitPlans({ good, bad }, &diagnostic);
+        if (! admitted) std::cerr << "contained admission: " << diagnostic << '\n';
+        const auto* reason = contained.refusedLowering(bad.clipId, bad.structuralRevision);
+        check(admitted && contained.compiled(good.clipId, good.structuralRevision) != nullptr
+                  && contained.compiled(bad.clipId, bad.structuralRevision) == nullptr
+                  && reason != nullptr && reason->find("at most once") != std::string::npos
+                  && contained.refusedLowering(good.clipId, good.structuralRevision) == nullptr,
+              "a contained admission installs the good layer and keeps the refused layer's reason");
+    }
 
     const auto savedCompositePlan = filterCompositePlan(filterXml);
     check(!videowire::compileVisualLayerExecution(savedCompositePlan, execution, error),

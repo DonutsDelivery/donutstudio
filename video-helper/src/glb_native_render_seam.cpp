@@ -286,6 +286,7 @@ void GlbNativeFrameReceipt::exchange(GlbNativeFrameReceipt& other) noexcept
     swap(rendered.sceneId,other.rendered.sceneId);
     swap(rendered.dimensions,other.rendered.dimensions);
     swap(rendered.stats,other.rendered.stats);
+    rendered.causticDegradation.swap(other.rendered.causticDegradation);
     rendered.nativeFrame.swap(other.rendered.nativeFrame);
     localRetention_.swap(other.localRetention_);
 }

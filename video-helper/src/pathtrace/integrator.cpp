@@ -1,6 +1,7 @@
 #include "integrator.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -33,8 +34,6 @@ std::uint32_t dimensionOf (std::uint32_t vertex, std::uint32_t slot) noexcept
 }
 
 constexpr std::uint32_t kMaxShadowCrossings = 16;
-
-float maxComponent (Vec3 v) noexcept { return std::max (v.x, std::max (v.y, v.z)); }
 
 bool anyPositive (Vec3 v) noexcept { return v.x > 0.0f || v.y > 0.0f || v.z > 0.0f; }
 
@@ -97,30 +96,65 @@ SurfacePoint surfaceAt (const RenderScene& scene, const Hit& hit) noexcept
     return point;
 }
 
-// Fraction of light that crosses the segment of `ray`. Opaque and
-// transmissive (glass) surfaces block it; partially covered ones attenuate.
-float shadowTransmittance (const RenderScene& scene, Ray ray, PathCounters& counters) noexcept
+Spectrum activeAbsorption (const MediumStack& media, const Wavelengths& wavelengths) noexcept
+{
+    const Material* owner = media.active();
+    return owner != nullptr ? mediumAbsorption (*owner, wavelengths) : Spectrum {};
+}
+
+// Fraction of light that crosses the segment of `ray`, per channel. media is
+// the stack at the ray origin. Opaque surfaces and real refracting interfaces
+// block it; alpha cut-outs and thin sheets attenuate it, false interfaces let
+// it through, and the owning medium absorbs along the way.
+Spectrum shadowTransmittance (const RenderScene& scene, Ray ray, MediumStack media, const Wavelengths& wavelengths,
+                              PathCounters& counters) noexcept
 {
     ++counters.shadowRays;
-    if (! scene.anyPartialCoverage)
-        return scene.bvh.occluded (ray) ? 0.0f : 1.0f;
-    float transmittance = 1.0f;
+    if (media.empty() && ! scene.anyPartialCoverage && ! scene.anyThinSheet)
+        return scene.bvh.occluded (ray) ? Spectrum {} : Spectrum::constant (1.0f);
+    const float directionLength = length (ray.direction);
+    const Vec3 direction = normalizeOrZero (ray.direction);
+    Spectrum transmittance = Spectrum::constant (1.0f);
+    float segmentStart = ray.tMin;
     for (std::uint32_t crossing = 0; crossing <= kMaxShadowCrossings; ++crossing)
     {
         Hit hit;
-        if (! scene.bvh.intersect (ray, hit))
+        const bool blocked = scene.bvh.intersect (ray, hit);
+        const float segmentEnd = blocked ? hit.t : ray.tMax;
+        const Spectrum sigma = activeAbsorption (media, wavelengths);
+        if (sigma.anyPositive())
+            transmittance = transmittance * beerLambert (sigma, (segmentEnd - segmentStart) * directionLength);
+        if (! blocked)
             return transmittance;
         const Material& material = scene.materialOf (hit.triangle);
         const float coverage = materialCoverage (material);
-        if (coverage >= 1.0f || material.transmission > 0.0f)
-            return 0.0f;
-        transmittance *= 1.0f - coverage;
-        if (! (transmittance > 0.0f))
-            return 0.0f;
+        const bool front = dot (scene.geometry.triangles[hit.triangle].geometricNormal, direction) <= 0.0f;
+        if (isMediumBoundary (material))
+        {
+            const BoundaryCrossing boundary = classifyBoundary (media, &material, front);
+            if (boundary.falseInterface)
+                applyCrossing (media, &material, boundary);
+            else
+                transmittance = transmittance * (1.0f - coverage);
+        }
+        else if (isThinSheet (material))
+        {
+            const float around = mediumIor (media.active(), kDLineNm, false);
+            const Spectrum straight = straightTransmittance (material, dot (scene.geometry.triangles[hit.triangle].geometricNormal, direction),
+                                                             materialIorAt (material, kDLineNm, false) / around, wavelengths);
+            transmittance = transmittance * (Spectrum::constant (1.0f - coverage) + straight * coverage);
+        }
+        else
+        {
+            transmittance = transmittance * (1.0f - coverage);
+        }
+        if (! transmittance.anyPositive())
+            return {};
+        segmentStart = hit.t;
         ray.tMin = hit.t;
         ray.ignoreTriangle = hit.triangle;
     }
-    return 0.0f;
+    return {};
 }
 
 } // namespace
@@ -138,10 +172,20 @@ void RenderScene::commit()
 {
     bvh.build (geometry.positions);
     lights.build (lightRecords.data(), lightRecords.size(), ambient, geometry, materials, fallbackMaterial,
-                  &environmentImage);
-    anyPartialCoverage = materialCoverage (fallbackMaterial) < 1.0f;
-    for (const Material& material : materials)
+                  &environmentImage, &lightShapes, &areaLights);
+    const auto note = [this] (const Material& material) {
         anyPartialCoverage = anyPartialCoverage || materialCoverage (material) < 1.0f;
+        anyThinSheet = anyThinSheet || isThinSheet (material);
+        anyMediumBoundary = anyMediumBoundary || isMediumBoundary (material);
+        anyDispersive = anyDispersive || materialDispersive (material);
+    };
+    anyPartialCoverage = false;
+    anyThinSheet = false;
+    anyMediumBoundary = false;
+    anyDispersive = false;
+    note (fallbackMaterial);
+    for (const Material& material : materials)
+        note (material);
 }
 
 const Material& RenderScene::materialOf (std::uint32_t triangle) const noexcept
@@ -186,8 +230,34 @@ void prepareRenderScene (const Visual3DScene& scene, RenderScene& out, const Pre
     for (std::size_t i = 0; i < materialCount; ++i)
         out.materials.push_back (materialFromRecord (scene.materials[i]));
     out.fallbackMaterial = Material {};
-    const std::size_t lightCount = std::min (scene.lightCount, Visual3DScene::kMaxLights);
-    out.lightRecords.assign (scene.lights.begin(), scene.lights.begin() + static_cast<std::ptrdiff_t> (lightCount));
+    // Object overrides append their materials after the record materials and
+    // point that object's triangles at them.
+    for (const ObjectMaterialOverride& entry : options.objectMaterials)
+    {
+        const auto index = static_cast<std::uint32_t> (out.materials.size());
+        out.materials.push_back (entry.material);
+        for (TriangleAttributes& triangle : out.geometry.triangles)
+            if (triangle.objectId == entry.objectId)
+                triangle.materialIndex = index;
+    }
+    const float gain = std::isfinite (options.emissionGain) && options.emissionGain > 0.0f ? options.emissionGain : 0.0f;
+    if (gain != 1.0f)
+    {
+        for (Material& material : out.materials)
+            material.emission = material.emission * gain;
+        out.fallbackMaterial.emission = out.fallbackMaterial.emission * gain;
+    }
+    if (options.lightRecords != nullptr)
+        out.lightRecords.assign (options.lightRecords->begin(),
+                                 options.lightRecords->begin()
+                                     + static_cast<std::ptrdiff_t> (std::min (options.lightRecords->size(), Visual3DScene::kMaxLights)));
+    else
+    {
+        const std::size_t lightCount = std::min (scene.lightCount, Visual3DScene::kMaxLights);
+        out.lightRecords.assign (scene.lights.begin(), scene.lights.begin() + static_cast<std::ptrdiff_t> (lightCount));
+    }
+    out.lightShapes = options.lightShapes;
+    out.areaLights = options.areaLights;
     out.ambient = options.ambientAsEnvironment
                     ? Vec3 { scene.ambientColor.x, scene.ambientColor.y, scene.ambientColor.z }
                     : Vec3 {};
@@ -204,33 +274,80 @@ void prepareRenderScene (const Visual3DScene& scene, RenderScene& out, const Pre
     out.commit();
 }
 
+bool usesSpectralTransport (const RenderScene& scene, const IntegratorSettings& settings) noexcept
+{
+    switch (settings.spectral)
+    {
+        case SpectralMode::Off:
+            return false;
+        case SpectralMode::Automatic:
+            return scene.anyDispersive;
+        case SpectralMode::On:
+            return true;
+    }
+    return false;
+}
+
 bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, const Ray& cameraRay,
                 const PathSampler& sampler, PathCounters& counters, Vec3& radiance) noexcept
 {
     const LightSet& lights = scene.lights;
     const bool lightSamplingForAreas = settings.strategy != LightStrategy::BsdfOnly;
     const bool clampIndirect = settings.indirectClamp > 0.0f && std::isfinite (settings.indirectClamp);
+    const bool spectral = usesSpectralTransport (scene, settings);
+    const Wavelengths wavelengths = spectral ? sampleHeroWavelengths (sampler.get1D (kWavelengthDimension)) : rgbChannels();
 
-    Vec3 sum {};
-    Vec3 throughput { 1.0f, 1.0f, 1.0f };
+    Spectrum sum;
+    Spectrum throughput = Spectrum::constant (1.0f);
+    if (! spectral)
+        throughput[3] = 0.0f;
+    // Density of the path had each channel been the hero, over the hero's.
+    std::array<float, kSpectrumChannels> pdfRatio { { 1.0f, 1.0f, 1.0f, 1.0f } };
+    // Hero wavelength MIS weight, 1 / mean(pdfRatio); 1 in RGB mode.
+    float wavelengthWeight = 1.0f;
+    const auto updateWavelengthWeight = [&] {
+        if (! spectral)
+            return;
+        float total = 0.0f;
+        for (const float r : pdfRatio)
+            total += r;
+        wavelengthWeight = total > 0.0f ? static_cast<float> (kSpectrumChannels) / total : 0.0f;
+    };
+    bool heroOnly = false;
+    const auto keepHeroOnly = [&] {
+        for (int c = 1; c < kSpectrumChannels; ++c)
+        {
+            throughput[c] = 0.0f;
+            pdfRatio[static_cast<std::size_t> (c)] = 0.0f;
+        }
+        heroOnly = true;
+        updateWavelengthWeight();
+    };
+    const auto toChannels = [&wavelengths] (Vec3 rgb) { return upsampleRgb (rgb, wavelengths); };
+
+    MediumStack media;
     bool previousDelta = true;  // the camera acts as a delta "lobe"
     float previousPdf = 0.0f;
+    // Last scattering vertex: emitter MIS densities are measured from here.
+    Vec3 misOrigin = cameraRay.origin;
+    bool passedThrough = false;  // pass-throughs since misOrigin
     std::uint32_t depth = 0;            // bounces taken
-    std::uint32_t vertex = 0;           // surface interactions, including alpha crossings
+    std::uint32_t vertex = 0;           // surface interactions, including pass-throughs
     std::uint32_t transparentHits = 0;
     bool finite = true;
     Ray ray = cameraRay;
 
     // bounces is the number of scattering events the contribution went through.
-    const auto add = [&] (Vec3 contribution, std::uint32_t bounces) {
-        if (! isFinite (contribution))
+    const auto add = [&] (Spectrum contribution, std::uint32_t bounces) {
+        contribution = contribution * wavelengthWeight;
+        if (! contribution.finite())
         {
             finite = false;
             return;
         }
         if (clampIndirect && bounces >= 2)
         {
-            const float peak = maxComponent (contribution);
+            const float peak = contribution.maxValue();
             if (peak > settings.indirectClamp)
             {
                 contribution = contribution * (settings.indirectClamp / peak);
@@ -240,29 +357,84 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
         sum = sum + contribution;
     };
 
+    // Continues the ray through the surface just hit without scattering.
+    const auto passThrough = [&] (const Hit& hit, Vec3 position, Vec3 geometricNormal) {
+        ++vertex;
+        passedThrough = true;
+        ray.origin = spawnRayOrigin (position, geometricNormal, ray.direction);
+        if (std::isfinite (ray.tMax))
+            ray.tMax = std::max (0.0f, ray.tMax - hit.t);
+        ray.tMin = 0.0f;
+        ray.ignoreTriangle = hit.triangle;
+    };
+
     while (finite)
     {
         Hit hit;
         ++counters.closestRays;
-        if (! scene.bvh.intersect (ray, hit))
+        const bool surfaceHit = scene.bvh.intersect (ray, hit);
+        const Vec3 direction = normalizeOrZero (ray.direction);
+        const float directionLength = length (ray.direction);
+        const float segmentLength = surfaceHit ? hit.t * directionLength : std::numeric_limits<float>::infinity();
+        const Spectrum sigma = activeAbsorption (media, wavelengths);
+        const bool absorbing = sigma.anyPositive();
+
+        // Sized lights along the segment. Camera rays do not see them.
+        if (depth > 0 && lights.analyticCount() > 0)
+        {
+            for (std::size_t k = 0; k < lights.analyticCount(); ++k)
+            {
+                Vec3 emitted;
+                float lightPdf = 0.0f;
+                float distance = 0.0f;
+                // Visibility: the light lies on this segment.
+                if (! lights.analyticHit (k, ray.origin, direction, segmentLength, emitted, lightPdf, distance))
+                    continue;
+                // Density and radiance as seen from the last scattering
+                // vertex itself, not the offset ray origin, as next event
+                // estimation measures them.
+                if (! lights.analyticHit (k, misOrigin, direction, std::numeric_limits<float>::infinity(), emitted,
+                                          lightPdf, distance))
+                    continue;
+                const float weight = previousDelta ? 1.0f : emitterHitWeight (settings.strategy, previousPdf, lightPdf);
+                if (! (weight > 0.0f) || ! anyPositive (emitted))
+                    continue;
+                Spectrum contribution = throughput * toChannels (emitted) * weight;
+                if (absorbing)
+                {
+                    // Absorption up to the light, along this segment only.
+                    float along = 0.0f;
+                    Vec3 ignored;
+                    float ignoredPdf = 0.0f;
+                    if (lights.analyticHit (k, ray.origin, direction, segmentLength, ignored, ignoredPdf, along))
+                        contribution = contribution * beerLambert (sigma, along);
+                }
+                add (contribution, depth);
+            }
+        }
+
+        if (absorbing)
+            throughput = throughput * beerLambert (sigma, segmentLength);
+
+        if (! surfaceHit)
         {
             if (lights.hasEnvironment() && (depth > 0 || settings.environmentVisibleToCamera))
             {
-                const Vec3 direction = normalizeOrZero (ray.direction);
                 const Vec3 emitted = lights.environmentRadiance (direction);
                 const float weight = previousDelta
                                        ? 1.0f
                                        : emitterHitWeight (settings.strategy, previousPdf, lights.environmentPdf (direction));
-                if (weight > 0.0f && anyPositive (emitted))
-                    add (throughput * emitted * weight, depth);
+                if (weight > 0.0f && anyPositive (emitted) && throughput.anyPositive())
+                    add (throughput * toChannels (emitted) * weight, depth);
             }
             break;
         }
+        if (! throughput.anyPositive())
+            break;
 
         const SurfacePoint point = surfaceAt (scene, hit);
         const Material& material = scene.materialOf (hit.triangle);
         const float coverage = materialCoverage (material);
-        const Vec3 direction = normalizeOrZero (ray.direction);
 
         // Emission from either face.
         if (coverage > 0.0f && (material.emission.x != 0.0f || material.emission.y != 0.0f || material.emission.z != 0.0f))
@@ -270,14 +442,18 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
             float weight = 1.0f;
             if (! previousDelta)
             {
-                const float distance = hit.t * length (ray.direction);
+                const float distance = length (point.position - misOrigin);
                 const float cosAtLight = std::fabs (dot (point.geometricNormal, direction));
                 weight = emitterHitWeight (settings.strategy, previousPdf,
                                            lights.trianglePdf (hit.triangle, distance, cosAtLight));
             }
             if (weight > 0.0f)
-                add (throughput * material.emission * (coverage * weight), depth);
+                add (throughput * toChannels (material.emission) * (coverage * weight), depth);
         }
+
+        const Vec3 wo = -direction;
+        const bool front = dot (point.geometricNormal, wo) >= 0.0f;
+        const Vec3 ng = front ? point.geometricNormal : -point.geometricNormal;
 
         // Alpha cut-outs: cross with probability 1 - coverage, keeping the
         // path state, so the expected result is the coverage blend.
@@ -291,12 +467,26 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
                     ++counters.transparentLimitPaths;
                     break;
                 }
-                ++vertex;
-                ray.origin = spawnRayOrigin (point.position, point.geometricNormal, ray.direction);
-                if (std::isfinite (ray.tMax))
-                    ray.tMax = std::max (0.0f, ray.tMax - hit.t);
-                ray.tMin = 0.0f;
-                ray.ignoreTriangle = hit.triangle;
+                passThrough (hit, point.position, point.geometricNormal);
+                continue;
+            }
+        }
+
+        // A false interface between nested media: only the stack changes.
+        const bool boundary = isMediumBoundary (material);
+        BoundaryCrossing crossing;
+        if (boundary)
+        {
+            crossing = classifyBoundary (media, &material, front);
+            if (crossing.falseInterface)
+            {
+                if (++transparentHits > settings.maxTransparentHits)
+                {
+                    ++counters.transparentLimitPaths;
+                    break;
+                }
+                applyCrossing (media, &material, crossing);
+                passThrough (hit, point.position, point.geometricNormal);
                 continue;
             }
         }
@@ -304,16 +494,27 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
         if (depth >= settings.maxDepth)
             break;
 
-        const Vec3 wo = -direction;
-        const bool front = dot (point.geometricNormal, wo) >= 0.0f;
-        const Vec3 ng = front ? point.geometricNormal : -point.geometricNormal;
         Vec3 ns = front ? point.shadingNormal : -point.shadingNormal;
         if (dot (ns, wo) <= 1.0e-4f)
             ns = ng;
-        Bsdf bsdf;
-        buildMaterialBsdf (material, ns, ng, wo, front, bsdf);
+        DielectricSetup setup;
+        if (boundary)
+        {
+            setup = dielectricSetupFor (crossing, wavelengths);
+        }
+        else
+        {
+            // Sheets and opaque surfaces: the material against the medium around it.
+            const float ratio = materialIorAt (material, kDLineNm, false) / mediumIor (media.active(), kDLineNm, false);
+            setup.eta.fill (ratio);
+            setup.etaD = ratio;
+        }
+        SpectralBsdf bsdf;
+        buildMaterialBsdf (material, ns, ng, wo, wavelengths, setup, bsdf);
         if (bsdf.lobeCount() == 0)
             break;
+        if (spectral && bsdf.requiresHeroWavelength() && ! heroOnly)
+            keepHeroOnly();
 
         // Next event estimation: one light sample.
         if (bsdf.hasNonDelta() && lights.size() > 0)
@@ -323,8 +524,8 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
                                sampler.get2D (dimensionOf (vertex, kSlotLightPosition)), light)
                 && (light.delta || lightSamplingForAreas) && anyPositive (light.radiance))
             {
-                const BsdfEval eval = bsdf.eval (wo, light.wi);
-                if (anyPositive (eval.value))
+                const SpectralBsdfEval eval = bsdf.eval (wo, light.wi);
+                if (eval.value.anyPositive())
                 {
                     Ray shadow;
                     shadow.origin = spawnRayOrigin (point.position, ng, light.wi);
@@ -346,13 +547,18 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
                         shadow.direction = target - shadow.origin;
                         shadow.tMax = 1.0f;
                     }
-                    const float transmittance = shadowTransmittance (scene, shadow, counters);
-                    if (transmittance > 0.0f)
+                    // The shadow ray starts in the medium on its side of the surface.
+                    MediumStack shadowMedia = media;
+                    if (boundary && dot (light.wi, ng) < 0.0f)
+                        applyCrossing (shadowMedia, &material, crossing);
+                    const Spectrum transmittance = shadowTransmittance (scene, shadow, shadowMedia, wavelengths, counters);
+                    if (transmittance.anyPositive())
                     {
                         const float weight = light.delta || settings.strategy != LightStrategy::MultipleImportance
                                                ? 1.0f
                                                : powerHeuristic (light.pdf, eval.pdf);
-                        add (throughput * eval.value * light.radiance * (transmittance * weight / light.pdf), depth + 1);
+                        add (throughput * eval.value * toChannels (light.radiance) * transmittance * (weight / light.pdf),
+                             depth + 1);
                     }
                 }
             }
@@ -361,7 +567,7 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
         // Russian roulette on the path throughput.
         if (depth >= settings.rouletteStartDepth)
         {
-            const float survive = std::min (1.0f, std::sqrt (std::max (0.0f, maxComponent (throughput))));
+            const float survive = std::min (1.0f, std::sqrt (std::max (0.0f, throughput.maxValue() * wavelengthWeight)));
             if (! (survive > 0.0f))
                 break;
             if (survive < 1.0f)
@@ -372,20 +578,47 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
             }
         }
 
-        BsdfSample scattered;
+        SpectralBsdfSample scattered;
         if (! bsdf.sample (wo, sampler.get1D (dimensionOf (vertex, kSlotLobe)),
                            sampler.get2D (dimensionOf (vertex, kSlotDirection)), scattered))
             break;
         throughput = throughput * scattered.weight;
-        if (! isFinite (throughput))
+        if (spectral)
+        {
+            for (std::size_t c = 0; c < pdfRatio.size(); ++c)
+                pdfRatio[c] *= scattered.channelPdfRatio[c];
+            if ((scattered.flags & kBsdfHeroOnly) != 0)
+                keepHeroOnly();
+            else
+                updateWavelengthWeight();
+        }
+        if (! throughput.finite())
         {
             finite = false;
             break;
         }
-        if (! anyPositive (throughput))
+        if (! throughput.anyPositive())
             break;
+
+        const bool transmitted = (scattered.flags & kBsdfTransmission) != 0;
+        if ((scattered.flags & kBsdfStraight) != 0)
+        {
+            // Straight through a thin sheet: for MIS the path continues the
+            // direction sampled at misOrigin.
+            if (++transparentHits > settings.maxTransparentHits)
+            {
+                ++counters.transparentLimitPaths;
+                break;
+            }
+            passThrough (hit, point.position, point.geometricNormal);
+            continue;
+        }
+        if (transmitted && boundary)
+            applyCrossing (media, &material, crossing);
         previousDelta = (scattered.flags & kBsdfDelta) != 0;
         previousPdf = scattered.pdf;
+        misOrigin = point.position;
+        passedThrough = false;
 
         ray = Ray {};
         ray.origin = spawnRayOrigin (point.position, ng, scattered.wi);
@@ -397,8 +630,8 @@ bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, co
         ++vertex;
     }
 
-    radiance = sum;
-    return finite && isFinite (sum);
+    radiance = channelsToRgb (sum, wavelengths);
+    return finite && isFinite (radiance);
 }
 
 PathTracer::PathTracer (unsigned threadCount) : pool_ (threadCount) {}
@@ -448,6 +681,13 @@ RenderStats PathTracer::renderFixed (const RenderScene& scene, const PinholeCame
     return runPass (scene, camera, 0, samplesPerPixel, cancel);
 }
 
+TilePassResult PathTracer::forEachTile (std::uint32_t width, std::uint32_t height, const CancellationToken& cancel,
+                                        const ThreadPool::TileFunction& fn)
+{
+    const TileGrid grid (width, height, settings.tileSize);
+    return pool_.runTiles (grid, cancel, fn);
+}
+
 RenderStats PathTracer::runPass (const RenderScene& scene, const PinholeCamera& camera,
                                  std::uint32_t firstSample, std::uint32_t samples, const CancellationToken& cancel)
 {
@@ -456,6 +696,7 @@ RenderStats PathTracer::runPass (const RenderScene& scene, const PinholeCamera& 
     stats.samplesPerPixel = samples;
     stats.firstSampleIndex = firstSample;
     stats.lights = scene.lights.stats();
+    stats.spectral = usesSpectralTransport (scene, settings);
 
     struct ThreadTotals
     {

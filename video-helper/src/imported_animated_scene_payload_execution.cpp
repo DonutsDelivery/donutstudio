@@ -4,6 +4,7 @@
 #include "geometry_score_field.h"
 #include "../../shared/Visual3DSceneComposition.h"
 #include "../../shared/GeometrySurfaceMaterial.h"
+#include "loop_step_probe.h"
 
 #include <algorithm>
 #include <cmath>
@@ -877,6 +878,8 @@ bool ImportedAnimatedScenePayloadExecution::executeSceneAnimationComposition(
     const auto material=materialScene_.lock()==scene_?lastGoodMaterial_:nullptr;
     surfacematerial::MaterialEvaluationInputs materialInputs;materialInputs.timeSeconds=runtime.timeSeconds;
     videorender::fixture3d::RenderedFrame rendered;
+    loopstep::Scope renderScope (use == ImportedAnimationEvaluationOwner::Preview
+        ? "advance:imported-scene:animated-render" : "advance:imported-scene:animated-export-render");
     const bool success=use==ImportedAnimationEvaluationOwner::Preview
         ?sceneRenderer_.renderPreview(scene_,material,materialInputs,runtime,{request.width,request.height},
             videorender::fixture3d::kNativeGpuCapability,rendered,error)
@@ -918,6 +921,7 @@ bool ImportedAnimatedScenePayloadExecution::executeSceneAnimationComposition(
     receipt.frame.stats.reusedStaticResources=rendered.stats.reusedStaticResources;
     receipt.sceneAnimationComposition=issued;receipt.usedLastGoodMaterial=usedLastGoodMaterial;
     receipt.materialDiagnostic=std::move(materialDiagnostic);
+    receipt.causticDegradation=std::move(rendered.causticDegradation);
     if (!receipt.valid()) return reject(error,"camera/light composition native frame does not match its issued authority");
     sceneAnimationOwner_=std::move(sourceOwner);source_=receipt.source;
     sceneAnimationFrames_[use==ImportedAnimationEvaluationOwner::Preview?0:1]=std::move(issued);
@@ -1570,9 +1574,21 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     std::string& error,
     ImportedSceneParentReceiptStaging* parentStaging)
 {
+    const bool pathTrace = sceneRenderer_.selectedEngine().engine == videorender::fixture3d::SceneEngineKind::PathTrace;
+    const bool localTransform = !visualimportedobjectlocal::same(request.objectLocalTransform, {});
+    // Glass caustics belong to the retained Scene3D snapshot owner on the static route.
+    // The refusal sits ahead of every route that can render: the several-leaf branch
+    // (executeComposition copies runtimeInputs and renders with no glass check of its
+    // own), executeSceneAnimationComposition, and the one-leaf renderFrame. A one-leaf
+    // local transform request keeps its own, more specific message below.
+    if (request.runtimeInputs.glassCaustic && (!request.compositionLeaves.empty() || !localTransform))
+        return reject(error, "Glass caustics require the exact retained Scene3D snapshot owner");
     // Several imported leaves take their own route; one leaf never reaches it.
     if (!request.compositionLeaves.empty())
     {
+        // The composition draws through the deformation renderer.
+        if (pathTrace)
+            return reject(error, visualimportedscenerender::kPathTraceMultipleImportedLeavesUnavailable.data());
         if (parentStaging || request.parentIntent)
             return reject(error, "Scene Compose refused: imported parenting with multiple imported leaves is not rendered yet");
         return executeComposition(owner, request, output, error);
@@ -1580,7 +1596,6 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     // S5a admits one rigid animated leaf with a non-neutral object-local transform.
     // The uses below are refused by name. Leaf shape checks follow admission, once
     // the bindings and the drawn object are known.
-    const bool localTransform = !visualimportedobjectlocal::same(request.objectLocalTransform, {});
     if (localTransform)
     {
         if (!visualimportedobjectlocal::valid(request.objectLocalTransform))
@@ -1637,7 +1652,7 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         if (!sceneAnimationBudget_->work(bytes,2,error)) return false;
         parentStagingCharge=NativeCompositionRetentionBudget::reserve(compositionBudget_,bytes,error);
         if (!parentStagingCharge) return false;
-        if (request.parentIntent && (request.runtimeInputs.noteInstanceMapping || request.runtimeInputs.glassCaustic
+        if (request.parentIntent && (request.runtimeInputs.noteInstanceMapping
             || request.runtimeInputs.compositionFrame || request.runtimeInputs.previousMotion
             || request.runtimeInputs.animatedCamera
             || (request.material && request.material->vertexModifier)))
@@ -1775,7 +1790,11 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         compositionEpochPayload_=payload;compositionEpochIdentity_=epochIdentity;
         highestCompositionEvaluationRevision_=request.evaluationRevision;
     }
-    if (!admit(payload, request.operation, request.proceduralScene, request.sourceCameraNodeId, request, error)) return false;
+    {
+        // Cold admission decodes and adapts the GLB; a warm owner returns at once.
+        loopstep::Scope admitScope ("advance:imported-scene:animated-admit");
+        if (!admit(payload, request.operation, request.proceduralScene, request.sourceCameraNodeId, request, error)) return false;
+    }
     if (request.operation.pose.nodeStableId != 0
         && std::none_of(importedScene_->objects.begin(), importedScene_->objects.begin() + importedScene_->objectCount,
             [&](const auto& object) { return (object.id.value - 1u) / 65536u + 1u
@@ -1790,6 +1809,11 @@ bool ImportedAnimatedScenePayloadExecution::execute(
                 request.objectLocalTransform);
         if (refusal) return reject(error, refusal);
     }
+    // Bound meshes draw through the deformation renderer, which has no Path
+    // Trace engine. Without bindings the fixture scene renderer draws, and it
+    // honours the selection.
+    if (pathTrace && !bindings_.empty())
+        return reject(error, visualimportedscenerender::kPathTraceAnimatedMeshUnavailable.data());
 
     std::shared_ptr<const NativeSceneAnimationCompositionBudget::Charge> sampleCharge;
     if (composition && bindings_.empty())
@@ -1819,11 +1843,16 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         if (!sampleCharge) return false;
     }
     ImportedAnimationDeformationEvaluation evaluation;
-    const auto evaluated = owner == ImportedAnimationEvaluationOwner::Preview
-        ? consumer_.evaluatePreview(request.operation, request.frame,
-                                    request.structuralRevision, evaluation, error)
-        : consumer_.evaluateExport(request.operation, request.frame,
-                                   request.structuralRevision, evaluation, error);
+    bool evaluated = false;
+    {
+        // Samples the clip and evaluates the skin and morph deformation at this frame.
+        loopstep::Scope evaluateScope ("advance:imported-scene:animated-evaluate");
+        evaluated = owner == ImportedAnimationEvaluationOwner::Preview
+            ? consumer_.evaluatePreview(request.operation, request.frame,
+                                        request.structuralRevision, evaluation, error)
+            : consumer_.evaluateExport(request.operation, request.frame,
+                                       request.structuralRevision, evaluation, error);
+    }
     if (!evaluated) return false;
     if (sampleCharge && evaluation.sceneAnimation)
         evaluation.sceneAnimation=retainSceneAnimationAllocation(evaluation.sceneAnimation,sampleCharge);
@@ -2416,7 +2445,11 @@ bool ImportedAnimatedScenePayloadExecution::execute(
             return rejectMotion("Motion pass requires the native retained imported object matrices consumer");
     }
     bool renderPending = false;
+    // Preview only. Taken from the scene renderer's frame, empty for the retained deformation renderer.
+    std::string causticDegradation;
     const auto renderFrame = [&]() {
+        loopstep::Scope renderScope (owner == ImportedAnimationEvaluationOwner::Preview
+            ? "advance:imported-scene:animated-render" : "advance:imported-scene:animated-export-render");
         if (bindings_.empty())
         {
             videorender::fixture3d::RenderedFrame sceneFrame;
@@ -2436,6 +2469,7 @@ bool ImportedAnimatedScenePayloadExecution::execute(
                 renderPending = true;
                 return true;
             }
+            causticDegradation = std::move(sceneFrame.causticDegradation);
             frame.use = owner == ImportedAnimationEvaluationOwner::Preview
                 ? videorender::animation3d::RenderUse::Preview : videorender::animation3d::RenderUse::Export;
             frame.source = source_; frame.nativeFrame = std::move(sceneFrame.nativeFrame);
@@ -2603,6 +2637,7 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     receipt.runtimeInputs = std::move(runtimeInputs);
     receipt.usedLastGoodMaterial = usedLastGoodMaterial;
     receipt.materialDiagnostic = std::move(materialDiagnostic);
+    receipt.causticDegradation = std::move(causticDegradation);
     if (request.parentIntent && !receipt.inspectParent(*request.parentIntent,request.frame,request.structuralRevision,
             request.evaluationRevision,request.projectGeneration,request.helperGeneration,request.renderClipId,owner,
             request.width,request.height,&request.operation,request.proceduralScene,request.sourceCameraNodeId,

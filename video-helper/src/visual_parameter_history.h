@@ -17,13 +17,16 @@ class VisualParameterHistory
 public:
     using AudioReader = std::function<bool(double, const std::vector<int>&, bool,
                                            arbitmod::Audio&, std::string&)>;
+    // `harmony` feeds score.harmony.signal operations; null keeps them at 0.
     bool bind(const std::vector<arbitmod::Routing>& routes, const videocontrol::Plan& plan,
               std::shared_ptr<const arbitmod::Score> score, videotime::BeatTimeline timeline,
-              double fps, const std::set<std::string>& destinations, std::string& error)
+              double fps, const std::set<std::string>& destinations, std::string& error,
+              std::shared_ptr<const arbitharmony::HarmonyTimeline> harmony = nullptr)
     {
         VisualParameterHistory candidate;
         if (!candidate.bindSnapshot(routes,plan,std::move(score),std::move(timeline),fps,destinations,error))
             return false;
+        candidate.harmony_=std::move(harmony);
         *this=std::move(candidate);
         return true;
     }
@@ -147,6 +150,8 @@ public:
                     arbitmod::evaluateRouting(routes_[i],states_[i],0,*score_,input,audio,beats);
                     row.push_back(states_[i].smoothed);
                 }
+            // timeline_ lives in this object, so bind the context per call.
+            executor_.setHarmonyContext(harmony_.get(),&timeline_);
             const auto& sinks=executor_.evaluate(*score_,input,audio,beats,
                 static_cast<float>(1/fps_),static_cast<std::int64_t>(index),fps_);
             for (const auto& sink:sinks) if (sink.enabled) row.push_back(sink.value);
@@ -168,6 +173,7 @@ private:
     std::vector<arbitmod::Routing> routes_;
     std::vector<arbitmod::RoutingState> states_;
     videocontrol::Executor executor_;
+    std::shared_ptr<const arbitharmony::HarmonyTimeline> harmony_;
     std::shared_ptr<const arbitmod::Score> score_;
     videotime::BeatTimeline timeline_;
     std::vector<videocontrol::SinkValue> columns_;

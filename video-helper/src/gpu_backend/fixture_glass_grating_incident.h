@@ -164,6 +164,14 @@ inline bool prepareGratingIncidentBinding(const Prepared& prepared,const Frame& 
     SourceMeasureUse sourceUse=SourceMeasureUse::LegacyNative)
 {
     const auto refuse=[&](const char* text){error=text;return false;};
+    // Grating paths keep single-pixel deposits, so a binding owns the frame
+    // without its kernel splat opt-in. Producers match this identity against
+    // their ordinary owner's single-pixel identity.
+    if(frame.splatVersion) {
+        auto single=frame;
+        if(!disableSplat(prepared,single,error))return refuse("Glass to grating splat owner frame is invalid");
+        return prepareGratingIncidentBinding(prepared,single,gratingOwner,material,evaluationTime,output,error,sourceUse);
+    }
     if(!validateTables(prepared,frame,error,true,sourceUse))return false;
     if(!prepared.sceneLight.isValid()||!prepared.branchPolicy||frame.roughness!=0||frame.multipleScatterPolicy
         ||!gratingOwner||!material||!std::isfinite(evaluationTime)||gratingOwner->object==prepared.glass.object)

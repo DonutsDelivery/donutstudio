@@ -4,6 +4,9 @@
 # software snapshots (screenshots). The opaque component must therefore fill
 # its bounds on that path before the overlays, or the snapshot shows
 # uninitialised memory. The Mac transparent layer must stay as it is.
+# Linux single-context mode is the exception: the host context composites
+# paint() over the frame it drew, so the live paint must keep the slot
+# transparent. An opaque fill there made the docked video black (18 Oct).
 from pathlib import Path
 import re
 import sys
@@ -104,6 +107,12 @@ if dmabuf_block:
         errors.append("Mac transparentBlack handling missing from Dmabuf branch")
     if "isGuiComposited" not in code or "softwareSnapshotFrame_" not in code:
         errors.append("Mac composited snapshot path missing from Dmabuf branch")
+
+    external = re.search(r"if \(externalContextMode_ && ! softwareSnapshotFrame_\.isValid\(\)\)\s*\{([^}]*)\}\s*else", code)
+    if external is None:
+        errors.append("Linux single-context live paint no longer skips the opaque fill")
+    elif "transparentBlack" not in external.group(1) or "fillRect (getLocalBounds(), true)" not in external.group(1):
+        errors.append("Linux single-context live paint does not clear the slot to transparent")
 
 ctor_body = block_after(text, r"explicit VideoViewportComponent \(VideoSidecar& sidecarToUse\)")
 if "setComponentPaintingEnabled (false);" not in ctor_body:

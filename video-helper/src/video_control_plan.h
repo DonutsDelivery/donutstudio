@@ -1,5 +1,6 @@
 #pragma once
 
+#include "harmony_signals.h"
 #include "mod_defs.h"
 #include "video_control_window.h"
 
@@ -66,7 +67,7 @@ inline bool supportedKind(const std::string& kind)
         || kind == "control.samplehold" || kind == "control.quantize"
         || kind == "control.function" || kind == "control.stepseq"
         || kind == "control.trigger" || kind == "score.harmonic.complexity"
-        || kind == "score.note.match";
+        || kind == "score.note.match" || kind == "score.harmony.signal";
 }
 
 inline bool validatePlan(const Plan& plan, std::string& error)
@@ -230,6 +231,16 @@ public:
     }
 
     bool empty() const noexcept { return plan_.operations.empty(); }
+
+    // Harmony context for `score.harmony.signal`. Both pointers are borrowed
+    // and must outlive the next evaluate(); callers set them right before it.
+    // Null keeps the node at 0, the value an old payload produces.
+    void setHarmonyContext(const arbitharmony::HarmonyTimeline* harmony,
+                           const videotime::BeatTimeline* timeline) noexcept
+    {
+        harmony_ = harmony;
+        harmonyTimeline_ = timeline;
+    }
     bool signalWindowAvailable(std::int64_t frame, double fps) const noexcept
     {
         return !plan_.signalWindow.present()
@@ -472,6 +483,50 @@ public:
                 for (const auto& note : score.notes)
                     if (note.midiNote == wanted) { value = 1.0f; break; }
             }
+            else if (op.kind == "score.harmony.signal")
+            {
+                // Every selector but the chord-change trigger is a pure function
+                // of the beat. The trigger compares against the chord of the
+                // previous timeline frame. Export advances frame by frame from 0;
+                // the viewport can skip ahead or jump back. After any jump the
+                // previous frame's chord is recomputed from its own beat, so a
+                // seek or loop jump into the middle of a chord stays quiet and
+                // the viewport fires on exactly the frames export fires on.
+                value = 0.0f;
+                if (harmony_ != nullptr && harmonyTimeline_ != nullptr)
+                {
+                    const double beat = static_cast<double>(clock.beat);
+                    const auto signals = arbitharmony::evaluateHarmony(
+                        *harmony_, *harmonyTimeline_, beat);
+                    const bool framed = frame >= 0 && fps > 0.0 && std::isfinite(fps);
+                    const double step = std::max(0.0, static_cast<double>(std::max(dtBeats, state.lastDtBeats)));
+                    const bool contiguous = state.primed
+                        && (framed ? frame == state.lastFrame + 1
+                                   : beat >= state.lastBeats
+                                     && beat - state.lastBeats <= 1.5 * step + 1.0e-6);
+                    int previous = arbitharmony::kNoPreviousChord;
+                    if (contiguous)
+                        previous = state.count;
+                    else if (framed && frame > 0)
+                    {
+                        // Same float beat the callers build for frame - 1.
+                        const auto priorBeat = static_cast<float>(harmonyTimeline_->secondsToBeat(
+                            static_cast<double>(frame - 1) / fps));
+                        previous = arbitharmony::evaluateHarmony(
+                            *harmony_, *harmonyTimeline_, static_cast<double>(priorBeat)).chordIndex;
+                    }
+                    value = arbitharmony::harmonyControlValue(
+                        signals, static_cast<int>(std::lround(param(0))), previous);
+                    state.count = signals.chordIndex;
+                    state.lastBeats = beat;
+                    state.lastFrame = framed ? frame : -1;
+                    // Unframed callers keep the last frame step for the jump test.
+                    state.lastDtBeats = std::isfinite(dtBeats) ? std::max(dtBeats, 0.0f) : 0.0f;
+                    state.primed = true;
+                }
+                else
+                    state.primed = false;
+            }
             else if (op.kind == "sink")
             {
                 float shaped = in[0];
@@ -514,9 +569,13 @@ private:
         int count = 0;
         double lastBeats = 0.0;
         double holdRemaining = 0.0;
+        std::int64_t lastFrame = -1;
+        float lastDtBeats = 0.0f;
     };
 
     Plan plan_;
+    const arbitharmony::HarmonyTimeline* harmony_ = nullptr;
+    const videotime::BeatTimeline* harmonyTimeline_ = nullptr;
     std::vector<float> slots_;
     std::vector<bool> available_;
     std::vector<OperationState> states_;

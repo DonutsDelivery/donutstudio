@@ -181,6 +181,13 @@ struct WrapResult
     std::vector<IsfPass> passes;     // ISF multipass (M7); empty = single implicit pass
     bool singlePassOk = true;
     bool outputGuarded = false;
+    // Harmony uniforms (uChord, uLastOnsetBeat, uKey, uPhrase) the user shader
+    // owns. `bodyHarmonyUniforms` are declared by the shader with the contract
+    // type and still receive the harmony values. `foreignHarmonyUniforms` are a
+    // parameter's uniform or a declaration of another type; renderers must not
+    // write harmony values into them.
+    std::vector<std::string> bodyHarmonyUniforms;
+    std::vector<std::string> foreignHarmonyUniforms;
     std::vector<WrapDiagnostic> diagnostics;
 
     bool hasError() const
@@ -386,7 +393,9 @@ namespace detail
 
     // Names the prelude/contract already occupies, plus GLSL keywords/builtins the
     // contract relies on. A synthesized ISF uniform with any of these names would
-    // redefine an existing identifier.
+    // redefine an existing identifier. The harmony uniforms and accessors are not
+    // listed: they arrived after shaders and packs that use those names, so the
+    // prelude steps aside for a user-owned name instead (HarmonyLayout).
     inline bool isReservedName (const std::string& n)
     {
         static const char* const kReserved[] = {
@@ -632,10 +641,266 @@ inline IsfHeader parseIsfHeader (const std::string& src)
 }
 
 // ---------------------------------------------------------------------------
+// Harmony names the user shader may already own.
+// ---------------------------------------------------------------------------
+// The harmony uniforms and accessors were added to the prelude after shaders
+// that declare the same names (the media-machine effect prelude declares
+// `uniform vec4 uChord;` and `uniform float uLastOnsetBeat;`). The prelude
+// steps aside for those names instead of failing the compile:
+//   - `bodyUniforms`: the shader declares the uniform with the contract type.
+//     The prelude does not declare it, keeps the accessors as prototypes and
+//     wrapToContract defines them after the shader body.
+//   - `foreignUniforms`: a parameter or another type owns the name. The prelude
+//     declares nothing and drops the accessors that read it.
+//   - `ownedAccessors`: the shader or a parameter defines that accessor name.
+struct HarmonyLayout
+{
+    std::set<std::string> bodyUniforms;
+    std::set<std::string> foreignUniforms;
+    std::set<std::string> ownedAccessors;
+};
+
+namespace detail
+{
+    struct HarmonyUniformSpec { const char* name; const char* type; const char* declaration; };
+    struct HarmonyAccessorSpec { const char* name; const char* uniform; const char* prototype; const char* definition; };
+
+    inline const std::vector<HarmonyUniformSpec>& harmonyUniformSpecs()
+    {
+        static const std::vector<HarmonyUniformSpec> specs {
+            { "uChord", "vec4", "uniform vec4  uChord;             // root (pc/12), quality class (0 none, 1..9), tension 0..1, beats since change\n" },
+            { "uLastOnsetBeat", "float", "uniform float uLastOnsetBeat;     // timeline beat of the latest note onset (0 before the first)\n" },
+            { "uKey", "vec4", "uniform vec4  uKey;               // tonic (pc/12), mode + 1 (0 none), beats since change, brightness 0..1\n" },
+            { "uPhrase", "vec4", "uniform vec4  uPhrase;            // bar index, phrase index, phrase phase 0..1, song progress 0..1\n" },
+        };
+        return specs;
+    }
+
+    inline const std::vector<HarmonyAccessorSpec>& harmonyAccessorSpecs()
+    {
+        static const std::vector<HarmonyAccessorSpec> specs {
+            { "arbitChordRoot", "uChord", "float arbitChordRoot();\n", "float arbitChordRoot(){ return uChord.x; }\n" },
+            { "arbitChordQuality", "uChord", "float arbitChordQuality();\n", "float arbitChordQuality(){ return uChord.y; }\n" },
+            { "arbitChordTension", "uChord", "float arbitChordTension();\n", "float arbitChordTension(){ return uChord.z; }\n" },
+            { "arbitChordAge", "uChord", "float arbitChordAge();\n", "float arbitChordAge(){ return uChord.w; }\n" },
+            { "arbitChordPulse", "uChord", "float arbitChordPulse(float width);\n",
+              "float arbitChordPulse(float width){ return uChord.y>0.0 ? 1.0-smoothstep(0.0,max(width,1e-4),uChord.w) : 0.0; }\n" },
+            { "arbitKeyTonic", "uKey", "float arbitKeyTonic();\n", "float arbitKeyTonic(){ return uKey.x; }\n" },
+            { "arbitKeyMode", "uKey", "float arbitKeyMode();\n", "float arbitKeyMode(){ return uKey.y; }\n" },
+            { "arbitKeyAge", "uKey", "float arbitKeyAge();\n", "float arbitKeyAge(){ return uKey.z; }\n" },
+            { "arbitKeyBrightness", "uKey", "float arbitKeyBrightness();\n", "float arbitKeyBrightness(){ return uKey.w; }\n" },
+            { "arbitBarIndex", "uPhrase", "float arbitBarIndex();\n", "float arbitBarIndex(){ return uPhrase.x; }\n" },
+            { "arbitPhraseIndex", "uPhrase", "float arbitPhraseIndex();\n", "float arbitPhraseIndex(){ return uPhrase.y; }\n" },
+            { "arbitPhrasePhase", "uPhrase", "float arbitPhrasePhase();\n", "float arbitPhrasePhase(){ return uPhrase.z; }\n" },
+            { "arbitSongProgress", "uPhrase", "float arbitSongProgress();\n", "float arbitSongProgress(){ return uPhrase.w; }\n" },
+            { "arbitLastOnsetAge", "uLastOnsetBeat", "float arbitLastOnsetAge();\n",
+              "float arbitLastOnsetAge(){ return max(uBeat-uLastOnsetBeat,0.0); }\n" },
+        };
+        return specs;
+    }
+
+    // Code tokens: identifiers and numbers whole, every other non-space
+    // character alone. Comments and preprocessor lines are skipped.
+    inline std::vector<std::string> codeTokens (const std::string& src)
+    {
+        std::vector<std::string> tokens;
+        const size_t n = src.size();
+        bool lineStart = true;
+        for (size_t i = 0; i < n; )
+        {
+            const char c = src[i];
+            if (c == '\n') { lineStart = true; ++i; continue; }
+            if (std::isspace (static_cast<unsigned char> (c))) { ++i; continue; }
+            if (i + 1 < n && c == '/' && src[i + 1] == '/')
+            { while (i < n && src[i] != '\n') ++i; continue; }
+            if (i + 1 < n && c == '/' && src[i + 1] == '*')
+            { i += 2; while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) ++i; i += 2; continue; }
+            if (c == '#' && lineStart)
+            {
+                // Skip the directive and any backslash-continued lines.
+                while (i < n)
+                {
+                    if (src[i] == '\\' && i + 1 < n && src[i + 1] == '\n') { i += 2; continue; }
+                    if (src[i] == '\\' && i + 2 < n && src[i + 1] == '\r' && src[i + 2] == '\n') { i += 3; continue; }
+                    if (src[i] == '\n') break;
+                    ++i;
+                }
+                continue;
+            }
+            lineStart = false;
+            if (isIdentChar (c))
+            {
+                const size_t start = i++;
+                while (i < n && (isIdentChar (src[i]) || (src[start] >= '0' && src[start] <= '9' && src[i] == '.'))) ++i;
+                tokens.emplace_back (src.substr (start, i - start));
+            }
+            else
+            {
+                tokens.emplace_back (1, c);
+                ++i;
+            }
+        }
+        return tokens;
+    }
+
+    inline bool isIdentifierToken (const std::string& token)
+    {
+        return !token.empty() && ((token[0] >= 'A' && token[0] <= 'Z')
+            || (token[0] >= 'a' && token[0] <= 'z') || token[0] == '_');
+    }
+
+    inline bool isStorageQualifier (const std::string& token)
+    {
+        static const char* const kQualifiers[] = {
+            "uniform","const","in","out","inout","lowp","mediump","highp","flat","smooth",
+            "noperspective","centroid","invariant","precise","layout",
+        };
+        for (const char* q : kQualifiers) if (token == q) return true;
+        return false;
+    }
+
+    struct NameDeclaration
+    {
+        bool declared = false;
+        bool uniform = false;
+        std::string type;
+    };
+
+    // The first declaration of `name` in `tokens`: a variable, parameter,
+    // uniform or function. `Type name` or `Type a, name` declares it; a member
+    // access, a call or an expression does not.
+    inline NameDeclaration findDeclaration (const std::vector<std::string>& tokens, const std::string& name)
+    {
+        static const char* const kExpressionWords[] = { "return", "else", "case", "do" };
+        const auto expressionWord = [] (const std::string& token)
+        {
+            for (const char* word : kExpressionWords) if (token == word) return true;
+            return false;
+        };
+        const auto qualifiedUniform = [&tokens] (size_t typeIndex)
+        {
+            // Walk back from the type over qualifiers and layout(...) to the
+            // statement start.
+            size_t j = typeIndex;
+            while (j > 0)
+            {
+                const auto& token = tokens[j - 1];
+                if (token == "uniform") return true;
+                if (token == ")")
+                {
+                    int depth = 0;
+                    while (j > 0)
+                    {
+                        if (tokens[j - 1] == ")") ++depth;
+                        else if (tokens[j - 1] == "(" && --depth == 0) break;
+                        --j;
+                    }
+                    if (j == 0) return false;
+                    --j;
+                    continue;
+                }
+                if (!isStorageQualifier (token)) return false;
+                --j;
+            }
+            return false;
+        };
+        for (size_t i = 1; i < tokens.size(); ++i)
+        {
+            if (tokens[i] != name) continue;
+            const auto& previous = tokens[i - 1];
+            if (isIdentifierToken (previous) && !expressionWord (previous) && !isStorageQualifier (previous))
+                return { true, qualifiedUniform (i - 1), previous };
+            if (previous != ",") continue;
+            // `Type a, name`: find the statement start at bracket depth zero.
+            int depth = 0;
+            size_t start = i - 1;
+            bool insideCall = false;
+            while (start > 0)
+            {
+                const auto& token = tokens[start - 1];
+                if (token == ")" || token == "]") ++depth;
+                else if (token == "(" || token == "[")
+                {
+                    if (depth == 0) { insideCall = true; break; }
+                    --depth;
+                }
+                else if (depth == 0 && (token == ";" || token == "{" || token == "}")) break;
+                --start;
+            }
+            if (insideCall) continue;
+            size_t typeIndex = start;
+            while (typeIndex < i && (isStorageQualifier (tokens[typeIndex])))
+            {
+                if (tokens[typeIndex] == "layout" && typeIndex + 1 < i && tokens[typeIndex + 1] == "(")
+                {
+                    int layoutDepth = 0;
+                    while (typeIndex < i)
+                    {
+                        if (tokens[typeIndex] == "(") ++layoutDepth;
+                        else if (tokens[typeIndex] == ")" && --layoutDepth == 0) break;
+                        ++typeIndex;
+                    }
+                }
+                ++typeIndex;
+            }
+            if (typeIndex + 1 < i && isIdentifierToken (tokens[typeIndex]) && isIdentifierToken (tokens[typeIndex + 1])
+                && !expressionWord (tokens[typeIndex]))
+            {
+                bool uniform = false;
+                for (size_t q = start; q < typeIndex; ++q)
+                    if (tokens[q] == "uniform") uniform = true;
+                return { true, uniform, tokens[typeIndex] };
+            }
+        }
+        return {};
+    }
+
+    // Which harmony names the shader body or its parameters own.
+    inline HarmonyLayout harmonyLayout (const std::string& body, const std::vector<GenInput>& params)
+    {
+        HarmonyLayout layout;
+        const auto tokens = codeTokens (body);
+        const auto isParam = [&params] (const std::string& name)
+        {
+            for (const auto& param : params) if (param.name == name) return true;
+            return false;
+        };
+        for (const auto& spec : harmonyUniformSpecs())
+        {
+            if (isParam (spec.name)) { layout.foreignUniforms.insert (spec.name); continue; }
+            const auto declaration = findDeclaration (tokens, spec.name);
+            if (!declaration.declared) continue;
+            if (declaration.uniform && declaration.type == spec.type) layout.bodyUniforms.insert (spec.name);
+            else layout.foreignUniforms.insert (spec.name);
+        }
+        for (const auto& spec : harmonyAccessorSpecs())
+            if (isParam (spec.name) || findDeclaration (tokens, spec.name).declared)
+                layout.ownedAccessors.insert (spec.name);
+        return layout;
+    }
+
+    // Accessor definitions that read a uniform the body declares. They follow
+    // the body so the uniform is in scope; the prelude has their prototypes.
+    inline std::string harmonyAccessorTail (const HarmonyLayout& layout)
+    {
+        std::string out;
+        for (const auto& spec : harmonyAccessorSpecs())
+            if (layout.bodyUniforms.count (spec.uniform) != 0 && layout.ownedAccessors.count (spec.name) == 0)
+                out += spec.definition;
+        return out;
+    }
+} // namespace detail
+
+// ---------------------------------------------------------------------------
 // The fixed Arbit prelude (§4.1-4.4).
 // ---------------------------------------------------------------------------
-inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool includeHsv2Rgb)
+// `harmony` names the harmony uniforms and accessors the user shader owns
+// (detail::harmonyLayout); null means none, so the prelude declares them all.
+inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool includeHsv2Rgb,
+                                 const HarmonyLayout* harmony = nullptr)
 {
+    static const HarmonyLayout kNoOwnedHarmony {};
+    const HarmonyLayout& owned = harmony != nullptr ? *harmony : kNoOwnedHarmony;
     std::string p;
     p += "#version 330 core\n";
     p += "// --- Arbit uniform contract (auto-prepended) ---\n";
@@ -664,6 +929,12 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
     p += "uniform float uRootFreq;          // Block C: song root frequency in Hz\n";
     p += "uniform float uScoreHistoryBeats; // Block C: visible beats behind playhead\n";
     p += "uniform float uScoreLookaheadBeats; // Block C: visible beats ahead\n";
+    // Harmony and structure (harmony feed). All zero for a payload without
+    // the plugin's harmony object, and before the first chord or key. A name
+    // the user shader owns is left to it (HarmonyLayout).
+    for (const auto& spec : detail::harmonyUniformSpecs())
+        if (owned.bodyUniforms.count (spec.name) == 0 && owned.foreignUniforms.count (spec.name) == 0)
+            p += spec.declaration;
     // --- Block D: camera (3D / SDF raymarch, P5) ---
     // Contract uniforms readable by ANY shader; a Raymarch generator clip ships
     // uCamPos/uCamTarget/uCamFov as genParams so the camera automates + mod-routes
@@ -730,6 +1001,20 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
          " n.t0=arbitNoteTexel(r,0); n.t1=arbitNoteTexel(r,1);"
          " n.t2=arbitNoteTexel(r,2); n.t3=arbitNoteTexel(r,3); return n; }\n";
     p += "ArbitLink arbitLink(int edge){ ArbitLink l; l.t0=arbitLinkTexel(clamp(edge,0,255)); return l; }\n";
+    // Harmony and structure accessors. Quality classes: 1 major, 2 minor,
+    // 3 diminished, 4 augmented, 5 suspended, 6 dominant 7th, 7 major 7th,
+    // 8 minor 7th, 9 other (clusters, dyads, unnamed sets). Modes: 1 Ionian,
+    // 2 Dorian, 3 Phrygian, 4 Lydian, 5 Mixolydian, 6 Aeolian, 7 Locrian,
+    // 8 harmonic minor, 9 melodic minor.
+    // An accessor whose uniform the body declares is a prototype here and is
+    // defined after the body. One that reads a foreign uniform, or whose name
+    // the user owns, is left out.
+    for (const auto& spec : detail::harmonyAccessorSpecs())
+    {
+        if (owned.ownedAccessors.count (spec.name) != 0 || owned.foreignUniforms.count (spec.uniform) != 0)
+            continue;
+        p += owned.bodyUniforms.count (spec.uniform) != 0 ? spec.prototype : spec.definition;
+    }
     // Syntonic 2D lattice basis (e3=3-limit exponent, e5=5-limit) for note layout.
     p += "vec2 lattice2(float e3,float e5){ return vec2(e3*0.8660254 + e5*0.35, e5*0.72); }\n";
     // Block D camera helper (P5): primary ray for a fragCoord, aspect-correct
@@ -902,8 +1187,11 @@ inline WrapResult wrapToContract (const std::string& src)
 
     const bool includeHsv2Rgb = ! detail::hasFunctionDefinitionCode (
         body, "vec3", "hsv2rgb", "vec3");
+    const HarmonyLayout harmony = detail::harmonyLayout (body, r.params);
+    r.bodyHarmonyUniforms.assign (harmony.bodyUniforms.begin(), harmony.bodyUniforms.end());
+    r.foreignHarmonyUniforms.assign (harmony.foreignUniforms.begin(), harmony.foreignUniforms.end());
     std::string out = arbitPrelude (
-        r.dialect, r.dialect == Dialect::Isf ? &isf : nullptr, includeHsv2Rgb);
+        r.dialect, r.dialect == Dialect::Isf ? &isf : nullptr, includeHsv2Rgb, &harmony);
     if (r.dialect != Dialect::Isf && !r.params.empty())
     {
         out += "// --- curated bare GLSL parameters ---\n";
@@ -912,6 +1200,12 @@ inline WrapResult wrapToContract (const std::string& src)
     }
     out += body;
     if (!out.empty() && out.back() != '\n') out += '\n';
+    const std::string harmonyTail = detail::harmonyAccessorTail (harmony);
+    if (!harmonyTail.empty())
+    {
+        out += "// --- Arbit harmony accessors for shader-declared uniforms ---\n";
+        out += harmonyTail;
+    }
 
     const bool bodyOwnsMain = detail::hasFunctionCode (body, "main");
 

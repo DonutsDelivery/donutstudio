@@ -460,6 +460,39 @@ int main (int argc, char** argv)
                      "actual-editor inputs are two distinct owned source images");
     }
 
+    // Twenty 16x16 frames at 30 fps in Matroska, whose 1/1000 time base rounds the
+    // stamps to 0, 33, 67, ..., 467, 500, 533. Frame 14 really starts at 466.67 ms and
+    // frame 15 at exactly 500 ms, so a request for 0.5 s must land on frame 15 and not
+    // on frame 14 (whose rounded stamp plus one frame period still passed 0.5).
+    {
+        MediaContext millis;
+        if (! check (millis.open (fixtures + "/ms-timebase-30fps.mkv", false).empty(),
+                     "open the 30 fps millisecond time base fixture")) return 1;
+        DecodedFrame at;
+        if (! decode (millis, 14.0 / 30.0, at)) return 1;
+        ok &= check (at.ptsTicks == 467 && at.timeBase.den == 1000,
+                     "a request at frame 14's own start selects frame 14");
+        if (! decode (millis, 0.4985, at)) return 1;
+        ok &= check (at.ptsTicks == 467,
+                     "a request just before the next frame stays on frame 14");
+        if (! decode (millis, 0.5, at)) return 1;
+        ok &= check (at.ptsTicks == 500 && std::abs (at.ptsSec - 0.5) < 1.0e-9,
+                     "a request at 0.5 s advances forward from frame 14 to frame 15");
+        if (! decode (millis, 15.0 / 30.0 - 1.0e-9, at)) return 1;
+        ok &= check (at.ptsTicks == 500,
+                     "timeline rounding just under 0.5 s still selects frame 15");
+        if (! decode (millis, 16.0 / 30.0, at)) return 1;
+        ok &= check (at.ptsTicks == 533, "frame 16 starts at its own request time");
+        if (! decode (millis, 0.5, at)) return 1;
+        ok &= check (at.ptsTicks == 500, "a backward seek to 0.5 s selects frame 15");
+        uint64_t millisOrdinal = UINT64_MAX;
+        DecodedFrame scanned;
+        ok &= check (millis.getFrameWithPresentationOrdinal (0.5, 16, 16, scanned, millisOrdinal).empty()
+                     && millisOrdinal == 15 && scanned.ptsTicks == at.ptsTicks
+                     && scanned.rgba == at.rgba,
+                     "the presentation scan and the preview decode agree on frame 15");
+    }
+
     frame.setPresentationTimestamp (AV_NOPTS_VALUE, AVRational { 1, 1200000 });
     ok &= check (frame.ptsTicks == AV_NOPTS_VALUE
                  && frame.timeBase.num == 1 && frame.timeBase.den == 1200000,

@@ -48,6 +48,10 @@ struct StageBudget final
     // status tokens, 3 for each of the thirteen uniform tokens, and 30 for the
     // remaining appends, replacements and the final concatenation (293), plus 10.
     static constexpr std::size_t transport=303;
+    // The paired water and caustic volume transport adds four transport stages
+    // (prototypes, two renames, the paired entry points) and one fragment
+    // uniform declaration (5), plus 3.
+    static constexpr std::size_t pairedVolume=8;
 };
 struct Plan final
 {
@@ -56,7 +60,7 @@ struct Plan final
     // the spectral query) and the renamed query twice.
     static constexpr std::size_t maximumStages=StageBudget::nullVertex+StageBudget::finalFragment
         +3*StageBudget::opaque+StageBudget::sky+StageBudget::environment+2*StageBudget::renamedQuery
-        +StageBudget::spectral+StageBudget::transport;
+        +StageBudget::spectral+StageBudget::transport+StageBudget::pairedVolume;
     std::array<Stage,maximumStages> stages{};
     std::size_t count=0;
     std::uint64_t capacity=0, scans=0, copies=0, comparisons=0, formatting=0;

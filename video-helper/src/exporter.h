@@ -253,6 +253,12 @@ struct ExportJob
     // consumed by the GL frame loop.
     arbitmod::Score score;
 
+    // Harmony and structure timeline (score.harmony, harmony_signals.h). Parsed
+    // next to `score`; present == false for payloads without it, which keeps
+    // uChord/uKey/uPhrase and the score.harmony.signal node at zero.
+    std::shared_ptr<const arbitharmony::HarmonyTimeline> harmony
+        = std::make_shared<const arbitharmony::HarmonyTimeline>();
+
     // Cross-domain modulation matrix (M6 — "the music moves the picture"). Each
     // routing maps a musical SOURCE (Block A clock / Block B audio / Block C
     // score, evaluated by arbitmod::evaluateSource) onto a render-graph clip

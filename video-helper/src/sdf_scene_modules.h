@@ -18,7 +18,7 @@ inline constexpr const char* kScoreMonolithProgramId = "score-monolith";
 inline constexpr const char* kScoreMonolithSourcePath
     = "arbit-3d-raymarch/shaders/score_monolith.fs";
 inline constexpr const char* kScoreMonolithSourceSha256
-    = "c43e4add4e4e181a4ac5e25a454c9744776c1c441d0b31f50ed3b8083a660d69";
+    = "5d44da10849f5c1746af80a563f8e8667f70a638880125a6b7ee93a401cc3c1c";
 inline constexpr const char* kHoloFoilProgramId = "holo-foil";
 inline constexpr const char* kHoloFoilSourcePath
     = "arbit-3d-raymarch/shaders/holo_foil.fs";

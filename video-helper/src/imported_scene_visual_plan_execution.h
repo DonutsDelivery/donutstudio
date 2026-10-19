@@ -13,15 +13,18 @@
 #include "visual_plan_executor.h"
 #include "imported_material_frame_resolver.h"
 #include "loop_step_probe.h"
+#include "preview_render_extent.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -84,6 +87,13 @@ struct HasImportedPendingReceipt : std::false_type {};
 template <typename Receipt>
 struct HasImportedPendingReceipt<Receipt,std::void_t<decltype(std::declval<const Receipt&>().pending)>>
     : std::true_type {};
+
+// Test executions without a caustic reason keep the template's original contract.
+template <typename Execution,typename = void>
+struct HasImportedCausticDegradation : std::false_type {};
+template <typename Execution>
+struct HasImportedCausticDegradation<Execution,std::void_t<decltype(Execution::causticDegradation(
+    std::declval<const typename Execution::Receipt&>()))>> : std::true_type {};
 
 struct AnalyticSkyRuntimeParameter
 {
@@ -607,7 +617,11 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     const videotime::BeatTimeline* beatTimeline = nullptr,
     double projectSeconds = 0.0,
     geometry::GeometryExecutionCache* ownedGeometryCache = nullptr,
-    const ImportedMaterialFrameResolver* composedMaterialFrameResolver = nullptr)
+    const ImportedMaterialFrameResolver* composedMaterialFrameResolver = nullptr,
+    std::optional<std::uint64_t>* previewRenderNs = nullptr,
+    const previewextent::Extent* previewExtent = nullptr,
+    previewextent::Extent* renderedExtent = nullptr,
+    std::string* causticDegradation = nullptr)
 {
     const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
     // Refuse before resetting the layer or publishing source/cache retirement.
@@ -755,8 +769,18 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         linearColor = true;
     }
 
-    const auto renderExtent = compiled->typedScenePassExtent.value_or(renderpassoutput::Extent {
-        static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)});
+    // The live viewport may ask for a smaller scene render than the canvas. Export
+    // never passes one. A Render Passes extent, a pass composite and the Solid 3D
+    // overlay each need the exact canvas or pass extent, so they keep it.
+    const bool smallerPreview = previewExtent != nullptr && previewExtent->valid()
+        && use == NativeImportedSceneRenderUse::Preview
+        && !compiled->typedScenePassExtent && !compiled->passComposite && !solidOverlay
+        && previewExtent->width <= static_cast<std::uint32_t>(width)
+        && previewExtent->height <= static_cast<std::uint32_t>(height);
+    const auto renderExtent = smallerPreview
+        ? renderpassoutput::Extent { previewExtent->width, previewExtent->height }
+        : compiled->typedScenePassExtent.value_or(renderpassoutput::Extent {
+            static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)});
     if (renderExtent.width == 0 || renderExtent.height == 0 || renderExtent.width > 8192
         || renderExtent.height > 8192
         || static_cast<std::uint64_t>(renderExtent.width) * renderExtent.height > 67108864u)
@@ -788,6 +812,9 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     request.objectLocalTransform = importedSource.objectLocalTransform;
     request.dimensions = {renderExtent.width, renderExtent.height};
     request.deformation = importedSource.deformation;
+    // The engine belongs to the outer render request; composed leaves are Raster.
+    request.renderEngine = compiled->importedSceneRender->renderEngine;
+    request.pathTraceExportSamples = compiled->importedSceneRender->pathTraceExportSamples;
     request.runtimeInputs.imageOutput = compiled->importedSceneRender->imageOutput;
     request.runtimeInputs.linearColor = linearColor;
     if (linearColor && request.runtimeInputs.imageOutput != renderpassoutput::Output::Color
@@ -1338,12 +1365,30 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     if (baked->evaluationRevision != 0)
         bakedtarget::applyEvaluationRevision(request, baked->evaluationRevision);
     typename Execution::Receipt receipt;
+    // Preview only. The caller reports this to the HUD, since the graph timer starts
+    // after prepare and never sees the scene render. Export timing is not touched.
+    const auto previewRenderStart = std::chrono::steady_clock::now();
     const bool executed = use == NativeImportedSceneRenderUse::Preview
         ? execution->executePreview(request, receipt, error)
         : execution->executeExport(request, receipt, error);
+    const auto previewRenderElapsed = std::chrono::steady_clock::now() - previewRenderStart;
     if (!executed) return VisualImportedScenePreparation::rejected;
     if constexpr (HasImportedPendingReceipt<typename Execution::Receipt>::value)
         if (receipt.pending) return VisualImportedScenePreparation::pending;
+    // A pending retry did no render work, so only completed preview frames are reported.
+    if (previewRenderNs != nullptr && use == NativeImportedSceneRenderUse::Preview)
+        *previewRenderNs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(previewRenderElapsed).count());
+    if (renderedExtent != nullptr && use == NativeImportedSceneRenderUse::Preview)
+        *renderedExtent = { renderExtent.width, renderExtent.height };
+    // Preview only. Always assigned for a completed frame, so an empty reason clears the HUD row.
+    if (causticDegradation != nullptr && use == NativeImportedSceneRenderUse::Preview)
+    {
+        if constexpr (HasImportedCausticDegradation<Execution>::value)
+            *causticDegradation = Execution::causticDegradation(receipt);
+        else
+            causticDegradation->clear();
+    }
     if (!Execution::validReceipt(receipt))
         return reject("imported scene renderer returned an incomplete native frame receipt");
 
@@ -1352,7 +1397,11 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
                 use==NativeImportedSceneRenderUse::Preview?modelpayload::ImportedSceneUse::Preview:modelpayload::ImportedSceneUse::Export))
             return reject("imported parent native receipt does not match the expected compiled request");
 
-    const auto& frame = Execution::nativeFrame(receipt);
+    // Hold the frame by value. The receipt moves into frameOwners before the layer
+    // publishes its owner and linear image, and a moved receipt has no frame. A
+    // reference here left a linear Scene3D layer without nativeLinearImage, so the
+    // SDR compositor could not convert it to sRGB and refused it as undeclared.
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> frame = Execution::nativeFrame(receipt);
     if (!frame)
         return reject("imported scene renderer returned no native compositor frame");
     if (frame->width() != renderExtent.width || frame->height() != renderExtent.height)

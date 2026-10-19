@@ -1201,7 +1201,8 @@ inline bool run(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
         std::cout<<"smooth-glass-pixels backend="<<backend.info().backend<<" row="<<row++<<" rgb="<<actual[0]<<','<<actual[1]<<','<<actual[2]<<'\n';
         if(row==1) {
             auto prepared=backend.prepare(snapshot,material->nativeProgram());if(!prepared.prepared){error=prepared.error;return false;}
-            if(!reject(backend.render(snapshot,prepared.resources,3840,2160,inputs).rendered,"over-budget glass 4K frame admitted"))return false;
+            // 4K fits the closed glass frame cap; 4096x4096 is above it and refuses.
+            if(!reject(backend.render(snapshot,prepared.resources,4096,4096,inputs).rendered,"over-budget glass 4096x4096 frame admitted"))return false;
         }
     }
     if(std::abs(baseline[0]-dispersive[0])<.0005) {error="glass camera/prism controls did not change native radiance";return false;}
@@ -1246,10 +1247,38 @@ inline bool run(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
     const auto excessivePrepared=backend.prepare(excessiveSnapshot,excessiveMaterial->nativeProgram());
     if(!excessivePrepared.prepared) {error="finite high-radiance scene did not reach native output validation: "+excessivePrepared.error;return false;}
     arbitgpu::NativeFixtureSceneRuntimeInputs linear;linear.linearColor=true;
+    // Finite radiance above the binary16 maximum is a highlight. The shader
+    // stores it at 65504 and the frame renders; only NaN or infinity refuses.
     const auto overflow=backend.render(excessiveSnapshot,excessivePrepared.resources,9,9,linear);
-    if(overflow.rendered || overflow.frame || overflow.error.find("Color")==std::string::npos
-        || overflow.error.find("RGBA16F")==std::string::npos)
-    {error="unrepresentable native glass Color was published or lacked its output diagnostic";return false;}
+    arbitgpu::NativeRawPassPixels ceiling;
+    if(!overflow.rendered || !overflow.frame
+        || !overflow.frame->readRawPass(renderpassoutput::Output::Color,ceiling,error))
+    {error="finite native glass highlight was not stored at the RGBA16F ceiling: "+overflow.error+error;return false;}
+    for(int c=0;c<3;++c) {
+        std::uint16_t half=0;std::memcpy(&half,ceiling.bytes.data()+(4*9+4)*8+c*2,2);
+        if(half!=0x7bffu) {error="finite native glass highlight channel "+std::to_string(c)+" is not 65504";return false;}
+    }
+    // Smooth Dispersive Glass starter receivers: diffuse (roughness 1) and lit
+    // by the analytic sky. Its GGX sample 3 lands on the view near n.v 0.62,
+    // and an unclamped v.h above one made pow() return NaN on NVIDIA GL, so
+    // every frame refused. The wide view sweeps that n.v across the receiver,
+    // directly and through the slab, and the whole linear Color must be finite.
+    auto starter=scene();receiver(starter,-6,{0,0,0});
+    for(std::size_t v=8;v<12;++v) {starter.vertices[v].position.x*=4;starter.vertices[v].position.y*=4;}
+    starter.materials[1].baseColor={.8f,.8f,.78f};starter.ambientColor={.15f,.15f,.15f};
+    auto& sky=starter.lights[0];sky.color={1,1,1};sky.intensity=1.5f;sky.sky.version=1;
+    sky.sky.sunAzimuthDegrees=210;sky.sky.sunElevationDegrees=40;sky.sky.sunRadiusDegrees=3;sky.sky.sunIntensity=8;
+    starter.cameras[0].verticalFovRadians=1.6f;
+    auto starterSnapshot=std::make_shared<const Visual3DScene>(starter);
+    const auto starterMaterial=binding(starterSnapshot,target,1.5f,.004f,error);if(!starterMaterial)return false;
+    const auto starterPrepared=backend.prepare(starterSnapshot,starterMaterial->nativeProgram());
+    if(!starterPrepared.prepared) {error="sky-lit starter glass scene was not admitted: "+starterPrepared.error;return false;}
+    const auto starterFrame=backend.render(starterSnapshot,starterPrepared.resources,512,512,linear);
+    arbitgpu::NativeRawPassPixels starterColor;
+    if(!starterFrame.rendered || !starterFrame.frame
+        || !starterFrame.frame->readRawPass(renderpassoutput::Output::Color,starterColor,error)
+        || !arbitgpu::smoothglass::finiteColorFrame(starterColor,error))
+    {error="sky-lit starter glass frame refused or published nonfinite Color: "+starterFrame.error+error;return false;}
     auto rough=std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*native);rough->parameters.emissionRoughness[3]=.1f;
     arbitgpu::smoothglass::Prepared unclaimedRough;
     std::string roughError;

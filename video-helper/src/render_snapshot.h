@@ -296,6 +296,42 @@ inline bool isBoundedNativeCompositorDag (const std::vector<std::string>& kinds)
         && std::count(kinds.begin(), kinds.end(), "video.out") == 1;
 }
 
+// The native compositor has two secondary Blend inputs. Port 2 carries one text
+// overlay and port 3 one referenced layer; either may instead carry the one
+// native GPU overlay pass (Draw Shape or Gradient). The executor's composite
+// compile accepts exactly this set, so validation refuses anything else with
+// the executor's own reason rather than letting a plan pass and fail at render.
+inline bool isExecutableCompositeSecondaryKind (int blendPort, const std::string& kind)
+{
+    if (kind == "visual.draw.shape" || kind == "visual.gradient")
+        return blendPort == 2 || blendPort == 3;
+    return (blendPort == 2 && kind == "video.text")
+        || (blendPort == 3 && kind == "video.layer.source");
+}
+
+inline bool admitCompositeSecondaryKinds (const CompiledVisualLayerPlan& plan,
+                                          std::string& error)
+{
+    const auto blend = std::find(plan.nodeKinds.begin(), plan.nodeKinds.end(), "video.blend");
+    if (blend == plan.nodeKinds.end() || plan.nodeIds.size() != plan.nodeKinds.size())
+        return true;
+    const int blendId = plan.nodeIds[(size_t) std::distance(plan.nodeKinds.begin(), blend)];
+    for (const auto& edge : plan.edges)
+    {
+        if (edge.toNodeId != blendId || (edge.toPort != 2 && edge.toPort != 3))
+            continue;
+        const auto source = std::find(plan.nodeIds.begin(), plan.nodeIds.end(), edge.fromNodeId);
+        if (source == plan.nodeIds.end()) continue; // unknown identities fail elsewhere
+        const auto& kind = plan.nodeKinds[(size_t) std::distance(plan.nodeIds.begin(), source)];
+        if (! isExecutableCompositeSecondaryKind(edge.toPort, kind))
+        {
+            error = "visual composite secondary branch is not an executable native source";
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool admitBoundedNativeImageDescriptors (const CompiledVisualLayerPlan& plan,
                                                 std::string& error)
 {
@@ -990,6 +1026,18 @@ inline bool validateCompiledVisualLayerPlans (
             {
                 CompiledVisualDagSchedule schedule;
                 if (! compileBoundedVisualDagSchedule(plan, schedule, error))
+                    return false;
+                // Depth, Optical Flow, Scene3D and Geometry Core plans compile
+                // through their own exact branches (a Solid 3D scene takes an
+                // imported particle overlay on the Blend, for one), so their
+                // Blend wiring is theirs. Only the plain composite is checked here.
+                const bool ownBranch = std::any_of(plan.nodeKinds.begin(), plan.nodeKinds.end(),
+                    [&flowKind] (const std::string& kind)
+                    { return kind == "visual.depth.asset" || kind == flowKind
+                          || kind.rfind("visual.3d.", 0) == 0
+                          || kind.rfind("geometry.", 0) == 0; });
+                if (! importedSceneDag && ! ownBranch
+                    && ! admitCompositeSecondaryKinds(plan, error))
                     return false;
             }
             else if (collapsedNativePlan)

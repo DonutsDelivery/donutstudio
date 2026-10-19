@@ -1,7 +1,10 @@
 #include "software_h264_encoder.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace
 {
@@ -26,7 +29,7 @@ void checkPolicy(const AVCodec* codec, AVRational fps, int qp, bool intraOnly)
     require(av_opt_get_int(context->priv_data, "allow_skip_frames", 0, &value) >= 0
         && value == 0, "frame skipping was not disabled");
     require(av_opt_get_int(context->priv_data, "profile", 0, &value) >= 0
-        && value == FF_PROFILE_H264_MAIN, "main profile was not configured");
+        && value == AV_PROFILE_H264_MAIN, "main profile was not configured");
     // Resolve the named native RC value independently through the option API.
     AVCodecContext* defaults = avcodec_alloc_context3(codec);
     require(defaults != nullptr, "allocate reference option context");
@@ -52,10 +55,131 @@ void checkPolicy(const AVCodec* codec, AVRational fps, int qp, bool intraOnly)
     avformat_free_context(format);
     avcodec_free_context(&context);
 }
+
+// Hand-worked expectations, not read back from the planner. Frame cost is
+// 61/20 bytes per pixel: 3840x2160 gives 25,297,920 bytes, so the 1 GiB budget
+// holds 42 frames; 1920x1080 gives 6,324,480 bytes and 169 frames. An automatic
+// thread count is 3/2 of the cores (26 cores give 39), and the
+// unrestricted worst case is the preset lookahead + 3 frames per thread + 10 fixed frames.
+void checkX264MemoryPlan()
+{
+    using videohelper::planX264Memory;
+    // 4K, 26 cores: 40 + 3 * 39 + 10 = 167 > 42. Threads 42 / 6 = 7, lookahead 42 - 21 - 10 = 11.
+    auto plan = planX264Memory(3840, 2160, "medium", 39);
+    require(plan.threads == 7 && plan.lookahead == 11, "4K medium plan on 26 cores");
+    // 1080p, 26 cores: 40 + 117 + 10 = 167 <= 169, so the encoder stays untouched.
+    plan = planX264Memory(1920, 1080, "medium", 39);
+    require(plan.threads == 0 && plan.lookahead == -1, "1080p must keep the automatic settings");
+    // 1080p, 64 cores: 40 + 288 + 10 = 338 > 169. Threads 169 / 6 = 28; lookahead
+    // 169 - 84 - 10 = 75 exceeds the preset's 40, so it is never raised.
+    plan = planX264Memory(1920, 1080, "medium", 96);
+    require(plan.threads == 28 && plan.lookahead == -1, "1080p on 64 cores lowers threads only");
+    // veryfast looks 10 frames ahead; 4K computes 11, which is not lower.
+    plan = planX264Memory(3840, 2160, "veryfast", 39);
+    require(plan.threads == 7 && plan.lookahead == -1, "veryfast lookahead must not be raised");
+    // ultrafast has no lookahead to lower.
+    plan = planX264Memory(3840, 2160, "ultrafast", 39);
+    require(plan.threads == 7 && plan.lookahead == -1, "ultrafast lookahead must stay absent");
+    // A 2-core machine: auto 3 threads, 4K worst case 40 + 9 + 10 = 59 > 42.
+    // Threads max(2, 7) capped by 3 gives 3 and equals auto, so unchanged (0);
+    // lookahead 42 - 9 - 10 = 23.
+    plan = planX264Memory(3840, 2160, "medium", 3);
+    require(plan.threads == 0 && plan.lookahead == 23, "2-core 4K plan");
+    // A zero budget falls back to the 16-frame floor: threads 16 / 6 = 2,
+    // lookahead 16 - 6 - 10 = 0 raised to the floor of 8.
+    plan = planX264Memory(3840, 2160, "medium", 39, 0);
+    require(plan.threads == 2 && plan.lookahead == 8, "floor plan");
+    // Unknown size keeps the defaults.
+    plan = planX264Memory(0, 2160, "medium", 39);
+    require(plan.threads == 0 && plan.lookahead == -1, "zero width must not plan");
+    // A context that already runs 1 thread is never given more.
+    plan = planX264Memory(3840, 2160, "medium", 1);
+    require(plan.threads == 0 && plan.lookahead == 29, "single-thread 4K plan");
+    // The thread-count resolution: 26 cores -> 39, no cores known -> 8, 200 cores -> 128 cap.
+    require(videohelper::x264AutoThreads(26) == 39 && videohelper::x264AutoThreads(0) == 8
+            && videohelper::x264AutoThreads(200) == 128 && videohelper::x264AutoThreads(1) == 1,
+            "automatic thread resolution");
+    // The preset table.
+    require(videohelper::x264PresetLookahead("veryfast") == 10 && videohelper::x264PresetLookahead("medium") == 40
+            && videohelper::x264PresetLookahead("slow") == 50 && videohelper::x264PresetLookahead("ultrafast") == 0,
+            "preset lookahead table");
+    // Whatever the machine, a restricted 4K plan stays inside the 42-frame budget.
+    for (unsigned cores : { 1u, 2u, 4u, 8u, 16u, 26u, 64u, 128u, 512u })
+    {
+        const int autoThreads = static_cast<int>(std::min(128u, std::max(1u, cores * 3u / 2u)));
+        const auto p = planX264Memory(3840, 2160, "medium", autoThreads);
+        const int threads = p.threads > 0 ? p.threads : autoThreads;
+        const int lookahead = p.lookahead >= 0 ? p.lookahead : 40;
+        require(lookahead + 3 * threads + 10 <= 42 || (p.threads == 2 && p.lookahead == 8) || threads == 1,
+                "4K plan exceeds the frame budget");
+        require(threads <= autoThreads && lookahead <= 40, "plan raised a default");
+    }
+    // The real encoder context receives the plan when libx264 is present.
+    if (const auto* x264 = avcodec_find_encoder_by_name("libx264"))
+    {
+        const int autoThreads = videohelper::x264AutoThreads(std::thread::hardware_concurrency());
+        AVCodecContext* context = avcodec_alloc_context3(x264);
+        require(context != nullptr, "allocate libx264 context");
+        // The allocated default is whatever this FFmpeg picks (1 for the system
+        // libavcodec). The call site must not depend on it.
+        context->thread_count = 1;
+        context->width = 3840;
+        context->height = 2160;
+        context->pix_fmt = AV_PIX_FMT_YUV420P;
+        context->framerate = {30, 1};
+        context->time_base = {1, 30};
+        const auto error = videohelper::configureSoftwareH264(context, "libx264", 18, "medium");
+        require(error.empty(), error.c_str());
+        int64_t lookahead = -1;
+        require(av_opt_get_int(context->priv_data, "rc-lookahead", 0, &lookahead) >= 0, "read rc-lookahead");
+        if (autoThreads > 7)
+        {
+            // 42-frame budget: threads 42 / 6 = 7, lookahead 42 - 3 * 7 - 10 = 11.
+            require(context->thread_count == 7, "4K medium context must run 7 threads");
+            require(lookahead == 11, "4K medium context must look 11 frames ahead");
+        }
+        else
+        {
+            // Few cores: the automatic count (0) already sits below 7, and the
+            // lookahead fills the remaining 42 - 3 * auto - 10 frames.
+            require(context->thread_count == 0, "a small machine keeps automatic threads");
+            require(lookahead == 42 - 3 * autoThreads - 10,
+                    "4K medium lookahead on a small machine");
+        }
+        avcodec_free_context(&context);
+        AVCodecContext* small = avcodec_alloc_context3(x264);
+        require(small != nullptr, "allocate small libx264 context");
+        small->thread_count = 1;
+        small->width = 640;
+        small->height = 360;
+        require(videohelper::configureSoftwareH264(small, "libx264", 18, "medium").empty(), "configure small");
+        require(small->thread_count == 0, "a small frame must run automatic threads");
+        int64_t smallLookahead = 0;
+        require(av_opt_get_int(small->priv_data, "rc-lookahead", 0, &smallLookahead) >= 0
+                && smallLookahead == -1, "a small frame must keep the preset lookahead");
+        avcodec_free_context(&small);
+        // The live recorder caps its own threads at 4 so x264 holds few frames before
+        // the first packet. 1080p veryfast is far inside the budget (10 + 3 * 4 + 10
+        // frames of 169), so the plan leaves both the ceiling and the preset's
+        // lookahead of 10 alone.
+        AVCodecContext* recorder = avcodec_alloc_context3(x264);
+        require(recorder != nullptr, "allocate recorder libx264 context");
+        recorder->width = 1920;
+        recorder->height = 1080;
+        recorder->thread_count = 4;
+        require(videohelper::configureSoftwareH264(recorder, "libx264", 20, "veryfast").empty(), "configure recorder");
+        require(recorder->thread_count == 4, "the recorder must keep its 4-thread ceiling");
+        int64_t recorderLookahead = 0;
+        require(av_opt_get_int(recorder->priv_data, "rc-lookahead", 0, &recorderLookahead) >= 0
+                && recorderLookahead == -1, "the recorder lookahead must be left at the preset default");
+        avcodec_free_context(&recorder);
+    }
+}
 }
 
 int main()
 {
+    checkX264MemoryPlan();
     const auto* codec = avcodec_find_encoder_by_name("libopenh264");
     if (codec == nullptr)
     {

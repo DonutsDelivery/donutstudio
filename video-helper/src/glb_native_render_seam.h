@@ -268,6 +268,12 @@ public:
                 [](const auto& value) { return value && value->vertexProgram; }));
     }
 
+    // Render engine for the following renders (the 3D Render node's choice).
+    void selectEngine (videorender::fixture3d::SceneEngineSelection selection)
+    {
+        renderer_.selectEngine (selection);
+    }
+
 private:
     bool render (const GlbNativeSceneAdmission& admission,
                  videorender::fixture3d::RenderDimensions dimensions,

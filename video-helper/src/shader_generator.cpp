@@ -2,9 +2,57 @@
 
 #include "shader_generator.h"
 
+#include "beat_timeline.h"
+#include "harmony_signals.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace videorender
+{
+
+ShaderClock makeShaderClock (double displaySec, double clipStartSec,
+                             double clipDurationSec,
+                             const videotime::BeatTimeline& timeline, double fps,
+                             bool playing, int frame,
+                             const arbitharmony::HarmonyTimeline* harmony)
+{
+    ShaderClock c;
+    const double clipRel = displaySec - clipStartSec;
+    const auto timelineClock = timeline.clockAtSeconds (displaySec);
+    const double clipStartBeat = timeline.secondsToBeat (clipStartSec);
+    const double clipEndBeat = timeline.secondsToBeat (clipStartSec + clipDurationSec);
+    c.timeSec     = clipRel > 0.0 ? clipRel : 0.0;
+    c.timeDelta   = fps > 1e-6 ? 1.0 / fps : 1.0 / 30.0;
+    c.frame       = frame;
+    c.bpm         = timelineClock.bpm;
+    c.beatsPerBar = timelineClock.beatsPerBar;
+    c.beat        = timelineClock.beat;
+    c.beatPhase   = c.beat - std::floor (c.beat);
+    c.barPhase    = timelineClock.barPhase;
+    c.clipBeat    = std::max (0.0, c.beat - clipStartBeat);
+    c.clipLength  = std::max (0.0, clipEndBeat - clipStartBeat);
+    c.playing     = playing;
+    if (harmony != nullptr)
+    {
+        const auto signals = arbitharmony::evaluateHarmony (*harmony, timeline, c.beat);
+        for (int i = 0; i < 4; ++i)
+        {
+            c.chord[i]  = signals.chord[i];
+            c.key[i]    = signals.key[i];
+            c.phrase[i] = signals.phrase[i];
+        }
+        c.lastOnsetBeat = signals.lastOnsetBeat;
+    }
+    return c;
+}
+
+} // namespace videorender
+
 #if ARBIT_HAVE_VIEWPORT
 
 #include "gl_loader.h"
+#include "harmony_signals.h"
 #include "shader_dialect.h"
 
 #include <cmath>
@@ -24,30 +72,6 @@ void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
 
 // Fullscreen triangle strip in NDC.
 static const float kGenQuad[8] = { -1.f, -1.f,  1.f, -1.f,  -1.f, 1.f,  1.f, 1.f };
-
-ShaderClock makeShaderClock (double displaySec, double clipStartSec,
-                             double clipDurationSec,
-                             const videotime::BeatTimeline& timeline, double fps,
-                             bool playing, int frame)
-{
-    ShaderClock c;
-    const double clipRel = displaySec - clipStartSec;
-    const auto timelineClock = timeline.clockAtSeconds (displaySec);
-    const double clipStartBeat = timeline.secondsToBeat (clipStartSec);
-    const double clipEndBeat = timeline.secondsToBeat (clipStartSec + clipDurationSec);
-    c.timeSec     = clipRel > 0.0 ? clipRel : 0.0;
-    c.timeDelta   = fps > 1e-6 ? 1.0 / fps : 1.0 / 30.0;
-    c.frame       = frame;
-    c.bpm         = timelineClock.bpm;
-    c.beatsPerBar = timelineClock.beatsPerBar;
-    c.beat        = timelineClock.beat;
-    c.beatPhase   = c.beat - std::floor (c.beat);
-    c.barPhase    = timelineClock.barPhase;
-    c.clipBeat    = std::max (0.0, c.beat - clipStartBeat);
-    c.clipLength  = std::max (0.0, clipEndBeat - clipStartBeat);
-    c.playing     = playing;
-    return c;
-}
 
 ShaderGenerator::~ShaderGenerator()
 {
@@ -137,6 +161,8 @@ void ShaderGenerator::cacheLocs (const arbitgl::GlFuncs* gl, unsigned prog)
     locs_.uLastOnsetBeat= L ("uLastOnsetBeat");
     locs_.uRootFreq     = L ("uRootFreq");
     locs_.uChord        = L ("uChord");
+    locs_.uKey          = L ("uKey");
+    locs_.uPhrase       = L ("uPhrase");
     // Block D — camera (P5).
     locs_.uCamPos       = L ("uCamPos");
     locs_.uCamTarget    = L ("uCamTarget");
@@ -176,6 +202,15 @@ bool ShaderGenerator::setSource (const arbitgl::GlFuncs* gl, const std::string& 
         gl->DeleteProgram (program_);
     program_ = prog;
     cacheLocs (gl, program_);
+    // A harmony name owned by a parameter or declared with another type is not
+    // the harmony uniform; never write chord/key/phrase values into it.
+    for (const auto& name : wrap.foreignHarmonyUniforms)
+    {
+        if (name == "uChord") locs_.uChord = -1;
+        else if (name == "uLastOnsetBeat") locs_.uLastOnsetBeat = -1;
+        else if (name == "uKey") locs_.uKey = -1;
+        else if (name == "uPhrase") locs_.uPhrase = -1;
+    }
     inputImageLoc_ = -1;
     bridgeStartImageLoc_ = bridgeEndImageLoc_ = bridgeProgressLoc_ = -1;
 
@@ -551,10 +586,12 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
         gl->Uniform1f (locs_.uScoreHistoryBeats, haveNotes ? notes->historyBeats() : 0.0f);
     if (locs_.uScoreLookaheadBeats >= 0)
         gl->Uniform1f (locs_.uScoreLookaheadBeats, haveNotes ? notes->lookaheadBeats() : 0.0f);
-    // uLastOnsetBeat / uChord stay reserved (in Locs, not in the v1 prelude) —
-    // a later slice can fill them without a contract change.
-    if (locs_.uLastOnsetBeat>= 0) gl->Uniform1f (locs_.uLastOnsetBeat, 0.0f);
-    if (locs_.uChord        >= 0) gl->Uniform4f (locs_.uChord, 0.0f, 0.0f, 0.0f, 0.0f);
+    // Harmony and structure ride the clock (makeShaderClock), so they stay a
+    // pure function of the beat in both render paths. Zero without a payload.
+    if (locs_.uLastOnsetBeat>= 0) gl->Uniform1f (locs_.uLastOnsetBeat, clock.lastOnsetBeat);
+    if (locs_.uChord        >= 0) gl->Uniform4f (locs_.uChord, clock.chord[0], clock.chord[1], clock.chord[2], clock.chord[3]);
+    if (locs_.uKey          >= 0) gl->Uniform4f (locs_.uKey, clock.key[0], clock.key[1], clock.key[2], clock.key[3]);
+    if (locs_.uPhrase       >= 0) gl->Uniform4f (locs_.uPhrase, clock.phrase[0], clock.phrase[1], clock.phrase[2], clock.phrase[3]);
 
     // Block D — camera (P5 raymarch). Contract uniforms any shader may read; a
     // Raymarch clip ships uCamPos/uCamTarget/uCamFov as genParams so the camera

@@ -42,6 +42,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -377,6 +378,12 @@ struct VisualLayerExecution
     bool drawShapeSecondaryEllipse = false;
     // 0 = first shape only, 1 = union, 2 = intersection, 3 = subtraction.
     int drawShapeOperation = 0;
+    // Set when the one native overlay pass draws a visual.gradient instead of a
+    // shape. Colour A rides in shapeR..shapeA, colour B below, and the pass
+    // mixes A to B along (gradientCos, gradientSin) in frame UV space.
+    bool drawShapeGradient = false;
+    float gradientCos = 1.0f, gradientSin = 0.0f;
+    float gradientR2 = 1.0f, gradientG2 = 1.0f, gradientB2 = 1.0f, gradientA2 = 1.0f;
     bool pathMatte = false;
     bool pathMatteEllipse = false;
     bool pathMatteHasSecondary = false;
@@ -498,6 +505,36 @@ inline bool visualBoundedPayloadFloat (const std::string& xml, const char* name,
         || value < minimum || value > maximum)
         return false;
     result = value;
+    return true;
+}
+
+// Packed ARGB colour attribute. The plugin writes either the unsigned value or
+// the signed 32-bit spelling of the same bits, so accept both and nothing else.
+inline bool visualBoundedPayloadColour (const std::string& xml, const char* name,
+                                        std::uint32_t fallback, std::uint32_t& result)
+{
+    const std::string key = std::string (name) + "=\"";
+    const auto begin = xml.find (key);
+    if (begin == std::string::npos)
+    {
+        result = fallback;
+        return true;
+    }
+    if (xml.find (key, begin + key.size()) != std::string::npos)
+        return false;
+    const auto valueBegin = begin + key.size();
+    const auto valueEnd = xml.find ('"', valueBegin);
+    if (valueEnd == std::string::npos)
+        return false;
+    errno = 0;
+    char* parsedEnd = nullptr;
+    const double value = std::strtod (xml.c_str() + valueBegin, &parsedEnd);
+    if (errno != 0 || parsedEnd != xml.c_str() + valueEnd || ! std::isfinite (value)
+        || value < -2147483648.0 || value > 4294967295.0 || std::floor (value) != value)
+        return false;
+    result = value < 0.0
+        ? static_cast<std::uint32_t> (static_cast<std::int32_t> (value))
+        : static_cast<std::uint32_t> (value);
     return true;
 }
 
@@ -997,6 +1034,9 @@ public:
         VolumeProduct volumeProduct;
         visualtemporalsampling::LifecycleState samplingLifecycle;
         bool lowered = false;
+        // Why this clip's plan did not lower. Kept only when admission contains
+        // layer failures (see containLayerLoweringFailures).
+        std::string loweringError;
     };
     using SlotTable = std::array<Slot, kMaxAdmittedPlans>;
 
@@ -1017,6 +1057,35 @@ public:
                      std::string* diagnostic = nullptr,
                      int canvasWidth = 1920, int canvasHeight = 1080,
                      const VisualBackendResourceLimits* backendLimits = nullptr);
+
+    // By default one plan that does not lower refuses the whole admission. A
+    // viewport, export or probe admission contains that failure instead: the
+    // clip is installed as refused with its reason, every other clip admits,
+    // and executeVisualLayerPlan fails only the frames that build that clip,
+    // naming it. Capacity and resource-budget failures still refuse everything.
+    void containLayerLoweringFailures (bool contain) noexcept { containLayerLoweringFailures_ = contain; }
+
+    // The reason a contained clip was refused at this revision, or null.
+    const std::string* refusedLowering (int clipId, uint64_t revision) const
+    {
+        const auto* slot = findSlot(clipId);
+        return slot != nullptr && ! slot->lowered && slot->structuralRevision == revision
+            && ! slot->loweringError.empty() ? &slot->loweringError : nullptr;
+    }
+
+    // Every clip a contained admission refused, as "clip N: reason" in clip
+    // order, so the caller can count and report them like refused admissions.
+    std::vector<std::string> containedLayerRefusals() const
+    {
+        std::vector<std::string> refusals;
+        for (size_t index = 0; index < slotCount_; ++index)
+        {
+            const auto& slot = (*slots_)[index];
+            if (! slot.lowered && ! slot.loweringError.empty())
+                refusals.push_back("clip " + std::to_string(slot.clipId) + ": " + slot.loweringError);
+        }
+        return refusals;
+    }
     void reset()
     {
         const auto authority = temporalAuthority_;
@@ -1375,6 +1444,7 @@ private:
     }
     std::unique_ptr<SlotTable> slots_;
     size_t slotCount_ = 0;
+    bool containLayerLoweringFailures_ = false;
     VisualPlanTelemetry telemetry_;
     VisualPlanTelemetry* telemetryOwner_ = &telemetry_;
     VisualPlanResourceReceipt resourceReceipt_;
@@ -1476,6 +1546,17 @@ public:
             }
             candidate.owner = record->owner;
             candidate.expectedGeneration = authority->generation;
+            // The previous frame's commit is still pending when a pipelined export
+            // builds this frame, and it will advance the shared generation once. A
+            // clip with no earlier lifecycle of its own (the first frame after a cut)
+            // must expect that advance, the same as a clip that continues across it.
+            const auto pending = std::find_if(bases_.begin(), bases_.end(),
+                [&](const Candidate& value) { return sameOwner(value.authority, authority); });
+            if (pending != bases_.end())
+            {
+                candidate.expectedGeneration = pending->expectedGeneration + 1;
+                candidate.dependency = pending->batch;
+            }
         }
         if (candidate.owner.structuralRevision != revision
             || (candidate.owner.hasTime && timeSec < candidate.owner.lastTimeSec))
@@ -4558,8 +4639,64 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 { error = "shader operation plan exceeds the bounded operation budget"; return false; }
                 return true;
             };
-            if (!visit(finalEdge->fromNodeId) || ordered.empty()) return false;
-            std::size_t expectedEdges = 1;
+            // Passes after the shader chain run inside the existing LayerDesc
+            // stages, in the same fixed order a decoded-source chain uses:
+            // Transform, Effects, Feedback Trail, Shape Mask. Each is the
+            // descriptor-owned clip pass, so it can appear once. Peel them off
+            // the Output side first, then lower what remains as shader work.
+            // Anything else after a shader (a second shader filter, a common
+            // effect, another temporal pass) stays refused with the exact reason.
+            const CompiledVisualEdgeBinding* headEdge = finalEdge;
+            std::size_t tailStages = 0;
+            int tailLimit = 5;
+            bool tailTransform = false, tailEffects = false, tailMask = false;
+            const CompiledVisualOperation* tailFeedback = nullptr;
+            for (;;)
+            {
+                const int tailIndex = operationIndex(headEdge->fromNodeId);
+                if (tailIndex < 0) break;
+                const auto& tail = plan.operations[static_cast<std::size_t>(tailIndex)];
+                visualtemporaloperation::Mode temporalMode {};
+                const bool temporal = visualtemporaloperation::modeForKind(tail.kind, temporalMode);
+                const int tailStage = tail.kind == "video.transform" ? 1
+                    : tail.kind == "video.effects" ? 2
+                    : temporal ? 3
+                    : tail.kind == "video.mask.shape" ? 4 : 0;
+                if (tailStage == 0) break;
+                // Consecutive Transforms are one stage: the plugin composes
+                // them into the layer's single transform.
+                if (tailStage >= tailLimit && ! (tailStage == 1 && tailLimit == 1))
+                { error = "shader operation tail must run Transform, Effects, Feedback Trail, then Shape Mask, each at most once"; return false; }
+                if (temporal && temporalMode != visualtemporaloperation::Mode::feedback)
+                { error = "shader operation tail supports only the Feedback Trail temporal pass"; return false; }
+                if (tail.backendCapability != "native-gpu" || headEdge->fromPort != 1
+                    || !exactFilterPorts(tail.nodeId))
+                { error = tail.kind + " after a shader requires exact native Frame<Image> input and output ports"; return false; }
+                if (temporal)
+                {
+                    tailFeedback = &tail;
+                }
+                else if (tail.kind == "video.transform") tailTransform = true;
+                else if (tail.kind == "video.effects") tailEffects = true;
+                else tailMask = true;
+                tailLimit = tailStage;
+                ++tailStages;
+                headEdge = incomingEdge(tail.nodeId, 0);
+                if (headEdge == nullptr)
+                { error = tail.kind + " after a shader has no exact input resource"; return false; }
+            }
+            if (tailFeedback != nullptr && tailEffects)
+            { error = "visual.feedback cannot be combined with video.effects until LayerDesc owns a merged immutable rack"; return false; }
+            visualtemporaloperation::Payload tailFeedbackPayload;
+            if (tailFeedback != nullptr
+                && !visualtemporaloperation::parseForKind(tailFeedback->kind, tailFeedback->payloadXml,
+                                                          tailFeedbackPayload, &error))
+            {
+                error = tailFeedback->kind + " payload is malformed or out of bounds";
+                return false;
+            }
+            if (!visit(headEdge->fromNodeId) || ordered.empty()) return false;
+            std::size_t expectedEdges = 1 + tailStages;
             for (const auto* op : ordered)
                 expectedEdges += op->kind == shadertransition::operationKind ? 2u
                     : op->kind == "visual.shader.filter" ? 1u : 0u;
@@ -4640,7 +4777,18 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 { error = "shader operation plan exceeds the bounded multipass resource budget"; return false; }
                 shaderPlan->operations.push_back(std::move(operation));
             }
-            execution.transform = execution.effects = execution.mask = false;
+            execution.transform = tailTransform;
+            execution.effects = tailEffects;
+            execution.mask = tailMask;
+            if (tailFeedback != nullptr)
+            {
+                execution.feedback = true;
+                execution.temporalNodeId = tailFeedback->nodeId;
+                execution.temporalPayload = tailFeedbackPayload;
+                execution.feedbackDecay = tailFeedbackPayload.decay;
+                execution.feedbackZoom = tailFeedbackPayload.zoom;
+                execution.feedbackSwirl = tailFeedbackPayload.swirl;
+            }
             execution.flatShaderBridge = true;
             shaderPlan->revision = plan.structuralRevision;
             shaderPlan->digest = shaderOperationPlanDigest(*shaderPlan, shaderPlan->revision);
@@ -5091,8 +5239,12 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     : (kind == "video.mask.shape" || kind == "visual.matte.path"
                        || matteApplyStage) ? 3 : -1;
                 const int stageOutputPort = (kind == "visual.matte.path" || matteApplyStage) ? 2 : 1;
-                if (stage < 0 || stage >= previousStage || consumed[(size_t) current]
-                    || primaryEdge.fromPort != stageOutputPort)
+                // Walking from the Blend toward the source, a Transform that
+                // follows another Transform is a consecutive Image Transform.
+                // The plugin composes them into the layer's one transform.
+                const bool consecutiveTransform = stage == 1 && previousStage == 1;
+                if (stage < 0 || (stage >= previousStage && ! consecutiveTransform)
+                    || consumed[(size_t) current] || primaryEdge.fromPort != stageOutputPort)
                 {
                     error = "visual composite primary branch cannot be represented exactly by LayerDesc";
                     return false;
@@ -5458,10 +5610,14 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             }
 
             // The existing compositor does not resolve arbitrary graph node
-            // identities to secondary textures. Port 2 owns its one text or
-            // retained Draw Shape overlay, and port 3 owns its one referenced
-            // layer. Keep admission exact until the renderer has node-to-texture
-            // routing for general secondary sources.
+            // identities to secondary textures. Port 2 owns its one text
+            // overlay and port 3 its one referenced layer. Either port may
+            // instead carry the one native GPU overlay pass, which draws a
+            // retained Draw Shape or a Gradient. The two share that single
+            // pass, so the Blend takes at most one of them. Keep admission
+            // exact until the renderer has node-to-texture routing for general
+            // secondary sources. render_snapshot.h refuses the same set of
+            // kinds at validation (isExecutableCompositeSecondaryKind).
             bool haveDrawShape = false;
             for (int blendPort : { 2, 3 })
             {
@@ -5487,7 +5643,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     }
                     consumed[(size_t) terminal] = true;
                 }
-                else if (blendPort == 2 && terminalKind == "visual.draw.shape")
+                else if (terminalKind == "visual.draw.shape")
                 {
                     if (haveDrawShape || branchEdge.fromPort != 1)
                     {
@@ -5670,6 +5826,61 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                         return false;
                     }
                 }
+                else if (terminalKind == "visual.gradient")
+                {
+                    if (haveDrawShape || branchEdge.fromPort != 0)
+                    {
+                        error = "visual composite supports one exact native Draw Shape or Gradient overlay";
+                        return false;
+                    }
+                    const auto exactImagePort = [] (const CompiledVisualPortBinding* port,
+                                                    const char* direction)
+                    {
+                        return port != nullptr && port->channels == 1
+                            && port->direction == direction && port->carrier == "frame"
+                            && port->dataType == "image" && ! port->pixelFormat.empty()
+                            && port->pixelFormat != "unspecified" && ! port->colorSpace.empty()
+                            && port->colorSpace != "unspecified";
+                    };
+                    const auto* gradientOutput = findExactPort(ids[(size_t) terminal], 0);
+                    const auto* blendInput = findExactPort(ids[blendIndex], blendPort);
+                    const auto gradientPortCount = std::count_if(
+                        plan.ports.begin(), plan.ports.end(),
+                        [&] (const auto& port) { return port.nodeId == ids[(size_t) terminal]; });
+                    if (gradientPortCount != 1 || ! exactImagePort(gradientOutput, "out")
+                        || ! exactImagePort(blendInput, "in")
+                        || gradientOutput->pixelFormat != blendInput->pixelFormat
+                        || gradientOutput->colorSpace != blendInput->colorSpace)
+                    {
+                        error = "visual Gradient requires one exact Frame<Image> output bound to the Blend input";
+                        return false;
+                    }
+                    const auto& gradientPayload = plan.operations[(size_t) terminal].payloadXml;
+                    float angleDegrees = 35.0f;
+                    std::uint32_t colourA = 0xff184a88u, colourB = 0xffd86b32u;
+                    if (! visualBoundedPayloadFloat(gradientPayload, "angle", 35.0f,
+                                                    -360.0f, 360.0f, angleDegrees)
+                        || ! visualBoundedPayloadColour(gradientPayload, "colourA", colourA, colourA)
+                        || ! visualBoundedPayloadColour(gradientPayload, "colourB", colourB, colourB))
+                    {
+                        error = "visual Gradient payload is malformed or out of bounds";
+                        return false;
+                    }
+                    const auto channel = [] (std::uint32_t argb, int shift)
+                    { return static_cast<float>((argb >> shift) & 0xffu) / 255.0f; };
+                    const float radians = angleDegrees * 3.14159265358979f / 180.0f;
+                    consumed[(size_t) terminal] = true;
+                    haveDrawShape = true;
+                    execution.drawShape = true;
+                    execution.drawShapeGradient = true;
+                    execution.drawShapeNodeId = ids[(size_t) terminal];
+                    execution.gradientCos = std::cos(radians);
+                    execution.gradientSin = std::sin(radians);
+                    execution.shapeR = channel(colourA, 16); execution.shapeG = channel(colourA, 8);
+                    execution.shapeB = channel(colourA, 0); execution.shapeA = channel(colourA, 24);
+                    execution.gradientR2 = channel(colourB, 16); execution.gradientG2 = channel(colourB, 8);
+                    execution.gradientB2 = channel(colourB, 0); execution.gradientA2 = channel(colourB, 24);
+                }
                 else
                 {
                     error = "visual composite secondary branch is not an executable native source";
@@ -5743,6 +5954,13 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
     if (consume ("video.legacy.retime", cursor)) {}
     execution.transform = consume (legacyChain ? "video.legacy.transform"
                                                : "video.transform", cursor);
+    // Consecutive Image Transforms are one transform stage. The plugin folds
+    // every Transform on the layer's image path into the layer's single
+    // scale, offset and rotation (matrix product in path order), so the extra
+    // operations carry no work of their own. A Transform after Effects or
+    // after a temporal pass is a different order and stays refused below.
+    if (execution.transform && ! legacyChain)
+        while (consume ("video.transform", cursor)) {}
     execution.effects = consume (legacyChain ? "video.legacy.effects"
                                              : "video.effects", cursor);
     visualtemporaloperation::Mode temporalMode {};
@@ -5778,7 +5996,12 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
         error = "visual layer plan contains an unsupported ordered production operation";
         return false;
     }
-    if (execution.feedback && execution.effects)
+    // Feedback Trail after the Effects node runs while the clip's own effects
+    // rack is empty, which is how a placed trail meets the default chain. The
+    // plugin refuses the plan, with the reason, when that rack holds an effect.
+    // Other history passes keep this plan-time refusal.
+    if (execution.feedback && execution.effects
+        && execution.temporalPayload.mode != visualtemporaloperation::Mode::feedback)
     {
         error = "visual.feedback cannot be combined with video.effects until LayerDesc owns a merged immutable rack";
         return false;
@@ -6180,6 +6403,7 @@ inline bool VisualPlanExecutionState::admitPlans (
         slot.clipId = plan.clipId;
         slot.structuralRevision = plan.structuralRevision;
         slot.owner.structuralRevision = plan.structuralRevision;
+        slot.loweringError.clear();
         std::string loweringError;
         const auto begin = std::chrono::steady_clock::now();
         slot.lowered = compileVisualLayerExecution(plan, slot.execution, loweringError);
@@ -6214,9 +6438,22 @@ inline bool VisualPlanExecutionState::admitPlans (
         loweringSamples.push_back({ loweringNs, slot.lowered });
         if (! slot.lowered)
         {
-            complete = false;
             telemetry().recordFailedLowering(loweringError);
-            if (diagnostic != nullptr && diagnostic->empty()) *diagnostic = loweringError;
+            if (containLayerLoweringFailures_)
+            {
+                // Only this clip is refused. Its frames fail with the reason
+                // and the clip id; the rest of the project still renders.
+                slot.execution = VisualLayerExecution {};
+                slot.volumeProduct = {};
+                slot.samplingLifecycle.reset();
+                slot.loweringError = loweringError.empty()
+                    ? std::string("visual layer plan could not be lowered") : loweringError;
+            }
+            else
+            {
+                complete = false;
+                if (diagnostic != nullptr && diagnostic->empty()) *diagnostic = loweringError;
+            }
         }
         // Temporal ownership is published separately by the synchronized
         // generation authority after the complete replacement is ready.
@@ -6994,7 +7231,11 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     {
         if (execution == nullptr)
         {
-            error = "render layer has no pre-admitted visual execution";
+            // A contained admission keeps the reason a clip's plan was refused,
+            // so only the frames that build this clip fail, and they name it.
+            const auto* refused = state->refusedLowering(clipId, plan->structuralRevision);
+            error = refused != nullptr ? "clip " + std::to_string(clipId) + ": " + *refused
+                                       : std::string("render layer has no pre-admitted visual execution");
             return false;
         }
     }
@@ -7224,6 +7465,19 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     }
     if (execution->feedback && execution->temporalPayload.mode == visualtemporaloperation::Mode::feedback)
     {
+        // The trail replaces the layer's effect list for this frame, so it can
+        // only follow an Effects node whose clip rack is empty. The plugin
+        // refuses that layer at Place and when it compiles the plan. This
+        // check only guards a rack that changed after the plan was admitted.
+        if (execution->effects && layer.effects != nullptr)
+            for (int index = 0; index < static_cast<int>(layer.effectCount); ++index)
+                if (layer.effects[index].enabled && layer.effects[index].type >= 0)
+                {
+                    error = "clip " + std::to_string(clipId)
+                        + ": Feedback Trail can't run while this clip's Effects rack holds effects."
+                          " Remove the clip's effects or the Feedback Trail.";
+                    return false;
+                }
         layer.graphFeedbackEffect = {};
         layer.graphFeedbackEffect.enabled = true;
         layer.graphFeedbackEffect.type = 25; // stable FeedbackTrail wire value
@@ -7439,6 +7693,7 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     layer.drawShapeHasSecondary = execution->drawShapeHasSecondary;
     layer.drawShapeSecondaryEllipse = execution->drawShapeSecondaryEllipse;
     layer.drawShapeOperation = execution->drawShapeOperation;
+    layer.drawShapeGradient = execution->drawShapeGradient;
     layer.pathMatte = execution->pathMatte;
     layer.pathMatteEllipse = execution->pathMatteEllipse;
     layer.pathMatteHasSecondary = execution->pathMatteHasSecondary;
@@ -7457,6 +7712,13 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
         layer.drawShape2W = execution->shape2W; layer.drawShape2H = execution->shape2H;
         layer.drawShapeR = execution->shapeR; layer.drawShapeG = execution->shapeG;
         layer.drawShapeB = execution->shapeB; layer.drawShapeA = execution->shapeA;
+        if (execution->drawShapeGradient)
+        {
+            layer.drawGradientCos = execution->gradientCos;
+            layer.drawGradientSin = execution->gradientSin;
+            layer.drawGradientR = execution->gradientR2; layer.drawGradientG = execution->gradientG2;
+            layer.drawGradientB = execution->gradientB2; layer.drawGradientA = execution->gradientA2;
+        }
     }
     if (state != nullptr)
     {
@@ -7792,6 +8054,31 @@ inline bool prepareGeometryMaterialFrame(Renderer& renderer, const CompiledVisua
     if (!std::any_of(plan.operations.begin(),plan.operations.end(),
         [](const auto& operation) { return operation.kind == "geometry.core.runtime"; })) return true;
     return prepareMaterialFrameDag(renderer,plan,layer,use,seconds,parameters,context,error,admitted);
+}
+
+/** Run a curated shader transition on the timeline instead of at a fixed mix.
+    A transition whose saved progress is exactly 0, as a placed Fade Transition
+    starts, follows fraction (0 to 1 over its span) through its saved direction
+    and easing. Any other saved progress is the user's own value and is left
+    as it is. Returns true when a transition was driven. */
+template <typename LayerDesc>
+inline bool driveShaderTransitionProgress (LayerDesc& layer, double fraction)
+{
+    if (! layer.shaderOperationPlan)
+        return false;
+    bool driven = false;
+    for (const auto& operation : layer.shaderOperationPlan->operations)
+    {
+        if (! operation.transitionPayload || operation.transitionPayload->progress != 0.0)
+            continue;
+        const auto values = layer.shaderOperationParameters.find(operation.nodeId);
+        if (values == layer.shaderOperationParameters.end())
+            continue;
+        values->second["progress"] = shadertransition::evaluateProgress(
+            fraction, operation.transitionPayload->direction, operation.transitionPayload->easing);
+        driven = true;
+    }
+    return driven;
 }
 
 template <typename Renderer, typename LayerDesc>

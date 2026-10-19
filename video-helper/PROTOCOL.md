@@ -459,7 +459,12 @@ self-describe their dims, no renegotiation). When the new size outgrows a
 slot, Arbit instead closes, recreates the ring, and reopens.
 `viewport_close_shm {}` — ends shm mode; the region stays Arbit-owned (it
 survives helper restarts, so restart replay just re-issues
-`viewport_open_shm`). Mutually exclusive with `viewport_open` /
+`viewport_open_shm`). frameSeq is monotonic within one open only: each
+`viewport_open_shm` restarts it at 1. Before its render thread starts, the
+helper zeroes every slot's frameSeq (and makes a slot left mid-write even
+again), so frames from the previous open never outrank the new ones. A reader
+that still sees the newest frameSeq drop counts it as a new open generation.
+Mutually exclusive with `viewport_open` /
 `viewport_open_shared`; timeline/params/transport/canvas state is shared by
 all modes.
 
@@ -930,15 +935,113 @@ export path** — all without any shader change beyond new prelude accessors):
   negative `remainBeats`; future notes have negative `ageBeats`. An empty/absent `score` ⇒
   `uNoteCount`/`uLinkCount` 0
   and the note/link samplers read black. Live preview and export use the same
-  score schema and packer. (`uChord`/`uLastOnsetBeat` are
-  reserved — declared in the generator, not in the v1 prelude.)
+  score schema and packer.
+- **Harmony and structure** (harmony feed): four uniforms evaluated at the
+  frame's beat from the optional `score.harmony` object below. Export and the
+  live viewport call the same function (`harmony_signals.h`
+  `evaluateHarmony`), so a seek or a mid-range export reads the same values as
+  playback from the top.
+  - `uChord` (vec4): root position (continuous pitch class / 12, 0 = C),
+    quality class, tension 0..1, beats since the chord changed. Quality
+    classes: 0 none, 1 major, 2 minor, 3 diminished, 4 augmented,
+    5 suspended, 6 dominant 7th, 7 major 7th, 8 minor 7th, 9 other
+    (clusters, dyads, single notes, unnamed sets).
+  - `uLastOnsetBeat` (float): timeline beat of the latest unmuted note onset
+    at or before the frame, 0 before the first. Read from the notes, so it
+    also works for payloads without `harmony`.
+  - `uKey` (vec4): tonic pitch class / 12, mode + 1 (0 none; 1 Ionian,
+    2 Dorian, 3 Phrygian, 4 Lydian, 5 Mixolydian, 6 Aeolian, 7 Locrian,
+    8 harmonic minor, 9 melodic minor), beats since the key changed, mode
+    brightness (Lydian 1 down to Locrian 0).
+  - `uPhrase` (vec4): bar index (counted across meter changes), phrase index,
+    phrase phase 0..1, song progress 0..1.
+
+  A chord or key segment holds through the silence after it, so a rest is not
+  a change. Before the first segment, and for every payload without
+  `harmony`, `uChord`, `uKey` and `uPhrase` are exactly 0.
+
+  These names are not reserved. A shader written before the harmony feed may
+  declare them itself, and the prelude steps aside instead of failing the
+  compile. A shader that declares `uniform vec4 uChord;` (or another harmony
+  uniform with its contract type) keeps it, receives the harmony values and
+  still gets the accessors. A parameter (ISF `INPUT`, `ARBIT_PARAM`) with a
+  harmony name, or a declaration with another type, owns the name outright:
+  the renderer never writes harmony values into it and the accessors that
+  read it are left out. A shader that defines an accessor name itself keeps
+  its own definition.
 - Helpers: `beatPulse(width)`, `hsv2rgb()`, `arbitGuard()`; `arbitBand(b)` for
   Block B; and for Block C `arbitNoteMidi/Vel/Age/Remain/Length/StartOffset/
   EndOffset/Freq/Cents/Track/IsRoot(row)`, `arbitNotePitch/Bend(row)`,
   `arbitNotePrimesLo/Hi(row)`, `arbitNoteMasterRow(row)`,
   `arbitNoteActive(row)`, `arbitLink(edge)`, `arbitLinkRatio(edge)` — so a shader
   reads the packed score by note/link without touching raw texel layout. The
-  full contract is live in the export path through M5.
+  full contract is live in the export path through M5. Harmony accessors:
+  `arbitChordRoot/Quality/Tension/Age()`, `arbitChordPulse(width)` (1 at a
+  chord change, fading over `width` beats), `arbitKeyTonic/Mode/Age/
+  Brightness()`, `arbitBarIndex()`, `arbitPhraseIndex()`,
+  `arbitPhrasePhase()`, `arbitSongProgress()` and `arbitLastOnsetAge()`.
+
+**`score.harmony` (optional).** The app adds it to the `score` object of both
+the export jobSpec and `viewport_set_score`. Payloads without it still load;
+malformed entries are skipped one by one and never fail the score.
+
+```json
+"harmony": {
+  "version": 1,
+  "phraseBars": 4,
+  "songEndBeat": 64.0,
+  "chordAuthority": "ChordAnalysis::analyzeChord",
+  "keyAuthority": "TonalGuidance fit zones",
+  "keyStatus": "complete",
+  "chords": [{ "startBeat": 0, "endBeat": 4, "name": "Cmaj", "quality": "maj",
+               "qualityClass": 1, "rootPc": 0, "rootPos": 0.0, "rootHz": 261.63,
+               "rootCents": 0.0, "rootEdoStep": 0,
+               "rootRatioNum": 1, "rootRatioDen": 1, "tension": 0.33 }],
+  "keys": [{ "startBeat": 0, "endBeat": 16, "tonicPc": 0, "mode": 0,
+             "modeId": "ionian", "source": "inferred" }]
+}
+```
+
+- Notes on drum tracks (Punch drum synth, MIDI channel 10 or soundfont bank
+  128) and muted notes are left out of both chord and key analysis.
+- `chords`: segments from the chord analyser over the sounding notes. Equal
+  neighbours merge, and a set that only repeats tones of the chord before it
+  extends that chord. When a set of four or more pitch classes has no name,
+  the analyser tries it again without the top note (a melody note over a
+  chord). Unnamed sets become class 9 rooted on the bass. Segments shorter
+  than 1/8 beat join the next one. `chordsTruncated: true` appears when the
+  list stopped early, with `chordTruncation` naming the limit:
+  `"segment-cap"` (8192 segments) or `"work-budget"` (a fixed analysis work
+  budget that only a pathological pile of overlapping notes reaches). The
+  segments found before the limit are kept. `rootCents` is the root above the project root folded to
+  one octave, `rootEdoStep` the nearest step of the project EDO, and
+  `rootRatioNum/Den` the exact ratio when the root note carries one that
+  matches its frequency. `tension` scores every interval between the sounding
+  pitch classes by Tenney height, using exact note ratios when they match the
+  frequencies within a cent, and otherwise the nearest just interval within
+  25 cents plus a small mistuning penalty.
+- `keys`: tonic pitch class and mode (`Tonal::Mode` order, 0 = Ionian) from the
+  tonal guidance authority: automatic fit zones over the score, with the
+  user's zone pins and zone behaviour. When guidance is on, a global key the
+  user set replaces the inferred key, and a shared zone (one with no track)
+  that pins a tonic and mode replaces it inside the zone; Automatic and Free
+  zones keep the inferred key. `source` is `inferred`, `pinned` (a fit-zone
+  pin), `authored` or `zone`. `keyStatus` is `complete`, `authored` (no
+  inference was needed), `no-notes`, `too-many-notes` (over 2048 notes; only
+  authored keys are published) or the failing step's `limit-reached`,
+  `invalid-input`, `cancelled` or `failed`.
+- `phraseBars` (1..64, default 4) groups bars into phrases for `uPhrase`.
+- Arrangement sections are not published: the project has no section or
+  marker model yet.
+- The control node kind `score.harmony.signal` (one output, param 0 selects
+  the signal: 0 chord root, 1 quality, 2 tension, 3 chord-change trigger,
+  4 key tonic, 5 key mode, 6 key brightness, 7 bar phase, 8 phrase phase,
+  9 song progress) evaluates the same timeline in control plans. The
+  chord-change trigger is 1 on the first frame inside a new chord. It
+  compares with the chord of the previous timeline frame; after a seek, a
+  loop jump or a skipped frame that chord is recomputed from the previous
+  frame's beat, so the viewport fires on exactly the frames export fires on
+  and a jump into the middle of a chord stays 0.
 
 **Dialects.** Raw source may be bare `void main()` (writes `fragColor`),
 Shadertoy `void mainImage(out vec4, in vec2)` (the convention LLMs are most

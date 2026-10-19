@@ -36,12 +36,27 @@ bool readMetalGlassCausticReceipt(const std::shared_ptr<const NativeFixtureScene
 struct MetalGlassCausticMetrics {
     std::uint64_t admittedBytes=0, retainedNativeBytes=0, peakNativeBytes=0;
     double traceMilliseconds=0, depositionMilliseconds=0, readbackMilliseconds=0, resolveMilliseconds=0, frameMilliseconds=0;
+    // Splat frames: depositionMilliseconds covers tile keys, sort, segments and
+    // the gather. splatVersion 0 is single-pixel deposition.
+    std::uint32_t splatVersion=0;
+    std::uint64_t splatGatherWork=0;
+    double normaliserMilliseconds=0;
+    // The splat caps overflowed and the frame re-ran as single-pixel deposits.
+    bool splatFallback=false;
 };
 bool readMetalGlassCausticMetrics(const std::shared_ptr<const NativeFixtureSceneFrame>& owner,
     MetalGlassCausticMetrics& metrics,std::string& error);
 
 // Private immutable mixed resources and completed query/raster staging only.
 // Color and public depth handles remain absent until the paired activation gate.
+// Private caustic preparation for a selected closed volume beside one thin
+// camera dielectric. The volume lands in smoothglass::Prepared::causticVolume.
+// A camera-only selection prepares the same slot for the paired camera walk.
+NativeFixtureScenePreparation prepareMetalGlassCausticVolumeResources(
+    NativeFixtureSceneBackend& backend,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& material,
+    const smoothglass::CausticVolumeSelection& selection,NativeFixturePrepareUse use);
 NativeFixtureScenePreparation prepareMetalGlassGratingResources(
     const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
     const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& mixedRoot,
@@ -968,15 +983,21 @@ static_assert(multipleScatterBranchDelta<=48);
 inline bool decodePathReceiptExtensions(const Path& native,bool multipleScatter,
     glasscaustics::NativePathReceipt& output) {
     const auto paddingCount=multipleScatter?17u:21u;
+    // The legacy layout carries thin-absorbed power in padding[0]. The
+    // multiple-scatter layout has no thin absorber and keeps it zero.
+    const auto firstReserved=multipleScatter?0u:1u;
     if(native.reserved!=(multipleScatter?glasscaustics::kPrivateMultipleScatterVersion:0u)
         ||native.roughTransportVersion>glasscaustics::kRoughTransportVersion
         ||native.interfaceSample>=glasscaustics::kRoughInterfaceSamples
         ||native.complete>1u||native.blocked>1u
-        ||std::any_of(native.padding,native.padding+paddingCount,[](float value){return value!=0;}))return false;
+        ||!std::isfinite(native.padding[0])||native.padding[0]<0
+        ||std::any_of(native.padding+firstReserved,native.padding+paddingCount,[](float value){return value!=0;}))return false;
     glasscaustics::Texel micro{};
     if(multipleScatter)std::copy_n(native.padding+17,4,micro.begin());
-    return glasscaustics::decodePathExtensions(micro,{native.masked,float(native.roughTransportVersion),
-        float(native.interfaceSample),float(native.reserved)},glasscaustics::PathExtensionLayout::Metal,output);
+    if(!glasscaustics::decodePathExtensions(micro,{native.masked,float(native.roughTransportVersion),
+        float(native.interfaceSample),float(native.reserved)},glasscaustics::PathExtensionLayout::Metal,output))return false;
+    output.thinAbsorbedPower=multipleScatter?0.0f:native.padding[0];
+    return true;
 }
 struct alignas(16) Params {
     std::array<float,4> query, source, camera, rotation, projection;
@@ -1209,6 +1230,13 @@ kernel void causticTrace(constant CParams& u [[buffer(0)]],
             }
             int triangle=ctriangle(hit,triangles,u.extent.w);
             if(triangle<0) {atomic_store_explicit((device atomic_uint*)diagnostic,6u,memory_order_relaxed);return;}
+            // Owner flag 2 is the thin camera dielectric beside the caustic volume.
+            // The photon is absorbed: no deposit, no refusal, no unresolved charge.
+            // padding[0] carries this thin-absorbed power in the legacy layout.
+            if(triangles[uint(triangle)*8u+5u].z==2.0f) {
+                if(branch.inside) {atomic_store_explicit((device atomic_uint*)diagnostic,7u,memory_order_relaxed);return;}
+                receipt.padding[0]+=power*branch.fraction;continue;
+            }
             if(hit.objectId!=u.policy.w) {
                 if(branch.inside||!hit.entering||branch.interfaces==0u||receipt.count>=u.policy.y) {atomic_store_explicit((device atomic_uint*)diagnostic,7u,memory_order_relaxed);return;}
                 CDeposit d={};d.work=w;d.historyLow=uint(branch.history);d.historyHigh=uint(branch.history>>32u);
@@ -1335,6 +1363,243 @@ kernel void causticResolve(constant CParams& u [[buffer(0)]],device const float*
     float4 base=color.read(p);float3 value=base.xyz+causticXyzToSceneLinear(xyz);
     if(!sceneFinite3(value)||any(abs(value)>float3(65504.0f))) {atomic_store_explicit((device atomic_uint*)diagnostic,14u,memory_order_relaxed);return;}
     resolved.write(float4(value,base.w),p);
+}
+)METAL";
+}
+// Kernel splat deposition (Frame::splatVersion 1) for ordinary caustic frames.
+// The scratch is one uint array with the GL binding 7 layout: a float
+// normaliser per trace slot at 0, a begin/end pair per tile after
+// maximumDeposits, the triangle owner rows, then two counter words.
+inline constexpr std::uint64_t kSplatTriangleRowWords=5,kSplatCounterWords=2;
+// Counter word 0 collects these overflow bits. Word 1 is the measured gather work.
+// A path with more deposits than its keyed slots sets kSplatOverflowKeySlots.
+// Like an out-of-image tile it is a defect, so the frame refuses.
+inline constexpr std::uint32_t kSplatOverflowTile=1,kSplatOverflowTileCap=2,kSplatOverflowGatherWork=4,kSplatOverflowKeySlots=8;
+struct SplatScratchLayout
+{
+    std::uint64_t normaliserBase=0,rangeBase=0,lookupBase=0,lookupCount=0,counterBase=0,words=0;
+};
+inline bool splatScratchLayout(const glasscaustics::Frame& frame,SplatScratchLayout& output)
+{
+    const auto tiles=frame.splat.tilesX*frame.splat.tilesY;
+    if(frame.splatVersion!=glasscaustics::kSplatVersion || !tiles || frame.work.empty() || frame.triangles.empty())return false;
+    SplatScratchLayout layout;
+    layout.rangeBase=frame.bounds.maximumDeposits;layout.lookupBase=layout.rangeBase+2*tiles;
+    layout.lookupCount=frame.triangles.size();
+    layout.counterBase=layout.lookupBase+kSplatTriangleRowWords*layout.lookupCount;
+    layout.words=layout.counterBase+kSplatCounterWords;
+    if(layout.words>UINT32_MAX)return false;
+    output=layout;return true;
+}
+// Initial scratch words. Normalisers, tile ranges and counters start at zero.
+// Triangle rows are (instance, triangle, object, material, table index), sorted
+// so a lower bound finds the lowest table index among equal owners, the row
+// ctriangle and the CPU hitTriangle pick.
+inline std::vector<std::uint32_t> splatScratchWords(const glasscaustics::Frame& frame,const SplatScratchLayout& layout)
+{
+    std::vector<std::uint32_t> words(std::size_t(layout.words),0u);
+    std::vector<std::uint32_t> order(frame.triangles.size());
+    for(std::size_t i=0;i<order.size();++i)order[i]=std::uint32_t(i);
+    const auto owner=[&](std::uint32_t i) {
+        const auto& t=frame.triangles[i];return std::make_tuple(t.instance,t.triangle,t.object,t.material,i);
+    };
+    std::sort(order.begin(),order.end(),[&](std::uint32_t a,std::uint32_t b){return owner(a)<owner(b);});
+    for(std::size_t i=0;i<order.size();++i) {
+        const auto& t=frame.triangles[order[i]];auto* row=words.data()+layout.lookupBase+i*kSplatTriangleRowWords;
+        row[0]=t.instance;row[1]=t.triangle;row[2]=t.object;row[3]=t.material;row[4]=order[i];
+    }
+    return words;
+}
+// Buffer 10 of the splat kernels. Word layout matches CSplatParams in splatShader.
+struct alignas(16) SplatParams {
+    std::array<std::uint32_t,4> bases {}; // normaliser, range, lookup, lookup count
+    std::array<std::uint32_t,4> tiles {}; // counter, tiles x, tiles y, keyed slots per path
+};
+static_assert(sizeof(SplatParams)==32);
+static_assert(glasscaustics::kSplatNormalAgreement==.9f,"splatShader spells the normal agreement literally");
+static_assert(glasscaustics::kSplatTilesPerDeposit==9,"causticSplatKeys emits at most nine tile keys per deposit");
+// Splat kernels, appended to shader() or multipleScatterShader() so CParams,
+// CPath, CDeposit (with its multiple scatter stride) and the translated
+// nativeMathSource helpers are already declared. Only ordinary splat frames
+// compile them. A window pixel is accepted by the CPU rule in
+// buildSplatReference: the private raster's admitted triangle at the pixel is
+// a reflective non-glass receiver, its receiver-plane footprint through the
+// pixel centre projects back to the pixel, and its normal agrees with the
+// deposit's. Pass order: causticSplatNormaliser, causticSplatKeys, the shared
+// causticSort over the tile keys, causticSplatSegments, then the host counter
+// check and causticSplatGather.
+inline std::string splatShader() {
+    auto math=glasscaustics::nativeSplatMathSource();
+    const auto replace=[&](const std::string& before,const std::string& after) {
+        std::size_t at=0; while((at=math.find(before,at))!=std::string::npos) {math.replace(at,before.size(),after);at+=after.size();}
+    };
+    replace("uvec2","uint2");replace("vec2","float2");replace("vec3","float3");replace("vec4","float4");
+    return math+"#define CAUSTIC_SPLAT_GATHER_CAP "+std::to_string(glasscaustics::kMaximumSplatGatherWork)+"u\n"+R"METAL(
+struct CSplatParams {uint4 bases,tiles;};
+bool causticSplatOwnerLess(uint4 a,uint4 b) {
+    if(a.x!=b.x)return a.x<b.x;
+    if(a.y!=b.y)return a.y<b.y;
+    if(a.z!=b.z)return a.z<b.z;
+    return a.w<b.w;
+}
+uint4 causticSplatOwnerRow(device const uint* splat,constant CSplatParams& s,uint row) {
+    uint at=s.bases.z+row*5u;return uint4(splat[at],splat[at+1u],splat[at+2u],splat[at+3u]);
+}
+// Admitted triangle table index with these raster owners, or -1.
+int causticSplatTriangle(device const uint* splat,constant CSplatParams& s,uint4 owner) {
+    uint low=0u,high=s.bases.w;
+    while(low<high) {
+        uint middle=low+(high-low)/2u;
+        if(causticSplatOwnerLess(causticSplatOwnerRow(splat,s,middle),owner))low=middle+1u;else high=middle;
+    }
+    if(low>=s.bases.w||any(causticSplatOwnerRow(splat,s,low)!=owner))return -1;
+    return int(splat[s.bases.z+low*5u+4u]);
+}
+// The receiver seen through the centre of top-first pixel p. The raster holds
+// (object, material, instance, triangle) and a positive linear depth; cleared
+// pixels have depth 0. position is on the centre ray and the admitted
+// triangle's plane, and area is its footprint area.
+bool causticSplatSurface(constant CParams& u,constant CSplatParams& s,device const float4* triangles,device const uint* splat,
+    texture2d<uint> raster,texture2d<float> rasterDepth,uint2 pixel,thread float3& position,thread float3& normal,thread float& area) {
+    position=float3(0.0f);normal=float3(0.0f);area=0.0f;
+    float depth=rasterDepth.read(pixel).x;
+    if(!causticFinite(depth)||depth<=0.0f)return false;
+    uint4 ids=raster.read(pixel);
+    int t=causticSplatTriangle(splat,s,uint4(ids.z,ids.w,ids.x,ids.y));
+    if(t<0)return false;
+    float4 shape=triangles[uint(t)*8u+5u];
+    if(shape.z!=0.0f||shape.w!=1.0f)return false;
+    normal=triangles[uint(t)*8u+3u].xyz;
+    float2 extent=float2(u.extent.xy);
+    if(!causticPixelCorner(float2(pixel)+float2(0.5f),triangles[uint(t)*8u].xyz,normal,u.camera.xyz,u.rotation,u.projection,extent,position))
+        return false;
+    float4 footprint;
+    if(causticProjectReceiver(position,normal,u.camera.xyz,u.rotation,u.projection,extent,footprint)!=1
+        ||uint(footprint.x)!=pixel.x||uint(footprint.y)!=pixel.y)return false;
+    area=footprint.w;return causticFinite(area)&&area>0.0f;
+}
+// A camera-visible deposit slot of a complete path with a projected in-image pixel.
+bool causticSplatVisible(constant CParams& u,device const CPath* paths,device const CDeposit* deposits,uint index,thread uint2& pixel) {
+    pixel=uint2(0u);
+    uint w=index/u.policy.y,slot=index%u.policy.y;
+    if(index>=u.deposition.y||w>=u.extent.z||paths[w].complete!=1u||slot>=paths[w].count)return false;
+    device const CDeposit& d=deposits[index];
+    if(d.visible!=1u||d.projected!=1u||d.x>=u.extent.x||d.y>=u.extent.y)return false;
+    pixel=uint2(d.x,d.y);return true;
+}
+struct CSplatDeposit {uint2 pixel;float3 position,normal;float outgoing,radius,spread;uint band;};
+bool causticSplatDepositAt(constant CParams& u,device const float4* work,device const CPath* paths,device const CDeposit* deposits,
+    uint index,thread CSplatDeposit& deposit) {
+    deposit.position=float3(0.0f);deposit.normal=float3(0.0f);deposit.outgoing=0.0f;deposit.radius=0.0f;deposit.spread=0.0f;deposit.band=0u;
+    if(!causticSplatVisible(u,paths,deposits,index,deposit.pixel))return false;
+    device const CDeposit& d=deposits[index];uint w=index/u.policy.y;
+    deposit.position=float3(d.receiver.position[0],d.receiver.position[1],d.receiver.position[2]);
+    deposit.normal=float3(d.receiver.normal[0],d.receiver.normal[1],d.receiver.normal[2]);
+    deposit.outgoing=d.outgoing;
+    float band=work[w*4u+3u].w;
+    if(!(band>=0.0f&&band<8.0f))return false;
+    deposit.band=uint(band);
+    deposit.radius=causticSplatRadiusFromScale(work[w*4u].w,
+        causticSplatPixelScale(deposit.pixel,deposit.position,deposit.normal,u.camera.xyz,u.rotation,u.projection,float2(u.extent.xy)));
+    deposit.spread=causticSplatSpread(deposit.position,deposit.normal,u.camera.xyz);
+    return causticFinite(deposit.radius)&&deposit.radius>0.0f&&causticFinite(deposit.spread);
+}
+// Inclusive window (x0,y0,x1,y1) of a deposit pixel, clipped to the image.
+uint4 causticSplatWindow(constant CParams& u,uint2 pixel) {
+    uint r=uint(CAUSTIC_SPLAT_RADIUS);
+    return uint4(pixel.x>=r?pixel.x-r:0u,pixel.y>=r?pixel.y-r:0u,min(pixel.x+r,u.extent.x-1u),min(pixel.y+r,u.extent.y-1u));
+}
+// K times the grazing spread for an accepted pixel. The deposit's own pixel
+// always weighs 1.
+float causticSplatWeight(CSplatDeposit deposit,uint2 pixel,float3 position,float3 normal) {
+    if(!(dot(normal,deposit.normal)>=0.9f))return 0.0f;
+    if(all(pixel==deposit.pixel))return 1.0f;
+    return causticSplatKernel(length(position-deposit.position),deposit.radius)*deposit.spread;
+}
+// One thread per trace slot (work*visits+slot). N is the sum of K*area over the
+// accepted window pixels, written as float bits, and 0 for a hidden slot.
+kernel void causticSplatNormaliser(constant CParams& u [[buffer(0)]],device const float4* work [[buffer(1)]],
+    device const float4* triangles [[buffer(2)]],device const CPath* paths [[buffer(3)]],
+    device const CDeposit* deposits [[buffer(4)]],device uint* splat [[buffer(9)]],constant CSplatParams& s [[buffer(10)]],
+    texture2d<uint> raster [[texture(1)]],texture2d<float> rasterDepth [[texture(2)]],uint index [[thread_position_in_grid]]) {
+    if(index>=u.extent.z*u.policy.y)return;
+    float normaliser=0.0f;CSplatDeposit deposit;
+    if(causticSplatDepositAt(u,work,paths,deposits,index,deposit)) {
+        uint4 window=causticSplatWindow(u,deposit.pixel);
+        for(uint y=window.y;y<=window.w;++y)for(uint x=window.x;x<=window.z;++x) {
+            float3 position,normal;float area;
+            if(!causticSplatSurface(u,s,triangles,splat,raster,rasterDepth,uint2(x,y),position,normal,area))continue;
+            normaliser+=causticSplatWeight(deposit,uint2(x,y),position,normal)*area;
+        }
+    }
+    splat[s.bases.x+index]=as_type<uint>(normaliser);
+}
+// One thread per padded key. Keyed slot k = work*s.tiles.w+slot owns keys
+// 9k..9k+8: one (tile, work, slot, slot index) key per 32x32 tile its window
+// touches, then all-ones sentinels. The slot index is work*u.policy.y+slot.
+kernel void causticSplatKeys(constant CParams& u [[buffer(0)]],device const CPath* paths [[buffer(3)]],
+    device const CDeposit* deposits [[buffer(4)]],device uint4* keys [[buffer(7)]],device uint* splat [[buffer(9)]],
+    constant CSplatParams& s [[buffer(10)]],uint at [[thread_position_in_grid]]) {
+    if(at>=u.deposition.x)return;
+    uint4 key=uint4(0xffffffffu);
+    uint per=uint(CAUSTIC_SPLAT_TILES_PER_DEPOSIT),keyed=at/per,which=at%per,work=keyed/s.tiles.w,slot=keyed%s.tiles.w;
+    uint index=work*u.policy.y+slot;uint2 pixel;
+    // The last keyed slot of a path flags deposits the keys would skip.
+    if(which==0u&&work<u.extent.z&&slot+1u==s.tiles.w&&paths[work].count>s.tiles.w)
+        atomic_fetch_or_explicit((device atomic_uint*)(splat+s.tiles.x),8u,memory_order_relaxed);
+    if(work<u.extent.z&&causticSplatVisible(u,paths,deposits,index,pixel)) {
+        uint4 window=causticSplatWindow(u,pixel);uint tile=uint(CAUSTIC_SPLAT_TILE);
+        uint x0=window.x/tile,y0=window.y/tile,columns=window.z/tile-x0+1u,count=columns*(window.w/tile-y0+1u);
+        if(which<count)key=uint4((y0+which/columns)*s.tiles.y+x0+which%columns,work,slot,index);
+    }
+    keys[at]=key;
+}
+// One thread per sorted key. Each run leader records its tile's [begin,end),
+// adds tile pixels x run length to the gather work and flags overflow. It scans
+// at most one key past the per-tile cap.
+kernel void causticSplatSegments(constant CParams& u [[buffer(0)]],device const uint4* keys [[buffer(7)]],
+    device uint* splat [[buffer(9)]],constant CSplatParams& s [[buffer(10)]],uint at [[thread_position_in_grid]]) {
+    if(at>=u.deposition.x)return;
+    uint tile=keys[at].x;
+    if(tile==0xffffffffu||(at>0u&&keys[at-1u].x==tile))return;
+    device atomic_uint* counters=(device atomic_uint*)(splat+s.tiles.x);
+    if(tile>=s.tiles.y*s.tiles.z) {atomic_fetch_or_explicit(&counters[0],1u,memory_order_relaxed);return;}
+    uint cap=uint(CAUSTIC_SPLAT_TILE_CAP),end=at+1u;
+    while(end<u.deposition.x&&end-at<=cap&&keys[end].x==tile)++end;
+    uint run=end-at;
+    if(run>cap)atomic_fetch_or_explicit(&counters[0],2u,memory_order_relaxed);
+    splat[s.bases.y+tile*2u]=at;splat[s.bases.y+tile*2u+1u]=end;
+    uint side=uint(CAUSTIC_SPLAT_TILE),tx=tile%s.tiles.y,ty=tile/s.tiles.y;
+    uint amount=(min(u.extent.x,(tx+1u)*side)-tx*side)*(min(u.extent.y,(ty+1u)*side)-ty*side)*run;
+    uint previous=atomic_fetch_add_explicit(&counters[1],amount,memory_order_relaxed);
+    if(previous>CAUSTIC_SPLAT_GATHER_CAP-amount)atomic_fetch_or_explicit(&counters[0],4u,memory_order_relaxed);
+}
+// One thread per pixel. A pixel walks its tile's keys in (work, slot) order, the
+// canonical deposit order, and adds outgoing*K/(pi*N) to its deposit's band.
+// Pixels nobody splats write zero.
+kernel void causticSplatGather(constant CParams& u [[buffer(0)]],device const float4* work [[buffer(1)]],
+    device const float4* triangles [[buffer(2)]],device const CPath* paths [[buffer(3)]],
+    device const CDeposit* deposits [[buffer(4)]],device float* accumulation [[buffer(5)]],
+    device const uint4* keys [[buffer(7)]],device uint* splat [[buffer(9)]],constant CSplatParams& s [[buffer(10)]],
+    texture2d<uint> raster [[texture(1)]],texture2d<float> rasterDepth [[texture(2)]],uint2 pixel [[thread_position_in_grid]]) {
+    if(pixel.x>=u.extent.x||pixel.y>=u.extent.y)return;
+    float sum[8]={};
+    float3 position,normal;float area;
+    if(causticSplatSurface(u,s,triangles,splat,raster,rasterDepth,pixel,position,normal,area)) {
+        uint side=uint(CAUSTIC_SPLAT_TILE),tile=(pixel.y/side)*s.tiles.y+pixel.x/side;
+        uint begin=splat[s.bases.y+tile*2u],end=splat[s.bases.y+tile*2u+1u];
+        for(uint at=begin;at<end;++at) {
+            uint index=keys[at].w;CSplatDeposit deposit;
+            if(!causticSplatDepositAt(u,work,paths,deposits,index,deposit))continue;
+            uint4 window=causticSplatWindow(u,deposit.pixel);
+            if(pixel.x<window.x||pixel.x>window.z||pixel.y<window.y||pixel.y>window.w)continue;
+            float normaliser=as_type<float>(splat[s.bases.x+index]);
+            float weight=causticSplatWeight(deposit,pixel,position,normal);
+            if(weight>0.0f&&normaliser>0.0f)sum[deposit.band]+=deposit.outgoing*weight/(3.14159265358979323846f*normaliser);
+        }
+    }
+    uint first=(pixel.y*u.extent.x+pixel.x)*8u;
+    for(uint b=0u;b<8u;++b)accumulation[first+b]=sum[b];
 }
 )METAL";
 }

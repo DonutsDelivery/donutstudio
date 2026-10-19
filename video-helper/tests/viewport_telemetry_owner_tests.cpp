@@ -1,10 +1,14 @@
+#include "../src/layer_failure_attribution.h"
+#include "../src/preview_render_extent.h"
 #include "../src/viewport_telemetry_owner.h"
 #include "../src/viewport_publish_gate.h"
 #include "../src/viewport_rpc_policy.h"
+#include "../src/visual_plan_telemetry_json.h"
 
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace
@@ -242,6 +246,152 @@ void publishGateTests()
     }
 }
 
+// A frame that the plan keeps refusing, driven the way the render loop drives the
+// governor: shouldHold before the attempt, noteFailure after a failed one.
+void frameFailureGovernorTests()
+{
+    using Governor = arbitviewport::FrameFailureGovernor;
+    Governor::Key frame;
+    frame.revision = 7;
+    frame.displaySec = 2.0;
+    frame.width = 1280;
+    frame.height = 720;
+
+    // Tick every 10 ms against one refused frame for ten seconds.
+    const auto attempts = [] (Governor& governor, const Governor::Key& key, int64_t fromMs, int64_t toMs)
+    {
+        int made = 0;
+        for (int64_t at = fromMs; at < toMs; at += 10)
+        {
+            if (governor.shouldHold (key, at))
+                continue;
+            ++made;
+            governor.noteFailure (key, at);
+        }
+        return made;
+    };
+
+    {
+        Governor governor;
+        check (! governor.shouldHold (frame, 0), "governor: a frame that never failed is not held");
+        const int made = attempts (governor, frame, 0, 10000);
+        check (made == Governor::kMaxAttempts, "governor: a refused frame gets a few attempts, then none");
+        check (governor.exhausted() && governor.shouldHold (frame, 600000),
+               "governor: an exhausted frame stays held however long it waits");
+    }
+    {
+        Governor governor;
+        check (! governor.shouldHold (frame, 0), "governor: first attempt runs");
+        check (! governor.noteFailure (frame, 0), "governor: the first failure leaves attempts");
+        check (governor.shouldHold (frame, 50), "governor: held inside the first backoff");
+        check (! governor.shouldHold (frame, 100), "governor: retries when the first backoff ends");
+        governor.noteFailure (frame, 100);
+        check (governor.shouldHold (frame, 300), "governor: the second backoff is longer than the first");
+        check (! governor.shouldHold (frame, 500), "governor: retries when the second backoff ends");
+        governor.noteFailure (frame, 500);
+        check (governor.shouldHold (frame, 1500), "governor: the third backoff is longer again");
+        check (! governor.shouldHold (frame, 2100), "governor: retries when the third backoff ends");
+        check (governor.noteFailure (frame, 2100), "governor: the last attempt reports the stop");
+        check (governor.shouldHold (frame, 2101), "governor: no attempt after the last");
+    }
+    {
+        // Anything that can change the outcome gives the new frame a full set of attempts.
+        Governor governor;
+        check (attempts (governor, frame, 0, 10000) == Governor::kMaxAttempts, "governor: setup exhausts");
+
+        auto edited = frame;
+        edited.revision = 8;
+        check (! governor.shouldHold (edited, 20000), "governor: a state RPC releases the hold");
+        check (attempts (governor, edited, 20000, 30000) == Governor::kMaxAttempts,
+               "governor: the edited frame gets its own attempts");
+
+        auto moved = edited;
+        moved.displaySec = 2.5;
+        check (! governor.shouldHold (moved, 40000), "governor: a playhead move releases the hold");
+        check (attempts (governor, moved, 40000, 50000) == Governor::kMaxAttempts,
+               "governor: the new playhead frame gets its own attempts");
+
+        auto resized = moved;
+        resized.width = 1920;
+        resized.height = 1080;
+        check (! governor.shouldHold (resized, 60000), "governor: a resize releases the hold");
+    }
+    {
+        // Playing, the loop keys on the clips under the playhead, not on the frame. A
+        // playhead that moves inside one refused clip must not earn fresh attempts.
+        const auto clipsKey = [&] (std::initializer_list<int> ids)
+        {
+            auto key = frame;
+            key.displaySec = 0.0;
+            key.clipSet = Governor::kEmptyClipSet;
+            for (const int id : ids)
+                key.clipSet = Governor::foldClip (key.clipSet, id);
+            return key;
+        };
+        Governor governor;
+        const auto refused = clipsKey ({ 4 });
+        check (attempts (governor, refused, 0, 10000) == Governor::kMaxAttempts,
+               "governor: a refused clip set gets a few attempts while playing");
+        check (attempts (governor, refused, 10000, 60000) == 0,
+               "governor: playing on inside the refused clip set makes no further attempts");
+
+        check (! governor.shouldHold (clipsKey ({}), 70000),
+               "governor: leaving the refused clip releases the hold");
+        governor.noteSuccess(); // a gap or a good clip renders
+        check (clipsKey ({ 4 }) != clipsKey ({ 5 }) && clipsKey ({ 4 }) != clipsKey ({ 4, 5 })
+                   && clipsKey ({ 4 }) != clipsKey ({}),
+               "governor: the clip set tells different clips under the playhead apart");
+        check (attempts (governor, clipsKey ({ 4, 5 }), 70000, 80000) == Governor::kMaxAttempts,
+               "governor: a different clip set gets its own attempts");
+    }
+    {
+        // A frame that renders, or a deferral from another cause, clears the count.
+        Governor governor;
+        governor.noteFailure (frame, 0);
+        governor.noteFailure (frame, 100);
+        governor.noteSuccess();
+        check (governor.failures() == 0 && ! governor.shouldHold (frame, 101),
+               "governor: success forgets earlier failures");
+    }
+}
+
+// Which export layer errors name their clip. The plugin isolates a named clip, so a
+// device, encoder or helper error must not carry a clip id.
+void layerFailureAttributionTests()
+{
+    using videoexport::attributeLayerError;
+    check (attributeLayerError (7, "Optical Flow export timeline frame is invalid")
+               == "clip 7: Optical Flow export timeline frame is invalid",
+           "attribution: a plan error names the layer's clip");
+    check (attributeLayerError (7, "typed matte asset frame is unavailable")
+               == "clip 7: typed matte asset frame is unavailable",
+           "attribution: a content error names the layer's clip");
+    check (attributeLayerError (7, "native GPU SDF backend does not support operation blur")
+               == "clip 7: native GPU SDF backend does not support operation blur",
+           "attribution: a plan error that mentions the GPU still names its clip");
+    check (attributeLayerError (7, "clip 3 LUT: bad cube") == "clip 3 LUT: bad cube",
+           "attribution: an error that already names a clip is kept");
+    check (attributeLayerError (7, "cancelled") == "cancelled", "attribution: cancellation is not a clip error");
+    check (attributeLayerError (-1, "bad plan") == "bad plan" && attributeLayerError (7, "") == "",
+           "attribution: no layer or no error leaves the text alone");
+    // Errors about a clip's own shader, material or source name the clip, even when they
+    // mention OpenGL, a readback or an upload.
+    for (const char* content : { "physical diffraction OpenGL shader compile failed: 0:12 syntax error",
+                                 "physical diffraction OpenGL validation readback rejected shader output",
+                                 "physical diffraction Metal validation readback rejected shader output",
+                                 "Optical Flow OpenGL linear source mapping failed",
+                                 "native surface material execution requires an OpenGL or Metal material program" })
+        check (attributeLayerError (7, content) == "clip 7: " + std::string (content),
+               "attribution: a content error that mentions OpenGL or a readback names its clip");
+    for (const char* environment : { "FBO incomplete", "float HDR lease OpenGL context changed",
+                                     "OpenGL context lost", "GPU out of memory",
+                                     "export encoder rejected the frame",
+                                     "production GPU compositor is busy",
+                                     "Optical Flow export has no native source worker" })
+        check (attributeLayerError (7, environment) == environment,
+               "attribution: a device or helper error stays unnamed");
+}
+
 // The revision policy the RPC guard applies to each handle() call.
 void rpcPolicyTests()
 {
@@ -349,6 +499,116 @@ void revisionGuardTests()
     check (bumps == 9 && ! memo.valid, "guard: a throwing handler bumps and clears the memo");
 }
 
+// The size the live viewport renders an imported 3D scene at (preview_render_extent.h).
+void previewExtentTests()
+{
+    using videohelper::previewextent::Extent;
+    using videohelper::previewextent::fitToPresentation;
+    using videohelper::previewextent::zoomBucket;
+
+    // A 4K canvas in the docked panel renders at the panel size, canvas aspect kept.
+    check(fitToPresentation(3840, 2160, 424, 240) == Extent { 424, 239 },
+          "4K canvas in a 424x240 dock fits to 424x239");
+    check(fitToPresentation(3840, 2160, 800, 240) == Extent { 427, 240 },
+          "a wide dock is limited by its height");
+    check(fitToPresentation(3840, 2160, 240, 800) == Extent { 240, 135 },
+          "a tall dock is limited by its width");
+    check(fitToPresentation(1080, 1920, 424, 240) == Extent { 135, 240 },
+          "a portrait canvas fits inside a landscape dock");
+    // Never larger than the canvas.
+    check(fitToPresentation(640, 360, 1920, 1080) == Extent { 640, 360 },
+          "a canvas smaller than the viewport keeps its size");
+    check(fitToPresentation(640, 360, 640, 360) == Extent { 640, 360 },
+          "a canvas equal to the viewport keeps its size");
+    // Unknown sizes fall back to the canvas, an unknown canvas gives no extent.
+    check(fitToPresentation(3840, 2160, 0, 0) == Extent { 3840, 2160 },
+          "an unknown viewport gives the canvas");
+    check(fitToPresentation(3840, 2160, -5, 240) == Extent { 3840, 2160 },
+          "a negative viewport side gives the canvas");
+    check(! fitToPresentation(0, 2160, 424, 240).valid() && ! fitToPresentation(3840, 0, 424, 240).valid(),
+          "a zero canvas gives no extent");
+    // The short side never drops below the floor.
+    check(fitToPresentation(3840, 2160, 40, 20) == Extent { 114, 64 },
+          "a tiny viewport is held at a 64 px short side");
+    check(fitToPresentation(2160, 3840, 20, 40) == Extent { 64, 114 },
+          "the floor applies to the short side of a portrait canvas");
+    check(fitToPresentation(48, 27, 20, 10) == Extent { 48, 27 },
+          "a canvas already below the floor is not enlarged");
+    // Whole pixels and a stable result for the same inputs.
+    const auto a = fitToPresentation(1920, 1080, 777, 431);
+    check(a.valid() && a.width <= 777 && a.height <= 431 && a == fitToPresentation(1920, 1080, 777, 431),
+          "the fit stays inside the viewport and repeats exactly");
+    // Zoom widens the fit, up to the canvas.
+    check(fitToPresentation(3840, 2160, 424, 240, 4) == Extent { 1696, 954 },
+          "a 4x zoom bucket renders four times the fitted width");
+    check(fitToPresentation(3840, 2160, 424, 240, 32) == Extent { 3840, 2160 },
+          "a deep zoom is capped at the canvas");
+    check(fitToPresentation(3840, 2160, 424, 240, 0) == Extent { 424, 239 },
+          "a zero zoom bucket counts as 1");
+    check(zoomBucket(0.1) == 1 && zoomBucket(1.0) == 1 && zoomBucket(1.01) == 2
+          && zoomBucket(2.0) == 2 && zoomBucket(3.0) == 4 && zoomBucket(32.0) == 32
+          && zoomBucket(1000.0) == 32 && zoomBucket(std::numeric_limits<double>::quiet_NaN()) == 1,
+          "zoom buckets are powers of two from 1 to 32");
+
+    // The telemetry keeps the last completed extent and forgets it on reset.
+    videowire::VisualPlanTelemetry telemetry;
+    check(telemetry.snapshot().importedScenePreviewWidth == 0
+          && telemetry.snapshot().importedScenePreviewHeight == 0,
+          "preview extent is unobserved before any render");
+    check(telemetry.recordImportedScenePreviewExtent(424, 239), "preview extent is recorded");
+    check(telemetry.snapshot().importedScenePreviewWidth == 424
+          && telemetry.snapshot().importedScenePreviewHeight == 239,
+          "snapshot carries the preview extent");
+    telemetry.resetOwner(0, 0);
+    check(telemetry.snapshot().importedScenePreviewWidth == 0,
+          "owner reset forgets the preview extent");
+}
+
+// The latest caustic degradation reason of an imported scene preview: recorded, shown in
+// the JSON the HUD reads, cleared by a frame that renders the caustic as planned, and
+// forgotten on reset.
+void importedSceneCausticDegradationTests()
+{
+    const std::string reason = "caustic off: exceeds GL limits (deposit receipts need 125.0 MiB, max SSBO 64.0 MiB)";
+    videowire::VisualPlanTelemetry telemetry;
+    check(telemetry.snapshot().importedSceneCausticDegradation.empty(),
+          "no caustic reason before any preview render");
+    auto json = videowire::visualTelemetryJson(telemetry.snapshot());
+    check(json.contains("importedSceneCausticDegradation")
+          && json["importedSceneCausticDegradation"].is_string()
+          && json["importedSceneCausticDegradation"].get<std::string>().empty(),
+          "the JSON field is an empty string when nothing degraded");
+
+    check(telemetry.recordImportedSceneCausticDegradation(reason), "caustic reason is recorded");
+    check(telemetry.snapshot().importedSceneCausticDegradation == reason,
+          "snapshot carries the caustic reason");
+    json = videowire::visualTelemetryJson(telemetry.snapshot());
+    check(json["importedSceneCausticDegradation"].get<std::string>() == reason,
+          "the JSON carries the caustic reason the HUD reads");
+
+    const std::string reduced = "caustic reduced to 32 entry subdivisions: deposit receipts need 70.0 MiB, max SSBO 64.0 MiB";
+    check(telemetry.recordImportedSceneCausticDegradation(reduced)
+          && telemetry.snapshot().importedSceneCausticDegradation == reduced,
+          "a later frame replaces the reason");
+
+    check(telemetry.recordImportedSceneCausticDegradation(std::string())
+          && telemetry.snapshot().importedSceneCausticDegradation.empty(),
+          "a frame that renders the caustic as planned clears the reason");
+    json = videowire::visualTelemetryJson(telemetry.snapshot());
+    check(json["importedSceneCausticDegradation"].get<std::string>().empty(),
+          "the JSON field is empty again after the clear");
+
+    const std::string oversized(videowire::kMaxCausticDegradationBytes * 4, 'x');
+    check(telemetry.recordImportedSceneCausticDegradation(oversized)
+          && telemetry.snapshot().importedSceneCausticDegradation.size() == videowire::kMaxCausticDegradationBytes,
+          "an oversized reason is cut to the bound");
+
+    check(telemetry.recordImportedSceneCausticDegradation(reason), "caustic reason is recorded again");
+    telemetry.resetOwner(0, 0);
+    check(telemetry.snapshot().importedSceneCausticDegradation.empty(),
+          "owner reset forgets the caustic reason");
+}
+
 } // namespace
 
 int main()
@@ -441,19 +701,44 @@ int main()
           && transportSnapshot.droppedSocketFailure == 1
           && transportSnapshot.droppedNoBuffer == 1,
           "exact zero-copy failure reasons never count success");
+    check(! transport.zeroCopyReleased()
+          && transportTelemetry.snapshot().framesPresented == 0,
+          "a release with no observed zero-copy handoff presents nothing");
     check(transport.zeroCopyHandoff(true, true, true), "successful socket handoff");
-    transport.exportedBufferReleased(80);
-    transport.exportedBufferPoolClosed();
     transportSnapshot = transportTelemetry.snapshot();
     check(transportSnapshot.zeroCopyFrames == 1
           && transportSnapshot.transportFramesHandedOff == 2
           && transportSnapshot.framesPresented == 0,
-          "transport handoff is distinct from window presentation");
+          "transport handoff alone leaves presented at zero");
+    check(transport.zeroCopyReleased(), "consumer release is recorded");
+    transport.exportedBufferReleased(80);
+    transport.exportedBufferPoolClosed();
+    transportSnapshot = transportTelemetry.snapshot();
+    check(transportSnapshot.framesPresented == 1
+          && transportSnapshot.transportFramesHandedOff == 2,
+          "consumer release of a handed-off buffer counts one presented frame");
     check(transportSnapshot.retainedFramesCurrent == 0
           && transportSnapshot.intermediateImagesCurrent == 0
           && transportSnapshot.retainedBytesCurrent == 0
           && transportSnapshot.retainedFramesPeak == 2,
           "pool teardown returns current resources to zero and preserves peak");
+
+    videowire::VisualPlanTelemetry sceneTelemetry;
+    check(! sceneTelemetry.snapshot().importedSceneRender.observed,
+          "imported scene render is unobserved before any sample");
+    check(sceneTelemetry.recordImportedSceneRender(1'000'000)
+          && sceneTelemetry.recordImportedSceneRender(2'000'000),
+          "imported scene preview render samples are recorded");
+    const auto sceneSnapshot = sceneTelemetry.snapshot();
+    check(sceneSnapshot.importedSceneRender.observed
+          && sceneSnapshot.importedSceneRender.count == 2
+          && sceneSnapshot.importedSceneRender.totalNs == 3'000'000
+          && sceneSnapshot.importedSceneRender.movingNs > 1'000'000.0
+          && sceneSnapshot.graphEvaluations == 0,
+          "imported scene render is separate from the graph timer");
+    sceneTelemetry.resetOwner(0, 0);
+    check(! sceneTelemetry.snapshot().importedSceneRender.observed,
+          "owner reset forgets the imported scene render duration");
 
     videowire::VisualPlanTelemetry saturated;
     saturated.seedForSaturationTesting(std::numeric_limits<uint64_t>::max());
@@ -469,8 +754,12 @@ int main()
           "viewport transport and stage-specific drop counters saturate");
 
     publishGateTests();
+    frameFailureGovernorTests();
+    layerFailureAttributionTests();
     rpcPolicyTests();
     revisionGuardTests();
+    previewExtentTests();
+    importedSceneCausticDegradationTests();
 
     std::printf("viewport telemetry owner: %s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;

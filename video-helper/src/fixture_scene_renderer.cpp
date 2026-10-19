@@ -10,10 +10,13 @@
 #include "gpu_backend/fixture_glass_caustics_opengl.h"
 #endif
 #include "../../shared/VisualImportedSceneRenderOperationContract.h"
+#include "loop_step_probe.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -584,7 +587,8 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
     }
     const auto& scene = *sceneSnapshot;
     const bool graphFrame = hasGraphFrameInput(request.binding);
-    if (request.version != requestVersion(graphFrame, request.program.spectralReflectance.has_value(),request.roughGlassScatteringVersion)
+    if (request.version != requestVersion(graphFrame, request.program.spectralReflectance.has_value(),request.roughGlassScatteringVersion,
+            request.program.diffractionLayer.has_value())
         || !validRoughGlassVersion(request))
     {
         error = "surface material request version is unsupported";
@@ -641,7 +645,8 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
         = std::make_shared<const surfacematerial::AdmittedSurfaceMaterialIR> (
             std::move (*admittedProgram));
     Description description;
-    description.version = requestVersion(graphFrame,request.program.spectralReflectance.has_value());
+    description.version = requestVersion(graphFrame,request.program.spectralReflectance.has_value(),1,
+        request.program.diffractionLayer.has_value());
     description.scene = &scene;
     description.sceneRevision = request.sceneRevision;
     description.structuralRevision = request.structuralRevision;
@@ -702,6 +707,7 @@ admitSurfaceMaterialBinding (const std::shared_ptr<const Visual3DScene>& sceneSn
         auto owned = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*native);
         if (graphFrame) owned->frameEndpoint = request.binding.textures.front().graphFrame;
         owned->spectralReflectance = immutableProgram->spectralReflectance();
+        owned->diffractionLayer = immutableProgram->diffractionLayer();
         owned->roughGlassScatteringVersion = request.roughGlassScatteringVersion;
         owned->authoredScene = scene.id;
         owned->authoredMaterial = visual3d_detail::findById(
@@ -749,7 +755,8 @@ std::shared_ptr<const AdmittedSurfaceMaterialBinding> admitSurfaceMaterialCollec
         auto native = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*binding->nativeProgram());
         for (const auto& field : object.program.fields)
             if (!surfacematerialfield::evaluate(field, evaluation, object.instanceIndex,
-                    native->parameters, native->timeMixEndColor, error)) return {};
+                    native->parameters, native->timeMixEndColor, error,
+                    native->diffractionLayer ? &*native->diffractionLayer : nullptr)) return {};
         for (std::size_t channel = 0; channel < 3; ++channel)
         {
             native->parameters.baseColorMetallic[channel] *= object.appearance.color[channel];
@@ -766,6 +773,10 @@ std::shared_ptr<const AdmittedSurfaceMaterialBinding> admitSurfaceMaterialCollec
         for (const auto value : native->parameters.normalOpacity) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
         for (const auto value : native->parameters.transmissionIorClearcoat) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
         for (const auto value : native->timeMixEndColor) evaluated << visualimportedscenerender::detail::floatBits(value) << ' ';
+        // Only layered programs add bytes, so earlier digests are unchanged.
+        if (native->diffractionLayer)
+            surfacematerial::forEachDiffractionLayerFloat(*native->diffractionLayer, [&evaluated](const char*, float value) {
+                evaluated << visualimportedscenerender::detail::floatBits(value) << ' '; });
         if (!root) root = std::move(native); else root->objectPrograms.push_back(std::move(native));
     }
     if (!arbitgpu::validNativeSurfaceObjectPrograms(*root, *scene, root->backend))
@@ -980,9 +991,79 @@ admitDiffractionProductPlan (
             *productBinding, request.plan, request.productDigest));
 }
 
+namespace
+{
+std::atomic<SceneRenderEngineFactory>& pathTraceFactory() noexcept
+{
+    static std::atomic<SceneRenderEngineFactory> factory { nullptr };
+    return factory;
+}
+} // namespace
+
+void setPathTraceSceneEngineFactory (SceneRenderEngineFactory factory) noexcept
+{
+    pathTraceFactory().store (factory, std::memory_order_release);
+}
+
 FixtureSceneRenderer::FixtureSceneRenderer (arbitgpu::NativeFixtureSceneBackend& backend) noexcept
     : backend_ (backend)
 {
+}
+
+void FixtureSceneRenderer::selectEngine (SceneEngineSelection selection)
+{
+    if (selection.engine != SceneEngineKind::PathTrace)
+    {
+        if (pathTraceEngine_ != nullptr) pathTraceEngine_->cancel();
+        pathTraceEngine_.reset();
+    }
+    engineSelection_ = selection;
+}
+
+bool FixtureSceneRenderer::renderWithEngine (
+    const std::shared_ptr<const Visual3DScene>& snapshot,
+    const std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram>& material,
+    const arbitgpu::NativeFixtureSceneRuntimeInputs& sceneInputs,
+    RenderDimensions dimensions, RenderUse use, const std::string& backend,
+    RenderedFrame& output, std::string& error)
+{
+    if (pathTraceEngine_ == nullptr)
+    {
+        const auto factory = pathTraceFactory().load (std::memory_order_acquire);
+        if (factory != nullptr) pathTraceEngine_ = factory();
+        if (pathTraceEngine_ == nullptr)
+        {
+            error = "Path Trace is not available in this build";
+            return false;
+        }
+    }
+    SceneEngineDraw draw;
+    draw.snapshot = snapshot;
+    draw.material = material;
+    draw.inputs = &sceneInputs;
+    draw.dimensions = dimensions;
+    draw.use = use;
+    draw.exportSamples = engineSelection_.exportSamples;
+    draw.backend = backend;
+    RenderedFrame rendered;
+    if (! pathTraceEngine_->render (draw, rendered, error))
+        return false;
+    if (rendered.nativeFrame == nullptr || rendered.nativeFrame->backend() != backend
+        || rendered.nativeFrame->width() != dimensions.width
+        || rendered.nativeFrame->height() != dimensions.height
+        || rendered.nativeFrame->colorImageHandle() == 0
+        || rendered.nativeFrame->colorTextureViewHandle() == 0)
+    {
+        error = "Path Trace returned an incompatible frame";
+        return false;
+    }
+    rendered.use = use;
+    rendered.sceneId = snapshot->id;
+    rendered.dimensions = dimensions;
+    rendered.pending = false;
+    output = std::move (rendered);
+    error.clear();
+    return true;
 }
 
 bool FixtureSceneRenderer::renderPreview (
@@ -1120,6 +1201,9 @@ bool FixtureSceneRenderer::render (
     // A selected caustic draw cannot leave an earlier ordinary or caustic frame visible.
     if (sceneInputs.glassCaustic)
         output = {};
+    // Preview frames stay on the GPU. Export keeps every host readback and check.
+    sceneInputs.previewUse = use == RenderUse::Preview;
+    sceneInputs.previewCallerWaits = false;
     if (snapshot == nullptr)
     {
         error = "native fixture rendering requires an immutable scene snapshot";
@@ -1284,8 +1368,21 @@ bool FixtureSceneRenderer::render (
     }
 
     sceneInputs.timeSeconds = runtimeInputs.timeSeconds;
+    if (engineSelection_.engine == SceneEngineKind::PathTrace)
+    {
+        // Path Trace renders the admitted scene and surface materials only.
+        // Features with their own raster passes are refused, not dropped.
+        if (diffractionMaterial != nullptr || sceneInputs.glassCaustic)
+        {
+            error = "Path Trace does not render diffraction or glass caustic passes yet; choose Raster";
+            return false;
+        }
+        return renderWithEngine (snapshot, nativeMaterial, sceneInputs, dimensions, use, info.backend,
+                                 output, error);
+    }
     std::optional<arbitgpu::glasscaustics::AdmittedBranchPolicy> causticPolicy;
     std::optional<arbitgpu::glasscaustics::MultipleScatterPolicy> multipleScatterPolicy;
+    bool causticRoughQuery = false;
     if (sceneInputs.glassCaustic)
     {
         const auto& selection = *sceneInputs.glassCaustic;
@@ -1303,7 +1400,9 @@ bool FixtureSceneRenderer::render (
             error = "Glass caustic selection does not match an exact authored closed-volume material";
             return false;
         }
-        if (selectedMaterial->parameters.emissionRoughness[3] > 0.0f)
+        // Positive roughness selects both the multiple scatter transport and the rough query.
+        causticRoughQuery = selectedMaterial->parameters.emissionRoughness[3] > 0.0f;
+        if (causticRoughQuery)
             multipleScatterPolicy.emplace();
         // Material Fields have already consumed the caller's retained score owner.
         // Only an explicit mapping authorizes carrying it into a native instance draw.
@@ -1340,18 +1439,112 @@ bool FixtureSceneRenderer::render (
         }
     }
 
+    // A caustic selection beside another dielectric (the lighthouse water) is
+    // prepared with the selected volume in the smooth glass second slot. Without
+    // that second dielectric the selection is the camera dielectric itself.
+    // With no caustic requested, a scene of one thin water interface and one
+    // closed volume gets a camera-only selection of that volume: the same
+    // second slot and paired camera walk, and no caustic resources or passes.
+    // Every image output, including the material-ID view, takes this path.
+    std::optional<arbitgpu::smoothglass::CausticVolumeSelection> causticVolume;
+    if (sceneInputs.glassCaustic
+        && arbitgpu::smoothglass::causticVolumeNeedsSlot (nativeMaterial.get(), sceneInputs.glassCaustic->glassObject))
+        causticVolume = arbitgpu::smoothglass::CausticVolumeSelection {
+            sceneInputs.glassCaustic->glassObject, sceneInputs.glassCaustic->glassMaterial };
+    else if (! sceneInputs.glassCaustic && ! diffractionMaterial)
+    {
+        // Only the backends that own the paired camera walk take the selection.
+        // Any other backend keeps the released preparation and its refusal.
+#if ARBIT_HAVE_METAL_BACKEND
+        const bool pairedCameraWalk = info.backend == "metal";
+#elif ARBIT_HAVE_OPENGL_SDF_BACKEND && !defined(__APPLE__)
+        const bool pairedCameraWalk = info.backend == "opengl";
+#else
+        const bool pairedCameraWalk = false;
+#endif
+        if (pairedCameraWalk)
+            causticVolume = arbitgpu::smoothglass::cameraVolumeSelection (*snapshot, nativeMaterial.get());
+    }
+    const HarmonicMIDI::grid::SceneObjectId requestedVolume = causticVolume ? causticVolume->object
+                                                                            : HarmonicMIDI::grid::SceneObjectId {};
+    const bool requestedCameraOnly = causticVolume && causticVolume->cameraOnly;
+
+    // The caustic programs start here, before the scene preparation, and Preview frames
+    // poll them. A frame stays pending until they are linked, so their compile never runs
+    // inside fixture-caustic-submit. Blocking use finishes them here.
+    bool causticProgramsPending = false;
+#if ! ARBIT_HAVE_METAL_BACKEND && ARBIT_HAVE_OPENGL_SDF_BACKEND && ! defined(__APPLE__)
+    if (sceneInputs.glassCaustic)
+    {
+        loopstep::Scope causticProgramScope ("advance:imported-scene:fixture-caustic-programs");
+        const auto readiness = arbitgpu::prepareOpenGlGlassCausticPrograms (
+            multipleScatterPolicy.has_value(), causticRoughQuery,
+            use == RenderUse::Preview ? arbitgpu::NativeFixturePrepareUse::Preview
+                                      : arbitgpu::NativeFixturePrepareUse::Blocking,
+            error);
+        if (readiness == arbitgpu::OpenGlCausticProgramReadiness::Failed)
+            return false;
+        causticProgramsPending = readiness == arbitgpu::OpenGlCausticProgramReadiness::Pending;
+    }
+#endif
+    (void) causticRoughQuery;
+
     auto cachedSnapshot = cache_.snapshot.lock();
     // Prepared resources retain this exact immutable admission owner. Equal
     // digests from a separately admitted owner are not a cache hit.
     const bool exactMaterialHit = nativeMaterial == cache_.materialProgram;
+    // Preview frames with glass caustics take the structural hit too: the caustic
+    // keeps its own resident schedule and tables beside the refreshed water.
+    const bool residentFrame = use == RenderUse::Preview && diffractionMaterial == nullptr;
     const bool exactCacheHit = cachedSnapshot == snapshot && cache_.native != nullptr
-                            && exactMaterialHit;
-    if (! exactCacheHit)
+                            && (residentFrame || ! cache_.residentRefreshed)
+                            && exactMaterialHit && cache_.causticVolume == requestedVolume
+                            && cache_.cameraVolumeOnly == requestedCameraOnly;
+    // Preview structural hit. A snapshot whose only change is the deformed vertex
+    // data of one admitted mesh (the animated water) keeps every static resource.
+    // The backend compares structure and sizes, uploads only that mesh's vertex
+    // range and refits its BLAS on the GPU. Export and diffraction frames never
+    // take it: they keep the full prepare below on every snapshot change.
+    bool structuralCacheHit = false;
+    if (! exactCacheHit && residentFrame && cache_.native != nullptr
+        && cache_.mixedSurfaces == nullptr && cache_.mixedDiffraction == nullptr
+        && cache_.causticVolume == requestedVolume && cache_.cameraVolumeOnly == requestedCameraOnly)
+    {
+        loopstep::Scope residentScope ("advance:imported-scene:fixture-resident-refresh");
+        structuralCacheHit = backend_.refreshPreviewDeformedVertices (cache_.native, snapshot, nativeMaterial);
+        if (structuralCacheHit)
+        {
+            cache_.snapshot = snapshot;
+            cache_.materialProgram = nativeMaterial;
+            cache_.residentRefreshed = true;
+        }
+    }
+    const bool staticReuse = exactCacheHit || structuralCacheHit;
+    if (! staticReuse)
     {
         const auto prepareUse = use == RenderUse::Preview
             ? arbitgpu::NativeFixturePrepareUse::Preview
             : arbitgpu::NativeFixturePrepareUse::Blocking;
-        auto preparation = backend_.prepare (snapshot, nativeMaterial, prepareUse);
+        // A cache miss builds the static GPU resources: buffers, textures and
+        // the scene shader and pipelines. The backend's own scopes split it.
+        std::optional<loopstep::Scope> prepareScope;
+        prepareScope.emplace ("advance:imported-scene:fixture-prepare");
+        arbitgpu::NativeFixtureScenePreparation preparation;
+        if (causticVolume)
+        {
+#if ARBIT_HAVE_METAL_BACKEND
+            preparation = arbitgpu::prepareMetalGlassCausticVolumeResources (
+                backend_, snapshot, nativeMaterial, *causticVolume, prepareUse);
+#elif ARBIT_HAVE_OPENGL_SDF_BACKEND && !defined(__APPLE__)
+            preparation = arbitgpu::prepareOpenGlGlassCausticVolumeResources (
+                backend_, snapshot, nativeMaterial, *causticVolume, prepareUse);
+#else
+            preparation.error = "Glass caustics have no native consumer in this renderer backend";
+#endif
+        }
+        else
+            preparation = backend_.prepare (snapshot, nativeMaterial, prepareUse);
+        prepareScope.reset();
         if (preparation.pending)
         {
             // Pending is a retry state, not a failure. No cache or static resource changes.
@@ -1386,9 +1579,34 @@ bool FixtureSceneRenderer::render (
         cache_.mixedDiffraction = material && diffractionMaterial ? diffractionMaterial->nativeProgram_ : nullptr;
         cache_.native = std::move (preparation.resources);
         cache_.footprint = preparation.stats;
+        cache_.causticVolume = requestedVolume;
+        cache_.cameraVolumeOnly = requestedCameraOnly;
+        cache_.residentRefreshed = false;
+    }
+
+    if (causticProgramsPending)
+    {
+        // The same retry state as a pending preparation. The prepared resources above stay
+        // cached, so the next frame only polls the programs.
+        ++previewPendingResults;
+        if (use != RenderUse::Preview)
+        {
+            error = "native fixture GPU backend returned pending caustic programs for a blocking render";
+            return false;
+        }
+        output = {};
+        output.use = use;
+        output.pending = true;
+        error.clear();
+        return true;
     }
 
     arbitgpu::NativeFixtureSceneSubmission submission;
+    std::string causticDegradation;
+    // Encodes, submits and (for checked paths) waits on the frame's GPU work.
+    std::optional<loopstep::Scope> submitScope;
+    submitScope.emplace (sceneInputs.glassCaustic ? "advance:imported-scene:fixture-caustic-submit"
+                                                  : "advance:imported-scene:fixture-submit");
     if (sceneInputs.glassCaustic)
     {
         const auto& selection = *sceneInputs.glassCaustic;
@@ -1418,10 +1636,15 @@ bool FixtureSceneRenderer::render (
             dimensions.width, dimensions.height, sceneInputs, prepared, {},
             multipleScatterPolicy ? &*multipleScatterPolicy : nullptr);
 #elif ARBIT_HAVE_OPENGL_SDF_BACKEND && !defined(__APPLE__)
+        // Preview traces the coarser entry schedule and skips the host receipt. Export
+        // keeps the default schedule and every check.
+        const auto causticUse = use == RenderUse::Preview ? arbitgpu::OpenGlCausticRenderUse::Preview
+                                                          : arbitgpu::OpenGlCausticRenderUse::Export;
+        const auto causticPlan = arbitgpu::openGlCausticRenderPlan (causticUse, dimensions.width, dimensions.height);
         submission = arbitgpu::renderOpenGlGlassCausticScene(snapshot, cache_.native,
             selection.sourceLight, selection.glassObject, selection.glassMaterial, *causticPolicy,
-            {}, dimensions.width, dimensions.height, sceneInputs,
-            multipleScatterPolicy ? &*multipleScatterPolicy : nullptr);
+            causticPlan.scheduling, dimensions.width, dimensions.height, sceneInputs,
+            multipleScatterPolicy ? &*multipleScatterPolicy : nullptr, causticUse, &causticDegradation);
 #else
         (void)selection;
         error = "Glass caustics have no native consumer in this renderer backend";
@@ -1431,6 +1654,7 @@ bool FixtureSceneRenderer::render (
     else
         submission = backend_.render (
             snapshot, cache_.native, dimensions.width, dimensions.height, sceneInputs);
+    submitScope.reset();
     if (! submission.rendered || submission.frame == nullptr)
     {
         error = submission.error.empty()
@@ -1485,14 +1709,15 @@ bool FixtureSceneRenderer::render (
     rendered.stats.vertexBytes = cache_.footprint.vertexBytes;
     rendered.stats.indexBytes = cache_.footprint.indexBytes;
     rendered.stats.textureBytes = textureBytes;
-    rendered.stats.staticUploadCount = exactCacheHit
+    rendered.stats.staticUploadCount = staticReuse
         ? 0u : cache_.footprint.staticUploadCount;
-    rendered.stats.textureUploadCount = exactCacheHit
+    rendered.stats.textureUploadCount = staticReuse
         ? 0u : cache_.footprint.textureUploadCount;
-    rendered.stats.reusedStaticResources = exactCacheHit;
+    rendered.stats.reusedStaticResources = staticReuse;
     rendered.stats.materialProgramUploadCount
-        = nativeMaterial != nullptr && ! exactCacheHit ? 1u : 0u;
-    rendered.stats.reusedMaterialProgram = nativeMaterial != nullptr && exactCacheHit;
+        = nativeMaterial != nullptr && ! staticReuse ? 1u : 0u;
+    rendered.stats.reusedMaterialProgram = nativeMaterial != nullptr && staticReuse;
+    rendered.causticDegradation = std::move (causticDegradation);
     output = std::move (rendered);
     error.clear();
     return true;

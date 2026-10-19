@@ -156,6 +156,20 @@ add_executable(arbit-video-helper
     src/visual_plan_execution_telemetry.cpp
     src/visual_renderer_telemetry.cpp
     src/exporter.cpp
+    # Path Trace render engine (Plan 3, PT-C1): the CPU path tracer and the
+    # adapter that registers it with FixtureSceneRenderer.
+    src/pathtrace_fixture_engine.cpp
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bsdf.cpp
+    src/pathtrace/spectrum.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/engine.cpp
+    src/pathtrace/environment_map.cpp
+    src/pathtrace/environment_resident.cpp
+    src/pathtrace/integrator.cpp
+    src/pathtrace/lights.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp
 )
 add_dependencies(arbit-video-helper arbit-shader-catalog-check)
 
@@ -174,6 +188,7 @@ if(APPLE AND ARBIT_WITH_METAL)
     target_sources(arbit-video-helper PRIVATE
         src/diffraction_order_bsdf.cpp
         src/gpu_backend/backend_sokol.mm
+        src/gpu_backend/cpu_scene_frame_stub.cpp
         src/optical_flow_source_upload_metal.mm
         src/diffraction_material_metal.mm)
     target_include_directories(arbit-video-helper PRIVATE third_party/sokol)
@@ -185,12 +200,14 @@ elseif(GLFW3_FOUND AND OpenGL_FOUND)
     target_sources(arbit-video-helper PRIVATE
         src/diffraction_order_bsdf.cpp
         src/gpu_backend/backend_opengl.cpp
+        src/gpu_backend/cpu_scene_frame_opengl.cpp
         src/optical_flow_source_upload_gl.cpp)
     target_compile_definitions(arbit-video-helper PRIVATE ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
     message(STATUS "arbit-video-helper: strict native OpenGL SDF backend enabled")
 else()
     target_sources(arbit-video-helper PRIVATE
         src/gpu_backend/backend_stub.cpp
+        src/gpu_backend/cpu_scene_frame_stub.cpp
         src/optical_flow_source_upload_stub.cpp)
 endif()
 
@@ -863,6 +880,19 @@ if(NOT MSVC)
 endif()
 add_test(NAME beat_timeline COMMAND arbit-beat-timeline-tests)
 
+# Docked-viewport shm ring handover between helper sessions. Header-only, no GL.
+add_executable(arbit-viewport-frame-ring-tests tests/viewport_frame_ring_tests.cpp)
+target_include_directories(arbit-viewport-frame-ring-tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source)
+if(NOT MSVC)
+    target_compile_options(arbit-viewport-frame-ring-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+if(UNIX AND NOT APPLE)
+    # shm_open lives in librt on older glibc.
+    target_link_libraries(arbit-viewport-frame-ring-tests PRIVATE rt)
+endif()
+add_test(NAME viewport_frame_ring COMMAND arbit-viewport-frame-ring-tests)
+
 add_executable(arbit-block-b-analyzer-tests tests/block_b_analyzer_tests.cpp)
 target_include_directories(arbit-block-b-analyzer-tests PRIVATE src)
 if(NOT MSVC)
@@ -990,6 +1020,20 @@ else()
 endif()
 add_test(NAME note_identity_voice_reallocation
     COMMAND arbit-note-identity-voice-reallocation-tests)
+
+# Harmony feed: score.harmony parsing, uChord/uKey/uPhrase values per beat, the
+# score.harmony.signal control node and the prelude declarations. No GL:
+# shader_generator.cpp contributes only makeShaderClock without the viewport.
+add_executable(arbit-harmony-uniform-tests tests/harmony_uniform_tests.cpp src/shader_generator.cpp)
+target_include_directories(arbit-harmony-uniform-tests PRIVATE src)
+target_link_libraries(arbit-harmony-uniform-tests PRIVATE nlohmann_json::nlohmann_json)
+target_compile_features(arbit-harmony-uniform-tests PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(arbit-harmony-uniform-tests PRIVATE /W4)
+else()
+    target_compile_options(arbit-harmony-uniform-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME harmony_uniforms COMMAND arbit-harmony-uniform-tests)
 
 add_executable(arbit-score-renderer-tests tests/score_renderer_tests.cpp)
 target_include_directories(arbit-score-renderer-tests PRIVATE src)
@@ -1354,6 +1398,23 @@ endif()
 add_test(NAME stam_diffraction
     COMMAND arbit-stam-diffraction-tests)
 
+add_executable(arbit-diffraction-layer-material-tests
+    tests/diffraction_layer_material_tests.cpp)
+target_include_directories(arbit-diffraction-layer-material-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-diffraction-layer-material-tests PRIVATE cxx_std_17)
+target_compile_definitions(arbit-diffraction-layer-material-tests PRIVATE
+    BACKEND_OPENGL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_backend/backend_opengl.cpp"
+    BACKEND_SOKOL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/gpu_backend/backend_sokol.mm"
+    COMPLETENESS_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_feature_uniform_completeness_source_contract.py")
+if(NOT MSVC)
+    target_compile_options(arbit-diffraction-layer-material-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME diffraction_layer_material
+    COMMAND arbit-diffraction-layer-material-tests)
+
 add_executable(arbit-diffraction-grating-equation-tests
     tests/diffraction_grating_equation_tests.cpp
     src/diffraction_order_bsdf.cpp)
@@ -1415,6 +1476,17 @@ add_test(NAME glass_caustic_contract COMMAND arbit-glass-caustic-contract-tests)
 add_test(NAME glass_smooth_refusal_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/glass_smooth_refusal_source_contract.py)
+add_test(NAME lighthouse_paired_camera_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/lighthouse_paired_camera_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME lighthouse_starter_walk_model
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/lighthouse_starter_walk_model.py)
+add_test(NAME metal_fixture_released_shader_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/metal_fixture_released_shader_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(arbit-thin-water-entry-ownership-tests
     tests/thin_water_entry_ownership_tests.cpp
@@ -1426,6 +1498,31 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME thin_water_entry_ownership COMMAND arbit-thin-water-entry-ownership-tests)
+
+add_executable(arbit-glass-nested-shell-tests
+    tests/glass_nested_shell_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-glass-nested-shell-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-glass-nested-shell-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME glass_nested_shell COMMAND arbit-glass-nested-shell-tests)
+add_test(NAME glass_nested_shell_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/glass_nested_shell_source_contract.py)
+
+add_executable(arbit-lighthouse-caustic-volume-tests
+    tests/lighthouse_caustic_volume_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-lighthouse-caustic-volume-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-lighthouse-caustic-volume-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME lighthouse_caustic_volume COMMAND arbit-lighthouse-caustic-volume-tests)
 
 # The Metal SurfacePbr source ledger and Sokol Metal pool sizes, measured on
 # Linux. The OpenGL path never runs this ledger.
@@ -1904,6 +2001,10 @@ add_test(NAME depth_cache_windows_source_contract
 add_test(NAME blend_modes_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/blend_modes_source_contract.py)
+add_test(NAME metal_imported_overlay_orientation_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/metal_imported_overlay_orientation_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME phase13_recovery_preview_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/phase13_recovery_preview_source_contract.py
@@ -2154,6 +2255,9 @@ add_test(NAME generator_particle_telemetry_source_contract
 add_test(NAME node_cost_telemetry_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/node_cost_telemetry_source_contract.py)
+add_test(NAME visual_recipe_composite_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/visual_recipe_composite_source_contract.py)
 
 add_executable(arbit-viewport-telemetry-owner-tests tests/viewport_telemetry_owner_tests.cpp)
 target_include_directories(arbit-viewport-telemetry-owner-tests PRIVATE src)
@@ -2164,6 +2268,14 @@ add_test(NAME viewport_telemetry_owner COMMAND arbit-viewport-telemetry-owner-te
 add_test(NAME viewport_telemetry_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_telemetry_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME imported_scene_render_telemetry_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/imported_scene_render_telemetry_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME imported_scene_preview_extent_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/imported_scene_preview_extent_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(arbit-export-telemetry-owner-tests tests/export_telemetry_owner_tests.cpp)
@@ -2218,6 +2330,18 @@ add_test(NAME gl_async_program_compile_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/gl_async_program_compile_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME glass_caustic_program_prewarm_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/glass_caustic_program_prewarm_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME glass_caustic_preview_async_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/glass_caustic_preview_async_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME preview_resident_scene_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/preview_resident_scene_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME fixture_program_nonblocking_overdue_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_program_nonblocking_overdue_source_contract.py
@@ -2233,6 +2357,10 @@ add_test(NAME fixture_prepare_pending_plumbing_source_contract
 add_test(NAME geometry_core_preview_prepare_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/geometry_core_preview_prepare_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME viewport_plan_error_ui_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_plan_error_ui_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME viewport_dmabuf_snapshot_fill_source_contract
     COMMAND ${Python3_EXECUTABLE}
@@ -2292,6 +2420,13 @@ if(NOT MSVC)
 endif()
 add_test(NAME viewport_plan_concurrency COMMAND arbit-viewport-plan-concurrency-tests)
 
+add_executable(arbit-loop-step-probe-tests tests/loop_step_probe_tests.cpp)
+target_link_libraries(arbit-loop-step-probe-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-loop-step-probe-tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME loop_step_probe COMMAND arbit-loop-step-probe-tests)
+
 # CPU path tracer foundation (Plan 3, PT-A1): scene ingest, BVH, tile pool and
 # progressive accumulation. No GPU, display or backend dependency.
 add_executable(arbit-pathtrace-core-tests
@@ -2317,6 +2452,7 @@ add_executable(arbit-pathtrace-integrator-tests
     tests/pathtrace_integrator_tests.cpp
     src/pathtrace/accumulator.cpp
     src/pathtrace/bsdf.cpp
+    src/pathtrace/spectrum.cpp
     src/pathtrace/bvh.cpp
     src/pathtrace/environment_map.cpp
     src/pathtrace/integrator.cpp
@@ -2341,6 +2477,7 @@ add_executable(arbit-pathtrace-environment-tests
     tests/pathtrace_environment_tests.cpp
     src/pathtrace/accumulator.cpp
     src/pathtrace/bsdf.cpp
+    src/pathtrace/spectrum.cpp
     src/pathtrace/bvh.cpp
     src/pathtrace/environment_map.cpp
     src/pathtrace/environment_resident.cpp
@@ -2358,6 +2495,117 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME pathtrace_environment COMMAND arbit-pathtrace-environment-tests)
+
+# CPU path tracer refraction (Plan 3, PT-D): hero wavelength spectral
+# transport, dispersion, nested dielectrics, thin sheets, Beer-Lambert
+# absorption and sized lights.
+add_executable(arbit-pathtrace-refraction-tests
+    tests/pathtrace_refraction_tests.cpp
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bsdf.cpp
+    src/pathtrace/spectrum.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/environment_map.cpp
+    src/pathtrace/integrator.cpp
+    src/pathtrace/lights.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp)
+target_include_directories(arbit-pathtrace-refraction-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-refraction-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-refraction-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-refraction-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_refraction COMMAND arbit-pathtrace-refraction-tests)
+
+# Path Trace render engine (Plan 3, PT-C1): the V27 engine field on the Render
+# wire, RenderScene cache reuse, progressive reset rules, the compositor output
+# format and export determinism. CPU only.
+set(ARBIT_PATHTRACE_ENGINE_SOURCES
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bsdf.cpp
+    src/pathtrace/spectrum.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/engine.cpp
+    src/pathtrace/environment_map.cpp
+    src/pathtrace/integrator.cpp
+    src/pathtrace/lights.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp)
+add_executable(arbit-pathtrace-engine-tests
+    tests/pathtrace_engine_tests.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-pathtrace-engine-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-engine-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-engine-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-engine-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_engine COMMAND arbit-pathtrace-engine-tests)
+
+# Path Trace routes (Plan 3, PT-C1): glass material mapping, input refusals,
+# the FixtureSceneRenderer engine branch and the imported animated routes. A
+# Path Trace request draws with the tracer or fails by name, never as Raster.
+# The stub frame upload stands in for Metal until PT-C2.
+add_executable(arbit-pathtrace-route-tests
+    tests/pathtrace_route_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp
+    src/glb_native_render_seam.cpp
+    src/imported_scene_payload_execution.cpp
+    src/imported_animated_scene_payload_execution.cpp
+    src/animation_mix.cpp
+    src/imported_animation_deformation_consumer.cpp
+    src/fixture_scene_renderer.cpp
+    src/animation_clip.cpp
+    src/animation_playback_control.cpp
+    src/animation_deformation_evaluation.cpp
+    src/deformation_contract.cpp
+    src/native_animation_deformation.cpp
+    src/native_animation_deformation_renderer.cpp
+    src/gpu_backend/backend_stub.cpp
+    src/gpu_backend/cpu_scene_frame_stub.cpp
+    src/pathtrace_fixture_engine.cpp
+    src/pathtrace/environment_resident.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-pathtrace-route-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-route-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-route-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    PkgConfig::AV
+    Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-route-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_route COMMAND arbit-pathtrace-route-tests)
+
+# Wall-clock timing of the Path Trace engine on the Smooth Dispersive Glass
+# starter scene. A manual tool: deliberately not registered with ctest.
+add_executable(arbit-pathtrace-timing
+    tests/pathtrace_timing.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-pathtrace-timing PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-timing PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-timing PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-timing PRIVATE
+        -Wall -Wextra -Werror)
+endif()
 
 if(GLFW3_FOUND AND OpenGL_FOUND)
     # Real Linux pixel acceptance for Depth Fog. This compiles the production

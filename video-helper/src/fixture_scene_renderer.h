@@ -39,6 +39,10 @@ struct RenderedFrame
     arbitgpu::NativeFixtureSceneStats stats {};
     // Set only for a Preview render whose backend has not finished. No frame is present.
     bool pending = false;
+    // Non-fatal Preview warning: why the glass caustic rendered reduced or not at all,
+    // for example "caustic off: exceeds GL limits (...)". Empty when it rendered as planned.
+    // Export never sets it; an export that cannot fit the caustic refuses instead.
+    std::string causticDegradation;
 };
 
 // Number of Preview renders on the calling thread that came back pending from the
@@ -269,6 +273,52 @@ admitDiffractionProductPlan (
     videohelper::materialprogram::BackendTarget target,
     std::string& error);
 
+// Render engine the 3D Render node selected (visualimportedscenerender::RenderEngine).
+// Raster is the GPU fixture draw. PathTrace is the CPU path tracer, chosen by the
+// user per node; it is not Visual3DSceneRenderContract's CPU image fallback,
+// which stays refused.
+enum class SceneEngineKind : std::uint8_t
+{
+    Raster = 0,
+    PathTrace = 1
+};
+
+struct SceneEngineSelection
+{
+    SceneEngineKind engine = SceneEngineKind::Raster;
+    std::uint32_t exportSamples = 64;
+};
+
+// One admitted draw handed to a non-raster engine. Everything here has passed
+// the same scene, material and backend admission as a raster draw.
+struct SceneEngineDraw
+{
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> snapshot;
+    std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> material;
+    const arbitgpu::NativeFixtureSceneRuntimeInputs* inputs = nullptr;
+    RenderDimensions dimensions {};
+    RenderUse use = RenderUse::Preview;
+    std::uint32_t exportSamples = 64;
+    std::string backend;  // physical fixture backend name ("opengl", "metal")
+};
+
+class SceneRenderEngine
+{
+public:
+    virtual ~SceneRenderEngine() = default;
+    // Fills output with a compositor-ready native frame, or fails with error.
+    virtual bool render (const SceneEngineDraw& draw, RenderedFrame& output, std::string& error) = 0;
+    // Thread safe. Stops work in flight; the next preview starts over.
+    virtual void cancel() noexcept = 0;
+};
+
+// The path tracer lives in the helper executable only. It registers its
+// factory at static initialisation, so the fixture renderer's other link
+// targets (tests, tools) carry no tracer code. Without a factory a PathTrace
+// draw fails with a clear error.
+using SceneRenderEngineFactory = std::shared_ptr<SceneRenderEngine> (*)();
+void setPathTraceSceneEngineFactory (SceneRenderEngineFactory factory) noexcept;
+
 class FixtureSceneRenderer
 {
 public:
@@ -276,6 +326,11 @@ public:
     static constexpr std::uint64_t kMaxPixels = 4096ull * 4096ull;
 
     explicit FixtureSceneRenderer (arbitgpu::NativeFixtureSceneBackend& backend) noexcept;
+
+    // Applies to every following render call. Raster releases the path
+    // tracer's caches; a PathTrace selection keeps them across draws.
+    void selectEngine (SceneEngineSelection selection);
+    SceneEngineSelection selectedEngine() const noexcept { return engineSelection_; }
 
     bool renderPreview (
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& snapshot,
@@ -379,6 +434,15 @@ private:
         std::shared_ptr<const arbitgpu::NativeFixtureSceneResources> native;
         arbitgpu::NativeFixtureSceneStats footprint {};
         std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> mixedSurfaces, mixedDiffraction;
+        // Selected closed volume prepared beside a thin camera dielectric, or invalid.
+        // cameraVolumeOnly separates a camera-only selection (Glass Caustics off)
+        // from a caustic selection of the same volume.
+        HarmonicMIDI::grid::SceneObjectId causticVolume {};
+        bool cameraVolumeOnly = false;
+        // Set by a Preview structural hit. The resources then hold refreshed water
+        // vertices that only the Preview resident query path reads, so any other
+        // frame (export, caustics, diffraction) takes a full prepare.
+        bool residentRefreshed = false;
     };
 
     bool render (
@@ -393,8 +457,17 @@ private:
         RenderedFrame& output,
         std::string& error);
 
+    bool renderWithEngine (
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& snapshot,
+        const std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram>& material,
+        const arbitgpu::NativeFixtureSceneRuntimeInputs& sceneInputs,
+        RenderDimensions dimensions, RenderUse use, const std::string& backend,
+        RenderedFrame& output, std::string& error);
+
     arbitgpu::NativeFixtureSceneBackend& backend_;
     CachedResources cache_;
+    SceneEngineSelection engineSelection_ {};
+    std::shared_ptr<SceneRenderEngine> pathTraceEngine_;
 };
 
 } // namespace videorender::fixture3d

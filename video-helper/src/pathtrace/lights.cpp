@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <new>
 #include <utility>
@@ -32,6 +33,8 @@ Vec3 nonNegative (Vec3 v) noexcept
 
 float clampUnit (float x) noexcept { return std::min (1.0f, std::max (0.0f, x)); }
 
+float finiteOrZero (float x) noexcept { return std::isfinite (x) ? x : 0.0f; }
+
 bool normalizedRotation (const SceneLightRecord& record, Quat& q) noexcept
 {
     const auto& r = record.transform.rotation;
@@ -51,6 +54,171 @@ float spotCone (float cosAngle, float cosOuter, float cosInner) noexcept
         return t * t * (3.0f - 2.0f * t);
     }
     return cosAngle >= cosOuter ? 1.0f : 0.0f;
+}
+
+bool normalizedQuat (Quat in, Quat& q) noexcept
+{
+    const float norm = std::sqrt (in.x * in.x + in.y * in.y + in.z * in.z + in.w * in.w);
+    if (! std::isfinite (norm) || ! (norm > 0.0f))
+        return false;
+    q = { in.x / norm, in.y / norm, in.z / norm, in.w / norm };
+    return true;
+}
+
+// Distance falloff, range window and spot cone of a point or spot light, at
+// squared distance d2 from its centre in unit direction fromLight.
+float pointFalloff (const Light& light, float d2, Vec3 fromLight) noexcept
+{
+    float falloff = 1.0f / std::max (d2, 1.0f);
+    if (light.range > 0.0f)
+    {
+        const float window = clampUnit (1.0f - std::sqrt (d2) / light.range);
+        falloff *= window * window;
+    }
+    if (light.type == LightType::Spot)
+        falloff *= spotCone (dot (light.direction, fromLight), light.cosOuter, light.cosInner);
+    return falloff;
+}
+
+// 1 - cos of the half angle a sphere of radius r subtends at squared distance
+// d2 > r^2, written so that small spheres keep their precision.
+float sphereConeOneMinusCos (float r, float d2) noexcept
+{
+    const float sin2 = std::min (1.0f, r * r / d2);
+    return sin2 / (1.0f + std::sqrt (std::max (0.0f, 1.0f - sin2)));
+}
+
+bool outsideSphere (const Light& light, float d2) noexcept
+{
+    return std::isfinite (d2) && d2 > light.radius * light.radius * (1.0f + 1.0e-4f);
+}
+
+// Radiance of a sphere light seen from squared distance d2 in unit direction
+// fromLight (centre to viewer), chosen so it delivers the point light's
+// irradiance.
+Vec3 sphereRadiance (const Light& light, float d2, Vec3 fromLight) noexcept
+{
+    return light.strength * (pointFalloff (light, d2, fromLight) * d2 / (kPi * light.radius * light.radius));
+}
+
+// Planar lights emit on the side their normal points to, or both.
+bool planarLightFaces (const Light& light, Vec3 p) noexcept
+{
+    const Vec3 onPlane = light.type == LightType::Rect ? light.vertex0 : light.position;
+    return light.twoSided || dot (p - onPlane, light.normal) > 0.0f;
+}
+
+// Point on the unit disk by the concentric mapping (Shirley and Chiu 1997).
+Vec2 concentricDisk (Vec2 u) noexcept
+{
+    const float ox = 2.0f * u.x - 1.0f;
+    const float oy = 2.0f * u.y - 1.0f;
+    if (ox == 0.0f && oy == 0.0f)
+        return {};
+    float r = 0.0f;
+    float theta = 0.0f;
+    if (std::fabs (ox) > std::fabs (oy))
+    {
+        r = ox;
+        theta = 0.25f * kPi * (oy / ox);
+    }
+    else
+    {
+        r = oy;
+        theta = 0.5f * kPi - 0.25f * kPi * (ox / oy);
+    }
+    return { r * std::cos (theta), r * std::sin (theta) };
+}
+
+// Below this solid angle a rect is sampled by area: the spherical
+// construction loses its precision to cancellation.
+constexpr float kRectMinSolidAngle = 1.0e-4f;
+
+// A rect as seen from one point, in the rect's frame with the point at the
+// origin and the rect in the plane z = z0 < 0 (Urena et al. 2013, section 3).
+struct SphericalRect
+{
+    Vec3 origin {};
+    Vec3 axisX {};
+    Vec3 axisY {};
+    Vec3 axisZ {};
+    float x0 = 0.0f;
+    float x1 = 0.0f;
+    float y0 = 0.0f;
+    float y1 = 0.0f;
+    float z0 = 0.0f;
+    float b0 = 0.0f;
+    float b1 = 0.0f;
+    float k = 0.0f;
+    float solidAngle = 0.0f;
+};
+
+float angleBetweenPlanes (Vec3 a, Vec3 b) noexcept
+{
+    return std::acos (std::min (1.0f, std::max (-1.0f, -dot (a, b))));
+}
+
+// False when the point is in the rect's plane or the solid angle is too
+// small to sample this way.
+bool sphericalRectFrom (const Light& light, Vec3 p, SphericalRect& out) noexcept
+{
+    const float lengthX = length (light.edge1);
+    const float lengthY = length (light.edge2);
+    if (! (lengthX > 0.0f) || ! (lengthY > 0.0f))
+        return false;
+    out.origin = p;
+    out.axisX = light.edge1 * (1.0f / lengthX);
+    out.axisY = light.edge2 * (1.0f / lengthY);
+    out.axisZ = cross (out.axisX, out.axisY);
+    const Vec3 toCorner = light.vertex0 - p;
+    out.z0 = dot (toCorner, out.axisZ);
+    if (out.z0 > 0.0f)
+    {
+        out.axisZ = -out.axisZ;
+        out.z0 = -out.z0;
+    }
+    if (! (out.z0 < 0.0f))
+        return false;
+    out.x0 = dot (toCorner, out.axisX);
+    out.y0 = dot (toCorner, out.axisY);
+    out.x1 = out.x0 + lengthX;
+    out.y1 = out.y0 + lengthY;
+    // Inward normals of the four great-circle edges of the projected rect.
+    const Vec3 n0 = normalizeOrZero ({ 0.0f, out.z0, -out.y0 });
+    const Vec3 n1 = normalizeOrZero ({ -out.z0, 0.0f, out.x1 });
+    const Vec3 n2 = normalizeOrZero ({ 0.0f, -out.z0, out.y1 });
+    const Vec3 n3 = normalizeOrZero ({ out.z0, 0.0f, -out.x0 });
+    const float g0 = angleBetweenPlanes (n0, n1);
+    const float g1 = angleBetweenPlanes (n1, n2);
+    const float g2 = angleBetweenPlanes (n2, n3);
+    const float g3 = angleBetweenPlanes (n3, n0);
+    out.b0 = n0.z;
+    out.b1 = n2.z;
+    out.k = 2.0f * kPi - g2 - g3;
+    out.solidAngle = g0 + g1 - out.k;
+    return std::isfinite (out.solidAngle) && out.solidAngle >= kRectMinSolidAngle;
+}
+
+// Point on the rect for u, uniform in the solid angle it subtends.
+bool sampleSphericalRect (const SphericalRect& rect, Vec2 u, Vec3& point) noexcept
+{
+    const float au = u.x * rect.solidAngle + rect.k;
+    const float sinAu = std::sin (au);
+    const float fu = (std::cos (au) * rect.b0 - rect.b1) / sinAu;
+    float cu = (fu > 0.0f ? 1.0f : -1.0f) / std::sqrt (fu * fu + rect.b0 * rect.b0);
+    if (! std::isfinite (cu))
+        cu = 0.0f;
+    cu = std::min (1.0f, std::max (-1.0f, cu));
+    float xu = -(cu * rect.z0) / std::sqrt (std::max (1.0f - cu * cu, 1.0e-12f));
+    xu = std::min (rect.x1, std::max (rect.x0, finiteOrZero (xu)));
+    const float distance = std::sqrt (xu * xu + rect.z0 * rect.z0);
+    const float h0 = rect.y0 / std::sqrt (distance * distance + rect.y0 * rect.y0);
+    const float h1 = rect.y1 / std::sqrt (distance * distance + rect.y1 * rect.y1);
+    const float hv = h0 + u.y * (h1 - h0);
+    const float hv2 = hv * hv;
+    const float yv = hv2 < 1.0f - 1.0e-6f ? hv * distance / std::sqrt (1.0f - hv2) : rect.y1;
+    point = rect.origin + rect.axisX * xu + rect.axisY * std::min (rect.y1, std::max (rect.y0, yv)) + rect.axisZ * rect.z0;
+    return isFinite (point);
 }
 
 bool sameAsset (const visualenvironmentimage::Identity& a, const visualenvironmentimage::Identity& b) noexcept
@@ -175,6 +343,7 @@ void LightSet::clear() noexcept
     cdf_.clear();
     probability_.clear();
     triangleLight_.clear();
+    analytic_.clear();
     environment_ = {};
     environmentLight_ = -1;
     stats_ = {};
@@ -182,7 +351,8 @@ void LightSet::clear() noexcept
 
 void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 ambient,
                       const IngestedScene& geometry, const std::vector<Material>& materials,
-                      const Material& fallback, const EnvironmentPixels* environmentImage)
+                      const Material& fallback, const EnvironmentPixels* environmentImage,
+                      const std::vector<LightShape>* shapes, const std::vector<AreaLightRecord>* areaLights)
 {
     clear();
     std::vector<double> weights;
@@ -218,6 +388,7 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
             continue;
         }
         const Vec3 strength = nonNegative (color * record.intensity);
+        const LightShape shape = shapes != nullptr && i < shapes->size() ? (*shapes)[i] : LightShape {};
         Quat q;
         const bool rotationValid = normalizedRotation (record, q);
         Light light;
@@ -234,6 +405,16 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
                 light.type = LightType::Directional;
                 light.strength = strength;
                 light.direction = toLight;
+                if (std::isfinite (shape.angularRadius) && shape.angularRadius > 1.0e-4f)
+                {
+                    const float a = std::min (shape.angularRadius, 1.5f);
+                    const float halfSine = std::sin (0.5f * a);
+                    const float sine = std::sin (a);
+                    light.coneCos = std::cos (a);
+                    light.coneOneMinusCos = 2.0f * halfSine * halfSine;
+                    light.coneRadianceScale = 1.0f / (kPi * sine * sine);
+                    ++stats_.sizedLights;
+                }
                 ++stats_.directional;
                 push (light, static_cast<double> (average (strength)) * sceneDisk);
                 break;
@@ -256,6 +437,11 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
                 light.strength = strength;
                 light.position = position;
                 light.range = std::max (record.range, 0.0f);
+                if (std::isfinite (shape.radius) && shape.radius > 1.0e-6f)
+                {
+                    light.radius = shape.radius;
+                    ++stats_.sizedLights;
+                }
                 double solidAngle = 4.0 * kPi;
                 if (spot)
                 {
@@ -409,6 +595,53 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
         }
     }
 
+    for (std::size_t a = 0; areaLights != nullptr && a < areaLights->size(); ++a)
+    {
+        const AreaLightRecord& record = (*areaLights)[a];
+        const Vec3 emitted = record.color * record.intensity;
+        Quat q;
+        if (! isFinite (emitted) || ! isFinite (record.position) || ! normalizedQuat (record.rotation, q)
+            || ! std::isfinite (record.sizeX) || ! std::isfinite (record.sizeY) || ! (record.sizeX > 0.0f)
+            || ! (record.sizeY > 0.0f))
+        {
+            ++stats_.invalidLights;
+            continue;
+        }
+        const Vec3 axisX = normalizeOrZero (rotate (q, { 1.0f, 0.0f, 0.0f }));
+        const Vec3 axisY = normalizeOrZero (rotate (q, { 0.0f, 1.0f, 0.0f }));
+        Light light;
+        light.strength = nonNegative (emitted);
+        light.normal = normalizeOrZero (rotate (q, { 0.0f, 0.0f, -1.0f }));
+        light.twoSided = record.twoSided;
+        if (record.shape == AreaLightShape::Rect)
+        {
+            light.type = LightType::Rect;
+            light.edge1 = axisX * record.sizeX;
+            light.edge2 = axisY * record.sizeY;
+            light.vertex0 = record.position - light.edge1 * 0.5f - light.edge2 * 0.5f;
+            light.area = record.sizeX * record.sizeY;
+        }
+        else
+        {
+            light.type = LightType::Disk;
+            light.position = record.position;
+            light.edge1 = axisX * (0.5f * record.sizeX);
+            light.edge2 = axisY * (0.5f * record.sizeY);
+            light.area = 0.25f * kPi * record.sizeX * record.sizeY;
+        }
+        if (! std::isfinite (light.area) || ! (light.area > 0.0f))
+        {
+            ++stats_.invalidLights;
+            continue;
+        }
+        const std::size_t before = lights_.size();
+        // pi * L * A per emitting face.
+        push (light, (light.twoSided ? 2.0 : 1.0) * kPi * static_cast<double> (average (light.strength))
+                         * static_cast<double> (light.area));
+        if (lights_.size() > before)
+            ++stats_.areaLights;
+    }
+
     double total = 0.0;
     for (const double w : weights)
         total += w;
@@ -418,6 +651,14 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
         triangleLight_.assign (triangleCount, -1);
         environmentLight_ = -1;
         return;
+    }
+    for (std::size_t i = 0; i < lights_.size(); ++i)
+    {
+        const Light& light = lights_[i];
+        const bool sized = light.radius > 0.0f || light.coneOneMinusCos > 0.0f || light.type == LightType::Rect
+                        || light.type == LightType::Disk;
+        if (sized)
+            analytic_.push_back (static_cast<std::uint32_t> (i));
     }
     probability_.resize (weights.size());
     cdf_.resize (weights.size());
@@ -452,11 +693,24 @@ bool LightSet::sample (Vec3 p, float uSelect, Vec2 u, LightSample& out) const no
     {
         case LightType::Directional:
         {
+            out.infinite = true;
+            if (light.coneOneMinusCos > 0.0f)
+            {
+                // Uniform in the sun's cone.
+                const float oneMinusCos = u.x * light.coneOneMinusCos;
+                const float cosTheta = 1.0f - oneMinusCos;
+                const float sinTheta = std::sqrt (std::max (0.0f, oneMinusCos * (2.0f - oneMinusCos)));
+                const float phi = kTwoPi * u.y;
+                out.wi = normalizeOrZero (Frame::fromNormal (light.direction)
+                                              .toWorld ({ sinTheta * std::cos (phi), sinTheta * std::sin (phi), cosTheta }));
+                out.radiance = light.strength * light.coneRadianceScale;
+                out.pdf = selection / (kTwoPi * light.coneOneMinusCos);
+                return dot (out.wi, out.wi) > 0.0f && std::isfinite (out.pdf);
+            }
             out.wi = light.direction;
             out.radiance = light.strength;
             out.pdf = selection;
             out.delta = true;
-            out.infinite = true;
             return true;
         }
         case LightType::Point:
@@ -467,16 +721,30 @@ bool LightSet::sample (Vec3 p, float uSelect, Vec2 u, LightSample& out) const no
             if (! (d2 > 0.0f) || ! std::isfinite (d2))
                 return false;
             const float d = std::sqrt (d2);
-            out.wi = toLight * (1.0f / d);
-            float falloff = 1.0f / std::max (d2, 1.0f);
-            if (light.range > 0.0f)
+            const Vec3 axis = toLight * (1.0f / d);
+            if (light.radius > 0.0f && outsideSphere (light, d2))
             {
-                const float window = clampUnit (1.0f - d / light.range);
-                falloff *= window * window;
+                // Uniform in the cone the sphere subtends.
+                const float coneWidth = sphereConeOneMinusCos (light.radius, d2);
+                const float oneMinusCos = u.x * coneWidth;
+                const float cosTheta = 1.0f - oneMinusCos;
+                const float sinTheta = std::sqrt (std::max (0.0f, oneMinusCos * (2.0f - oneMinusCos)));
+                const float phi = kTwoPi * u.y;
+                out.wi = normalizeOrZero (Frame::fromNormal (axis)
+                                              .toWorld ({ sinTheta * std::cos (phi), sinTheta * std::sin (phi), cosTheta }));
+                // Nearest intersection with the sphere along wi.
+                const float along = dot (out.wi, toLight);
+                const float disc = light.radius * light.radius - std::max (0.0f, d2 - along * along);
+                const float t = std::max (0.0f, along - std::sqrt (std::max (0.0f, disc)));
+                out.radiance = sphereRadiance (light, d2, -axis);
+                out.point = p + out.wi * t;
+                out.distance = t;
+                out.pdf = selection / (kTwoPi * coneWidth);
+                return dot (out.wi, out.wi) > 0.0f && std::isfinite (out.pdf) && out.pdf > 0.0f;
             }
-            if (light.type == LightType::Spot)
-                falloff *= spotCone (dot (light.direction, -out.wi), light.cosOuter, light.cosInner);
-            out.radiance = light.strength * falloff;
+            // A point light, or a shading point inside the sphere.
+            out.wi = axis;
+            out.radiance = light.strength * pointFalloff (light, d2, -axis);
             out.point = light.position;
             out.distance = d;
             out.pdf = selection;
@@ -518,6 +786,125 @@ bool LightSet::sample (Vec3 p, float uSelect, Vec2 u, LightSample& out) const no
             out.area = true;
             return std::isfinite (out.pdf) && out.pdf > 0.0f;
         }
+        case LightType::Rect:
+        case LightType::Disk:
+        {
+            if (! planarLightFaces (light, p))
+                return false;
+            Vec3 q;
+            float directionPdf = 0.0f;
+            SphericalRect rect;
+            if (light.type == LightType::Rect && sphericalRectFrom (light, p, rect))
+            {
+                if (! sampleSphericalRect (rect, u, q))
+                    return false;
+                directionPdf = 1.0f / rect.solidAngle;
+            }
+            else if (light.type == LightType::Rect)
+            {
+                q = light.vertex0 + light.edge1 * u.x + light.edge2 * u.y;
+            }
+            else
+            {
+                const Vec2 disk = concentricDisk (u);
+                q = light.position + light.edge1 * disk.x + light.edge2 * disk.y;
+            }
+            const Vec3 toLight = q - p;
+            const float d2 = dot (toLight, toLight);
+            if (! (d2 > 0.0f) || ! std::isfinite (d2))
+                return false;
+            const float d = std::sqrt (d2);
+            out.wi = toLight * (1.0f / d);
+            const float cosAtLight = std::fabs (dot (light.normal, out.wi));
+            if (! (cosAtLight > 1.0e-6f))
+                return false;
+            if (! (directionPdf > 0.0f))
+                directionPdf = d2 / (cosAtLight * light.area);
+            out.radiance = light.strength;
+            out.point = q;
+            out.lightNormal = light.normal;
+            out.distance = d;
+            out.pdf = selection * directionPdf;
+            return std::isfinite (out.pdf) && out.pdf > 0.0f;
+        }
+    }
+    return false;
+}
+
+bool LightSet::analyticHit (std::size_t index, Vec3 origin, Vec3 direction, float tMax, Vec3& radiance,
+                            float& pdf, float& distance) const noexcept
+{
+    radiance = {};
+    pdf = 0.0f;
+    distance = std::numeric_limits<float>::infinity();
+    if (index >= analytic_.size())
+        return false;
+    const std::size_t slot = analytic_[index];
+    const Light& light = lights_[slot];
+    const float selection = probability_[slot];
+    switch (light.type)
+    {
+        case LightType::Directional:
+        {
+            if (! std::isinf (tMax) || ! (light.coneOneMinusCos > 0.0f) || dot (direction, light.direction) < light.coneCos)
+                return false;
+            radiance = light.strength * light.coneRadianceScale;
+            pdf = selection / (kTwoPi * light.coneOneMinusCos);
+            return true;
+        }
+        case LightType::Point:
+        case LightType::Spot:
+        {
+            const Vec3 toLight = light.position - origin;
+            const float d2 = dot (toLight, toLight);
+            // From inside, light sampling treats the sphere as a point.
+            if (! (light.radius > 0.0f) || ! outsideSphere (light, d2))
+                return false;
+            const float along = dot (direction, toLight);
+            const float disc = light.radius * light.radius - (d2 - along * along);
+            if (! (disc >= 0.0f) || ! (along > 0.0f))
+                return false;
+            const float t = along - std::sqrt (disc);
+            if (! (t > 0.0f) || ! (t < tMax))
+                return false;
+            radiance = sphereRadiance (light, d2, toLight * (-1.0f / std::sqrt (d2)));
+            distance = t;
+            pdf = selection / (kTwoPi * sphereConeOneMinusCos (light.radius, d2));
+            return true;
+        }
+        case LightType::Rect:
+        case LightType::Disk:
+        {
+            if (! planarLightFaces (light, origin))
+                return false;
+            const float denominator = dot (direction, light.normal);
+            if (! (std::fabs (denominator) > 1.0e-8f))
+                return false;
+            const Vec3 onPlane = light.type == LightType::Rect ? light.vertex0 : light.position;
+            const float t = dot (onPlane - origin, light.normal) / denominator;
+            if (! (t > 0.0f) || ! (t < tMax))
+                return false;
+            const Vec3 offset = origin + direction * t - onPlane;
+            const float a = dot (offset, light.edge1) / dot (light.edge1, light.edge1);
+            const float b = dot (offset, light.edge2) / dot (light.edge2, light.edge2);
+            const bool inside = light.type == LightType::Rect ? a >= 0.0f && a <= 1.0f && b >= 0.0f && b <= 1.0f
+                                                              : a * a + b * b <= 1.0f;
+            if (! inside)
+                return false;
+            float directionPdf = 0.0f;
+            SphericalRect rect;
+            if (light.type == LightType::Rect && sphericalRectFrom (light, origin, rect))
+                directionPdf = 1.0f / rect.solidAngle;
+            else
+                directionPdf = t * t / (std::fabs (denominator) * light.area);
+            radiance = light.strength;
+            pdf = selection * directionPdf;
+            distance = t;
+            return std::isfinite (pdf);
+        }
+        case LightType::Environment:
+        case LightType::Triangle:
+            return false;
     }
     return false;
 }

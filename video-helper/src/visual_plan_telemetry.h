@@ -19,6 +19,8 @@ inline constexpr size_t kMaxCompiledNodesPerGraph = 256;
 inline constexpr size_t kMaxIntermediateImagesPerGraph = 32;
 inline constexpr size_t kMaxTelemetryNodes = kMaxTelemetryPlans * kMaxCompiledNodesPerGraph;
 inline constexpr uint64_t kPlanLoweringBudgetNs = 2'000'000;
+// A caustic degradation reason is one short sentence. Longer text is cut.
+inline constexpr size_t kMaxCausticDegradationBytes = 512;
 
 enum class VisualTransportMode : uint8_t { none, zeroCopy, readback };
 enum class VisualBackend : uint8_t { openGL, metal, vulkan, software };
@@ -76,7 +78,12 @@ struct VisualTelemetrySnapshot
     std::string lastLoweringError;
     size_t executableNodeTotal = 0;
     bool executableNodeSubsetTruncated = false;
-    VisualDurationCounter compositor, presentation, particles, generators;
+    VisualDurationCounter compositor, presentation, particles, generators, importedSceneRender;
+    // Size of the last imported scene preview render. 0 x 0 until one completes.
+    uint32_t importedScenePreviewWidth = 0, importedScenePreviewHeight = 0;
+    // Why the last imported scene preview rendered its glass caustic reduced or not at all.
+    // Empty when it rendered as planned or no preview has rendered yet.
+    std::string importedSceneCausticDegradation;
     bool transportObserved = false, zeroCopyAllocationObserved = false;
     VisualTransportMode transportMode = VisualTransportMode::none;
     uint64_t zeroCopyFrames = 0, zeroCopyAllocationBytes = 0, readbackFrames = 0, readbackCopiedBytes = 0;
@@ -164,6 +171,48 @@ public:
         if (! lock.owns_lock()) return dropRecording();
         applyResetAndPending();
         addDuration(kind == VisualExecutionKind::generator ? generators_ : particles_, durationNs);
+        return true;
+    }
+    // Preview render of one imported scene, measured around the native execute call.
+    // That work runs in the prepare step, ahead of the graph timer, so recordEvaluation()
+    // never sees it. Export has its own timing and never reports here.
+    bool recordImportedSceneRender (uint64_t durationNs)
+    {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (! lock.owns_lock()) return dropRecording();
+        applyResetAndPending();
+        addDuration(importedSceneRender_, durationNs);
+        return true;
+    }
+    // Size the last completed imported scene preview was rendered at. It can be smaller
+    // than the canvas; export never reports here.
+    bool recordImportedScenePreviewExtent (uint32_t width, uint32_t height)
+    {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (! lock.owns_lock()) return dropRecording();
+        applyResetAndPending();
+        importedScenePreviewWidth_ = width; importedScenePreviewHeight_ = height;
+        return true;
+    }
+    // Latest caustic degradation reason of a completed imported scene preview. An empty reason
+    // clears it, so a frame that renders the caustic as planned removes the HUD warning.
+    // Export never reports here; an export that cannot fit the caustic refuses instead.
+    bool recordImportedSceneCausticDegradation (const std::string& reason)
+    {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (! lock.owns_lock()) return dropRecording();
+        applyResetAndPending();
+        importedSceneCausticDegradation_.assign (reason, 0, kMaxCausticDegradationBytes);
+        return true;
+    }
+    // The consumer returned a handed-off zero-copy buffer, so the frame was shown or dropped
+    // downstream. Handoff alone is not presentation.
+    bool recordTransportRelease()
+    {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (! lock.owns_lock()) return dropRecording();
+        if (transportMode_ != VisualTransportMode::zeroCopy) return false;
+        framesPresented_ = saturatingAdd(framesPresented_, 1);
         return true;
     }
     bool recordRuntime (uint64_t compositorNs, uint64_t presentationNs, uint64_t,
@@ -419,7 +468,8 @@ public:
                 out.nodes.push_back({ slot.clipId, slot.revision, slot.nodeIds[n], slot.nodeAvailable[n],
                     slot.nodeEvaluations[n], slot.nodeMeasuredTotalNs[n], slot.nodeMeasuredMovingNs[n] });
         }
-        out.compositor = compositor_; out.presentation = presentation_; out.particles = particles_; out.generators = generators_;
+        out.compositor = compositor_; out.presentation = presentation_; out.particles = particles_; out.generators = generators_; out.importedSceneRender = importedSceneRender_; out.importedScenePreviewWidth = importedScenePreviewWidth_; out.importedScenePreviewHeight = importedScenePreviewHeight_;
+        out.importedSceneCausticDegradation = importedSceneCausticDegradation_;
         out.transportObserved = transportObserved_; out.zeroCopyAllocationObserved = zeroCopyAllocationObserved_; out.transportMode = transportMode_; out.zeroCopyFrames = zeroCopyFrames_; out.zeroCopyAllocationBytes = zeroCopyAllocationBytes_; out.readbackFrames = readbackFrames_; out.readbackCopiedBytes = readbackCopiedBytes_; out.transportFramesHandedOff = transportFramesHandedOff_;
         out.framesRendered = framesRendered_; out.framesPresented = framesPresented_; out.exportHandoffFrames = exportHandoffFrames_; out.framesDropped = framesDropped_;
         out.presentationModeObserved = presentationModeObserved_; out.presentationMode = presentationMode_;
@@ -441,9 +491,10 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         graphEvaluations_ = graphMeasuredTotalNs_ = planCacheHits_ = planCacheMisses_ = planInstalls_ = value;
-        compositor_.observed = presentation_.observed = particles_.observed = generators_.observed = true;
+        compositor_.observed = presentation_.observed = particles_.observed = generators_.observed = importedSceneRender_.observed = true;
         compositor_.count = compositor_.totalNs = presentation_.count = presentation_.totalNs = value;
         particles_.count = particles_.totalNs = generators_.count = generators_.totalNs = value;
+        importedSceneRender_.count = importedSceneRender_.totalNs = value;
         zeroCopyFrames_ = zeroCopyAllocationBytes_ = readbackFrames_ = readbackCopiedBytes_ = transportFramesHandedOff_ = value;
         framesRendered_ = framesPresented_ = exportHandoffFrames_ = framesDropped_ = droppedNoBuffer_ = droppedTransportFailure_ = value;
         droppedRenderFailure_ = droppedDimensionMismatch_ = droppedBlitFailure_ = droppedFenceFailure_ = droppedSocketFailure_ = value;
@@ -517,7 +568,9 @@ private:
         graphEvaluations_ = graphMeasuredTotalNs_ = 0; graphMeasuredMovingNs_ = 0.0;
         planCacheHits_ = planCacheMisses_ = lastPlanLoweringNs_ = planInstalls_ = 0;
         lastPlanLoweringWithinBudget_ = true;
-        compositor_ = {}; presentation_ = {}; particles_ = {}; generators_ = {};
+        compositor_ = {}; presentation_ = {}; particles_ = {}; generators_ = {}; importedSceneRender_ = {};
+        importedScenePreviewWidth_ = importedScenePreviewHeight_ = 0;
+        importedSceneCausticDegradation_.clear();
         presentationModeObserved_ = false; presentationMode_ = VisualPresentationMode::none;
         transportObserved_ = zeroCopyAllocationObserved_ = false; transportMode_ = VisualTransportMode::none;
         zeroCopyFrames_ = zeroCopyAllocationBytes_ = readbackFrames_ = readbackCopiedBytes_ = transportFramesHandedOff_ = 0;
@@ -606,7 +659,9 @@ private:
     std::string lastLoweringError_;
     std::atomic<uint64_t> resetGeneration_ { 0 }, droppedSamples_ { 0 };
     std::array<PendingSlot, 64> pending_ {};
-    VisualDurationCounter compositor_, presentation_, particles_, generators_;
+    VisualDurationCounter compositor_, presentation_, particles_, generators_, importedSceneRender_;
+    uint32_t importedScenePreviewWidth_ = 0, importedScenePreviewHeight_ = 0;
+    std::string importedSceneCausticDegradation_;
     bool presentationModeObserved_ = false; VisualPresentationMode presentationMode_ = VisualPresentationMode::none;
     bool transportObserved_ = false, zeroCopyAllocationObserved_ = false;
     VisualTransportMode transportMode_ = VisualTransportMode::none;

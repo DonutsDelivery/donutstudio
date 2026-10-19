@@ -43,15 +43,17 @@ if enum_at < 0 or struct_at < 0 or enum_at > struct_at:
 if 'if (! smoothGlass) text += "uniform vec4 uRoughCameraControl;\\nuniform vec4 uGlassTransport;\\n";' not in backend:
     errors.append("fixtureFragmentShaderSource must declare uRoughCameraControl and uGlassTransport when smooth glass is off")
 
-# Split complete() into the common, smooth-glass and diffraction groups.
+# Split complete() into the common, smooth-glass, diffraction and diffraction-layer groups.
+complete_return = "return common && glass && diffractionUniforms && stamLayerUniforms;"
 body = region(backend, "bool complete (unsigned features) const noexcept",
-              "return common && glass && diffractionUniforms;", "OpenGlFixtureUniformLocations")
-body += "return common && glass && diffractionUniforms;"
-if "return common && glass && diffractionUniforms;" not in backend:
-    errors.append("complete() must return the three groups together")
+              complete_return, "OpenGlFixtureUniformLocations")
+body += complete_return
+if complete_return not in backend:
+    errors.append("complete() must return the four groups together")
 common = region(body, "const bool common =", "const bool glass =", "complete()")
 glass = region(body, "const bool glass =", "const bool diffractionUniforms =", "complete()")
-diffraction = region(body, "const bool diffractionUniforms =", "return", "complete()")
+diffraction = region(body, "const bool diffractionUniforms =", "const bool layered =", "complete()")
+layer = region(body, "const bool layered =", "return", "complete()")
 
 
 def fields(text):
@@ -61,6 +63,7 @@ def fields(text):
 common_fields = fields(common)
 glass_fields = fields(glass)
 diffraction_fields = fields(diffraction)
+layer_fields = fields(layer)
 
 if not {"glassTexture", "glassControl", "glassReceivers", "glassEmission"} <= glass_fields:
     errors.append("the smooth-glass group must require glassTexture, glassControl, glassReceivers and glassEmission")
@@ -70,7 +73,9 @@ if "materialKind" not in diffraction_fields or "diffractionQueryTexture" not in 
     errors.append("the diffraction group must require materialKind and diffractionQueryTexture")
 if "smoothGlass" not in glass or "diffraction" not in diffraction:
     errors.append("the glass and diffraction groups must be conditioned on their feature bits")
-for name in sorted(common_fields & (glass_fields | diffraction_fields)):
+if layer_fields != {"stamLayer"} or "kFixtureFragmentStamLayer" not in layer or "! layered" not in layer:
+    errors.append("the diffraction-layer group must require only stamLayer, conditioned on kFixtureFragmentStamLayer")
+for name in sorted(common_fields & (glass_fields | diffraction_fields | layer_fields)):
     errors.append("field " + name + " is required both in the common group and a gated group")
 
 # GLSL name for each uniform field, from the location lookups.

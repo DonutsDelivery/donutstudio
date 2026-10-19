@@ -7,6 +7,11 @@
 #include "fixture_glass_camera_cell_coverage.h"
 #include "fixture_native_camera_pixel_signs.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <string>
+
 namespace arbitgpu
 {
 enum class OpenGlQueryArithmeticRole : std::uint32_t
@@ -41,8 +46,320 @@ struct OpenGlGlassCausticDiagnostics
     glasscaustics::DepositionSchedule deposition;
     double baseMilliseconds=0,rasterMilliseconds=0,traceMilliseconds=0,sortMilliseconds=0;
     double reduceMilliseconds=0,readbackMilliseconds=0,resolveMilliseconds=0,frameMilliseconds=0;
+    // Splat frames: sortMilliseconds covers tile keys, sort and segments, and
+    // reduceMilliseconds the gather. splatVersion 0 is single-pixel deposition.
+    std::uint32_t splatVersion=0;
+    std::uint64_t splatGatherWork=0;
+    double normaliserMilliseconds=0;
+    // The splat caps overflowed and the frame re-ran as single-pixel deposits.
+    bool splatFallback=false;
+    // Preview frames: no host receipt, and whether the spectrum or query program was reused.
+    // Preview stages do not wait, so their host times are encode times. The GPU times come
+    // from timestamps; deposition covers the splat normaliser, sort and reduce or gather.
+    bool preview=false,spectrumReused=false,queryProgramReused=false;
+    std::uint64_t workCount=0;
+    double gpuRasterMilliseconds=0,gpuTraceMilliseconds=0,gpuDepositionMilliseconds=0,gpuResolveMilliseconds=0;
 };
-// Backend-private native route used by the scene-linear Color dispatcher.
+// Who consumes a caustic render. Export keeps the full entry schedule, a fence after
+// every stage and band, and the host receipt: paths, deposits, keys and spectrum mapped,
+// decoded and validated, and the resolved Color read back and checked finite. Preview
+// only draws Color. It traces a coarser entry schedule, flushes between stages, and
+// reuses the spectrum of an unchanged frame. Up to kPreviewCausticUnfencedPixels it never
+// waits on the caustic: the submission is fenced and polled on later frames, the splat
+// counters are read only after that fence signals, and the resolve is not fenced. Larger
+// extents still wait on each gather band. Nothing else is read back.
+enum class OpenGlCausticRenderUse : std::uint8_t { Export=0, Preview };
+// Preview entry subdivisions. Each entry carries subdivisions^-2 of its triangle's
+// area, so a coarser schedule keeps the projected power and traces 1/4 of the paths.
+inline constexpr std::size_t kPreviewCausticEntrySubdivisions=2;
+// Preview gather bands still wait one by one above this extent, where a band nears
+// the per-submission work the export bands bound.
+inline constexpr std::uint64_t kPreviewCausticUnfencedPixels=2560ull*1440ull;
+// The retained preview spectrum is two RGBA32F buffers, 29.5 MB at this extent.
+inline constexpr std::uint64_t kPreviewCausticReusePixels=1280ull*720ull;
+// Preview frames slower than this log their per-stage timings.
+inline constexpr double kPreviewCausticSlowFrameMilliseconds=100;
+struct OpenGlCausticRenderPlan
+{
+    glasscaustics::SchedulingDescription scheduling;
+    bool hostReceipt=true,stageFences=true,bandFences=true,reuseSpectrum=false;
+};
+inline OpenGlCausticRenderPlan openGlCausticRenderPlan(OpenGlCausticRenderUse use,std::uint32_t width,std::uint32_t height)
+{
+    OpenGlCausticRenderPlan plan;
+    if(use!=OpenGlCausticRenderUse::Preview)return plan;
+    const auto pixels=std::uint64_t(width)*height;
+    plan.scheduling.entrySubdivisions=kPreviewCausticEntrySubdivisions;
+    plan.hostReceipt=false;plan.stageFences=false;
+    plan.bandFences=pixels>kPreviewCausticUnfencedPixels;plan.reuseSpectrum=pixels<=kPreviewCausticReusePixels;
+    return plan;
+}
+// A preview frame splats only when the export schedule of the same frame would, so
+// the smaller entry budget never turns a single-pixel caustic into a splat one.
+inline bool openGlCausticPreviewSplatAllowed(const glasscaustics::Frame& frame)
+{
+    const auto subdivisions=std::uint64_t(frame.scheduling.entrySubdivisions);
+    if(frame.work.empty()||!subdivisions||glasscaustics::kEntrySubdivisions%subdivisions
+        ||frame.bounds.maximumDeposits%frame.work.size())return false;
+    const auto ratio=(glasscaustics::kEntrySubdivisions/subdivisions)*(glasscaustics::kEntrySubdivisions/subdivisions);
+    glasscaustics::SplatSchedule full;std::string error;
+    return glasscaustics::calculateSplatSchedule(frame.width,frame.height,frame.work.size()*ratio,
+        frame.bounds.maximumDeposits/frame.work.size(),glasscaustics::splatKeySlots(frame),full,error);
+}
+// The native GL limits a caustic frame must fit. Software GL such as llvmpipe caps one
+// storage block at 128 MiB, which a full deposit receipt buffer can pass.
+struct OpenGlCausticDeviceLimits
+{
+    std::uint64_t maximumStorageBlockBytes=0,maximumWorkGroupsX=0,maximumTextureSize=0;
+    std::uint64_t maximumInvocations=0,maximumLocalSizeX=0,storageBindings=0,computeStorageBlocks=0;
+    std::uint64_t maximumWorkGroupsY=0,maximumLocalSizeY=0;
+};
+// The storage, dispatch and texture sizes of one caustic frame. bytes[5] holds keyCount
+// keys: the deposition key count, or the splat key count once a frame splats.
+struct OpenGlCausticStorageDemand
+{
+    std::uint64_t workCount=0,textureExtent=0,depositionKeys=0;
+    std::array<std::uint64_t,7> bytes{};
+};
+inline constexpr std::array<const char*,7> kOpenGlCausticStorageNames{
+    "path receipts","deposit receipts","spectrum","work texels","triangle texels","deposition keys","resolve spectrum"};
+inline OpenGlCausticStorageDemand openGlCausticStorageDemand(const glasscaustics::Frame& frame,std::uint64_t keyCount)
+{
+    namespace gc=glasscaustics;
+    OpenGlCausticStorageDemand demand;
+    const auto pixels=std::uint64_t(frame.width)*frame.height;
+    demand.workCount=frame.work.size();demand.depositionKeys=frame.bounds.deposition.paddedKeyCount;
+    demand.textureExtent=std::max({std::uint64_t(frame.width),std::uint64_t(frame.height),
+        std::uint64_t(opaquevisibility::kTextureWidth),std::uint64_t(frame.query.height)});
+    demand.bytes={frame.work.size()*gc::kPathReceiptStride*sizeof(gc::Texel),
+        frame.bounds.maximumDeposits*gc::kDepositReceiptStride*sizeof(gc::Texel),pixels*4*sizeof(float),
+        frame.workTexels.size()*sizeof(gc::Texel),frame.triangleTexels.size()*sizeof(gc::Texel),
+        keyCount*sizeof(gc::DepositionKey),pixels*4*sizeof(float)};
+    return demand;
+}
+inline std::string openGlCausticMebibytes(std::uint64_t bytes)
+{
+    char text[32];std::snprintf(text,sizeof(text),"%.1f MiB",double(bytes)/(1024.0*1024.0));return text;
+}
+// Names the first limit the demand exceeds, with the needed size and the limit, or returns
+// an empty string when the frame fits. The deposition key buffer and its dispatch repeat
+// admitDepositionDevice at 32 threads and four bands per buffer.
+inline std::string openGlCausticLimitFailure(const OpenGlCausticDeviceLimits& limits,const OpenGlCausticStorageDemand& demand)
+{
+    const auto count=[](std::uint64_t value){return std::to_string(value);};
+    if(limits.maximumInvocations<32||limits.maximumLocalSizeX<32)
+        return "compute work group of 32 threads exceeds max invocations "+count(limits.maximumInvocations)+" or local size "+count(limits.maximumLocalSizeX);
+    if(limits.storageBindings<7||limits.computeStorageBlocks<5)
+        return "7 storage bindings and 5 compute blocks exceed max bindings "+count(limits.storageBindings)+" or compute blocks "+count(limits.computeStorageBlocks);
+    if(!limits.maximumStorageBlockBytes||!limits.maximumWorkGroupsX)return "GL reports no storage block size or work group count";
+    for(std::size_t i=0;i<demand.bytes.size();++i)
+        if(demand.bytes[i]>limits.maximumStorageBlockBytes)
+            return std::string(kOpenGlCausticStorageNames[i])+" need "+openGlCausticMebibytes(demand.bytes[i])
+                +", max SSBO "+openGlCausticMebibytes(limits.maximumStorageBlockBytes);
+    const auto keyBytes=demand.depositionKeys*sizeof(glasscaustics::DepositionKey);
+    if(keyBytes>limits.maximumStorageBlockBytes)
+        return "deposition keys need "+openGlCausticMebibytes(keyBytes)+", max SSBO "+openGlCausticMebibytes(limits.maximumStorageBlockBytes);
+    if(demand.workCount>limits.maximumWorkGroupsX*32)
+        return "trace needs "+count((demand.workCount+31)/32)+" work groups, max work group count "+count(limits.maximumWorkGroupsX);
+    if((demand.depositionKeys+31)/32>limits.maximumWorkGroupsX)
+        return "deposition needs "+count((demand.depositionKeys+31)/32)+" work groups, max work group count "+count(limits.maximumWorkGroupsX);
+    if(demand.textureExtent>limits.maximumTextureSize)
+        return "texture extent "+count(demand.textureExtent)+" exceeds max texture size "+count(limits.maximumTextureSize);
+    return {};
+}
+// The extra terms of a splat frame: binding 7, 16x16 gather groups (four per tile), and
+// dispatches over the splat key count and every trace slot.
+struct OpenGlCausticSplatDemand
+{
+    std::uint64_t scratchWords=0,keyCount=0,slots=0,maximumDeposits=0,tilesX=0,tilesY=0;
+};
+// Names the first splat term past its limit, with the need and the limit, or returns empty.
+inline std::string openGlCausticSplatLimitFailure(const OpenGlCausticDeviceLimits& limits,const OpenGlCausticSplatDemand& demand)
+{
+    const auto count=[](std::uint64_t value){return std::to_string(value);};
+    const auto side=std::uint64_t(glasscaustics::kSplatGatherGroup);
+    const auto groupsPerTile=std::uint64_t(glasscaustics::kSplatTile/glasscaustics::kSplatGatherGroup);
+    const auto groups=[&](std::uint64_t work){return (work+31)/32;};
+    if(limits.storageBindings<8)return "splat needs 8 storage bindings, max "+count(limits.storageBindings);
+    if(limits.computeStorageBlocks<7)return "splat needs 7 compute storage blocks, max "+count(limits.computeStorageBlocks);
+    if(limits.maximumInvocations<side*side)
+        return "splat needs "+count(side*side)+" invocations per work group, max "+count(limits.maximumInvocations);
+    if(limits.maximumLocalSizeX<side)return "splat needs local size X "+count(side)+", max "+count(limits.maximumLocalSizeX);
+    if(limits.maximumLocalSizeY<side)return "splat needs local size Y "+count(side)+", max "+count(limits.maximumLocalSizeY);
+    if(demand.scratchWords*sizeof(std::uint32_t)>limits.maximumStorageBlockBytes)
+        return "splat scratch needs "+openGlCausticMebibytes(demand.scratchWords*sizeof(std::uint32_t))
+            +", max SSBO "+openGlCausticMebibytes(limits.maximumStorageBlockBytes);
+    if(demand.keyCount>std::uint64_t(std::numeric_limits<int>::max()))
+        return "splat needs "+count(demand.keyCount)+" keys, max "+count(std::uint64_t(std::numeric_limits<int>::max()));
+    if(demand.slots>demand.maximumDeposits)
+        return "splat needs "+count(demand.slots)+" trace slots, max "+count(demand.maximumDeposits)+" deposit slots";
+    if(groups(demand.keyCount)>limits.maximumWorkGroupsX)
+        return "splat keys need "+count(groups(demand.keyCount))+" work groups, max work group count "+count(limits.maximumWorkGroupsX);
+    if(groups(demand.slots)>limits.maximumWorkGroupsX)
+        return "splat slots need "+count(groups(demand.slots))+" work groups, max work group count "+count(limits.maximumWorkGroupsX);
+    if(demand.tilesX*groupsPerTile>limits.maximumWorkGroupsX)
+        return "splat gather needs "+count(demand.tilesX*groupsPerTile)+" X work groups, max "+count(limits.maximumWorkGroupsX);
+    if(demand.tilesY*groupsPerTile>limits.maximumWorkGroupsY)
+        return "splat gather needs "+count(demand.tilesY*groupsPerTile)+" Y work groups, max "+count(limits.maximumWorkGroupsY);
+    return {};
+}
+// Preview steps down one entry subdivision level when the plan does not fit: 4 to 2, 2 to 1.
+// 0 means no smaller valid schedule.
+inline std::size_t openGlCausticReducedEntrySubdivisions(std::size_t subdivisions)
+{return subdivisions>1&&glasscaustics::validScheduling({glasscaustics::kScheduleVersion,subdivisions/2})?subdivisions/2:0;}
+// Full renders the planned schedule. Reduced renders entrySubdivisions instead. Off renders
+// the scene without the caustic and carries reason as a non-fatal warning. Refused is the
+// Export answer when the plan does not fit, so an export never silently drops the caustic.
+enum class OpenGlCausticAdmission : std::uint8_t { Full, Reduced, Off, Refused };
+struct OpenGlCausticAdmissionDecision
+{
+    OpenGlCausticAdmission admission=OpenGlCausticAdmission::Refused;
+    std::size_t entrySubdivisions=0;
+    std::string reason;
+};
+// planned is the demand at planSubdivisions. reduced is the demand at
+// openGlCausticReducedEntrySubdivisions(planSubdivisions), or null when none was built.
+inline OpenGlCausticAdmissionDecision decideOpenGlCausticAdmission(OpenGlCausticRenderUse use,
+    const OpenGlCausticDeviceLimits& limits,std::size_t planSubdivisions,
+    const OpenGlCausticStorageDemand& planned,const OpenGlCausticStorageDemand* reduced)
+{
+    OpenGlCausticAdmissionDecision decision;
+    const auto failure=openGlCausticLimitFailure(limits,planned);
+    if(failure.empty()) {decision.admission=OpenGlCausticAdmission::Full;decision.entrySubdivisions=planSubdivisions;return decision;}
+    if(use!=OpenGlCausticRenderUse::Preview)
+    {decision.reason="OpenGL caustic admitted storage exceeds native GL limits: "+failure;return decision;}
+    const auto smaller=openGlCausticReducedEntrySubdivisions(planSubdivisions);
+    if(reduced&&smaller)
+    {
+        const auto reducedFailure=openGlCausticLimitFailure(limits,*reduced);
+        if(reducedFailure.empty())
+        {
+            decision.admission=OpenGlCausticAdmission::Reduced;decision.entrySubdivisions=smaller;
+            decision.reason="caustic reduced to "+std::to_string(smaller)+" entry subdivisions: "+failure;return decision;
+        }
+        decision.admission=OpenGlCausticAdmission::Off;decision.reason="caustic off: exceeds GL limits ("+reducedFailure+")";return decision;
+    }
+    decision.admission=OpenGlCausticAdmission::Off;decision.reason="caustic off: exceeds GL limits ("+failure+")";return decision;
+}
+// The Preview caustic runs across frames. A frame submits the raster, trace and deposition
+// with a fence and never waits on it. Later frames poll the fence, and the spectrum is
+// resolved once it signals. The time checked against this budget is the GPU span from the
+// raster start to the deposition end, read from timestamps after the fence signals. Without
+// timestamps, the submission's age at the poll that found it signalled stands in. A submission
+// still running at four times the budget is checked by its age at once. The admission above
+// runs from static limits; this ladder adds measured time.
+inline constexpr double kPreviewCausticSubmitBudgetMilliseconds=250;
+// Consecutive submissions over budget before the ladder steps down one level.
+inline constexpr unsigned kPreviewCausticOverBudgetSteps=2;
+// One submission past this multiple of the budget steps down at once.
+inline constexpr double kPreviewCausticSevereBudgetFactor=4;
+// Consecutive submissions within budget before Reduced retries Full.
+inline constexpr unsigned kPreviewCausticRetryWithinSteps=120;
+// Off retries Reduced after this long. Each retry that falls back to Off doubles it, up to the cap.
+inline constexpr double kPreviewCausticOffRetryMilliseconds=30000,kPreviewCausticOffRetryCapMilliseconds=480000;
+// True when a submission took longer than the budget. A non-finite time counts as over.
+inline bool decidePreviewCausticOverBudget(double elapsedMs,double budgetMs)
+{return budgetMs>0&&!(elapsedMs<=budgetMs);}
+// Whole milliseconds for a reason string. A negative or non-finite time reads 0.
+inline std::string previewCausticMilliseconds(double elapsedMs)
+{
+    const auto ms=std::isfinite(elapsedMs)&&elapsedMs>0?static_cast<long long>(std::min(elapsedMs,1e15)+.5):0LL;
+    return std::to_string(ms)+" ms";
+}
+// The HUD reason of a Preview frame drawn without its caustic while the submission runs.
+inline std::string previewCausticOverBudgetReason(double elapsedMs)
+{return "caustic submit over budget ("+previewCausticMilliseconds(elapsedMs)+")";}
+enum class OpenGlPreviewCausticLevel : std::uint8_t { Full=0, Reduced, Off };
+struct OpenGlPreviewCausticBudget
+{
+    OpenGlPreviewCausticLevel level=OpenGlPreviewCausticLevel::Full;
+    unsigned over=0,within=0;
+    // Off: when it was entered and how long it waits before retrying Reduced.
+    double offSinceMs=0,offRetryMs=kPreviewCausticOffRetryMilliseconds;
+    // A Reduced level entered by an Off retry. Falling back to Off doubles the wait.
+    bool retrying=false;
+    std::string reason;
+};
+// Records one submission's elapsed time and steps the level. Full steps to Reduced and
+// Reduced to Off after kPreviewCausticOverBudgetSteps consecutive submissions over budget,
+// or after one past kPreviewCausticSevereBudgetFactor times the budget. Reduced returns to
+// Full after kPreviewCausticRetryWithinSteps within budget. Returns true when the level changed.
+inline bool stepPreviewCausticBudget(OpenGlPreviewCausticBudget& state,double elapsedMs,double nowMs,
+    double budgetMs=kPreviewCausticSubmitBudgetMilliseconds)
+{
+    if(state.level==OpenGlPreviewCausticLevel::Off)return false;
+    if(!decidePreviewCausticOverBudget(elapsedMs,budgetMs))
+    {
+        state.over=0;
+        if(state.level!=OpenGlPreviewCausticLevel::Reduced||++state.within<kPreviewCausticRetryWithinSteps)return false;
+        state.level=OpenGlPreviewCausticLevel::Full;state.within=0;state.retrying=false;
+        state.offRetryMs=kPreviewCausticOffRetryMilliseconds;state.reason.clear();return true;
+    }
+    state.within=0;
+    const bool severe=!(elapsedMs<kPreviewCausticSevereBudgetFactor*budgetMs);
+    if(++state.over<kPreviewCausticOverBudgetSteps&&!severe)return false;
+    state.over=0;
+    const auto over="submit over budget ("+previewCausticMilliseconds(elapsedMs)+")";
+    if(state.level==OpenGlPreviewCausticLevel::Full)
+    {state.level=OpenGlPreviewCausticLevel::Reduced;state.reason="caustic reduced: "+over;return true;}
+    if(state.retrying)state.offRetryMs=std::min(2*state.offRetryMs,kPreviewCausticOffRetryCapMilliseconds);
+    state.level=OpenGlPreviewCausticLevel::Off;state.offSinceMs=nowMs;state.retrying=false;
+    state.reason="caustic off: "+over;return true;
+}
+// Off retries Reduced once its wait has passed. Returns true when the level changed.
+inline bool retryPreviewCausticBudget(OpenGlPreviewCausticBudget& state,double nowMs)
+{
+    if(state.level!=OpenGlPreviewCausticLevel::Off||nowMs-state.offSinceMs<state.offRetryMs)return false;
+    state.level=OpenGlPreviewCausticLevel::Reduced;state.over=0;state.within=0;state.retrying=true;
+    state.reason="caustic reduced: retrying after submit over budget";return true;
+}
+// A completed Preview submission is resolved only onto a frame with the same caustic
+// schedule: context, prepared owner generation, extent and the schedule identity, which
+// covers the camera, source, instances, triangles, schedule and branch policy. The resident
+// water revision is left out on purpose, so the spectrum of the previous water step can be
+// drawn beside the current water. With animated water the caustic therefore lags the water by
+// one or more frames. That lag is accepted: otherwise each new water step would drop the
+// spectrum, and a slow device would never show the caustic.
+struct OpenGlCausticScheduleKey
+{
+    std::uintptr_t context=0;std::uint64_t rendererGeneration=0;
+    std::uint32_t width=0,height=0;
+    std::string scheduleIdentity;
+};
+inline bool operator==(const OpenGlCausticScheduleKey& a,const OpenGlCausticScheduleKey& b)
+{
+    return a.context==b.context&&a.rendererGeneration==b.rendererGeneration&&a.width==b.width&&a.height==b.height
+        &&a.scheduleIdentity==b.scheduleIdentity;
+}
+inline bool operator!=(const OpenGlCausticScheduleKey& a,const OpenGlCausticScheduleKey& b){return !(a==b);}
+// A preview spectrum is reused only for the same context, prepared owner generation,
+// extent, evaluation time and frame identity. The identity covers the camera, source,
+// instance transforms, triangles, schedule and branch policy.
+struct OpenGlCausticSpectrumReuseKey
+{
+    std::uintptr_t context=0;std::uint64_t rendererGeneration=0;
+    std::uint32_t width=0,height=0;double timeSeconds=0;
+    std::string frameIdentity;
+};
+inline bool operator==(const OpenGlCausticSpectrumReuseKey& a,const OpenGlCausticSpectrumReuseKey& b)
+{
+    return a.context==b.context&&a.rendererGeneration==b.rendererGeneration&&a.width==b.width&&a.height==b.height
+        &&a.timeSeconds==b.timeSeconds&&a.frameIdentity==b.frameIdentity;
+}
+inline OpenGlCausticSpectrumReuseKey openGlCausticSpectrumReuseKey(const glasscaustics::Frame& frame,double timeSeconds,
+    std::uintptr_t context,std::uint64_t rendererGeneration)
+{return {context,rendererGeneration,frame.width,frame.height,timeSeconds,frame.identity};}
+enum class OpenGlCausticProgramReadiness : std::uint8_t { Ready, Pending, Failed };
+// Starts or finishes the caustic programs of the current context before the caustic
+// render needs them. Preview submits them without waiting and returns Pending until the
+// driver reports every link complete. Blocking finishes them before it returns. Ready
+// programs stay with the context, so a scene re-prepare does not compile them again.
+// multipleScatter and rough select the query variant the render will schedule.
+OpenGlCausticProgramReadiness prepareOpenGlGlassCausticPrograms(bool multipleScatter,bool rough,
+    NativeFixturePrepareUse use,std::string& error);
+// Backend-private native route used by the scene-linear Color dispatcher. A Preview
+// frame whose caustic exceeds the GL limits renders reduced or without the caustic, and
+// degradation receives the reason. Empty means the caustic rendered as planned.
 NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
     const std::shared_ptr<const NativeFixtureSceneResources>& resources,
@@ -51,7 +368,9 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     const glasscaustics::AdmittedBranchPolicy& policy,
     glasscaustics::SchedulingDescription scheduling,
     std::uint32_t width, std::uint32_t height, NativeFixtureSceneRuntimeInputs runtime,
-    const glasscaustics::MultipleScatterPolicy* multipleScatterPolicy=nullptr);
+    const glasscaustics::MultipleScatterPolicy* multipleScatterPolicy=nullptr,
+    OpenGlCausticRenderUse use=OpenGlCausticRenderUse::Export,
+    std::string* degradation=nullptr);
 bool readOpenGlGlassCausticReceiptForFixture(const NativeFixtureSceneFrame& frame,
     std::shared_ptr<const glasscaustics::NativeReadback>& receipt,
     glasscaustics::EnergyLedger& energy, std::string& error,
@@ -186,6 +505,14 @@ bool produceOpenGlGlassGratingCameraReadback(
     glasscaustics::NativeReadback& output,glasscaustics::EnergyLedger& energy,std::string& error,
     OpenGlGratingCameraDiagnostics* diagnostics=nullptr);
 
+// Private caustic preparation for a selected closed volume beside one thin
+// camera dielectric. The volume lands in smoothglass::Prepared::causticVolume.
+// A camera-only selection prepares the same slot for the paired camera walk.
+NativeFixtureScenePreparation prepareOpenGlGlassCausticVolumeResources(
+    NativeFixtureSceneBackend& backend,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& material,
+    const smoothglass::CausticVolumeSelection& selection,NativeFixturePrepareUse use);
 // Private real mixed owners. Staging is fenced geometry/query ownership only.
 NativeFixtureScenePreparation prepareOpenGlGlassGratingResources(
     const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
@@ -244,29 +571,70 @@ inline bool causticHit(const glasscaustics::Texel* words,opaquevisibility::Close
         &&(!retainIndices||(causticId(words[4][0],words[4][1],hit.instanceId)
             &&causticId(words[4][2],words[4][3],hit.triangleId)));
 }
-inline bool causticDecodePath(const glasscaustics::Texel* p,const glasscaustics::Frame& frame,
-    std::size_t work,glasscaustics::NativePathReceipt& output)
+// Texel 4.z of an incomplete path receipt: the first condition that stopped the
+// photon walk in computeSource. Complete receipts keep the word zero. None is
+// left by an invocation that returned before its walk, and VariantCheck by a
+// rough, multiple-scatter or grating check that sets no code of its own.
+enum class CausticWalkRefusal : std::uint32_t
 {
+    None,SourceQuery,EntryMismatch,BranchQuery,InsideEscaped,UnknownTriangle,InsideWater,
+    ReceiverFacing,ReceiverFootprint,CameraQuery,RasterMismatch,Radiance,MediumMismatch,
+    UnresolvedTail,VariantCheck,Count
+};
+inline const char* causticWalkRefusalText(float word)
+{
+    static constexpr const char* text[]{
+        "the shader walk did not complete and recorded no reason",
+        "the shader walk did not complete: the source visibility query was refused",
+        "the shader walk did not complete: the entry query did not return the scheduled glass triangle",
+        "the shader walk did not complete: a branch query was refused",
+        "the shader walk did not complete: a branch inside the glass met the environment",
+        "the shader walk did not complete: a branch hit a triangle missing from the frame table",
+        "the shader walk did not complete: a branch inside the glass met the water",
+        "the shader walk did not complete: a receiver was hit from inside, from behind, with no reflectance or before any glass interface",
+        "the shader walk did not complete: a receiver pixel footprint met the horizon or overflowed",
+        "the shader walk did not complete: a camera endpoint or pixel query was refused or missed",
+        "the shader walk did not complete: the raster owner or depth at a visible receiver pixel does not match its pixel-centre hit",
+        "the shader walk did not complete: a receiver pixel radiance is outside the half-float range",
+        "the shader walk did not complete: a branch medium disagrees with the facing of its glass hit",
+        "the shader walk did not complete: the unresolved tail is above the policy fraction",
+        "the shader walk did not complete: a rough, multiple-scatter or grating transport check failed"};
+    static_assert(std::size(text)==std::size_t(CausticWalkRefusal::Count));
+    std::uint32_t code=0;
+    if(!causticWord(word,std::uint32_t(CausticWalkRefusal::Count)-1,code))
+        return "the shader walk did not complete and its reason word is malformed";
+    return text[code];
+}
+// reason, when given, names the first failed condition for the refusal text.
+inline bool causticDecodePath(const glasscaustics::Texel* p,const glasscaustics::Frame& frame,
+    std::size_t work,glasscaustics::NativePathReceipt& output,const char** reason=nullptr)
+{
+    const auto refuse=[&](const char* text){if(reason)*reason=text;return false;};
     glasscaustics::NativePathReceipt r;
     for(unsigned t=0;t<glasscaustics::kPathReceiptStride;++t)
-        for(float value:p[t])if(!std::isfinite(value))return false;
+        for(float value:p[t])if(!std::isfinite(value))return refuse("a receipt word is not finite");
     // Inspect the explicit marker before interpreting overlapping texel14.
     std::uint32_t version=0;
     if(!causticWord(p[15][3],kPrivateMultipleScatterVersion,version)
-        ||version!=(frame.multipleScatterPolicy?kPrivateMultipleScatterVersion:0u))return false;
+        ||version!=(frame.multipleScatterPolicy?kPrivateMultipleScatterVersion:0u))return refuse("multiple-scatter version mismatch");
+    // The shader writes 0 here when its walk did not complete, and texel 4.z
+    // names the first failed condition.
+    if(p[1][0]!=1)return refuse(causticWalkRefusalText(p[4][2]));
     std::uint32_t low=0,high=0;
-    if(!causticId(p[0][0],p[0][1],r.work)||!causticWord(p[0][2],glasscaustics::kMaximumBranchVisits,r.depositCount)
-        ||!causticWord(p[0][3],glasscaustics::kMaximumBranchVisits,r.visits)
-        ||p[1][0]!=1||(p[1][1]!=0&&p[1][1]!=1)
-        ||!causticId(p[2][0],p[2][1],low)||!causticId(p[2][2],p[2][3],high)
-        ||r.work!=work||work>=frame.work.size()||frame.work[work].entry>=frame.entries.size()
-        ||p[1][2]!=0||p[1][3]!=0||p[4][1]!=0||p[4][2]!=0||p[4][3]!=0)return false;
+    if(!causticId(p[0][0],p[0][1],r.work))return refuse("work id word");
+    if(!causticWord(p[0][2],glasscaustics::kMaximumBranchVisits,r.depositCount))return refuse("deposit count word");
+    if(!causticWord(p[0][3],glasscaustics::kMaximumBranchVisits,r.visits))return refuse("visit count word");
+    if(p[1][1]!=0&&p[1][1]!=1)return refuse("source-blocked flag word");
+    if(!causticId(p[2][0],p[2][1],low)||!causticId(p[2][2],p[2][3],high))return refuse("query work word");
+    if(r.work!=work||work>=frame.work.size()||frame.work[work].entry>=frame.entries.size())return refuse("work id does not match its scheduled slot");
+    if(p[1][2]!=0||p[1][3]!=0||p[4][1]<0||p[4][2]!=0||p[4][3]!=0)return refuse("reserved or thin-absorbed word");
     r.complete=true;r.sourceBlocked=p[1][1]==1;r.queryWork=low|(std::uint64_t(high)<<32);
     r.launchedPower=p[3][0];r.depositedPower=p[3][1];r.absorbedPower=p[3][2];r.escapedPower=p[3][3];r.unresolvedPower=p[4][0];
-    if(!causticHit(p+5,r.sourceHit))return false;
+    r.thinAbsorbedPower=p[4][1];
+    if(!causticHit(p+5,r.sourceHit))return refuse("source hit decode");
     // Blocked work never queries the entry. Its unused sentinel is retained.
-    if(!r.sourceBlocked&&!causticHit(p+10,r.entryHit,version==0))return false;
-    if(!decodePathExtensions(p[14],p[15],PathExtensionLayout::OpenGl,r))return false;
+    if(!r.sourceBlocked&&!causticHit(p+10,r.entryHit,version==0))return refuse("entry hit decode");
+    if(!decodePathExtensions(p[14],p[15],PathExtensionLayout::OpenGl,r))return refuse("path extension decode");
     output=r;return true;
 }
 inline bool causticDecodeDeposit(const glasscaustics::Texel* p,std::uint32_t owningMultipleScatterVersion,
@@ -632,6 +1000,9 @@ uniform int uWorkCount,uTriangleCount,uVisits,uInterfaces,uPending;
 uniform vec4 uSource,uCamera,uRotation,uProjection,uIor[2],uLi[2];
 uniform vec2 uExtent,uPolicy;
 uint queryWork=0u;
+// First failed walk condition, a CausticWalkRefusal code. Written to texel 4.z
+// of an incomplete path receipt only; complete receipts keep that word zero.
+uint causticFailReason=0u;
 uint id(vec2 words) {return uint(words.x)|(uint(words.y)<<16u);}
 vec2 words(uint value) {return vec2(value&65535u,value>>16u);}
 vec4 owners(SceneClosestHit hit) {return vec4(words(hit.objectId),words(hit.materialId));}
@@ -661,6 +1032,27 @@ int findTriangle(SceneClosestHit hit) {
 bool sameTriangle(SceneClosestHit a,SceneClosestHit b) {
     return a.objectId==b.objectId&&a.materialId==b.materialId&&a.instanceId==b.instanceId&&a.triangleId==b.triangleId;
 }
+// A pixel centre on an edge shared by two triangles of one receiver belongs to
+// both, and the raster and the closest-hit query can each name a different
+// one. The raster triangle must then hold the pixel-centre hit within the
+// 8-bias tolerance of the camera checks. rasterOwnsPixelHit mirrors this.
+bool causticRasterOwns(vec4 raster,SceneClosestHit hit,SceneClosestHit pixelHit) {
+    if(uint(raster.y)==hit.triangleId) return true;
+    float tolerance=8.0*rayBias(pixelHit.position);
+    for(int t=0;t<uTriangleCount;++t) {
+        vec4 o=triangles[t*8+4],i=triangles[t*8+5];
+        if(id(o.xy)!=hit.objectId||id(o.zw)!=hit.materialId||uint(i.x)!=hit.instanceId||uint(i.y)!=uint(raster.y)) continue;
+        vec3 v[3]=vec3[3](triangles[t*8].xyz,triangles[t*8+1].xyz,triangles[t*8+2].xyz);
+        vec3 n=triangles[t*8+3].xyz;
+        if(abs(dot(pixelHit.position-v[0],n))>tolerance) return false;
+        for(int e=0;e<3;++e) {
+            vec3 edge=v[(e+1)%3]-v[e];
+            if(dot(cross(edge,pixelHit.position-v[e]),n)<-tolerance*length(edge)) return false;
+        }
+        return true;
+    }
+    return false;
+}
 struct Branch {vec3 origin,direction;float fraction;uvec2 history;int interfaces;bool inside;};
 void main() {
     uint invocation=gl_GlobalInvocationID.x;if(invocation>=uint(uWorkCount)) return;
@@ -676,39 +1068,48 @@ void main() {
     SceneClosestHit source=query(entry.xyz,uSource.xyz,1e-5,uSource.w);uint sourceWork=causticLastWork;
     pathHit(base+5,source,sourceWork);
     bool blocked=source.status==1;complete=source.status>=0;
+    if(!complete)causticFailReason=1u;
     SceneClosestHit entryHit=sceneEmptyHit(-1,0.0);uint entryWork=0u;
     Branch stack[CAUSTIC_MAX_PENDING];
+    float thinAbsorbed=0.0;
     if(complete&&!blocked) {
         float offset=rayBias(entry.xyz);
         entryHit=query(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,0.0,uSource.w);entryWork=causticLastWork;
         complete=entryHit.status==1&&entryHit.entering&&entryHit.objectId==id(entryOwners.xy)
             &&entryHit.materialId==id(entryOwners.zw)&&entryHit.instanceId==uint(entryIndices.x)&&entryHit.triangleId==uint(entryIndices.y);
+        if(!complete)causticFailReason=2u;
         if(complete)stack[pending++]=Branch(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,1.0,uvec2(0u),0,false);
     }
     pathHit(base+10,entryHit,entryWork);
     while(complete&&pending>0&&visits<uVisits) {
         Branch branch=stack[--pending];++visits;
         SceneClosestHit hit=query(branch.origin,branch.direction,branch.interfaces==0?0.0:1e-5,uSource.w);uint hitWork=causticLastWork;
-        if(hit.status<0) {complete=false;break;}
+        if(hit.status<0) {causticFailReason=3u;complete=false;break;}
         if(hit.status==0) {
-            if(branch.inside){complete=false;break;}escaped+=potential*branch.fraction;continue;
+            if(branch.inside){causticFailReason=4u;complete=false;break;}escaped+=potential*branch.fraction;continue;
         }
-        int triangle=findTriangle(hit);if(triangle<0) {complete=false;break;}
+        int triangle=findTriangle(hit);if(triangle<0) {causticFailReason=5u;complete=false;break;}
         vec4 shape=triangles[triangle*8+5];
+        // Owner flag 2 is the thin camera dielectric beside the caustic volume.
+        // The photon is absorbed: no deposit, no refusal, no unresolved charge.
+        if(shape.z==2.0) {
+            if(branch.inside) {causticFailReason=6u;complete=false;break;}
+            thinAbsorbed+=potential*branch.fraction;continue;
+        }
         if(shape.z==0.0) {
-            if(branch.inside||!hit.entering||shape.w!=1.0||branch.interfaces==0) {complete=false;break;}
+            if(branch.inside||!hit.entering||shape.w!=1.0||branch.interfaces==0) {causticFailReason=7u;complete=false;break;}
             float incident=potential*branch.fraction;
             vec2 power=causticReceiverPower(incident,triangles[triangle*8+6+band/4][band%4]);
             outgoing+=power.x;absorbed+=power.y;
             vec4 footprint;int projected=causticProjectReceiver(hit.position,hit.outwardNormal,uCamera.xyz,uRotation,uProjection,uExtent,footprint);
-            if(projected<0) {complete=false;break;}
+            if(projected<0) {causticFailReason=8u;complete=false;break;}
             SceneClosestHit cameraHit=sceneEmptyHit(0,0.0),pixelHit=sceneEmptyHit(0,0.0);
             uint cameraWork=0u,pixelWork=0u;bool visible=false;vec4 rasterOwners=vec4(0.0),raster=vec4(0.0);
             if(projected>0) {
                 vec3 delta=hit.position-uCamera.xyz;float distance=length(delta);
                 cameraHit=query(uCamera.xyz,delta,0.0,distance+8.0*rayBias(hit.position));cameraWork=causticLastWork;
                 pixelHit=query(uCamera.xyz,causticCameraRay(footprint.xy+vec2(0.5),uRotation,uProjection,uExtent),0.0,uProjection.w);pixelWork=causticLastWork;
-                if(cameraHit.status!=1||pixelHit.status<0) {complete=false;break;}
+                if(cameraHit.status!=1||pixelHit.status<0) {causticFailReason=9u;complete=false;break;}
                 visible=sameTriangle(hit,cameraHit)&&abs(cameraHit.distance-distance)<=8.0*rayBias(hit.position)
                     &&length(cameraHit.position-hit.position)<=8.0*rayBias(hit.position)&&pixelHit.status==1&&sameTriangle(hit,pixelHit);
                 ivec2 pixel=ivec2(footprint.x,uExtent.y-1.0-footprint.y);
@@ -716,10 +1117,10 @@ void main() {
                 if(visible) {
                     vec3 local=causticRotate(vec4(-uRotation.xyz,uRotation.w),pixelHit.position-uCamera.xyz);
                     if(id(rasterOwners.xy)!=hit.objectId||id(rasterOwners.zw)!=hit.materialId
-                        ||uint(raster.x)!=hit.instanceId||uint(raster.y)!=hit.triangleId
-                        ||abs(raster.z+local.z)>2e-4*max(abs(local.z),1e-20)) {complete=false;break;}
+                        ||uint(raster.x)!=hit.instanceId||!causticRasterOwns(raster,hit,pixelHit)
+                        ||abs(raster.z+local.z)>2e-4*max(abs(local.z),1e-20)) {causticFailReason=10u;complete=false;break;}
                     float radiance=causticPixelRadiance(power.x,footprint.w);
-                    if(!causticFinite(radiance)||radiance<0.0||radiance>65504.0) {complete=false;break;}
+                    if(!causticFinite(radiance)||radiance<0.0||radiance>65504.0) {causticFailReason=11u;complete=false;break;}
                 }
             }
             int d=depositBase+count*CAUSTIC_DEPOSIT_RECEIPT_STRIDE;
@@ -732,7 +1133,7 @@ void main() {
             depositHit(d+7,hit,hitWork);depositHit(d+12,cameraHit,cameraWork);depositHit(d+17,pixelHit,pixelWork);
             ++count;continue;
         }
-        if(branch.inside==hit.entering) {complete=false;break;}
+        if(branch.inside==hit.entering) {causticFailReason=12u;complete=false;break;}
         if(branch.interfaces>=uInterfaces) {tail+=potential*branch.fraction;continue;}
         vec3 normal=branch.inside?-hit.outwardNormal:hit.outwardNormal;
         vec3 transmitted,reflected;bool tir;float ior=uIor[band/4][band%4];
@@ -753,11 +1154,15 @@ void main() {
     }
     for(int i=0;i<pending;++i)tail+=potential*stack[i].fraction;
     float launched=blocked?0.0:potential;
+    bool walked=complete;
     complete=complete&&tail<=launched*uPolicy.x*(1.0+2e-4);
+    if(!complete&&causticFailReason==0u)causticFailReason=walked?13u:14u;
     paths[base].zw=vec2(float(count),float(visits));
     paths[base+1]=vec4(float(complete),float(blocked),0.0,0.0);
     paths[base+2]=vec4(words(queryWork),0.0,0.0);
     paths[base+3]=vec4(launched,outgoing,absorbed,escaped);paths[base+4]=vec4(tail,0.0,0.0,0.0);
+    paths[base+4].y=thinAbsorbed;
+    if(!complete)paths[base+4].z=float(causticFailReason);
 }
 )GLSL";
 }
@@ -1056,6 +1461,8 @@ inline std::string gratingIncidentComputeSource(const std::string& materialMath,
 )GLSL");
     smoothglass::replace(source,"    paths[base+1]=vec4(float(complete),float(blocked),0.0,0.0);",
         "    paths[base+1]=vec4(float(complete),float(blocked),words(extraQueryWork));");
+    // Texel 4.y carries orderWork here. Grating frames have no thin absorber.
+    smoothglass::replace(source,"\n    paths[base+4].y=thinAbsorbed;","");
     smoothglass::replace(source,"paths[base+4]=vec4(tail,0.0,0.0,0.0);",
         "paths[base+4]=vec4(tail,float(orderWork),0.0,0.0);");
     smoothglass::replace(source,"/*GRATING_NATIVE_ORDER_EQUATION*/",orderEquation);
@@ -1280,6 +1687,283 @@ void main() {
     }
     for(int b=0;b<4;++b) {bandsLow[pixel*4u+uint(b)]=floatBitsToUint(sum[b]);
         bandsHigh[pixel*4u+uint(b)]=floatBitsToUint(sum[b+4]);}
+}
+)GLSL";
+}
+// Kernel splat deposition (Frame::splatVersion 1) for ordinary caustic frames.
+// Grating paths never link these programs. After the trace the render runs the
+// normaliser, the tile keys, the shared bitonic sort over the tile keys, the
+// tile segment table and one gather thread per pixel. Tile keys use binding 5,
+// sized frame.splat.paddedKeyCount. Binding 7 is one uint scratch array, laid
+// out by SplatScratchLayout: a float normaliser per trace slot, a begin/end
+// pair per tile, the sorted triangle owner rows and two counters.
+inline constexpr unsigned kSplatScratchBinding=7;
+inline constexpr std::uint64_t kSplatTriangleRowWords=5,kSplatCounterWords=2;
+// Counter word 0 collects these overflow bits. Word 1 is the measured gather work.
+// A path with more deposits than its keyed slots sets kSplatOverflowKeySlots.
+// Like an out-of-image tile it is a defect, so the frame refuses.
+inline constexpr std::uint32_t kSplatOverflowTile=1,kSplatOverflowTileCap=2,kSplatOverflowGatherWork=4,kSplatOverflowKeySlots=8;
+struct SplatScratchLayout
+{
+    std::uint64_t normaliserBase=0,rangeBase=0,lookupBase=0,lookupCount=0,counterBase=0,words=0;
+};
+inline bool splatScratchLayout(const Frame& frame,SplatScratchLayout& output)
+{
+    const auto tiles=frame.splat.tilesX*frame.splat.tilesY;
+    if(frame.splatVersion!=kSplatVersion || !tiles || frame.work.empty() || frame.triangles.empty())return false;
+    SplatScratchLayout layout;
+    layout.rangeBase=frame.bounds.maximumDeposits;layout.lookupBase=layout.rangeBase+2*tiles;
+    layout.lookupCount=frame.triangles.size();
+    layout.counterBase=layout.lookupBase+kSplatTriangleRowWords*layout.lookupCount;
+    layout.words=layout.counterBase+kSplatCounterWords;
+    if(layout.words>UINT32_MAX)return false;
+    output=layout;return true;
+}
+// Why splatScratchLayout refuses a frame. limit is true only for a word count past the
+// index range; a missing precondition is an invalid frame, not a GL limit.
+inline std::string splatScratchLayoutFailure(const Frame& frame,bool& limit)
+{
+    limit=false;
+    const auto tiles=frame.splat.tilesX*frame.splat.tilesY;
+    if(frame.splatVersion!=kSplatVersion)return "the frame does not splat";
+    if(!tiles||frame.work.empty()||frame.triangles.empty())
+        return "the frame has "+std::to_string(tiles)+" tiles, "
+            +std::to_string(frame.work.size())+" paths, "+std::to_string(frame.triangles.size())+" triangles";
+    const auto words=frame.bounds.maximumDeposits+2*tiles+kSplatTriangleRowWords*frame.triangles.size()+kSplatCounterWords;
+    limit=true;return "splat scratch needs "+std::to_string(words)+" words, max "+std::to_string(std::uint64_t(UINT32_MAX));
+}
+// Initial scratch words. Normalisers, tile ranges and counters start at zero.
+// Triangle rows are (instance, triangle, object, material, table index), sorted
+// so a lower bound finds the lowest table index among equal owners, the row
+// findTriangle and the CPU hitTriangle pick.
+inline std::vector<std::uint32_t> splatScratchWords(const Frame& frame,const SplatScratchLayout& layout)
+{
+    std::vector<std::uint32_t> words(std::size_t(layout.words),0u);
+    std::vector<std::uint32_t> order(frame.triangles.size());
+    for(std::size_t i=0;i<order.size();++i)order[i]=std::uint32_t(i);
+    const auto owner=[&](std::uint32_t i) {
+        const auto& t=frame.triangles[i];return std::make_tuple(t.instance,t.triangle,t.object,t.material,i);
+    };
+    std::sort(order.begin(),order.end(),[&](std::uint32_t a,std::uint32_t b){return owner(a)<owner(b);});
+    for(std::size_t i=0;i<order.size();++i) {
+        const auto& t=frame.triangles[order[i]];auto* row=words.data()+layout.lookupBase+i*kSplatTriangleRowWords;
+        row[0]=t.instance;row[1]=t.triangle;row[2]=t.object;row[3]=t.material;row[4]=order[i];
+    }
+    return words;
+}
+// The host dispatches the normaliser and gather passes in bands and waits for
+// each band. One 4K gather is tens of millions of key-pixel evaluations, and a
+// single long submission can trip the NVIDIA context switch timeout (Xid 109),
+// which drops the rest of the dispatch. A gather band is whole 16-row groups
+// of at most kSplatGatherBandPixels pixels, the bound the closed glass draw
+// uses. A normaliser band is kSplatNormaliserBandSlots trace slots.
+inline constexpr std::uint64_t kSplatGatherBandPixels=262144;
+inline constexpr std::uint64_t kSplatNormaliserBandSlots=16384;
+inline std::uint32_t splatGatherBandRows(std::uint32_t width)
+{
+    const std::uint64_t group=kSplatGatherGroup,rows=width?kSplatGatherBandPixels/width/group*group:group;
+    return std::uint32_t(std::max<std::uint64_t>(group,rows));
+}
+// Shared by the four splat programs. A window pixel is accepted by the CPU rule
+// in buildSplatReference: the private raster's admitted triangle at the pixel is
+// a reflective non-glass receiver, its receiver-plane footprint through the pixel
+// centre projects back to the pixel, and its normal agrees with the deposit's.
+static_assert(kSplatNormalAgreement==.9f,"splatCommonSource spells the normal agreement literally");
+static_assert(kSplatTilesPerDeposit==9,"splatKeySource emits at most nine tile keys per deposit");
+static_assert(kSplatGatherGroup==16,"splatGatherSource spells its 16x16 work group literally");
+inline std::string splatCommonSource()
+{
+    return std::string("#version 430 core\n")+nativeMathSource()+nativeSplatMathSource()
+        +"#define CAUSTIC_SPLAT_GATHER_CAP "+std::to_string(kMaximumSplatGatherWork)+"u\n"+R"GLSL(
+layout(std430,binding=1) readonly buffer Deposits {vec4 deposits[];};
+layout(std430,binding=3) readonly buffer Work {vec4 workTable[];};
+layout(std430,binding=4) readonly buffer Triangles {vec4 triangles[];};
+layout(std430,binding=7) buffer Splat {uint splat[];};
+uniform sampler2D uRasterOwners,uRasterTriangle;
+uniform vec4 uCamera,uRotation,uProjection;
+uniform vec2 uExtent;
+uniform int uWorkCount,uVisits,uKeyCount,uKeySlots;
+uniform uint uNormaliserBase,uRangeBase,uLookupBase,uLookupCount,uCounterBase,uTilesX,uTilesY;
+// First slot of a normaliser band and first row of a gather band.
+uniform uint uSlotOffset,uRowOffset;
+uint causticSplatId(vec2 words) {return uint(words.x)|(uint(words.y)<<16u);}
+bool causticSplatOwnerLess(uvec4 a,uvec4 b) {
+    if(a.x!=b.x)return a.x<b.x;
+    if(a.y!=b.y)return a.y<b.y;
+    if(a.z!=b.z)return a.z<b.z;
+    return a.w<b.w;
+}
+uvec4 causticSplatOwnerRow(uint row) {
+    uint at=uLookupBase+row*5u;return uvec4(splat[at],splat[at+1u],splat[at+2u],splat[at+3u]);
+}
+// Admitted triangle table index with these raster owners, or -1.
+int causticSplatTriangle(uvec4 owner) {
+    uint low=0u,high=uLookupCount;
+    while(low<high) {
+        uint middle=low+(high-low)/2u;
+        if(causticSplatOwnerLess(causticSplatOwnerRow(middle),owner))low=middle+1u;else high=middle;
+    }
+    if(low>=uLookupCount||causticSplatOwnerRow(low)!=owner)return -1;
+    return int(splat[uLookupBase+low*5u+4u]);
+}
+// The receiver seen through the centre of top-first pixel p. position is on the
+// centre ray and the admitted triangle's plane; area is its footprint area.
+bool causticSplatSurface(uvec2 pixel,out vec3 position,out vec3 normal,out float area) {
+    position=vec3(0.0);normal=vec3(0.0);area=0.0;
+    ivec2 texel=ivec2(int(pixel.x),int(uExtent.y)-1-int(pixel.y));
+    vec4 raster=texelFetch(uRasterTriangle,texel,0);
+    if(raster.w!=1.0)return false;
+    vec4 owners=texelFetch(uRasterOwners,texel,0);
+    int t=causticSplatTriangle(uvec4(uint(raster.x),uint(raster.y),causticSplatId(owners.xy),causticSplatId(owners.zw)));
+    if(t<0)return false;
+    vec4 shape=triangles[t*8+5];
+    if(shape.z!=0.0||shape.w!=1.0)return false;
+    normal=triangles[t*8+3].xyz;
+    if(!causticPixelCorner(vec2(pixel)+vec2(0.5),triangles[t*8].xyz,normal,uCamera.xyz,uRotation,uProjection,uExtent,position))
+        return false;
+    vec4 footprint;
+    if(causticProjectReceiver(position,normal,uCamera.xyz,uRotation,uProjection,uExtent,footprint)!=1
+        ||uint(footprint.x)!=pixel.x||uint(footprint.y)!=pixel.y)return false;
+    area=footprint.w;return causticFinite(area)&&area>0.0;
+}
+// A camera-visible deposit slot with a projected in-image footprint pixel.
+bool causticSplatVisible(uint index,out uvec2 pixel) {
+    uint d=index*uint(CAUSTIC_DEPOSIT_RECEIPT_STRIDE);vec4 target=deposits[d+3u];pixel=uvec2(0u);
+    if(deposits[d].w!=1.0||target.x!=1.0||!(target.y>=0.0&&target.z>=0.0&&target.y<uExtent.x&&target.z<uExtent.y))
+        return false;
+    pixel=uvec2(target.yz);return true;
+}
+struct CausticSplatDeposit {uvec2 pixel;vec3 position,normal;float outgoing,radius,spread;int band;};
+bool causticSplatDepositAt(uint index,out CausticSplatDeposit deposit) {
+    deposit.position=vec3(0.0);deposit.normal=vec3(0.0);deposit.outgoing=0.0;deposit.radius=0.0;deposit.spread=0.0;deposit.band=0;
+    if(!causticSplatVisible(index,deposit.pixel))return false;
+    uint d=index*uint(CAUSTIC_DEPOSIT_RECEIPT_STRIDE),work=index/uint(uVisits);
+    deposit.position=deposits[d+8u].xyz;deposit.normal=deposits[d+9u].xyz;deposit.outgoing=deposits[d+2u].z;
+    deposit.band=int(workTable[work*4u+3u].w);
+    deposit.radius=causticSplatRadiusFromScale(workTable[work*4u].w,
+        causticSplatPixelScale(deposit.pixel,deposit.position,deposit.normal,uCamera.xyz,uRotation,uProjection,uExtent));
+    deposit.spread=causticSplatSpread(deposit.position,deposit.normal,uCamera.xyz);
+    return causticFinite(deposit.radius)&&deposit.radius>0.0&&causticFinite(deposit.spread)&&deposit.band>=0&&deposit.band<8;
+}
+// Inclusive window (x0,y0,x1,y1) of a deposit pixel, clipped to the image.
+uvec4 causticSplatWindow(uvec2 pixel) {
+    uint r=uint(CAUSTIC_SPLAT_RADIUS);
+    return uvec4(pixel.x>=r?pixel.x-r:0u,pixel.y>=r?pixel.y-r:0u,
+        min(pixel.x+r,uint(uExtent.x)-1u),min(pixel.y+r,uint(uExtent.y)-1u));
+}
+// K times the grazing spread for an accepted pixel. The deposit's own pixel
+// always weighs 1.
+float causticSplatWeight(CausticSplatDeposit deposit,uvec2 pixel,vec3 position,vec3 normal) {
+    if(!(dot(normal,deposit.normal)>=0.9))return 0.0;
+    if(pixel==deposit.pixel)return 1.0;
+    return causticSplatKernel(length(position-deposit.position),deposit.radius)*deposit.spread;
+}
+)GLSL";
+}
+// One thread per trace slot (work*visits+slot). N is the sum of K*area over the
+// accepted window pixels, written as float bits, and 0 for a hidden slot.
+inline std::string splatNormaliserSource()
+{
+    return splatCommonSource()+R"GLSL(
+layout(local_size_x=32) in;
+layout(std430,binding=0) readonly buffer Paths {vec4 paths[];};
+void main() {
+    uint index=gl_GlobalInvocationID.x+uSlotOffset;if(index>=uint(uWorkCount)*uint(uVisits))return;
+    uint work=index/uint(uVisits),slot=index%uint(uVisits);
+    float normaliser=0.0;CausticSplatDeposit deposit;
+    if(slot<uint(paths[work*uint(CAUSTIC_PATH_RECEIPT_STRIDE)].z)&&causticSplatDepositAt(index,deposit)) {
+        uvec4 window=causticSplatWindow(deposit.pixel);
+        for(uint y=window.y;y<=window.w;++y)for(uint x=window.x;x<=window.z;++x) {
+            vec3 position,normal;float area;
+            if(!causticSplatSurface(uvec2(x,y),position,normal,area))continue;
+            normaliser+=causticSplatWeight(deposit,uvec2(x,y),position,normal)*area;
+        }
+    }
+    splat[uNormaliserBase+index]=floatBitsToUint(normaliser);
+}
+)GLSL";
+}
+// One thread per padded key. Keyed slot k = work*uKeySlots+slot owns keys
+// 9k..9k+8: one (tile, work, slot, slot index) key per 32x32 tile its window
+// touches, then all-ones sentinels. The slot index is work*uVisits+slot.
+inline std::string splatKeySource()
+{
+    return splatCommonSource()+R"GLSL(
+layout(local_size_x=32) in;
+layout(std430,binding=0) readonly buffer Paths {vec4 paths[];};
+layout(std430,binding=5) writeonly buffer Keys {uvec4 keys[];};
+void main() {
+    uint at=gl_GlobalInvocationID.x;if(at>=uint(uKeyCount))return;
+    uvec4 key=uvec4(0xffffffffu);
+    uint per=uint(CAUSTIC_SPLAT_TILES_PER_DEPOSIT),keyed=at/per,which=at%per,work=keyed/uint(uKeySlots),slot=keyed%uint(uKeySlots);
+    uint index=work*uint(uVisits)+slot;uvec2 pixel;
+    // The last keyed slot of a path flags deposits the keys would skip.
+    if(which==0u&&work<uint(uWorkCount)&&slot+1u==uint(uKeySlots)
+        &&uint(paths[work*uint(CAUSTIC_PATH_RECEIPT_STRIDE)].z)>uint(uKeySlots))atomicOr(splat[uCounterBase],8u);
+    if(work<uint(uWorkCount)&&slot<uint(paths[work*uint(CAUSTIC_PATH_RECEIPT_STRIDE)].z)&&causticSplatVisible(index,pixel)) {
+        uvec4 window=causticSplatWindow(pixel);uint tile=uint(CAUSTIC_SPLAT_TILE);
+        uint x0=window.x/tile,y0=window.y/tile,columns=window.z/tile-x0+1u,count=columns*(window.w/tile-y0+1u);
+        if(which<count)key=uvec4((y0+which/columns)*uTilesX+x0+which%columns,work,slot,index);
+    }
+    keys[at]=key;
+}
+)GLSL";
+}
+// One thread per sorted key. Each run leader records its tile's [begin,end),
+// adds tile pixels x run length to the gather work and flags overflow. It scans
+// at most one key past the per-tile cap.
+inline std::string splatSegmentSource()
+{
+    return splatCommonSource()+R"GLSL(
+layout(local_size_x=32) in;
+layout(std430,binding=5) readonly buffer Keys {uvec4 keys[];};
+void main() {
+    uint at=gl_GlobalInvocationID.x;if(at>=uint(uKeyCount))return;
+    uint tile=keys[at].x;
+    if(tile==0xffffffffu||(at>0u&&keys[at-1u].x==tile))return;
+    if(tile>=uTilesX*uTilesY) {atomicOr(splat[uCounterBase],1u);return;}
+    uint cap=uint(CAUSTIC_SPLAT_TILE_CAP),end=at+1u;
+    while(end<uint(uKeyCount)&&end-at<=cap&&keys[end].x==tile)++end;
+    uint run=end-at;
+    if(run>cap)atomicOr(splat[uCounterBase],2u);
+    splat[uRangeBase+tile*2u]=at;splat[uRangeBase+tile*2u+1u]=end;
+    uint side=uint(CAUSTIC_SPLAT_TILE),tx=tile%uTilesX,ty=tile/uTilesX;
+    uint amount=(min(uint(uExtent.x),(tx+1u)*side)-tx*side)*(min(uint(uExtent.y),(ty+1u)*side)-ty*side)*run;
+    uint previous=atomicAdd(splat[uCounterBase+1u],amount);
+    if(previous>CAUSTIC_SPLAT_GATHER_CAP-amount)atomicOr(splat[uCounterBase],4u);
+}
+)GLSL";
+}
+// One thread per pixel, 16x16 work groups, four per 32x32 tile. A pixel walks its tile's
+// keys in (work, slot) order, the canonical deposit order, and adds
+// outgoing*K/(pi*N) to its deposit's band. Pixels nobody splats write zero.
+inline std::string splatGatherSource()
+{
+    return splatCommonSource()+R"GLSL(
+layout(local_size_x=16,local_size_y=16) in;
+layout(std430,binding=2) buffer SpectrumLow {uint bandsLow[];};
+layout(std430,binding=6) buffer SpectrumHigh {uint bandsHigh[];};
+layout(std430,binding=5) readonly buffer Keys {uvec4 keys[];};
+void main() {
+    uvec2 pixel=gl_GlobalInvocationID.xy+uvec2(0u,uRowOffset);
+    if(pixel.x>=uint(uExtent.x)||pixel.y>=uint(uExtent.y))return;
+    float sum[8];for(int b=0;b<8;++b)sum[b]=0.0;
+    vec3 position,normal;float area;
+    if(causticSplatSurface(pixel,position,normal,area)) {
+        uint side=uint(CAUSTIC_SPLAT_TILE),tile=(pixel.y/side)*uTilesX+pixel.x/side;
+        uint begin=splat[uRangeBase+tile*2u],end=splat[uRangeBase+tile*2u+1u];
+        for(uint at=begin;at<end;++at) {
+            uint index=keys[at].w;CausticSplatDeposit deposit;
+            if(!causticSplatDepositAt(index,deposit))continue;
+            uvec4 window=causticSplatWindow(deposit.pixel);
+            if(pixel.x<window.x||pixel.x>window.z||pixel.y<window.y||pixel.y>window.w)continue;
+            float normaliser=uintBitsToFloat(splat[uNormaliserBase+index]);
+            float weight=causticSplatWeight(deposit,pixel,position,normal);
+            if(weight>0.0&&normaliser>0.0)sum[deposit.band]+=deposit.outgoing*weight/(3.14159265358979323846*normaliser);
+        }
+    }
+    uint first=(pixel.y*uint(uExtent.x)+pixel.x)*4u;
+    for(int b=0;b<4;++b) {bandsLow[first+uint(b)]=floatBitsToUint(sum[b]);bandsHigh[first+uint(b)]=floatBitsToUint(sum[b+4]);}
 }
 )GLSL";
 }
@@ -1876,11 +2560,11 @@ void main() {
             // Enclose both the true retained plane and the released triangle
             // arithmetic, including its independent barycentric/distance path.
             vec2 plane=divI(dotB(subB(p,origin),n),denominator);
-            Box t=subB(origin,p),crossRay=crossB(ray,e2),q=crossB(t,e1);vec2 determinant=dotB(e1,crossRay);
-            vec2 nativeDistance=divI(dotB(e2,q),determinant);
+            Box t=subB(origin,p),crossRay=crossB(ray,e2),q=crossB(t,e1);vec2 det=dotB(e1,crossRay);
+            vec2 nativeDistance=divI(dotB(e2,q),det);
             distance=vec2(min(plane.x,nativeDistance.x),max(plane.y,nativeDistance.y));
             hit=addB(origin,scaleB(ray,distance));
-            bary[1]=divI(dotB(t,crossRay),determinant);bary[2]=divI(dotB(ray,q),determinant);
+            bary[1]=divI(dotB(t,crossRay),det);bary[2]=divI(dotB(ray,q),det);
             bary[0]=subI(subI(vec2(1),bary[1]),bary[2]);
             clear=clear&&distance.x>=(depth==0?0.0:1e-5)&&distance.y<=uSource.w;
             for(int k=0;k<3;++k)clear=clear&&bary[k].x>0.0&&bary[k].y<1.0;

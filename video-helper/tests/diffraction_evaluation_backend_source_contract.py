@@ -328,4 +328,24 @@ for last_order in (4, 8):
 
 assert skipped > 0, "the bound did not skip any admitted production orders"
 
+# Row bands keep each diffraction draw within the per-draw backend caps so the
+# authored foil budget and lobe work admit the 4K canvas. Both backends share
+# one schedule, scissor every band, and guard a band-local evaluation index.
+bands = (root / "src/gpu_backend/fixture_diffraction_bands.h").read_text(encoding="utf-8")
+for token in ("kMaximumNativeFixtureDiffractionBands = 8",
+              "kNativeFixtureDiffractionFrameScale = 4",
+              "diffractivefoil::kMaximumEvaluations",
+              "diffractivefoil::makeEvaluationSchedule ("):
+    assert token in bands, f"diffraction band schedule lost: {token}"
+for name, source in (("OpenGL", gl), ("Metal", metal)):
+    assert '#include "fixture_diffraction_bands.h"' in source, f"{name} lost the band schedule"
+    assert "nativeFixtureDiffractionBandSchedule (" in source, f"{name} does not admit row bands"
+    assert "nativeFixtureDiffractionBandEvaluationLimit(diffractionBands, band)" in source, (
+        f"{name} does not offset the band evaluation ceiling")
+    assert "diffractionBands.maximumEvaluations" in source and "diffractionBands.requiredEvaluations" in source
+assert "glScissor(0, static_cast<int>(bandOrigin), static_cast<int>(width), static_cast<int>(bandRows));" in gl
+assert "uintAsFloat(bandEvaluationLimit)" in gl
+assert "sg_apply_scissor_rect(0, static_cast<int>(nativeFixtureDiffractionBandOrigin(diffractionBands, band))," in metal
+assert "uniforms.diffractionEvaluationSchedule[2] = bandEvaluationLimit;" in metal
+
 print("diffraction evaluation OpenGL/Metal source parity: PASS")

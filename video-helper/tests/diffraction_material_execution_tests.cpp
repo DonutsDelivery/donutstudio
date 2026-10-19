@@ -1,6 +1,7 @@
 #include "diffraction_material_execution.h"
 #include "DiffractionMaterialPresets.h"
 #include "gpu_backend/backend.h"
+#include "gpu_backend/fixture_diffraction_bands.h"
 #include "DiffractionProductPlans.h"
 
 #include <array>
@@ -390,6 +391,75 @@ int main()
                   diffractivefoil::kMaximumEvaluations,
                   std::numeric_limits<std::uint32_t>::max(), 2, 2, schedule),
           "CPU oracle rejects zero, malformed, and overflowing schedules");
+
+    // The Holographic Trading Card: environment lighting (version 2, three
+    // paths), signed orders 1 to 4 on a 1D lattice and a 1080p foil budget.
+    auto card = backendProgram;
+    if (legacyEnvironment)
+        card.diffractionLightingAdmission
+            = std::make_shared<const AdmittedLightingPlan>(*legacyEnvironment);
+    card.diffractionPathCount = 3;
+    card.diffractionPaths[0].material.microstructure.w = 1.0f;
+    card.diffractionPaths[0].material.control.x = 4.0f;
+    card.diffractionPaths[0].material.secondaryGeometry.w
+        = static_cast<float>(GratingLattice::OneDimensional);
+    card.diffractionFoilMaximumEvaluations = 1920u * 1080u * 3u;
+    arbitgpu::NativeFixtureDiffractionBands bands;
+    check(arbitgpu::nativeFixtureDiffractionBandSchedule(card, 1920, 1080, true, bands)
+              && bands.bandCount == 1 && bands.bandHeight == 1080
+              && bands.requiredEvaluations == 1920u * 1080u * 3u
+              && arbitgpu::nativeFixtureDiffractionWorkWithinBudget(card, 1920, 1080),
+          "a 1080p card frame stays one draw per path under the released admission");
+    check(!arbitgpu::nativeFixtureDiffractionWorkWithinBudget(card, 3840, 2160)
+              && arbitgpu::nativeFixtureDiffractionBandSchedule(card, 3840, 2160, true, bands)
+              && bands.bandCount == 4 && bands.bandHeight == 540
+              && bands.maximumEvaluations == 1920u * 1080u * 3u
+              && bands.requiredEvaluations == 3840u * 2160u * 3u
+              && arbitgpu::nativeFixtureDiffractionLobeEvaluations(card, 3840, 2160)
+                  <= arbitgpu::kMaximumNativeFixtureDiffractionFrame1DLobeEvaluations
+              && arbitgpu::nativeFixtureDiffractionLobeEvaluations(card, 3840, 540)
+                  <= arbitgpu::kMaximumNativeFixtureDiffraction1DLobeEvaluations,
+          "the default 4K canvas admits the card in four bands within the per-draw and frame caps");
+    bool bandsExact = true;
+    std::uint32_t coveredRows = 0;
+    for (std::uint32_t band = 0; band < bands.bandCount; ++band)
+    {
+        const auto rows = arbitgpu::nativeFixtureDiffractionBandRows(bands, band);
+        bandsExact &= arbitgpu::nativeFixtureDiffractionBandOrigin(bands, band) == coveredRows
+            && diffractivefoil::makeEvaluationSchedule(bands.maximumEvaluations, 3840, rows, 3, schedule)
+            && arbitgpu::nativeFixtureDiffractionBandEvaluationLimit(bands, band)
+                == bands.maximumEvaluations + coveredRows * 3840u;
+        coveredRows += rows;
+    }
+    check(bandsExact && coveredRows == 2160,
+          "4K bands tile every row once, each with an exact shared foil schedule");
+    check(arbitgpu::nativeFixtureDiffractionBandSchedule(card, 3840, 2161, true, bands)
+              && bands.bandCount == 5
+              && arbitgpu::nativeFixtureDiffractionBandRows(bands, 4) == 1,
+          "a short last band keeps its own exact row count");
+
+    auto starvedCard = card;
+    starvedCard.diffractionFoilMaximumEvaluations = 1920u * 1080u * 3u / 5u;
+    check(!arbitgpu::nativeFixtureDiffractionBandSchedule(starvedCard, 3840, 2160, true, bands)
+              && bands.bandCount == 0,
+          "a foil budget that needs more than eight bands still refuses at 4K");
+    starvedCard.diffractionFoilMaximumEvaluations = 3839u * 3u;
+    check(!arbitgpu::nativeFixtureDiffractionBandSchedule(starvedCard, 3840, 2160, true, bands),
+          "a foil budget below one row of path slots refuses");
+    auto crossedCard = card;
+    crossedCard.diffractionFoilMaximumEvaluations = 0;
+    crossedCard.diffractionPaths[0].material.secondaryGeometry.w
+        = static_cast<float>(GratingLattice::CrossedTwoDimensional);
+    check(arbitgpu::nativeFixtureDiffractionLobeEvaluations(crossedCard, 3840, 2160)
+              > arbitgpu::kMaximumNativeFixtureDiffractionFrame2DLobeEvaluations
+              && !arbitgpu::nativeFixtureDiffractionBandSchedule(crossedCard, 3840, 2160, true, bands),
+          "crossed lobe work over the frame cap still refuses at 4K");
+    check(arbitgpu::nativeFixtureDiffractionBandSchedule(crossedCard, 3840, 2160, false, bands)
+              && bands.bandCount == 1,
+          "spectral-receiver transport leaves lobe admission to its own frame budget");
+    check(!arbitgpu::nativeFixtureDiffractionBandSchedule(card, 0, 2160, true, bands)
+              && !arbitgpu::nativeFixtureDiffractionBandSchedule(card, 4097, 2160, true, bands),
+          "band admission keeps the fixture extent bounds");
 
     auto crossedDescription = makeCrossedTwoDimensionalGratingPreset();
     const auto crossed = admit(crossedDescription, error);
