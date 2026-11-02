@@ -52,7 +52,7 @@ inline bool consumerCanRender(const ConsumerContract& consumer, NativeFixtureMat
 // the refusal reports a per-reason pixel count instead of one anonymous
 // sentence: this is a debug readback of the frame that already refused, not a
 // shipped log.
-inline constexpr std::uint32_t diagnosticReason(float value) noexcept
+inline std::uint32_t diagnosticReason(float value) noexcept
 {
     std::uint32_t bits=0;std::memcpy(&bits,&value,sizeof(bits));
     return (bits>>10u)&0xffu;
