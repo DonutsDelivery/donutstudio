@@ -15561,8 +15561,8 @@ static bool metalFiniteSourceInputs(const MetalFixtureSceneFrame& frame,MetalFin
     std::size_t nextOrder=0;
     for(unsigned band=0;band<8;++band){const auto& row=value.bands[band];const auto base=kFiniteSourceHeaderWords+band*kFiniteSourceBandWords;
         if(row.source||row.endpoint||row.band!=band||row.witness!=value.bands[0].witness||!row.responseEvaluated
-            ||row.frame.tangent!=std::array<double,3>{1,0,0}||row.frame.bitangent!=std::array<double,3>{0,1,0}
-            ||row.frame.normal!=std::array<double,3>{0,0,1}||row.toSource!=std::array<double,3>{0,0,1}
+            ||row.frame.tangent!=std::array<float,3>{1,0,0}||row.frame.bitangent!=std::array<float,3>{0,1,0}
+            ||row.frame.normal!=std::array<float,3>{0,0,1}||row.toSource!=std::array<float,3>{0,0,1}
             ||row.incidentIrradiance!=double(sample.surfaceIrradiance[band])||row.firstOrder!=nextOrder
             ||row.orderCount>3||row.orderCount>value.orders.size()-nextOrder)return refuse();
         for(double coordinate:row.uv)if(!std::isfinite(coordinate)||coordinate<0||coordinate>1)return refuse();
@@ -16629,7 +16629,7 @@ static bool metalFiniteReceiverInputs(const MetalFixtureSceneFrame& frame,MetalF
         ||!put(45,glassCameraTraceFloatBits(rays.inputs[0].originMinimum[2])))return refuse();
     for(unsigned band=0;band<8;++band){const auto& row=terminal.orders[band];const auto& r=rays.readback.rows[band];
         if(row.source||row.endpoint||row.band!=band||row.order.primary||row.order.secondary
-            ||row.order.direction!=std::array<double,3>{0,0,1}||terminal.bands[band].firstOrder!=band
+            ||row.order.direction!=std::array<float,3>{0,0,1}||terminal.bands[band].firstOrder!=band
             ||terminal.bands[band].orderCount!=1||r.disposition!=DirectGratingTerminalReceiverRow::Disposition::Pixel
             ||r.pixel.x||r.pixel.y||r.hit.entering!=1
             ||std::tie(r.hit.objectId,r.hit.materialId,r.hit.instanceId)!=std::tie(ta.object,ta.material,ta.instance)
