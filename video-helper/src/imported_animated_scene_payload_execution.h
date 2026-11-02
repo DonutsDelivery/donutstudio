@@ -18,6 +18,11 @@ namespace videohelper::modelpayload
 {
 class NativeCompositionRetentionBudget;
 class ImportedSceneParentReceiptStaging;
+// Joins two or more admitted leaf scenes into leaf ID ranges over the procedural scene.
+std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> composeImportedLeafScenes(
+    const HarmonicMIDI::grid::Visual3DScene& procedural,
+    const std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>>& leaves, std::string& error);
+
 // Defined only by tests that inspect composition leaf admission.
 struct ImportedAnimatedSceneCompositionProbe;
 #if defined(ARBIT_TEST_IMPORTED_PARENT_STAGING_FAILURES)
@@ -203,9 +208,9 @@ public:
                        ImportedAnimatedSceneReceipt& output,
                        std::string& error);
     // The 3D Render node's engine for the following executions. The fixture
-    // scene renderer draws a Path Trace selection (camera/light animation and
-    // compositions without mesh deformation). Routes the deformation renderer
-    // draws, animated meshes and multi-leaf Scene Compose, refuse it by name.
+    // scene renderer draws a Path Trace selection, with a bound mesh's vertices
+    // baked for the frame. Compositions the deformation renderer draws and
+    // multi-leaf Scene Compose refuse it by name.
     void selectEngine(videorender::fixture3d::SceneEngineSelection selection) { sceneRenderer_.selectEngine(selection); }
     videorender::fixture3d::SceneEngineSelection selectedEngine() const noexcept { return sceneRenderer_.selectedEngine(); }
     bool chargeParentInspection() const noexcept;
@@ -305,6 +310,13 @@ private:
     std::shared_ptr<const ImportedParentBindingOwner> parentOwner_;
     ImportedAnimatedSceneAdmissionIdentity admittedIdentity_;
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> scene_;
+    // scene_ with an unanimated mesh's morph weights and skin rest pose in its vertices.
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> restWeightScene_;
+    // Kept while a frame bakes to the same vertices, so a parked frame keeps accumulating.
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> bakedDeformationScene_;
+    std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> bakedDeformationSource_;
+    std::string restWeightError_;
+    std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> restWeightSource_;
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> importedScene_;
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> proceduralScene_;
     std::shared_ptr<const gltf::GlbStaticMeshDocument> baseScene_;

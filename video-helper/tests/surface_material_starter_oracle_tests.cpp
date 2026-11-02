@@ -39,25 +39,36 @@ int main()
         const auto document = nlohmann::json::parse (stream);
         const auto oracle = surfacematerialstarteroracle::loadDocument (document);
 
-        std::vector<std::uint8_t> canonicalBytes;
+        std::vector<std::uint8_t> canonicalBytes, displayBytes;
         canonicalBytes.reserve (oracle.materials.size() * 4);
+        displayBytes.reserve (oracle.materials.size() * 4);
         for (const auto& material : oracle.materials)
+        {
             canonicalBytes.insert (canonicalBytes.end(), material.centerRgba8.begin(), material.centerRgba8.end());
+            displayBytes.insert (displayBytes.end(), material.displayCenterRgba8.begin(), material.displayCenterRgba8.end());
+        }
 
         char fnvText[17] {};
         std::snprintf (fnvText, sizeof (fnvText), "%016llx",
                        static_cast<unsigned long long> (surfacematerialstarteroracle::fnv1a64 (canonicalBytes)));
         videohelper::Sha256 sha256;
         sha256.update (canonicalBytes.data(), canonicalBytes.size());
+        char displayFnvText[17] {};
+        std::snprintf (displayFnvText, sizeof (displayFnvText), "%016llx",
+                       static_cast<unsigned long long> (surfacematerialstarteroracle::fnv1a64 (displayBytes)));
+        videohelper::Sha256 displaySha256;
+        displaySha256.update (displayBytes.data(), displayBytes.size());
 
-        const bool schemasFailClosed = rejectsSchema (document, 2)
-            && rejectsSchema (document, 3)
-            && rejectsSchema (document, 5)
-            && rejectsSchema (document, 4.0)
-            && rejectsSchema (document, "4")
+        const bool schemasFailClosed = rejectsSchema (document, 3)
+            && rejectsSchema (document, 4)
+            && rejectsSchema (document, 6)
+            && rejectsSchema (document, 5.0)
+            && rejectsSchema (document, "5")
             && rejectsSchema (document, nullptr);
         if (canonicalBytes.size() != 20 || oracle.sampledRgba8Fnv1a64 != fnvText
-            || oracle.sampledRgba8Sha256 != sha256.finishHex() || ! schemasFailClosed)
+            || oracle.sampledRgba8Sha256 != sha256.finishHex()
+            || oracle.displayRgba8Fnv1a64 != displayFnvText
+            || oracle.displayRgba8Sha256 != displaySha256.finishHex() || ! schemasFailClosed)
         {
             std::cerr << "Surface Material oracle schema or cross-language digest mismatch\n";
             return 1;

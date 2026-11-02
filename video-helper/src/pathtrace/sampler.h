@@ -14,6 +14,7 @@
 // A value depends only on (pixel, sample index, generation, dimension), never
 // on call order, thread or tile, so a render is reproducible bit for bit.
 
+#include "devices/device_annotations.h"
 #include "accumulator.h"
 #include "vec_math.h"
 
@@ -33,7 +34,7 @@ enum class SamplePattern : std::uint8_t
 namespace sampling
 {
 
-constexpr std::uint32_t reverseBits (std::uint32_t x) noexcept
+PT_SHARED_FN constexpr std::uint32_t reverseBits (std::uint32_t x) noexcept
 {
     x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
     x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
@@ -52,7 +53,7 @@ struct SobolMatrices
     std::uint32_t columns[4][32];
 };
 
-constexpr SobolMatrices makeSobolMatrices() noexcept
+PT_SHARED_FN constexpr SobolMatrices makeSobolMatrices() noexcept
 {
     SobolMatrices out {};
     const std::uint32_t degree[4] { 0, 1, 2, 3 };
@@ -80,9 +81,9 @@ constexpr SobolMatrices makeSobolMatrices() noexcept
     return out;
 }
 
-inline constexpr SobolMatrices kSobolMatrices = makeSobolMatrices();
+PT_DEVICE_CONSTANT constexpr SobolMatrices kSobolMatrices = makeSobolMatrices();
 
-inline std::uint32_t sobol (std::uint32_t index, std::uint32_t dimension) noexcept
+PT_SHARED_FN std::uint32_t sobol (std::uint32_t index, std::uint32_t dimension) noexcept
 {
     std::uint32_t result = 0;
     for (std::uint32_t bit = 0; index != 0; ++bit, index >>= 1)
@@ -93,7 +94,7 @@ inline std::uint32_t sobol (std::uint32_t index, std::uint32_t dimension) noexce
 
 // Burley's Laine-Karras style permutation: every step only lets lower bits
 // change higher bits, so applied to bit-reversed input it is an Owen scramble.
-inline std::uint32_t laineKarras (std::uint32_t x, std::uint32_t seed) noexcept
+PT_SHARED_FN std::uint32_t laineKarras (std::uint32_t x, std::uint32_t seed) noexcept
 {
     x += seed;
     x ^= x * 0x6c50b47cu;
@@ -103,18 +104,18 @@ inline std::uint32_t laineKarras (std::uint32_t x, std::uint32_t seed) noexcept
     return x;
 }
 
-inline std::uint32_t nestedUniformScramble (std::uint32_t x, std::uint32_t seed) noexcept
+PT_SHARED_FN std::uint32_t nestedUniformScramble (std::uint32_t x, std::uint32_t seed) noexcept
 {
     return reverseBits (laineKarras (reverseBits (x), seed));
 }
 
-inline std::uint32_t hashCombine (std::uint32_t seed, std::uint32_t value) noexcept
+PT_SHARED_FN std::uint32_t hashCombine (std::uint32_t seed, std::uint32_t value) noexcept
 {
     return pcgHash (seed ^ pcgHash (value + 0x9e3779b9u));
 }
 
 // [0, 1) with 24 bits of resolution.
-inline float toUnitFloat (std::uint32_t bits) noexcept
+PT_SHARED_FN float toUnitFloat (std::uint32_t bits) noexcept
 {
     return static_cast<float> (bits >> 8) * (1.0f / 16777216.0f);
 }
@@ -127,7 +128,7 @@ inline float toUnitFloat (std::uint32_t bits) noexcept
 class PathSampler
 {
 public:
-    PathSampler (std::uint32_t pixelIndex, std::uint32_t sampleIndex, std::uint64_t generation,
+    PT_SHARED_FN PathSampler (std::uint32_t pixelIndex, std::uint32_t sampleIndex, std::uint64_t generation,
                  SamplePattern pattern = SamplePattern::OwenSobol) noexcept
         : pixel_ (pixelIndex), sample_ (sampleIndex), generation_ (generation), pattern_ (pattern)
     {
@@ -136,10 +137,10 @@ public:
         seed_ = pcgHash (h ^ pixelIndex);
     }
 
-    std::uint32_t sampleIndex() const noexcept { return sample_; }
-    SamplePattern pattern() const noexcept { return pattern_; }
+    PT_SHARED_FN std::uint32_t sampleIndex() const noexcept { return sample_; }
+    PT_SHARED_FN SamplePattern pattern() const noexcept { return pattern_; }
 
-    float get1D (std::uint32_t dimension) const noexcept
+    PT_SHARED_FN float get1D (std::uint32_t dimension) const noexcept
     {
         if (pattern_ == SamplePattern::Independent)
             return independent (dimension * 2u + 0x40000000u).nextFloat();
@@ -149,7 +150,7 @@ public:
         return sampling::toUnitFloat (x);
     }
 
-    Vec2 get2D (std::uint32_t dimension) const noexcept
+    PT_SHARED_FN Vec2 get2D (std::uint32_t dimension) const noexcept
     {
         if (pattern_ == SamplePattern::Independent)
         {
@@ -165,7 +166,7 @@ public:
     }
 
 private:
-    PixelRng independent (std::uint32_t stream) const noexcept
+    PT_SHARED_FN PixelRng independent (std::uint32_t stream) const noexcept
     {
         return PixelRng (pixel_, sample_, generation_ ^ (static_cast<std::uint64_t> (stream) * 0x9e3779b97f4a7c15ull));
     }

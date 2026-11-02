@@ -153,11 +153,18 @@ int main()
            "one-dimensional gratings reject hidden secondary lattice data");
     malformed = makeCrossedTwoDimensionalGratingPreset();
     malformed.geometry.secondaryDirectionUv = { 1.0f, 0.0f };
-    reject(malformed, "orthonormal secondary lattice",
-           "crossed gratings reject non-orthogonal lattice directions");
+    reject(malformed, "independent secondary lattice",
+           "crossed gratings reject parallel lattice directions");
+    malformed = makeCrossedTwoDimensionalGratingPreset();
+    malformed.geometry.secondaryDirectionUv = { 0.5f, 0.8660254f };
+    {
+        std::string sixtyDegreeError;
+        check(admit(malformed, sixtyDegreeError).has_value(),
+              "crossed gratings admit a second direction at sixty degrees");
+    }
     malformed = makeCrossedTwoDimensionalGratingPreset();
     malformed.geometry.secondaryGrooveSpacingNanometres = 0.0f;
-    reject(malformed, "orthonormal secondary lattice",
+    reject(malformed, "independent secondary lattice",
            "crossed gratings reject invalid secondary periods");
     malformed = makeAluminiumBinaryGratingPreset();
     malformed.microstructure.profile = static_cast<GrooveProfile>(255);

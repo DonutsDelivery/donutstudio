@@ -7,6 +7,8 @@
 #include "water_surface_replay.h"
 #include "particle_points_body_frame.h"
 
+#include <algorithm>
+#include <limits>
 #include <cmath>
 
 namespace videohelper::geometry {
@@ -19,8 +21,7 @@ using namespace videowire::geometry;
 }
 bool particlePointsBodyCoreEnvelope(const DeferredBodyGeometrySource& source,std::size_t wireBytes,
     bool frame,videorender::ParticlePointsBodyEnvelope& envelope) {
-  if (!source.reference || source.reference->positions.size()>256 || source.reference->indices.size()>384
-      || source.points.capacity==0 || source.points.capacity>64 || wireBytes>65536) return false;
+  if (!source.reference || source.points.capacity==0) return false;
   std::size_t mesh=sizeof(GeometryData), points=sizeof(ValueDescriptor), instances=sizeof(ValueDescriptor);
   if (!addArrayBytes(source.reference->positions.size(),sizeof(Vec3)+sizeof(StableId),mesh)
       || !addArrayBytes(source.reference->indices.size(),sizeof(std::uint32_t),mesh)
@@ -78,7 +79,7 @@ std::optional<RuntimeAdmission> GeometryCorePlanRuntime::admitPointsBody(const P
     const std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission>& source,std::string& error) {
   error.clear();
   try {
-  if (source && !source->caller()->charge(videorender::particlePointsBodyCoreOwnerVisits)) {
+  if (source && !source->caller()->charge(videorender::particlePointsBodyOperationCount(source->declaration()))) {
     error="Paired Geometry Core owner comparison work is short"; return std::nullopt;
   }
   if (!source || !owner.valid() || owner.planGeneration!=source->declaration().structuralRevision) {
@@ -569,11 +570,6 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     return std::nullopt;
   }
   if (!descriptor.spectrumFields.empty()) {
-    if (mesh->positions.size() > Visual3DScene::kMaxVertices
-        || mesh->indices.size() > Visual3DScene::kMaxIndices) {
-      error = "Audio Spectrum Field mesh exceeds the native retained-scene bounds";
-      return std::nullopt;
-    }
     if (spectrumEvaluation == nullptr) {
       error = "Spectrum geometry requires the frame's shared master analysis";
       return std::nullopt;
@@ -689,15 +685,13 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   if (mesh->positions.empty() || mesh->indices.empty() ||
       mesh->vertexIds.size() != mesh->positions.size() ||
       mesh->indices.size() % 3 != 0 ||
-      mesh->positions.size() > Visual3DScene::kMaxVertices ||
-      mesh->indices.size() > Visual3DScene::kMaxIndices ||
       mesh->positions.size() > std::numeric_limits<std::uint32_t>::max() ||
-      mesh->indices.size() > std::numeric_limits<std::uint32_t>::max() ||
-      (instances != nullptr && instances->instances.size() > Visual3DScene::kMaxObjects)) {
-    error = "Geometry Core mesh exceeds the native retained-scene bounds";
+      mesh->indices.size() > std::numeric_limits<std::uint32_t>::max()) {
+    error = "Geometry Core mesh is empty, malformed or overflows 32-bit indices: "
+        + std::to_string(mesh->positions.size()) + " vertices, " + std::to_string(mesh->indices.size()) + " indices";
     return std::nullopt;
   }
-  // Validate all untrusted references before allocating the fixed retained
+  // Validate all untrusted references before allocating the retained
   // scene. A hostile index must not cause a large Visual3DScene allocation or
   // any partial copy into backend-owned storage.
   for (const auto index : mesh->indices) {
@@ -718,6 +712,12 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   scene->id = {1};
   scene->activeCamera = {1};
   scene->ambientColor = {0.12f, 0.12f, 0.12f};
+  Visual3DSceneGrowth sceneGrowth;
+  sceneGrowth.vertices = mesh->positions.size();
+  sceneGrowth.indices = mesh->indices.size();
+  sceneGrowth.objects = instances != nullptr ? instances->instances.size() : 1;
+  if (!growVisual3DScene(*scene, sceneGrowth, error))
+    return std::nullopt;
   scene->vertexCount = mesh->positions.size();
   scene->indexCount = mesh->indices.size();
   for (std::size_t index = 0; index < mesh->positions.size(); ++index) {
@@ -788,8 +788,8 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   };
   scene->materials[0].baseColor = {channel(0), channel(8), channel(16)};
   // Bit 24 of a material identity marks a self-lit material. The three colour channels above read
-  // bits 0 to 23 only, so the flag leaves the hue alone. The fixed Geometry Core light does not
-  // reach most front faces, so a flagged material adds its own tinted emission to stay visible.
+  // bits 0 to 23 only, so the flag leaves the hue alone. The flag adds a tinted emission on top of
+  // the fixed Geometry Core key light so a self-lit material still reads in shadowed regions.
   if (((materialId >> 24) & 1u) != 0u)
     scene->materials[0].emissive = {scene->materials[0].baseColor.x * 0.35f,
                                     scene->materials[0].baseColor.y * 0.62f,
@@ -834,7 +834,11 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   }
   scene->lights[0].id = {1};
   scene->lights[0].kind = SceneLightKind::Directional;
-  scene->lights[0].transform.rotation = {-0.25f, 0.25f, 0.0f, 0.9354143f};
+  // Camera-facing key light: toLight = (-0.299, 0.399, 0.867), up and toward the viewer. Every
+  // camera-facing starter surface then gets a positive NdotL whatever its tilt, so displaced
+  // slopes shade instead of staying at the flat ambient-plus-emission floor. The previous
+  // direction raked from the upper right and left most front faces unlit.
+  scene->lights[0].transform.rotation = {-0.2064f, -0.1548f, 0.0f, 0.9661f};
   scene->lights[0].intensity = 1.5f;
   scene->lightCount = 1;
   scene->cameras[0].id = {1};
@@ -902,7 +906,7 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
         for (std::size_t channel=0;channel<3;++channel) {
           native->parameters.baseColorMetallic[channel]*=appearance.color[channel];
           native->timeMixEndColor[channel]*=appearance.color[channel];
-          native->parameters.emissionRoughness[channel]+=appearance.emission[channel];
+          native->parameters.emissionRoughness[channel]=std::min(native->parameters.emissionRoughness[channel]+appearance.emission[channel],std::numeric_limits<float>::max());
         }
         native->parameters.normalOpacity[3]*=appearance.color[3];
         if (appearance.metallic>=0) native->parameters.baseColorMetallic[3]=appearance.metallic;

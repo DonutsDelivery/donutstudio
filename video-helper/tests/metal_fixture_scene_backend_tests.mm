@@ -2048,7 +2048,7 @@ bool metalDirectionalIrradianceCohortCases(std::string& error)
             if(!diffractionmaterial::evaluateDiffractionOrders(*bindings[row.source]->material,row.wavelengthNanometres,
                 row.frame,row.toSource,row.uv,expected,error))return false;
             if(row.orderCount!=expected.orderCount||row.substrateReflectedPower!=expected.substrateReflectedPower
-                ||row.absorbedIrradiance!=row.incidentIrradiance*(1-expected.substrateReflectedPower))
+                ||row.absorbedIrradiance!=row.incidentIrradiance*(1-double(expected.substrateReflectedPower)))
                 return fail("Metal terminal response differs from the released physical evaluator");
             for(std::size_t o=0;o<row.orderCount;++o) {
                 const auto& actual=terminal.orders[row.firstOrder+o];const auto& physical=expected.orders[o];
@@ -4056,6 +4056,7 @@ std::size_t differingPixelCount(const std::vector<std::uint8_t>& left,
 
 int main()
 {
+    // These rows compare each authored walk against its own reference.
 #if ! defined(__aarch64__) && ! defined(__arm64__)
     std::cerr << "FAIL: strict fixture material target requires physical Apple Silicon\n";
     return EXIT_FAILURE;

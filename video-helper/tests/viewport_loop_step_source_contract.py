@@ -132,10 +132,13 @@ label_shape = re.compile(r"advance:imported-scene:[a-z-]+|gl:[a-z-]+|metal:[a-z-
 header_labels = scope_labels(imported_header)
 payload_labels = scope_labels(imported_payload)
 backend_labels = scope_labels(backend)
+# The caustic frame stages emplace onto one optional scope, which the direct-Scope
+# regex cannot see; their ordered partition of renderOpenGlGlassCausticScene is required.
+caustic_stage_labels = re.findall(r'stageScope\.emplace \("(gl:caustic-[a-z-]+)"\)', backend)
 fixture_labels = re.findall(r'"(advance:imported-scene:fixture-[a-z-]+)"', fixture)
 animated_labels = scope_labels(animated)
 metal_labels = re.findall(r'"(metal:[a-z-]+)"', metal)
-for label in header_labels + payload_labels + backend_labels + fixture_labels + animated_labels + metal_labels:
+for label in header_labels + payload_labels + backend_labels + caustic_stage_labels + fixture_labels + animated_labels + metal_labels:
     if not label_shape.fullmatch(label):
         errors.append("scope label not in advance:imported-scene:<name>, gl:<name> or metal:<name> form: " + label)
 for label in ("advance:imported-scene:plan-publish", "advance:imported-scene:resolve-compile"):
@@ -149,6 +152,24 @@ for label in ("gl:fixture-scene-program-compile", "gl:fixture-deformation-comput
               "gl:fixture-draw-finish", "gl:caustic-coverage-fence-wait"):
     if label not in backend_labels:
         errors.append("missing GL scope: " + label)
+
+# The caustic frame stages emplace onto one optional scope, which the direct-Scope
+# regex cannot see; their ordered partition of renderOpenGlGlassCausticScene is required.
+caustic_stages = ("gl:caustic-prepare", "gl:caustic-scene-base", "gl:caustic-frame-lock",
+                  "gl:caustic-frame-allocations", "gl:caustic-frame-decide",
+                  "gl:caustic-prep-residency", "gl:caustic-prep-buffers",
+                  "gl:caustic-prep-textures", "gl:caustic-prep-setup",
+                  "gl:caustic-compute-gap",
+                  "gl:caustic-job-store",
+                  "gl:caustic-composite", "gl:caustic-report")
+caustic_stage_at = [backend.find('stageScope.emplace ("%s")' % label) for label in caustic_stages]
+missing_stages = [label for label, at in zip(caustic_stages, caustic_stage_at) if at < 0]
+if missing_stages:
+    errors.append("missing caustic stage scope: " + str(missing_stages))
+elif not all(a < b for a, b in zip(caustic_stage_at, caustic_stage_at[1:])):
+    errors.append("caustic stage scopes are not in frame order: %s" % caustic_stage_at)
+if 'stageScope.emplace ("gl:caustic-scene-base");\n    const auto baseStarted' not in backend:
+    errors.append("the caustic scene-base stage does not wrap the base render call")
 
 # The scene program compile is timed inside the fixtureMutex-held prepare, not before it.
 prepare_at = backend.find("NativeFixtureScenePreparation prepareGeometryInstancesImpl(")

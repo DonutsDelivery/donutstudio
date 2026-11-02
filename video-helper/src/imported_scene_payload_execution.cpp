@@ -1,4 +1,5 @@
 #include "imported_scene_payload_execution.h"
+#include "pathtrace/devices/auto_device_latch.h"
 #include "VisualImportedAnimationOperationContract.h"
 #include "VisualImportedSceneIdentity.h"
 #include "geometry_score_field.h"
@@ -6,6 +7,7 @@
 #include "../../shared/Visual3DSceneComposition.h"
 #include "../../shared/GeometrySurfaceMaterial.h"
 #include "loop_step_probe.h"
+#include "timeline_scene_evaluation_inputs.h"
 
 #include <algorithm>
 #include <limits>
@@ -24,13 +26,40 @@ bool reject(std::string& error, const char* message)
     return false;
 }
 
-// The 3D Render node's engine and Path Trace export samples (V27 wire).
-videorender::fixture3d::SceneEngineSelection sceneEngineSelection(const ImportedSceneRequest& request) noexcept
+// Names the site that drops or creates a clip's StaticOwner. A per-frame drop
+// rebuilds its GLB seam and fixture renderer, so the renderer's resource cache —
+// and with it the resident water refit plan — never survives to the next frame.
+void logStaticOwnerChange (const char* what, const char* site, int clipId,
+    std::size_t stored = 0, std::size_t incoming = 0)
 {
+    static int logged = 0;
+    if (logged >= 60) return;
+    ++logged;
+    std::fprintf (stderr, "[gl] static owner %s site=%s clip=%d lens=%zu/%zu\n",
+                  what, site, clipId, stored, incoming);
+}
+
+static_assert(videorender::fixture3d::SceneEngineSelection {}.maxBounces
+              == visualimportedscenerender::kDefaultPathTraceMaxBounces);
+
+// The 3D Render node's engine, Path Trace export samples, preview
+// accumulation target (V27/V28 wire) and quality mode (V29 wire).
+videorender::fixture3d::SceneEngineSelection sceneEngineSelection(const ImportedSceneRequest& request)
+{
+    videohelper::pathtrace::device::autoDeviceLatch().noteEngine(request.clipId, request.renderStableId,
+        request.renderEngine == visualimportedscenerender::RenderEngine::PathTrace);
     videorender::fixture3d::SceneEngineSelection selection;
     selection.engine = request.renderEngine == visualimportedscenerender::RenderEngine::PathTrace
-        ? videorender::fixture3d::SceneEngineKind::PathTrace : videorender::fixture3d::SceneEngineKind::Raster;
+        ? videorender::fixture3d::SceneEngineKind::PathTrace
+        : request.renderEngine == visualimportedscenerender::RenderEngine::Realtime
+            ? videorender::fixture3d::SceneEngineKind::Realtime
+            : videorender::fixture3d::SceneEngineKind::Raster;
+    selection.mode = request.renderMode == visualimportedscenerender::RenderMode::Fast
+        ? videorender::fixture3d::SceneEngineMode::Fast : videorender::fixture3d::SceneEngineMode::Accurate;
     selection.exportSamples = request.pathTraceExportSamples;
+    selection.previewSamples = request.pathTracePreviewSamples;
+    selection.denoise = request.pathTraceDenoise;
+    selection.maxBounces = request.pathTraceMaxBounces;
     return selection;
 }
 
@@ -429,7 +458,9 @@ static const char* staticLocalRefusal(const ImportedSceneRequest& request)
         return "Static local object transforms in a Scene Compose need its procedural scene";
     if (request.runtimeInputs.noteInstanceMapping)
         return "Static local object transforms do not yet admit note instancing";
-    if (request.glassCaustic || request.diffractionMaterial)
+    // Realtime draws no caustic, so its selection does not stop a local transform.
+    if ((request.glassCaustic && request.renderEngine != visualimportedscenerender::RenderEngine::Realtime)
+        || request.diffractionMaterial)
         return "Static local object transforms do not yet admit glass caustics or diffraction gratings";
     return nullptr;
 }
@@ -534,8 +565,7 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
     if ((node.mesh ? *node.mesh + 1u : 0u) != local.meshStableId)
         return reject(error, "Static local target mesh does not match its exact original node");
     const auto imported = admission.sourceScene ? admission.sourceScene : admission.scene;
-    if (!imported || imported->objectCount > imported->objects.size()
-        || imported->objectCount > Visual3DScene::kMaxObjects)
+    if (!imported || imported->objectCount > imported->objects.size())
         return reject(error, "Static local retained source draw count is invalid");
     const auto n = document.nodes.size();
     const auto o = imported->objectCount;
@@ -819,9 +849,9 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
             if (multiplier != request.importedLights.intensityMultipliers.end())
             {
                 const auto intensity = double(value.intensity)*multiplier->second;
-                if (!std::isfinite(intensity) || intensity < 0 || intensity > 1000000)
+                if (!std::isfinite(intensity) || intensity < 0)
                     return reject(error, "Static local light intensity is out of bounds");
-                value.intensity = float(intensity);
+                value.intensity = float(std::min(intensity, double(std::numeric_limits<float>::max())));
             }
         }
         if (!visualimportedscenerender::detail::validLight(value))
@@ -998,6 +1028,7 @@ void ImportedScenePayloadExecution::reset() noexcept
     parentPublicationReady_=true;
     if (deformationExecution_ != nullptr)
         deformationExecution_->reset();
+    logStaticOwnerChange ("retired", "clear-reset", 0);
     staticOwners_.clear();
     staticLocalBudget_.reset();
     staticLocalCallerBudget_.reset();
@@ -1013,7 +1044,10 @@ void ImportedScenePayloadExecution::synchronizeGenerations(
     if (!staticOwners_.empty()
         && (projectGeneration != projectGeneration_
             || helperGeneration != helperGeneration_))
+    {
+        logStaticOwnerChange ("retired", "clear-generations", 0);
         staticOwners_.clear();
+    }
     projectGeneration_ = projectGeneration;
     helperGeneration_ = helperGeneration;
 }
@@ -1023,13 +1057,17 @@ void ImportedScenePayloadExecution::synchronizeDevice() noexcept
     const auto info = backend_.info();
     const auto identity = info.backend + "\n" + info.device;
     if (!deviceIdentity_.empty() && identity != deviceIdentity_)
+    {
+        logStaticOwnerChange ("retired", "clear-device", 0);
         staticOwners_.clear();
+    }
     deviceIdentity_ = identity;
 }
 
 void ImportedScenePayloadExecution::publishStaticPayload(
     int clipId, std::uint64_t projectGeneration, std::uint64_t helperGeneration,
-    const std::string& exactPayloadIdentity) noexcept
+    const std::string& exactPayloadIdentity,
+    const std::shared_ptr<const void>& planPublication) noexcept
 {
     parentPublicationReady_=true;
     if (parentPublication_ && !parentPublication_->presentation->retired_)
@@ -1066,18 +1104,28 @@ void ImportedScenePayloadExecution::publishStaticPayload(
     synchronizeGenerations(projectGeneration, helperGeneration);
     synchronizeDevice();
     bool retired = false;
-    for (auto found = staticOwners_.begin(); found != staticOwners_.end();)
+    // Every owner is created by an execute that publishes its text here first, so text that
+    // matched for this clip in this publication still matches, and the 276 MB scan can stay out.
+    if (publishedPayloads_.size() >= kMaximumStaticOwners && !publishedPayloads_.count(clipId))
+        publishedPayloads_.clear();
+    auto& publishedPayload = publishedPayloads_[clipId];
+    if (!publishedPayload.holds(planPublication, &exactPayloadIdentity))
     {
-        if (found->first == clipId
-            && found->second.exactPayloadIdentity != exactPayloadIdentity
-            && !(found->second.payload && !found->second.proceduralScene
-                && sameStaticObjectSelectionSource(found->second.exactPayloadIdentity, exactPayloadIdentity)))
+        ++staticPayloadScans_;
+        for (auto found = staticOwners_.begin(); found != staticOwners_.end();)
         {
-            retired = true;
-            found = staticOwners_.erase(found);
+            if (found->first == clipId
+                && found->second.exactPayloadIdentity != exactPayloadIdentity
+                && !(found->second.payload && !found->second.proceduralScene
+                    && sameStaticObjectSelectionSource(found->second.exactPayloadIdentity, exactPayloadIdentity)))
+            {
+                retired = true;
+                found = staticOwners_.erase(found);
+            }
+            else
+                ++found;
         }
-        else
-            ++found;
+        publishedPayload.remember(planPublication, &exactPayloadIdentity);
     }
     retiredOwnerSinceLastAttempt_ = retired;
 }
@@ -1104,6 +1152,11 @@ bool ImportedScenePayloadExecution::execute(
     // Early successes below return before the final publish, so a pending flag
     // from an earlier call must not survive into them.
     output.pending = false;
+    // The lighthouse window lost ~9 s inside this call with every inner step
+    // under the slow-step threshold, unaccounted between the seam warm and the
+    // fixture renderer's own scopes. The whole payload execute is named first so
+    // its share of imported-scene-exec is visible; a follow-up bisects inside.
+    loopstep::Scope payloadExecuteScope ("advance:imported-scene:payload-execute");
     const bool localTransform = !visualimportedobjectlocal::same(request.objectLocalTransform, {})
         || (request.importedScene && !visualimportedobjectlocal::same(request.importedScene->objectLocalTransform, {}));
     if (localTransform)
@@ -1126,9 +1179,6 @@ bool ImportedScenePayloadExecution::execute(
         }
         if (selecting > 1)
             return reject(error, "Scene Compose refused: more than one imported leaf selects an object");
-        // The animated execution refuses this on every frame too.
-        if (request.renderEngine == visualimportedscenerender::RenderEngine::PathTrace)
-            return reject(error, visualimportedscenerender::kPathTraceMultipleImportedLeavesUnavailable.data());
     }
     std::shared_ptr<const NativeCompositionRetentionBudget::Charge> parentPayloadCharge;
     std::shared_ptr<ImportedSceneExecutionReceipt::ParentPayloadIdentity> parentPayloadIdentity;
@@ -1217,9 +1267,9 @@ bool ImportedScenePayloadExecution::execute(
 #endif
         if (!execution.sceneAnimationBudget_->work(fixedBytes,2,error)
             || !execution.sceneAnimationBudget_->work(parentReceiptExchangeWork,1,error)) return false;
-        if (request.staticPayloadIdentity.capacity()>=NativeSceneAnimationCompositionBudget::kMaximumBytes)
+        if (request.payloadIdentity().capacity()>=NativeSceneAnimationCompositionBudget::kMaximumBytes)
             return reject(error,"imported parent outer payload identity exceeds logical CPU capacity");
-        const auto identityBytes=request.staticPayloadIdentity.capacity()+1;
+        const auto identityBytes=request.payloadIdentity().capacity()+1;
         const auto incumbentBytes=output.parentPayloadIdentity_
             ? output.parentPayloadIdentity_->exactPayloadIdentity.capacity()+1:0;
         if (!execution.sceneAnimationBudget_->work(identityBytes+incumbentBytes,2,error)) return false;
@@ -1236,7 +1286,7 @@ bool ImportedScenePayloadExecution::execute(
                 *(24+2*(visualmodelasset::kMaximumStableAssetIdBytes+visualmodelasset::kSha256HexBytes+17));
             if (!execution.sceneAnimationBudget_->work(resolveWork,1,error)) return false;
             const auto payload=use==ImportedSceneUse::Preview?store_.resolvePreview(request.asset):store_.resolveExport(request.asset);
-            if (old.exactPayloadIdentity!=request.staticPayloadIdentity || payload!=output.payload)
+            if (old.exactPayloadIdentity!=request.payloadIdentity() || payload!=output.payload)
             {
                 if (parentPublication_ && old.presentation==parentPublication_->presentation) retireParentPresentation();
                 clearCallerReceipt(output);
@@ -1247,8 +1297,8 @@ bool ImportedScenePayloadExecution::execute(
         parentPayloadIdentity=std::make_shared<Identity>();
         parentPayloadIdentity->retention=parentPayloadCharge;
         parentPayloadIdentity->budget=execution.sceneAnimationBudget_;
-        parentPayloadIdentity->exactPayloadIdentity=request.staticPayloadIdentity;
-        if (parentPayloadIdentity->exactPayloadIdentity.capacity()>request.staticPayloadIdentity.capacity())
+        parentPayloadIdentity->exactPayloadIdentity=request.payloadIdentity();
+        if (parentPayloadIdentity->exactPayloadIdentity.capacity()>request.payloadIdentity().capacity())
             return reject(error,"imported parent copied outer identity exceeds its reserved capacity");
         parentPayloadIdentity->structural=request.structuralRevision;
         parentPayloadIdentity->project=request.projectGeneration;parentPayloadIdentity->helper=request.helperGeneration;
@@ -1260,7 +1310,7 @@ bool ImportedScenePayloadExecution::execute(
         }
     }
     publishStaticPayload(request.clipId, request.projectGeneration,
-                         request.helperGeneration, request.staticPayloadIdentity);
+                         request.helperGeneration, request.payloadIdentity(), request.publishedPayloadOwner);
     if (request.parentIntent && !parentPublicationReady_)
         return reject(error,"imported parent publication identity exceeds permanent work or logical CPU capacity");
     // When this attempt retires the clip's previous owner, any frame from the
@@ -1388,8 +1438,9 @@ bool ImportedScenePayloadExecution::execute(
                 return reject(error, "Scene Compose refused: note instancing of multiple imported leaves is not rendered yet");
             if (request.material && request.material->vertexModifier)
                 return reject(error, "Scene Compose refused: a material vertex processor with multiple imported leaves is not rendered yet");
-            if (!animatedLeaf)
-                return reject(error, "Scene Compose refused: multiple imported leaves without animation are not rendered yet");
+            if (!animatedLeaf && (request.objectNodeStableId != 0 || std::any_of(request.additionalImportedScenes.begin(),
+                    request.additionalImportedScenes.end(), [](const auto& entry) { return entry.scene->objectNodeStableId != 0; })))
+                return reject(error, "Scene Compose refused: a selected object with only static imported leaves is not rendered yet");
         }
     }
     else if (!request.additionalImportedScenes.empty())
@@ -1402,7 +1453,12 @@ bool ImportedScenePayloadExecution::execute(
         return reject(error,"Imported parenting requires one genuine deformation composition without family, notes or vertex processors");
     if (composedScene)
     {
-        if (!HarmonicMIDI::grid::validateVisual3DScene(*request.sceneSnapshot).valid()
+        const auto verifiedOwner = staticOwners_.find(request.clipId);
+        const visualimportedscenerender::Request* verified = verifiedOwner != staticOwners_.end()
+            && verifiedOwner->second.verifiedOperation
+            && verifiedOwner->second.verifiedOperation->sceneSnapshot == request.sceneSnapshot
+            ? verifiedOwner->second.verifiedOperation.get() : nullptr;
+        if ((!verified && !HarmonicMIDI::grid::validateVisual3DScene(*request.sceneSnapshot).valid())
             || !request.asset.id.empty() || request.sceneIndex || request.sourceCameraNodeId || request.deformation
             || request.camera || request.light || !request.importedLights.empty()
             || request.structuralRevision == 0
@@ -1420,12 +1476,19 @@ bool ImportedScenePayloadExecution::execute(
         operation.diffractionMaterial = request.diffractionMaterial;
         if (operation.material && operation.material->sceneSnapshot == nullptr)
             operation.material->sceneSnapshot = request.sceneSnapshot;
-        if (!visualimportedscenerender::valid(operation))
-            return reject(error, "composed Scene3D material identity or revision is stale");
+        if (!verified || !visualimportedscenerender::sameRequest(*verified, operation))
+        {
+            if (!visualimportedscenerender::valid(operation))
+                return reject(error, "composed Scene3D material identity or revision is stale");
+            if (verifiedOwner != staticOwners_.end())
+                verifiedOwner->second.verifiedOperation
+                    = std::make_shared<const visualimportedscenerender::Request>(operation);
+        }
     }
     else
     {
-        if (request.glassCaustic)
+        // Realtime draws no caustic, so it needs no snapshot owner for one.
+        if (request.glassCaustic && request.renderEngine != visualimportedscenerender::RenderEngine::Realtime)
             return reject(error, "Glass caustics require the exact retained Scene3D snapshot owner");
         if (!request.surfacePrograms.empty() && !importedComposition)
             return reject(error, "Surface object collections require the retained Scene3D snapshot owner");
@@ -1512,7 +1575,9 @@ bool ImportedScenePayloadExecution::execute(
     if (!sceneInputs.noteInstanceMapping)
         sceneInputs.canonicalBlockCFrame.reset();
 
-    if (request.deformation || !request.additionalImportedScenes.empty())
+    // Only static leaves stay on the static route below, joined in its owner.
+    if (request.deformation || std::any_of(request.additionalImportedScenes.begin(), request.additionalImportedScenes.end(),
+            [](const auto& entry) { return entry.deformation.has_value(); }))
     {
         if (request.deformation && (!visualanimationoperation::valid(*request.deformation)
             || !visualanimationimport::sameAsset(
@@ -1629,8 +1694,11 @@ bool ImportedScenePayloadExecution::execute(
     }
 
     visualmodelassetpayload::PayloadPtr payload;
+    std::vector<visualmodelassetpayload::PayloadPtr> additionalPayloads;
+    std::vector<std::optional<std::size_t>> additionalSceneIndices;
     if (!composedScene)
     {
+        loopstep::Scope payloadResolveScope ("advance:imported-scene:payload-resolve");
         payload = use == ImportedSceneUse::Preview
             ? store_.resolvePreview(request.asset)
             : store_.resolveExport(request.asset);
@@ -1638,7 +1706,17 @@ bool ImportedScenePayloadExecution::execute(
             return reject(error, "imported scene exact payload is not resident");
         if (payload->bytes().size() != request.asset.sourceByteSize)
             return reject(error, "imported scene resident payload size is inconsistent");
-
+        for (const auto& entry : request.additionalImportedScenes)
+        {
+            auto leafPayload = use == ImportedSceneUse::Preview
+                ? store_.resolvePreview(entry.scene->asset) : store_.resolveExport(entry.scene->asset);
+            if (!leafPayload)
+                return reject(error, "imported scene exact payload is not resident");
+            if (leafPayload->bytes().size() != entry.scene->asset.sourceByteSize)
+                return reject(error, "imported scene resident payload size is inconsistent");
+            additionalPayloads.push_back(std::move(leafPayload));
+            additionalSceneIndices.push_back(entry.scene->sceneIndex);
+        }
     }
 
     if (!composedScene && !staticLocalBudget_)
@@ -1651,6 +1729,11 @@ bool ImportedScenePayloadExecution::execute(
         }
     }
 
+    // Bisect: the entry-to-publish stretch of payload-execute holds ~9.3 s with
+    // cold-admit, the deformation delegate, the camera decode and the payload
+    // resolve all sub-threshold or absent, so this owner-prepare section reports
+    // its own share next to payload-execute's total.
+    loopstep::Scope payloadOwnerScope ("advance:imported-scene:payload-owner");
     // One immutable static owner per clip: preview and export share the exact
     // prepared scene so an export re-render never re-uploads static resources.
     const StaticOwnerKey ownerKey = request.clipId;
@@ -1671,9 +1754,28 @@ bool ImportedScenePayloadExecution::execute(
     }
     std::array<arbitgpu::NativeSceneMotionHistory, 2> carriedMotion;
     std::optional<gltf::GlbNativeSceneAdmission> carriedImport;
+    std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>> carriedAdditionalScenes;
     std::optional<HarmonicMIDI::grid::SceneCameraRecord> carriedCamera;
+    // The replacement owner's fresh seam gets the previous renderer's prepared
+    // static resources: an animated scene is a new snapshot every frame, and
+    // without them every frame would cold-prepare, so the resident water refit
+    // plan would never have a second frame to be made in.
+    std::optional<videorender::fixture3d::FixtureSceneRenderer::CachedResources> carriedRendererCache;
+    std::shared_ptr<videorender::fixture3d::SceneRenderEngine> carriedPathTraceEngine;
+    const auto sameRequestEnvironmentImage = [&](const StaticOwner& owner)
+    {
+        const bool bound = !composedScene && request.light && request.light->environmentImage.version != 0;
+        if (bound != owner.environmentImage.has_value()) return false;
+        if (!bound) return true;
+        const auto& asset = request.light->environmentImage.asset;
+        return owner.environmentImage->id == asset.id && owner.environmentImage->version == asset.version
+            && owner.environmentImage->contentSha256 == asset.contentSha256;
+    };
     if (foundOwner != staticOwners_.end()
         && ((!composedScene && foundOwner->second.payload != payload)
+            || !sameRequestEnvironmentImage(foundOwner->second)
+            || foundOwner->second.additionalPayloads != additionalPayloads
+            || foundOwner->second.additionalSceneIndices != additionalSceneIndices
             || foundOwner->second.sceneIndex != request.sceneIndex
             || foundOwner->second.objectNodeStableId != request.objectNodeStableId
             || foundOwner->second.objectMeshStableId != request.objectMeshStableId
@@ -1699,6 +1801,8 @@ bool ImportedScenePayloadExecution::execute(
         // seam, so material publication starts clean for the composed scene.
         if (importedComposition && foundOwner->second.importedScene
             && foundOwner->second.payload == payload
+            && foundOwner->second.additionalPayloads == additionalPayloads
+            && foundOwner->second.additionalSceneIndices == additionalSceneIndices
             && foundOwner->second.sceneIndex == request.sceneIndex
             && foundOwner->second.objectNodeStableId == request.objectNodeStableId
             && foundOwner->second.objectMeshStableId == request.objectMeshStableId
@@ -1706,8 +1810,11 @@ bool ImportedScenePayloadExecution::execute(
         {
             carriedImport = std::move(foundOwner->second.admission);
             carriedImport->scene = std::move(foundOwner->second.importedScene);
+            carriedAdditionalScenes = std::move(foundOwner->second.additionalScenes);
             carriedCamera = std::move(foundOwner->second.selectedSourceCamera);
         }
+        carriedRendererCache = foundOwner->second.seam.takeRendererCache();
+        carriedPathTraceEngine = foundOwner->second.seam.takePathTraceEngine();
         staticOwners_.erase(foundOwner);
         foundOwner = staticOwners_.end();
     }
@@ -1720,8 +1827,18 @@ bool ImportedScenePayloadExecution::execute(
         if (!didInsert)
             return reject(error, "imported scene static owner insertion failed");
         auto& owner = inserted->second;
+        if (carriedRendererCache)
+        {
+            owner.seam.giveRendererCache (std::move (*carriedRendererCache));
+            carriedRendererCache.reset();
+        }
+        if (carriedPathTraceEngine)
+        {
+            owner.seam.givePathTraceEngine (std::move (carriedPathTraceEngine));
+            carriedPathTraceEngine.reset();
+        }
         owner.motion = std::move(carriedMotion);
-        owner.exactPayloadIdentity = request.staticPayloadIdentity;
+        owner.exactPayloadIdentity = request.payloadIdentity();
         owner.glassCaustic = request.glassCaustic;
         owner.payload = payload;
         owner.sceneIndex = request.sceneIndex;
@@ -1762,11 +1879,47 @@ bool ImportedScenePayloadExecution::execute(
         }
         if (importedComposition)
         {
-            auto composed = gltf::composeImportedVisual3DScene(*request.sceneSnapshot, *owner.admission.scene, error);
+            std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> composed;
+            if (additionalPayloads.empty())
+                composed = gltf::composeImportedVisual3DScene(*request.sceneSnapshot, *owner.admission.scene, error);
+            else
+            {
+                owner.additionalPayloads = additionalPayloads;
+                owner.additionalSceneIndices = additionalSceneIndices;
+                owner.additionalScenes = std::move(carriedAdditionalScenes);
+                for (std::size_t leaf = owner.additionalScenes.size(); leaf < additionalPayloads.size(); ++leaf)
+                {
+                    gltf::GlbNativeRenderSeam leafSeam(backend_);
+                    gltf::GlbNativeSceneAdmission leafAdmission;
+                    if (!leafSeam.admit(additionalPayloads[leaf]->bytes(), additionalSceneIndices[leaf], leafAdmission,
+                            error, 0, 0, staticLocalBudget_, true))
+                    {
+                        staticOwners_.erase(inserted);
+                        return false;
+                    }
+                    owner.additionalScenes.push_back(std::move(leafAdmission.scene));
+                }
+                std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>> leaves {owner.admission.scene};
+                leaves.insert(leaves.end(), owner.additionalScenes.begin(), owner.additionalScenes.end());
+                composed = composeImportedLeafScenes(*request.sceneSnapshot, leaves, error);
+            }
             if (!composed) { staticOwners_.erase(inserted); return false; }
             owner.proceduralScene = request.sceneSnapshot;
             owner.importedScene = std::move(owner.admission.scene);
             owner.admission.scene = std::move(composed);
+        }
+        if (!composedScene && request.light && request.light->environmentImage.version != 0)
+        {
+            std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> bound;
+            try { bound = HarmonicMIDI::grid::scenecomposition::sceneWithEnvironmentImageLight(*owner.admission.scene, *request.light); }
+            catch (const std::bad_alloc&) {}
+            if (!bound)
+            {
+                staticOwners_.erase(inserted);
+                return reject(error, "HDR environment scene copy allocation failed");
+            }
+            owner.admission.scene = std::move(bound);
+            owner.environmentImage = request.light->environmentImage.asset;
         }
         foundOwner = inserted;
         insertedStaticOwner = !request.parentIntent && request.objectLocalTransform.version != 0;
@@ -1790,12 +1943,21 @@ bool ImportedScenePayloadExecution::execute(
         }
     }
 
-    if (!importedComposition && !importedscene::evaluateImportedLights(request.importedLights,
-            admission.importedLightDefinitions, *admission.scene, sceneInputs.animatedLights, error)) return false;
+    // The call ends with its own block scope so the difference between this
+    // scope's total and the call's names which side holds the first-publish cost.
+    bool importedLightsOk = true;
+    {
+        loopstep::Scope payloadLightsCallScope ("advance:imported-scene:payload-lights-call");
+        importedLightsOk = importedComposition || importedscene::evaluateImportedLights(request.importedLights,
+            admission.importedLightDefinitions, *admission.scene, sceneInputs.animatedLights, error);
+    }
+    if (!importedLightsOk) return false;
 
     bool usedLastGoodMaterial = false;
     std::string materialDiagnostic;
-    if (!request.surfacePrograms.empty())
+    const bool staticLeafMaterial = std::any_of(request.additionalImportedScenes.begin(),
+        request.additionalImportedScenes.end(), [](const auto& entry) { return entry.scene->material.has_value(); });
+    if (!request.surfacePrograms.empty() || staticLeafMaterial)
     {
         auto programs = request.surfacePrograms;
         if (importedComposition)
@@ -1813,6 +1975,29 @@ bool ImportedScenePayloadExecution::execute(
                     admission.scene, request.structuralRevision, request.evaluationRevision, overrideError))
                 return reject(error, overrideError.c_str());
         }
+        // A leaf 1+ material arrives lowered in its leaf range, as on the animated route.
+        const auto leafCount = request.additionalImportedScenes.size() + 1;
+        for (std::size_t index = 0; index + 1 < leafCount; ++index)
+        {
+            const auto& leafMaterial = request.additionalImportedScenes[index].scene->material;
+            if (!leafMaterial) continue;
+            const auto prefix = "Scene Compose refused: imported leaf " + std::to_string(index + 1);
+            const auto object = leafMaterial->binding.object;
+            if (leafMaterial->sceneSnapshot != nullptr)
+                return reject(error, "imported scene material transport must not carry a foreign scene owner");
+            if (!HarmonicMIDI::grid::scenecomposition::importedLeafOwnsObjectId(object.value, index + 1, leafCount))
+                return reject(error, (prefix + " Render Material names an object outside its own leaf").c_str());
+            const auto* target = HarmonicMIDI::grid::visual3d_detail::findById(
+                admission.scene->objects, admission.scene->objectCount, object);
+            if (!target || target->indexCount == 0)
+                return reject(error, (prefix + " draws no object at its Render Material node and primitive").c_str());
+            if (target->material.value != geometrysurfacematerial::materialId(*leafMaterial))
+                return reject(error, (prefix + " Render Material ID does not match its object's material").c_str());
+            std::string overrideError;
+            if (!geometrysurfacematerial::appendImportedOverride(programs, *leafMaterial,
+                    admission.scene, request.structuralRevision, request.evaluationRevision, overrideError))
+                return reject(error, overrideError.c_str());
+        }
         if (request.frame.rateNumerator == 0 || request.frame.rateDenominator == 0)
             return reject(error, "Surface collection requires the exact rational preview or export frame");
         videowire::geometry::RuntimeFieldEvaluation evaluation;
@@ -1820,12 +2005,16 @@ bool ImportedScenePayloadExecution::execute(
         evaluation.scoreAt = [&](const auto& operation, const auto& positions, auto& result, auto& diagnostic) {
             return scorefield::evaluateSampleField(operation, positions, request.runtimeInputs.canonicalBlockCFrame, result, diagnostic);
         };
+        const auto* materialFrame = request.runtimeInputs.canonicalBlockCFrame.get();
+        const auto materialInputs = geometry::timelineSceneEvaluationInputs(evaluation.timelineSeconds, 0.0, false,
+            materialFrame ? &materialFrame->key : nullptr);
         if (!seam.publishSurfacePrograms(admission, programs, evaluation, error,
                 request.diffractionMaterial ? &*request.diffractionMaterial : nullptr,
-                request.glassCaustic ? &*request.glassCaustic : nullptr)) return false;
+                request.glassCaustic ? &*request.glassCaustic : nullptr, &materialInputs)) return false;
     }
     else if (request.material)
     {
+        loopstep::Scope materialBindingScope ("advance:imported-scene:material-binding");
         auto material = *request.material;
         if (importedComposition)
         {
@@ -1863,6 +2052,11 @@ bool ImportedScenePayloadExecution::execute(
         seam.clearDiffractionMaterial(admission);
     }
 
+    // Bisect: payload-execute held ~9.3 s unaccounted between the seam warm and
+    // the seam render, past the material chain with every inner step sub-threshold.
+    // Local staging, motion history and the predecessor projection run from here to
+    // the render, so their share is named next.
+    loopstep::Scope preRenderScope ("advance:imported-scene:pre-render");
     // A non-neutral object-local transform stages one candidate over this
     // owner's exact admission, so nothing decodes twice. Its checked worlds
     // drive the native draw. The candidate itself ends with this attempt.

@@ -1,7 +1,10 @@
 #pragma once
 
 #include "fixture_opaque_visibility.h"
+#include "fixture_rough_v1_fallback.h"
+#include <cstdio>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <numeric>
@@ -9,30 +12,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <set>
+#include <tuple>
 
 namespace arbitgpu::smoothglass
 {
-inline constexpr std::size_t kMaximumSceneTriangles = 8192;
-inline constexpr std::size_t kMaximumVolumeTriangles = 2048;
 inline constexpr std::size_t kMaximumRayVisits = 64;
 inline constexpr std::size_t kMaximumInterfaceDepth = 32;
-// A camera smooth-glass walk that runs out of visits with power still inside
-// the glass ends there: the remaining power counts as absorbed (no radiance)
-// and the pixel keeps the radiance it already gathered. The shader marks such
-// a pixel complete with SmoothTransportStatus::Trapped, which the raw-normal
-// alpha carries as +2.0. Rim pixels under total internal reflection and lens
-// reflections in animated water do this a handful of pixels at a time, and
-// which pixels do it moves with the water, so one of them must not refuse the
-// frame. A frame still refuses when trapped pixels are systemic: more than
-// 4096 pixels (about 0.05% of a 3840x2160 frame), or more than 0.5% of the
-// drawn surface pixels. The raw-normal alpha cannot tell glass coverage from
-// opaque coverage, so the fraction is of every drawn pixel; the absolute cap
-// is the bound that bites on a small lens in a large frame. Interface depth,
-// pending branches, non-finite results and identity or medium mismatches
-// stay per-pixel refusals.
-inline constexpr std::size_t kMaximumTrappedCameraPixels = 4096;
-inline constexpr double kMaximumTrappedCameraFraction = 0.005;
+// A camera smooth-glass walk that reaches the interface depth limit or runs out
+// of visits with power still inside the glass ends there: the remaining power
+// counts as absorbed (no radiance) and the pixel keeps the radiance it already
+// gathered. The shader marks such a pixel complete with
+// SmoothTransportStatus::Trapped, which the raw-normal alpha carries as +2.0.
+// Trapped pixels never refuse a frame. Pending branches, non-finite results and
+// identity or medium mismatches stay per-pixel refusals.
 // Prerequisite for native rough transport, not a capability admission. Native
 // callers must retain the separate terminal, masked and tail power receipts.
 inline constexpr std::size_t kRoughInterfaceSamples = 16;
@@ -41,10 +35,13 @@ inline constexpr std::uint32_t kMultipleScatterVersion = 2;
 inline constexpr std::size_t kMaximumMicrofacetEvents = 32, kMaximumMicrofacetExits = 16;
 inline constexpr std::uint32_t kSingleScatterCameraVersion = 1;
 inline constexpr int kMultipleScatterCameraComplete = 33;
+// A pixel with lanes still to run. Never a final status.
+inline constexpr int kMultipleScatterCameraRunning = 34;
 inline constexpr std::uint64_t kMaximumCameraMicroEvents = 3*kRoughInterfaceSamples*kMaximumRayVisits*kMaximumMicrofacetEvents;
 // Retain the conservative two-walk charge. Selected compute shares one walk
 // between Color and receipt without increasing the admitted workload.
 inline constexpr std::uint64_t kCameraMicroWorkPerEvent = 2*5;
+// One submission's work, which sets the tile size. A frame runs as many tiles as it needs.
 inline constexpr std::uint64_t kMaximumCameraMicroWork = 128ull*1024ull*1024ull;
 inline constexpr std::uint64_t kMaximumCameraPixelMicroWork = kCameraMicroWorkPerEvent*kMaximumCameraMicroEvents;
 inline constexpr float kMaximumRoughUnresolvedPower = 0.0001f;
@@ -57,40 +54,37 @@ static_assert(kRoughInterfaceSamples==16, "The rough visible-normal schedule req
 enum class RoughTransportStatus : int
 {
     Complete=1, Smooth=2, InvalidInput=-1, InternalCamera=-2, IncompleteQuery=-3,
-    IdentityOrMedium=-4, InterfaceDepth=-5, PendingBranches=-6, RayVisits=-7,
+    IdentityOrMedium=-4, PendingBranches=-6, RayVisits=-7,
     UnresolvedEnergy=-8, Nonfinite=-9, NonconservingEnergy=-10
 };
 // Smooth closed-glass refusals are written to the raw-normal alpha channel of
 // incomplete pixels. -1 (no reason) and -2 (unrepresentable) keep their
 // released meanings, so the codes start at -3 and each has a distinct binary16
 // pattern. Every early return in glassTransport sets one of these codes.
-// The thin water path adds -15 to -19. Rough refusals map to -20 to -29 through
+// The thin water path adds -15 to -20. Rough refusals map to -21 to -30 through
 // roughReasonCode, so every incomplete native pixel names its reason.
 enum class SmoothTransportStatus : int
 {
     Unclassified=-3, QueryRefused=-4, QueryBudget=-5, FirstHitMismatch=-6,
-    MediumMismatch=-7, ReceiverMiss=-8, OrientationMismatch=-9, InterfaceDepth=-10,
+    MediumMismatch=-7, ReceiverMiss=-8, OrientationMismatch=-9,
     NonfiniteScatter=-11, DiscardedEnergy=-12, PendingBranches=-13, RayVisits=-14,
     ThinReentry=-15, ThinNonfiniteIncoming=-16, ThinFirstHit=-17, ThinReceiver=-18,
     ThinRadiance=-19,
+    // Site A of the thin entry check: the camera's first query did not return
+    // a usable hit (refused, work budget, or nonfinite distance), as opposed
+    // to ThinFirstHit, which the past-tolerance second query returns when a
+    // foreign surface still stands in front of the water entry.
+    ThinFirstQuery=-20,
     // Not a refusal. The walk completed after absorbing the power it could not
-    // trace within its visits; see kMaximumTrappedCameraPixels.
+    // trace within its depth limit and visits; see kMaximumInterfaceDepth.
     Trapped=2
 };
 // Raw-normal alpha of a trapped pixel: binary16 +2.0.
 inline constexpr std::uint16_t kTrappedNormalBits = 0x4000u;
 static_assert(int(SmoothTransportStatus::Trapped)==2, "kTrappedNormalBits encodes +2.0");
-static_assert(kMaximumTrappedCameraFraction==0.005, "completeFrame names the trapped fraction as 0.5%");
-// Whole-frame admission of trapped camera pixels. surfacePixels counts every
-// drawn pixel of the raw-normal attachment, trapped ones included.
-inline bool admitTrappedCameraPixels(std::uint64_t trappedPixels, std::uint64_t surfacePixels) noexcept
-{
-    return trappedPixels <= kMaximumTrappedCameraPixels
-        && double(trappedPixels) <= kMaximumTrappedCameraFraction*double(surfacePixels);
-}
 // Rough status s in [-10,-1] is reported as kRoughReasonBase+s, so -1 to -10
-// become -20 to -29 and never collide with the smooth codes or -1 and -2.
-inline constexpr int kRoughReasonBase=-19;
+// become -21 to -30 and never collide with the smooth codes or -1 and -2.
+inline constexpr int kRoughReasonBase=-20;
 constexpr int roughReasonCode(RoughTransportStatus status) { return kRoughReasonBase+int(status); }
 inline const char* roughTransportDiagnostic(RoughTransportStatus status)
 {
@@ -101,7 +95,6 @@ inline const char* roughTransportDiagnostic(RoughTransportStatus status)
         case RoughTransportStatus::InternalCamera: return "Rough glass currently refuses internal cameras";
         case RoughTransportStatus::IncompleteQuery: return "Rough glass closest-hit query did not complete";
         case RoughTransportStatus::IdentityOrMedium: return "Rough glass path identity or medium orientation is inconsistent";
-        case RoughTransportStatus::InterfaceDepth: return "Rough glass interface-depth budget exhausted";
         case RoughTransportStatus::PendingBranches: return "Rough glass pending-branch budget exhausted";
         case RoughTransportStatus::RayVisits: return "Rough glass ray-query work budget exhausted";
         case RoughTransportStatus::UnresolvedEnergy: return "Rough glass requires microfacet multiple scattering beyond its unresolved-power bound";
@@ -110,20 +103,32 @@ inline const char* roughTransportDiagnostic(RoughTransportStatus status)
     }
     return "Rough glass completion status is unavailable";
 }
+// The refusal for a selected camera pixel that came back incomplete. A negative
+// status names why the walk stopped.
+inline std::string selectedCameraFailure(float status)
+{
+    for (int code=-1;code>=-10;--code) if (status==code) return roughTransportDiagnostic(static_cast<RoughTransportStatus>(code));
+    return "selected camera native invocation did not complete within its work reserve";
+}
 struct RoughEnergyReceipt final
 {
     std::array<double, 3> terminal {}, masked {}, tail {};
+    // Power of the paths that ended at the interface depth limit, as tracked when
+    // each path ended. It closes the receipt without counting as unresolved. It is
+    // darkening: large values mean too few bounces or a bad sample schedule.
+    std::array<double, 3> absorbed {};
 };
 inline bool completeRoughEnergy(const RoughEnergyReceipt& receipt, std::string& error)
 {
     for (std::size_t c=0;c<3;++c) {
-        const double terminal=receipt.terminal[c], masked=receipt.masked[c], tail=receipt.tail[c];
-        if (!std::isfinite(terminal) || !std::isfinite(masked) || !std::isfinite(tail)
-            || terminal<0 || masked<0 || tail<0 || terminal>1 || masked>1 || tail>1
-            || std::abs(terminal+masked+tail-1)>kRoughEnergyConservationTolerance)
-        { error="Rough glass energy receipt is incomplete or nonconserving"; return false; }
+        const double terminal=receipt.terminal[c], masked=receipt.masked[c], tail=receipt.tail[c], absorbed=receipt.absorbed[c];
+        if (!std::isfinite(terminal) || !std::isfinite(masked) || !std::isfinite(tail) || !std::isfinite(absorbed)
+            || terminal<0 || masked<0 || tail<0 || absorbed<0 || terminal>1 || masked>1 || tail>1 || absorbed>1
+            || std::abs(terminal+masked+tail+absorbed-1)>kRoughEnergyConservationTolerance)
+        { error="Rough glass energy receipt is incomplete or nonconserving: terminal="+std::to_string(terminal)+" masked="+std::to_string(masked)
+            +" tail="+std::to_string(tail)+" absorbed="+std::to_string(absorbed); return false; }
         if (masked+tail>kMaximumRoughUnresolvedPower)
-        { error="Rough glass requires microfacet multiple scattering beyond its unresolved-power bound"; return false; }
+        { error=kRoughUnresolvedError; return false; }
     }
     return true;
 }
@@ -155,7 +160,11 @@ inline std::uint32_t closedGlassBandRows(std::uint32_t width) noexcept
 // visits, and flushes its bands without a CPU wait up to 2560x1440, where a
 // band is no longer than the export bands. The visit cap ends the leftover
 // branches the way the walks already end branches when their visits run out.
-inline constexpr std::uint32_t kPreviewCameraVisits = 12;
+// The cap is 6 because it cuts the Fast walk on the 673x379 Lighthouse starter
+// (RTX 4070) from 209 ms to 96 ms, and only small rim glints change (dome against
+// Accurate, 8-bit levels: mean 0.16 and p99 4 at 12 visits, mean 0.50 and p99 10
+// at 6). Four visits (mean 1.10, p99 22) is too coarse.
+inline constexpr std::uint32_t kPreviewCameraVisits = 6;
 inline constexpr std::uint64_t kPreviewUnfencedGlassPixels = 2560ull*1440ull;
 // A Preview glass base slower than this, on the host or the GPU, logs its breakdown.
 inline constexpr double kPreviewGlassSlowFrameMilliseconds = 50;
@@ -177,33 +186,162 @@ inline CameraWalkBudget cameraWalkBudget(bool preview, std::uint32_t width, std:
     budget.bandFinish = std::uint64_t(width)*height > kPreviewUnfencedGlassPixels;
     return budget;
 }
+// ARBIT_GL_GLASS_PREVIEW_VISITS, a diagnostic that sets the Fast Preview walk cap
+// to time the walk at other visit counts. Only a whole decimal number from 1 to 64
+// parses; 64 is the longest walk loop in the Export text. Anything else returns
+// nothing and Preview keeps kPreviewCameraVisits.
+inline constexpr std::uint32_t kMaximumPreviewCameraVisitsOverride = 64;
+inline std::optional<std::uint32_t> parsePreviewCameraVisitsOverride(const char* text)
+{
+    if (!text || !*text) return std::nullopt;
+    std::uint32_t value = 0;
+    for (const char* digit = text; *digit; ++digit)
+    {
+        if (*digit < '0' || *digit > '9') return std::nullopt;
+        value = value*10 + std::uint32_t(*digit - '0');
+        if (value > kMaximumPreviewCameraVisitsOverride) return std::nullopt;
+    }
+    if (value == 0) return std::nullopt;
+    return value;
+}
+// The pending branch slots a Preview walk can fill, at most the 16 of the
+// Export walk. Each visit takes one branch and adds at most two, so a walk with
+// seeds starting branches and visits visits never holds more than
+// seeds + visits. At that size the slot checks of the walk can never fire, and
+// the PENDING refusal and the paired spill stay exactly as they are at 16. A
+// cap past 14 visits keeps all 16 slots.
+inline constexpr std::uint32_t kPendingBranchSlots = 16;
+inline std::uint32_t previewPendingSlots(std::uint32_t seeds, std::uint32_t visits)
+{
+    return std::min<std::uint32_t>(kPendingBranchSlots, seeds + visits);
+}
 // Rewrites the GLSL camera transport text into the Preview walk budget above.
 // The Export text is never edited. Returns empty when an anchor is missing, so a
 // changed transport text cannot silently build a different Preview shader.
-inline std::string previewCameraTransportShader(std::string text)
+// visits is the walk cap written into GLASS_PREVIEW_VISITS. The walk arrays shrink
+// to GLASS_PREVIEW_PENDING (single walk, one seed) and GLASS_PREVIEW_PAIR_PENDING
+// (paired walk, two seeds) slots, which cuts the local memory of every visit.
+inline std::string previewCameraTransportShader(std::string text, std::uint32_t visits = kPreviewCameraVisits)
 {
-    const std::pair<const char*, std::string> edits[] {
+    struct Edit { const char* old; std::string value; std::size_t count = 1; };
+    const Edit edits[] {
         {"    bool sharedPaths=volumeDispersion==0.0;\n    int walks=sharedPaths?1:3,visits=sharedPaths?48:16;\n",
          "    bool sharedPaths=true;volumeDispersion=0.0;\n    int walks=1,visits=GLASS_PREVIEW_VISITS;\n"},
+        // A total internal reflection chain keeps nearly all its weight, so at
+        // 6 visits a branch still inside the volume would leave its pixel
+        // black. Preview ends it on the environment along its current direction
+        // instead. The callers still count its weight as truncated, so the
+        // TRAPPED status and the spill refusal are unchanged.
+        {"    return inside?vec3(0.0):weight*glassEnvironment(direction GX_PASS);\n",
+         "    return weight*glassEnvironment(direction GX_PASS);\n"},
+        {"-direction for a seed.\n        vec3 origins[16],directions[16],backs[16];float weights[16];int depths[16];bool media[16];int seams[16];\n",
+         "-direction for a seed.\n        vec3 origins[GLASS_PREVIEW_PAIR_PENDING],directions[GLASS_PREVIEW_PAIR_PENDING],backs[GLASS_PREVIEW_PAIR_PENDING];"
+         "float weights[GLASS_PREVIEW_PAIR_PENDING];int depths[GLASS_PREVIEW_PAIR_PENDING];bool media[GLASS_PREVIEW_PAIR_PENDING];"
+         "int seams[GLASS_PREVIEW_PAIR_PENDING];\n"},
+        {"                if(pending>=16) {\n                    // The lightest of the sixteen pending branches and this child ends here.\n",
+         "                if(pending>=GLASS_PREVIEW_PAIR_PENDING) {\n                    // The lightest of the full pending slots and this child ends here.\n"},
+        {"for(int slot=1;slot<16;++slot) if(weights[slot]<weights[lightest]) lightest=slot;",
+         "for(int slot=1;slot<GLASS_PREVIEW_PAIR_PENDING;++slot) if(weights[slot]<weights[lightest]) lightest=slot;"},
         {"    for(int channel=0;channel<3;++channel) {\n        float wavelength=channel==0?0.6563:channel==1?0.5461:0.4358;\n"
-         "        float ior=uSurfaceCoating.y+uGlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756));\n"
+         "        float ior=max(1.0,uSurfaceCoating.y+uGlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));\n"
          "        // backs: where retry 3 looks (seamSpawnBack), -direction for the seed.\n",
          "    for(int channel=0;channel<1;++channel) {\n        float ior=uSurfaceCoating.y;\n"
          "        // backs: where retry 3 looks (seamSpawnBack), -direction for the seed.\n"},
+        {"-direction for the seed.\n        vec3 origins[16],directions[16],backs[16];float weights[16];int depths[16];bool media[16];int seams[16];\n",
+         "-direction for the seed.\n        vec3 origins[GLASS_PREVIEW_PENDING],directions[GLASS_PREVIEW_PENDING],backs[GLASS_PREVIEW_PENDING];"
+         "float weights[GLASS_PREVIEW_PENDING];int depths[GLASS_PREVIEW_PENDING];bool media[GLASS_PREVIEW_PENDING];"
+         "int seams[GLASS_PREVIEW_PENDING];\n"},
+        {"if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}",
+         "if(pending>=GLASS_PREVIEW_PENDING) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}", 2},
         {"        for(int visit=0;visit<64;++visit) {\n", "        for(int visit=0;visit<GLASS_PREVIEW_VISITS;++visit) {\n"},
         {"radiance[channel]+=weight*glassEnvironment(direction GX_PASS)[channel];continue;",
          "radiance+=weight*glassEnvironment(direction GX_PASS);continue;"},
         {"radiance[channel]+=weight*receiver[channel];continue;", "radiance+=weight*receiver;continue;"}};
-    // The paired walk exists only in the Lighthouse paired-volume text, which defines this.
+    // The paired walk and its leftover (the first five edits) exist only in the
+    // Lighthouse paired-volume text, which defines this.
     const bool paired = text.find("#define GLASS_PAIR_TRUNCATED") != std::string::npos;
-    for (std::size_t edit = paired ? 0 : 1; edit < std::size(edits); ++edit)
+    for (std::size_t edit = paired ? 0 : 5; edit < std::size(edits); ++edit)
     {
-        const auto* old = edits[edit].first;
+        const auto* old = edits[edit].old;
+        const auto length = std::char_traits<char>::length(old);
+        std::size_t found = 0;
+        for (auto at = text.find(old); at != std::string::npos; at = text.find(old, at + length)) ++found;
+        if (found != edits[edit].count) return {};
+        for (auto at = text.find(old); at != std::string::npos; at = text.find(old, at + edits[edit].value.size()))
+            text.replace(at, length, edits[edit].value);
+    }
+    return "\n#define GLASS_PREVIEW_VISITS " + std::to_string(visits)
+        + "\n#define GLASS_PREVIEW_PENDING " + std::to_string(previewPendingSlots(1, visits))
+        + "\n#define GLASS_PREVIEW_PAIR_PENDING " + std::to_string(previewPendingSlots(2, visits)) + "\n" + text;
+}
+// Rewrites the GLSL glass closest-hit text for the Preview variant only. The
+// Export text passes each 16-slot BVH stack to glassSceneChildren as an inout
+// array, so every interior node visit copies the whole stack into the call and
+// back out, both in local memory. Here glassSceneChildren returns how many
+// children it pushes (0, 1 or 2) and hands them back in pushFirst and
+// pushSecond, and the caller writes them onto its own stack. The capacity check,
+// the push order (farther child first) and every refusal code stay as they
+// were, so each query returns the same hit. Returns empty when an anchor is missing.
+inline std::string previewQueryShader(std::string text)
+{
+    const std::pair<const char*, const char*> edits[] {
+        {"int glassSceneChildren(SV3 origin,SV3 direction,float limit,int node,int escape SC_STACK_ARGS ST_ARGS) {\n    int left=node+2;\n",
+         "int glassSceneChildren(SV3 origin,SV3 direction,float limit,int node,int escape,int pending,int capacity,"
+         "out int pushFirst,out int pushSecond ST_ARGS) {\n    pushFirst=0;pushSecond=0;\n    int left=node+2;\n"},
+        {"        nodes[pending++]=leftFirst?right:left;nodes[pending++]=leftFirst?left:right;\n"
+         "    } else if(useLeft) nodes[pending++]=left;\n    else if(useRight) nodes[pending++]=right;\n    return 0;\n}\n",
+         "        pushFirst=leftFirst?right:left;pushSecond=leftFirst?left:right;return 2;\n"
+         "    }\n    if(useLeft) {pushFirst=left;return 1;}\n    if(useRight) {pushFirst=right;return 1;}\n    return 0;\n}\n"},
+        {"                int pushed=glassSceneChildren(origin,direction,reach,node,escape,nodes,pending,capacity ST_PASS);\n"
+         "                if(pushed<0) return glassSceneEmptyHit(pushed,maximum);\n",
+         "                int pushFirst,pushSecond;\n"
+         "                int pushed=glassSceneChildren(origin,direction,reach,node,escape,pending,capacity,pushFirst,pushSecond ST_PASS);\n"
+         "                if(pushed<0) return glassSceneEmptyHit(pushed,maximum);\n"
+         "                if(pushed>0) nodes[pending++]=pushFirst;\n                if(pushed>1) nodes[pending++]=pushSecond;\n"},
+        {"                        int pushed=glassSceneChildren(localOrigin,localDirection,reach,at,next,meshNodes,meshPending,capacity ST_PASS);\n"
+         "                        if(pushed<0) return glassSceneEmptyHit(pushed,maximum);\n",
+         "                        int pushFirst,pushSecond;\n"
+         "                        int pushed=glassSceneChildren(localOrigin,localDirection,reach,at,next,meshPending,capacity,pushFirst,pushSecond ST_PASS);\n"
+         "                        if(pushed<0) return glassSceneEmptyHit(pushed,maximum);\n"
+         "                        if(pushed>0) meshNodes[meshPending++]=pushFirst;\n"
+         "                        if(pushed>1) meshNodes[meshPending++]=pushSecond;\n"}};
+    for (const auto& [old, value] : edits)
+    {
         const auto at = text.find(old);
         if (at == std::string::npos || text.find(old, at + 1) != std::string::npos) return {};
-        text.replace(at, std::char_traits<char>::length(old), edits[edit].second);
+        text.replace(at, std::char_traits<char>::length(old), value);
     }
-    return "\n#define GLASS_PREVIEW_VISITS " + std::to_string(kPreviewCameraVisits) + "\n" + text;
+    return text;
+}
+// The GLSL camera transport text of a scene whose glass is all roughness 0
+// (smoothOnlyCameraGlass). Such a frame never runs a rough walk, but the GL
+// fixture program still inlined them at the rough call sites in main, and the
+// dead code cost registers and local memory. This cuts four blocks: the GGX
+// sampling helpers, the rough direct-light lobe, the rough water walk, and the
+// rough camera walks (v1, the multiple-scatter v2 and the dispatcher between
+// them). The smooth walks, the paired walk and the receivers keep their bytes.
+// Each block runs from its leading comment to the closing brace of its last
+// function. Returns empty when an anchor is missing or repeats, so a changed
+// transport text cannot cut something else.
+inline std::string smoothOnlyCameraTransportShader(std::string text)
+{
+    const std::pair<const char*, const char*> cuts[] {
+        {"// Isotropic GGX visible normals.", "void glassRoughInterface("},
+        {"// Direct-light GGX reflection at a camera-side rough", "vec3 glassDirectSpecular("},
+        {"// A rough water surface has exactly one optical interface.", "vec3 roughThinInterfaceTransport("},
+        {"// Native callers must retain float32 terminal/masked/tail outputs", "vec3 roughCameraTransport("}};
+    for (const auto& [first, last] : cuts)
+    {
+        const auto begin = text.find(first);
+        const auto at = text.find(last);
+        if (begin == std::string::npos || at == std::string::npos || at < begin
+            || text.find(first, begin + 1) != std::string::npos || text.find(last, at + 1) != std::string::npos)
+            return {};
+        const auto close = text.find("\n}\n", at);
+        if (close == std::string::npos) return {};
+        text.erase(begin, close + 3 - begin);
+    }
+    return text;
 }
 // Per pixel: one primary validation, at most one sliver probe past a foreign
 // camera hit (thinEntryStatus) and at most two closest-hit queries. Each
@@ -468,6 +606,42 @@ struct RoughNativeConsumer final
             && (version==kSingleScatterCameraVersion || (version==kMultipleScatterVersion && selectedComputeV2));
     }
 };
+// A stored version of 0, what a new material gets, takes the best walk the renderer has.
+// V1 can't finish a rough closed volume at ordinary roughness, because its masked power
+// stays unresolved, so OpenGL with the selected compute walk runs V2. Thin water has no
+// V2, and OpenGL without the walk runs V1. Metal runs V1 until its V2 camera reconciles
+// silhouette owners and accepts a pass composite. A stored 1 or 2 always stays itself.
+inline constexpr std::uint32_t kBestRoughVersion = 0;
+inline std::uint32_t roughCameraVersion(std::uint32_t authored,bool closedVolume,float roughness,const RoughNativeConsumer& consumer) noexcept
+{
+    if(authored!=kBestRoughVersion)return authored;
+    return closedVolume && roughness!=0 && consumer.backend==NativeFixtureMaterialBackend::OpenGl
+        && consumer.version==kMultipleScatterVersion && consumer.selectedComputeV2?kMultipleScatterVersion:1u;
+}
+// The same material with its stored V1 closed volumes left to the renderer, for one frame
+// V1 couldn't finish. The stored value isn't touched. Null when nothing would change.
+inline std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> bestRoughProgram(
+    const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& program)
+{
+    if(!program)return nullptr;
+    const auto open=[](const NativeFixtureSurfaceMaterialProgram& surface) {
+        return surface.roughGlassScatteringVersion==1 && surface.parameters.identifiers[1]
+            ==static_cast<std::uint32_t>(surfacematerial::TransportMode::ClosedVolume);
+    };
+    bool changed=open(*program);
+    for(const auto& surface:program->objectPrograms)changed=changed || (surface && open(*surface));
+    if(!changed)return nullptr;
+    auto best=std::make_shared<NativeFixtureSurfaceMaterialProgram>(*program);
+    const auto mark=[&](NativeFixtureSurfaceMaterialProgram& surface) {
+        if(open(surface)) {surface.roughGlassScatteringVersion=kBestRoughVersion;surface.bindingDigest+=":rough-glass:best";}
+    };
+    mark(*best);
+    for(auto& surface:best->objectPrograms)if(surface) {
+        auto copy=std::make_shared<NativeFixtureSurfaceMaterialProgram>(*surface);
+        mark(*copy);surface=std::move(copy);
+    }
+    return best;
+}
 static_assert(sizeof(float)==4, "Native rough receipts require float32 scalar storage");
 inline constexpr std::uint64_t kRoughReceiptBytesPerPixel = 3*4*sizeof(float);
 inline constexpr std::uint64_t kMaximumRoughFrameRayQueries = kMaximumRoughColorRayQueries+kMaximumRoughClosestHitQueries;
@@ -540,7 +714,11 @@ struct Prepared final
     surfacematerial::TransportMode transport = surfacematerial::TransportMode::ThinSurface;
     HarmonicMIDI::grid::SceneObjectId object {};
     opaquevisibility::Prepared query;
-    std::array<std::array<float, 4>, 64> receivers {}, emission {};
+    // A receiver has interpolated vertex normals. The camera walk shades them. A
+    // caustic deposits flux on the face, so it refuses them (glasscaustics::prepareScene).
+    bool smoothReceiverNormals = false;
+    // One record per scene object, in object order.
+    std::vector<std::array<float, 4>> receivers, emission;
     float roughness = 0;
     HarmonicMIDI::grid::SceneMaterialId material {};
     RoughNativeConsumer roughConsumer {};
@@ -592,7 +770,7 @@ inline bool frameHasBlendedDraw(const HarmonicMIDI::grid::Visual3DScene& scene,
                                 const NativeFixtureSurfaceMaterialProgram* root,
                                 const Appearances& instanceAppearances) noexcept
 {
-    const auto count = std::min<std::size_t>(scene.objectCount, HarmonicMIDI::grid::Visual3DScene::kMaxObjects);
+    const auto count = scene.objectCount;
     for (std::size_t o = 0; o < count; ++o)
     {
         const auto& object = scene.objects[o];
@@ -676,6 +854,51 @@ inline bool hasTransport(const NativeFixtureSurfaceMaterialProgram* root)
     if (traced(root)) return true;
     for (const auto& program : root->objectPrograms) if (traced(program.get())) return true;
     return false;
+}
+// True when some program has a glass transport mode and every such program has
+// roughness exactly 0. A glass draw uploads its program's emissionRoughness[3]
+// as the roughness the fixture shader reads, and prepare refuses instance
+// appearances, textures and vertex programs on glass, so no glass fragment of
+// the scene can see another value. NaN or any nonzero roughness returns false.
+inline bool smoothOnlyCameraGlass(const NativeFixtureSurfaceMaterialProgram* root) noexcept
+{
+    if (!root) return false;
+    bool glass = false, rough = false;
+    const auto visit = [&](const NativeFixtureSurfaceMaterialProgram* program) {
+        if (!program || program->parameters.identifiers[1] == 0) return;
+        glass = true;
+        if (!(program->parameters.emissionRoughness[3] == 0.0f)) rough = true;
+    };
+    visit(root);
+    for (const auto& program : root->objectPrograms) visit(program.get());
+    return glass && !rough;
+}
+// Counts GL scene program choices that took the smooth-only text. Tests read it
+// to show a smooth scene really drew with that program.
+inline std::atomic<std::uint64_t>& smoothOnlyProgramChoices() noexcept
+{
+    static std::atomic<std::uint64_t> choices {0};
+    return choices;
+}
+// Counts every GL scene program choice, smooth-only or not. A test reads it to
+// show a scene reached the choice at all.
+inline std::atomic<std::uint64_t>& glassProgramDecisions() noexcept
+{
+    static std::atomic<std::uint64_t> decisions {0};
+    return decisions;
+}
+// Counts GL scene frames drawn with the Fast Preview glass variant, and variant
+// builds that ended Failed. A test polls them to know the variant is in use, or
+// that it never will be.
+inline std::atomic<std::uint64_t>& previewGlassVariantFrames() noexcept
+{
+    static std::atomic<std::uint64_t> frames {0};
+    return frames;
+}
+inline std::atomic<std::uint64_t>& previewGlassVariantFailures() noexcept
+{
+    static std::atomic<std::uint64_t> failures {0};
+    return failures;
 }
 namespace topology
 {
@@ -818,9 +1041,8 @@ inline bool closedVolume(const HarmonicMIDI::grid::Visual3DScene& scene,
         || object.firstIndex > scene.indexCount || object.indexCount > scene.indexCount - object.firstIndex)
     { error = "Closed glass volume geometry range is invalid"; return false; }
     const auto triangles = object.indexCount / 3;
-    if (object.indexCount == 0 || object.indexCount % 3 || triangles > kMaximumVolumeTriangles
-        || object.vertexCount > 3*kMaximumVolumeTriangles)
-    { error = "Closed glass volume triangle count is outside its bound"; return false; }
+    if (object.indexCount == 0 || object.indexCount % 3)
+    { error = "Closed glass volume requires whole indexed triangles"; return false; }
     using Position = std::array<float, 3>;
     std::map<Position, std::size_t> welded;
     std::vector<std::size_t> vertices(object.vertexCount);
@@ -839,7 +1061,7 @@ inline bool closedVolume(const HarmonicMIDI::grid::Visual3DScene& scene,
     std::set<std::array<std::size_t, 3>> faces;
     std::vector<topology::Face> geometricFaces;
     std::iota(parents.begin(), parents.end(), 0);
-    const auto find = [&](std::size_t at) { while (parents[at] != at) at = parents[at]; return at; };
+    const auto find = [&](std::size_t at) { while (parents[at] != at) { parents[at] = parents[parents[at]]; at = parents[at]; } return at; };
     const auto& anchorVertex = scene.vertices[object.firstVertex].position;
     const std::array<double,3> anchor {anchorVertex.x,anchorVertex.y,anchorVertex.z};
     double volume = 0;
@@ -894,13 +1116,49 @@ inline bool closedVolume(const HarmonicMIDI::grid::Visual3DScene& scene,
     for (const auto& [key, edge] : edges)
         if (edge.count != 2 || edge.orientation != 0)
         { error = "Closed glass volume has an open edge or inconsistent winding"; return false; }
-    for (std::size_t a=0;a<geometricFaces.size();++a)
-        for (std::size_t b=a+1;b<geometricFaces.size();++b)
-            if (topology::intersects(geometricFaces[a],geometricFaces[b]))
+    // Two faces meet only when their extents overlap on every axis, so a sweep
+    // along the widest axis tests only the pairs that overlap on it. The lowest
+    // intersecting pair decides the reason, so it does not depend on sweep order.
+    struct FaceExtent { double low = 0, high = 0; std::size_t face = 0; };
+    std::array<double, 3> sceneLow, sceneHigh;
+    sceneLow.fill(std::numeric_limits<double>::infinity());
+    sceneHigh.fill(-std::numeric_limits<double>::infinity());
+    for (const auto& face : geometricFaces)
+        for (const auto& point : face.points)
+            for (int axis = 0; axis < 3; ++axis)
             {
-                error = find(a) == find(b) ? "Closed glass volume has intersecting faces" : kShellsIntersectReason;
-                return false;
+                sceneLow[axis] = std::min(sceneLow[axis], point[axis]);
+                sceneHigh[axis] = std::max(sceneHigh[axis], point[axis]);
             }
+    int sweepAxis = 0;
+    for (int axis = 1; axis < 3; ++axis)
+        if (sceneHigh[axis] - sceneLow[axis] > sceneHigh[sweepAxis] - sceneLow[sweepAxis]) sweepAxis = axis;
+    std::vector<FaceExtent> extents(geometricFaces.size());
+    for (std::size_t f = 0; f < geometricFaces.size(); ++f)
+    {
+        const auto& points = geometricFaces[f].points;
+        extents[f].face = f;
+        extents[f].low = std::min({points[0][sweepAxis], points[1][sweepAxis], points[2][sweepAxis]});
+        extents[f].high = std::max({points[0][sweepAxis], points[1][sweepAxis], points[2][sweepAxis]});
+    }
+    std::sort(extents.begin(), extents.end(), [](const FaceExtent& x, const FaceExtent& y) {
+        return std::tie(x.low, x.face) < std::tie(y.low, y.face); });
+    std::optional<std::pair<std::size_t, std::size_t>> firstIntersection;
+    for (std::size_t i = 0; i < extents.size(); ++i)
+        for (std::size_t j = i + 1; j < extents.size() && extents[j].low <= extents[i].high; ++j)
+        {
+            const auto pair = std::minmax(extents[i].face, extents[j].face);
+            const std::pair<std::size_t, std::size_t> candidate {pair.first, pair.second};
+            if (firstIntersection && candidate >= *firstIntersection) continue;
+            if (topology::intersects(geometricFaces[candidate.first], geometricFaces[candidate.second]))
+                firstIntersection = candidate;
+        }
+    if (firstIntersection)
+    {
+        error = find(firstIntersection->first) == find(firstIntersection->second)
+            ? "Closed glass volume has intersecting faces" : kShellsIntersectReason;
+        return false;
+    }
     for (const auto& link : links) {
         if (link.empty()) continue;
         std::set<std::size_t> visited;
@@ -1144,7 +1402,13 @@ inline bool opaqueClearOfGlass(const std::vector<topology::Face>& glass, const s
                 const double along = dot(across,opaqueNormal)/opaqueArea;
                 for (int k=0;k<3;++k) across[k]-=along*opaqueNormal[k];
             }
+            // Coplanar contact leaves across at rounding noise, not zero, and
+            // normalizing noise gives an arbitrary direction that can point into
+            // the glass. Below 1e-9 of the glass normal (the barycentric
+            // tolerance above) the planes count as parallel and only the
+            // centroid probe runs.
             const double acrossLength = std::sqrt(dot(across,across));
+            const bool planesCross = acrossLength > 1e-9*std::sqrt(dot(glassNormal,glassNormal));
             for (const auto& crossing : crossings)
             {
                 // The step stays well above the clearance, relative to the glass size.
@@ -1157,7 +1421,7 @@ inline bool opaqueClearOfGlass(const std::vector<topology::Face>& glass, const s
                     for (int k=0;k<3;++k) probe[k]+=step*towardCentroid[k]/towardLength;
                     probes.push_back(probe);
                 }
-                if (acrossLength > 0) for (const double side : {1.0, -1.0}) {
+                if (planesCross) for (const double side : {1.0, -1.0}) {
                     Point probe = crossing;
                     for (int k=0;k<3;++k) probe[k]+=side*step*across[k]/acrossLength;
                     probes.push_back(probe);
@@ -1183,7 +1447,7 @@ inline std::optional<CausticVolumeSelection> cameraVolumeSelection(
     std::size_t thin = 0, volumes = 0;
     CausticVolumeSelection selection;
     selection.cameraOnly = true;
-    const auto count = std::min<std::size_t>(scene.objectCount, HarmonicMIDI::grid::Visual3DScene::kMaxObjects);
+    const auto count = scene.objectCount;
     for (std::size_t o = 0; o < count; ++o)
     {
         const auto& object = scene.objects[o];
@@ -1222,23 +1486,20 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
 {
     using namespace HarmonicMIDI::grid;
     Prepared candidate;
-    if(distinctGrating&&(scene.objectCount>Visual3DScene::kMaxObjects
-        ||scene.vertexCount>Visual3DScene::kMaxVertices||scene.indexCount>Visual3DScene::kMaxIndices
-        ||!root||root->kind!=NativeFixtureMaterialKind::DiffractionReflective
+    if(distinctGrating&&(!root||root->kind!=NativeFixtureMaterialKind::DiffractionReflective
         ||root->object!=distinctGrating->object
         ||!validNativeFixtureMaterialPrograms(*root,scene,root->backend,true,
             NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders)))
     {error="Smooth glass grating requires the existing Diffraction-root and flat Surface-child authority";return false;}
     if (!hasTransport(root)) { output = std::move(candidate); return true; }
-    if (scene.objectCount > 64 || scene.vertexCount > Visual3DScene::kMaxVertices
-        || scene.indexCount > Visual3DScene::kMaxIndices)
-    { error = "Closed glass scene exceeds snapshot counts"; return false; }
+    candidate.receivers.assign(scene.objectCount, {});
+    candidate.emission.assign(scene.objectCount, {});
     if (!appearances.empty() || opaquevisibility::vertexDeformation(root))
-    { error = "Closed glass volume refuses instances, vertex deformation or scene triangle budget overflow"; return false; }
+    { error = "Closed glass volume refuses instances or vertex deformation"; return false; }
     // With a caustic selection the selected closed volume is counted apart from
     // the camera dielectric. Without one, selected stays false and the count,
     // checks and error strings are exactly the single-dielectric admission.
-    std::size_t count = 0, volumeCount = 0, expandedTriangles = 0, gratingCount=0;
+    std::size_t count = 0, volumeCount = 0, gratingCount=0;
     // Per-object admission. The default path stops at the first refusal. With
     // ARBIT_GLASS_ADMISSION_AUDIT=1 every object reports its first refusal.
     const auto admitObject = [&](std::size_t o) -> bool
@@ -1252,11 +1513,6 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
             || object.firstVertex > scene.vertexCount || object.vertexCount > scene.vertexCount - object.firstVertex
             || object.firstIndex > scene.indexCount || object.indexCount > scene.indexCount - object.firstIndex)
         { error = "Closed glass scene requires valid indexed geometry"; return false; }
-        // A reused or overlapping range still contributes geometry for this
-        // object. The global index array does not bound composed query work.
-        expandedTriangles += object.indexCount / 3;
-        if (expandedTriangles > kMaximumSceneTriangles)
-        { error = "Closed glass expanded scene exceeds its 8192 triangle budget"; return false; }
         if(grating&&(!surface||!validDistinctGrating(*surface,*distinctGrating)))
         {error="Closed glass distinct grating requires exact compiler-owned planar binary IR";return false;}
         if (!material || (surface && ((!grating&&surface->kind != NativeFixtureMaterialKind::SurfacePbr)
@@ -1275,8 +1531,8 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
             { error = "Closed glass transport requires constant unit vertex color"; return false; }
         }
         if(grating) {
-            if(++gratingCount!=1||object.indexCount/3>kMaximumNativeDiffractionTriangles)
-            {error="Closed glass distinct grating triangle budget is invalid";return false;}
+            if(++gratingCount!=1)
+            {error="Closed glass scene needs exactly one distinct grating";return false;}
             topology::Point firstNormal{},firstPosition{};
             for(std::size_t triangle=0;triangle<object.indexCount/3;++triangle) {
                 std::array<topology::Point,3> points;std::array<std::array<float,2>,3> uv;
@@ -1306,13 +1562,13 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
             == static_cast<std::uint32_t>(surfacematerial::TransportMode::ThinInterface);
         if (volume || thin)
         {
-            if(surface->roughGlassScatteringVersion!=1
+            if(surface->roughGlassScatteringVersion!=1 && surface->roughGlassScatteringVersion!=kBestRoughVersion
                 && (surface->roughGlassScatteringVersion!=2 || !volume
                     || (p.emissionRoughness[3]!=0 && (consumer.version!=2 || !consumer.selectedComputeV2))))
             {error="Rough glass scattering version requires a matching closed-volume native consumer";return false;}
             if (!std::isfinite(p.emissionRoughness[3]) || p.emissionRoughness[3]<0 || p.emissionRoughness[3]>1)
             { error = "Rough dielectric requires roughness within [0, 1]"; return false; }
-            auto selectedConsumer=consumer;selectedConsumer.version=surface->roughGlassScatteringVersion;
+            auto selectedConsumer=consumer;selectedConsumer.version=roughCameraVersion(surface->roughGlassScatteringVersion,volume,p.emissionRoughness[3],consumer);
             if (p.emissionRoughness[3] != 0 && !selectedConsumer.complete(surface->backend))
             { error = "Rough dielectric requires a matching native shader, float32 terminal, masked and tail energy receipts and completed readback consumer"; return false; }
             const bool selected = causticVolume && object.id == causticVolume->object;
@@ -1334,8 +1590,8 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
             for (const auto wavelength : surfacematerial::kGlassIorAdmissionWavelengths)
             {
                 const auto index = surfacematerial::wavelengthIor(p.transmissionIorClearcoat[1], p.transmissionIorClearcoat[3], wavelength);
-                if (!std::isfinite(index) || index < 1 || index > 3)
-                { error = "Closed glass transport wavelength IOR is outside [1, 3]"; return false; }
+                if (!std::isfinite(index))
+                { error = "Closed glass transport wavelength IOR is not finite"; return false; }
             }
             if (volume && !closedVolume(scene, object, error)) return false;
             if (thin) {
@@ -1398,9 +1654,16 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
                 for (std::size_t c=0;c<3;++c) {
                     const auto& normal=scene.vertices[object.firstVertex+scene.indices[object.firstIndex+t*3+c]].normal;
                     const topology::Point value{normal.x,normal.y,normal.z};
+                    if (!std::isfinite(topology::dot(value,value)) || !(topology::dot(value,value)>0))
+                    { error = "Closed glass receivers require finite vertex normals"; return false; }
                     for (std::size_t axis=0;axis<3;++axis)
-                        if (!std::isfinite(value[axis]) || std::abs(value[axis]-n[axis]/length)>1e-5)
-                        { error = "Closed glass receivers require flat geometric vertex normals"; return false; }
+                        if (std::abs(value[axis]-n[axis]/length)>1e-5) {
+                            // The camera walk interpolates these (shadingNormal). The grating
+                            // cell transport shades from the face, so it still refuses them.
+                            if (distinctGrating)
+                            { error = "Closed glass receivers require flat geometric vertex normals"; return false; }
+                            candidate.smoothReceiverNormals = true;
+                        }
                 }
             }
             candidate.receivers[o] = surface
@@ -1526,7 +1789,8 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
         }
     }
     if (!opaquevisibility::prepareScene(scene, root, {}, candidate.query, error, opaquevisibility::AdmissionMode::allSurfaces,false,false,
-        distinctGrating?NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders:NativeFixtureDiffractionConsumer::FiniteLobe)) return false;
+        distinctGrating?NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders:NativeFixtureDiffractionConsumer::FiniteLobe,
+        !distinctGrating)) return false;
     candidate.enabled = true;
     output = std::move(candidate);
     return true;
@@ -1619,7 +1883,8 @@ inline bool completeRoughFrame(const Prepared& prepared, std::uint32_t width, st
     const auto maximumQueries = prepared.transport == surfacematerial::TransportMode::ThinInterface
         ? kMaximumRoughThinClosestHitQueries : kMaximumRoughClosestHitQueries;
     std::uint64_t covered = 0;
-    double maximumResidual = 0, maximumUnresolved = 0;
+    double maximumResidual = 0, maximumUnresolved = 0, absorbedTotal = 0, maximumAbsorbed = 0;
+    std::uint64_t absorbedOverLimit = 0;
     for (std::size_t pixel=0;pixel<pixels;++pixel) {
         std::uint32_t object=0,material=0;
         std::memcpy(&object,objectIds.bytes.data()+pixel*4,4);
@@ -1642,7 +1907,15 @@ inline bool completeRoughFrame(const Prepared& prepared, std::uint32_t width, st
             // Compare known values before conversion, avoiding an invalid cast
             // for malicious/nonfinite float32 status data.
             for (int code=-1;code>=-10;--code) if (t[3]==code) {
-                error = roughTransportDiagnostic(static_cast<RoughTransportStatus>(code)); return false;
+                error = roughTransportDiagnostic(static_cast<RoughTransportStatus>(code));
+                // A closure or identity refusal names the walk's own values. The other statuses stay exact text.
+                if (code==int(RoughTransportStatus::NonconservingEnergy) || code==int(RoughTransportStatus::IdentityOrMedium)) {
+                    char values[160];
+                    std::snprintf(values,sizeof values,": pixel %zu,%zu terminal=%.9g masked=%.9g tail=%.9g",
+                        pixel%width,pixel/width,t[0],m[0],r[0]);
+                    error += values;
+                }
+                return false;
             }
             error = "Rough glass energy receipt does not certify completed rough transport"; return false;
         }
@@ -1655,14 +1928,18 @@ inline bool completeRoughFrame(const Prepared& prepared, std::uint32_t width, st
             || std::floor(r[3])!=r[3] || r[3]>(m[3]-1+sharedPrimaryInterfaces)*kMaximumMicrofacetEvents))
         { error="Rough glass v2 micro-event receipt is outside its integer scene-query work bound";return false; }
         RoughEnergyReceipt receipt;
-        if (multiple && (m[0]!=0 || m[1]!=0 || m[2]!=0))
-        { error="Rough glass v2 cannot retain single-scatter masked power";return false; }
-        for (std::size_t c=0;c<3;++c) { receipt.terminal[c]=t[c]; receipt.masked[c]=m[c]; receipt.tail[c]=r[c]; }
+        // A closed volume walk has bounces to run out of, so its second receipt carries absorbed
+        // power and its tail holds any masked power. A thin interface has one bounce and keeps masked.
+        const bool closed=prepared.transport==surfacematerial::TransportMode::ClosedVolume;
+        for (std::size_t c=0;c<3;++c) { receipt.terminal[c]=t[c]; (closed?receipt.absorbed:receipt.masked)[c]=m[c]; receipt.tail[c]=r[c]; }
         if (!completeRoughEnergy(receipt,error)) return false;
         for (std::size_t c=0;c<3;++c) {
-            maximumResidual=std::max(maximumResidual,std::abs(receipt.terminal[c]+receipt.masked[c]+receipt.tail[c]-1));
+            maximumResidual=std::max(maximumResidual,std::abs(receipt.terminal[c]+receipt.masked[c]+receipt.tail[c]+receipt.absorbed[c]-1));
             maximumUnresolved=std::max(maximumUnresolved,receipt.masked[c]+receipt.tail[c]);
+            absorbedTotal+=receipt.absorbed[c];
+            maximumAbsorbed=std::max(maximumAbsorbed,receipt.absorbed[c]);
         }
+        if (std::max({receipt.absorbed[0],receipt.absorbed[1],receipt.absorbed[2]})>kMaximumRoughUnresolvedPower) ++absorbedOverLimit;
         ++covered;
     }
     // Commit stats only after the entire frame passes. Failure leaves the
@@ -1672,6 +1949,9 @@ inline bool completeRoughFrame(const Prepared& prepared, std::uint32_t width, st
     stats.roughGlassReceiptBytes = scratchBytes;
     stats.roughGlassMaximumEnergyResidual = maximumResidual;
     stats.roughGlassMaximumUnresolvedPower = maximumUnresolved;
+    stats.roughGlassAbsorbedTotalPower = absorbedTotal;
+    stats.roughGlassMaximumAbsorbedPower = maximumAbsorbed;
+    stats.roughGlassAbsorbedPixelsOverLimit = absorbedOverLimit;
     return true;
 }
 // binary16 bit pattern of a negative integer in [-2048,-1].
@@ -1694,7 +1974,6 @@ inline constexpr IncompleteNormalReason kIncompleteNormalReasons[]{
     {negativeHalfBits(int(SmoothTransportStatus::MediumMismatch)), "the glass object intersects another object, so a ray inside the glass met that object from behind or left without meeting a glass surface. Move or resize the glass so no object passes into the glass solid. Objects may touch the glass or sit in an air cavity"},
     {negativeHalfBits(int(SmoothTransportStatus::ReceiverMiss)), "receiver lookup missed"},
     {negativeHalfBits(int(SmoothTransportStatus::OrientationMismatch)), "hit orientation disagrees with glass medium"},
-    {negativeHalfBits(int(SmoothTransportStatus::InterfaceDepth)), "interface depth budget exhausted"},
     {negativeHalfBits(int(SmoothTransportStatus::NonfiniteScatter)), "nonfinite Fresnel or transmitted direction"},
     {negativeHalfBits(int(SmoothTransportStatus::DiscardedEnergy)), "discarded energy above budget"},
     {negativeHalfBits(int(SmoothTransportStatus::PendingBranches)), "pending branch budget exhausted"},
@@ -1702,13 +1981,13 @@ inline constexpr IncompleteNormalReason kIncompleteNormalReasons[]{
     {negativeHalfBits(int(SmoothTransportStatus::ThinReentry)), "water receiver ray re-entered the water surface"},
     {negativeHalfBits(int(SmoothTransportStatus::ThinNonfiniteIncoming)), "nonfinite incoming ray or normal"},
     {negativeHalfBits(int(SmoothTransportStatus::ThinFirstHit)), "first hit is not the water surface"},
+    {negativeHalfBits(int(SmoothTransportStatus::ThinFirstQuery)), "first water-entry query refused or nonfinite"},
     {negativeHalfBits(int(SmoothTransportStatus::ThinReceiver)), "water receiver shading incomplete"},
     {negativeHalfBits(int(SmoothTransportStatus::ThinRadiance)), "nonfinite water radiance"},
     {negativeHalfBits(roughReasonCode(RoughTransportStatus::InvalidInput)), "rough glass input not admitted"},
     {negativeHalfBits(roughReasonCode(RoughTransportStatus::InternalCamera)), "rough glass refuses internal camera"},
     {negativeHalfBits(roughReasonCode(RoughTransportStatus::IncompleteQuery)), "rough glass query incomplete"},
     {negativeHalfBits(roughReasonCode(RoughTransportStatus::IdentityOrMedium)), "rough glass identity or medium inconsistent"},
-    {negativeHalfBits(roughReasonCode(RoughTransportStatus::InterfaceDepth)), "rough glass interface depth budget exhausted"},
     {negativeHalfBits(roughReasonCode(RoughTransportStatus::PendingBranches)), "rough glass pending branch budget exhausted"},
     {negativeHalfBits(roughReasonCode(RoughTransportStatus::RayVisits)), "rough glass ray query budget exhausted"},
     {negativeHalfBits(roughReasonCode(RoughTransportStatus::UnresolvedEnergy)), "rough glass unresolved microfacet energy"},
@@ -1761,8 +2040,8 @@ inline bool thinEntryOwnedPastSliver(const opaquevisibility::ClosestHit& first, 
 // then the readback texel where the first failure sits. Any -2 pixel takes
 // precedence and is reported with its own count and first texel. Native
 // readbacks are row-flipped to top-first, so y counts down from the top row. Trapped pixels
-// (+2.0) are complete; the frame refuses only when admitTrappedCameraPixels
-// does, and trappedPixels receives their count when the frame is admitted.
+// (+2.0) are complete at any count, and trappedPixels receives their count when
+// the frame is admitted.
 inline bool completeFrame(const NativeRawPassPixels& pixels, std::string& error,
                           std::uint64_t* trappedPixels = nullptr)
 {
@@ -1773,15 +2052,15 @@ inline bool completeFrame(const NativeRawPassPixels& pixels, std::string& error,
     std::size_t counts[kReasons]{};
     std::size_t firstReason=kReasons;
     std::size_t firstTexel=0;
-    std::uint64_t trapped=0, surface=0, nonfinite=0;
-    std::size_t firstTrapped=0, firstNonfinite=0;
+    std::uint64_t trapped=0, nonfinite=0;
+    std::size_t firstNonfinite=0;
     if (trappedPixels) *trappedPixels=0;
     for (std::size_t offset = 6; offset < pixels.bytes.size(); offset += 8) {
         std::uint16_t alpha = 0;
         std::memcpy(&alpha, pixels.bytes.data()+offset, sizeof(alpha));
         if (alpha == 0xc000u) { if (nonfinite++==0) firstNonfinite=offset/8; continue; }
-        if (alpha == kTrappedNormalBits) { if (trapped++==0) firstTrapped=offset/8; ++surface; continue; }
-        if (!(alpha & 0x8000u) && (alpha & 0x7c00u) != 0x7c00u) { if (alpha != 0) ++surface; continue; }
+        if (alpha == kTrappedNormalBits) { ++trapped; continue; }
+        if (!(alpha & 0x8000u) && (alpha & 0x7c00u) != 0x7c00u) continue;
         std::size_t reason=0;
         while (reason+1<kReasons && kIncompleteNormalReasons[reason].bits!=alpha) ++reason;
         if (firstReason==kReasons) { firstReason=reason; firstTexel=offset/8; }
@@ -1797,14 +2076,7 @@ inline bool completeFrame(const NativeRawPassPixels& pixels, std::string& error,
     }
     std::size_t failing=0;
     for (std::size_t i=0;i<kReasons;++i) failing+=counts[i];
-    if (failing==0) {
-        if (admitTrappedCameraPixels(trapped,surface)) { if (trappedPixels) *trappedPixels=trapped; return true; }
-        error="Closed glass ray transport did not produce a complete finite result (bounce budget exhausted; "
-            +std::to_string(trapped)+" trapped pixels of "+std::to_string(surface)+" drawn, over the limit of "
-            +std::to_string(kMaximumTrappedCameraPixels)+" pixels or 0.5% of drawn pixels) first at texel x="+std::to_string(firstTrapped%pixels.width)+" y="+std::to_string(firstTrapped/pixels.width)
-            +" of the "+std::to_string(pixels.width)+"x"+std::to_string(pixels.height)+" readback";
-        return false;
-    }
+    if (failing==0) { if (trappedPixels) *trappedPixels=trapped; return true; }
     const auto describe=[&](std::size_t i) {
         return std::string(kIncompleteNormalReasons[i].text)+"; "+std::to_string(counts[i])
             +(counts[i]==1?" pixel":" pixels");
@@ -1898,7 +2170,7 @@ template<class String> inline String transportShaderRecipe(bool metal, bool imag
         {"COMPLETE",RoughTransportStatus::Complete}, {"SMOOTH",RoughTransportStatus::Smooth},
         {"INPUT",RoughTransportStatus::InvalidInput}, {"INTERNAL",RoughTransportStatus::InternalCamera},
         {"QUERY",RoughTransportStatus::IncompleteQuery}, {"IDENTITY",RoughTransportStatus::IdentityOrMedium},
-        {"DEPTH",RoughTransportStatus::InterfaceDepth}, {"PENDING",RoughTransportStatus::PendingBranches},
+        {"PENDING",RoughTransportStatus::PendingBranches},
         {"VISITS",RoughTransportStatus::RayVisits}, {"ENERGY",RoughTransportStatus::UnresolvedEnergy},
         {"NONFINITE",RoughTransportStatus::Nonfinite}, {"CLOSURE",RoughTransportStatus::NonconservingEnergy}})
         source += "#define GLASS_ROUGH_STATUS_" + surfacesource::literal<String>(name) + " " + surfacesource::number<String>(static_cast<int>(status)) + "\n";
@@ -1906,11 +2178,12 @@ template<class String> inline String transportShaderRecipe(bool metal, bool imag
         {"UNCLASSIFIED",SmoothTransportStatus::Unclassified}, {"QUERY_REFUSED",SmoothTransportStatus::QueryRefused},
         {"QUERY_BUDGET",SmoothTransportStatus::QueryBudget}, {"FIRST_HIT",SmoothTransportStatus::FirstHitMismatch},
         {"MEDIUM",SmoothTransportStatus::MediumMismatch}, {"RECEIVER",SmoothTransportStatus::ReceiverMiss},
-        {"ORIENTATION",SmoothTransportStatus::OrientationMismatch}, {"DEPTH",SmoothTransportStatus::InterfaceDepth},
+        {"ORIENTATION",SmoothTransportStatus::OrientationMismatch},
         {"NONFINITE_SCATTER",SmoothTransportStatus::NonfiniteScatter}, {"DISCARDED",SmoothTransportStatus::DiscardedEnergy},
         {"PENDING",SmoothTransportStatus::PendingBranches}, {"VISITS",SmoothTransportStatus::RayVisits},
         {"THIN_REENTRY",SmoothTransportStatus::ThinReentry}, {"THIN_NONFINITE_INCOMING",SmoothTransportStatus::ThinNonfiniteIncoming},
-        {"THIN_FIRST_HIT",SmoothTransportStatus::ThinFirstHit}, {"THIN_RECEIVER",SmoothTransportStatus::ThinReceiver},
+        {"THIN_FIRST_HIT",SmoothTransportStatus::ThinFirstHit}, {"THIN_FIRST_QUERY",SmoothTransportStatus::ThinFirstQuery},
+        {"THIN_RECEIVER",SmoothTransportStatus::ThinReceiver},
         {"THIN_RADIANCE",SmoothTransportStatus::ThinRadiance}, {"TRAPPED",SmoothTransportStatus::Trapped}})
         source += "#define GLASS_SMOOTH_STATUS_" + surfacesource::literal<String>(name) + " " + surfacesource::number<String>(static_cast<int>(status)) + "\n";
     // The paired entry points are defined after the released text, which calls
@@ -2005,46 +2278,44 @@ void glassRoughInterface(vec3 incoming,vec3 normal,float fromIor,float toIor,
 vec3 glassEnvironment(vec3 direction GX_ARGS) {
     if(GU_Sky[0].w>0.5) return analyticSkyRadiance(direction,GU_Sky[0],GU_Sky[1],GU_Sky[2],GU_Sky[3],GU_Sky[4]);
     vec3 color=vec3(0.0);
-    for(int i=0;i<16;++i) {
-        if(i>=GLASS_LIGHT_COUNT) break;
-        if(GLASS_LIGHT_KIND(i)==2) color+=GU_LightColors[i].rgb*GU_LightColors[i].a;
+    for(int i=0;i<GLASS_LIGHT_COUNT;++i) {
+        if(GLASS_LIGHT_KIND(i)==2) color+=GLASS_LIGHT_COLOR(i).rgb*GLASS_LIGHT_COLOR(i).a;
     }
     return color;
 }
 vec3 glassReceiver(GlassClosestHit hit,vec3 direction,out bool complete GX_ARGS) {
     complete=false;
     vec3 base=vec3(0.0),emission=vec3(0.0);
-    for(int object=0;object<64;++object) {
-        uint id=uint(GU_GlassReceivers[object].w)|(uint(GU_GlassEmission[object].w)<<uint(16));
-        if(id==hit.objectId) {base=GU_GlassReceivers[object].rgb;emission=GU_GlassEmission[object].rgb;complete=true;break;}
+    for(int object=0;object<GLASS_OBJECT_COUNT;++object) {
+        uint id=uint(GLASS_RECEIVER(object).w)|(uint(GLASS_EMISSION(object).w)<<uint(16));
+        if(id==hit.objectId) {base=GLASS_RECEIVER(object).rgb;emission=GLASS_EMISSION(object).rgb;complete=true;break;}
     }
     if(!complete) return vec3(0.0);
-    vec3 normal=hit.outwardNormal;
+    vec3 normal=hit.shadingNormal;
     vec3 lighting=GU_Ambient.xyz*0.5;
     vec3 direct=vec3(0.0);
-    for(int i=0;i<16;++i) {
-        if(i>=GLASS_LIGHT_COUNT) break;
+    for(int i=0;i<GLASS_LIGHT_COUNT;++i) {
         int kind=GLASS_LIGHT_KIND(i);
         if(kind==2) {
-            if(GU_Sky[0].w<0.5) lighting+=GU_LightColors[i].rgb*GU_LightColors[i].a*0.5;
+            if(GU_Sky[0].w<0.5) lighting+=GLASS_LIGHT_COLOR(i).rgb*GLASS_LIGHT_COLOR(i).a*0.5;
             else direct+=analyticSkyBase(base,0.0,1.0,0.04,normal,-direction,
                 GU_Sky[0],GU_Sky[1],GU_Sky[2],GU_Sky[3],GU_Sky[4]);
             continue;
         }
-        vec3 delta=GU_LightPositions[i].xyz-hit.position;
-        vec3 toLight=kind==0?GLASS_ROTATE(GU_LightRotations[i],vec3(0.0,0.0,1.0)):normalize(delta);
+        vec3 delta=GLASS_LIGHT_POSITION(i).xyz-hit.position;
+        vec3 toLight=kind==0?GLASS_ROTATE(GLASS_LIGHT_ROTATION(i),vec3(0.0,0.0,1.0)):normalize(delta);
         float distance=length(delta),attenuation=1.0;
         if(kind==1||kind==3) {
             attenuation=1.0/max(distance*distance,1.0);
-            float range=GU_LightPositions[i].w;
+            float range=GLASS_LIGHT_POSITION(i).w;
             if(range>0.0) attenuation*=pow(clamp(1.0-distance/range,0.0,1.0),2.0);
             if(kind==3) {
-                vec3 spotDirection=GLASS_ROTATE(GU_LightRotations[i],vec3(0.0,0.0,-1.0));
-                attenuation*=smoothstep(GU_LightCones[i].y,GU_LightCones[i].x,dot(spotDirection,normalize(-delta)));
+                vec3 spotDirection=GLASS_ROTATE(GLASS_LIGHT_ROTATION(i),vec3(0.0,0.0,-1.0));
+                attenuation*=smoothstep(GLASS_LIGHT_CONE(i).y,GLASS_LIGHT_CONE(i).x,dot(spotDirection,normalize(-delta)));
             }
         }
         float visibility=opaqueVisibility(hit.position,normal,toLight,kind==0?3.402823e38:distance,GU_OpaqueControl GX_OPAQUE);
-        direct+=GU_LightColors[i].rgb*GU_LightColors[i].a*attenuation
+        direct+=GLASS_LIGHT_COLOR(i).rgb*GLASS_LIGHT_COLOR(i).a*attenuation
             *baseSurfaceDirect(base,0.0,1.0,0.04,0.0,normal,toLight,-direction)*visibility;
     }
     return base*lighting+direct+emission;
@@ -2066,22 +2337,21 @@ vec3 glassDirectSpecular(vec3 position,vec3 normal,vec3 toView,float roughness,
         ||!glassSceneFinite(roughness)||roughness<=0.0||roughness>1.0
         ||!glassSceneFinite(fromIor)||!glassSceneFinite(toIor)||fromIor<=0.0||toIor<=0.0
         ||viewCosine<=0.0) return specular;
-    for(int i=0;i<16;++i) {
-        if(i>=GLASS_LIGHT_COUNT) break;
+    for(int i=0;i<GLASS_LIGHT_COUNT;++i) {
         int kind=GLASS_LIGHT_KIND(i);
         if(kind==2) continue;
-        vec3 delta=GU_LightPositions[i].xyz-position;
-        vec3 toLight=kind==0?GLASS_ROTATE(GU_LightRotations[i],vec3(0.0,0.0,1.0)):normalize(delta);
+        vec3 delta=GLASS_LIGHT_POSITION(i).xyz-position;
+        vec3 toLight=kind==0?GLASS_ROTATE(GLASS_LIGHT_ROTATION(i),vec3(0.0,0.0,1.0)):normalize(delta);
         float lightCosine=dot(normal,toLight);
         if(lightCosine<=0.0) continue;
         float lightDistance=length(delta),attenuation=1.0;
         if(kind==1||kind==3) {
             attenuation=1.0/max(lightDistance*lightDistance,1.0);
-            float range=GU_LightPositions[i].w;
+            float range=GLASS_LIGHT_POSITION(i).w;
             if(range>0.0) attenuation*=pow(clamp(1.0-lightDistance/range,0.0,1.0),2.0);
             if(kind==3) {
-                vec3 spotDirection=GLASS_ROTATE(GU_LightRotations[i],vec3(0.0,0.0,-1.0));
-                attenuation*=smoothstep(GU_LightCones[i].y,GU_LightCones[i].x,dot(spotDirection,normalize(-delta)));
+                vec3 spotDirection=GLASS_ROTATE(GLASS_LIGHT_ROTATION(i),vec3(0.0,0.0,-1.0));
+                attenuation*=smoothstep(GLASS_LIGHT_CONE(i).y,GLASS_LIGHT_CONE(i).x,dot(spotDirection,normalize(-delta)));
             }
         }
         // Both light and view sit on the front side, so n.h is positive.
@@ -2093,7 +2363,7 @@ vec3 glassDirectSpecular(vec3 position,vec3 normal,vec3 toView,float roughness,
         float fresnel=glassFresnel(-toView,halfVector,fromIor,toIor,transmittedUnused,tirUnused);
         float masking=glassRoughG1(lightCosine,alpha)*glassRoughG1(viewCosine,alpha);
         float visibility=opaqueVisibility(position,normal,toLight,kind==0?3.402823e38:lightDistance,GU_OpaqueControl GX_OPAQUE);
-        specular+=GU_LightColors[i].rgb*GU_LightColors[i].a*attenuation*visibility
+        specular+=GLASS_LIGHT_COLOR(i).rgb*GLASS_LIGHT_COLOR(i).a*attenuation*visibility
             *fresnel*distribution*masking/(4.0*viewCosine);
     }
     return specular;
@@ -2158,7 +2428,7 @@ bool thinEntryOwned(GlassClosestHit first,uint water,vec3 camera,vec3 entry) {
 // status. thinEntryOwnedPastSliver in C++ is the same test.
 int thinEntryStatus(GlassClosestHit first,uint water,vec3 camera,vec3 incoming,vec3 entry GX_ARGS) {
     if(thinEntryOwned(first,water,camera,entry)) return 0;
-    if(first.status!=1||!glassSceneFinite(first.distance)) return GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;
+    if(first.status!=1||!glassSceneFinite(first.distance)) return GLASS_SMOOTH_STATUS_THIN_FIRST_QUERY;
     GlassClosestHit beyond=glassSceneClosestHit(camera,incoming,first.distance+thinEntryTolerance(camera,entry),3.402823e38,GU_GlassControl GX_QUERY);
     if(beyond.status<0) return beyond.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;
     return thinEntryOwned(beyond,water,camera,entry)?0:GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;
@@ -2209,7 +2479,7 @@ vec3 roughThinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,
     if(roughness==0.0) {
         bool smoothComplete;int smoothStatus;
         vec3 smoothColour=thinInterfaceTransport(camera,entry,evaluatedNormal,smoothComplete,smoothStatus GX_PASS);
-        status=smoothComplete&&smoothStatus!=GLASS_SMOOTH_STATUS_TRAPPED?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;return smoothColour;
+        status=smoothComplete?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;return smoothColour;
     }
     if(!glassSceneFinite(roughness)||roughness<0.0||roughness>1.0
         ||!glassSceneFinite3(camera)||!glassSceneFinite3(entry)||!glassSceneFinite3(evaluatedNormal)
@@ -2268,8 +2538,8 @@ vec3 roughThinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,
                 if(!receiverComplete) {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
             } else {
                 bool owned=false;
-                for(int object=0;object<64;++object) {
-                    uint id=uint(GU_GlassReceivers[object].w)|(uint(GU_GlassEmission[object].w)<<uint(16));
+                for(int object=0;object<GLASS_OBJECT_COUNT;++object) {
+                    uint id=uint(GLASS_RECEIVER(object).w)|(uint(GLASS_EMISSION(object).w)<<uint(16));
                     if(id==target.objectId) {owned=true;break;}
                 }
                 if(!owned) {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
@@ -2282,9 +2552,10 @@ vec3 roughThinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,
         float sum=terminal[channel]+masked[channel]+tail[channel];
         if(!glassSceneFinite(sum)||!glassSceneFinite(radiance[channel]))
             {status=GLASS_ROUGH_STATUS_NONFINITE;return vec3(0.0);}
-        if(terminal[channel]<0.0||terminal[channel]>1.0||masked[channel]<0.0||masked[channel]>1.0
-            ||tail[channel]<0.0||tail[channel]>1.0||abs(sum-1.0)>GLASS_ROUGH_CONSERVATION)
+        if(terminal[channel]<0.0||masked[channel]<0.0||tail[channel]<0.0||abs(sum-1.0)>GLASS_ROUGH_CONSERVATION)
             {status=GLASS_ROUGH_STATUS_CLOSURE;return vec3(0.0);}
+        // Closure bounds each nonnegative part. Only float32 rounding can leave one just above 1.
+        terminal[channel]=min(terminal[channel],1.0);masked[channel]=min(masked[channel],1.0);tail[channel]=min(tail[channel],1.0);
         if(masked[channel]+tail[channel]>GLASS_ROUGH_UNRESOLVED)
             {status=GLASS_ROUGH_STATUS_ENERGY;return vec3(0.0);}
     }
@@ -2307,7 +2578,7 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
     bool trapped=false;
     for(int channel=0;channel<3;++channel) {
         float wavelength=channel==0?0.6563:channel==1?0.5461:0.4358;
-        float ior=GU_SurfaceCoating.y+GU_GlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756));
+        float ior=max(1.0,GU_SurfaceCoating.y+GU_GlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));
         // backs: where retry 3 looks (seamSpawnBack), -direction for the seed.
         vec3 origins[16],directions[16],backs[16];float weights[16];int depths[16];bool media[16];int seams[16];
         int pending=1;
@@ -2365,7 +2636,7 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
                 hit.status=0;
             } else if(seam==5) {
                 if(hit.status==1&&hit.objectId==volume&&hit.entering) {
-                    hit.objectId=uint(depth);hit.position=origin;hit.outwardNormal=back;hit.entering=true;inside=false;
+                    hit.objectId=uint(depth);hit.position=origin;hit.outwardNormal=back;hit.shadingNormal=back;hit.entering=true;inside=false;
                 } else hit.status=0;
             } else if(seam==7) {
                 if(hit.status!=1||hit.objectId==volume||!hit.entering) {
@@ -2394,7 +2665,7 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
                 radiance[channel]+=weight*receiver[channel];continue;
             }
             if(inside==hit.entering) {status=GLASS_SMOOTH_STATUS_ORIENTATION;return vec3(0.0);}
-            if(depth>=GLASS_INTERFACE_DEPTH) {status=GLASS_SMOOTH_STATUS_DEPTH;return vec3(0.0);}
+            if(depth>=GLASS_INTERFACE_DEPTH) {trapped=true;continue;}
             vec3 normal=hit.entering?hit.outwardNormal:-hit.outwardNormal;
             vec3 transmitted;bool tir;
             float reflection=glassFresnel(direction,normal,inside?ior:1.0,inside?1.0:ior,transmitted,tir);
@@ -2433,7 +2704,7 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
     if(roughness==0.0) {
         bool smoothComplete;int smoothStatus;
         vec3 smoothColour=glassTransport(camera,entry,smoothComplete,smoothStatus GX_PASS);
-        status=smoothComplete&&smoothStatus!=GLASS_SMOOTH_STATUS_TRAPPED?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;return smoothColour;
+        status=smoothComplete?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;return smoothColour;
     }
     if(!glassSceneFinite(roughness)||roughness<0.0||roughness>1.0
         ||!glassSceneFinite3(camera)||!glassSceneFinite3(entry)||GU_GlassTransport.x!=1.0) return vec3(0.0);
@@ -2449,8 +2720,8 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
     #pragma optionNV(unroll none)
     for(int channel=0;channel<3;++channel) {
         float wavelength=channel==0?0.6563:channel==1?0.5461:0.4358;
-        float ior=GU_SurfaceCoating.y+GU_GlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756));
-        if(!glassSceneFinite(ior)||ior<1.0||ior>3.0) {status=GLASS_ROUGH_STATUS_INPUT;return vec3(0.0);}
+        float ior=max(1.0,GU_SurfaceCoating.y+GU_GlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));
+        if(!glassSceneFinite(ior)||ior<1.0) {status=GLASS_ROUGH_STATUS_INPUT;return vec3(0.0);}
         // Analytic lights reach the camera-side interface directly, not through the sampled paths.
         if(!receiptOnly) radiance[channel]+=glassDirectSpecular(first.position,first.outwardNormal,-incoming,
             roughness,1.0,ior GX_PASS)[channel];
@@ -2464,13 +2735,41 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
             for(int visit=0;visit<GLASS_ROUGH_VISITS;++visit) {
                 if(pending==0) break;
                 --pending;
-                vec3 origin=origins[pending],direction=directions[pending];
-                float power=powers[pending],throughput=throughputs[pending];
-                int depth=depths[pending];bool inside=media[pending];
+                // Heaviest first, so a path out of visits leaves the least power behind.
+                int heaviest=pending;
+                #pragma optionNV(unroll none)
+                for(int slot=0;slot<pending;++slot) if(powers[slot]>powers[heaviest]) heaviest=slot;
+                vec3 origin=origins[heaviest],direction=directions[heaviest];
+                float power=powers[heaviest],throughput=throughputs[heaviest];
+                int depth=depths[heaviest];bool inside=media[heaviest];
+                origins[heaviest]=origins[pending];directions[heaviest]=directions[pending];
+                powers[heaviest]=powers[pending];throughputs[heaviest]=throughputs[pending];
+                depths[heaviest]=depths[pending];media[heaviest]=media[pending];
                 if(queryCount>=GLASS_ROUGH_QUERY_LIMIT) {status=GLASS_ROUGH_STATUS_VISITS;return vec3(0.0);}
                 GlassClosestHit hit=glassSceneClosestHit(origin,direction,0.0,3.402823e38,GU_GlassControl GX_QUERY);
                 ++queryCount;
                 if(hit.status<0) {status=GLASS_ROUGH_STATUS_QUERY;return vec3(0.0);}
+                // A float32 entry point from a far camera can miss the face by more than the bias, leaving
+                // the origin on the wrong side of it. The ray has already scattered there, so it goes on
+                // past that face, at the cost of a visit. The margin follows the camera ray's float error.
+                if(hit.status==1&&hit.objectId==volume&&inside==hit.entering
+                    &&hit.distance*abs(dot(direction,hit.outwardNormal))<=2.0*glassBias(origin)+2.4e-7*length(origin-camera)) {
+                    if(visit+1>=GLASS_ROUGH_VISITS) {masked[channel]+=power;continue;}
+                    ++visit;
+                    hit=glassSceneClosestHit(origin,direction,hit.distance+glassBias(origin),3.402823e38,GU_GlassControl GX_QUERY);
+                    ++queryCount;
+                    if(hit.status<0) {status=GLASS_ROUGH_STATUS_QUERY;return vec3(0.0);}
+                }
+                // A ray inside the glass can pass exactly between two triangles of a closed mesh and
+                // miss the exit. Tilted by about 1e-3 radians it meets the face, at the cost of a visit.
+                // An object inside the glass is met both ways, and refuses below.
+                if(inside&&(hit.status==0||hit.objectId!=volume)) {
+                    if(visit+1>=GLASS_ROUGH_VISITS) {masked[channel]+=power;continue;}
+                    ++visit;
+                    hit=glassSceneClosestHit(origin,glassSeamTilt(direction),0.0,3.402823e38,GU_GlassControl GX_QUERY);
+                    ++queryCount;
+                    if(hit.status<0) {status=GLASS_ROUGH_STATUS_QUERY;return vec3(0.0);}
+                }
                 if(hit.status==0||hit.objectId!=volume) {
                     if(inside) {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
                     terminal[channel]+=power;
@@ -2484,8 +2783,8 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                     } else {
                         bool owned=false;
                         #pragma optionNV(unroll none)
-                        for(int object=0;object<64;++object) {
-                            uint id=uint(GU_GlassReceivers[object].w)|(uint(GU_GlassEmission[object].w)<<uint(16));
+                        for(int object=0;object<GLASS_OBJECT_COUNT;++object) {
+                            uint id=uint(GLASS_RECEIVER(object).w)|(uint(GLASS_EMISSION(object).w)<<uint(16));
                             if(id==hit.objectId) {owned=true;break;}
                         }
                         if(!owned) {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
@@ -2494,7 +2793,9 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                 }
                 if(hit.materialId!=first.materialId||hit.instanceId!=first.instanceId||inside==hit.entering)
                     {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
-                if(depth>=GLASS_INTERFACE_DEPTH) {status=GLASS_ROUGH_STATUS_DEPTH;return vec3(0.0);}
+                // A path at the depth limit ends. Its tracked power goes in the receipt as absorbed,
+                // which this walk carries in masked.
+                if(depth>=GLASS_INTERFACE_DEPTH) {masked[channel]+=power;continue;}
                 vec3 normal=hit.entering?hit.outwardNormal:-hit.outwardNormal;
                 int stratum=(sampleIndex*(2*depth+1)+5*depth)%GLASS_ROUGH_SAMPLES;
                 int digits=stratum;float inverse=0.0,place=0.5;
@@ -2506,7 +2807,8 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                 glassRoughInterface(direction,normal,fromIor,toIor,roughness,sampleU,sampleV,
                     reflected,transmitted,fractions,interfaceComplete);
                 if(!interfaceComplete) {status=GLASS_ROUGH_STATUS_NONFINITE;return vec3(0.0);}
-                masked[channel]+=power*fractions.z;
+                // Masked power is lost to the missing multiple scattering. It stays unresolved.
+                tail[channel]+=power*fractions.z;
                 float bias=glassBias(hit.position),eta=fromIor/toIor;
                 for(int branch=0;branch<2;++branch) {
                     bool transmission=branch==0;
@@ -2516,32 +2818,43 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                     if(!glassSceneFinite(branchPower)||!glassSceneFinite(branchThroughput))
                         {status=GLASS_ROUGH_STATUS_NONFINITE;return vec3(0.0);}
                     if(branchPower<0.00001/float(GLASS_ROUGH_SAMPLES)) {tail[channel]+=branchPower;continue;}
-                    if(pending>=16) {status=GLASS_ROUGH_STATUS_PENDING;return vec3(0.0);}
-                    origins[pending]=hit.position+normal*(transmission?-bias:bias);
-                    directions[pending]=transmission?transmitted:reflected;
-                    powers[pending]=branchPower;throughputs[pending]=branchThroughput;
-                    depths[pending]=depth+1;media[pending]=transmission?!inside:inside;++pending;
+                    // A full stack ends its lightest branch. That power goes in the receipt as absorbed.
+                    int free=pending;
+                    if(pending>=16) {
+                        free=0;
+                        #pragma optionNV(unroll none)
+                        for(int slot=1;slot<16;++slot) if(powers[slot]<powers[free]) free=slot;
+                        if(powers[free]<=branchPower) masked[channel]+=powers[free];
+                        else {masked[channel]+=branchPower;continue;}
+                    } else ++pending;
+                    origins[free]=hit.position+normal*(transmission?-bias:bias);
+                    directions[free]=transmission?transmitted:reflected;
+                    powers[free]=branchPower;throughputs[free]=branchThroughput;
+                    depths[free]=depth+1;media[free]=transmission?!inside:inside;
                 }
             }
-            if(pending!=0) {status=GLASS_ROUGH_STATUS_VISITS;return vec3(0.0);}
+            // A path out of visits ends here. Its tracked power goes in the receipt as absorbed.
+            #pragma optionNV(unroll none)
+            for(int slot=0;slot<pending;++slot) masked[channel]+=powers[slot];
         }
         float sum=terminal[channel]+masked[channel]+tail[channel];
         if(!glassSceneFinite(sum)||!glassSceneFinite(radiance[channel]))
             {status=GLASS_ROUGH_STATUS_NONFINITE;return vec3(0.0);}
-        if(terminal[channel]<0.0||terminal[channel]>1.0||masked[channel]<0.0||masked[channel]>1.0
-            ||tail[channel]<0.0||tail[channel]>1.0||abs(sum-1.0)>GLASS_ROUGH_CONSERVATION)
+        if(terminal[channel]<0.0||masked[channel]<0.0||tail[channel]<0.0||abs(sum-1.0)>GLASS_ROUGH_CONSERVATION)
             {status=GLASS_ROUGH_STATUS_CLOSURE;return vec3(0.0);}
-        if(masked[channel]+tail[channel]>GLASS_ROUGH_UNRESOLVED)
+        // Closure bounds each nonnegative part. Only float32 rounding can leave one just above 1.
+        terminal[channel]=min(terminal[channel],1.0);masked[channel]=min(masked[channel],1.0);tail[channel]=min(tail[channel],1.0);
+        if(tail[channel]>GLASS_ROUGH_UNRESOLVED)
             {status=GLASS_ROUGH_STATUS_ENERGY;return vec3(0.0);}
     }
     status=GLASS_ROUGH_STATUS_COMPLETE;
     return radiance;
 }
 )shader";
-    // The released v1 body above stays unchanged. V2 replaces its interface split.
+    // V2 replaces the v1 interface split above.
     source += multipleScatterShaderRecipe<String>();
     source += "\n#define GLASS_CAMERA_RESIDUAL (GLASS_ROUGH_UNRESOLVED/128.0)"
-        "\n#define GLASS_CAMERA_V2_COMPLETE " + surfacesource::number<String>(kMultipleScatterCameraComplete) + "\n";
+        "\n#define GLASS_CAMERA_V2_RUNNING " + surfacesource::number<String>(kMultipleScatterCameraRunning) + "\n#define GLASS_CAMERA_V2_COMPLETE " + surfacesource::number<String>(kMultipleScatterCameraComplete) + "\n";
     source += R"shader(vec3 roughGlassTransportV2(vec3 camera,vec3 entry,float roughness,bool receiptOnly,uint pixelKey,
                          out vec3 terminal,out vec3 masked,out vec3 tail,
                          out int status,out int queryCount,out int microEvents GX_ARGS) {
@@ -2550,7 +2863,7 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
     if(roughness==0.0) {
         bool smoothComplete;int smoothStatus;
         vec3 smoothColour=glassTransport(camera,entry,smoothComplete,smoothStatus GX_PASS);
-        status=smoothComplete&&smoothStatus!=GLASS_SMOOTH_STATUS_TRAPPED?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;return smoothColour;
+        status=smoothComplete?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;return smoothColour;
     }
     if(!glassSceneFinite(roughness)||roughness<0.0||roughness>1.0
         ||!glassSceneFinite3(camera)||!glassSceneFinite3(entry)||GU_GlassTransport.x!=1.0) return vec3(0.0);
@@ -2566,8 +2879,8 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
     #pragma optionNV(unroll none)
     for(int channel=0;channel<3;++channel) {
         float wavelength=channel==0?0.6563:channel==1?0.5461:0.4358;
-        float ior=GU_SurfaceCoating.y+GU_GlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756));
-        if(!glassSceneFinite(ior)||ior<1.0||ior>3.0) {status=GLASS_ROUGH_STATUS_INPUT;return vec3(0.0);}
+        float ior=max(1.0,GU_SurfaceCoating.y+GU_GlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));
+        if(!glassSceneFinite(ior)||ior<1.0) {status=GLASS_ROUGH_STATUS_INPUT;return vec3(0.0);}
         // Analytic lights reach the camera-side interface directly, not through the sampled paths.
         if(!receiptOnly) radiance[channel]+=glassDirectSpecular(first.position,first.outwardNormal,-incoming,
             roughness,1.0,ior GX_PASS)[channel];
@@ -2581,13 +2894,41 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
             for(int visit=0;visit<GLASS_ROUGH_VISITS;++visit) {
                 if(pending==0) break;
                 --pending;
-                vec3 origin=origins[pending],direction=directions[pending];
-                float power=powers[pending],throughput=throughputs[pending];
-                int depth=depths[pending];bool inside=media[pending];uint history=histories[pending];
+                // Heaviest first, so a path out of visits leaves the least power behind.
+                int heaviest=pending;
+                #pragma optionNV(unroll none)
+                for(int slot=0;slot<pending;++slot) if(powers[slot]>powers[heaviest]) heaviest=slot;
+                vec3 origin=origins[heaviest],direction=directions[heaviest];
+                float power=powers[heaviest],throughput=throughputs[heaviest];
+                int depth=depths[heaviest];bool inside=media[heaviest];uint history=histories[heaviest];
+                origins[heaviest]=origins[pending];directions[heaviest]=directions[pending];
+                powers[heaviest]=powers[pending];throughputs[heaviest]=throughputs[pending];
+                depths[heaviest]=depths[pending];media[heaviest]=media[pending];histories[heaviest]=histories[pending];
                 if(queryCount>=GLASS_ROUGH_QUERY_LIMIT) {status=GLASS_ROUGH_STATUS_VISITS;return vec3(0.0);}
                 GlassClosestHit hit=glassSceneClosestHit(origin,direction,0.0,3.402823e38,GU_GlassControl GX_QUERY);
                 ++queryCount;
                 if(hit.status<0) {status=GLASS_ROUGH_STATUS_QUERY;return vec3(0.0);}
+                // A float32 entry point from a far camera can miss the face by more than the bias, leaving
+                // the origin on the wrong side of it. The ray has already scattered there, so it goes on
+                // past that face, at the cost of a visit. The margin follows the camera ray's float error.
+                if(hit.status==1&&hit.objectId==volume&&inside==hit.entering
+                    &&hit.distance*abs(dot(direction,hit.outwardNormal))<=2.0*glassBias(origin)+2.4e-7*length(origin-camera)) {
+                    if(visit+1>=GLASS_ROUGH_VISITS) {masked[channel]+=power;continue;}
+                    ++visit;
+                    hit=glassSceneClosestHit(origin,direction,hit.distance+glassBias(origin),3.402823e38,GU_GlassControl GX_QUERY);
+                    ++queryCount;
+                    if(hit.status<0) {status=GLASS_ROUGH_STATUS_QUERY;return vec3(0.0);}
+                }
+                // A ray inside the glass can pass exactly between two triangles of a closed mesh and
+                // miss the exit. Tilted by about 1e-3 radians it meets the face, at the cost of a visit.
+                // An object inside the glass is met both ways, and refuses below.
+                if(inside&&(hit.status==0||hit.objectId!=volume)) {
+                    if(visit+1>=GLASS_ROUGH_VISITS) {masked[channel]+=power;continue;}
+                    ++visit;
+                    hit=glassSceneClosestHit(origin,glassSeamTilt(direction),0.0,3.402823e38,GU_GlassControl GX_QUERY);
+                    ++queryCount;
+                    if(hit.status<0) {status=GLASS_ROUGH_STATUS_QUERY;return vec3(0.0);}
+                }
                 if(hit.status==0||hit.objectId!=volume) {
                     if(inside) {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
                     terminal[channel]+=power;
@@ -2601,8 +2942,8 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                     } else {
                         bool owned=false;
                         #pragma optionNV(unroll none)
-                        for(int object=0;object<64;++object) {
-                            uint id=uint(GU_GlassReceivers[object].w)|(uint(GU_GlassEmission[object].w)<<uint(16));
+                        for(int object=0;object<GLASS_OBJECT_COUNT;++object) {
+                            uint id=uint(GLASS_RECEIVER(object).w)|(uint(GLASS_EMISSION(object).w)<<uint(16));
                             if(id==hit.objectId) {owned=true;break;}
                         }
                         if(!owned) {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
@@ -2611,7 +2952,9 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                 }
                 if(hit.materialId!=first.materialId||hit.instanceId!=first.instanceId||inside==hit.entering)
                     {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
-                if(depth>=GLASS_INTERFACE_DEPTH) {status=GLASS_ROUGH_STATUS_DEPTH;return vec3(0.0);}
+                // A path at the depth limit ends. Its tracked power goes in the receipt as absorbed,
+                // which this walk carries in masked.
+                if(depth>=GLASS_INTERFACE_DEPTH) {masked[channel]+=power;continue;}
                 vec3 normal=hit.entering?hit.outwardNormal:-hit.outwardNormal;
                 float fromIor=inside?ior:1.0,toIor=inside?1.0:ior;
                 uint key=glassMsEntryKey(hit.objectId,hit.instanceId,hit.triangleId,pixelKey);
@@ -2637,23 +2980,34 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                         ||dot(exits[branch].xyz,normal)*(transmission?-1.0:1.0)<=0.0)
                         {status=GLASS_ROUGH_STATUS_NONFINITE;return vec3(0.0);}
                     if(branchPower<0.00001/float(GLASS_ROUGH_SAMPLES)) {tail[channel]+=branchPower;continue;}
-                    if(pending>=16) {status=GLASS_ROUGH_STATUS_PENDING;return vec3(0.0);}
-                    origins[pending]=hit.position+normal*(transmission?-bias:bias);
-                    directions[pending]=exits[branch].xyz;
-                    powers[pending]=branchPower;throughputs[pending]=branchThroughput;
-                    depths[pending]=depth+1;media[pending]=transmission?!inside:inside;
-                    histories[pending]=glassMsChildHistory(history,orders[branch],transmission);++pending;
+                    // A full stack ends its lightest branch. That power goes in the receipt as absorbed.
+                    int free=pending;
+                    if(pending>=16) {
+                        free=0;
+                        #pragma optionNV(unroll none)
+                        for(int slot=1;slot<16;++slot) if(powers[slot]<powers[free]) free=slot;
+                        if(powers[free]<=branchPower) masked[channel]+=powers[free];
+                        else {masked[channel]+=branchPower;continue;}
+                    } else ++pending;
+                    origins[free]=hit.position+normal*(transmission?-bias:bias);
+                    directions[free]=exits[branch].xyz;
+                    powers[free]=branchPower;throughputs[free]=branchThroughput;
+                    depths[free]=depth+1;media[free]=transmission?!inside:inside;
+                    histories[free]=glassMsChildHistory(history,orders[branch],transmission);
                 }
             }
-            if(pending!=0) {status=GLASS_ROUGH_STATUS_VISITS;return vec3(0.0);}
+            // A path out of visits ends here. Its tracked power goes in the receipt as absorbed.
+            #pragma optionNV(unroll none)
+            for(int slot=0;slot<pending;++slot) masked[channel]+=powers[slot];
         }
         float sum=terminal[channel]+masked[channel]+tail[channel];
         if(!glassSceneFinite(sum)||!glassSceneFinite(radiance[channel]))
             {status=GLASS_ROUGH_STATUS_NONFINITE;return vec3(0.0);}
-        if(terminal[channel]<0.0||terminal[channel]>1.0||masked[channel]<0.0||masked[channel]>1.0
-            ||tail[channel]<0.0||tail[channel]>1.0||abs(sum-1.0)>GLASS_ROUGH_CONSERVATION)
+        if(terminal[channel]<0.0||masked[channel]<0.0||tail[channel]<0.0||abs(sum-1.0)>GLASS_ROUGH_CONSERVATION)
             {status=GLASS_ROUGH_STATUS_CLOSURE;return vec3(0.0);}
-        if(masked[channel]+tail[channel]>GLASS_ROUGH_UNRESOLVED)
+        // Closure bounds each nonnegative part. Only float32 rounding can leave one just above 1.
+        terminal[channel]=min(terminal[channel],1.0);masked[channel]=min(masked[channel],1.0);tail[channel]=min(tail[channel],1.0);
+        if(tail[channel]>GLASS_ROUGH_UNRESOLVED)
             {status=GLASS_ROUGH_STATUS_ENERGY;return vec3(0.0);}
     }
     status=GLASS_CAMERA_V2_COMPLETE;
@@ -2722,7 +3076,7 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
         // The radiance channels this walk carries.
         vec3 lanes=sharedPaths?vec3(1.0):vec3(channel==0?1.0:0.0,channel==1?1.0:0.0,channel==2?1.0:0.0);
         float wavelength=channel==0?0.6563:channel==1?0.5461:0.4358;
-        float ior=volumeIor+volumeDispersion*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756));
+        float ior=max(1.0,volumeIor+volumeDispersion*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));
         // backs: where retry 3 looks (seamSpawnBack), -direction for a seed.
         vec3 origins[16],directions[16],backs[16];float weights[16];int depths[16];bool media[16];int seams[16];
         int pending=0;
@@ -2778,7 +3132,7 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
             } else if(seam==5) {
                 // The preferred look-back meets the volume over the water too.
                 if(hit.status==1&&hit.objectId==volume&&hit.entering) {
-                    hit.objectId=uint(depth);hit.position=rayOrigin;hit.outwardNormal=rayBack;hit.entering=true;rayInside=false;
+                    hit.objectId=uint(depth);hit.position=rayOrigin;hit.outwardNormal=rayBack;hit.shadingNormal=rayBack;hit.entering=true;rayInside=false;
                 } else hit.status=0;
             } else if(seam==7) {
                 if(hit.status!=1||hit.objectId==volume||hit.objectId==water||!hit.entering) {
@@ -2884,6 +3238,20 @@ vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool
     GlassClosestHit first=glassSceneClosestHit(camera,incoming,0.0,3.402823e38,GU_GlassControl GX_QUERY);
     if(first.status<0) {status=first.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;return vec3(0.0);}
     int entryStatus=thinEntryStatus(first,water,camera,incoming,entry GX_PASS);
+    uint partner=glassPairId(GU_GlassTransport2);
+    // The partner volume's float32 silhouette sliver stands in front of this
+    // draw's raster water entry, where thinEntryStatus names ThinFirstHit and
+    // a closed occluder's exit in front of the entry still refuses. The paired
+    // walk owns both dielectrics, so a partner-first pixel runs its camera
+    // seed exactly as glassTransport seeds the same ray: the water draw then
+    // reproduces the partner arm instead of refusing the frame.
+    if(entryStatus!=0&&first.status==1&&first.objectId==partner&&glassSceneFinite(first.distance)) {
+        vec3 partnerRadiance=glassPairWalk(camera,incoming,1.0,first.status==1&&first.objectId==partner&&!first.entering,
+            camera,incoming,0.0,
+            water,GU_SurfaceCoating.y,partner,GU_GlassTransport2.x,GU_GlassTransport2.y,complete,status GX_PASS);
+        if(!complete&&status==GLASS_SMOOTH_STATUS_UNCLASSIFIED) status=GLASS_SMOOTH_STATUS_THIN_RADIANCE;
+        return partnerRadiance;
+    }
     if(entryStatus!=0) {status=entryStatus;return vec3(0.0);}
     bool entering=dot(incoming,normal)<0.0;
     if(!entering) normal=-normal;
@@ -2930,6 +3298,23 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
         replace(selected,
             "GlassClosestHit hit=glassSceneClosestHit(origin,direction,0.0,3.402823e38,GU_GlassControl GX_QUERY);\n                ++queryCount;",
             "GlassClosestHit hit=first;\n                if(depth!=0) {hit=glassSceneClosestHit(origin,direction,0.0,3.402823e38,GU_GlassControl GX_QUERY);++queryCount;}");
+        if(!metal) {
+            // One dispatch runs lanes laneBegin to laneEnd and leaves the accumulators for the next.
+            replace(selected,"GlassClosestHit first,float roughness,bool receiptOnly,uint pixelKey,\n                         out vec3 terminal,out vec3 masked,out vec3 tail,\n                         out int status,out int queryCount,out int microEvents GX_ARGS) {\n    terminal=vec3(0.0);masked=vec3(0.0);tail=vec3(0.0);queryCount=0;microEvents=0;\n",
+                "GlassClosestHit first,float roughness,bool receiptOnly,uint pixelKey,int laneBegin,int laneEnd,vec3 radianceSoFar,\n                         inout vec3 terminal,inout vec3 masked,inout vec3 tail,\n                         out int status,inout int queryCount,inout int microEvents GX_ARGS) {\n");
+            replace(selected,"    queryCount=1; // The completed native selection already queried the primary.\n",
+                "    if(laneBegin==0) queryCount=1; // The completed native selection already queried the primary.\n");
+            replace(selected,"vec3 radiance=vec3(0.0);","vec3 radiance=radianceSoFar;");
+            replace(selected,"for(int channel=0;channel<3;++channel) {",
+                "for(int channel=laneBegin/GLASS_ROUGH_SAMPLES;channel<3&&channel*GLASS_ROUGH_SAMPLES<laneEnd;++channel) {");
+            replace(selected,"if(!receiptOnly) radiance[channel]+=glassDirectSpecular(",
+                "if(!receiptOnly&&laneBegin<=channel*GLASS_ROUGH_SAMPLES) radiance[channel]+=glassDirectSpecular(");
+            replace(selected,"for(int sampleIndex=0;sampleIndex<GLASS_ROUGH_SAMPLES;++sampleIndex) {",
+                "for(int sampleIndex=max(laneBegin-channel*GLASS_ROUGH_SAMPLES,0);sampleIndex<GLASS_ROUGH_SAMPLES&&channel*GLASS_ROUGH_SAMPLES+sampleIndex<laneEnd;++sampleIndex) {");
+            replace(selected,"float sum=terminal[channel]+masked[channel]+tail[channel];",
+                "if(laneEnd<(channel+1)*GLASS_ROUGH_SAMPLES) {status=GLASS_CAMERA_V2_RUNNING;return radiance;}\n        float sum=terminal[channel]+masked[channel]+tail[channel];");
+            replace(selected,"status=GLASS_CAMERA_V2_COMPLETE;","status=laneEnd>=3*GLASS_ROUGH_SAMPLES?GLASS_CAMERA_V2_COMPLETE:GLASS_CAMERA_V2_RUNNING;");
+        }
         source += selected;
     }
     }
@@ -2957,9 +3342,7 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
         smoothglass::replace(source, "out int ", "thread int& ");
         smoothglass::replace(source, "vec3", "float3");
         for (const auto& [old, value] : std::initializer_list<std::pair<const char*,const char*>> {
-            {"GU_Sky","u.sky"}, {"GU_LightColors","u.lightColors"}, {"GU_LightPositions","u.lightPositions"},
-            {"GU_LightRotations","u.lightRotations"}, {"GU_LightCones","u.lightCones"}, {"GU_Ambient","u.ambient"},
-            {"GU_GlassReceivers","u.glassReceivers"}, {"GU_GlassEmission","u.glassEmission"},
+            {"GU_Sky","u.sky"}, {"GU_Ambient","u.ambient"},
             {"GU_GlassControl","u.glassControl"}, {"GU_GlassTransport","u.glassTransport"},
             {"GU_RoughCameraControl","u.roughCameraControl"}, {"GU_SurfaceCoating","u.surfaceCoating"}, {"GU_OpaqueControl","u.opaqueControl"}})
             smoothglass::replace(source, old, value);
@@ -2969,15 +3352,23 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
             "#define GX_PASS , u, opaqueTexture, glassTexture" + imagePass + "\n#define GX_QUERY , glassTexture\n#define GX_OPAQUE , opaqueTexture\n"
             + surfacesource::literal<String>(imageSecondary ? "#define GX_IMAGE , environmentTexture\n" : "") +
             "#define GLASS_LIGHT_COUNT int(u.ambient.w)\n#define GLASS_LIGHT_KIND(i) int(u.lightKinds[i].x)\n"
+            "#define GLASS_LIGHT_COLOR(i) u.lightColors[i]\n#define GLASS_LIGHT_POSITION(i) u.lightPositions[i]\n"
+            "#define GLASS_LIGHT_ROTATION(i) u.lightRotations[i]\n#define GLASS_LIGHT_CONE(i) u.lightCones[i]\n"
+            "#define GLASS_OBJECT_COUNT 64\n#define GLASS_RECEIVER(o) u.glassReceivers[o]\n#define GLASS_EMISSION(o) u.glassEmission[o]\n"
             "#define GLASS_ROTATE glassRotateQ\n"
             "float3 glassRotateQ(float4 q,float3 v) {return v+2.0f*cross(q.xyz,cross(q.xyz,v)+q.w*v);}\n" + source;
     }
     smoothglass::replace(source, "GU_", "u");
-    return "\nuniform vec4 uRoughCameraControl;\nuniform vec4 uGlassTransport;\nuniform vec4 uGlassReceivers[64];\nuniform vec4 uGlassEmission[64];\n"
+    return "\nuniform vec4 uRoughCameraControl;\nuniform vec4 uGlassTransport;\nuniform int uSceneTableObjects;\n"
         "#define GX_ARGS\n#define GX_PASS\n#define GX_QUERY\n#define GX_OPAQUE\n"
         + surfacesource::literal<String>(imageSecondary ? "#define GX_IMAGE\n" : "")
         + surfacesource::literal<String>(pairedVolume ? "uniform vec4 uGlassTransport2;\n" : "") +
-        "#define GLASS_LIGHT_COUNT uLightCount\n#define GLASS_LIGHT_KIND(i) uLightKinds[i]\n#define GLASS_ROTATE glassRotateQ\n"
+        "#define GLASS_LIGHT_COUNT uLightCount\n#define GLASS_LIGHT_KIND(i) fixtureLightKind(i)\n#define GLASS_ROTATE glassRotateQ\n"
+        "#define GLASS_LIGHT_COLOR(i) fixtureLightColor(i)\n#define GLASS_LIGHT_POSITION(i) fixtureLightPosition(i)\n"
+        "#define GLASS_LIGHT_ROTATION(i) fixtureLightRotation(i)\n#define GLASS_LIGHT_CONE(i) fixtureLightCone(i)\n"
+        "#define GLASS_OBJECT_COUNT uSceneTableObjects\n"
+        "#define GLASS_RECEIVER(o) sceneTableRead(4*uLightCount+uSceneTableObjects+(o))\n"
+        "#define GLASS_EMISSION(o) sceneTableRead(4*uLightCount+2*uSceneTableObjects+(o))\n"
         "vec3 glassRotateQ(vec4 q,vec3 v) {return v+2.0*cross(q.xyz,cross(q.xyz,v)+q.w*v);}\n" + source;
 }
 inline std::string transportShader(bool metal,bool imageSecondary=false,bool selectedPrimary=false,bool pairedVolume=false)
@@ -3047,11 +3438,12 @@ int glassMsWalk(vec3 incoming,vec3 normal,float fromIor,float toIor,float roughn
     if(!glassSceneFinite3(incoming)||!glassSceneFinite3(normal)
         ||abs(dot(incoming,incoming)-1.0)>1e-4||abs(dot(normal,normal)-1.0)>1e-4
         ||dot(incoming,normal)>=0.0||!glassSceneFinite(roughness)||roughness<=0.0||roughness>1.0
-        ||!glassSceneFinite(fromIor)||!glassSceneFinite(toIor)||fromIor<1.0||toIor<1.0||fromIor>3.0||toIor>3.0
+        ||!glassSceneFinite(fromIor)||!glassSceneFinite(toIor)||fromIor<1.0||toIor<1.0
         ||eventLimit==0u||eventLimit>32u||exitLimit==0u||exitLimit>16u
         ||!glassSceneFinite(maximumResidual)||maximumResidual<=0.0||maximumResidual>1e-4) return -1;
     if(fromIor==toIor) {directions[0]=vec4(incoming,-1.0);count=1u;residual=0.0;return 1;}
-    float alpha=roughness*roughness;if(alpha<=0.0) return -1;
+    // A roughness under about 1e-23 squares to zero in float32. It stays on the smallest normal float32.
+    float alpha=max(roughness*roughness,1.17549435e-38);
     float q=1.0,weight=1.0;vec3 ray=incoming;bool crossed=false;
     for(uint event=0u;event<eventLimit;++event) {
         vec3 side=crossed?-normal:normal;float cosine=dot(ray,side);
@@ -3062,17 +3454,26 @@ int glassMsWalk(vec3 incoming,vec3 normal,float fromIor,float toIor,float roughn
             if(lambda==0.0) return -1;
             q=exp(log(q)-log(1.0-u*(1.0-escape))/lambda);
         }
-        if(!glassSceneFinite(q)||q<=0.0||q>=1.0) return -1;
+        // In float32 a sampled height can round onto the ends of (0,1), where it stops being a height.
+        // It stays on the nearest float32 inside, so a ray at the top still escapes.
+        if(q>0.99999994) q=0.99999994;
+        if(q<1.17549435e-38) q=1.17549435e-38;
+        if(!glassSceneFinite(q)) return -1;
         vec3 facet=glassMsNormal(ray,side,alpha,glassMsRandom(seed,event*4u+1u),glassMsRandom(seed,event*4u+2u));
         draws+=2u;
+        if(!glassSceneFinite3(facet)) return -1;
         vec3 transmitted;bool tir;
-        if(!glassSceneFinite3(facet)||dot(-ray,facet)<=0.0) return -1;
         ++events;
-        float fresnel=glassFresnel(ray,facet,crossed?toIor:fromIor,crossed?fromIor:toIor,transmitted,tir);
-        float choice=glassMsRandom(seed,event*4u+3u);++draws;
-        if(tir||choice<fresnel) ray=normalize(reflect(ray,facet));
-        else {ray=transmitted;crossed=!crossed;q=1.0-q;}
-        if(!glassSceneFinite(fresnel)||!glassSceneFinite3(ray)||q<=0.0||q>=1.0) return -1;
+        float fresnel=0.0,choice=glassMsRandom(seed,event*4u+3u);++draws;
+        // A ray rising almost along the normal samples a facet at its own horizon, which float32 can
+        // round to facing away. A facet met edge-on doesn't turn the ray, so the ray goes on.
+        if(dot(-ray,facet)>0.0) {
+            fresnel=glassFresnel(ray,facet,crossed?toIor:fromIor,crossed?fromIor:toIor,transmitted,tir);
+            if(tir||choice<fresnel) ray=normalize(reflect(ray,facet));
+            else {ray=transmitted;crossed=!crossed;q=1.0-q;}
+        }
+        if(q>0.99999994) q=0.99999994;
+        if(!glassSceneFinite(fresnel)||!glassSceneFinite3(ray)||q<=0.0) return -1;
         escape=glassMsEscape(q,dot(ray,crossed?-normal:normal),alpha);
         float emitted=weight*escape;
         if(emitted>0.0) {

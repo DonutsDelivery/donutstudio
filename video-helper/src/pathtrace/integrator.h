@@ -12,6 +12,15 @@
 // (Mask/Blend alpha) are crossed stochastically without counting a bounce, and
 // shadow rays multiply their transmittance.
 //
+// Light-path limits, as in Cycles. maxDepth caps every scattering event; the
+// diffuse, glossy and transmission limits cap the bounces of that kind (a
+// delta reflection counts as glossy, any transmission as transmission), and
+// maxTransparentHits caps alpha cut-outs, false interfaces and thin sheets
+// crossed. A path that reaches a limit ends there and keeps the radiance it
+// gathered; RenderStats counts it. No limit ever refuses a frame. The tracer
+// has no volume scattering yet (media only absorb), so there is no volume
+// bounce limit to reach.
+//
 // Nothing is clamped by default. A sample whose radiance is NaN or infinite
 // is dropped before it reaches the accumulator and counted in
 // RenderStats::nonFiniteSamples. The optional indirect clamp is off unless
@@ -29,7 +38,13 @@
 // densities to the hero's. A dispersive refraction (or a rough dispersive
 // interface) leaves the companions at 0, after which only the hero counts,
 // with weight 4 (Wilkie et al. 2014; Cycles path_state.h does the same after
-// dispersion). SpectralMode::Automatic, the default, uses spectral transport
+// dispersion). One wavelength alone comes out as a nearly pure colour, so any
+// other noise in the path would show as colour speckle. A path that meets
+// dispersion is therefore traced four times with the same random numbers and
+// each of its wavelengths as the hero in turn, and the estimates are averaged.
+// Each wavelength follows its own direction, so the colour on screen comes
+// from the geometry and not from the random numbers. Paths that never meet
+// dispersion are traced once. SpectralMode::Automatic, the default, uses spectral transport
 // only when some material is dispersive, so every other scene renders exactly
 // as in RGB mode.
 //
@@ -39,8 +54,24 @@
 // owning medium absorbs by Beer-Lambert along every segment
 // (Material::absorptionDistance). Thin sheets transmit straight, which camera,
 // bounce and shadow rays all follow. Shadow rays still stop at real
-// refracting interfaces: light seen through glass arrives by BSDF sampling
-// only (caustics are PT-E).
+// refracting interfaces: light seen through glass arrives by BSDF sampling.
+//
+// Caustics (light tracing). A camera path cannot reach a point or
+// directional light through glass, a mirror chain or a grating, and finds
+// small lights that way only by chance. When the scene has a refracting
+// interface or a bound grating (causticLightPaths, on by default), every
+// pixel sample also traces one light path: it leaves a light chosen by power
+// (LightSet::sampleEmission, every light type including the environment and
+// directional lights through a disk around the scene), follows delta lobes
+// only (smooth refraction with its Fresnel split, total internal reflection,
+// mirrors, dispersion per wavelength as above, diffraction orders through
+// diffraction_order_bsdf), and at the first surface with a non-delta lobe
+// after at least one delta vertex it connects to the camera and splats into
+// the Accumulator. The camera path leaves out exactly those paths: an emitter
+// reached after a first non-delta scatter on an opaque surface followed only
+// by delta scatters. Neither method counts a path twice, so the sum is
+// unbiased. Caustics seen through glass or a mirror (the camera's first
+// scatter is delta) stay with the camera path.
 //
 // Lights with a size (lights.h) are invisible to camera rays. Bounce rays
 // reach them, and MIS pairs those hits with light sampling. The MIS densities
@@ -63,11 +94,21 @@
 #include "spectrum.h"
 #include "scene_ingest.h"
 #include "thread_pool.h"
+#include "devices/device_interface.h"
 #include "../../../shared/Visual3DScene.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
+#include <string>
 #include <vector>
+
+namespace diffractionmaterial
+{
+class AdmittedDiffractionMaterialIR;
+}
 
 namespace videohelper::pathtrace
 {
@@ -86,9 +127,15 @@ enum class SpectralMode : std::uint8_t
     On = 2          // always spectral
 };
 
+// A per-kind bounce limit that never binds before maxDepth does.
+constexpr std::uint32_t kUnlimitedBounces = 0xffffffffu;
+
 struct IntegratorSettings
 {
     std::uint32_t maxDepth = 12;            // bounces after the camera hit
+    std::uint32_t maxDiffuseBounces = kUnlimitedBounces;
+    std::uint32_t maxGlossyBounces = kUnlimitedBounces;
+    std::uint32_t maxTransmissionBounces = kUnlimitedBounces;
     std::uint32_t rouletteStartDepth = 3;   // first bounce that may be terminated
     std::uint32_t maxTransparentHits = 16;  // alpha cut-outs crossed per path
     // 0 disables. Otherwise the largest channel of every indirect contribution
@@ -98,7 +145,18 @@ struct IntegratorSettings
     SpectralMode spectral = SpectralMode::Automatic;
     SamplePattern pattern = SamplePattern::OwenSobol;
     bool environmentVisibleToCamera = true;
+    // Light tracing for caustics (see the header comment). It runs only for
+    // scenes with a refracting interface or a bound grating.
+    bool causticLightPaths = true;
     std::uint32_t tileSize = TileGrid::kDefaultTileSize;
+};
+
+// An object tinted by a frame texture. Camera samples that first hit it go to
+// frame layer `layer` instead of the accumulator (FrameLayerFilm).
+struct ObjectFrameBinding
+{
+    std::uint32_t objectId = 0;  // SceneObjectId::value
+    std::uint32_t layer = 0;
 };
 
 // Geometry, materials and lights the integrator reads. Fill the public
@@ -120,6 +178,11 @@ struct RenderScene
     std::vector<LightShape> lightShapes;
     // Rect and disk lights next to the records.
     std::vector<AreaLightRecord> areaLights;
+    // Materials whose surfaces scatter by diffraction orders. Each binding
+    // holds a copy of its admitted material's description.
+    std::vector<std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR>> gratingMaterials;
+    std::vector<device::GratingBinding> gratings;
+    std::vector<ObjectFrameBinding> frameBindings;
 
     // Built by commit().
     Bvh bvh;
@@ -128,6 +191,9 @@ struct RenderScene
     bool anyThinSheet = false;
     bool anyMediumBoundary = false;
     bool anyDispersive = false;
+    // Bounding sphere of the triangles; radius 0 for an empty scene.
+    Vec3 boundsCentre {};
+    float boundsRadius = 0.0f;
 
     // Rebuilds the BVH and the light set from the members above.
     void commit();
@@ -142,11 +208,24 @@ struct ObjectMaterialOverride
     Material material {};
 };
 
+// An object whose triangles scatter by the diffraction orders of an admitted
+// material (diffraction_order_bsdf.h) instead of a Material.
+struct ObjectGratingBinding
+{
+    std::uint32_t objectId = 0;  // SceneObjectId::value
+    std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR> material;
+    // A spatial foil's corners (GratingBinding::field).
+    std::optional<std::array<std::array<float, 4>, 4>> field {};
+};
+
 struct PrepareOptions
 {
     IngestOptions ingest {};
     // Applied in order; a later entry for the same object wins.
     std::vector<ObjectMaterialOverride> objectMaterials;
+    // Applied after objectMaterials; a null material is skipped.
+    std::vector<ObjectGratingBinding> objectGratings;
+    std::vector<ObjectFrameBinding> objectFrames;
     // When set, these records light the scene instead of scene.lights, e.g.
     // the records a runtime light override produced. Must outlive the call.
     const std::vector<HarmonicMIDI::grid::SceneLightRecord>* lightRecords = nullptr;
@@ -177,7 +256,14 @@ struct PathCounters
     std::uint64_t closestRays = 0;
     std::uint64_t shadowRays = 0;
     std::uint64_t clampedContributions = 0;
-    std::uint64_t transparentLimitPaths = 0;
+    std::uint64_t bounceLimitPaths = 0;       // ended at maxDepth or a per-kind limit
+    std::uint64_t transparentLimitPaths = 0;  // ended at maxTransparentHits
+    // Caustic light tracing. lightPathRays counts the light paths' closest
+    // and camera-visibility rays, which closestRays and shadowRays leave out.
+    std::uint64_t lightPaths = 0;
+    std::uint64_t lightPathRays = 0;
+    std::uint64_t causticSplats = 0;
+    std::array<std::uint64_t, 7> causticSplatsByLight {};  // by LightType
 
     PathCounters& operator+= (const PathCounters& other) noexcept;
 };
@@ -190,7 +276,16 @@ struct RenderStats
     float indirectClamp = 0.0f;            // the setting in force; 0 is off
     std::uint64_t closestRays = 0;         // camera and bounce rays
     std::uint64_t shadowRays = 0;
+    // Paths that ended at a light-path limit. They still contribute, so these
+    // describe the image; they never mean a pixel or frame failed.
+    std::uint64_t bounceLimitPaths = 0;
     std::uint64_t transparentLimitPaths = 0;
+    std::uint64_t limitEndedPaths = 0;     // bounceLimitPaths + transparentLimitPaths
+    // Caustic light tracing (PathCounters).
+    std::uint64_t lightPaths = 0;
+    std::uint64_t lightPathRays = 0;
+    std::uint64_t causticSplats = 0;
+    std::array<std::uint64_t, 7> causticSplatsByLight {};  // by LightType
     std::uint32_t samplesPerPixel = 0;     // requested by this call
     std::uint32_t firstSampleIndex = 0;
     std::uint32_t tileCount = 0;
@@ -198,6 +293,10 @@ struct RenderStats
     bool cancelled = false;
     bool invalidRequest = false;           // size mismatch or zero samples; nothing rendered
     bool spectral = false;                 // the pass used spectral transport
+    // This pass ran on the CPU because the device cannot draw the scene, and why.
+    // Null otherwise. See PathTracer::setDeviceSceneFallback.
+    const char* deviceSkipped = nullptr;
+    bool deviceFailed = false;             // PathTracer::deviceFailure(); the frame must not show
     LightSetStats lights {};
 };
 
@@ -217,6 +316,8 @@ constexpr std::uint32_t kWavelengthDimension = 0;
 class PathTracer
 {
 public:
+    // threadCount 0 renders on sharedThreadPool(). Any other count gets a private
+    // pool of that size.
     explicit PathTracer (unsigned threadCount = 0);
 
     IntegratorSettings settings {};
@@ -224,10 +325,14 @@ public:
     // One progressive pass of samplesPerPass samples per pixel over every
     // tile. A new size or generation clears the accumulator first. Sample
     // indices continue across passes of one generation, so the low-discrepancy
-    // sequence keeps its stratification.
+    // sequence keeps its stratification. samplerGeneration seeds the sample
+    // streams; zero means generation itself. An accumulation seeded with the
+    // export generation draws the same samples as renderFixed, so after N
+    // samples it holds the export image at N samples bit for bit.
     RenderStats renderProgressive (const RenderScene& scene, const PinholeCamera& camera,
                                    std::uint32_t width, std::uint32_t height, std::uint32_t samplesPerPass,
-                                   std::uint64_t generation, const CancellationToken& cancel);
+                                   std::uint64_t generation, const CancellationToken& cancel,
+                                   std::uint64_t samplerGeneration = 0);
 
     // Clears the accumulator and renders exactly samplesPerPixel samples per
     // pixel (unless cancelled), for export.
@@ -235,7 +340,34 @@ public:
                              std::uint32_t width, std::uint32_t height, std::uint32_t samplesPerPixel,
                              std::uint64_t generation, const CancellationToken& cancel);
 
+    // One pass on another device. It adds to film and stats, or fills error.
+    struct DevicePass
+    {
+        const RenderScene& scene;
+        const PinholeCamera& camera;
+        const IntegratorSettings& settings;
+        std::uint32_t firstSample;
+        std::uint32_t samples;
+        std::uint64_t generation;
+        const CancellationToken& cancel;
+        Accumulator& film;
+        RenderStats& stats;
+        PathCounters& counters;
+        std::string& error;
+    };
+    using DevicePassFunction = std::function<bool (DevicePass&)>;
+    // Set, every pass runs there; a failure sets RenderStats::deviceFailed and
+    // the CPU traces nothing. Not set, the CPU device renders.
+    void setDevicePass (DevicePassFunction pass) { devicePass_ = std::move (pass); }
+    const std::string& deviceFailure() const noexcept { return deviceFailure_; }
+    // A scene the device cannot draw goes to the CPU for that scene's passes, and
+    // the device stays set for the next scene. Off, such a scene fails instead.
+    void setDeviceSceneFallback (bool allowed) noexcept { deviceSceneFallback_ = allowed; }
+
     const Accumulator& accumulator() const noexcept { return accumulator_; }
+    // One film per frame layer of the scene last rendered. Divide by the
+    // accumulator's sample count, which counts these samples too.
+    const std::vector<FrameLayerFilm>& frameLayers() const noexcept { return frameLayers_; }
     unsigned concurrency() const noexcept { return pool_.concurrency(); }
 
     // Runs fn once per tile of a width x height image on this tracer's pool,
@@ -247,9 +379,16 @@ private:
     RenderStats runPass (const RenderScene& scene, const PinholeCamera& camera,
                          std::uint32_t firstSample, std::uint32_t samples, const CancellationToken& cancel);
 
-    ThreadPool pool_;
+    std::unique_ptr<ThreadPool> ownedPool_;
+    ThreadPool& pool_;
+    DevicePassFunction devicePass_;
+    bool deviceSceneFallback_ = false;
+    std::string deviceFailure_;
     Accumulator accumulator_;
+    std::vector<FrameLayerFilm> frameLayers_;
     std::uint32_t nextSample_ = 0;
+    // Seeds the sample streams of the live accumulation (see renderProgressive).
+    std::uint64_t samplerGeneration_ = 0;
 };
 
 } // namespace videohelper::pathtrace

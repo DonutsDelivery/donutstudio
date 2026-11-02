@@ -92,7 +92,7 @@ inline bool calculateGratingCellTransportBounds(const GratingEntryCellBinding& c
     const auto& parent=*cells.incidentBinding;const auto& frame=parent.frame;
     const auto interfaces=parent.prepared.branchPolicy->description().maximumInterfaces;
     const auto query=gratingCellQueryAllowance(frame);
-    if(!interfaces||interfaces>kMaximumInterfaces||incidents>kMaximumEntrySamples*8*kMaximumBranchVisits
+    if(!interfaces||interfaces>kMaximumAncestryInterfaces||incidents>kMaximumEntrySamples*8*kMaximumBranchVisits
         ||incidents>parent.bounds.maximumIncidents
         ||!query||query>opaquevisibility::kMaximumClosestHitWork)return refuse("Cell transport schedule or query allowance is invalid");
     GratingCellTransportBounds bounds;bounds.maximumRecords=incidents;bounds.maximumInterfaces=interfaces;
@@ -181,7 +181,7 @@ inline bool decodeGratingCellTransportRecord(const Texel* row,const GratingCellT
 {
     const auto refuse=[&](){error="Native cell transport row is malformed";return false;};
     if(!row||!binding.sourceCells||!binding.pointReadback||!binding.bounds.maximumInterfaces
-        ||binding.bounds.maximumInterfaces>kMaximumInterfaces
+        ||binding.bounds.maximumInterfaces>kMaximumAncestryInterfaces
         ||binding.bounds.recordStride!=kGratingCellTransportHeaderStride+kGratingCellTracePaths*(binding.bounds.maximumInterfaces+1)*kGratingCellTraceStepStride)return refuse();
     for(std::size_t i=0;i<binding.bounds.recordStride;++i)for(float x:row[i])if(!std::isfinite(x))return refuse();
     NativeGratingCellTransportRecord r;std::uint32_t disposition=0,words[4]{};

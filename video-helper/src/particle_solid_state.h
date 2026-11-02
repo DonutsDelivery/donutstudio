@@ -813,7 +813,7 @@ struct SolidTriangleWorkBudget
     bool preflight(std::uint64_t steps,std::uint64_t bodies,std::uint64_t vertices,std::uint64_t triangles,
                    std::uint64_t pointColliders=64,std::uint64_t queryCost=1) const
     {
-        if (steps>1200+kParticleReplayMaxEvents || bodies>static_cast<std::uint64_t>(kParticleSolidMaxBodies) || vertices>256 || triangles>128 || pointColliders>64
+        if (bodies>static_cast<std::uint64_t>(kParticleSolidMaxBodies) || vertices>256 || triangles>128 || pointColliders>64
             || queryCost==0 || queryCost>96) return false;
         const auto multiply=[](std::uint64_t a,std::uint64_t b,std::uint64_t& result)
         { if (b && a>maximum/b) return false; result=a*b; return true; };

@@ -17,6 +17,7 @@
 #include "../src/gpu_backend/fixture_smooth_glass.h"
 #include "../src/gpu_backend/fixture_analytic_sky.h"
 #include "../src/gpu_backend/metal_resource_pools.h"
+#include "../src/gpu_backend/metal_fixed_bindings.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -124,8 +125,7 @@ void overBudgetRefusal()
 
 void metalPoolArithmetic()
 {
-    using Scene = HarmonicMIDI::grid::Visual3DScene;
-    const auto textures = static_cast<int> (Scene::kMaxTextures);
+    const auto textures = static_cast<int> (::metalbinding::kTextures);
     // Fallback slot plus both roles of every texture, and the environment image.
     const int images = 1 + 2 * textures + 1, samplers = 1 + 2 * textures;
     constexpr int concurrentPreparations = 4;
@@ -137,7 +137,7 @@ void metalPoolArithmetic()
            "sampler pool cannot hold four maximum-texture fixture preparations");
     check (pools::kIdPoolSlots == 2 * (2 * 512 + 2 * 512 + 256 + 6 * 128 + 3 * 128 + 1024 + 128),
            "Metal id pool size differs from sokol_gfx _sg_mtl_init_pool()");
-    check (pools::fixturePreparationIds (Scene::kMaxTextures) <= pools::kMinimumFreeIds,
+    check (pools::fixturePreparationIds (::metalbinding::kTextures) <= pools::kMinimumFreeIds,
            "a maximum-texture fixture preparation needs more ids than the headroom guard keeps");
     check (2 * pools::kMinimumFreeIds < pools::kIdPoolSlots / 2,
            "the headroom guard reserves too much of the Metal id pool");

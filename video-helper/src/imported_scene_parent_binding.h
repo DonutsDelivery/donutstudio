@@ -6,27 +6,23 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 #include <type_traits>
 #include <vector>
 
 namespace videohelper::modelpayload
 {
 // Logical CPU retention only. Allocator, library and native-driver overhead is
-// unknown. The pool uses four history envelopes plus one attempt envelope.
-// Actual originals, caller scratch and escaped references all consume this pool;
-// it refuses rather than promise four maximum-sized original-input admissions.
+// unknown. Actual originals, caller scratch and escaped references all consume
+// this pool.
 class NativeCompositionRetentionBudget final
 {
 public:
     NativeCompositionRetentionBudget() : bytes_(sizeof(*this)) {}
-    static constexpr std::size_t kCallerMaximumBytes = 64 *
-        (3 * sizeof(arbitgpu::NativeDeformationScene)
-         + 3 * 64 * sizeof(arbitgpu::NativeDeformationJointBaseTransform)
-         + 3 * 8 * sizeof(float) + 4 * sizeof(std::shared_ptr<const arbitgpu::NativeDeformationScene>)
-         + sizeof(arbitgpu::NativeDeformationCompositionMapping));
-    static constexpr std::size_t kMaximumBytes = 5 *
-        (arbitgpu::NativeDeformationCompositionOwner::kMaximumLogicalBytes * 3 / 2
-         + kCallerMaximumBytes + 4 * 4096 * sizeof(arbitgpu::NativeSceneMotionSample::ImportedNodeWorldMatrix));
+    // Counter ranges for checked arithmetic, far above anything a machine can
+    // hold. They are not a scene ceiling: real allocations fail on their own.
+    static constexpr std::size_t kMaximumBytes = std::size_t(1) << 56;
+    static constexpr std::size_t kCallerMaximumBytes = kMaximumBytes;
     struct Charge final
     {
         std::shared_ptr<NativeCompositionRetentionBudget> budget;
@@ -79,7 +75,14 @@ class ImportedParentBindingOwner final
 public:
     using Intent = visualimportedscenerender::ImportedParentIntentV1;
     using Scene = HarmonicMIDI::grid::Visual3DScene;
-    struct Parents final { std::array<HarmonicMIDI::grid::SceneObjectId,64> values {}; };
+    struct Parents final { std::vector<HarmonicMIDI::grid::SceneObjectId> values; };
+    // These checks run noexcept, so a failed allocation refuses here instead of terminating.
+    template <typename Record>
+    static bool sized(std::vector<Record>& records,std::size_t count) noexcept
+    {
+        try {records.assign(count,Record {});return true;}
+        catch (const std::bad_alloc&) {return false;}
+    }
 
     // Named logical units count fixed reads/tests, loop control and each record
     // probe separately. Byte comparisons/copies use the reachable capacities.
@@ -90,7 +93,7 @@ public:
         // One vector capacity/addition and two string guards/additions in
         // every light slot. 32 setup units and 64 per-slot units cover those
         // fixed header reads, arithmetic, branches and counter updates.
-        if (!budget.consumeWork(1,32 + 64*Scene::kMaxLights)) return false;
+        if (!budget.consumeWork(1,32 + 64*scene.lights.size())) return false;
         bytes=sizeof(Scene);
         const auto add=[&](std::size_t count,std::size_t stride) {
             if (bytes>NativeSceneAnimationCompositionBudget::kMaximumBytes
@@ -121,7 +124,7 @@ public:
         const auto i=imported.objectCount;
         const auto n=basis.objectCount;
         const auto k=intent.rootMembershipCount;
-        if (p>64 || i>64 || n>64 || p+i!=n || !p || !i || k>64) return false;
+        if (p+i!=n || !p || !i || k>intent.rootMembership.size()) return false;
         // validImportedParentIntent visits all slots and its triangular duplicate
         // loop. Then complete-union lookup, expected-parent assembly and final
         // identity lookup visit their own tables. Reserve failures in full.
@@ -129,7 +132,9 @@ public:
             +64+4 + 6*p + 8*k*p + 12*k +4*4
             +n + 10*n*i + 12*n*p + 12*n*k + n*32;
         if (!budget.consumeWork(work,1) || !visualimportedscenerender::validImportedParentIntent(intent)) return false;
-        std::array<bool,64> seen {};
+        std::vector<char> seen;
+        if (!budget.consumeWork(p+n*sizeof(HarmonicMIDI::grid::SceneObjectId),1) || !sized(seen,p)
+            || !sized(result.values,n)) return false;
         std::array<std::size_t,4> groups {};
         if (intent.direction==2)
         {
@@ -203,23 +208,34 @@ public:
     {
         std::size_t a=0,b=0;
         if (!sceneBytes(basis,budget,a) || !sceneBytes(scene,budget,b)
-            || !budget.consumeWork(a+b,1) || !budget.consumeWork(64,sizeof(HarmonicMIDI::grid::SceneObjectRecord)+3)) return false;
+            || !budget.consumeWork(a+b,1) || !budget.consumeWork(basis.objects.size(),sizeof(HarmonicMIDI::grid::SceneObjectRecord)+3)) return false;
         const auto same=[](const auto& x,const auto& y) {
             static_assert(std::is_trivially_copyable_v<std::decay_t<decltype(x)>>);
             return std::memcmp(&x,&y,sizeof(x))==0;
+        };
+        // SceneBuffer owns heap storage, so compare its length and then every
+        // allocated record bytewise, as same() did over the fixed arrays.
+        const auto sameBuffer=[](const auto& x,const auto& y) {
+            using Record=typename std::decay_t<decltype(x)>::value_type;
+            static_assert(std::is_trivially_copyable_v<Record>);
+            return x.size()==y.size() && (x.empty() || std::memcmp(x.data(),y.data(),x.size()*sizeof(Record))==0);
         };
         if (basis.schemaVersion!=scene.schemaVersion || basis.id!=scene.id || basis.activeCamera!=scene.activeCamera
             || !same(basis.ambientColor,scene.ambientColor) || basis.vertexCount!=scene.vertexCount
             || basis.indexCount!=scene.indexCount || basis.objectCount!=scene.objectCount
             || basis.materialCount!=scene.materialCount || basis.textureCount!=scene.textureCount
             || basis.textureTexelCount!=scene.textureTexelCount || basis.lightCount!=scene.lightCount
-            || basis.cameraCount!=scene.cameraCount || !same(basis.vertices,scene.vertices)
-            || !same(basis.indices,scene.indices)
-            || !same(basis.textures,scene.textures) || !same(basis.cameras,scene.cameras)
+            || basis.cameraCount!=scene.cameraCount || !sameBuffer(basis.vertices,scene.vertices)
+            || !sameBuffer(basis.indices,scene.indices)
+            || !sameBuffer(basis.textures,scene.textures) || !sameBuffer(basis.cameras,scene.cameras)
             || basis.textureTexels.size()!=scene.textureTexels.size()) return false;
+        // The loops below visit every allocated record of both scenes.
+        if (basis.objects.size()!=scene.objects.size()
+            || basis.materials.size()!=scene.materials.size()
+            || basis.lights.size()!=scene.lights.size()) return false;
         if (basis.textureTexels.size() && std::memcmp(basis.textureTexels.data(),scene.textureTexels.data(),
                 basis.textureTexels.size()*sizeof(HarmonicMIDI::grid::SceneTexelRgba8))) return false;
-        for (std::size_t x=0;x<64;++x)
+        for (std::size_t x=0;x<basis.objects.size();++x)
         {
             auto expected=basis.objects[x];
             if (x<basis.objectCount) expected.parent=parents.values[x];
@@ -227,8 +243,8 @@ public:
         }
         // Compare fields, not material padding around its enum/bool. Inactive
         // records are conserved as well, including any float bit patterns.
-        if (!budget.consumeWork(Scene::kMaxMaterials,24) || !budget.consumeWork(Scene::kMaxLights,128)) return false;
-        for (std::size_t x=0;x<Scene::kMaxMaterials;++x)
+        if (!budget.consumeWork(basis.materials.size(),24) || !budget.consumeWork(basis.lights.size(),128)) return false;
+        for (std::size_t x=0;x<basis.materials.size();++x)
         {
             const auto& a=basis.materials[x];const auto& b=scene.materials[x];
             if (a.id!=b.id || !same(a.baseColor,b.baseColor) || a.baseColorTexture!=b.baseColorTexture
@@ -239,7 +255,7 @@ public:
                 || !same(a.occlusionStrength,b.occlusionStrength) || a.alphaMode!=b.alphaMode
                 || !same(a.alphaCutoff,b.alphaCutoff) || a.doubleSided!=b.doubleSided) return false;
         }
-        for (std::size_t x=0;x<Scene::kMaxLights;++x)
+        for (std::size_t x=0;x<basis.lights.size();++x)
             if (!HarmonicMIDI::grid::scenecomposition::sameLightRecord(basis.lights[x],scene.lights[x])) return false;
         return true;
     }
@@ -249,9 +265,10 @@ public:
     {
         // conservation visits all fixed records and reachable texels/identities.
         // Preserve original parent words here rather than applying new edges.
-        if (!budget.consumeWork(1,24) || frozen.objectCount>64 || actual.objectCount>64
-            || !budget.consumeWork(sizeof(Parents)+64*(2*sizeof(HarmonicMIDI::grid::SceneObjectId)+4),1)) return false;
+        if (!budget.consumeWork(1,24)
+            || !budget.consumeWork(sizeof(Parents)+frozen.objectCount*(2*sizeof(HarmonicMIDI::grid::SceneObjectId)+4),1)) return false;
         Parents original;
+        if (!sized(original.values,frozen.objectCount)) return false;
         for (std::size_t x=0;x<frozen.objectCount;++x) original.values[x]=frozen.objects[x].parent;
         return conservation(frozen,actual,original,budget);
     }
@@ -259,7 +276,8 @@ public:
     bool inspect(const Intent& expected) const noexcept
     {
         NativeCompositionRetentionBudget::Scratch scratch;
-        constexpr auto scratchBytes=2*sizeof(Parents)+64*sizeof(bool)+4*sizeof(std::size_t)
+        const auto objects=basis_ ? basis_->objectCount : 0;
+        const auto scratchBytes=2*sizeof(Parents)+objects*(sizeof(char)+2*sizeof(HarmonicMIDI::grid::SceneObjectId))+4*sizeof(std::size_t)
             +sizeof(HarmonicMIDI::grid::SceneObjectRecord)+sizeof(NativeCompositionRetentionBudget::Scratch)
             +8*sizeof(std::size_t)+2*sizeof(std::shared_ptr<const void>);
         if (!budget_ || !budget_->consumeWork(scratchBytes,1) || !retention_

@@ -11,7 +11,6 @@ struct Resident final
 {
     visualenvironmentimagepayload::PayloadPtr payload;
     visualenvironmentimage::DecodedImage image;
-    std::array<float,3> maximumRadiance{};
 };
 using ResidentPtr = std::shared_ptr<const Resident>;
 
@@ -96,8 +95,6 @@ public:
             if (!visualenvironmentimage::decodeRadianceEnvironment(pending.bytes.data(),pending.bytes.size(),
                     resident->image,error) || !sameMetadata(resident->image.metadata,pending.metadata))
             { reject(error,"HDR environment source interpretation is invalid"); return {}; }
-            for (const auto& pixel:resident->image.pixels)
-                for (std::size_t c=0;c<3;++c) resident->maximumRadiance[c]=std::max(resident->maximumRadiance[c],pixel[c]);
             resident->payload=visualenvironmentimagepayload::ImmutablePayload::create(
                 std::move(pending.key),pending.metadata,std::move(pending.bytes));
             if (!resident->payload) { reject(error,"HDR environment immutable payload admission failed"); return {}; }

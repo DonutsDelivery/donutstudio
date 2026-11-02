@@ -38,18 +38,27 @@ inline constexpr std::uint64_t kAccumulatorBytesPerPixel = 8*sizeof(float);
 inline constexpr std::size_t kMaximumSplatsPerDeposit = 1;
 inline constexpr std::size_t kTriangleStride = 8;
 inline constexpr std::size_t kEntrySubdivisions = 4;
-inline constexpr std::size_t kMaximumEntryTriangles = 128;
-inline constexpr std::size_t kMaximumEntrySamples = kMaximumEntryTriangles*kEntrySubdivisions*kEntrySubdivisions;
-inline constexpr std::size_t kMaximumInterfaces = 32;
+// Entries per frame traced by the native query. Glass with more entries is
+// thinned by thinEntrySamples, which keeps its total area, so this sets caustic
+// sampling density and not which meshes can cast.
+inline constexpr std::size_t kMaximumEntrySamples = 128*kEntrySubdivisions*kEntrySubdivisions;
+// Smooth macro paths keep a 64-bit reflection history, so 48 interfaces fit.
+// Rough, multiple-scatter and grating paths store one ancestry byte per
+// interface in kMacroAncestryBytes and keep the older 32 interface ceiling.
+// A branch policy is only bounded by these caps; policy 32 behaves as before.
+inline constexpr std::size_t kMaximumInterfaces = 48;
+inline constexpr std::size_t kMaximumAncestryInterfaces = kMacroAncestryBytes;
+inline constexpr std::size_t kDefaultPolicyInterfaces = 32;
+static_assert(kMaximumInterfaces<64, "Smooth caustic reflection history is one uint64 bit per interface");
+static_assert(kMaximumAncestryInterfaces<=kMaximumInterfaces && kMaximumAncestryInterfaces==32,
+    "Ancestry, camera-trace and grating layouts hold 32 interfaces");
 inline constexpr std::uint64_t kMaximumQueryWork = 128ull*1024ull*1024ull;
-// Worst-case query work of one native frame: per path, the source and entry
+// Worst-case query work of one native frame is, per path, the source and entry
 // queries plus three per visit (the visit and two camera queries per possible
-// deposit), times the BVH allowance. A faceted lens with 24 sunlit triangles
-// at 64 visits reserves 292 to 355 Mi, and the worst case assumes every query
-// visits every BVH node and triangle. Measured work stays far below it. CPU
-// diagnostic traces, grating bindings and multiple-scatter frames keep
-// kMaximumQueryWork.
-inline constexpr std::uint64_t kMaximumFrameQueryWork = 1024ull*1024ull*1024ull;
+// deposit), times the BVH allowance. It grows with the scene and assumes every
+// query visits every BVH node and triangle. Only a total that does not fit 64
+// bits refuses. CPU diagnostic traces, grating bindings and multiple-scatter
+// frames keep kMaximumQueryWork.
 inline constexpr float kRayMinimum = 1.0e-5f;
 inline constexpr std::uint32_t kBranchPolicyVersion = 1;
 inline constexpr std::size_t kMaximumBranchVisits = smoothglass::kMaximumRayVisits;
@@ -137,7 +146,7 @@ struct BranchPolicyDescription
 {
     std::uint32_t version = 0;
     float maximumUnresolvedFraction = 0, minimumBranchFraction = 0;
-    std::size_t maximumInterfaces = kMaximumInterfaces, maximumVisits = kMaximumBranchVisits;
+    std::size_t maximumInterfaces = kDefaultPolicyInterfaces, maximumVisits = kMaximumBranchVisits;
     std::size_t maximumPending = kMaximumPendingBranches;
 };
 class AdmittedBranchPolicy final
@@ -453,10 +462,9 @@ inline std::uint64_t splatGatherWorkCap()
 // The 4K faceted lens has about 1.5k distinct visible deposit spots in clusters
 // of overlapping windows, an estimated 1 to 3.4 Mi window pixels, at about 40 to
 // 80 measured closest-hit work each: 40 to 270 Mi in all, past the 128 Mi
-// kMaximumQueryWork. 4 Mi pixels at an average of 256 work leaves headroom over
-// that estimate and holds the validator's pixel map to about 600 MB.
+// kMaximumQueryWork. 4 Mi pixels hold the validator's pixel map to about 600 MB.
+// Work per pixel grows with the scene BVH and has no cap of its own.
 inline constexpr std::uint64_t kMaximumSplatCpuPixelQueries = 4ull<<20;
-inline constexpr std::uint64_t kMaximumSplatCpuQueryWork = kMaximumSplatCpuPixelQueries*256;
 // Largest admitted relative normaliser tolerance. Per-pixel footprint area
 // tolerances alone reach about 3e-3 at 4K and up to the 1e-2 verification cap,
 // so a 1e-3 bound would refuse ordinary frames. Twice that cap keeps the
@@ -606,7 +614,22 @@ inline std::uint64_t splatKeySlots(const Frame& frame)
 {
     if(frame.work.empty())return 0;
     const auto visits=frame.bounds.maximumDeposits/frame.work.size();
-    return frame.multipleScatterPolicy?visits:(visits+1)/2;
+    const auto slots=frame.multipleScatterPolicy?visits:(visits+1)/2;
+    // Key only the slots the dispatch-pinned gather budget admits: keyed
+    // deposits x kSplatTilesPerDeposit x kSplatTile^2 must stay under
+    // kMaximumSplatGatherWork, which is exactly what keeps the admitted sort
+    // inside one 2^20 key dispatch. The authored lighthouse dome pushed the
+    // design's 24 sunlit triangles to 30 - 3840 paths x 32 slots keyed to
+    // 122880 against a 116508 cap - so every frame of that scene fell to
+    // single-pixel deposits and its caustic coverage check failed. A closed
+    // dome-and-water trace physically cannot make the deposits a clamped path
+    // would need to reach the refused slots, and a frame that somehow does
+    // refuses honestly instead of dispatching an oversized sort. Frames at or
+    // under the design envelope keep their full slot count unchanged.
+    const auto keyedCap=kMaximumSplatGatherWork
+        /(std::uint64_t(kSplatTilesPerDeposit)*kSplatTile*kSplatTile);
+    const auto byBudget=keyedCap/frame.work.size();
+    return byBudget && byBudget<slots ? byBudget : slots;
 }
 inline bool calculateSplatSchedule(const Frame& frame,SplatSchedule& output,std::string& error)
 {
@@ -791,7 +814,7 @@ inline bool roughInterface(Point incoming,Point normal,float from,float to,float
     unsigned sample,unsigned depth,RoughInterface& output)
 {
     if(!std::isfinite(roughness) || roughness<=0 || roughness>1 || sample>=kRoughInterfaceSamples
-        || depth>=kMaximumInterfaces || !finite(incoming) || !finite(normal)
+        || depth>=kMaximumAncestryInterfaces || !finite(incoming) || !finite(normal)
         || std::abs(dot(incoming,incoming)-1)>1e-4f || std::abs(dot(normal,normal)-1)>1e-4f
         || dot(incoming,normal)>=0)return false;
     RoughInterface candidate;
@@ -922,6 +945,8 @@ inline bool prepareScene(const smoothglass::Prepared& glass, std::string identit
     const smoothglass::CausticVolumeSelection selection{slot.object,slot.material};
     if (!smoothglass::prepare(scene,root,{},candidate.glass,error,consumer,glass.distinctGrating.get(),
             slot.present?&selection:nullptr)) return false;
+    if (candidate.glass.smoothReceiverNormals)
+        return refuse("Closed glass receivers require flat geometric vertex normals");
     if (slot.present!=candidate.glass.causticVolume.present)
         return refuse("Glass caustic volume slot changed on re-admission");
     if (candidate.glass.causticVolume.present)
@@ -966,11 +991,6 @@ inline bool prepareScene(const smoothglass::Prepared& glass, std::string identit
         }
         const bool volume=object.id==candidate.glass.object;
         const bool absorber=candidate.absorber.isValid()&&object.id==candidate.absorber;
-        if (volume && object.indexCount/3>kMaximumEntryTriangles)
-        {
-            if (stop("Glass caustic entry triangles exceed their finite sample budget")) return refuse(firstRefusal.c_str());
-            continue;
-        }
         if (volume && surface->spectralReflectance)
         {
             if (stop("Glass caustic volume spectral absorption is unsupported")) return refuse(firstRefusal.c_str());
@@ -1191,6 +1211,20 @@ inline void appendEntrySamples(const Triangle& triangle,Point toSource,Schedulin
         if(u+v+1<scheduling.entrySubdivisions)append((u+2.0f/3)/scheduling.entrySubdivisions,(v+2.0f/3)/scheduling.entrySubdivisions);
     }
 }
+// Keeps an even stride of entries across the glass when a mesh yields more than
+// the native query traces. Each kept entry stands for the area of those it
+// replaced, so the deposited energy is preserved and the caustic gets noisier.
+inline void thinEntrySamples(std::vector<EntrySample>& entries)
+{
+    if(entries.size()<=kMaximumEntrySamples)return;
+    const auto stride=(entries.size()+kMaximumEntrySamples-1)/kMaximumEntrySamples;
+    std::size_t kept=0;
+    for(std::size_t e=0;e<entries.size();e+=stride)
+    {
+        entries[kept]=entries[e];entries[kept].area*=float(stride);++kept;
+    }
+    entries.resize(kept);
+}
 inline bool selectCamera(const Prepared& prepared,const NativeFixtureSceneRuntimeInputs* runtime,
     HarmonicMIDI::grid::SceneCameraRecord& output,std::string& identity,std::string& error)
 {
@@ -1289,7 +1323,7 @@ inline std::size_t reservedFrameIdentityBytes(const Prepared& prepared,const Fra
 }
 inline bool calculateResourceBounds(const Prepared& prepared,const Frame& frame,ResourceBounds& output,std::string& error)
 {
-    const auto refuse=[&](const char* text){error=text;return false;};
+    const auto refuse=[&](std::string text){error=text;return false;};
     if(frame.multipleScatterPolicy && (!prepared.branchPolicy || frame.roughness<=0
         || !validMultipleScatterPolicy(*frame.multipleScatterPolicy)))
         return refuse("Glass caustic multiple-scatter policy is unsupported");
@@ -1305,8 +1339,11 @@ inline bool calculateResourceBounds(const Prepared& prepared,const Frame& frame,
     // deposit. CPU diagnostic traversals check their own budget when they run.
     ResourceBounds candidate;
     const auto queryCount=std::uint64_t(frame.work.size())*(2+3*std::uint64_t(visits));
-    if(!work || work>opaquevisibility::kMaximumClosestHitWork || queryCount>kMaximumFrameQueryWork/work)
-        return refuse("Glass caustic native path/camera query work exceeds budget");
+    if(!work || work>opaquevisibility::kMaximumClosestHitWork)
+        return refuse("Glass caustic native query allowance "+std::to_string(work)+" is invalid");
+    if(queryCount>std::numeric_limits<std::uint64_t>::max()/work)
+        return refuse("Glass caustic native path/camera query work does not fit 64 bits: "
+            +std::to_string(queryCount)+" queries at "+std::to_string(work)+" work");
     candidate.queryWork=queryCount*work;candidate.maximumDeposits=std::uint64_t(frame.work.size())*visits;
     if(frame.multipleScatterPolicy) {
         if(!multipleScatterWorkWithinBounds(candidate.queryWork,candidate.maximumDeposits,*frame.multipleScatterPolicy,candidate.combinedWork))
@@ -1368,11 +1405,11 @@ inline bool buildFrameImpl(const Prepared& prepared, const std::vector<opaquevis
     const NativeFixtureSceneRuntimeInputs* runtime,std::uint32_t width,std::uint32_t height,Frame& output,std::string& error,
     SchedulingDescription scheduling={},std::optional<MultipleScatterPolicy> multipleScatterPolicy={},bool gratingPrerequisite=false)
 {
-    const auto refuse=[&](const char* text){error=text;return false;};
+    const auto refuse=[&](std::string text){error=text;return false;};
     if (!prepared.glass.sourceScene || !prepared.glass.sourceMaterial || prepared.identity.empty()
         || !nativeFixtureDimensionsWithinBounds(width,height) || !validScheduling(scheduling))return refuse("Glass caustic frame has no admitted ownership or extent");
     const auto& scene=*prepared.glass.sourceScene;
-    std::array<bool,64> seen{};
+    std::vector<char> seen(scene.objectCount,0);
     Frame candidate;candidate.width=width;candidate.height=height;candidate.scheduling=scheduling;candidate.instances=instances;
     if(prepared.glass.distinctGrating&&!gratingPrerequisite)return refuse("Distinct grating requires guarded native staging admission");
     candidate.gratingStaging=bool(prepared.glass.distinctGrating);
@@ -1384,6 +1421,9 @@ inline bool buildFrameImpl(const Prepared& prepared, const std::vector<opaquevis
     // The absorber rule exists in the smooth CPU, GL and Metal tracers. Rough
     // volumes also need the camera rough schedule to follow the volume, not
     // the thin camera dielectric, so they stay refused here.
+    if(prepared.branchPolicy && (candidate.roughness!=0 || multipleScatterPolicy || candidate.gratingStaging)
+        && prepared.branchPolicy->description().maximumInterfaces>kMaximumAncestryInterfaces)
+        return refuse("Glass caustic rough, multiple-scatter and grating paths admit at most 32 interfaces");
     if(prepared.absorber.isValid() && (candidate.roughness!=0 || multipleScatterPolicy || prepared.glass.distinctGrating))
         return refuse("Glass caustics beside a thin camera dielectric require a smooth closed volume");
     if(!selectCamera(prepared,runtime,candidate.camera,candidate.cameraIdentity,error))return false;
@@ -1402,8 +1442,8 @@ inline bool buildFrameImpl(const Prepared& prepared, const std::vector<opaquevis
     {
         candidate.ior[b]=surfacematerial::wavelengthIor(volume->parameters.transmissionIorClearcoat[1],
             volume->parameters.transmissionIorClearcoat[3],diffractionmaterial::kProductionWavelengthsNanometres[b]*.001f);
-        if (!std::isfinite(candidate.ior[b]) || candidate.ior[b]<1 || candidate.ior[b]>3)
-            return refuse("Glass caustic eight-band IOR is outside [1,3]");
+        if (!std::isfinite(candidate.ior[b]))
+            return refuse("Glass caustic eight-band IOR is not finite");
     }
     for(std::size_t i=0;i<instances.size();++i)
     {
@@ -1443,16 +1483,20 @@ inline bool buildFrameImpl(const Prepared& prepared, const std::vector<opaquevis
     }
     for(std::size_t o=0;o<scene.objectCount;++o)if(scene.objects[o].indexCount && !seen[o])
         return refuse("Glass caustic frame omitted an authored object");
+    thinEntrySamples(candidate.entries);
     const auto root=std::size_t(candidate.query.control[0]);
-    if (!root || root>=candidate.query.texels.size() || candidate.entries.size()>kMaximumEntrySamples)
-        return refuse("Glass caustic query/sample admission is empty or over budget");
+    if (!root || root>=candidate.query.texels.size())
+        return refuse("Glass caustic query table is empty");
     const auto& allowance=candidate.query.texels[root-1];
     const auto work=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
     // The native per-path bound calculateResourceBounds reserves. The CPU
     // diagnostic traces are not admitted here; they check their own budget.
     const auto visits=prepared.branchPolicy?prepared.branchPolicy->description().maximumVisits:kMaximumBranchVisits;
     const auto queries=std::uint64_t(candidate.entries.size())*8*candidate.interfaceSamples*(2+3*std::uint64_t(visits));
-    if (!work || queries>kMaximumFrameQueryWork/work)return refuse("Glass caustic finite path query work exceeds budget");
+    if (!work)return refuse("Glass caustic finite path query allowance is invalid");
+    if (queries>std::numeric_limits<std::uint64_t>::max()/work)
+        return refuse("Glass caustic finite path query work does not fit 64 bits: "
+            +std::to_string(queries)+" queries at "+std::to_string(work)+" work");
     for(std::size_t e=0;e<candidate.entries.size();++e)for(unsigned sample=0;sample<candidate.interfaceSamples;++sample)for(unsigned b=0;b<8;++b)
     {
         const auto& entry=candidate.entries[e];
@@ -1507,6 +1551,12 @@ struct PathReceipt
     float reflectedFraction = 0, transmittedFraction = 1;
     std::size_t interfaces = 0;
 };
+// Diagnostic CPU traces walk and budget the owning policy's interface bound,
+// so a policy of 32 keeps the same work as before the cap rose to 48.
+inline std::size_t policyInterfaces(const Prepared& prepared)
+{
+    return prepared.branchPolicy?prepared.branchPolicy->description().maximumInterfaces:kDefaultPolicyInterfaces;
+}
 inline bool validatePath(const Prepared& prepared,const Frame& frame,const EntrySample& entry,
     unsigned band,PathReceipt& output,std::string& error,bool entryOnly=false)
 {
@@ -1552,7 +1602,7 @@ inline bool validatePath(const Prepared& prepared,const Frame& frame,const Entry
         return refuse("Glass caustic entry query identity is incomplete or stale");
     if(entryOnly) {output=candidate;error.clear();return true;}
     auto hit=first;bool inside=false;
-    for(std::size_t depth=0;depth<kMaximumInterfaces;++depth)
+    for(std::size_t depth=0,limit=policyInterfaces(prepared);depth<limit;++depth)
     {
         if (hit.objectId!=prepared.glass.object.value || inside==hit.entering)return refuse("Glass caustic interface order is invalid");
         Point normal=hit.outwardNormal;if(inside)for(auto& v:normal)v=-v;
@@ -1646,7 +1696,7 @@ inline bool validateTables(const Prepared& prepared,const Frame& frame,std::stri
     if(!opaquevisibility::frame(prepared.glass.query,frame.instances,exactQuery,error))return false;
     if(exactQuery.control!=frame.query.control || exactQuery.height!=frame.query.height || exactQuery.texels!=frame.query.texels)
     {error="Glass caustic native closest-hit table no longer matches its retained instances";return false;}
-    const auto& scene=*prepared.glass.sourceScene;std::size_t expectedTriangles=0;std::array<bool,64> seen{};
+    const auto& scene=*prepared.glass.sourceScene;std::size_t expectedTriangles=0;std::vector<char> seen(scene.objectCount,0);
     for(const auto& instance:frame.instances)
     {
         if(instance.object>=scene.objectCount || seen[instance.object])
@@ -1686,6 +1736,7 @@ inline bool validateTables(const Prepared& prepared,const Frame& frame,std::stri
     {error="Glass caustic exact triangle/rho table changed after admission";return false;}
     std::vector<EntrySample> exactEntries;
     for(const auto& triangle:frame.triangles)appendEntrySamples(triangle,source.direction,frame.scheduling,exactEntries);
+    thinEntrySamples(exactEntries);
     if(exactEntries.size()!=frame.entries.size())
     {error="Glass caustic native entry quadrature coverage changed";return false;}
     std::vector<Texel> workTexels;
@@ -1736,7 +1787,7 @@ inline bool validateQueries(const Prepared& prepared,const Frame& frame,std::str
 {
     if(frame.multipleScatterPolicy) {error="Private multiple-scatter frames require an exact native consumer";return false;}
     if(!validateTables(prepared,frame,error))return false;
-    if(!diagnosticQueryWorkWithinBudget(frame,std::uint64_t(frame.entries.size())*8*(kMaximumInterfaces+3),error))return false;
+    if(!diagnosticQueryWorkWithinBudget(frame,std::uint64_t(frame.entries.size())*8*(policyInterfaces(prepared)+3),error))return false;
     for(const auto& entry:frame.entries)for(unsigned band=0;band<8;++band)
     {PathReceipt receipt;if(!validatePath(prepared,frame,entry,band,receipt,error))return false;}
     error.clear();return true;
@@ -1918,7 +1969,7 @@ inline bool validateBranchQueries(const Prepared& prepared,const Frame& frame,co
     const auto& allowance=frame.query.texels[root-1];
     const auto work=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
     // Includes the compatible primary identity validation plus branching.
-    const auto queries=std::uint64_t(frame.work.size())*(2*(kMaximumInterfaces+3)+policy.description().maximumVisits);
+    const auto queries=std::uint64_t(frame.work.size())*(2*(policy.description().maximumInterfaces+3)+policy.description().maximumVisits);
     if(!work || queries>kMaximumQueryWork/work)
     {error="Glass caustic branch frame query work exceeds budget";return false;}
     for(const auto& work:frame.work)
@@ -2382,7 +2433,7 @@ inline bool validMacroAncestry(const NativeDeposit& deposit,const MultipleScatte
     std::uint32_t& minimumEvents)
 {
     minimumEvents=0;bool inside=false;
-    if(!validMultipleScatterPolicy(policy) || !deposit.interfaces || deposit.interfaces>kMaximumInterfaces
+    if(!validMultipleScatterPolicy(policy) || !deposit.interfaces || deposit.interfaces>kMaximumAncestryInterfaces
         || (deposit.reflectionHistory>>deposit.interfaces)!=0)return false;
     for(unsigned i=0;i<deposit.ancestry.size();++i)
     {
@@ -2490,21 +2541,21 @@ inline NativeDirectionalSourceInput directionalSourceInput(const Prepared& prepa
 }
 // Derive the complete D8 roster from the immutable scene.
 inline bool directionalSourceRoster(const Prepared& prepared,
-    std::array<HarmonicMIDI::grid::SceneLightId,HarmonicMIDI::grid::Visual3DScene::kMaxLights>& output,
+    std::vector<HarmonicMIDI::grid::SceneLightId>& output,
     std::size_t& count,std::string& error)
 {
     using namespace HarmonicMIDI::grid;
     if(!prepared.glass.sourceScene||!validateVisual3DScene(*prepared.glass.sourceScene).valid())
     {error="Directional source cohort has no valid immutable scene roster";return false;}
-    std::array<SceneLightId,Visual3DScene::kMaxLights> candidate{};std::size_t size=0;
+    std::vector<SceneLightId> candidate;
     const auto& scene=*prepared.glass.sourceScene;
     for(std::size_t i=0;i<scene.lightCount;++i) {
         const auto& light=scene.lights[i];
         if(light.kind==SceneLightKind::Directional&&light.spectralSource.version==1
-            &&light.spectralSource.directionalIrradiance.version==1)candidate[size++]=light.id;
+            &&light.spectralSource.directionalIrradiance.version==1)candidate.push_back(light.id);
     }
-    if(!size){error="Directional source cohort has no admitted D8 scene lights";return false;}
-    output=candidate;count=size;error.clear();return true;
+    if(candidate.empty()){error="Directional source cohort has no admitted D8 scene lights";return false;}
+    count=candidate.size();output=std::move(candidate);error.clear();return true;
 }
 inline bool validSourceSubmission(const SubmissionIdentity& submission,const Frame& frame,
     const GratingIncidentBinding* incidentBinding=nullptr)
@@ -2682,6 +2733,27 @@ inline bool checkSpectralBands(const std::vector<float>& bands,const Map& refere
             if(!(values[p]==0.0f) && !check(values[p],static_cast<const Sum*>(nullptr)))return false;
         if(p==count)break;
         if(!check(values[p],&next->second))return false;
+        ++next;++p;
+    }
+    return true;
+}
+// The same walk for the splat validator: the refusal needs the flat band index
+// of its first mismatch, from which the pixel and band decode, because
+// "radiance differs" alone cannot say which pixel the native gather left at
+// zero or wrote across.
+template<class Map,class Check>
+inline bool checkSpectralBandsIndexed(const std::vector<float>& bands,const Map& reference,const Check& check)
+{
+    using Sum=typename Map::mapped_type;
+    auto next=reference.begin();const auto end=reference.end();
+    const float* values=bands.data();const std::size_t count=bands.size();
+    std::size_t p=0;
+    while(p<count) {
+        const std::size_t stop=next==end?count:std::size_t(std::min<std::uint64_t>(next->first,count));
+        for(;p<stop;++p)
+            if(!(values[p]==0.0f) && !check(values[p],static_cast<const Sum*>(nullptr),p))return false;
+        if(p==count)break;
+        if(!check(values[p],&next->second,p))return false;
         ++next;++p;
     }
     return true;
@@ -2948,8 +3020,8 @@ inline bool buildSplatReference(const Frame& frame,const std::vector<NativeDepos
     };
     const auto charge=[&](const opaquevisibility::ClosestHit& hit) {
         ++candidate.pixelQueries;
-        if(hit.work>kMaximumSplatCpuQueryWork-candidate.queryWork)
-        {error="Glass caustic splat CPU query work exceeds its budget";return false;}
+        if(hit.work>std::numeric_limits<std::uint64_t>::max()-candidate.queryWork)
+        {error="Glass caustic splat CPU query work does not fit 64 bits: "+std::to_string(candidate.queryWork)+" plus "+std::to_string(hit.work);return false;}
         candidate.queryWork+=hit.work;return true;
     };
     std::unordered_map<std::uint64_t,Sample> samples;
@@ -3228,16 +3300,45 @@ inline bool validateSplatReadback(const Frame& frame,const NativeReadback& readb
             return refuse("Glass caustic splat native normaliser differs from the CPU reference");
     }
     // One ordered walk of reference.pixels beside the readback, as in the
-    // single-pixel check; every pixel band is still compared.
-    const auto checkBand=[&](float actual,const SplatReference::Sum* found) {
+    // single-pixel check; every pixel band is still compared. The first
+    // mismatch carries its arithmetic into the refused error: expected zero
+    // means the native gather wrote a pixel the reference claims empty, a
+    // magnitude over tolerance means the sums themselves disagree, and the
+    // schedule numbers say which keyed set produced them.
+    std::size_t bandChecks=0;
+    double firstActual=0,firstExpected=0,firstTolerance=0;std::size_t firstFlat=0;bool firstFound=false;
+    const auto checkBand=[&](float actual,const SplatReference::Sum* found,std::size_t flat) {
         const double expected=found?found->physical:0;
         const double tolerance=found?found->tolerance+5e-4*expected:0;
         if(!std::isfinite(actual) || actual<0 || actual>surfacematerial::kMaximumLinearColorComponent
             || std::abs(double(actual)-expected)>tolerance)
+        {
+            if(!firstFound)
+            {
+                firstFound=true;firstActual=actual;firstExpected=expected;firstTolerance=tolerance;firstFlat=flat;
+            }
             return refuse("Glass caustic splat native pixel radiance differs from the CPU reference");
+        }
+        ++bandChecks;
         return true;
     };
-    if(!checkSpectralBands(readback.spectralRadiance,reference.pixels,checkBand))return false;
+    if(!checkSpectralBandsIndexed(readback.spectralRadiance,reference.pixels,checkBand))
+    {
+        const auto firstPixel=firstFlat/8u;
+        error+=" (check="+std::to_string(bandChecks)
+            +" pixel="+std::to_string(firstPixel%frame.width)+","+(firstPixel/frame.width>=frame.height
+                ?std::string("?"):std::to_string(firstPixel/frame.width))
+            +" band="+std::to_string(firstFlat%8)
+            +" actual="+std::to_string(firstActual)
+            +" expected="+std::to_string(firstExpected)
+            +" tolerance="+std::to_string(firstTolerance)
+            +" keys="+std::to_string(receipt.keys.size())
+            +" padded="+std::to_string(frame.splat.paddedKeyCount)
+            +" keySlots="+std::to_string(frame.splat.keySlots)
+            +" visits="+std::to_string(frame.bounds.maximumDeposits/(frame.work.empty()?1:frame.work.size()))
+            +" paths="+std::to_string(frame.work.size())+")";
+        return false;
+    }
     error.clear();return true;
 }
 // Opt-in for a native consumer that implements the splat passes. Grating
@@ -3559,7 +3660,7 @@ inline bool referencePower(const Prepared& prepared,const Frame& frame,EnergyLed
     if(!prepared.branchPolicy) {error="Glass caustic power diagnostic requires owning admitted branch policy";return false;}
     if(!validateTables(prepared,frame,error))return false;
     if(!diagnosticQueryWorkWithinBudget(frame,std::uint64_t(frame.work.size())
-        *(2*(kMaximumInterfaces+3)+prepared.branchPolicy->description().maximumVisits),error))return false;
+        *(2*(policyInterfaces(prepared)+3)+prepared.branchPolicy->description().maximumVisits),error))return false;
     EnergyLedger candidate;
     for(const auto& work:frame.work)
     {
@@ -3600,7 +3701,7 @@ inline std::string nativeContractDefines()
         +"\n#define CAUSTIC_DEPOSIT_RECEIPT_STRIDE "+std::to_string(kDepositReceiptStride)
         +"\n#define CAUSTIC_MAX_PENDING "+std::to_string(kMaximumPendingBranches)
         +"\n#define CAUSTIC_MAX_VISITS "+std::to_string(kMaximumBranchVisits)
-        +"\n#define CAUSTIC_MAX_INTERFACES "+std::to_string(kMaximumInterfaces)
+        +"\n#define CAUSTIC_MAX_ANCESTRY_INTERFACES "+std::to_string(kMaximumAncestryInterfaces)
         +"\n#define CAUSTIC_MAX_SPLATS "+std::to_string(kMaximumSplatsPerDeposit)+"\n";
 }
 

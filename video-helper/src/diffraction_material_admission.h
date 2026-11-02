@@ -148,7 +148,8 @@ inline bool validateGeometry(const GratingGeometry& geometry, std::string& error
     {
         if (geometry.secondaryDirectionUv[0] != 0.0f
             || geometry.secondaryDirectionUv[1] != 0.0f
-            || geometry.secondaryGrooveSpacingNanometres != 0.0f)
+            || geometry.secondaryGrooveSpacingNanometres != 0.0f
+            || geometry.thirdGrooveFamily)
         {
             error = "one-dimensional diffraction material carries secondary lattice data";
             return false;
@@ -168,12 +169,12 @@ inline bool validateGeometry(const GratingGeometry& geometry, std::string& error
         + geometry.directionUv[1] * geometry.secondaryDirectionUv[1];
     if (!finite(secondaryLengthSquared)
         || std::abs(secondaryLengthSquared - 1.0f) > 0.0001f
-        || !finite(directionDot) || std::abs(directionDot) > 0.0001f
+        || !finite(directionDot) || std::abs(directionDot) > 0.9999f
         || !bounded(geometry.secondaryGrooveSpacingNanometres,
                     kMinimumGrooveSpacingNanometres,
                     kMaximumGrooveSpacingNanometres))
     {
-        error = "crossed diffraction material requires an orthonormal secondary lattice and valid period";
+        error = "crossed diffraction material requires an independent secondary lattice and valid period";
         return false;
     }
     return true;
@@ -376,7 +377,14 @@ inline bool validateRoughness(const SurfaceRoughness& roughness,
 {
     if (!bounded(roughness.rmsHeightNanometres, 0.0f,
                  kMaximumRmsHeightNanometres)
-        || !bounded(roughness.rmsSlope, 0.0f, kMaximumRmsSlope))
+        || !bounded(roughness.rmsSlope, 0.0f, kMaximumRmsSlope)
+        || !bounded(roughness.acrossGrooveSlope, 0.0f, kMaximumRmsSlope)
+        || !bounded(roughness.streakSlope, 0.0f, kMaximumStreakSlope)
+        || !bounded(roughness.streakSpacingUv, kMinimumStreakSpacingUv, kMaximumStreakSpacingUv)
+        || !bounded(roughness.reliefRmsHeightNanometres, 0.0f, kMaximumReliefRmsHeightNanometres)
+        || !bounded(roughness.reliefMinimumSpacingNanometres, kMinimumReliefSpacingNanometres, kMaximumReliefSpacingNanometres)
+        // The relief's arm is a Gaussian of 2 x rmsSlope across its axis.
+        || (roughness.reliefRmsHeightNanometres > 0.0f && !(roughness.rmsSlope > 0.0f)))
     {
         error = "diffraction material physical roughness is invalid";
         return false;
@@ -466,6 +474,11 @@ inline void canonicalize(Description& description) noexcept
     canonicalize(description.coating.opticalConstants);
     canonicalize(description.roughness.rmsHeightNanometres);
     canonicalize(description.roughness.rmsSlope);
+    canonicalize(description.roughness.acrossGrooveSlope);
+    canonicalize(description.roughness.streakSlope);
+    canonicalize(description.roughness.streakSpacingUv);
+    canonicalize(description.roughness.reliefRmsHeightNanometres);
+    canonicalize(description.roughness.reliefMinimumSpacingNanometres);
     for (auto& wavelength : description.spectrum.wavelengthsNanometres)
         canonicalize(wavelength);
 }
@@ -524,6 +537,9 @@ inline std::string structuralDigest(const Description& description)
     hashU8(hash, static_cast<std::uint8_t>(description.geometry.lattice));
     hashFloats(hash, description.geometry.secondaryDirectionUv);
     hashFloat(hash, description.geometry.secondaryGrooveSpacingNanometres);
+    // Hashed only when on, so existing materials keep their identity.
+    if (description.geometry.thirdGrooveFamily)
+        hashU8(hash, 1);
     hashU8(hash, static_cast<std::uint8_t>(description.grooveField.mode));
     hashFloats(hash, description.grooveField.originUv);
     hashFloats(hash, description.grooveField.axisUv);
@@ -536,11 +552,33 @@ inline std::string structuralDigest(const Description& description)
     hashFloat(hash, description.microstructure.dutyCycle);
     hashFloat(hash, description.microstructure.blazeAngleDegrees);
     hashOpticalConstants(hash, description.substrate);
+    // Only when set, so every digest of a material without a table stays as it was.
+    if (description.substrateData != SubstrateData::AuthoredConstants)
+        hashU8(hash, static_cast<std::uint8_t>(description.substrateData));
+    if (description.orderMedium != OrderMedium::Air)
+        hashU8(hash, static_cast<std::uint8_t>(0x10u + static_cast<unsigned>(description.orderMedium)));
+    if (description.pitStatistics != PitStatistics::None)
+        hashU8(hash, static_cast<std::uint8_t>(0x20u + static_cast<unsigned>(description.pitStatistics)));
     hashU8(hash, static_cast<std::uint8_t>(description.coating.model));
     hashFloat(hash, description.coating.thicknessNanometres);
     hashOpticalConstants(hash, description.coating.opticalConstants);
     hashFloat(hash, description.roughness.rmsHeightNanometres);
     hashFloat(hash, description.roughness.rmsSlope);
+    // Only when present, so every material without it keeps its digest.
+    if (description.roughness.acrossGrooveSlope != 0.0f)
+        hashFloat(hash, description.roughness.acrossGrooveSlope);
+    // Only when present, so every material without it keeps its digest.
+    if (description.roughness.reliefRmsHeightNanometres != 0.0f)
+    {
+        hashFloat(hash, description.roughness.reliefRmsHeightNanometres);
+        hashFloat(hash, description.roughness.reliefMinimumSpacingNanometres);
+    }
+    // Only when present, so every material without relief keeps its digest.
+    if (description.roughness.streakSlope != 0.0f)
+    {
+        hashFloat(hash, description.roughness.streakSlope);
+        hashFloat(hash, description.roughness.streakSpacingUv);
+    }
 
     hashU8(hash, static_cast<std::uint8_t>(description.spectrum.integrationModel));
     hashU8(hash, description.spectrum.wavelengthCount);
@@ -589,6 +627,31 @@ inline std::optional<AdmittedDiffractionMaterialIR> admit(
     if (!detail::validateOpticalConstants(source.substrate))
     {
         error = "diffraction material substrate optical constants are invalid";
+        return std::nullopt;
+    }
+    if (source.substrateData != SubstrateData::AuthoredConstants
+        && source.substrateData != SubstrateData::AluminiumMcPeak2015)
+    {
+        error = "diffraction material substrate data is unknown";
+        return std::nullopt;
+    }
+    if (source.orderMedium != OrderMedium::Air
+        && source.orderMedium != OrderMedium::SurroundingMedium)
+    {
+        error = "diffraction material order medium is unknown";
+        return std::nullopt;
+    }
+    if (source.pitStatistics != PitStatistics::None
+        && source.pitStatistics != PitStatistics::PressedDisc)
+    {
+        error = "diffraction material pit statistics are unknown";
+        return std::nullopt;
+    }
+    if (source.pitStatistics == PitStatistics::PressedDisc
+        && (source.geometry.lattice != GratingLattice::OneDimensional
+            || source.microstructure.profile != GrooveProfile::BinaryRectangular))
+    {
+        error = "pressed disc pit statistics require a one-dimensional binary track";
         return std::nullopt;
     }
     if (!detail::validateCoating(source.coating, error)

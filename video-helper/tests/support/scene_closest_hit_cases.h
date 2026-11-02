@@ -123,14 +123,11 @@ inline bool glassExpandedAdmission(std::string& error)
         auto& object=scene->objects[o];object.id={std::uint32_t(o)};object.material={9};
         object.firstVertex=8;object.vertexCount=3;object.firstIndex=36;object.indexCount=256*3;
     }
-    // 12 shell triangles + 31 reused 256-triangle ranges + an overlapping
-    // 244-triangle range reaches exactly 8192, despite only 268 source triangles.
-    scene->objects[32].indexCount=244*3;
+    // 12 shell triangles + 32 reused 256-triangle ranges expand to 8204 from only
+    // 268 source triangles. The expanded count no longer bounds admission.
     arbitgpu::smoothglass::Prepared prepared;
-    if(!arbitgpu::smoothglass::prepare(*scene,&volume,{},prepared,error))return false;
-    scene->objects[32].indexCount=248*3;
-    if(arbitgpu::smoothglass::prepare(*scene,&volume,{},prepared,error)||error.find("8192")==std::string::npos)
-        {error="expanded reused/overlapping glass scene exceeded admission without refusal";return false;}
+    if(!arbitgpu::smoothglass::prepare(*scene,&volume,{},prepared,error))
+        {error="expanded reused/overlapping glass scene past 8192 triangles refused: "+error;return false;}
     error.clear();return true;
 }
 inline bool run(const Execute& execute,std::string& error)
@@ -248,8 +245,9 @@ inline bool run(const Execute& execute,std::string& error)
        !arbitgpu::opaquevisibility::frame(prepared,{{identity(),0}},frame,error))return false;
     auto singular=identity();singular[0]=0;
     if(arbitgpu::opaquevisibility::frame(prepared,{{singular,0}},corrupt,error)) {error="singular scene query transform admitted";return false;}
-    if(arbitgpu::opaquevisibility::frame(prepared,std::vector<Instance>(kMaximumInstances+1,{identity(),0}),corrupt,error))
-        {error="over-budget scene query instances admitted";return false;}
+    // 8,193 instances, past the former 64 objects times 128 notes: the table grows to hold them.
+    if(!arbitgpu::opaquevisibility::frame(prepared,std::vector<Instance>(8193,{identity(),0}),corrupt,error)) return false;
+    if(corrupt.height<=frame.height) {error="scene query table did not grow with its instances";return false;}
     scene->vertices[0].position.x=std::numeric_limits<float>::quiet_NaN();
     if(prepareScene(*scene,nullptr,{},prepared,error,AdmissionMode::allSurfaces)) {error="nonfinite scene query vertex admitted";return false;}
     scene->vertices[0].position.x=-1;

@@ -15,6 +15,15 @@ shared_contract = [
     "required > maximumEvaluations",
     "maximumEvaluations == 0",
 ]
+# The third-family convolution reaches order 12, so every besselJ copy must build
+# the leading factor that far. Stopping at 8 erred by up to 0.00465 at m=12, x=4.
+for copy in ("src/diffraction_material_gl.cpp", "src/gpu_backend/backend_opengl.cpp",
+             "src/diffraction_material_metal.mm", "src/gpu_backend/backend_sokol.mm"):
+    text = (root / copy).read_text(encoding="utf-8")
+    start = text.index("float besselJ(int order, float argument)")
+    assert "factor <= 12" in text[start:text.index("float sum = term;", start)], (
+        f"{copy} besselJ stops its factor loop below order 12")
+
 for token in shared_contract:
     assert token in shared, f"shared evaluation contract lost: {token}"
 

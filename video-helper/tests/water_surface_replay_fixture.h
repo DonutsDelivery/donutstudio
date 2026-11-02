@@ -234,7 +234,7 @@ inline void waterSurfacePreparedSteps(Check check)
     check(validateWaterSurfaceGrid(capped,capGrid,error)
         && replay.prepare(history,quiet,capped,capGrid,10,error)
         && replay.stepCount()==1200 && replay.height().size()==1024 && replay.velocity().size()==1024,
-        "prepared water preserves the ten-second and 32 by 32 admission bounds");
+        "prepared water preserves the ten-second horizon at 32 by 32");
     while (!replay.complete()) if (!replay.advance(error)) break;
     check(replay.complete() && fixture::zero(replay.height()) && fixture::zero(replay.velocity()),
         "the maximal prepared quiet grid remains at rest through every bounded wave step");
@@ -381,11 +381,20 @@ inline void waterSurfaceHistoryReplay(Check check)
     invalidScore->notes.back().velocity = std::numeric_limits<float>::quiet_NaN(); badHistory.score = invalidScore;
     rejected(badHistory, op, rest, grid, dt, "whole canonical score audit rejects malformed future note outside replay window");
     auto overScore = std::make_shared<arbitmod::Score>(*history.score); overScore->notes.clear();
-    for (int i = 1; i <= 512; ++i) overScore->notes.push_back(fixture::note(i, 0));
+    // Summed velocity after one step counts the impulses that landed: bilinear
+    // deposits conserve it and the stencil moves nothing while height is at rest.
+    const auto depositedAfterOneStep = [&](const ParticleHistorySource& source) {
+        WaterSurfaceReplayState replay; double sum = 0;
+        if (replay.prepare(source, op, rest, grid, dt, error) && replay.advance(error))
+            for (const auto value : replay.velocity()) sum += value;
+        return sum;
+    };
+    overScore->notes.push_back(fixture::note(1, 0));
     badHistory = history; badHistory.score = overScore;
-    check(replayWaterSurface(badHistory, op, rest, grid, dt, before, error), "exact 512 score impulse cap replays without truncation");
-    overScore->notes.push_back(fixture::note(513, 0));
-    rejected(badHistory, op, rest, grid, dt, "513 score impulses refuse atomically before stepping");
+    const auto oneImpulse = depositedAfterOneStep(badHistory);
+    for (int i = 2; i <= 600; ++i) overScore->notes.push_back(fixture::note(i, 0));
+    check(oneImpulse > 0 && std::abs(depositedAfterOneStep(badHistory) / oneImpulse - 600) < 1e-9,
+          "600 score events in give 600 impulses out");
     op.field.values[2] = 0;
     check(replayWaterSurface(badHistory, op, rest, grid, dt, before, error) && fixture::zero(before), "disabled score gain does not request unnecessary impulse work");
     op.field.values[3] = 1;
@@ -419,14 +428,15 @@ inline void waterSurfaceHistoryReplay(Check check)
     auto dense = fixture::audio(514);
     for (std::size_t i = 0; i < 513; ++i) { dense[i].onset = 1; dense[i].onsetAge = 0; }
     badHistory.audioFrames = &dense; badHistory.audioSampleRate = 61440;
-    rejected(badHistory, op, rest, grid, 514 * dt, "513 audio impulses refuse rather than truncating history");
+    check(replayWaterSurface(badHistory, op, rest, grid, 514 * dt, before, error), "513 audio impulses replay without truncating history");
     auto combinedScore = std::make_shared<arbitmod::Score>(*history.score); combinedScore->notes.clear();
     for (int i = 1; i <= 512; ++i) combinedScore->notes.push_back(fixture::note(i, 0));
     badHistory.score = combinedScore; badHistory.audioFrames = &frames; op.field.values[2] = 1;
-    rejected(badHistory, op, rest, grid, 2 * dt, "score and master onset share the same 512 impulse budget");
+    check(replayWaterSurface(badHistory, op, rest, grid, 2 * dt, before, error), "512 score and one master onset replay together");
     op = fixture::operation(30, 0, 0, 0);
     check(replayWaterSurface(history, op, rest, grid, 10, before, error) && fixture::zero(before), "exact replay horizon returns rest with disabled sources");
-    rejected(history, op, rest, grid, 10.001, "time beyond ten seconds refuses without silently dropping older waves");
+    check(replayWaterSurface(history, op, rest, grid, 10.001, before, error) && fixture::zero(before), "time beyond ten seconds replays");
+    rejected(history, op, rest, grid, 1e300, "time beyond the tick clock refuses atomically");
     rejected(history, op, rest, grid, -dt, "negative project time refuses atomically");
     rejected(history, op, rest, grid, std::numeric_limits<double>::quiet_NaN(), "nonfinite project time refuses atomically");
     auto invalid = op; invalid.field.values[0] = 100;
@@ -447,9 +457,14 @@ inline void waterSurfaceHistoryReplay(Check check)
     WaterSurfaceGrid capGrid;
     check(validateWaterSurfaceGrid(capped, capGrid, error)
           && replayWaterSurface(history, op, capped, capGrid, 10, before, error)
-          && before.size() == 1024 && fixture::zero(before), "exact 32 by 32 vertex cap replays the full supported horizon");
-    const auto oversized = fixture::mesh(33, 2);
-    rejected(history, op, oversized, grid, dt, "over-cap water axis refuses atomically");
+          && before.size() == 1024 && fixture::zero(before), "32 by 32 grid replays the full supported horizon");
+    const auto ocean = fixture::mesh(256, 256);
+    WaterSurfaceGrid oceanGrid;
+    check(validateWaterSurfaceGrid(ocean, oceanGrid, error)
+          && replayWaterSurface(history, op, ocean, oceanGrid, dt, before, error)
+          && before.size() == 65536, "256 by 256 water grid replays through the admission path");
+    const auto oversized = fixture::mesh(700, 700);
+    rejected(history, op, oversized, grid, dt, "over-budget water grid refuses atomically");
     check(std::all_of(repeat.begin(), repeat.end(), [](double value) { return std::isfinite(value); }), "published water offsets remain finite");
 }
 

@@ -1003,6 +1003,28 @@ void determinismTests()
 
 void nonFiniteTests()
 {
+    // White at the largest float sums past a float in the mean, and is still a sampled light.
+    {
+        const float top = std::numeric_limits<float>::max();
+        pt::RenderScene brightest;
+        pt::Material emitter;
+        emitter.emission = { top, top, top };
+        brightest.materials = { emitter, pt::Material {} };
+        appendMesh (brightest, quad ({ 0.0f, 0.0f, 0.0f }, { 0.5f, 0.0f, 0.0f }, { 0.0f, 0.5f, 0.0f }), 0);
+        appendMesh (brightest, quad ({ -2.0f, -2.0f, -1.0f }, { 4.0f, 0.0f, 0.0f }, { 0.0f, 4.0f, 0.0f }), 1);
+        brightest.commit();
+        check (brightest.lights.stats().invalidLights == 0 && brightest.lights.stats().zeroPowerLights == 0
+                   && brightest.lights.stats().emissiveTriangles > 0,
+               "an emitter at the largest float stays a light");
+
+        // A surface it lights overflows a float in the estimate: that holds the largest float, not a dropped sample.
+        const pt::PinholeCamera view = makeCamera ({ 0.0f, 0.0f, 3.0f }, pt::Quat {}, 0.8f, 4, 4);
+        pt::PathTracer brightTracer (2);
+        const pt::CancellationToken go {};
+        const pt::RenderStats lit = brightTracer.renderFixed (brightest, view, 4, 4, 1, 1, go);
+        check (lit.nonFiniteSamples == 0, "light past a float saturates instead of dropping samples");
+    }
+
     pt::RenderScene scene;
     pt::Material broken;
     broken.emission = { std::numeric_limits<float>::infinity(), 1.0f, 1.0f };

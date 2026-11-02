@@ -298,8 +298,8 @@ int main()
     check(rejected(badSchema), "unknown schema versions are rejected");
 
     AdmissionLimits invalidLimits;
-    invalidLimits.maxDepth = 65;
-    check(rejected(completeFixture(), invalidLimits), "admission limits have absolute ceilings");
+    invalidLimits.maxDepth = 0;
+    check(rejected(completeFixture(), invalidLimits), "a zero depth limit is invalid");
 
     if (reorderedAdmission)
         std::cout << "fixture digest: " << reorderedAdmission->structuralDigest() << '\n';

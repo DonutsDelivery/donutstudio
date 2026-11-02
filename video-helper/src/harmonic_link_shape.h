@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace videohelper::harmonicgeometry
 {
@@ -59,6 +60,63 @@ inline void appendPrismSides(videowire::geometry::GeometryData& mesh, std::uint3
         const auto endI = first + 4 + i, endJ = first + 4 + j;
         mesh.indices.insert(mesh.indices.end(), { startI, startJ, endI, startJ, endJ, endI });
     }
+}
+
+struct LinkSample final
+{
+    LinkPoint center;
+    LinkPoint width;
+};
+
+// One point along a link's polyline, with the width vector normal to it there.
+inline LinkSample linkSample(visualharmonicgeometry::LinkShape shape, std::uint32_t curvaturePercent,
+                             std::uint32_t coilCount, std::size_t count, std::size_t sample,
+                             LinkPoint start, LinkPoint end, LinkPoint side)
+{
+    using visualharmonicgeometry::LinkShape;
+    const LinkPoint axisVector { end.x - start.x, end.y - start.y, end.z - start.z };
+    const auto length = lengthOf(axisVector);
+    const auto axis = scalePoint(axisVector, 1.0f / length);
+    const auto halfWidth = lengthOf(side);
+    const auto sideUnit = scalePoint(side, 1.0f / halfWidth);
+    const auto curvature = static_cast<float>(curvaturePercent) / 100.0f;
+    const auto bow = curvature * 0.5f * length;
+    const auto coils = static_cast<float>(coilCount);
+    const auto helixAcross = crossPoint(axis, sideUnit);
+    const auto radius = length * 0.1f + halfWidth;
+    const auto t = static_cast<float>(sample) / static_cast<float>(count);
+    // The ribbon endpoints are exact link endpoints for every shape.
+    const auto straight = addPoint(start, scalePoint(axisVector, t));
+    LinkPoint center = sample == 0 ? start : (sample == count ? end : straight);
+    LinkPoint width = side;
+    if (shape == LinkShape::curve)
+    {
+        // Arc bowed along the side direction. The width stays normal to the tangent in that plane.
+        const auto phase = kLinkPi * t;
+        if (sample != 0 && sample != count)
+            center = offsetPoint(straight, sideUnit, bow * std::sin(phase));
+        const auto normal = addPoint(scalePoint(sideUnit, length),
+            scalePoint(axis, -bow * kLinkPi * std::cos(phase)));
+        width = scalePoint(normal, halfWidth / lengthOf(normal));
+    }
+    else if (shape == LinkShape::spring)
+    {
+        // Helix ribbon. The radial width is perpendicular to the helix tangent.
+        const auto theta = 2.0f * kLinkPi * coils * t;
+        const auto radial = addPoint(scalePoint(sideUnit, std::cos(theta)),
+                                     scalePoint(helixAcross, std::sin(theta)));
+        const auto offset = addPoint(radial, scalePoint(sideUnit, -1.0f));
+        if (sample != 0 && sample != count)
+            center = offsetPoint(straight, scalePoint(offset, radius), 1.0f);
+        width = scalePoint(radial, halfWidth);
+    }
+    return { center, width };
+}
+
+inline LinkPoint unitOr(LinkPoint point, LinkPoint fallback) noexcept
+{
+    const auto length = lengthOf(point);
+    return length > 0.0f ? scalePoint(point, 1.0f / length) : fallback;
 }
 } // namespace detail
 
@@ -128,46 +186,10 @@ inline void appendLinkShape(videowire::geometry::GeometryData& mesh,
         // vector, and each segment is two triangles with the ribbon's winding.
         const auto count = visualharmonicgeometry::polylineSegments(shape, effective.coils,
                                                                     effective.segments);
-        const auto count32 = static_cast<float>(count);
-        const LinkPoint axisVector { end.x - start.x, end.y - start.y, end.z - start.z };
-        const auto length = detail::lengthOf(axisVector);
-        const auto axis = detail::scalePoint(axisVector, 1.0f / length);
-        const auto halfWidth = detail::lengthOf(side);
-        const auto sideUnit = detail::scalePoint(side, 1.0f / halfWidth);
-        const auto curvature = static_cast<float>(curvaturePercent) / 100.0f;
-        const auto bow = curvature * 0.5f * length;
-        const auto coils = static_cast<float>(effective.coils);
-        const auto helixAcross = detail::crossPoint(axis, sideUnit);
-        const auto radius = length * 0.1f + halfWidth;
         for (std::size_t sample = 0; sample <= count; ++sample)
         {
-            const auto t = static_cast<float>(sample) / count32;
-            // The ribbon endpoints are exact link endpoints for every shape.
-            const auto straight = detail::addPoint(start, detail::scalePoint(axisVector, t));
-            LinkPoint center = sample == 0 ? start : (sample == count ? end : straight);
-            LinkPoint width = side;
-            if (shape == LinkShape::curve)
-            {
-                // Arc bowed along the side direction. The width stays normal to the tangent in that plane.
-                const auto phase = detail::kLinkPi * t;
-                if (sample != 0 && sample != count)
-                    center = detail::offsetPoint(straight, sideUnit, bow * std::sin(phase));
-                const auto normal = detail::addPoint(detail::scalePoint(sideUnit, length),
-                    detail::scalePoint(axis, -bow * detail::kLinkPi * std::cos(phase)));
-                width = detail::scalePoint(normal, halfWidth / detail::lengthOf(normal));
-            }
-            else if (shape == LinkShape::spring)
-            {
-                // Helix ribbon. The radial width is perpendicular to the helix tangent.
-                const auto theta = 2.0f * detail::kLinkPi * coils * t;
-                const auto radial = detail::addPoint(
-                    detail::scalePoint(sideUnit, std::cos(theta)),
-                    detail::scalePoint(helixAcross, std::sin(theta)));
-                const auto offset = detail::addPoint(radial, detail::scalePoint(sideUnit, -1.0f));
-                if (sample != 0 && sample != count)
-                    center = detail::offsetPoint(straight, detail::scalePoint(offset, radius), 1.0f);
-                width = detail::scalePoint(radial, halfWidth);
-            }
+            const auto [center, width] = detail::linkSample(shape, curvaturePercent, effective.coils,
+                                                            count, sample, start, end, side);
             mesh.positions.push_back(detail::offsetPoint(center, width, -1.0f));
             mesh.positions.push_back(detail::offsetPoint(center, width, 1.0f));
         }
@@ -182,5 +204,90 @@ inline void appendLinkShape(videowire::geometry::GeometryData& mesh,
         break;
     }
     }
+}
+// Sides of a link's round section in a retained scene.
+inline constexpr std::size_t kLinkTubeSides = 16;
+
+// Vertices and triangles of one round link: a ring per polyline sample, plus an end cap of a
+// ring and a centre at each end. The caps have their own rings so their edge stays sharp.
+inline visualharmonicgeometry::LinkLayout linkTubeLayout(visualharmonicgeometry::LinkShape shape,
+                                                         const visualharmonicgeometry::LinkDetail& detail) noexcept
+{
+    const auto count = visualharmonicgeometry::polylineSegments(shape, detail.coils, detail.segments);
+    return { kLinkTubeSides * (count + 1) + 2 * (kLinkTubeSides + 1),
+             2 * kLinkTubeSides * count + 2 * kLinkTubeSides };
+}
+
+// Appends one link as a closed round tube along the shape's polyline, with the radius of the
+// half width in side. A strut is a thin tube with full-width discs at its ends.
+inline void appendLinkTube(videowire::geometry::GeometryData& mesh,
+                           visualharmonicgeometry::LinkShape shape,
+                           std::uint32_t curvaturePercent,
+                           const visualharmonicgeometry::LinkDetail& effective,
+                           LinkPoint start, LinkPoint end, LinkPoint side)
+{
+    using visualharmonicgeometry::LinkShape;
+    const auto count = visualharmonicgeometry::polylineSegments(shape, effective.coils, effective.segments);
+    const auto radius = detail::lengthOf(side);
+    const auto tubeRadius = shape == LinkShape::strut ? radius * 0.5f : radius;
+    std::vector<LinkPoint> centers;
+    centers.reserve(count + 1);
+    for (std::size_t sample = 0; sample <= count; ++sample)
+        centers.push_back(detail::linkSample(shape, curvaturePercent, effective.coils, count, sample,
+                                             start, end, side).center);
+    const auto first = static_cast<std::uint32_t>(mesh.positions.size());
+    const auto sides = static_cast<std::uint32_t>(kLinkTubeSides);
+    const auto appendRing = [&mesh](LinkPoint center, LinkPoint u, LinkPoint v, float ringRadius)
+    {
+        for (std::size_t corner = 0; corner < kLinkTubeSides; ++corner)
+        {
+            const auto angle = 2.0f * detail::kLinkPi * static_cast<float>(corner)
+                / static_cast<float>(kLinkTubeSides);
+            mesh.positions.push_back(detail::addPoint(center, detail::addPoint(
+                detail::scalePoint(u, ringRadius * std::cos(angle)),
+                detail::scalePoint(v, ringRadius * std::sin(angle)))));
+        }
+    };
+    // The section is carried along the polyline, so the tube doesn't twist between samples.
+    const auto tangentAt = [&](std::size_t sample)
+    {
+        const auto& from = centers[sample == 0 ? 0 : sample - 1];
+        const auto& to = centers[std::min(sample + 1, count)];
+        return detail::unitOr({ to.x - from.x, to.y - from.y, to.z - from.z }, { 0.0f, 0.0f, 1.0f });
+    };
+    auto u = detail::scalePoint(side, 1.0f / radius);
+    LinkPoint firstU {}, firstV {}, lastU {}, lastV {};
+    for (std::size_t sample = 0; sample <= count; ++sample)
+    {
+        const auto tangent = tangentAt(sample);
+        const auto along = u.x * tangent.x + u.y * tangent.y + u.z * tangent.z;
+        u = detail::unitOr(detail::offsetPoint(u, tangent, -along), u);
+        const auto v = detail::crossPoint(tangent, u);
+        appendRing(centers[sample], u, v, tubeRadius);
+        if (sample == 0) { firstU = u; firstV = v; }
+        lastU = u; lastV = v;
+    }
+    for (std::uint32_t segment = 0; segment < count; ++segment)
+        for (std::uint32_t corner = 0; corner < sides; ++corner)
+        {
+            const auto next = (corner + 1) % sides;
+            const auto a = first + segment * sides + corner, b = first + segment * sides + next;
+            const auto c = a + sides, d = b + sides;
+            mesh.indices.insert(mesh.indices.end(), { a, b, c, b, d, c });
+        }
+    const auto appendCap = [&](LinkPoint center, LinkPoint capU, LinkPoint capV, bool facesForward)
+    {
+        const auto ring = static_cast<std::uint32_t>(mesh.positions.size());
+        appendRing(center, capU, capV, radius);
+        const auto middle = static_cast<std::uint32_t>(mesh.positions.size());
+        mesh.positions.push_back(center);
+        for (std::uint32_t corner = 0; corner < sides; ++corner)
+        {
+            const auto here = ring + corner, next = ring + (corner + 1) % sides;
+            mesh.indices.insert(mesh.indices.end(), { middle, facesForward ? here : next, facesForward ? next : here });
+        }
+    };
+    appendCap(centers.front(), firstU, firstV, false);
+    appendCap(centers.back(), lastU, lastV, true);
 }
 } // namespace videohelper::harmonicgeometry

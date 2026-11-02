@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -34,10 +35,11 @@ struct PbrField final
 // PBR scene records admit only opacity one, so this table omits opacity. The limit
 // applies to PBR scene records only. Surface constants offer opacity on thin-surface
 // programs.
+inline constexpr double kMaximumEmission = std::numeric_limits<float>::max();
 inline constexpr std::array<PbrField, 8> kPbrFields {{
     { "baseRed", 64.0 }, { "baseGreen", 64.0 }, { "baseBlue", 64.0 },
     { "metallic", 1.0 }, { "roughness", 1.0 },
-    { "emissiveRed", 64.0 }, { "emissiveGreen", 64.0 }, { "emissiveBlue", 64.0 }
+    { "emissiveRed", kMaximumEmission }, { "emissiveGreen", kMaximumEmission }, { "emissiveBlue", kMaximumEmission }
 }};
 inline constexpr const char* kMaximumDisplacement = "maximumDisplacement";
 inline constexpr double kMinimumDisplacementBound = 0.000001;

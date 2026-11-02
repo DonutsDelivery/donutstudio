@@ -151,7 +151,8 @@ class StaticLocalObjectWorldSourceContractTests(unittest.TestCase):
             "request.objectLocalTransform.version != 1",
             "request.deformation || request.parentIntent",
             "request.runtimeInputs.noteInstanceMapping",
-            "request.glassCaustic || request.diffractionMaterial",
+            "request.glassCaustic && request.renderEngine != visualimportedscenerender::RenderEngine::Realtime",
+            "|| request.diffractionMaterial)\n        return \"Static local object transforms do not yet admit glass caustics",
         ):
             self.assertIn(gate, self.payload)
 

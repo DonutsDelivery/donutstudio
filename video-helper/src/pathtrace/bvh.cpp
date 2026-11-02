@@ -357,31 +357,6 @@ bool intersectTriangle (const PreparedRay& ray, Vec3 p0, Vec3 p1, Vec3 p2,
     return true;
 }
 
-Vec3 offsetRayOrigin (Vec3 p, Vec3 n) noexcept
-{
-    // Near the origin a fixed float step; elsewhere an integer step in the
-    // float's bit pattern, which scales with the exponent.
-    constexpr float originRegion = 1.0f / 32.0f;
-    constexpr float floatStep = 1.0f / 65536.0f;
-    constexpr float intStep = 256.0f;
-    Vec3 out;
-    for (int axis = 0; axis < 3; ++axis)
-    {
-        const float pc = p[axis];
-        const float nc = n[axis];
-        if (std::fabs (pc) < originRegion)
-        {
-            out[axis] = pc + floatStep * nc;
-            continue;
-        }
-        const auto steps = static_cast<std::int32_t> (intStep * nc);
-        const auto bits = static_cast<std::int32_t> (floatBits (pc));
-        const std::int32_t moved = bits + (pc < 0.0f ? -steps : steps);
-        out[axis] = bitsToFloat (static_cast<std::uint32_t> (moved));
-    }
-    return out;
-}
-
 void Bvh::build (const std::vector<Vec3>& positions, const BvhBuildOptions& options)
 {
     build (positions.data(), positions.size() / 3, options);

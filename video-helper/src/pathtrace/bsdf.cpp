@@ -16,45 +16,46 @@ constexpr float kTwoPi = 6.28318530717958647692f;
 // Below this Fresnel reflectance a smooth dielectric never samples reflection.
 constexpr float kMinSampledFresnel = 1.0e-12f;
 
-float clampUnit (float x) noexcept
+PT_SHARED_ENTRY float clampUnit (float x) noexcept
 {
     return std::isfinite (x) ? std::min (1.0f, std::max (0.0f, x)) : 0.0f;
 }
 
-Vec3 clampUnit (Vec3 v) noexcept
+PT_SHARED_ENTRY Vec3 clampUnit (Vec3 v) noexcept
 {
     return { clampUnit (v.x), clampUnit (v.y), clampUnit (v.z) };
 }
 
-float average (Vec3 v) noexcept
+PT_SHARED_ENTRY float average (Vec3 v) noexcept
 {
     return (v.x + v.y + v.z) * (1.0f / 3.0f);
 }
 
-bool finitePositive (float x) noexcept
+PT_SHARED_ENTRY bool finitePositive (float x) noexcept
 {
     return std::isfinite (x) && x > 0.0f;
 }
 
-float pow5 (float x) noexcept
+PT_SHARED_ENTRY float pow5 (float x) noexcept
 {
     const float x2 = x * x;
     return x2 * x2 * x;
 }
 
 // GGX normal distribution for a unit half vector in the local frame.
-float ggxD (Vec3 h, float alpha) noexcept
+PT_SHARED_ENTRY float ggxD (Vec3 h, float alpha) noexcept
 {
     if (h.z <= 0.0f)
         return 0.0f;
     const float a2 = alpha * alpha;
-    const float c2 = h.z * h.z;
-    const float d = c2 * (a2 - 1.0f) + 1.0f;
+    // sin^2 + a2 cos^2, from h's tangent part. The usual cos^2 (a2 - 1) + 1 cancels
+    // near the peak, and at alpha under 1.7e-4 a2 - 1 rounds to -1 and D to infinity.
+    const float d = h.x * h.x + h.y * h.y + a2 * h.z * h.z;
     return a2 / (kPi * d * d);
 }
 
 // Smith Lambda of GGX. Grazing directions give infinity, so G becomes 0.
-float smithLambda (float cosTheta, float alpha) noexcept
+PT_SHARED_ENTRY float smithLambda (float cosTheta, float alpha) noexcept
 {
     const float c2 = cosTheta * cosTheta;
     if (! (c2 > 0.0f))
@@ -65,7 +66,7 @@ float smithLambda (float cosTheta, float alpha) noexcept
 
 // Visible-normal sample around wo (wo.z > 0) by the projected-hemisphere
 // construction of Heitz 2018. The result is a unit microfacet normal with z > 0.
-Vec3 sampleVisibleNormal (Vec3 wo, float alpha, Vec2 u) noexcept
+PT_SHARED_ENTRY Vec3 sampleVisibleNormal (Vec3 wo, float alpha, Vec2 u) noexcept
 {
     const Vec3 stretched = normalizeOrZero ({ alpha * wo.x, alpha * wo.y, wo.z });
     const float planar = stretched.x * stretched.x + stretched.y * stretched.y;
@@ -83,14 +84,14 @@ Vec3 sampleVisibleNormal (Vec3 wo, float alpha, Vec2 u) noexcept
     return normalizeOrZero ({ alpha * onHemisphere.x, alpha * onHemisphere.y, std::max (1.0e-6f, onHemisphere.z) });
 }
 
-Vec3 reflectAbout (Vec3 wo, Vec3 h) noexcept
+PT_SHARED_ENTRY Vec3 reflectAbout (Vec3 wo, Vec3 h) noexcept
 {
     return h * (2.0f * dot (wo, h)) - wo;
 }
 
 // Refracts wo (pointing away, dot(wo, n) > 0) through a surface with normal n.
 // eta is the far index over the near index. False on total internal reflection.
-bool refractThrough (Vec3 wo, Vec3 n, float eta, Vec3& wt) noexcept
+PT_SHARED_ENTRY bool refractThrough (Vec3 wo, Vec3 n, float eta, Vec3& wt) noexcept
 {
     const float cosI = dot (wo, n);
     const float sin2T = std::max (0.0f, 1.0f - cosI * cosI) / (eta * eta);
@@ -103,7 +104,7 @@ bool refractThrough (Vec3 wo, Vec3 n, float eta, Vec3& wt) noexcept
 
 // Cosine-weighted hemisphere through the concentric disk mapping
 // (Shirley and Chiu, "A Low Distortion Map Between Disk and Square", 1997).
-Vec3 cosineHemisphere (Vec2 u) noexcept
+PT_SHARED_ENTRY Vec3 cosineHemisphere (Vec2 u) noexcept
 {
     const float ox = 2.0f * u.x - 1.0f;
     const float oy = 2.0f * u.y - 1.0f;
@@ -126,13 +127,39 @@ Vec3 cosineHemisphere (Vec2 u) noexcept
     return { x, y, std::sqrt (std::max (0.0f, 1.0f - x * x - y * y)) };
 }
 
+constexpr int kGgxTableSize = 32;
+
+// Bilinear in (sqrt(alpha), cosO) over two kGgxTableSize^2 tables.
+PT_SHARED_ENTRY void ggxAlbedoLookup (const float* scaleTable, const float* biasTable, float cosO, float alpha, float& scale,
+                      float& bias) noexcept
+{
+    const float r = std::sqrt (clampUnit (alpha));
+    const float fr = r * static_cast<float> (kGgxTableSize - 1);
+    const float fc = clampUnit (cosO) * static_cast<float> (kGgxTableSize - 1);
+    const int r0 = std::min (static_cast<int> (fr), kGgxTableSize - 2);
+    const int c0 = std::min (static_cast<int> (fc), kGgxTableSize - 2);
+    const float tr = fr - static_cast<float> (r0);
+    const float tc = fc - static_cast<float> (c0);
+    const auto at = [] (const float* table, int row, int column) {
+        return table[static_cast<std::size_t> (row * kGgxTableSize + column)];
+    };
+    const auto bilinear = [&] (const float* table) {
+        const float top = at (table, r0, c0) * (1.0f - tc) + at (table, r0, c0 + 1) * tc;
+        const float bottom = at (table, r0 + 1, c0) * (1.0f - tc) + at (table, r0 + 1, c0 + 1) * tc;
+        return top * (1.0f - tr) + bottom * tr;
+    };
+    scale = bilinear (scaleTable);
+    bias = bilinear (biasTable);
+}
+
+#if ! defined(__CUDACC__)
 // Directional albedo table of the single-scatter GGX reflection lobe, split in
 // the Fresnel-independent scale and bias terms. Rows are perceptual roughness
 // in [0, 1] (alpha = max(r^2, the opaque floor)), columns cos(theta_o) in [0, 1].
 class GgxAlbedoTable
 {
 public:
-    static constexpr int kSize = 32;
+    static constexpr int kSize = kGgxTableSize;
     static constexpr int kSamples = 1024;
 
     GgxAlbedoTable() noexcept
@@ -173,26 +200,8 @@ public:
         }
     }
 
-    void lookup (float cosO, float alpha, float& scale, float& bias) const noexcept
-    {
-        const float r = std::sqrt (clampUnit (alpha));
-        const float fr = r * static_cast<float> (kSize - 1);
-        const float fc = clampUnit (cosO) * static_cast<float> (kSize - 1);
-        const int r0 = std::min (static_cast<int> (fr), kSize - 2);
-        const int c0 = std::min (static_cast<int> (fc), kSize - 2);
-        const float tr = fr - static_cast<float> (r0);
-        const float tc = fc - static_cast<float> (c0);
-        const auto at = [] (const std::array<float, kSize * kSize>& table, int row, int column) {
-            return table[static_cast<std::size_t> (row * kSize + column)];
-        };
-        const auto bilinear = [&] (const std::array<float, kSize * kSize>& table) {
-            const float top = at (table, r0, c0) * (1.0f - tc) + at (table, r0, c0 + 1) * tc;
-            const float bottom = at (table, r0 + 1, c0) * (1.0f - tc) + at (table, r0 + 1, c0 + 1) * tc;
-            return top * (1.0f - tr) + bottom * tr;
-        };
-        scale = bilinear (scale_);
-        bias = bilinear (bias_);
-    }
+    const float* scale() const noexcept { return scale_.data(); }
+    const float* bias() const noexcept { return bias_.data(); }
 
 private:
     std::array<float, kSize * kSize> scale_ {};
@@ -204,19 +213,20 @@ const GgxAlbedoTable& ggxAlbedoTable() noexcept
     static const GgxAlbedoTable table;
     return table;
 }
+#endif
 
 template <class Color>
-constexpr int channelCount() noexcept;
+PT_SHARED_ENTRY constexpr int channelCount() noexcept;
 template <>
-constexpr int channelCount<Vec3>() noexcept { return 3; }
+PT_SHARED_ENTRY constexpr int channelCount<Vec3>() noexcept { return 3; }
 template <>
-constexpr int channelCount<Spectrum>() noexcept { return kSpectrumChannels; }
+PT_SHARED_ENTRY constexpr int channelCount<Spectrum>() noexcept { return kSpectrumChannels; }
 
-bool finiteColor (const Vec3& c) noexcept { return isFinite (c); }
-bool finiteColor (const Spectrum& c) noexcept { return c.finite(); }
+PT_SHARED_ENTRY bool finiteColor (const Vec3& c) noexcept { return isFinite (c); }
+PT_SHARED_ENTRY bool finiteColor (const Spectrum& c) noexcept { return c.finite(); }
 
 template <class Color>
-Color schlickColor (const Color& f0, float cosine) noexcept
+PT_SHARED_ENTRY Color schlickColor (const Color& f0, float cosine) noexcept
 {
     const float s = pow5 (clampUnit (1.0f - cosine));
     Color out = f0;
@@ -226,25 +236,24 @@ Color schlickColor (const Color& f0, float cosine) noexcept
 }
 
 template <class Color>
-Color uniformColor (float x) noexcept;
+PT_SHARED_ENTRY Color uniformColor (float x) noexcept;
 template <>
-Vec3 uniformColor<Vec3> (float x) noexcept { return { x, x, x }; }
+PT_SHARED_ENTRY Vec3 uniformColor<Vec3> (float x) noexcept { return { x, x, x }; }
 template <>
-Spectrum uniformColor<Spectrum> (float x) noexcept { return Spectrum::constant (x); }
+PT_SHARED_ENTRY Spectrum uniformColor<Spectrum> (float x) noexcept { return Spectrum::constant (x); }
 
 // Keeps a ratio of indices finite, inside [1/3, 3], and away from exactly 1
 // where the rough transmission half vector degenerates.
-float sanitizeEta (float eta, bool rough) noexcept
+PT_SHARED_ENTRY float sanitizeEta (float eta, bool rough) noexcept
 {
     if (! std::isfinite (eta) || ! (eta > 0.0f))
         return 1.5f;
-    eta = std::min (3.0f, std::max (1.0f / 3.0f, eta));
     if (rough && std::fabs (eta - 1.0f) < 1.0e-4f)
         eta = eta >= 1.0f ? 1.0f + 1.0e-4f : 1.0f - 1.0e-4f;
     return eta;
 }
 
-std::uint32_t lobeKindFlags (LobeKind kind) noexcept
+PT_SHARED_ENTRY std::uint32_t lobeKindFlags (LobeKind kind) noexcept
 {
     switch (kind)
     {
@@ -262,7 +271,7 @@ std::uint32_t lobeKindFlags (LobeKind kind) noexcept
 }
 
 template <class Color>
-BasicBsdfEval<Color> evalLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, Vec3 wi) noexcept
+PT_SHARED_ENTRY BasicBsdfEval<Color> evalLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, Vec3 wi) noexcept
 {
     BasicBsdfEval<Color> out;
     if (! (wo.z > 0.0f))
@@ -345,7 +354,7 @@ BasicBsdfEval<Color> evalLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, Vec3 w
 }
 
 template <class Color>
-bool sampleLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, float uChoice, Vec2 u, BasicBsdfSample<Color>& out) noexcept
+PT_SHARED_ENTRY bool sampleLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, float uChoice, Vec2 u, BasicBsdfSample<Color>& out) noexcept
 {
     out = {};
     if (! (wo.z > 0.0f))
@@ -479,7 +488,7 @@ bool sampleLobeImpl (const BasicLobe<Color>& lobe, Vec3 wo, float uChoice, Vec2 
 }
 
 template <class Color, class ToColor>
-void buildBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal, Vec3 wo,
+PT_SHARED_ENTRY void buildBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal, Vec3 wo,
                 const DielectricSetup& setup, const ToColor& toColor, BasicBsdf<Color>& out) noexcept
 {
     out.reset (shadingNormal, geometricNormal);
@@ -489,7 +498,7 @@ void buildBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNorm
     const float roughness = clampUnit (material.roughness);
     const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
     const float cosO = clampUnit (dot (shadingNormal, wo));
-    const float opaqueAlpha = std::max (roughness * roughness, kMinOpaqueGgxAlpha);
+    const float opaqueAlpha = std::max (roughness * roughness, float (kMinOpaqueGgxAlpha));
     const float glassWeight = dielectricWeight (material);
     const float transmission = clampUnit (material.transmission);
 
@@ -524,7 +533,7 @@ void buildBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNorm
         const float alpha = roughness * roughness;
         const bool rough = alpha >= kSmoothDielectricAlpha;
         glass.kind = rough ? LobeKind::RoughDielectric : LobeKind::SmoothDielectric;
-        glass.alpha = std::max (alpha, kSmoothDielectricAlpha);
+        glass.alpha = std::max (alpha, float (kSmoothDielectricAlpha));
         glass.eta = sanitizeEta (setup.eta[0], rough);
         if (setup.dispersive)
         {
@@ -580,7 +589,7 @@ void buildBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNorm
 }
 
 // Reflectance spectrum of an RGB colour clamped to [0, 1].
-Spectrum reflectanceSpectrum (Vec3 rgb, const Wavelengths& wavelengths) noexcept
+PT_SHARED_ENTRY Spectrum reflectanceSpectrum (Vec3 rgb, const Wavelengths& wavelengths) noexcept
 {
     Spectrum s = upsampleRgb (clampUnit (rgb), wavelengths);
     for (float& x : s.v)
@@ -590,7 +599,7 @@ Spectrum reflectanceSpectrum (Vec3 rgb, const Wavelengths& wavelengths) noexcept
 
 } // namespace
 
-float materialCoverage (const Material& material) noexcept
+PT_SHARED_ENTRY float materialCoverage (const Material& material) noexcept
 {
     switch (material.alphaMode)
     {
@@ -604,45 +613,45 @@ float materialCoverage (const Material& material) noexcept
     return 1.0f;
 }
 
-float dielectricWeight (const Material& material) noexcept
+PT_SHARED_ENTRY float dielectricWeight (const Material& material) noexcept
 {
     return (1.0f - clampUnit (material.metallic)) * clampUnit (material.transmission);
 }
 
-bool isMediumBoundary (const Material& material) noexcept
+PT_SHARED_ENTRY bool isMediumBoundary (const Material& material) noexcept
 {
     return dielectricWeight (material) > 0.0f && material.transport != DielectricTransport::ThinSheet;
 }
 
-bool isThinSheet (const Material& material) noexcept
+PT_SHARED_ENTRY bool isThinSheet (const Material& material) noexcept
 {
     return dielectricWeight (material) > 0.0f && material.transport == DielectricTransport::ThinSheet;
 }
 
-float materialCauchyB (const Material& material) noexcept
+PT_SHARED_ENTRY float materialCauchyB (const Material& material) noexcept
 {
-    // The surface material IR admits B in [0, 0.02]; allow some headroom.
+    // Any finite nonnegative B renders as authored, like the admission's.
     if (std::isfinite (material.dispersion) && material.dispersion != 0.0f)
-        return std::min (0.05f, std::max (0.0f, material.dispersion));
+        return std::max (0.0f, material.dispersion);
     const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
-    return std::min (0.05f, cauchyBFromAbbe (ior, material.abbe));
+    return cauchyBFromAbbe (ior, material.abbe);
 }
 
-bool materialDispersive (const Material& material) noexcept
+PT_SHARED_ENTRY bool materialDispersive (const Material& material) noexcept
 {
     return isMediumBoundary (material) && materialCauchyB (material) > 0.0f;
 }
 
-float materialIorAt (const Material& material, float nm, bool spectral) noexcept
+PT_SHARED_ENTRY float materialIorAt (const Material& material, float nm, bool spectral) noexcept
 {
     const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
     if (! spectral)
         return ior;
     const float n = cauchyIor (ior, materialCauchyB (material), nm);
-    return std::isfinite (n) ? std::min (3.0f, std::max (1.0f, n)) : ior;
+    return std::isfinite (n) ? std::max (1.0f, n) : ior;
 }
 
-Spectrum mediumAbsorption (const Material& material, const Wavelengths& wavelengths) noexcept
+PT_SHARED_ENTRY Spectrum mediumAbsorption (const Material& material, const Wavelengths& wavelengths) noexcept
 {
     Spectrum sigma;
     if (! isMediumBoundary (material) || ! std::isfinite (material.absorptionDistance)
@@ -655,7 +664,7 @@ Spectrum mediumAbsorption (const Material& material, const Wavelengths& waveleng
     return sigma;
 }
 
-Spectrum straightTransmittance (const Material& material, float cosine, float etaD,
+PT_SHARED_ENTRY Spectrum straightTransmittance (const Material& material, float cosine, float etaD,
                                 const Wavelengths& wavelengths) noexcept
 {
     if (! isThinSheet (material))
@@ -664,7 +673,7 @@ Spectrum straightTransmittance (const Material& material, float cosine, float et
     return reflectanceSpectrum (material.baseColor, wavelengths) * (dielectricWeight (material) * (1.0f - r));
 }
 
-Frame Frame::fromNormal (Vec3 n) noexcept
+PT_SHARED_ENTRY Frame Frame::fromNormal (Vec3 n) noexcept
 {
     Frame frame;
     const float sign = n.z >= 0.0f ? 1.0f : -1.0f;
@@ -676,7 +685,7 @@ Frame Frame::fromNormal (Vec3 n) noexcept
     return frame;
 }
 
-float fresnelDielectric (float cosI, float eta) noexcept
+PT_SHARED_ENTRY float fresnelDielectric (float cosI, float eta) noexcept
 {
     cosI = clampUnit (cosI);
     const float sin2T = (1.0f - cosI * cosI) / (eta * eta);
@@ -688,46 +697,53 @@ float fresnelDielectric (float cosI, float eta) noexcept
     return clampUnit (0.5f * (rs * rs + rp * rp));
 }
 
-float thinSheetReflectance (float cosI, float eta) noexcept
+PT_SHARED_ENTRY float thinSheetReflectance (float cosI, float eta) noexcept
 {
     const float r = fresnelDielectric (cosI, eta);
     return clampUnit (2.0f * r / (1.0f + r));
 }
 
-void ggxAlbedoScaleBias (float cosO, float alpha, float& scale, float& bias) noexcept
+PT_SHARED_ENTRY void ggxAlbedoScaleBias (float cosO, float alpha, float& scale, float& bias) noexcept
 {
-    ggxAlbedoTable().lookup (cosO, alpha, scale, bias);
+#if defined(__CUDACC__)
+    const device::DeviceLookupTables& tables = device::deviceLookupTables();
+    ggxAlbedoLookup (tables.ggxScale, tables.ggxBias, cosO, alpha, scale, bias);
+#else
+    const GgxAlbedoTable& table = ggxAlbedoTable();
+    ggxAlbedoLookup (table.scale(), table.bias(), cosO, alpha, scale, bias);
+#endif
 }
 
-std::uint32_t lobeFlags (const Lobe& lobe) noexcept { return lobeKindFlags (lobe.kind); }
-std::uint32_t lobeFlags (const SpectralLobe& lobe) noexcept { return lobeKindFlags (lobe.kind); }
+PT_SHARED_ENTRY std::uint32_t lobeFlags (const Lobe& lobe) noexcept { return lobeKindFlags (lobe.kind); }
+PT_SHARED_ENTRY std::uint32_t lobeFlags (const SpectralLobe& lobe) noexcept { return lobeKindFlags (lobe.kind); }
 
-BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept { return evalLobeImpl (lobe, wo, wi); }
-SpectralBsdfEval evalLobe (const SpectralLobe& lobe, Vec3 wo, Vec3 wi) noexcept { return evalLobeImpl (lobe, wo, wi); }
+PT_SHARED_ENTRY BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept { return evalLobeImpl (lobe, wo, wi); }
+PT_SHARED_ENTRY SpectralBsdfEval evalLobe (const SpectralLobe& lobe, Vec3 wo, Vec3 wi) noexcept { return evalLobeImpl (lobe, wo, wi); }
 
-bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& out) noexcept
+PT_SHARED_ENTRY bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& out) noexcept
 {
     return sampleLobeImpl (lobe, wo, uChoice, u, out);
 }
 
-bool sampleLobe (const SpectralLobe& lobe, Vec3 wo, float uChoice, Vec2 u, SpectralBsdfSample& out) noexcept
+PT_SHARED_ENTRY bool sampleLobe (const SpectralLobe& lobe, Vec3 wo, float uChoice, Vec2 u, SpectralBsdfSample& out) noexcept
 {
     return sampleLobeImpl (lobe, wo, uChoice, u, out);
 }
 
 template <class Color>
-void BasicBsdf<Color>::reset (Vec3 shadingNormal, Vec3 geometricNormal) noexcept
+PT_SHARED_ENTRY void BasicBsdf<Color>::reset (Vec3 shadingNormal, Vec3 geometricNormal) noexcept
 {
     frame_ = Frame::fromNormal (shadingNormal);
     geometricNormal_ = geometricNormal;
     count_ = 0;
     nonDelta_ = false;
     heroOnly_ = false;
-    probability_.fill (0.0f);
+    for (float& probability : probability_)
+        probability = 0.0f;
 }
 
 template <class Color>
-bool BasicBsdf<Color>::addLobe (const BasicLobe<Color>& lobe) noexcept
+PT_SHARED_ENTRY bool BasicBsdf<Color>::addLobe (const BasicLobe<Color>& lobe) noexcept
 {
     if (count_ >= kMaxLobes || ! finitePositive (lobe.selectWeight))
         return false;
@@ -737,7 +753,7 @@ bool BasicBsdf<Color>::addLobe (const BasicLobe<Color>& lobe) noexcept
 }
 
 template <class Color>
-void BasicBsdf<Color>::finalize() noexcept
+PT_SHARED_ENTRY void BasicBsdf<Color>::finalize() noexcept
 {
     float total = 0.0f;
     for (int i = 0; i < count_; ++i)
@@ -753,7 +769,7 @@ void BasicBsdf<Color>::finalize() noexcept
 }
 
 template <class Color>
-BasicBsdfEval<Color> BasicBsdf<Color>::evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept
+PT_SHARED_ENTRY BasicBsdfEval<Color> BasicBsdf<Color>::evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept
 {
     BasicBsdfEval<Color> out;
     for (int i = 0; i < count_; ++i)
@@ -769,7 +785,7 @@ BasicBsdfEval<Color> BasicBsdf<Color>::evalLocal (Vec3 woLocal, Vec3 wiLocal) co
 }
 
 template <class Color>
-BasicBsdfEval<Color> BasicBsdf<Color>::eval (Vec3 wo, Vec3 wi) const noexcept
+PT_SHARED_ENTRY BasicBsdfEval<Color> BasicBsdf<Color>::eval (Vec3 wo, Vec3 wi) const noexcept
 {
     const Vec3 woLocal = frame_.toLocal (wo);
     const Vec3 wiLocal = frame_.toLocal (wi);
@@ -782,7 +798,7 @@ BasicBsdfEval<Color> BasicBsdf<Color>::eval (Vec3 wo, Vec3 wi) const noexcept
 }
 
 template <class Color>
-bool BasicBsdf<Color>::sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfSample<Color>& out) const noexcept
+PT_SHARED_ENTRY bool BasicBsdf<Color>::sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfSample<Color>& out) const noexcept
 {
     out = {};
     if (count_ == 0)
@@ -828,7 +844,9 @@ bool BasicBsdf<Color>::sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfS
         out.pdf = probability * local.pdf;
         return finiteColor (out.weight) && out.pdf > 0.0f;
     }
-    const BasicBsdfEval<Color> mixture = evalLocal (woLocal, local.wi);
+    // At the direction the path takes, as eval reads it. The lobe's own wi is not quite
+    // unit, and a narrow lobe's D turns on that last bit.
+    const BasicBsdfEval<Color> mixture = evalLocal (woLocal, frame_.toLocal (wi));
     if (! (mixture.pdf > 0.0f) || ! std::isfinite (mixture.pdf))
         return false;
     out.weight = mixture.value * (1.0f / mixture.pdf);
@@ -839,7 +857,7 @@ bool BasicBsdf<Color>::sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfS
 template class BasicBsdf<Vec3>;
 template class BasicBsdf<Spectrum>;
 
-void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
+PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
                         Vec3 wo, bool entering, Bsdf& out) noexcept
 {
     const float ior = std::isfinite (material.ior) ? std::min (3.0f, std::max (1.01f, material.ior)) : 1.5f;
@@ -847,12 +865,13 @@ void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geome
     // A sheet has the same medium on both sides; a volume or interface
     // refracts into the material when entering and out of it otherwise.
     const float eta = material.transport == DielectricTransport::ThinSheet || entering ? ior : 1.0f / ior;
-    setup.eta.fill (eta);
+    for (float& channel : setup.eta)
+        channel = eta;
     setup.etaD = eta;
     buildBsdf (material, shadingNormal, geometricNormal, wo, setup, [] (Vec3 rgb) { return rgb; }, out);
 }
 
-void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
+PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
                         Vec3 wo, const Wavelengths& wavelengths, const DielectricSetup& setup,
                         SpectralBsdf& out) noexcept
 {
@@ -861,5 +880,15 @@ void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geome
     buildBsdf (material, shadingNormal, geometricNormal, wo, used,
                [&wavelengths] (Vec3 rgb) { return reflectanceSpectrum (rgb, wavelengths); }, out);
 }
+
+#if ! defined(__CUDACC__)
+void exportGgxTables (device::DeviceLookupTables& out) noexcept
+{
+    const GgxAlbedoTable& table = ggxAlbedoTable();
+    out.ggxScale = table.scale();
+    out.ggxBias = table.bias();
+    out.ggxEntries = kGgxTableSize * kGgxTableSize;
+}
+#endif
 
 } // namespace videohelper::pathtrace

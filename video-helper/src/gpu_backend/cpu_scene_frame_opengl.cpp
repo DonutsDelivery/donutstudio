@@ -122,6 +122,219 @@ bool uploadTexture (unsigned texture, int internalFormat, unsigned format, unsig
                   format, type, pixels);
     return glGetError() == GL_NO_ERROR;
 }
+
+// Restores everything the frame layer pass changes.
+struct LayerPassState final
+{
+    explicit LayerPassState (const arbitgl::GlFuncs& gl) : gl_ (gl)
+    {
+        glGetIntegerv (GL_FRAMEBUFFER_BINDING, &framebuffer_);
+        glGetIntegerv (GL_VIEWPORT, viewport_);
+        glGetIntegerv (GL_CURRENT_PROGRAM, &program_);
+        glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &vertexArray_);
+        glGetIntegerv (GL_ACTIVE_TEXTURE, &activeTexture_);
+        for (int unit = 0; unit < 3; ++unit)
+        {
+            gl_.ActiveTexture (GL_TEXTURE0 + static_cast<unsigned> (unit));
+            glGetIntegerv (GL_TEXTURE_BINDING_2D, &textures_[unit]);
+            glGetIntegerv (GL_SAMPLER_BINDING, &samplers_[unit]);
+            gl_.BindSampler (static_cast<unsigned> (unit), 0);
+        }
+        glGetIntegerv (GL_BLEND_SRC_RGB, &blend_[0]);
+        glGetIntegerv (GL_BLEND_DST_RGB, &blend_[1]);
+        glGetIntegerv (GL_BLEND_SRC_ALPHA, &blend_[2]);
+        glGetIntegerv (GL_BLEND_DST_ALPHA, &blend_[3]);
+        glGetBooleanv (GL_COLOR_WRITEMASK, colorMask_);
+        for (std::size_t index = 0; index < kSwitches; ++index)
+            enabled_[index] = glIsEnabled (switches()[index]);
+        for (std::size_t index = 0; index < kSwitches; ++index)
+            glDisable (switches()[index]);
+        glEnable (GL_BLEND);
+        gl_.BlendFuncSeparate (GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+        glColorMask (GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    ~LayerPassState()
+    {
+        for (std::size_t index = 0; index < kSwitches; ++index)
+            if (enabled_[index] != GL_FALSE) glEnable (switches()[index]);
+            else glDisable (switches()[index]);
+        glColorMask (colorMask_[0], colorMask_[1], colorMask_[2], colorMask_[3]);
+        gl_.BlendFuncSeparate (static_cast<unsigned> (blend_[0]), static_cast<unsigned> (blend_[1]),
+                               static_cast<unsigned> (blend_[2]), static_cast<unsigned> (blend_[3]));
+        for (int unit = 0; unit < 3; ++unit)
+        {
+            gl_.ActiveTexture (GL_TEXTURE0 + static_cast<unsigned> (unit));
+            glBindTexture (GL_TEXTURE_2D, static_cast<unsigned> (textures_[unit]));
+            gl_.BindSampler (static_cast<unsigned> (unit), static_cast<unsigned> (samplers_[unit]));
+        }
+        gl_.ActiveTexture (static_cast<unsigned> (activeTexture_));
+        gl_.BindVertexArray (static_cast<unsigned> (vertexArray_));
+        gl_.UseProgram (static_cast<unsigned> (program_));
+        glViewport (viewport_[0], viewport_[1], viewport_[2], viewport_[3]);
+        gl_.BindFramebuffer (GL_FRAMEBUFFER, static_cast<unsigned> (framebuffer_));
+    }
+    LayerPassState (const LayerPassState&) = delete;
+    LayerPassState& operator= (const LayerPassState&) = delete;
+
+private:
+    static constexpr std::size_t kSwitches = 6;
+    static const unsigned* switches() noexcept
+    {
+        static const unsigned values[kSwitches] { GL_BLEND, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_SCISSOR_TEST,
+                                                  GL_CULL_FACE, GL_FRAMEBUFFER_SRGB };
+        return values;
+    }
+    const arbitgl::GlFuncs& gl_;
+    int framebuffer_ = 0, viewport_[4] { 0, 0, 0, 0 }, program_ = 0, vertexArray_ = 0, activeTexture_ = GL_TEXTURE0;
+    int textures_[3] { 0, 0, 0 }, samplers_[3] { 0, 0, 0 }, blend_[4] { GL_ONE, GL_ZERO, GL_ONE, GL_ZERO };
+    GLboolean colorMask_[4] { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
+    GLboolean enabled_[kSwitches] {};
+};
+
+const char* const kFrameLayerVertex = R"glsl(#version 330 core
+void main() {
+    vec2 corner = vec2((gl_VertexID & 1) * 4 - 1, (gl_VertexID & 2) * 2 - 1);
+    gl_Position = vec4(corner, 0.0, 1.0);
+}
+)glsl";
+
+// The tint and coverage of the raster's frame-tinted materials (backend_opengl.cpp,
+// uTexturePresence.w). Where the raster keeps a partly transparent colour and
+// writes its alpha, this frame has alpha 1 (pathtrace/engine.h), so the colour
+// lands over the background here.
+const char* const kFrameLayerFragment = R"glsl(#version 330 core
+uniform sampler2D uLight;
+uniform sampler2D uUvCoverage;
+uniform sampler2D uFrame;
+uniform int uFrameBottomFirst;
+uniform int uFrameLinear;
+uniform vec3 uBackground;
+layout(location = 0) out vec4 outColor;
+vec3 srgbToLinear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec3 uvCoverage = texelFetch(uUvCoverage, pixel, 0).xyz;
+    if (uvCoverage.z <= 0.0) discard;
+    vec2 uv = uFrameBottomFirst != 0 ? vec2(uvCoverage.x, 1.0 - uvCoverage.y) : uvCoverage.xy;
+    vec4 imagery = texture(uFrame, uv);
+    vec3 tint = uFrameLinear != 0 ? imagery.rgb : srgbToLinear(imagery.rgb);
+    float alpha = clamp(imagery.a, 0.0, 1.0);
+    outColor = vec4(texelFetch(uLight, pixel, 0).rgb * tint * alpha
+                    + uBackground * uvCoverage.z * (1.0 - alpha), 0.0);
+}
+)glsl";
+
+struct FrameLayerProgram final
+{
+    unsigned program = 0;
+    unsigned vertexArray = 0;
+    int light = -1, uvCoverage = -1, frame = -1, frameBottomFirst = -1, frameLinear = -1, background = -1;
+};
+
+unsigned compileLayerShader (const arbitgl::GlFuncs& gl, unsigned stage, const char* source, std::string& error)
+{
+    const unsigned shader = gl.CreateShader (stage);
+    gl.ShaderSource (shader, 1, &source, nullptr);
+    gl.CompileShader (shader);
+    int compiled = 0;
+    gl.GetShaderiv (shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled != 0) return shader;
+    char log[1024] {};
+    gl.GetShaderInfoLog (shader, sizeof (log), nullptr, log);
+    gl.DeleteShader (shader);
+    error = std::string ("Path Trace frame layer shader did not compile: ") + log;
+    return 0;
+}
+
+bool buildLayerProgram (const arbitgl::GlFuncs& gl, FrameLayerProgram& out, std::string& error)
+{
+    const unsigned vertex = compileLayerShader (gl, GL_VERTEX_SHADER, kFrameLayerVertex, error);
+    if (vertex == 0) return false;
+    const unsigned fragment = compileLayerShader (gl, GL_FRAGMENT_SHADER, kFrameLayerFragment, error);
+    if (fragment == 0)
+    {
+        gl.DeleteShader (vertex);
+        return false;
+    }
+    out.program = gl.CreateProgram();
+    gl.AttachShader (out.program, vertex);
+    gl.AttachShader (out.program, fragment);
+    gl.LinkProgram (out.program);
+    gl.DeleteShader (vertex);
+    gl.DeleteShader (fragment);
+    int linked = 0;
+    gl.GetProgramiv (out.program, GL_LINK_STATUS, &linked);
+    if (linked == 0)
+    {
+        char log[1024] {};
+        gl.GetProgramInfoLog (out.program, sizeof (log), nullptr, log);
+        gl.DeleteProgram (out.program);
+        out.program = 0;
+        error = std::string ("Path Trace frame layer shader did not link: ") + log;
+        return false;
+    }
+    gl.GenVertexArrays (1, &out.vertexArray);
+    out.light = gl.GetUniformLocation (out.program, "uLight");
+    out.uvCoverage = gl.GetUniformLocation (out.program, "uUvCoverage");
+    out.frame = gl.GetUniformLocation (out.program, "uFrame");
+    out.frameBottomFirst = gl.GetUniformLocation (out.program, "uFrameBottomFirst");
+    out.frameLinear = gl.GetUniformLocation (out.program, "uFrameLinear");
+    out.background = gl.GetUniformLocation (out.program, "uBackground");
+    return true;
+}
+
+// Adds each layer to the colour texture, sampling its frame on the GPU.
+bool drawFrameLayers (const arbitgl::GlFuncs& gl, const FrameLayerProgram& program, unsigned color,
+                      const CpuSceneImage& image, std::string& error)
+{
+    const LayerPassState state (gl);
+    const UploadState unpack (gl);
+    unsigned framebuffer = 0;
+    gl.GenFramebuffers (1, &framebuffer);
+    gl.BindFramebuffer (GL_FRAMEBUFFER, framebuffer);
+    gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+    const unsigned drawBuffer = GL_COLOR_ATTACHMENT0;
+    gl.DrawBuffers (1, &drawBuffer);
+    bool drawn = gl.CheckFramebufferStatus (GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (! drawn)
+        error = "Path Trace frame layer target is not renderable";
+    glViewport (0, 0, static_cast<int> (image.width), static_cast<int> (image.height));
+    gl.UseProgram (program.program);
+    gl.BindVertexArray (program.vertexArray);
+    gl.Uniform1i (program.light, 0);
+    gl.Uniform1i (program.uvCoverage, 1);
+    gl.Uniform1i (program.frame, 2);
+    gl.Uniform3f (program.background, image.background[0], image.background[1], image.background[2]);
+    unsigned textures[2] { 0, 0 };
+    glGenTextures (2, textures);
+    for (const auto& layer : image.frameLayers)
+    {
+        if (! drawn) break;
+        gl.ActiveTexture (GL_TEXTURE0);
+        drawn = uploadTexture (textures[0], GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, image.width, image.height, layer.light->data());
+        gl.ActiveTexture (GL_TEXTURE1);
+        drawn = drawn && uploadTexture (textures[1], GL_RGB32F, GL_RGB, GL_FLOAT, image.width, image.height, layer.uvCoverage->data());
+        if (! drawn)
+        {
+            error = "Path Trace frame layer upload was refused by the OpenGL driver";
+            break;
+        }
+        gl.ActiveTexture (GL_TEXTURE2);
+        glBindTexture (GL_TEXTURE_2D, static_cast<unsigned> (layer.frame->colorTextureViewHandle()));
+        const auto descriptor = layer.frame->colorTextureDescriptor();
+        gl.Uniform1i (program.frameBottomFirst, descriptor.rowOrder == NativeTextureRowOrder::BottomFirst ? 1 : 0);
+        gl.Uniform1i (program.frameLinear, materialFrameIsLinear (descriptor) ? 1 : 0);
+        glDrawArrays (GL_TRIANGLES, 0, 3);
+        drawn = glGetError() == GL_NO_ERROR;
+        if (! drawn)
+            error = "Path Trace frame layer draw was refused by the OpenGL driver";
+    }
+    glDeleteTextures (2, textures);
+    gl.DeleteFramebuffers (1, &framebuffer);
+    return drawn;
+}
 } // namespace
 
 std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
@@ -142,6 +355,16 @@ std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
         error = "Path Trace image does not match its declared size and format";
         return nullptr;
     }
+    const auto contextIdentity = reinterpret_cast<std::uintptr_t> (glfwGetCurrentContext());
+    for (const auto& layer : image.frameLayers)
+        if (layer.frame == nullptr || layer.light == nullptr || layer.uvCoverage == nullptr
+            || layer.light->size() != pixels * 8u || layer.uvCoverage->size() != pixels * 3u
+            || layer.frame->colorTextureViewHandle() == 0
+            || layer.frame->colorTextureDescriptor().deviceOrContextIdentity != contextIdentity)
+        {
+            error = "Path Trace frame layer does not match its image or this OpenGL context";
+            return nullptr;
+        }
     auto* context = glfwGetCurrentContext();
     if (context == nullptr)
     {
@@ -152,10 +375,12 @@ std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
     // thread for the context it was loaded in.
     thread_local GLFWwindow* loadedContext = nullptr;
     thread_local arbitgl::GlFuncs gl;
+    thread_local FrameLayerProgram layerProgram;
     if (loadedContext != context)
     {
         std::string missing;
         loadedContext = nullptr;
+        layerProgram = {};
         if (! arbitgl::loadGlFunctions (gl, missing))
         {
             error = "Path Trace upload could not load OpenGL functions: " + missing;
@@ -185,6 +410,13 @@ std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
     {
         glDeleteTextures (2, textures);
         error = "Path Trace upload was refused by the OpenGL driver";
+        return nullptr;
+    }
+    if (! image.frameLayers.empty()
+        && ((layerProgram.program == 0 && ! buildLayerProgram (gl, layerProgram, error))
+            || ! drawFrameLayers (gl, layerProgram, textures[0], image, error)))
+    {
+        glDeleteTextures (2, textures);
         return nullptr;
     }
     try

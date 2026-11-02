@@ -60,8 +60,11 @@
 #include "environment_map.h"
 #include "scene_ingest.h"
 #include "vec_math.h"
+#include "../../../shared/DiffractionLightingPlan.h"
+#include "devices/device_interface.h"
 #include "../../../shared/Visual3DScene.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -89,7 +92,26 @@ struct LightShape
     float radius = 0.0f;
     // Directional: angular radius of the sun disk in radians, at most 1.5.
     float angularRadius = 0.0f;
+    // Directional: one authored value per production wavelength. The record's
+    // color * intensity is then their mean, and each band scales it.
+    bool spectralBands = false;
+    std::array<float, diffractionmaterial::kMaximumSpectralSamples> bands {};
 };
+
+// A grating scatters into delta orders, and a delta order never meets a delta
+// light, so an unsized Directional Light gives a grating nothing. RenderScene
+// gives each one in a grating scene this angular radius. Its radiance is
+// E / (pi sin^2 a), so the irradiance E stays what was authored. At 1400 nm,
+// first order disperses about 0.7 mrad per nm, so 3 degrees lights a band about
+// 150 nm wide: narrow enough to stay coloured.
+inline constexpr float kGratingSourceAngularRadius = 0.05235988f;
+
+// The Direct path of an authored spectral lighting plan (version 3) as a
+// Directional record and its shape. Each band is a beam integral in W / (m^2 nm),
+// the unit a Directional Light's irradiance already has. False for other plans
+// and for a source with no energy.
+PT_SHARED_ENTRY bool authoredSpectralSourceLight (const diffractionmaterial::LightingDescription& lighting,
+                                                  HarmonicMIDI::grid::SceneLightRecord& record, LightShape& shape) noexcept;
 
 enum class AreaLightShape : std::uint8_t
 {
@@ -136,6 +158,9 @@ struct Light
     float coneCos = 1.0f;
     float coneOneMinusCos = 0.0f;
     float coneRadianceScale = 0.0f;
+    // Directional from an authored spectrum: each band over strength.
+    bool spectralBands = false;
+    std::array<float, diffractionmaterial::kMaximumSpectralSamples> bandScale {};
     // Rect: vertex0 is a corner, edge1 and edge2 the full sides. Disk:
     // position is the centre, edge1 and edge2 the half axes.
     bool twoSided = false;
@@ -153,16 +178,23 @@ struct EnvironmentField
     Vec3 sunDirection { 0.0f, 1.0f, 0.0f };
     float sunCosRadius = 1.0f;
     float sunSampleProbability = 0.0f;  // share of samples drawn inside the sun cap
+    // The analytic cloud layer, as the raster's analyticSkyCloudOpacity reads it: coverage in
+    // 1023rds, type in 63rds and heading in 256ths of a turn. Coverage 0 means no clouds.
+    float cloudCoverage = 0.0f;
+    float cloudKind = 0.0f;
+    float cloudHeadingRadians = 0.0f;
+    float cloudDrift = 0.0f;
     // When set, the image replaces the analytic gradient and sun, and
     // constant still adds to it.
-    std::shared_ptr<const EnvironmentMap> image;
+    // Owned by the LightSet that built this field.
+    const EnvironmentMapView* image = nullptr;
     float imageSampleProbability = 0.0f;  // share of samples drawn from the image
 
-    bool active() const noexcept;
-    Vec3 radiance (Vec3 direction) const noexcept;
+    PT_SHARED_ENTRY bool active() const noexcept;
+    PT_SHARED_ENTRY Vec3 radiance (Vec3 direction) const noexcept;
     // Solid-angle density of sample() for a unit direction.
-    float pdf (Vec3 direction) const noexcept;
-    Vec3 sample (Vec2 u, float& pdfOut) const noexcept;
+    PT_SHARED_ENTRY float pdf (Vec3 direction) const noexcept;
+    PT_SHARED_ENTRY Vec3 sample (Vec2 u, float& pdfOut) const noexcept;
 };
 
 struct LightSample
@@ -179,6 +211,29 @@ struct LightSample
     bool infinite = false;    // Directional and Environment
     bool area = false;        // Triangle
     std::uint32_t light = 0;
+};
+
+// One particle leaving a light, for light tracing (integrator.h, caustic
+// light paths). weight is the flux it carries: emitted radiance times the
+// area and solid angle it stands for, over their densities and the selection
+// probability, so the expected weight is the light set's emitted power in the
+// units above. Lights at infinity (Directional, Environment) emit through a
+// disk of the scene bounding sphere's radius, facing the particle, so every
+// surface inside the sphere is lit as from infinitely far.
+// Point and Spot lights, sized or not, follow the raster's receiver-dependent
+// falloff: multiply the weight by emissionFalloff() at the first surface the
+// particle reaches.
+struct EmissionSample
+{
+    Vec3 origin {};
+    Vec3 direction {};          // unit, the way the light travels
+    Vec3 weight {};
+    std::uint32_t light = 0;    // index into lights()
+    LightType type = LightType::Point;
+    // Emissive triangle the particle leaves, which its first ray must skip;
+    // 0xffffffff for other lights.
+    std::uint32_t ignoreTriangle = 0xffffffffu;
+    bool receiverFalloff = false;
 };
 
 struct LightSetStats
@@ -199,9 +254,93 @@ struct LightSetStats
     std::uint32_t zeroPowerLights = 0;        // valid but black, skipped
 };
 
-class LightSet
+// The read side of a built light set: plain data over borrowed buffers, so the
+// same sampling code runs on a device once the buffers are uploaded. A LightSet
+// owns the buffers its view reads.
+class LightSetView
 {
 public:
+    PT_SHARED_FN std::size_t size() const noexcept { return lights_.size(); }
+    PT_SHARED_FN const EnvironmentField& environment() const noexcept { return environment_; }
+    PT_SHARED_FN bool hasEnvironment() const noexcept { return environment_.active(); }
+    PT_SHARED_ENTRY float selectionProbability (std::size_t light) const noexcept;
+
+    // One light sample toward shading point p.
+    PT_SHARED_ENTRY bool sample (Vec3 p, float uSelect, Vec2 u, LightSample& out) const noexcept;
+
+    // Density sample() gives to the direction of a ray from a shading point
+    // that hit emissive triangle `triangle` at distance `distance` with
+    // |cos| = cosAtLight at the light. 0 when the triangle is not a light.
+    PT_SHARED_ENTRY float trianglePdf (std::uint32_t triangle, float distance, float cosAtLight) const noexcept;
+    // Density sample() gives to an escaping unit direction.
+    PT_SHARED_ENTRY float environmentPdf (Vec3 direction) const noexcept;
+
+    // One emitted particle: a light by selection probability, then a point
+    // and direction on it. sceneCentre and sceneRadius bound the geometry;
+    // lights at infinity emit nothing without them (sceneRadius 0).
+    PT_SHARED_ENTRY bool sampleEmission (float uSelect, Vec2 uPosition, Vec2 uDirection, Vec3 sceneCentre, float sceneRadius,
+                         EmissionSample& out) const noexcept;
+    // Point and Spot: d^2 times the falloff, range window and spot cone at
+    // squared distance d^2 from the light centre, which turns the particle's
+    // weight into the irradiance the raster convention gives at receiver. 1
+    // for every other particle.
+    PT_SHARED_ENTRY float emissionFalloff (const EmissionSample& sample, Vec3 receiver) const noexcept;
+    PT_SHARED_FN Vec3 environmentRadiance (Vec3 direction) const noexcept { return environment_.radiance (direction); }
+
+    // Sized lights without geometry (spheres, sun disks, rects, disks).
+    PT_SHARED_FN std::size_t analyticCount() const noexcept { return analytic_.size(); }
+    // The index into lights_ of analytic light `index`.
+    PT_SHARED_FN std::uint32_t analyticLight (std::size_t index) const noexcept { return analytic_[index]; }
+    // The authored spectrum of a light at a wavelength, relative to its
+    // strength: 1 for a light with no authored spectrum.
+    PT_SHARED_ENTRY float spectralBandScale (std::uint32_t light, float wavelengthNm) const noexcept;
+    // Whether the ray origin + t direction, 0 < t < tMax (direction unit),
+    // reaches analytic light `index`. On a hit, radiance is what the ray
+    // receives from it, pdf the density sample() gives that direction from
+    // origin, selection included, and distance the t of the hit (infinite
+    // for a sun).
+    PT_SHARED_ENTRY bool analyticHit (std::size_t index, Vec3 origin, Vec3 direction, float tMax, Vec3& radiance,
+                      float& pdf, float& distance) const noexcept;
+
+#if ! defined(__CUDACC__)
+    // This view with each buffer replaced by what upload returns for it.
+    template <typename Upload>
+    LightSetView deviceCopy (Upload&& upload) const
+    {
+        LightSetView copy = *this;
+        copy.lights_ = upload (lights_);
+        copy.cdf_ = upload (cdf_);
+        copy.probability_ = upload (probability_);
+        copy.triangleLight_ = upload (triangleLight_);
+        copy.analytic_ = upload (analytic_);
+        if (environment_.image != nullptr)
+        {
+            const EnvironmentMapView image = environment_.image->deviceCopy (upload);
+            copy.environment_.image = upload (device::BufferView<EnvironmentMapView> { &image, 1 }).data;
+        }
+        return copy;
+    }
+#endif
+
+protected:
+    device::BufferView<Light> lights_;
+    device::BufferView<float> cdf_;                 // inclusive, normalized, last entry 1
+    device::BufferView<float> probability_;
+    device::BufferView<std::int32_t> triangleLight_;
+    device::BufferView<std::uint32_t> analytic_;    // indices into lights_
+    EnvironmentField environment_ {};
+    std::int32_t environmentLight_ = -1;
+};
+
+class LightSet : public LightSetView
+{
+public:
+    LightSet() = default;
+    LightSet (const LightSet& other);
+    LightSet (LightSet&& other) noexcept;
+    LightSet& operator= (const LightSet& other);
+    LightSet& operator= (LightSet&& other) noexcept;
+
     // records may be null when count is 0. materials is indexed by
     // TriangleAttributes::materialIndex; triangles outside it use fallback.
     // environmentImage holds the decoded pixels for the image record whose
@@ -215,42 +354,19 @@ public:
                 const std::vector<AreaLightRecord>* areaLights = nullptr);
     void clear() noexcept;
 
-    std::size_t size() const noexcept { return lights_.size(); }
-    const std::vector<Light>& lights() const noexcept { return lights_; }
+    const std::vector<Light>& lights() const noexcept { return ownedLights_; }
     const LightSetStats& stats() const noexcept { return stats_; }
-    const EnvironmentField& environment() const noexcept { return environment_; }
-    bool hasEnvironment() const noexcept { return environment_.active(); }
-    float selectionProbability (std::size_t light) const noexcept;
-
-    // One light sample toward shading point p.
-    bool sample (Vec3 p, float uSelect, Vec2 u, LightSample& out) const noexcept;
-
-    // Density sample() gives to the direction of a ray from a shading point
-    // that hit emissive triangle `triangle` at distance `distance` with
-    // |cos| = cosAtLight at the light. 0 when the triangle is not a light.
-    float trianglePdf (std::uint32_t triangle, float distance, float cosAtLight) const noexcept;
-    // Density sample() gives to an escaping unit direction.
-    float environmentPdf (Vec3 direction) const noexcept;
-    Vec3 environmentRadiance (Vec3 direction) const noexcept { return environment_.radiance (direction); }
-
-    // Sized lights without geometry (spheres, sun disks, rects, disks).
-    std::size_t analyticCount() const noexcept { return analytic_.size(); }
-    // Whether the ray origin + t direction, 0 < t < tMax (direction unit),
-    // reaches analytic light `index`. On a hit, radiance is what the ray
-    // receives from it, pdf the density sample() gives that direction from
-    // origin, selection included, and distance the t of the hit (infinite
-    // for a sun).
-    bool analyticHit (std::size_t index, Vec3 origin, Vec3 direction, float tMax, Vec3& radiance,
-                      float& pdf, float& distance) const noexcept;
 
 private:
-    std::vector<Light> lights_;
-    std::vector<float> cdf_;                 // inclusive, normalized, back() == 1
-    std::vector<float> probability_;
-    std::vector<std::int32_t> triangleLight_;
-    std::vector<std::uint32_t> analytic_;    // indices into lights_
-    EnvironmentField environment_ {};
-    std::int32_t environmentLight_ = -1;
+    // Points the view at the buffers below. Runs after every change to them.
+    void refreshView() noexcept;
+
+    std::vector<Light> ownedLights_;
+    std::vector<float> ownedCdf_;
+    std::vector<float> ownedProbability_;
+    std::vector<std::int32_t> ownedTriangleLight_;
+    std::vector<std::uint32_t> ownedAnalytic_;
+    std::shared_ptr<const EnvironmentMap> ownedImage_;
     LightSetStats stats_ {};
 };
 

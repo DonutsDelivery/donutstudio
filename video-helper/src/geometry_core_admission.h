@@ -3,10 +3,15 @@
 
 #include "../../shared/GeometryCoreTransport.h"
 #include "timeline_scene_family_budget.h"
+#include "published_plan_memo.h"
+#include "timeline_scene_evaluation_inputs.h"
 #include "particle_body_caller_admission.h"
 
+#include <array>
 #include <algorithm>
 #include <map>
+#include <new>
+#include <stdexcept>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -52,6 +57,7 @@ struct ExecutionBudgetReceipt final {
 // A plan is owned by one presentation or export request.  Keeping every
 // generation in the key prevents a stale helper/device plan from being reused
 // after either side restarts.
+
 struct PlanOwnerIdentity final {
   std::uint64_t projectGeneration = 0;
   std::uint64_t helperGeneration = 0;
@@ -599,6 +605,84 @@ public:
       const std::vector<std::uint8_t>&,const videowire::geometry::ResourceLimits&,
       const std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission>&,std::string&);
 
+  // A timeline plan that was fully checked against this immutable authored scene
+  // needs none of that work again: only its time changes from frame to frame. No
+  // value and no error means the caller runs the full admission, which reports.
+  std::optional<RuntimeAdmission> reuseVerifiedTimelinePlan(const PlanOwnerIdentity& owner,
+      const videowire::geometry::TimelineSceneBinding& binding,
+      const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored,
+      const std::shared_ptr<const void>& planPublication = {}) {
+    std::string ignored;
+    if (!residency_->mutationAllowed(ignored)) return std::nullopt;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found=cache_.find(owner);
+    if (found==cache_.end() || found->second.family || found->second.bodySource
+        || owner.projectGeneration!=activeProjectGeneration_ || owner.helperGeneration!=activeHelperGeneration_
+        || owner.deviceGeneration!=activeDeviceGeneration_
+        || !authored || found->second.verifiedScene.lock()!=authored
+        || !(found->second.verifiedObject==binding.object)) return std::nullopt;
+    // Hashing the lowered plan costs 87 ms a sample on the sea, and it cannot change inside a publication.
+    if (!found->second.verifiedPlanText.holds(planPublication,&binding)) {
+      ++timelinePlanDigests_;
+      if (found->second.verifiedPlan!=timelinePlanDigest(binding)) return std::nullopt;
+      found->second.verifiedPlanText.remember(planPublication,&binding);
+    }
+    const videowire::geometry::AdmissionContext context;
+    auto copy=admitRuntimeCopy(context,found->second.surfaceMaterial,
+        found->second.plan->receipt().effectiveLimits.maxBufferBytes,ignored);
+    if (!copy) return std::nullopt;
+    found->second.lastUse=++clock_;
+    ++verifiedTimelineReuses_;
+    RuntimeAdmission result{owner.use,owner,found->second.plan,found->second.ownerLease,
+        found->second.nativeResources,found->second.surfaceMaterial,context,found->second.bodySource,{}};
+    result.issueResidency(residency_,std::move(copy)); return result;
+  }
+  void markTimelinePlanVerified(const PlanOwnerIdentity& owner,
+      const videowire::geometry::TimelineSceneBinding& binding,
+      const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found=cache_.find(owner);
+    if (found==cache_.end()) return;
+    found->second.verifiedScene=authored;
+    found->second.verifiedObject=binding.object;
+    found->second.verifiedPlan=timelinePlanDigest(binding);
+    found->second.verifiedPlanText.clear();
+    found->second.evaluatedScene.reset();
+  }
+  // Weak: the static owner keeps the snapshot it renders, and this adds no retention of its own.
+  std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> reuseEvaluatedTimelineScene(
+      const PlanOwnerIdentity& owner, const TimelineSceneEvaluationInputs& inputs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found=cache_.find(owner);
+    if (found==cache_.end() || found->second.evaluatedInputs!=inputs) return nullptr;
+    auto held=found->second.evaluatedScene.lock();
+    if (held) ++evaluatedTimelineReuses_;
+    return held;
+  }
+  void rememberEvaluatedTimelineScene(const PlanOwnerIdentity& owner, const TimelineSceneEvaluationInputs& inputs,
+      const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++timelineSceneEvaluations_;
+    const auto found=cache_.find(owner);
+    if (found==cache_.end()) return;
+    found->second.evaluatedScene=scene;
+    found->second.evaluatedInputs=inputs;
+  }
+  std::uint64_t evaluatedTimelineReuses() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return evaluatedTimelineReuses_;
+  }
+  // One per mesh replacement, each of which validates the whole resulting scene.
+  std::uint64_t timelineSceneEvaluations() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return timelineSceneEvaluations_;
+  }
+  std::uint64_t timelinePlanDigests() const noexcept { std::lock_guard<std::mutex> lock(mutex_); return timelinePlanDigests_; }
+  std::uint64_t verifiedTimelineReuses() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return verifiedTimelineReuses_;
+  }
+
   std::shared_ptr<const AdmittedTimelineScenePlans> admitTimelineScenePreview(
       const PlanOwnerIdentity& owner,const HarmonicMIDI::grid::Visual3DScene& scene,
       const std::vector<videowire::geometry::TimelineSceneBinding>& bindings,
@@ -617,13 +701,19 @@ private:
   admitLowered(const std::vector<std::uint8_t> &bytes,
                const videowire::geometry::ResourceLimits &limits,
                const videowire::geometry::AdmissionContext &context,
-               PlanUse use, std::string &error) {
+               PlanUse use, std::string &error) try {
     if (!residency_->mutationAllowed(error,bytes.size())) return std::nullopt;
     auto lowered = videowire::geometry::decodeLoweredRuntimePlan(bytes, error);
     if (!lowered)
       return std::nullopt;
     return admit(lowered->runtimeValue, lowered->contract, limits, context,
                  PlanOwnerIdentity{1, 1, 1, 1, 1, use}, error, lowered->surfaceMaterial);
+  } catch (const std::bad_alloc&) {
+    error = "Geometry Core plan could not allocate its geometry";
+    return std::nullopt;
+  } catch (const std::length_error&) {
+    error = "Geometry Core plan could not allocate its geometry";
+    return std::nullopt;
   }
   std::optional<RuntimeAdmission>
   admitLowered(const std::vector<std::uint8_t> &bytes,
@@ -631,7 +721,7 @@ private:
                const videowire::geometry::AdmissionContext &context,
                const PlanOwnerIdentity &owner, std::string &error,
                const std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission>& bodySource = {},
-               const std::shared_ptr<const videorender::ParticleBodyCallerLease>& bodyLease = {}) {
+               const std::shared_ptr<const videorender::ParticleBodyCallerLease>& bodyLease = {}) try {
     if (!owner.valid()) {
       error = "Geometry Core plan owner identity is incomplete";
       return std::nullopt;
@@ -642,6 +732,12 @@ private:
       return std::nullopt;
     return admit(lowered->runtimeValue, lowered->contract, limits, context,
                  owner, error, lowered->surfaceMaterial, bodySource, bodyLease);
+  } catch (const std::bad_alloc&) {
+    error = "Geometry Core plan could not allocate its geometry";
+    return std::nullopt;
+  } catch (const std::length_error&) {
+    error = "Geometry Core plan could not allocate its geometry";
+    return std::nullopt;
   }
   std::optional<RuntimeAdmission>
   admit(const std::vector<std::uint8_t> &bytes,
@@ -694,11 +790,23 @@ private:
         }
       }
     }
-    auto plan = admitPlanValue(decoded->descriptor(), contract, limits, context,
+    // Export rebuilds Subdivision Surface at its render level; preview keeps the viewport level.
+    std::optional<videowire::geometry::ValueDescriptor> levelSelected;
+    if (std::any_of(decoded->descriptor().operations.begin(),decoded->descriptor().operations.end(),[](const auto& op) {
+          return op.code==videowire::geometry::OperationCode::subdivisionSurface;
+        })) {
+      levelSelected=decoded->descriptor();
+      if (!videowire::geometry::selectSubdivisionSurfaceUse(*levelSelected,owner.use==PlanUse::exportRender,context,error))
+        return std::nullopt;
+    }
+    auto plan = admitPlanValue(levelSelected ? *levelSelected : decoded->descriptor(), contract, limits, context,
                                backend_, error);
     if (!plan)
       return std::nullopt;
     std::uint64_t key = plan->receipt().backendBinding;
+    if (levelSelected) {
+      key ^= static_cast<std::uint64_t>(owner.use); key *= 1099511628211ull;
+    }
     for (const auto& source : context.deferredPoints) {
       for (const auto part : {source.first,source.second.sourceStableId,source.second.sourceRevision,
                              static_cast<std::uint64_t>(source.second.capacity)}) {
@@ -825,9 +933,6 @@ private:
     ARBIT_TIMELINE_TIGHTEN(maxOperations); ARBIT_TIMELINE_TIGHTEN(maxDispatches);
     ARBIT_TIMELINE_TIGHTEN(maxBufferBytes);
 #undef ARBIT_TIMELINE_TIGHTEN
-    effective.maxVertices=std::min(effective.maxVertices,Scene::kMaxVertices);
-    effective.maxIndices=std::min(effective.maxIndices,Scene::kMaxIndices);
-    effective.maxOperations=std::min<std::size_t>(effective.maxOperations,128);
     timelinefamily::Envelope envelope;
     std::size_t childBytes=sizeof(TimelineSceneChildAdmission)+sizeof(AdmittedPlanValue)
         +sizeof(RuntimeAdmission::NativeResources)+3;
@@ -850,8 +955,8 @@ private:
     }
     // Admit the complete checked scene-work schedule and logical storage before
     // the first validator, hierarchy lookup, exact comparison or range walk.
-    // The API has no independent scalar-work limit; checked fixed capacities
-    // bound the named visit schedules. Storage still shares the effective cap.
+    // The API has no independent scalar-work limit. Visit estimates saturate;
+    // storage still answers to the caller's byte allowance.
     std::lock_guard<std::mutex> lock(mutex_);
     std::size_t preflightResident=0,preflightAttempt=0;
     // Preflight/resident/victim scans plus map lookup/insertion, each visiting
@@ -869,9 +974,7 @@ private:
         envelope.matrixMultiplyTerms,envelope.matrixElementVisits,envelope.matrixPostcheckIterations,
         envelope.lightChannelVisits,envelope.sceneRecordVisits,envelope.sceneStringByteVisits,
         envelope.fieldElementVisits,envelope.normalIndexVisits,envelope.waterSampleElements,envelope.sceneCopyElements})
-      if (!checkedAdd(familyWork,work,familyWork)) {
-        error="Timeline scene caller work arithmetic overflow"; return {};
-      }
+      timelinefamily::visitAdd(familyWork,work,familyWork);
     if (!residency_->prepare(envelope.attemptBytes,familyWork,effective.maxBufferBytes,error)) return {};
     for (const auto& entry : cache_) {
       std::size_t bytes=0;
@@ -889,7 +992,7 @@ private:
       error="Timeline scene family and retained owners exceed the attempt budget"; return {};
     }
     if (!HarmonicMIDI::grid::validateVisual3DScene(scene).valid()) {
-      error="Timeline scene family requires a valid scene and 1..64 exact bindings"; return {};
+      error="Timeline scene family requires a valid scene and exact bindings"; return {};
     }
     // Canonical input order avoids ambiguous object-to-plan tables. Validate
     // all ranges before decoding the first child or copying any authored data.
@@ -1063,7 +1166,21 @@ private:
     std::shared_ptr<const AdmittedTimelineScenePlans> family {};
     std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission> bodySource {};
     std::shared_ptr<const videorender::ParticleBodyCallerLease> bodyLease {};
+    std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> verifiedScene {};
+    std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluatedScene {};
+    TimelineSceneEvaluationInputs evaluatedInputs {};
+    HarmonicMIDI::grid::SceneObjectId verifiedObject {};
+    std::uint64_t verifiedPlan = 0;
+    PublishedPlanMemo verifiedPlanText {};
   };
+  static std::uint64_t timelinePlanDigest(const videowire::geometry::TimelineSceneBinding& binding) noexcept {
+    std::uint64_t digest=14695981039346656037ull;
+    for (const unsigned char byte : binding.loweredPlan) {
+      digest ^= byte;
+      digest *= 1099511628211ull;
+    }
+    return digest;
+  }
   static bool entryUnused(const Entry& entry) noexcept {
     if (entry.family) return entry.family.use_count()==1 && entry.family->childrenUnused();
     // The cache's own alias retains the native owner. It is not an escaped
@@ -1082,6 +1199,10 @@ private:
   std::uint64_t activeHelperGeneration_ = 0;
   std::uint64_t activeDeviceGeneration_ = 0;
   std::uint64_t admissionsInGeneration_ = 0;
+  std::uint64_t verifiedTimelineReuses_ = 0;
+  std::uint64_t timelinePlanDigests_=0;
+  std::uint64_t evaluatedTimelineReuses_ = 0;
+  std::uint64_t timelineSceneEvaluations_ = 0;
   std::map<PlanOwnerIdentity, Entry> cache_;
 };
 } // namespace videohelper::geometry

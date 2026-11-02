@@ -573,6 +573,55 @@ void testSpectralMaterial()
     }
 }
 
+void testDispersionHasNoUpperBound()
+{
+    auto program = evaluationProgram();
+    program.version = kSpectralWireVersion;
+    program.transport = TransportMode::ClosedVolume;
+    program.outputs[10] = appendScalar(program, 0.0f);
+    MaterialEvaluationInputs inputs;
+    inputs.timeSeconds = 1.5f;
+    inputs.audioBass = 0.25f;
+    inputs.controlCount = 1;
+    inputs.controls[0] = 0.8f;
+    const auto evaluated = [&](float value) {
+        program.operations.back().literal[0] = value;
+        std::string error;
+        const auto admitted = admit(program, error);
+        return admitted ? evaluateReference(*admitted, inputs, error) : std::nullopt;
+    };
+    for (const float value : {0.021f, 0.1f, 0.5f, 5.0f})
+    {
+        const auto block = evaluated(value);
+        check(block && block->transmissionIorClearcoat[3] == value,
+              "admission keeps a finite Cauchy B above 0.02 unchanged");
+    }
+    check(!evaluated(std::numeric_limits<float>::quiet_NaN()), "NaN Cauchy B stays refused");
+    check(!evaluated(std::numeric_limits<float>::infinity()), "infinite Cauchy B stays refused");
+    // Negative B stays refused as a domain rule, whatever its size. Cauchy's B is
+    // positive for normal dispersion, and the endpoint finiteness check and the
+    // index floor both rely on index falling as wavelength grows.
+    check(!evaluated(-0.001f), "negative Cauchy B is outside the normal dispersion domain");
+
+    check(wavelengthIor(1.5f, 0.5f, 0.38f) > 3.0f, "blue index rises past 3 at a large Cauchy B");
+    check(wavelengthIor(1.5f, 0.5f, 0.78f) == 1.0f, "a red index that Cauchy puts below vacuum stops at 1");
+    check(wavelengthIor(1.5f, 0.0f, 0.78f) == 1.5f, "zero Cauchy B still leaves the index exact");
+
+    // Refraction at one interface, 45 degrees in: red exits straighter than blue.
+    const auto fringe = [](float b) {
+        const auto angle = [b](float wavelength) {
+            return std::asin(std::sin(0.78539816f) / wavelengthIor(1.5f, b, wavelength));
+        };
+        return angle(kGlassWavelengths[0]) - angle(kGlassWavelengths[2]);
+    };
+    float previous = 0.0f;
+    for (const float b : {0.004f, 0.02f, 0.1f, 0.5f, 5.0f})
+    {
+        check(fringe(b) > previous, "fringe separation grows with Cauchy B, with no plateau");
+        previous = fringe(b);
+    }
+}
+
 void testExplicitSpectralReflectance()
 {
     auto source = comprehensiveProgram();
@@ -630,7 +679,7 @@ void testAdmissionAndDigest()
     check(admitted->structuralDigest().size() == 64,
           "structural digest is lowercase SHA-256 hex");
     check(admitted->structuralDigest()
-              == "3071cfeebe22ff91edcf4389164b9001528833bed5186771f8cf3f720963cbe4",
+              == "4e3acf69b8dfb81a0740975776adf53ac2c51ef25a0dfebf3e5eb606f6fb4135",
           "structural digest matches the independent serialization oracle");
 
     const auto originalDigest = admitted->structuralDigest();
@@ -969,22 +1018,20 @@ void testExactBounds()
 {
     std::string error;
     const auto maxOperations = maximumOperationProgram();
-    check(maxOperations.operations.size() == kMaximumOperations,
-          "maximum-operation fixture reaches the exact hard bound");
     const auto admittedOperations = admit(maxOperations, error);
-    check(admittedOperations.has_value(), "exact hard operation bound is admitted");
+    check(admittedOperations.has_value(), "a program of the former hard bound's size is admitted");
 
-    auto tooManyOperations = maxOperations;
-    appendScalar(tooManyOperations, 1.0f);
-    expectRejected(tooManyOperations, "operation limit exceeded",
-                   "one operation above the hard bound rejected");
+    AdmissionLimits oneFewerOperation;
+    oneFewerOperation.operations = maxOperations.operations.size() - 1;
+    expectRejected(maxOperations, "operation limit exceeded",
+                   "a caller's own operation limit still applies", oneFewerOperation);
 
     const auto maxDepth = maximumDepthProgram();
     const auto admittedDepth = admit(maxDepth, error);
-    check(admittedDepth && admittedDepth->maximumDepth() == kMaximumDepth,
-          "exact hard graph depth is admitted");
+    check(admittedDepth && admittedDepth->maximumDepth() == 32,
+          "a graph of the former hard depth is admitted");
     AdmissionLimits shallow;
-    shallow.depth = kMaximumDepth - 1;
+    shallow.depth = 31;
     expectRejected(maxDepth, "depth limit exceeded",
                    "one level below required depth rejects the graph", shallow);
 
@@ -1057,10 +1104,6 @@ void testExactBounds()
     expectRejected(comprehensiveProgram(), "limits exceed hard contract bounds",
                    "caller cannot raise the operation hard bound", invalidLimits);
     invalidLimits = {};
-    invalidLimits.depth = kMaximumDepth + 1;
-    expectRejected(comprehensiveProgram(), "limits exceed hard contract bounds",
-                   "caller cannot raise the depth hard bound", invalidLimits);
-    invalidLimits = {};
     invalidLimits.controlInputs = 0;
     check(admit(comprehensiveProgram(), error, invalidLimits).has_value(),
           "zero control-input policy admits programs without controls");
@@ -1078,7 +1121,7 @@ void testMalformedGraphs()
     expectRejected(empty, "operation limit exceeded", "empty program rejected");
 
     auto wrongVersion = comprehensiveProgram();
-    ++wrongVersion.version;
+    wrongVersion.version = kSpectralWireVersion + 1;
     expectRejected(wrongVersion, "wire version is unsupported",
                    "unknown wire version rejected");
 
@@ -1164,6 +1207,7 @@ int main()
     testStableVocabulary();
     testAdmissionAndDigest();
     testSpectralMaterial();
+    testDispersionHasNoUpperBound();
     testExplicitSpectralReflectance();
     testEveryInput();
     testDeterministicEvaluation();

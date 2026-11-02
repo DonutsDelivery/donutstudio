@@ -2156,11 +2156,13 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         if (const auto dit = clipGenDefaults.find (clipId); dit != clipGenDefaults.end())
             for (const auto& [k, v] : dit->second)
                 s.genParams.emplace (k, v);
-        videohelper::importedscene::seedImportedSceneRuntimeParameters(
-            visualLayerPlans, clipId, s.visualParams);
         if (const auto* plan = videowire::findVisualLayerPlan(visualLayerPlans, clipId))
-            videowire::seedFlatShaderRuntimeParameters(
-                visualPlanState.compiled(clipId, plan->structuralRevision), s.visualParams);
+        {
+            const auto* execution = visualPlanState.compiled(clipId, plan->structuralRevision);
+            if (execution != nullptr)
+                videohelper::importedscene::seedImportedSceneRuntimeParameters(*plan, *execution, s.visualParams);
+            videowire::seedFlatShaderRuntimeParameters(execution, s.visualParams);
+        }
         if (const auto it = bakedByClip.find (clipId); it != bakedByClip.end())
             for (const auto& tr : it->second)
                 applyGraphParam (s, tr.node, tr.param, sampleBakedTrack (tr.samples, t));
@@ -2943,6 +2945,11 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         // this frame; independent of which clips are visible so the stateful
         // allocator advances deterministically with the frame sequence.
         const auto frameNotes = haveScore ? notesForFrame (t) : nullptr;
+        if (progress != nullptr && frameNotes != nullptr)
+        {
+            progress->droppedNotesPeak.store (std::max (progress->droppedNotesPeak.load(), frameNotes->droppedNotes));
+            progress->droppedLinksPeak.store (std::max (progress->droppedLinksPeak.load(), frameNotes->droppedLinks));
+        }
         if (auto* receipt = videohelper::harmonicprobe::activeReceipt)
         {
             receipt->canonicalFramePresent = frameNotes != nullptr;
@@ -3589,7 +3596,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 const auto* plan = videowire::findVisualLayerPlan(
                     visualLayerPlans, active.seg->clipId);
                 if (plan == nullptr) continue;
-                const auto payload = videohelper::importedscene::
+                const auto& payload = videohelper::importedscene::
                     exactImportedScenePayloadIdentity(*plan);
                 if (payload.empty()) continue;
                 const auto* compiled = importedScenePlanCache.resolve(*plan, error);

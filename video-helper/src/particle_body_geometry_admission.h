@@ -2,6 +2,7 @@
 
 #include "../../shared/ParticleGeometryContract.h"
 #include <new>
+#include <vector>
 
 namespace videorender {
 
@@ -77,12 +78,11 @@ struct ParticleBodyGeometryScalarOperation final
     std::array<double,8> fieldValues{};
     std::size_t vertices=0,indices=0,fields=0;
     std::size_t retainedVertices=0,retainedIndices=0;
-    std::size_t inputIndex=32,secondaryIndex=32,auxiliaryIndex=32;
     bool emptyPayloads=false;
 };
 struct ParticleBodyGeometryScalarCensus final
 {
-    std::array<ParticleBodyGeometryScalarOperation,32> operations{};
+    std::vector<ParticleBodyGeometryScalarOperation> operations;
     std::size_t operationCount=0,terminalVertices=0,terminalIndices=0;
     videowire::geometry::StableId terminalId=0;
 };
@@ -97,7 +97,7 @@ struct ParticleBodyGeometryOwnedCapacityCensus final
     const videowire::geometry::AdmittedValue* observedSource=nullptr;
     std::size_t operationCount=0,terminalVertices=0,terminalIndices=0;
     std::size_t positions=0,identities=0,indices=0,operations=0,attributes=0,spectrumFields=0,scoreFields=0;
-    std::array<ParticleBodyGeometryOwnedCapacityRecord,32> records{};
+    std::vector<ParticleBodyGeometryOwnedCapacityRecord> records;
 };
 // Direct reset stores name native field slots. Padding is not explicitly stored.
 // A later observer reservation pays this reset separately from C0 construction.
@@ -125,18 +125,9 @@ inline constexpr std::array<StoreSite,7> recordStores{{
     {"attributes",sizeof(ParticleBodyGeometryOwnedCapacityRecord::attributes)},
     {"importedAnimation",sizeof(ParticleBodyGeometryOwnedCapacityRecord::importedAnimation)}
 }};
-inline constexpr std::size_t recordLoopVisits=
-    std::tuple_size<decltype(ParticleBodyGeometryOwnedCapacityCensus::records)>::value;
-inline constexpr std::size_t scalarStores=globalStores.size()+recordStores.size()*recordLoopVisits;
-inline constexpr std::size_t directNativeByteSlots=[]() constexpr {
-    std::size_t bytes=0;
-    for (const auto& site:globalStores) bytes+=site.nativeBytes;
-    for (const auto& site:recordStores) bytes+=site.nativeBytes*recordLoopVisits;
-    return bytes;
-}();
 } // namespace particlebodycapacityreset
 
-enum class ParticleBodyGeometryCostRefusal { none, unsupported, arithmetic, sourceMismatch };
+enum class ParticleBodyGeometryCostRefusal { none, unsupported, arithmetic, sourceMismatch, allocation };
 struct ParticleBodyGeometryScalarCost final
 {
     std::size_t operationCount=0,retainedCount=0,terminalVertices=0,terminalIndices=0;
@@ -249,7 +240,7 @@ private:
         const videowire::geometry::BudgetReceipt receipt;
         const videowire::geometry::ValueDescriptor snapshot;
         const videowire::geometry::GeometryData normalized;
-        const std::array<std::shared_ptr<const videowire::geometry::RetainedMeshData>,32> retainedOwners;
+        const std::vector<std::shared_ptr<const videowire::geometry::RetainedMeshData>> retainedOwners;
         const videowire::geometry::Vec3 center;
         const float radius;
         const std::array<float,3> halfRatios;
@@ -257,7 +248,7 @@ private:
         const ParticleBodyGeometryRecipe recipe;
         Data(const std::shared_ptr<const videowire::geometry::AdmittedValue>& sourceIn,
             videowire::geometry::ValueDescriptor&& snapshotIn, videowire::geometry::GeometryData&& normalizedIn,
-            std::array<std::shared_ptr<const videowire::geometry::RetainedMeshData>,32>&& owners,
+            std::vector<std::shared_ptr<const videowire::geometry::RetainedMeshData>>&& owners,
             const videowire::geometry::Vec3& centerIn,const float& radiusIn,const std::array<float,3>& halfIn,
             const ParticleBodyGeometryProxy& proxyIn,const ParticleBodyGeometryRecipe& recipeIn,
             const std::shared_ptr<const ParticleBodyCallerLease>& resources)
@@ -279,7 +270,14 @@ private:
 namespace particlebodygeometrydetail {
 using namespace videowire::geometry;
 struct Shape final { StableId id=0; std::size_t vertices=0,indices=0,fields=0; };
-inline constexpr std::size_t censusLogicalBytes=sizeof(std::array<Shape,32>);
+// Fixed part of the census charge. The native-frame floors below compare against
+// it, so it stays a constant; each operation record adds one Shape on top.
+inline constexpr std::size_t censusLogicalBytes=1024;
+inline bool censusBytes(std::size_t operations,std::size_t& bytes) noexcept
+{
+    bytes=censusLogicalBytes;
+    return addArrayBytes(operations,sizeof(Shape),bytes);
+}
 
 // These types are used only in template arguments and static assertions. They
 // create no proof object, runtime calculator instruction or storage reservation.
@@ -366,7 +364,7 @@ template <std::size_t OuterNativeBytes,std::size_t FactoryNativeFloor>
 inline bool derive(const ValueDescriptor& value,std::size_t boundaries,ParticleBodyGeometryProxy proxy,
     ParticleBodyGeometryRecipe& r,std::string& error)
 {
-    std::array<Shape,32> shapes{};
+    std::vector<Shape> shapes(value.operations.size());
     std::size_t shapeCount=0, geometryCount=0,fieldCount=0,edges=0;
     std::size_t meshPayload=0,fieldPayload=0,sourcePayload=0,temporaryMesh=0,temporaryField=0;
     std::size_t displacementCount=0,rootCount=0,constructedCount=0;
@@ -665,7 +663,7 @@ inline bool ParticleBodyGeometryAdmission::deriveScalarCost(
     result={}; refusal=ParticleBodyGeometryCostRefusal::none;
     const auto unsupported=[&] { refusal=ParticleBodyGeometryCostRefusal::unsupported; return false; };
     const auto overflow=[&] { refusal=ParticleBodyGeometryCostRefusal::arithmetic; return false; };
-    if (!boundaries || !scalar.operationCount || scalar.operationCount>32
+    if (!boundaries || !scalar.operationCount || scalar.operationCount>scalar.operations.size()
         || !scalar.terminalVertices || scalar.terminalVertices>256
         || !scalar.terminalIndices || scalar.terminalIndices>384 || scalar.terminalIndices%3
         || (proxy!=ParticleBodyGeometryProxy::sphere && proxy!=ParticleBodyGeometryProxy::fixedBox)) return unsupported();
@@ -673,7 +671,7 @@ inline bool ParticleBodyGeometryAdmission::deriveScalarCost(
     r.operationCount=scalar.operationCount;
     r.terminalVertices=scalar.terminalVertices; r.terminalIndices=scalar.terminalIndices;
     r.nativeDataBytes=sizeof(Data); r.nativeBodyBytes=sizeof(ParticleBodyGeometryAdmission);
-    r.censusLogicalBytes=particlebodygeometrydetail::censusLogicalBytes;
+    if (!particlebodygeometrydetail::censusBytes(scalar.operationCount,r.censusLogicalBytes)) return overflow();
     r.factoryDependencyLogicalBytes=sizeof(ParticleBodyGeometryFactoryResources);
     if (!particlebodygeometrydetail::meshBytes(scalar.terminalVertices,scalar.terminalIndices,r.sampleLogicalBytes)) return overflow();
     r.descriptorCopyLogicalBytes=sizeof(ValueDescriptor);
@@ -726,7 +724,8 @@ inline bool ParticleBodyGeometryAdmission::deriveScalarCost(
     r.retainedConstant=sizeof(ParticleBodyGeometryAdmission)+sizeof(Data)+sizeof(AdmittedValue);
     if (!checkedAdd(r.retainedConstant,r.descriptorCopyLogicalBytes-sizeof(ValueDescriptor),r.retainedConstant)
         || !checkedAdd(r.retainedConstant,r.retainedSourceSnapshotLogicalBytes,r.retainedConstant)
-        || !checkedAdd(r.retainedConstant,r.sampleLogicalBytes-sizeof(GeometryData),r.retainedConstant)) return overflow();
+        || !checkedAdd(r.retainedConstant,r.sampleLogicalBytes-sizeof(GeometryData),r.retainedConstant)
+        || !addArrayBytes(scalar.operationCount,sizeof(std::shared_ptr<const RetainedMeshData>),r.retainedConstant)) return overflow();
     r.factoryAttemptConstant=r.retainedConstant;
     if (!checkedAdd(r.factoryAttemptConstant,r.sampleLogicalBytes,r.factoryAttemptConstant)
         || !checkedAdd(r.factoryAttemptConstant,r.censusLogicalBytes,r.factoryAttemptConstant)) return overflow();
@@ -756,19 +755,13 @@ inline bool ParticleBodyGeometryAdmission::observeOwnedCapacities(const videowir
     result.attributes=0;
     result.spectrumFields=0;
     result.scoreFields=0;
-    for (auto& record:result.records) {
-        record.attributeName=0;
-        record.retained=false;
-        record.positions=0;
-        record.identities=0;
-        record.indices=0;
-        record.attributes=0;
-        record.importedAnimation=0;
-    }
+    result.records.clear();
     refusal=ParticleBodyGeometryCostRefusal::unsupported;
     const auto& value=source.descriptor(); const auto* mesh=std::get_if<GeometryData>(&value.data);
-    if (value.carrier!=CarrierKind::geometry3D || !mesh || value.operations.empty() || value.operations.size()>32
+    if (value.carrier!=CarrierKind::geometry3D || !mesh || value.operations.empty()
         || !value.attributes.empty() || !value.spectrumFields.empty() || !value.scoreFields.empty()) return false;
+    try { result.records.resize(value.operations.size()); }
+    catch (const std::bad_alloc&) { refusal=ParticleBodyGeometryCostRefusal::allocation; return false; }
     result.observedSource=&source; result.operationCount=value.operations.size();
     result.terminalVertices=mesh->positions.size(); result.terminalIndices=mesh->indices.size();
     result.positions=mesh->positions.capacity(); result.identities=mesh->vertexIds.capacity(); result.indices=mesh->indices.capacity();
@@ -796,7 +789,7 @@ inline bool ParticleBodyGeometryAdmission::instantiateScalarCost(const videowire
 {
     using namespace videowire::geometry;
     refusal=ParticleBodyGeometryCostRefusal::sourceMismatch;
-    if (capacity.observedSource!=&source || !capacity.operationCount || capacity.operationCount>32
+    if (capacity.observedSource!=&source || !capacity.operationCount || capacity.operationCount>capacity.records.size()
         || affine.operationCount!=capacity.operationCount || affine.terminalVertices!=capacity.terminalVertices
         || affine.terminalIndices!=capacity.terminalIndices) return false;
     result=affine;
@@ -861,13 +854,14 @@ inline std::shared_ptr<const ParticleBodyGeometryAdmission> admitParticleBodyGeo
     if (!source || (proxy!=ParticleBodyGeometryProxy::sphere && proxy!=ParticleBodyGeometryProxy::fixedBox)
         || !boundaries || boundaries>limits.maxReplayBoundaries) return refuse("Body geometry admission requires an exact source, proxy and bounded replay boundary count");
     const auto& value=source->descriptor(); const auto* mesh=std::get_if<GeometryData>(&value.data);
-    if (value.carrier!=CarrierKind::geometry3D || !mesh || value.operations.empty() || value.operations.size()>32
+    if (value.carrier!=CarrierKind::geometry3D || !mesh || value.operations.empty()
         || mesh->positions.empty() || mesh->positions.size()>256 || mesh->indices.empty() || mesh->indices.size()>384)
         return refuse("Body geometry admission requires the released Geometry3D source limits");
     if (!value.spectrumFields.empty()) return refuse("Body geometry has no spectrum/history replay source-work schedule");
     if (!value.scoreFields.empty()) return refuse("Body geometry has no canonical Score Field replay source-work schedule");
     auto& r=attempt.recipe;
-    r.censusLogicalBytes=particlebodygeometrydetail::censusLogicalBytes;
+    if (!particlebodygeometrydetail::censusBytes(value.operations.size(),r.censusLogicalBytes))
+        return refuse("Body geometry census arithmetic overflow");
     r.census.operationRecords=value.operations.size();
     // Two complete prior-shape searches per operation, plus terminal lookup.
     if (!checkedMul(value.operations.size(),value.operations.size()-1,r.census.shapeProbes)
@@ -885,10 +879,12 @@ inline std::shared_ptr<const ParticleBodyGeometryAdmission> admitParticleBodyGeo
         || r.censusLogicalBytes>limits.maxFactoryAttemptLogicalBytes)
         return refuse("Body geometry census work reservation is short");
     attempt.censusReserved=true;
-    if (!particlebodygeometrydetail::derive<FactoryEarly::value,FactoryNativeFloor::value>(value,boundaries,proxy,r,error)) {
-        if (error.empty()) error="Body geometry resource arithmetic overflow";
-        return {};
-    }
+    try {
+        if (!particlebodygeometrydetail::derive<FactoryEarly::value,FactoryNativeFloor::value>(value,boundaries,proxy,r,error)) {
+            if (error.empty()) error="Body geometry resource arithmetic overflow";
+            return {};
+        }
+    } catch (const std::bad_alloc&) { return refuse("Body geometry census allocation failed"); }
     // The new factory's own loops: finite/identity/index validation, bounds,
     // enclosing radius, normalized writes, and snapshot/publication copies.
     r.referenceValidation.positionElements=mesh->positions.size();
@@ -921,7 +917,8 @@ inline std::shared_ptr<const ParticleBodyGeometryAdmission> admitParticleBodyGeo
     if (!checkedAdd(r.retainedLogicalBytes,r.sourceLogicalBytes,r.retainedLogicalBytes)
         || !checkedAdd(r.retainedLogicalBytes,r.descriptorCopyLogicalBytes-sizeof(ValueDescriptor),r.retainedLogicalBytes)
         || !checkedAdd(r.retainedLogicalBytes,r.retainedSourceSnapshotLogicalBytes,r.retainedLogicalBytes)
-        || !checkedAdd(r.retainedLogicalBytes,r.sampleLogicalBytes-sizeof(GeometryData),r.retainedLogicalBytes))
+        || !checkedAdd(r.retainedLogicalBytes,r.sampleLogicalBytes-sizeof(GeometryData),r.retainedLogicalBytes)
+        || !addArrayBytes(value.operations.size(),sizeof(std::shared_ptr<const RetainedMeshData>),r.retainedLogicalBytes))
         return refuse("Body geometry retained storage arithmetic overflow");
     r.factoryAttemptLogicalBytes=r.retainedLogicalBytes;
     // One prospective owning descriptor and reference transfer remain covered
@@ -988,7 +985,7 @@ inline std::shared_ptr<const ParticleBodyGeometryAdmission> admitParticleBodyGeo
     attempt.publicationReserved=true;
     try {
         auto snapshot=value;
-        std::array<std::shared_ptr<const RetainedMeshData>,32> owners{};
+        std::vector<std::shared_ptr<const RetainedMeshData>> owners(snapshot.operations.size());
         using ReleasedFixed=NativeBytes<sizeof(ParticleBodyGeometryAdmission),sizeof(ParticleBodyGeometryAdmission::Data),
             sizeof(AdmittedValue),sizeof(ValueDescriptor),sizeof(ValueDescriptor),sizeof(GeometryData),censusLogicalBytes>;
         // Admitted+S is the original live source, with no P1 sharing credit.

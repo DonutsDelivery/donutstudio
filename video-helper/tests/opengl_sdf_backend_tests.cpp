@@ -5,6 +5,7 @@
 
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -333,6 +334,146 @@ std::vector<float> textAttachment (const arbitgpu::NativeSdfSceneFrame& frame,
     return values;
 }
 
+// The nearest surface is the last of 67 translated spheres, so the shader must read
+// past record 64 for this depth to equal the lone sphere's.
+// Past the old 256 expanded steps: sharing runs once per query, and distinct
+// points run every time. Both must draw the same surface as the lone sphere.
+bool verifyDeepProgramsAndBands (std::string& error)
+{
+    using namespace videohelper::sdf;
+    using videowire::SdfOperation;
+    videowire::SdfIr lone;
+    lone.rootId = 1;
+    lone.records = { record (1, SdfOperation::sphere, {}, { 0.6 }) };
+    videowire::SdfIr doubled = lone;
+    for (videowire::SdfStableId level = 2; level <= 21; ++level)
+        doubled.records.push_back (record (level, SdfOperation::unionOp, { level - 1, level - 1 }, {}));
+    doubled.rootId = 21;
+    videowire::SdfIr distinct = lone;
+    videowire::SdfStableId next = 2, previous = 1;
+    for (int level = 0; level < 7; ++level)
+    {
+        const auto first = next++, second = next++, joined = next++;
+        distinct.records.push_back (record (first, SdfOperation::translate, { previous }, { 0.0, 0.0, 0.0 }));
+        distinct.records.push_back (record (second, SdfOperation::translate, { previous }, { 0.0, 0.0, 0.0 }));
+        distinct.records.push_back (record (joined, SdfOperation::unionOp, { first, second }, {}));
+        previous = joined;
+    }
+    distinct.rootId = previous;
+
+    const auto doubledProgram = compileNativeSdfProgram (doubled, error, true);
+    if (! doubledProgram) return false;
+    if (doubledProgram->evaluationSteps() != 21 || doubledProgram->evaluationSlotCount() != 20)
+    {
+        error = "a doubled graph must run each shared record once";
+        return false;
+    }
+    const auto distinctProgram = compileNativeSdfProgram (distinct, error, true);
+    if (! distinctProgram) return false;
+    if (distinctProgram->evaluationSteps() != 3u * 127u + 128u || distinctProgram->evaluationSlotCount() != 0)
+    {
+        error = "records reached at different points must not share a slot";
+        return false;
+    }
+
+    NativeSdfRenderer renderer (arbitgpu::nativeSdfExecutionBackend());
+    NativeSdfRenderControls controls;
+    controls.maximumDistance = 10;
+    controls.maximumSteps = 32;
+    controls.output = arbitgpu::NativeSdfOutput::depth;
+    std::array<std::vector<float>, 3> depths;
+    std::size_t index = 0;
+    for (const auto* source : { &lone, &doubled, &distinct })
+    {
+        auto admission = admitSdfIr (*source, {}, error);
+        if (! admission) return false;
+        auto geometry = std::make_shared<const AdmittedSdfIr> (std::move (*admission));
+        NativeSdfRenderedFrame output;
+        if (! renderer.renderPreview (geometry, { 17, 17 }, controls, kNativeGpuCapability, output, error))
+            return false;
+        if (output.nativeFrame->sdfResourceReceipt().dispatchBands == 0
+            || ! output.nativeFrame->readDepthFloatPixels (depths[index]) || depths[index].size() != 17u * 17u)
+        {
+            error = "deep program bands or depth readback failed";
+            return false;
+        }
+        ++index;
+    }
+    for (std::size_t pixel = 0; pixel < depths[0].size(); ++pixel)
+        if (depths[0][pixel] != depths[1][pixel] || depths[0][pixel] != depths[2][pixel])
+        {
+            error = "a deep program drew a different surface than the sphere it reduces to";
+            return false;
+        }
+    return true;
+}
+
+bool verifyRecordTablePastTheOldUniformArray (std::string& error)
+{
+    using namespace videohelper::sdf;
+    using videowire::SdfOperation;
+    videowire::SdfIr many;
+    videowire::SdfStableId next = 1;
+    for (int leaf = 0; leaf < 67; ++leaf)
+    {
+        const auto sphere = next++;
+        many.records.push_back (record (sphere, SdfOperation::sphere, {}, { leaf == 66 ? 0.6 : 0.01 }));
+        const auto moved = next++;
+        const double away = leaf == 66 ? 0.0 : 40.0 + leaf;
+        many.records.push_back (record (moved, SdfOperation::translate, { sphere }, { away, away, away }));
+    }
+    std::vector<videowire::SdfStableId> level;
+    for (const auto& r : many.records) if (r.operation == SdfOperation::translate) level.push_back (r.stableId);
+    while (level.size() > 1)
+    {
+        std::vector<videowire::SdfStableId> up;
+        for (std::size_t i = 0; i < level.size(); i += 2)
+        {
+            if (i + 1 == level.size()) { up.push_back (level[i]); continue; }
+            many.records.push_back (record (next, SdfOperation::unionOp, { level[i], level[i + 1] }, {}));
+            up.push_back (next++);
+        }
+        level = std::move (up);
+    }
+    many.rootId = level[0];
+    if (many.records.size() != 200) { error = "record table fixture has the wrong size"; return false; }
+
+    videowire::SdfIr lone;
+    lone.rootId = 1;
+    lone.records = { record (1, SdfOperation::sphere, {}, { 0.6 }) };
+    NativeSdfRenderer renderer (arbitgpu::nativeSdfExecutionBackend());
+    NativeSdfRenderControls controls;
+    controls.maximumDistance = 10;
+    controls.output = arbitgpu::NativeSdfOutput::depth;
+    std::array<std::vector<float>, 2> depths;
+    for (std::size_t i = 0; i < 2; ++i)
+    {
+        auto admission = admitSdfIr (i == 0 ? many : lone, {}, error);
+        if (! admission) return false;
+        auto geometry = std::make_shared<const AdmittedSdfIr> (std::move (*admission));
+        NativeSdfRenderedFrame output;
+        if (! renderer.renderPreview (geometry, { 33, 33 }, controls, kNativeGpuCapability, output, error))
+            return false;
+        if (! output.nativeFrame->readDepthFloatPixels (depths[i]) || depths[i].size() != 33u * 33u)
+        {
+            error = "record table depth readback failed";
+            return false;
+        }
+    }
+    std::size_t hits = 0;
+    for (std::size_t i = 0; i < depths[0].size(); ++i)
+    {
+        hits += depths[1][i] < 1.0f ? 1u : 0u;
+        if (std::fabs (depths[0][i] - depths[1][i]) > 0.001f)
+        {
+            error = "a program past record 64 does not draw its last sphere";
+            return false;
+        }
+    }
+    if (hits == 0) { error = "record table fixture hit nothing"; return false; }
+    return true;
+}
+
 bool verifyNativeText (const arbitgl::GlFuncs& gl, std::string& error)
 {
     using namespace videohelper::sdf;
@@ -526,14 +667,10 @@ bool verifyNativeText (const arbitgl::GlFuncs& gl, std::string& error)
     invalid.geometryCacheBytes = renderpassoutput::kMaximumTotalBytes
         - retainedWithoutCache - cacheReceipt.transientUploadBytes + 1;
     if (! reject (invalid)) return fail ("text upload peak escaped the aggregate resource limit");
-    for (const auto dimensions : { NativeSdfRenderDimensions { 1920,1080 }, NativeSdfRenderDimensions { 3840,2160 } })
-    {
-        invalid = direct; invalid.width = dimensions.width; invalid.height = dimensions.height;
-        invalid.textWork = { 1,1,1 };
-        if (! reject (invalid)) return fail ("uncertified full-frame text extent bypassed the unchanged 100M work guard");
-    }
     // Public renderer refusal must retire an earlier successful publication.
-    if (renderer.renderPreview (geometry, { 1920,1080 }, controls, kNativeGpuCapability, sought, error, identity)
+    auto refusedControls = controls;
+    refusedControls.maximumSteps = 513;
+    if (renderer.renderPreview (geometry, { 96, 64 }, refusedControls, kNativeGpuCapability, sought, error, identity)
         || sought.nativeFrame)
         return fail ("refused text render retained the preceding Color frame");
 
@@ -1028,7 +1165,9 @@ int main()
     }
 
     if (! arbitgpu::queryNativeSdfExecution().supports (videowire::SdfOperation::textExtrusion)
-        || ! verifyNativeText (gl, error))
+        || ! verifyNativeText (gl, error)
+        || ! verifyRecordTablePastTheOldUniformArray (error)
+        || ! verifyDeepProgramsAndBands (error))
     {
         std::fprintf (stderr, "OpenGL SDF native text failed: %s\n", error.c_str());
         return 27;

@@ -18,6 +18,7 @@
 namespace
 {
 namespace gt=glasscaustictests;
+std::array<float,3> narrowed(const std::array<double,3>& v){return {float(v[0]),float(v[1]),float(v[2])};}
 namespace gc=arbitgpu::glasscaustics;
 int failures=0,checks=0;
 void check(bool condition,const std::string& text)
@@ -616,6 +617,21 @@ void gratingIncidentContract()
     check(gc::buildGratingStagingFrame(mixedPrepared,fixture.frame.instances,nullptr,32,32,{},mixedFrame,error)
         &&gc::validateTables(mixedPrepared,mixedFrame,error,true),"private mixed staging builds existing query tables with real zero Surface blocks: "+error);
     check(!gc::validateTables(mixedPrepared,mixedFrame,error),"mixed staging cannot enter default Color table gate");
+    check(mixedPrepared.branchPolicy->description().maximumInterfaces==32,"the staging frame above was admitted at policy 32");
+    {
+        // Grating staging keeps 32-interface ancestry, so a policy of 33 is refused.
+        auto description=fixture.policy->description();description.maximumInterfaces=33;
+        const auto deeper=gc::AdmittedBranchPolicy::admit(description,error);
+        check(bool(deeper),"a policy of 33 interfaces is admissible on its own: "+error);
+        gc::Prepared deeperPrepared;gc::Frame deeperFrame;
+        if(deeper)
+        {
+            const bool refused=gc::prepare(mixedGlass,fixture.ordinaryLight,*deeper,deeperPrepared,error)
+                &&!gc::buildGratingStagingFrame(deeperPrepared,fixture.frame.instances,nullptr,32,32,{},deeperFrame,error)
+                &&error.find("admit at most 32 interfaces")!=std::string::npos;
+            check(refused,"a grating staging frame at policy 33 is refused before its 32-byte ancestry overflows: "+error);
+        }
+    }
     std::shared_ptr<const gc::GratingIncidentBinding> mixedBinding;
     check(gc::prepareGratingIncidentBinding(mixedPrepared,mixedFrame,compiledGrating,material,.25,mixedBinding,error),
         "actual compiled distinct owner freezes exact IR/UV witness: "+error);
@@ -1263,10 +1279,10 @@ void directGratingTerminalOrderContract(PreparedDirectGratingCohort& common,
             resolved+=row.orderIrradiance;tiny|=row.orderIrradiance>0&&row.orderIrradiance<1e-24;
             zero|=band.incidentIrradiance==0&&row.orderIrradiance==0;
         }
-        const auto relative=[](double a,double b){return std::abs(a-b)<=2e-10*std::max(a,b);};
+        const auto relative=[](double a,double b){return std::abs(a-b)<=double(diffractionmaterial::ordercore::distributionConsistencyTolerance)*std::max(a,b);};
         check(relative(resolved+band.unresolvedReflectedIrradiance,band.substrateReflectedIrradiance)
             &&relative(band.substrateReflectedIrradiance+band.absorbedIrradiance,band.incidentIrradiance)
-            &&band.absorbedIrradiance==band.incidentIrradiance*(1-distribution.substrateReflectedPower)
+            &&band.absorbedIrradiance==band.incidentIrradiance*(1-double(distribution.substrateReflectedPower))
             &&band.unresolvedReflectedIrradiance==band.incidentIrradiance*distribution.unresolvedReflectedPower,
             "terminal resolved/unresolved/absorbed shares conserve energy without a tiny-value floor");
     }
@@ -2470,7 +2486,7 @@ void gratingCameraReceipts()
             const auto twiceCross=gt::plus(gt::D3{},gt::exterior(qVector,point),2);
             return gt::plus(gt::plus(point,twiceCross,q.w/qLength),gt::exterior(qVector,twiceCross)); };
         diffractionmaterial::DiffractionLocalFrame cameraAxes;
-        cameraAxes.tangent=rotate({1,0,0});cameraAxes.bitangent=rotate({0,1,0});cameraAxes.normal=rotate({0,0,1});
+        cameraAxes.tangent=narrowed(rotate({1,0,0}));cameraAxes.bitangent=narrowed(rotate({0,1,0}));cameraAxes.normal=narrowed(rotate({0,0,1}));
         for(unsigned band=0;band<8;++band) {
             gc::NativeGratingIncident event;event.version=gc::kGratingIncidentVersion;event.complete=true;event.work=band;event.band=band;
             event.interfaces=2;event.ancestry[0]=event.ancestry[1]=65;event.fraction=.5f;event.power=fixture.frame.work[band].incidentPower*.5f;
@@ -2489,14 +2505,15 @@ void gratingCameraReceipts()
             if(!gc::smoothHitDifferential(gc::sub(source->points[1],source->points[0]),event.direction,event.normal,event.dHdu)
                 ||!gc::smoothHitDifferential(gc::sub(source->points[2],source->points[0]),event.direction,event.normal,event.dHdv))
             {check(false,"camera receipt uses exact slanted-plane receiving differential");return {};}
-            const auto incident=gt::normalized(gt::doublePoint(event.normal));
+            const auto incident=narrowed(gt::normalized(gt::doublePoint(event.normal)));
             diffractionmaterial::DiffractionOrderDistribution distribution;
             diffractionmaterial::DiffractionLocalFrame local;
             // Widen and orthonormalize independently of the camera validator.
-            local.normal=gt::normalized(gt::doublePoint(event.normal));
+            const auto wideNormal=gt::normalized(gt::doublePoint(event.normal));
             const auto tangent=gt::doublePoint(event.tangent);
-            local.tangent=gt::normalized(gt::plus(tangent,local.normal,-gt::inner(tangent,local.normal)));
-            local.bitangent=gt::exterior(local.normal,local.tangent);
+            const auto wideTangent=gt::normalized(gt::plus(tangent,wideNormal,-gt::inner(tangent,wideNormal)));
+            local.normal=narrowed(wideNormal);local.tangent=narrowed(wideTangent);
+            local.bitangent=narrowed(gt::exterior(wideNormal,wideTangent));
             if(!diffractionmaterial::evaluateDiffractionOrders(*material,d.spectrum.wavelengthsNanometres[band],local,incident,{0,0},distribution,error))
             {check(false,"camera receipt orders evaluate: "+error);return {};}
             event.substrateReflectedPower=float(event.power*distribution.substrateReflectedPower);event.absorbedPower=float(event.power*(1-distribution.substrateReflectedPower));
@@ -2516,9 +2533,9 @@ void gratingCameraReceipts()
                 else {
                     const double halfY=std::tan(double(fixture.frame.camera.verticalFovRadians)/2),halfX=halfY*fixture.frame.width/fixture.frame.height;
                     const auto outgoing=gt::doublePoint(order.direction);
-                    const double backward=gt::inner(outgoing,cameraAxes.normal);
-                    r.x=std::uint32_t((1-gt::inner(outgoing,cameraAxes.tangent)/(backward*halfX))*.5*fixture.frame.width);
-                    r.y=std::uint32_t((1+gt::inner(outgoing,cameraAxes.bitangent)/(backward*halfY))*.5*fixture.frame.height);
+                    const double backward=gt::inner(outgoing,gt::doublePoint(cameraAxes.normal));
+                    r.x=std::uint32_t((1-gt::inner(outgoing,gt::doublePoint(cameraAxes.tangent))/(backward*halfX))*.5*fixture.frame.width);
+                    r.y=std::uint32_t((1+gt::inner(outgoing,gt::doublePoint(cameraAxes.bitangent))/(backward*halfY))*.5*fixture.frame.height);
                     r.cameraHit=gt::nativeHit(gt::closest(triangles,{2,-2,-2},gt::normalized({-order.direction[0],-order.direction[1],-order.direction[2]}),
                         fixture.frame.camera.nearPlane,fixture.frame.camera.farPlane));
                     // Independent native-shaped raster fixture from the true
@@ -2526,7 +2543,7 @@ void gratingCameraReceipts()
                     const auto pixelRay=gt::normalized(rotate({(2*(r.x+.5)/fixture.frame.width-1)*halfX,
                         (1-2*(r.y+.5)/fixture.frame.height)*halfY,-1}));
                     const auto pixelHit=gt::closest(triangles,{2,-2,-2},pixelRay,fixture.frame.camera.nearPlane,fixture.frame.camera.farPlane);
-                    r.raster={pixelHit.object,pixelHit.material,pixelHit.instance,pixelHit.triangle,float(gt::inner(gt::minus({2,-2,-2},pixelHit.position),cameraAxes.normal))};
+                    r.raster={pixelHit.object,pixelHit.material,pixelHit.instance,pixelHit.triangle,float(gt::inner(gt::minus({2,-2,-2},pixelHit.position),gt::doublePoint(cameraAxes.normal)))};
                     const bool visible=gc::sameTriangle(event.hit,r.cameraHit);
                     r.outcome=visible?gc::NativeGratingCameraReadback::Outcome::Visible:gc::NativeGratingCameraReadback::Outcome::Occluded;
                     diffractionmaterial::DiffractionCameraPixelIntegral integral;
@@ -2615,7 +2632,7 @@ void gratingCameraReceipts()
     auto rotated=make(false,false,true,true,true);
     if(rotated) {
         check(gc::validateGratingCameraReadback(*rotated->binding,rotated->native,rotated->camera->submission,error,&rotated->source),
-            "authored rotated camera and slanted grating retain valid binary64 optics: "+error);
+            "authored rotated camera and slanted grating retain valid optics: "+error);
         check(std::abs(rotated->binding->frame.camera.transform.rotation.z)>.1f
             &&std::abs(rotated->native.gratingIncidents->incidents.front().normal[0])>.1f,
             "rotation and slanted grating orientations remain authored and nontrivial");
@@ -2626,10 +2643,10 @@ void gratingCameraReceipts()
     const gc::Point normal{-.2f/std::sqrt(1.04f),0,1/std::sqrt(1.04f)};
     const gc::Point tangent{normal[2],0,-normal[0]};
     check(gc::gratingCameraOpticalFrame(tangent,{0,1,0},normal,corrected)
-        &&std::abs(gt::inner(corrected.normal,corrected.normal)-1)<1e-10
-        &&std::abs(gt::inner(corrected.tangent,corrected.normal))<1e-10
-        &&gt::inner(gt::exterior(corrected.tangent,corrected.bitangent),corrected.normal)>1-1e-10,
-        "native slanted frame converts to unit orthogonal right-handed binary64 axes");
+        &&std::abs(gt::inner(gt::doublePoint(corrected.normal),gt::doublePoint(corrected.normal))-1)<diffractionmaterial::ordercore::directionTolerance
+        &&std::abs(gt::inner(gt::doublePoint(corrected.tangent),gt::doublePoint(corrected.normal)))<diffractionmaterial::ordercore::directionTolerance
+        &&gt::inner(gt::exterior(gt::doublePoint(corrected.tangent),gt::doublePoint(corrected.bitangent)),gt::doublePoint(corrected.normal))>1-diffractionmaterial::ordercore::directionTolerance,
+        "native slanted frame converts to unit orthogonal right-handed axes");
     for(unsigned mode=0;mode<5;++mode) {
         auto t=tangent,b=gc::Point{0,1,0},n=normal;
         if(mode==0)t[0]=std::numeric_limits<float>::quiet_NaN();
@@ -2642,8 +2659,8 @@ void gratingCameraReceipts()
             &&corrected.tangent==unchanged.tangent&&corrected.bitangent==unchanged.bitangent&&corrected.normal==unchanged.normal,
             "nonfinite degenerate mirrored or excessive native optical correction refuses without output mutation");
     }
-    std::array<double,3> direction{1,2,3};
-    check(!gc::gratingCameraUnitDirection({0,0,1.001f},direction)&&direction==std::array<double,3>{1,2,3},
+    std::array<float,3> direction{1,2,3};
+    check(!gc::gratingCameraUnitDirection({0,0,1.001f},direction)&&direction==std::array<float,3>{1,2,3},
         "oversized incident length correction refuses without output mutation");
     auto legacy=make(false,false,false);if(legacy) {
         legacy->camera->physicalColor=true;
@@ -3238,14 +3255,40 @@ void branches()
     const auto policy=gc::AdmittedBranchPolicy::admit(description,error);
     check(bool(policy),error);if(!policy)return;
     check(!gc::AdmittedBranchPolicy::admit({},error),"absent explicit error policy cannot silently enable reflected caustics");
-    for(unsigned mode=0;mode<4;++mode)
+    check(description.maximumInterfaces==32&&gc::kMaximumInterfaces==48&&gc::kMaximumAncestryInterfaces==32,
+        "the default policy keeps 32 interfaces below the smooth 48 ceiling");
+    {auto deep=description;deep.maximumInterfaces=gc::kMaximumInterfaces;
+     check(bool(gc::AdmittedBranchPolicy::admit(deep,error)),"a smooth policy may reach the 48 interface ceiling: "+error);}
+    for(unsigned mode=0;mode<5;++mode)
     {
         auto invalid=description;
+        if(mode==4)invalid.maximumInterfaces=gc::kMaximumInterfaces+1;
         if(mode==0)invalid.maximumUnresolvedFraction=std::numeric_limits<float>::quiet_NaN();
         if(mode==1)invalid.minimumBranchFraction=2*description.maximumUnresolvedFraction;
         if(mode==2)invalid.maximumVisits=gc::kMaximumBranchVisits+1;
         if(mode==3)invalid.maximumUnresolvedFraction=2*gc::kMaximumUnresolvedFraction;
         check(!gc::AdmittedBranchPolicy::admit(invalid,error),"unbounded or invalid policy cannot admit discarded branch power");
+    }
+    {
+        // Rough paths store one ancestry byte per interface in 32 bytes, so frame
+        // admission refuses a policy above 32 on them. Smooth paths take 33 to 48.
+        const auto policyWith=[&](std::size_t interfaces) {
+            auto limited=description;limited.maximumInterfaces=interfaces;
+            const auto admitted=gc::AdmittedBranchPolicy::admit(limited,error);
+            return admitted?std::make_shared<const gc::AdmittedBranchPolicy>(*admitted):nullptr;
+        };
+        const arbitgpu::smoothglass::RoughNativeConsumer consumer{arbitgpu::NativeFixtureMaterialBackend::OpenGl,true,true,true};
+        for(const std::size_t interfaces:{std::size_t(32),std::size_t(33)})
+        {
+            auto rough=gt::roughFixture();rough.policy=policyWith(interfaces);
+            const bool admitted=rough.prepare(error,consumer);
+            if(interfaces==32)check(admitted,"a rough frame at policy 32 is admitted: "+error);
+            else check(!admitted&&error.find("admit at most 32 interfaces")!=std::string::npos,
+                "a rough frame at policy 33 is refused before its 32-byte ancestry overflows: "+error);
+            auto smooth=gt::roughFixture(0);smooth.policy=policyWith(interfaces);
+            const bool smoothAdmitted=smooth.prepare(error);
+            check(smoothAdmitted,"a smooth frame is admitted at policy "+std::to_string(interfaces)+": "+error);
+        }
     }
     const auto reflectedObject=fixture.scene->objects[2].id.value;
     const auto fraction=[&](const auto& receipt,std::uint32_t object) {
@@ -4769,7 +4812,8 @@ GpuMirrorFootprint gpuMirrorFootprint(const gc::Frame& frame,gc::Point position,
         +0.5f*length(cross(sub(corner[2],corner[0]),sub(corner[3],corner[0])));
     out.status=1;return out;
 }
-// Starter visual.lighthouse-and-ocean camera at 3840x2160. The sphere lens hangs
+// Starter visual.lighthouse-glass-caustics camera at 3840x2160 (the open
+// lighthouse starter shares this camera). The sphere lens hangs
 // in front of the lantern, clear of the tower and the rock, so the tower front z=-0.875
 // and the rock top y=0.375 are camera-visible caustic receivers. The test
 // uses those two planes only; no lens vertex enters it.
@@ -5107,10 +5151,12 @@ void splatDeposition()
         gc::splatGatherWorkCapOverride().store(0);
     }
     const gc::SplatPixelQuery expensive=[&](std::uint32_t x,std::uint32_t y,Hit& hit,std::string&) {
-        hit=hitAt(0,float(x)+.5f,float(y)+.5f);hit.work=std::uint32_t(gc::kMaximumSplatCpuQueryWork/2+1);return true;
+        hit=hitAt(0,float(x)+.5f,float(y)+.5f);hit.work=UINT32_MAX;return true;
     };
-    check(!gc::buildSplatReference(frame,deposits,expensive,single,error)&&error.find("CPU query work")!=std::string::npos,
-        "CPU splat query work over its budget refuses: "+error);
+    gc::SplatReference expensiveReference;
+    check(gc::buildSplatReference(frame,deposits,expensive,expensiveReference,error)
+        &&expensiveReference.queryWork>=std::uint64_t(UINT32_MAX),
+        "CPU splat query work grows with the scene BVH and passes at the largest hit work: "+error);
     {
         // The readback bound at 4K. Four deposits with disjoint 65x65 windows
         // query 16900 distinct wall pixels. At 10000 work each that is 161 Mi,
@@ -5138,10 +5184,10 @@ void splatDeposition()
             bigDeposit(1,1000.5f,600.5f),bigDeposit(1,1400.5f,1000.5f)};
         gc::SplatReference wide4k;
         check(gc::buildSplatReference(big,spread,bigWall,wide4k,error)&&wide4k.pixelQueries>=4*gc::kSplatWindow*gc::kSplatWindow
-            &&wide4k.queryWork>gc::kMaximumQueryWork&&wide4k.queryWork<=gc::kMaximumSplatCpuQueryWork,
-            "4K splat validation past 128 Mi of CPU query work stays inside its own cap: "+error);
-        check(std::uint64_t(3400000)<=gc::kMaximumSplatCpuPixelQueries&&std::uint64_t(3400000)*80<=gc::kMaximumSplatCpuQueryWork,
-            "the 4K faceted lens estimate of 3.4 Mi pixels at 80 work fits the CPU splat caps");
+            &&wide4k.queryWork>gc::kMaximumQueryWork,
+            "4K splat validation passes past 128 Mi of CPU query work: "+error);
+        check(std::uint64_t(3400000)<=gc::kMaximumSplatCpuPixelQueries,
+            "the 4K faceted lens estimate of 3.4 Mi pixels fits the CPU splat pixel map");
     }
     check(gc::nativeSplatMathSource().find("float causticSplatKernel(")!=std::string::npos
         &&gc::nativeMathSource().find("causticSplatKernel")==std::string::npos,
@@ -5451,8 +5497,7 @@ void facetedLensAdmission()
     check(admitted,"a 4K lens frame at 64 visits passes admission: "+error);if(!admitted)return;
     const auto paths=std::uint64_t(full.work.size());
     check(paths==3072,"the lens traces 24 sunlit triangles x 16 entries x 8 bands");
-    check(full.bounds.maximumDeposits==paths*64&&full.bounds.queryWork<=gc::kMaximumFrameQueryWork,
-        "the lens frame reserves 64 trace slots per path inside the frame query cap");
+    check(full.bounds.maximumDeposits==paths*64,"the lens frame reserves 64 trace slots per path");
     auto splat=full;
     const bool enabled=gc::enableSplat(fixture.prepared,splat,error);
     check(enabled&&splat.splatVersion==gc::kSplatVersion,"the 4K lens frame schedules the splat, not single-pixel deposits: "+error);
@@ -5467,19 +5512,24 @@ void facetedLensAdmission()
         "the lens splat scratch fits the frame memory budget and the scratch index range: "+error);
     check(gc::validateTables(fixture.prepared,splat,error),"the lens splat frame passes the native table validation: "+error);
     // The lighthouse lens sits in a bigger scene BVH, 514 to 624 work per query.
-    // Its native bound passes the frame cap while the CPU diagnostic trace of the
-    // same frame stays under kMaximumQueryWork and refuses on its own.
+    // Its native bound passes while the CPU diagnostic trace of the same frame
+    // stays under kMaximumQueryWork and refuses on its own.
     auto lighthouse=full;auto& allowance=lighthouse.query.texels[std::size_t(lighthouse.query.control[0])-1];
     allowance[0]=624;allowance[1]=0;
     gc::ResourceBounds bounds;
     check(gc::calculateResourceBounds(fixture.prepared,lighthouse,bounds,error)&&bounds.queryWork==paths*194*624
         &&bounds.queryWork>gc::kMaximumQueryWork,"lighthouse BVH work over the CPU diagnostic cap passes frame admission: "+error);
-    check(!gc::diagnosticQueryWorkWithinBudget(lighthouse,paths*(2*(gc::kMaximumInterfaces+3)+64),error)
+    check(!gc::diagnosticQueryWorkWithinBudget(lighthouse,paths*(2*(gc::kDefaultPolicyInterfaces+3)+64),error)
         &&error.find("CPU diagnostic")!=std::string::npos,"the CPU diagnostic trace of that frame keeps its own cap: "+error);
-    const auto over=gc::kMaximumFrameQueryWork/(paths*194)+1;
-    allowance[0]=float(over);
-    check(over<65536&&!gc::calculateResourceBounds(fixture.prepared,lighthouse,bounds,error)
-        &&error.find("path/camera query work")!=std::string::npos,"BVH work past the frame query cap refuses: "+error);
+    // A 12000-triangle glass BVH allows about 20000 work per query, 11 Gi for
+    // this frame and past the old 1 Gi frame cap. The largest allowance the query
+    // encoding holds still fits 64 bits.
+    allowance[0]=20000;allowance[1]=0;
+    check(gc::calculateResourceBounds(fixture.prepared,lighthouse,bounds,error)&&bounds.queryWork==paths*194*20000,
+        "BVH work of a 12000-triangle scene passes frame admission: "+error);
+    allowance[0]=65535;allowance[1]=65535;
+    check(gc::calculateResourceBounds(fixture.prepared,lighthouse,bounds,error)&&bounds.queryWork==paths*194*std::uint64_t(UINT32_MAX),
+        "the largest encodable BVH allowance passes frame admission: "+error);
 }
 }
 void legacyLightRecordsAccepted()
@@ -5610,7 +5660,7 @@ void previewCameraWalkBudget()
     const auto preview=sg::cameraWalkBudget(true,1000,560);
     check(preview.sharedDispersionWalk&&preview.pairVisits==sg::kPreviewCameraVisits&&preview.dispersivePairVisits==sg::kPreviewCameraVisits
         &&preview.singleVisits==sg::kPreviewCameraVisits&&preview.singleChannelWalks==1&&preview.roughSamples==sg::kRoughInterfaceSamples
-        &&!preview.bandFinish,"a viewport preview walks once with 12 visits and flushes its bands without a wait");
+        &&!preview.bandFinish,"a viewport preview walks once with 6 visits and flushes its bands without a wait");
     check(!sg::cameraWalkBudget(true,2560,1440).bandFinish&&sg::cameraWalkBudget(true,3840,2160).bandFinish,
         "a preview above 2560x1440 still finishes each band");
     for(const bool paired:{false,true})
@@ -5619,7 +5669,7 @@ void previewCameraWalkBudget()
         check(exported==sg::transportShader(false,true,false,paired),"the export transport text is deterministic");
         const auto previewText=sg::previewCameraTransportShader(exported);
         check(!previewText.empty(),"every Preview anchor is present exactly once");
-        check(previewText.find("#define GLASS_PREVIEW_VISITS 12")!=std::string::npos
+        check(previewText.find("#define GLASS_PREVIEW_VISITS 6")!=std::string::npos
             &&previewText.find("for(int visit=0;visit<GLASS_PREVIEW_VISITS;++visit) {")!=std::string::npos
             &&previewText.find("for(int visit=0;visit<64;++visit) {")==std::string::npos,"the preview single walk is capped");
         check(exported.find("GLASS_PREVIEW")==std::string::npos&&exported.find("for(int visit=0;visit<64;++visit) {")!=std::string::npos,
@@ -5627,6 +5677,18 @@ void previewCameraWalkBudget()
         if(paired)check(previewText.find("int walks=1,visits=GLASS_PREVIEW_VISITS;")!=std::string::npos
             &&exported.find("int walks=sharedPaths?1:3,visits=sharedPaths?48:16;")!=std::string::npos,
             "the paired walk shares one walk in preview and keeps 1/3 walks and 48/16 visits in export");
+        // Preview ends a branch still inside the volume on the environment; export absorbs it.
+        const std::string absorbedLeftover="    return inside?vec3(0.0):weight*glassEnvironment(direction GX_PASS);\n";
+        const std::string previewLeftover="vec3 glassPairLeftover(vec3 direction,float weight,bool inside GX_ARGS) {\n"
+            "    return weight*glassEnvironment(direction GX_PASS);\n";
+        if(paired)check(previewText.find(previewLeftover)!=std::string::npos&&previewText.find(absorbedLeftover)==std::string::npos
+            &&exported.find(absorbedLeftover)!=std::string::npos&&exported.find(previewLeftover)==std::string::npos
+            &&previewText.find("if(rayInside) truncated+=weight;")!=std::string::npos
+            &&previewText.find("if(media[slot]) truncated+=weights[slot];")!=std::string::npos
+            &&previewText.find("if(truncated>GLASS_PAIR_TRUNCATED) trapped=true;")!=std::string::npos,
+            "a preview inside leftover takes the environment and still counts as truncated; export keeps it absorbed");
+        if(!paired)check(exported.find("glassPairLeftover")==std::string::npos&&previewText.find("glassPairLeftover")==std::string::npos,
+            "the single-volume text has no paired leftover");
     }
     check(sg::previewCameraTransportShader("vec3 unrelated();").empty(),"a text without the anchors builds no preview variant");
 }

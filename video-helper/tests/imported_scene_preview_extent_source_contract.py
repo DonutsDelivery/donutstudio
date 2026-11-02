@@ -53,10 +53,28 @@ need(re.search(r"if \(renderedExtent != nullptr && use == NativeImportedSceneRen
 
 # The viewport computes the extent from the canvas, the presentation framebuffer
 # and the zoom bucket, and hands it to both imported scene prepare calls.
-need(re.search(r"previewSceneExtent = videohelper::previewextent::fitToPresentation \(\s*"
+need(re.search(r"previewSceneExtent = videohelper::previewextent::sceneExtent \(\s*"
                r"cw > 0 \? cw : fbW, ch > 0 \? ch : fbH, fbW, fbH,\s*"
-               r"videohelper::previewextent::zoomBucket \(viewZoom_\.load\(\)\)\);", viewport),
-     "viewport must fit the canvas into the framebuffer with the zoom bucket")
+               r"videohelper::previewextent::zoomBucket \(viewZoom_\.load\(\)\),\s*"
+               r"fullCanvasScene_\.load\(\)\);", viewport),
+     "viewport must fit the canvas into the framebuffer with the zoom bucket, or honor a full canvas request")
+need("std::atomic<bool> fullCanvasScene_ { false };" in (src / "viewport.h").read_text(),
+     "the full canvas request must default to off")
+
+# The request travels from the command to the helper, and a helper restart keeps it.
+main_cpp = (src / "main.cpp").read_text()
+need('method == "viewport_set_full_canvas_scene"' in main_cpp
+     and "g_viewport.setFullCanvasScene (" in main_cpp,
+     "the helper must route viewport_set_full_canvas_scene to the viewport")
+plugin = root.parent / "plugin/Source"
+need('method == "video_set_full_canvas_scene"' in (plugin / "CommandServer.cpp").read_text(),
+     "the command server must dispatch video_set_full_canvas_scene")
+need("viewportSetFullCanvasScene(enabled)" in (plugin / "CommandServerVideoClips.cpp").read_text(),
+     "the command must reach the sidecar")
+need('sendRequest ("viewport_set_full_canvas_scene"' in (plugin / "VideoSidecar.h").read_text(),
+     "the sidecar must send the request to the helper")
+need("viewportReassertFullCanvasScene();" in (plugin / "PluginProcessorVideoRender.cpp").read_text(),
+     "the viewport sync must replay the request after a helper restart")
 need(len(re.findall(r"&previewSceneExtent, &(?:importedScene|particleScene)RenderedExtent,", viewport)) == 2,
      "both viewport imported scene prepare calls must pass the preview extent")
 need(len(re.findall(r"recordImportedScenePreviewExtent \(", viewport)) == 2,

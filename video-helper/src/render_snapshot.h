@@ -251,6 +251,18 @@ inline std::vector<CompiledVisualLayerPlan> normalizedVisualLayerPlans (
     return normalized;
 }
 
+// Each clip selects one plan, so a selected index occurs once and moving it is safe.
+inline std::vector<CompiledVisualLayerPlan> normalizedVisualLayerPlans (
+    std::vector<CompiledVisualLayerPlan>&& plans)
+{
+    const auto selected = normalizedVisualLayerPlanIndices(plans);
+    std::vector<CompiledVisualLayerPlan> normalized;
+    normalized.reserve(selected.size());
+    for (const auto index : selected)
+        normalized.push_back(std::move(plans[index]));
+    return normalized;
+}
+
 inline const CompiledVisualLayerPlan* findVisualLayerPlan (
     const std::vector<CompiledVisualLayerPlan>& plans, int clipId)
 {
@@ -1197,7 +1209,7 @@ inline bool validateCompiledVisualLayerPlans (
                 "visual.3d.imported-animation", "visual.deformation.imported",
                 "visual.score.note-collection", "visual.3d.note-instanced-mesh",
                 "visual.3d.render", "visual.3d.transform", "visual.3d.camera.perspective",
-                "visual.3d.light.directional", "visual.depth.fog",
+                "visual.3d.light.directional", "visual.3d.light.environment", "visual.depth.fog",
                 "visual.material.diffraction-grating", "visual.material.diffractive-foil",
                 "visual.surface.constant.scalar", "visual.surface.constant.uint",
                 "visual.surface.constant.vec2", "visual.surface.constant.vec3",

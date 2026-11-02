@@ -171,8 +171,8 @@ void checkImmediateEmissionIgnoresCredit()
           "an immediate emission rate is unchanged by score emission credit");
 }
 
-// Adapter events share the replay's 512-event cap. A window of 520 notes is
-// refused only when the emission adapter is on, and the refusal names it.
+// Every event in the window reaches the visitor. A window of 520 notes loses none
+// of them with the emission adapter on, and adds none with it off.
 void checkAdapterEventsShareCap()
 {
     std::vector<arbitmod::Note> crowd;
@@ -186,14 +186,11 @@ void checkAdapterEventsShareCap()
     auto packedEmit = packed;
     packedEmit.scoreEmitGain = 1.0f;
     const auto window = particleReplayWindow(packedEmit, 9.0);
-    const auto noop = [](std::int64_t, const ParticleScoreEvent&) {};
-    check(visitParticleScoreEvents(packed, window, noop, 0.0, 0.0, 0.0)
-          && !visitParticleScoreEvents(packedEmit, window, noop, 0.0, 1.0, 0.0),
-          "520 weighted onsets exceed the shared 512-event cap only with a positive emission gain");
-    check(particleEventCapDiagnostic(packedEmit, window, "generic cap").find("Score note impulse") != std::string::npos,
-          "the cap refusal names score note adapters when one is active");
-    check(particleEventCapDiagnostic(packed, window, "generic cap") == "generic cap",
-          "the cap refusal without adapters keeps its generic diagnostic");
+    int plainEvents = 0, emissionEvents = 0;
+    visitParticleScoreEvents(packed, window, [&](std::int64_t, const ParticleScoreEvent&) { ++plainEvents; }, 0.0, 0.0, 0.0);
+    visitParticleScoreEvents(packedEmit, window, [&](std::int64_t, const ParticleScoreEvent& event)
+        { if (event.emission > 0) ++emissionEvents; }, 0.0, 1.0, 0.0);
+    check(plainEvents == 0 && emissionEvents == 520, "520 weighted onsets in the window give 520 emission events");
 }
 }
 

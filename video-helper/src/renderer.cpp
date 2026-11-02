@@ -429,10 +429,11 @@ uniform int uShapeOperation;
 uniform vec4 uShapeColor;
 uniform vec4 uShapeGradient; // x = 1 draws a gradient, yz = unit direction (cos, sin)
 uniform vec4 uShapeColorB;   // gradient end colour; uShapeColor is the start colour
+uniform vec4 uCanvasRect;    // minU, minV, maxU, maxV of the canvas in RawUV space
 
-bool shapeContains(vec4 rect) {
+bool shapeContains(vec2 p, vec4 rect) {
     vec2 halfSize = max(abs(rect.zw) * 0.5, vec2(0.0));
-    vec2 local = abs(RawUV - rect.xy);
+    vec2 local = abs(p - rect.xy);
     bool inside;
     if (rect.z < 0.0) {
         if (any(lessThanEqual(halfSize, vec2(0.0))))
@@ -449,15 +450,24 @@ bool shapeContains(vec4 rect) {
 }
 
 void main() {
+    // RawUV spans the whole buffer, but the shape and the gradient are authored
+    // against the canvas, exactly as the export reads them. The canvas maps them
+    // back; without it the shape stretched to the buffer height and the gradient
+    // filled the letterbox beside the canvas. Outside the canvas the export has no
+    // pixels at all, so nothing is drawn there.
+    vec2 canvasSpan = max(uCanvasRect.zw - uCanvasRect.xy, vec2(1e-6));
+    vec2 uv = (RawUV - uCanvasRect.xy) / canvasSpan;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+        discard;
     if (uShapeGradient.x > 0.5) {
         // Same ramp as the synthesised Gradient generator: 0 is left to right,
-        // positive angles turn toward the frame bottom (RawUV rows run down).
-        float t = clamp(dot(RawUV - vec2(0.5), uShapeGradient.yz) + 0.5, 0.0, 1.0);
+        // positive angles turn toward the frame bottom (uv rows run down).
+        float t = clamp(dot(uv - vec2(0.5), uShapeGradient.yz) + 0.5, 0.0, 1.0);
         FragColor = mix(uShapeColor, uShapeColorB, t);
         return;
     }
-    bool insideA = shapeContains(uShapeRect);
-    bool insideB = uShapeOperation == 0 ? false : shapeContains(uShapeRectB);
+    bool insideA = shapeContains(uv, uShapeRect);
+    bool insideB = uShapeOperation == 0 ? false : shapeContains(uv, uShapeRectB);
     bool inside = uShapeOperation == 1 ? (insideA || insideB)
                 : uShapeOperation == 2 ? (insideA && insideB)
                 : uShapeOperation == 3 ? (insideA && !insideB)
@@ -1707,6 +1717,7 @@ bool FrameRenderer::initialize (const arbitgl::GlFuncs* gl, int outWidth, int ou
     drawShape_.uColor     = loc (drawShape_.prog, "uShapeColor");
     drawShape_.uGradient  = loc (drawShape_.prog, "uShapeGradient");
     drawShape_.uColorB    = loc (drawShape_.prog, "uShapeColorB");
+    drawShape_.uCanvasRect = loc (drawShape_.prog, "uCanvasRect");
 
     blend_.uTransform = loc (blend_.prog, "uTransform");
     blend_.uCrop      = loc (blend_.prog, "uCrop");
@@ -3609,11 +3620,12 @@ std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseDec
 }
 
 std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseLinearImageForDisplay(
-    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error)
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame,
+    colortransform::ToneMap viewTransform, std::string& error)
 {
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
     if (frame && frame->backend() == "metal" && metalRenderer_ != nullptr)
-        return metalRenderer_->leaseLinearImageForDisplay(frame, error);
+        return metalRenderer_->leaseLinearImageForDisplay(frame, viewTransform, error);
 #endif
     error.clear();
     if (!frame || gl_ == nullptr) { error = "Linear image conversion requires a native frame"; return {}; }
@@ -3642,7 +3654,7 @@ std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> FrameRenderer::leaseLin
         ? copyTopFirstOpenGlTexture(*gl_, descriptor, error) : frame;
     if (!source) return {};
     colortransform::AdmissionFailure failure;
-    const auto transform = nativeLinearImageToSrgb({descriptor.width, descriptor.height}, failure);
+    const auto transform = nativeLinearImageToSrgb({descriptor.width, descriptor.height}, viewTransform, failure);
     if (!transform)
     { error = "Linear image display transform was rejected: " + std::string(colortransform::token(failure)); return {}; }
     const auto view = static_cast<unsigned>(source->colorTextureViewHandle());
@@ -4015,7 +4027,7 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
 #endif
     SdrNativeImageLayers displayInputs;
     if (!displayInputs.prepare(layers, numLayers, hdrImageCapture_,
-            [&](const auto& frame, auto& error) { return leaseLinearImageForDisplay(frame, error); }, lastError_))
+            [&](const auto& frame, auto viewTransform, auto& error) { return leaseLinearImageForDisplay(frame, viewTransform, error); }, lastError_))
         return 0;
     if (!displayInputs.layers.empty()) layers = displayInputs.layers.data();
     if (!validateLinearSceneComposite(layers, numLayers, numOverlays, hdrImageCapture_, lastError_))
@@ -4358,6 +4370,16 @@ unsigned FrameRenderer::renderComposite (const LayerDesc* layers, int numLayers,
             glClear (GL_COLOR_BUFFER_BIT);
             gl_->UseProgram (drawShape_.prog);
             setPassthrough (drawShape_.uTransform, drawShape_.uCrop);
+            // The canvas in this pass's buffer UV, computed the way every layer's
+            // transform and the canvas frame pass get it. RawUV alone spans the whole
+            // buffer, so without this the shape and gradient ignored the canvas.
+            float shapeZoomX, shapeZoomY, shapePanX, shapePanY;
+            viewMap (shapeZoomX, shapeZoomY, shapePanX, shapePanY);
+            gl_->Uniform4f (drawShape_.uCanvasRect,
+                            (shapePanX - shapeZoomX + 1.0f) * 0.5f,
+                            (shapePanY - shapeZoomY + 1.0f) * 0.5f,
+                            (shapePanX + shapeZoomX + 1.0f) * 0.5f,
+                            (shapePanY + shapeZoomY + 1.0f) * 0.5f);
             gl_->Uniform4f (drawShape_.uRect, use->drawShapeCx, use->drawShapeCy,
                              use->drawShapeEllipse ? -std::max (use->drawShapeW, 0.0f)
                                                    : std::max (use->drawShapeW, 0.0f),

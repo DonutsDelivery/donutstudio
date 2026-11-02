@@ -42,9 +42,14 @@ assert "mix(uShapeColor, uShapeColorB, t)" in renderer
 assert "gradient[4]" in metal and "colorB[4]" in metal
 assert "mix(p.color, p.colorB, t)" in metal
 size = re.search(r"sizeof \(MetalDrawShapeParams\) == (\d+)", metal)
-assert size and int(size.group(1)) == 96, "Metal draw-shape uniform size changed"
-# Four float4 rows of the old block plus colorB and gradient: 6 * 16 bytes.
-assert "float4 colorB; float4 gradient;" in metal
+assert size and int(size.group(1)) == 112, "Metal draw-shape uniform size changed"
+# Four float4 rows of the old block plus colorB, gradient and the canvas rect: 7 * 16 bytes.
+assert "float4 colorB; float4 gradient; float4 canvasRect;" in metal
+# Both backends map RawUV through the canvas: the shape and gradient are authored
+# against the canvas, and outside it the export has no pixels at all.
+assert "uCanvasRect" in renderer and "uCanvasRect" in renderer_h
+assert "vec2 uv = (RawUV - uCanvasRect.xy) / canvasSpan;" in renderer
+assert "shapeCanvasRect" in metal
 
 # Recipe wiring: both overlay starters feed Blend port 3 and carry visible values.
 assert "{ gradient, 0 }, { blend, 3 }" in recipes

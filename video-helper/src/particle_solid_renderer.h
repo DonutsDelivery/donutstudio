@@ -194,9 +194,11 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
     }
     // All bodies draw as one instanced scene object. Each collider is one more.
     const int contacts=(state.colliders.meshIdentity ? 1:0)+state.colliders.pointCount;
-    if (state.count<0 || state.count>kParticleSolidMaxBodies || contacts<0 || state.colliders.pointCount>64
-        || (state.count>0 ? 1:0)+contacts>int(Visual3DScene::kMaxObjects) || nodeId==0) {
-        error="Solid 3D draw exceeds 128 bodies or 63 collider objects; reduce Count or collider points";
+    // kParticleSolidMaxBodies and the 64 collider points size the solver's fixed
+    // state arrays. The scene itself grows to hold whatever they produce.
+    if (state.count<0 || state.count>kParticleSolidMaxBodies || contacts<0 || state.colliders.pointCount>64 || nodeId==0) {
+        error="Solid 3D solver state holds "+std::to_string(kParticleSolidMaxBodies)+" bodies and 64 collider points; this draw has "
+            +std::to_string(state.count)+" bodies and "+std::to_string(state.colliders.pointCount)+" points";
         return {};
     }
     if (prior) {
@@ -249,6 +251,11 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
             for (const auto& v:geometry.positions) radius=std::max(radius,std::hypot(std::hypot(v.x-center.x,v.y-center.y),v.z-center.z));
             if (!std::isfinite(radius) || radius<=1.0e-7f) { error="Rigid body mesh has no finite bounding sphere"; return {}; }
         }
+        {
+            Visual3DSceneGrowth body;
+            body.vertices=geometry.positions.size(); body.indices=geometry.indices.size();
+            if (!growVisual3DScene(*scene,body,error)) return {};
+        }
         bodyFirstVertex=scene->vertexCount; bodyFirstIndex=scene->indexCount;
         bodyVertices=geometry.positions.size(); bodyIndices=geometry.indices.size();
         for (const auto& v:geometry.positions)
@@ -279,6 +286,12 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
     scene->materials[0].alphaMode=p.alpha<1 ? SceneAlphaMode::Blend:SceneAlphaMode::Opaque;
     scene->materials[1].id={2}; scene->materials[1].baseColor={0.3f,0.34f,0.4f};
     scene->materials[1].doubleSided=true;
+    {
+        Visual3DSceneGrowth records;
+        records.objects=std::size_t(contacts)+2;
+        records.materials=2;
+        if (!growVisual3DScene(*scene,records,error)) return {};
+    }
     scene->materialCount=2;
     const auto object=[&](SceneVec3 position,SceneVec3 scale,std::uint32_t firstVertex,std::uint32_t vertices,
                           std::uint32_t firstIndex,std::uint32_t indices,std::uint32_t material)->SceneObjectRecord& {
@@ -323,9 +336,10 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
         if (!validateSolidTriangleFrame(state.colliders,work,error)) return {};
         const auto firstVertex=static_cast<std::uint32_t>(scene->vertexCount),firstIndex=static_cast<std::uint32_t>(scene->indexCount);
         const auto& surface=state.colliders;
-        if (surface.meshVertexCount>Visual3DScene::kMaxVertices-scene->vertexCount
-            || surface.meshTriangleCount*3>Visual3DScene::kMaxIndices-scene->indexCount)
-        { error="Authored triangle collider exceeds the retained scene budget"; return {}; }
+        Visual3DSceneGrowth colliderGrowth;
+        colliderGrowth.vertices=surface.meshVertexCount;
+        colliderGrowth.indices=std::size_t(surface.meshTriangleCount)*3;
+        if (!growVisual3DScene(*scene,colliderGrowth,error)) return {};
         for (std::uint32_t vertex=0;vertex<surface.meshVertexCount;++vertex) {
             const auto& point=surface.meshVertices[vertex];
             scene->vertices[scene->vertexCount++].position={point[0],point[1],point[2]};
@@ -401,9 +415,6 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> appendParticleSo
     using namespace HarmonicMIDI::grid;
     const auto refuse=[&](const char* reason)->std::shared_ptr<const Visual3DScene> { error=reason; return {}; };
     const auto& binding=*p.geometryBinding;
-    if (std::size_t(state.count)>Visual3DScene::kMaxObjects-source->objectCount
-        || source->materialCount==Visual3DScene::kMaxMaterials)
-        return refuse("Imported solid composition exceeds the remaining object or material budget");
     if (prior && (prior->previous.count<0 || prior->previous.count>kParticleSolidMaxBodies
         || !std::isfinite(prior->previousBodyRadius) || prior->previousBodyRadius<=0))
         return refuse("Solid 3D Motion prior frame has an invalid body count or radius");
@@ -415,10 +426,13 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> appendParticleSo
     const std::uint32_t first=p.geometryBinding->body ? 6u:0u;
     const std::uint32_t firstIndex=p.geometryBinding->body ? 24u:0u;
     const auto vertices=mesh->vertexCount-first, indices=mesh->indexCount-firstIndex;
-    if (vertices>Visual3DScene::kMaxVertices-source->vertexCount
-        || indices>Visual3DScene::kMaxIndices-source->indexCount)
-        return refuse("Imported solid composition exceeds the remaining vertex or index budget");
     auto result=std::make_shared<Visual3DScene>(*source);
+    {
+        Visual3DSceneGrowth appended;
+        appended.vertices=vertices;appended.indices=indices;
+        appended.objects=std::size_t(state.count);appended.materials=1;
+        if (!growVisual3DScene(*result,appended,error)) return {};
+    }
     const auto freeId=[](const auto& records,std::size_t count) {
         std::uint32_t id=1;
         while (std::any_of(records.begin(),records.begin()+count,[&](const auto& record) { return record.id.value==id; })) ++id;

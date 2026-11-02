@@ -22,8 +22,10 @@ class ImportedScenePayloadExecution;
 class NativeSceneAnimationCompositionBudget final
 {
 public:
-    static constexpr std::size_t kMaximumBytes = 8 * 1024 * 1024;
-    static constexpr std::uint64_t kMaximumWork = 4ull * 1024 * 1024 * 1024;
+    // Counter ranges for checked arithmetic, far above anything a machine can
+    // hold. They are not a scene ceiling: real allocations fail on their own.
+    static constexpr std::size_t kMaximumBytes = std::size_t(1) << 56;
+    static constexpr std::uint64_t kMaximumWork = std::uint64_t(1) << 60;
     struct Charge final
     {
         std::shared_ptr<NativeSceneAnimationCompositionBudget> budget;
@@ -162,8 +164,7 @@ private:
     std::shared_ptr<const arbitgpu::NativeDeformationScene> source_;
     visualanimationimport::Request selection_;
     std::optional<std::uint32_t> sourceCameraNodeId_;
-    std::array<RecordMapping, HarmonicMIDI::grid::Visual3DScene::kMaxCameras
-        + HarmonicMIDI::grid::Visual3DScene::kMaxLights> mappings_ {};
+    std::vector<RecordMapping> mappings_;
     std::size_t mappingCount_ = 0;
     std::uint64_t structural_ = 0, evaluation_ = 0, project_ = 0, helper_ = 0;
     int renderClip_ = 0;

@@ -205,6 +205,7 @@ constexpr double kXyzToSrgb[3][3] { { 3.2404542, -1.5371385, -0.4985314 },
                                     { -0.9692660, 1.8760108, 0.0415560 },
                                     { 0.0556434, -0.2040259, 1.0572252 } };
 
+#if ! defined(__CUDACC__)
 struct Tables
 {
     float weight[kTableSize][3] {};  // linear sRGB per nm, each channel integrates to 1
@@ -288,8 +289,30 @@ const Tables& tables() noexcept
     static const Tables instance;
     return instance;
 }
+#endif
 
-Vec3 lookup (const float (&table)[kTableSize][3], float nm) noexcept
+// Device code reads the same values from the buffers the host uploads.
+using TableRow = float[3];
+
+PT_SHARED_ENTRY const TableRow* basisTable() noexcept
+{
+#if defined(__CUDACC__)
+    return device::deviceLookupTables().spectrumBasis;
+#else
+    return tables().basis;
+#endif
+}
+
+PT_SHARED_ENTRY const TableRow* weightTable() noexcept
+{
+#if defined(__CUDACC__)
+    return device::deviceLookupTables().spectrumWeight;
+#else
+    return tables().weight;
+#endif
+}
+
+PT_SHARED_ENTRY Vec3 lookup (const TableRow* table, float nm) noexcept
 {
     const float position = std::min (std::max ((nm - kWavelengthMinNm) / kTableStepNm, 0.0f),
                                      static_cast<float> (kTableSize - 1));
@@ -300,21 +323,21 @@ Vec3 lookup (const float (&table)[kTableSize][3], float nm) noexcept
              table[k][2] + (table[k + 1][2] - table[k][2]) * t };
 }
 
-float wrapWavelength (float nm) noexcept
+PT_SHARED_ENTRY float wrapWavelength (float nm) noexcept
 {
     if (nm >= kWavelengthMaxNm)
         nm -= kWavelengthSpanNm;
-    return std::min (std::max (nm, kWavelengthMinNm), std::nextafter (kWavelengthMaxNm, kWavelengthMinNm));
+    return std::min (std::max (nm, float (kWavelengthMinNm)), std::nextafter (kWavelengthMaxNm, kWavelengthMinNm));
 }
 
 } // namespace
 
-Wavelengths rgbChannels() noexcept
+PT_SHARED_ENTRY Wavelengths rgbChannels() noexcept
 {
     return {};
 }
 
-Wavelengths sampleHeroWavelengths (float u) noexcept
+PT_SHARED_ENTRY Wavelengths sampleHeroWavelengths (float u) noexcept
 {
     Wavelengths out;
     out.spectral = true;
@@ -326,7 +349,7 @@ Wavelengths sampleHeroWavelengths (float u) noexcept
     return out;
 }
 
-Spectrum upsampleRgb (Vec3 rgb, const Wavelengths& wavelengths) noexcept
+PT_SHARED_ENTRY Spectrum upsampleRgb (Vec3 rgb, const Wavelengths& wavelengths) noexcept
 {
     Spectrum out;
     if (! wavelengths.spectral)
@@ -336,42 +359,40 @@ Spectrum upsampleRgb (Vec3 rgb, const Wavelengths& wavelengths) noexcept
         out[2] = rgb.z;
         return out;
     }
-    const Tables& t = tables();
     for (int i = 0; i < kSpectrumChannels; ++i)
     {
-        const Vec3 b = lookup (t.basis, wavelengths.nm[static_cast<std::size_t> (i)]);
+        const Vec3 b = lookup (basisTable(), wavelengths.nm[static_cast<std::size_t> (i)]);
         out[i] = std::max (0.0f, rgb.x * b.x + rgb.y * b.y + rgb.z * b.z);
     }
     return out;
 }
 
-Vec3 channelsToRgb (const Spectrum& value, const Wavelengths& wavelengths) noexcept
+PT_SHARED_ENTRY Vec3 channelsToRgb (const Spectrum& value, const Wavelengths& wavelengths) noexcept
 {
     if (! wavelengths.spectral)
         return { value[0], value[1], value[2] };
-    const Tables& t = tables();
     const float scale = kWavelengthSpanNm / static_cast<float> (kSpectrumChannels);
     Vec3 rgb {};
     for (int i = 0; i < kSpectrumChannels; ++i)
     {
         if (value[i] == 0.0f)
             continue;
-        rgb = rgb + lookup (t.weight, wavelengths.nm[static_cast<std::size_t> (i)]) * (value[i] * scale);
+        rgb = rgb + lookup (weightTable(), wavelengths.nm[static_cast<std::size_t> (i)]) * (value[i] * scale);
     }
     return rgb;
 }
 
-Vec3 rgbBasisAt (float nm) noexcept
+PT_SHARED_ENTRY Vec3 rgbBasisAt (float nm) noexcept
 {
-    return lookup (tables().basis, nm);
+    return lookup (basisTable(), nm);
 }
 
-Vec3 rgbMatchingWeightAt (float nm) noexcept
+PT_SHARED_ENTRY Vec3 rgbMatchingWeightAt (float nm) noexcept
 {
-    return lookup (tables().weight, nm);
+    return lookup (weightTable(), nm);
 }
 
-float cauchyIor (float iorD, float cauchyB, float nm) noexcept
+PT_SHARED_ENTRY float cauchyIor (float iorD, float cauchyB, float nm) noexcept
 {
     if (! (cauchyB != 0.0f) || ! std::isfinite (cauchyB))
         return iorD;
@@ -380,7 +401,7 @@ float cauchyIor (float iorD, float cauchyB, float nm) noexcept
     return iorD + cauchyB * (1.0f / (micrometres * micrometres) - 1.0f / (reference * reference));
 }
 
-float cauchyBFromAbbe (float iorD, float abbe) noexcept
+PT_SHARED_ENTRY float cauchyBFromAbbe (float iorD, float abbe) noexcept
 {
     if (! std::isfinite (abbe) || ! (abbe > 0.0f) || ! std::isfinite (iorD) || ! (iorD > 1.0f))
         return 0.0f;
@@ -389,5 +410,15 @@ float cauchyBFromAbbe (float iorD, float abbe) noexcept
     // n_F - n_C = B (1 / f^2 - 1 / c^2) = (n_d - 1) / V.
     return (iorD - 1.0f) / abbe / (1.0f / (f * f) - 1.0f / (c * c));
 }
+
+#if ! defined(__CUDACC__)
+void exportSpectrumTables (device::DeviceLookupTables& out) noexcept
+{
+    const Tables& t = tables();
+    out.spectrumWeight = t.weight;
+    out.spectrumBasis = t.basis;
+    out.spectrumRows = kTableSize;
+}
+#endif
 
 } // namespace videohelper::pathtrace

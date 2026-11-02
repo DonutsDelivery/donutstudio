@@ -6,6 +6,9 @@
 namespace videohelper::geometry::coupledwaterbudget {
 using namespace videorender;
 using namespace watersourcebudget;
+// Coupled replay still has a fixed schedule, and its limit goes before
+// evaluateCoupled gets a product caller. Uncoupled Water has no such length.
+inline constexpr double kCoupledMaximumSeconds = 10;
 using videowire::geometry::OperationRecord;
 using videowire::geometry::GeometryData;
 using videowire::geometry::WaterSurfaceGrid;
@@ -39,7 +42,7 @@ inline bool preflight(const ParticleHistorySource& source,
         return refuse("Water source budget requires finite time anchors");
     recipe.projectQuerySeconds = projectSeconds + (requestedSeconds - sceneSeconds);
     if (!std::isfinite(recipe.projectQuerySeconds) || recipe.projectQuerySeconds < 0
-        || recipe.projectQuerySeconds > waterreplay::kMaximumSeconds)
+        || recipe.projectQuerySeconds > kCoupledMaximumSeconds)
         return refuse("Water source budget requires a project query from zero through 10 seconds");
     // The callback's canonical clock uses the global anchor, not the query.
     if (!frame || !source.score || !std::isfinite(frame->key.fps) || frame->key.fps <= 0)
@@ -107,7 +110,7 @@ inline bool preflight(const ParticleHistorySource& source,
         || !checkedMultiply(v, 4, wave) || !checkedMultiply(v, recipe.steps, copied)
         || !checkedMultiply(recipe.audioPrefix, 5, audioScalars) || !checkedMultiply(recipe.audioPrefix, 64, bands))
         return refuse("Water source schedule overflow");
-    recipe.impulseCapacity = std::min<std::uint64_t>(kParticleReplayMaxEvents, candidates);
+    recipe.impulseCapacity = candidates;
     if (!watersourcebudget::checkedAdd(recipe.steps, recipe.impulseCapacity, checks)
         || !checkedMultiply(recipe.impulseCapacity, 4, deposits) || !checkedMultiply(copied, 7, heightReads))
         return refuse("Water step schedule overflow");
@@ -169,9 +172,10 @@ inline constexpr std::array<const char*,static_cast<std::size_t>(Work::count)> n
 }};
 struct Limits final {
   watersourcebudget::Limits source;
-  std::size_t maxRetainedBytes=256u*1024u*1024u, maxScratchBytes=256u*1024u*1024u, maxComparisonBytes=256u*1024u*1024u;
+  std::size_t maxRetainedBytes=std::numeric_limits<std::size_t>::max(), maxScratchBytes=std::numeric_limits<std::size_t>::max(),
+      maxComparisonBytes=std::numeric_limits<std::size_t>::max();
   std::array<std::uint64_t,static_cast<std::size_t>(Work::count)> work;
-  Limits() { work.fill(1000000000000ULL); }
+  Limits() { work.fill(std::numeric_limits<std::uint64_t>::max()); }
 };
 struct Recipe final {
   watersourcebudget::Recipe source;
@@ -247,7 +251,7 @@ inline bool complete(const ParticleParams& p,const OperationRecord& operation,co
   std::uint64_t eventCandidates=0;
   if (!checkedMultiply(p.geometryCount==0 ? r.source.sourceNotes:0,2,eventCandidates)
       || !watersourcebudget::checkedAdd(eventCandidates,p.history->hasAudio() ? r.source.sourceAudioFrames:0,eventCandidates)) return false;
-  r.events=std::min<std::uint64_t>(kParticleReplayMaxEvents,eventCandidates);
+  r.events=eventCandidates;
   if (!watersourcebudget::checkedAdd(r.source.steps,r.events,r.intervals) || !watersourcebudget::checkedAdd(r.intervals,1,r.intervals)) return false;
   const auto K=r.intervals;
   std::uint64_t H=0,G=0,canonicalChecks=0,sourceChecks=0,boundaries=0,parameterCopies=0,sourceCopies=0,previousHeightPasses=0;

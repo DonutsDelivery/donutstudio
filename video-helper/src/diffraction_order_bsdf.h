@@ -1,6 +1,7 @@
 #pragma once
 
 #include "diffraction_material_admission.h"
+#include "diffraction_order_core.h"
 
 #include <array>
 #include <cstddef>
@@ -9,49 +10,6 @@
 
 namespace diffractionmaterial
 {
-inline constexpr std::size_t kMaximumDiffractionBsdfOrders
-    = (2u * kMaximumDiffractionOrder + 1u)
-        * (2u * kMaximumDiffractionOrder + 1u);
-
-struct DiffractionLocalFrame
-{
-    std::array<double, 3> tangent { 1.0, 0.0, 0.0 };
-    std::array<double, 3> bitangent { 0.0, 1.0, 0.0 };
-    std::array<double, 3> normal { 0.0, 0.0, 1.0 };
-};
-
-struct DiffractionOrder
-{
-    std::int8_t primary = 0;
-    std::int8_t secondary = 0;
-    std::array<double, 3> direction {};
-    // Canonical support is exact: reflectedPower and selectionProbability are
-    // either both zero or both positive. The sampler assigns normalization
-    // rounding, bounded by its validation tolerance, to the last positive bin.
-    double reflectedPower = 0.0;
-    double selectionProbability = 0.0;
-    double angularStandardDeviationRadians = 0.0;
-};
-
-struct DiffractionOrderDistribution
-{
-    std::array<DiffractionOrder, kMaximumDiffractionBsdfOrders> orders {};
-    std::size_t orderCount = 0;
-    double substrateReflectedPower = 0.0;
-    double resolvedReflectedPower = 0.0;
-    double unresolvedReflectedPower = 0.0;
-};
-
-struct DiffractionOrderSample
-{
-    DiffractionOrder order;
-    std::size_t orderIndex = 0;
-    // Probability mass for this discrete order. This is not a solid-angle PDF.
-    // A future angular-lobe sampler must report its directional density separately.
-    double pdf = 0.0;
-    double throughput = 0.0;
-};
-
 // Perspective pinhole angular box filter. Axes are camera right, up, and
 // backward, so cross(right, up) == backward. Rows are top first. Adjacent
 // pixels partition the angular domain using [x,x+1) and [y,y+1).
@@ -94,20 +52,25 @@ struct DiffractionCameraPixelIntegral
 // must establish incident-area/Jacobian and exact source/camera/visibility owners.
 bool integrateDiscreteDiffractionCameraPixel(const AdmittedDiffractionMaterialIR& material,
     std::size_t wavelengthBand, const DiffractionLocalFrame& gratingFrame,
-    const std::array<double, 3>& incidentDirection, const DiffractionCameraIncident& incident,
+    const std::array<float, 3>& incidentDirection, const DiffractionCameraIncident& incident,
     const DiffractionCameraPixel& pixel, DiffractionCameraPixelIntegral& result,
     std::string& error) noexcept;
 
 bool evaluateDiffractionOrders(const AdmittedDiffractionMaterialIR& material,
-                               double wavelengthNanometres,
+                               float wavelengthNanometres,
                                const DiffractionLocalFrame& frame,
-                               const std::array<double, 3>& incidentDirection,
-                               const std::array<double, 2>& materialUv,
+                               const std::array<float, 3>& incidentDirection,
+                               const std::array<float, 2>& materialUv,
                                DiffractionOrderDistribution& result,
-                               std::string& error) noexcept;
+                               std::string& error,
+                               // Index of the medium the grating sits in, at this wavelength.
+                               float mediumIndex = 1.0f,
+                               // A spatial foil's grating at this point, in place of the
+                               // material's own: reciprocal direction in uv and period.
+                               const LocalGrating* local = nullptr) noexcept;
 
 bool sampleDiffractionOrder(const DiffractionOrderDistribution& distribution,
-                            double unitSample,
+                            float unitSample,
                             DiffractionOrderSample& result,
                             std::string& error) noexcept;
 } // namespace diffractionmaterial

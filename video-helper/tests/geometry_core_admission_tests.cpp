@@ -1,4 +1,5 @@
 #include "../src/geometry_core_admission.h"
+#include "../src/diffraction_uv_validation.h"
 #include "../src/glb_scene_adapter.h"
 #include "../src/mix_analyze.h"
 #include "../../shared/GeometryAudioDeformer.h"
@@ -1139,6 +1140,130 @@ void ownerIdentityAndBoundedLeases() {
   check(!runtime.admitPreview(invalid, bytes, ResourceLimits{}, {}, error),
         "incomplete owner identity fails closed");
 }
+// The grooved disc composes its plane disc through the same runtime scene
+// builder every Geometry3D value uses. The native diffraction transport then
+// refuses a surface whose material uv has degenerate derivatives on any
+// triangle, so the composed scene must carry the plane's generator uv.
+void groovedDiscPlaneCarriesUvThroughSceneCompose() {
+  auto contract = contractFor(CarrierKind::geometry3D);
+  contract.maxVertices = 4096;
+  contract.maxIndices = 12288;
+  std::string error;
+  auto value = lowerMeshGenerator(501, 501, 1, OperationCode::plane, {2, 3, 0, 0},
+                                  contract, error);
+  check(value.has_value(), "disc plane lowers");
+  if (!value) return;
+  const auto admitted = admitValue(*value, contract, error);
+  check(admitted.has_value(), "disc plane admits");
+  if (!admitted) return;
+  auto scene = std::make_unique<HarmonicMIDI::grid::Visual3DScene>();
+  HarmonicMIDI::grid::SceneObjectRecord object; object.id = {70};
+  HarmonicMIDI::grid::SceneMaterialRecord material; material.id = {10};
+  material.baseColor = {1, 1, 1};
+  check(appendGeometryToScene(*admitted, object, material, *scene, error),
+        error.c_str());
+  check(scene->objectCount == 1, "disc plane composes one scene object");
+  if (scene->objectCount != 1) return;
+  check(videorender::fixture3d::hasValidUvDerivatives(*scene, scene->objects[0]),
+        "composed disc plane carries non-degenerate uv derivatives for native diffraction");
+  check(videorender::fixture3d::hasUnitUvDomain(*scene, scene->objects[0]),
+        "composed disc plane uv stays in the admitted unit domain");
+}
+
+// R2's smooth glass ring has 13,824 indices, past the default 12,288. A 49 x 49
+// grid has the same index count, and a default scene must grow to hold it.
+void sceneCompositionGrowsToTheGlassRingSize() {
+  auto contract = contractFor(CarrierKind::geometry3D);
+  contract.maxVertices = 4096;
+  contract.maxIndices = 13824;
+  std::string error;
+  const auto grid = lowerGrid(511, 511, 1, 49, 49, 0.1f, contract, error);
+  const auto ring = grid ? admitValue(*grid, contract, error) : std::nullopt;
+  const auto cube = lowerMeshGenerator(512, 512, 1, OperationCode::cube, {1, 1, 1, 0}, contract, error);
+  const auto floor = cube ? admitValue(*cube, contract, error) : std::nullopt;
+  check(ring.has_value() && floor.has_value(), "ring-sized grid and cube admit");
+  if (!ring || !floor) return;
+  auto scene = std::make_unique<HarmonicMIDI::grid::Visual3DScene>();
+  scene->id = {7}; scene->activeCamera = {50}; scene->cameras[0].id = {50}; scene->cameraCount = 1;
+  scene->cameras[0].transform.translation.z = 4;
+  HarmonicMIDI::grid::SceneObjectRecord object; object.id = {70};
+  HarmonicMIDI::grid::SceneMaterialRecord material; material.id = {10}; material.baseColor = {1, 1, 1};
+  check(appendGeometryToScene(*ring, object, material, *scene, error), error.c_str());
+  object.id = {71}; material.id = {11};
+  check(appendGeometryToScene(*floor, object, material, *scene, error), error.c_str());
+  check(scene->indexCount == 13824 + 36 && scene->vertexCount == 2401 + 24,
+        "a ring-sized scene keeps every vertex and index");
+  check(scene->objects[1].firstIndex == 13824 && scene->objects[1].firstVertex == 2401,
+        "the second object starts after the ring's ranges");
+  check(scene->indices.size() >= scene->indexCount && scene->vertices.size() >= scene->vertexCount,
+        "composition grows the buffers it fills");
+  check(scene->objects.size() == HarmonicMIDI::grid::Visual3DScene::kInitialObjects,
+        "composition leaves a buffer that already fits at its length");
+  check(HarmonicMIDI::grid::validateVisual3DScene(*scene).valid(), "the grown scene validates");
+}
+
+// 1,000,000 triangles of shared corners: 1001 x 501 grid, 3,000,000 indices.
+void sceneCompositionAdmitsOneMillionTriangles() {
+  auto contract = contractFor(CarrierKind::geometry3D);
+  contract.maxVertices = kMaximumVertices;
+  contract.maxIndices = kMaximumIndices;
+  std::string error;
+  const auto grid = lowerGrid(513, 513, 1, 1001, 501, 0.01f, contract, error);
+  const auto admitted = grid ? admitValue(*grid, contract, error) : std::nullopt;
+  check(admitted.has_value(), "the million-triangle grid admits");
+  if (!admitted) return;
+  auto scene = std::make_unique<HarmonicMIDI::grid::Visual3DScene>();
+  HarmonicMIDI::grid::SceneObjectRecord object; object.id = {70};
+  HarmonicMIDI::grid::SceneMaterialRecord material; material.id = {10};
+  check(appendGeometryToScene(*admitted, object, material, *scene, error), error.c_str());
+  check(scene->indexCount == 3000000 && scene->vertexCount == 501501,
+        "a default scene grows to one million triangles");
+}
+
+// Live counts stand in for real records, so one cube passes every former cap
+// and former floor: 501501 vertices, 3000000 indices, 1000 objects, 256 materials.
+// Red under the old code because the budget and floor constants refused this
+// size or the append stopped at them.
+void sceneCompositionGrowsPastEveryFormerCap() {
+  HarmonicMIDI::grid::Visual3DSceneCapacity large = HarmonicMIDI::grid::kVisual3DSceneDefaultCapacity;
+  large.vertices = 501501; large.indices = 3000000; large.objects = 1000; large.materials = 256;
+  auto contract = contractFor(CarrierKind::geometry3D);
+  contract.maxVertices = 4096;
+  contract.maxIndices = 12288;
+  std::string error;
+  const auto cube = lowerMeshGenerator(514, 514, 1, OperationCode::cube, {1, 1, 1, 0}, contract, error);
+  const auto admitted = cube ? admitValue(*cube, contract, error) : std::nullopt;
+  check(admitted.has_value(), "large scene cube admits");
+  if (!admitted) return;
+  auto scene = std::make_unique<HarmonicMIDI::grid::Visual3DScene>();
+  const auto allocation = HarmonicMIDI::grid::allocateVisual3DSceneBuffers(*scene, large);
+  check(allocation.allocated(), allocation.message.c_str());
+  if (!allocation.allocated()) return;
+  HarmonicMIDI::grid::SceneObjectRecord object; object.id = {70};
+  HarmonicMIDI::grid::SceneMaterialRecord material; material.id = {10};
+  scene->vertexCount = large.vertices - 24; scene->indexCount = large.indices - 36;
+  scene->objectCount = large.objects - 1; scene->materialCount = large.materials - 1;
+  check(appendGeometryToScene(*admitted, object, material, *scene, error), error.c_str());
+  check(scene->vertexCount == large.vertices && scene->indexCount == large.indices
+            && scene->objectCount == large.objects && scene->materialCount == large.materials,
+        "one append fills the allocated buffers exactly");
+  object.id = {71}; material.id = {11};
+  check(appendGeometryToScene(*admitted, object, material, *scene, error), error.c_str());
+  check(scene->vertexCount == large.vertices + 24 && scene->indexCount == large.indices + 36
+            && scene->objectCount == large.objects + 1 && scene->materialCount == large.materials + 1,
+        "the next append grows past them");
+  check(scene->vertices.size() >= scene->vertexCount && scene->indices.size() >= scene->indexCount
+            && scene->objects.size() >= scene->objectCount && scene->materials.size() >= scene->materialCount,
+        "composition grows the buffers it fills");
+  const auto vertices = scene->vertexCount;
+  HarmonicMIDI::grid::Visual3DSceneGrowth huge;
+  huge.vertices = ~std::size_t{};
+  error.clear();
+  check(!HarmonicMIDI::grid::growVisual3DScene(*scene, huge, error) && error.find("overflows") != std::string::npos
+            && scene->vertexCount == vertices,
+        "a growth whose size overflows reports it and changes no count");
+}
+
 void meshGeneratorsRoundtripAndRejectInvalidPlans() {
   auto contract = contractFor(CarrierKind::geometry3D);
   contract.maxVertices = 4096;
@@ -1168,6 +1293,18 @@ void meshGeneratorsRoundtripAndRejectInvalidPlans() {
     const auto &mesh = std::get<GeometryData>(value->data);
     check(mesh.positions.size() == fixture.vertices && mesh.indices.size() == fixture.indices,
           "mesh generator has the declared exact topology");
+    if (fixture.code == OperationCode::plane) {
+      // The plane carries corner uv so uv-driven materials (the diffraction
+      // grating's Radial groove field) have real coordinates on graph geometry.
+      check(mesh.uv.size() == mesh.positions.size(),
+            "plane generator carries uv for every vertex");
+      check(mesh.uv.size() == 4
+              && mesh.uv[0].x == 0 && mesh.uv[0].y == 0
+              && mesh.uv[1].x == 1 && mesh.uv[1].y == 0
+              && mesh.uv[2].x == 0 && mesh.uv[2].y == 1
+              && mesh.uv[3].x == 1 && mesh.uv[3].y == 1,
+            "plane uv runs corner to corner in vertex order");
+    }
     for (std::size_t i = 0; i < mesh.positions.size(); ++i) {
       check(mesh.vertexIds[i] == i + 1, "mesh vertex identity follows deterministic construction order");
       const auto &p = mesh.positions[i];
@@ -1239,7 +1376,7 @@ void meshGeneratorsRoundtripAndRejectInvalidPlans() {
   for (const auto &fixture : std::array<Fixture, 5>{{
       {OperationCode::sphere,{1,3.5f,4,0},0,0},
       {OperationCode::sphere,{1,1000000,1000000,0},0,0},
-      {OperationCode::icosphere,{1,9,0,0},0,0},
+      {OperationCode::icosphere,{1,15,0,0},0,0},
       {OperationCode::cylinder,{1,2,2,0},0,0},
       {OperationCode::cube,{1,1,std::numeric_limits<float>::infinity(),0},0,0}}})
     check(!lowerMeshGenerator(501,501,1,fixture.code,fixture.parameters,contract,error),
@@ -3717,6 +3854,20 @@ void surfaceTableAndFieldTransport() {
     check(reopened && surfacematerialfield::evaluate(reopened->front().fields[0],evaluation,0,reopenedBlock,end,error)
         && property(reopenedBlock,target)==property(laterBlock,target),"Surface Field replay is unchanged by transport/reopen");
   }
+  // Unit gain sends dispersion 0.1 and 0.55 at these times, far above 0.02.
+  auto dispersionField=reactiveSurfaceField(12,error);
+  check(dispersionField.has_value(),"Dispersion Field fixture admits");
+  if (dispersionField) {
+    dispersionField->sample.gain=1;
+    auto firstDispersion=*base,laterDispersion=*base;
+    std::array<float,3> dispersionEnd{};
+    evaluation.timelineSeconds=0;
+    check(surfacematerialfield::evaluate(*dispersionField,evaluation,0,firstDispersion,dispersionEnd,error),"Dispersion Field evaluates first sample");
+    evaluation.timelineSeconds=3;
+    check(surfacematerialfield::evaluate(*dispersionField,evaluation,0,laterDispersion,dispersionEnd,error),"Dispersion Field evaluates later sample");
+    check(std::abs(laterDispersion.transmissionIorClearcoat[3]-firstDispersion.transmissionIorClearcoat[3]-.45f)<1e-5f,
+        "Surface Field carries dispersion above 0.02 without rewriting it down");
+  }
   auto indexed=*field; indexed.objectIndex=true; indexed.sample.reduction=materialfield::Reduction::index;
   auto block=*base; std::array<float,3> end{};
   check(surfacematerialfield::evaluate(indexed,evaluation,3,block,end,error)
@@ -4078,13 +4229,13 @@ void retainedSdfSurfaceReplay() {
     }
     check(outer && cutter,"CSG retains both exact outer and subtraction primitive IDs");
   }
-  // A shared DAG can have exponential evaluator work despite a small record count.
+  // A shared DAG evaluates each record once per query, so its expanded size costs nothing.
   auto expensive=fineRequest;
   for(unsigned i=0;i<28;++i) {
     SdfRecord v; v.stableId=9800+i; v.operation=SdfOperation::unionOp; v.inputCount=2;
     v.inputs={expensive.geometry.rootId,expensive.geometry.rootId}; expensive.geometry.records.push_back(v); expensive.geometry.rootId=v.stableId;
   }
-  check(!lowerSdfSurface(9700,9701,1,expensive,c,error),"Sample times expanded IR work refuses an exponential shared DAG");
+  check(lowerSdfSurface(9700,9701,1,expensive,c,error).has_value(),"An exponentially expanding shared DAG lowers without a work refusal");
   auto oldValue=geometryValue(); const auto oldContract=contractFor(CarrierKind::geometry3D);
   const auto old=admitValue(oldValue,oldContract,error);
   if(old) {
@@ -4347,18 +4498,9 @@ void retainedSdfTextSurfaceReplay() {
     unite.inputs={changed.geometry.rootId,changed.geometry.rootId};
     changed.geometry.records.push_back(unite); changed.geometry.rootId=unite.stableId;
   }
-  refusal(changed,"Expanded text segment work refuses the unchanged hundred-million visit cap");
-  check(error=="SDF text evaluation work capacity exceeded","Segment work refuses before the looser two-hundred-million sample cap");
-  changed.geometry.records.resize(4); changed.geometry.rootId=9912;
-  sdfsurface::Budget sharedBudget;
-  check(sdfsurface::inspect(changed,sharedBudget,error) && sharedBudget.textSegmentVisits<100000000
-      && sharedBudget.textSegmentVisits*2>100000000,"Two individually admitted text surfaces can exceed the aggregate segment cap");
-  auto aggregate=*value; aggregate.operations[0].sdfSurface=std::make_shared<const sdfsurface::Request>(changed);
-  aggregate.operations.push_back(aggregate.operations[0]); aggregate.operations.back().stableId=9920;
-  BudgetReceipt receipt;
-  check(!inspectValue(aggregate,AdmissionContext{},receipt,error)
-      && error=="SDF surface plan exceeds aggregate sample work or temporary memory",
-      "Geometry Core rejects aggregate retained text segment work before replay");
+  sdfsurface::Budget expandedBudget;
+  check(sdfsurface::inspect(changed,expandedBudget,error) && expandedBudget.textSegmentVisits==32*budget.textSegmentVisits,
+      "Text segment work counts every expanded edge and refuses nothing");
 }
 
 void typedSpectrumDomainsRetainSourcesAndSamples() {
@@ -5227,10 +5369,23 @@ void timelineSceneFamiliesRetainExactChildrenAndBudgets() {
   check(!budgets.admitTimelineScenePreview(owner,*scene,bindings,shortIndices,error),"complete scene shares the backend index cap");
   ResourceLimits shortBytes; shortBytes.maxBufferBytes=1;
   check(!budgets.admitTimelineScenePreview(owner,*scene,bindings,shortBytes,error),"logical storage refuses before parser/scene allocation");
-  changed=bindings; changed[1].loweredPlan.assign(kMaximumTimelineScenePlanBytes,'0');
-  check(!budgets.admitTimelineScenePreview(owner,*scene,changed,{},error),"aggregate text/binary capacity refuses oversized later children");
   changed.assign(65,bindings[0]);
-  check(!budgets.admitTimelineScenePreview(owner,*scene,changed,{},error),"family binding capacity remains 64");
+  check(!budgets.admitTimelineScenePreview(owner,*scene,changed,{},error),"duplicate bindings refuse at any family size");
+  // 65 distinct children pass the former family cap of 64.
+  auto wide=std::make_shared<Visual3DScene>();
+  wide->id={9}; wide->activeCamera={50}; wide->cameraCount=1;
+  wide->cameras[0]=scene->cameras[0];
+  std::vector<TimelineSceneBinding> wideBindings;
+  for (std::uint32_t i=0;i<65;++i) {
+    HarmonicMIDI::grid::SceneObjectRecord wideObject; wideObject.id={1000+i};
+    HarmonicMIDI::grid::SceneMaterialRecord wideMaterial=scene->materials[0]; wideMaterial.id={2000+i};
+    check(appendGeometryToScene(*a,wideObject,wideMaterial,*wide,error),error.c_str());
+    wideBindings.push_back({wideObject.id,bindings[0].loweredPlan});
+  }
+  check(HarmonicMIDI::grid::validateVisual3DScene(*wide).valid(),"the 65-child scene validates");
+  GeometryCorePlanRuntime wideRuntime(backend,1);
+  const auto wideFamily=wideRuntime.admitTimelineScenePreview(owner,*wide,wideBindings,{},error);
+  check(wideFamily && wideFamily->children().size()==65,"a family of 65 children admits, above the former cap of 64");
   ResourceLimits exhausted; exhausted.maxOperations=0;
   check(!decodeTimelineScenePlan(bindings[0],exhausted,error),"limits-aware decoder refuses exhausted remaining budget");
   check(bool(decodeTimelineScenePlan(bindings[0],error)),"old timeline decoder overload remains available");
@@ -5270,11 +5425,11 @@ void timelineSceneFamiliesRetainExactChildrenAndBudgets() {
       "effective backend operation cap is shared across all children");
 
   // Authentic transform-only ancestors and one exclusive retained-mesh leaf.
-  // Identity transforms keep the longest valid hierarchy non-singular.
+  // Identity transforms keep a long hierarchy non-singular.
   auto deep=std::make_shared<Visual3DScene>();
   deep->id={8}; deep->activeCamera={50}; deep->cameraCount=1;
   deep->cameras[0]=scene->cameras[0];
-  for (std::size_t i=0;i<Visual3DScene::kMaxObjects-1;++i) {
+  for (std::size_t i=0;i<Visual3DScene::kInitialObjects-1;++i) {
     deep->objects[i].id={static_cast<std::uint32_t>(i+1)};
     if (i) deep->objects[i].parent={static_cast<std::uint32_t>(i)};
     ++deep->objectCount;
@@ -5330,7 +5485,7 @@ void timelineSceneFamiliesRetainExactChildrenAndBudgets() {
       "short retained/attempt storage refuses before the invalid hierarchy is traversed");
   GeometryCorePlanRuntime invalidRuntime(backend,1);
   check(!invalidRuntime.admitTimelineScenePreview(deepNext,*invalid,deepBinding,{},error)
-      && error=="Timeline scene family requires a valid scene and 1..64 exact bindings"
+      && error=="Timeline scene family requires a valid scene and exact bindings"
       && invalidRuntime.admissionsInGeneration()==0,
       "admitted work schedule still refuses a cyclic hierarchy before publication");
   invalid->objects[0].parent={999};
@@ -5339,10 +5494,10 @@ void timelineSceneFamiliesRetainExactChildrenAndBudgets() {
   invalid->objects[0].parent={}; invalid->objects[1].transform.scale.x=0;
   check(!invalidRuntime.admitTimelineScenePreview(deepNext,*invalid,deepBinding,{},error),
       "singular ancestor transform remains refused after schedule admission");
-  invalid->objectCount=Visual3DScene::kMaxObjects+1;
+  invalid->objectCount=invalid->objects.size()+1;
   check(!timelinefamily::deriveEnvelope(*invalid,deepBinding,ResourceLimits{},0,invalidEnvelope,error)
       && !invalidRuntime.admitTimelineScenePreview(deepNext,*invalid,deepBinding,{},error)
-      && error=="Timeline scene family exceeds scene counts or 1..64 binding capacity",
+      && error=="Timeline scene family needs at least one binding and scene counts that match its allocated records",
       "invalid object count refuses in the cheap entry schedule without indexing records");
   const auto conserved=deepRuntime.admitTimelineScenePreview(deepOwner,*deep,deepBinding,{},error);
   check(conserved==deepFamily && &conserved->children()[0].plan()==deepPlan
@@ -5819,7 +5974,42 @@ void allocationFailureInfrastructure() {
 } // namespace
 #endif
 
+// Preview admits Subdivision Surface at its viewport level and export at its render level.
+static void subdivisionSurfaceUseSelectsItsLevel() {
+  namespace geo = videowire::geometry;
+  namespace helper = videohelper::geometry;
+  std::string error;
+  geo::PortContract contract;
+  contract.carrier = geo::CarrierKind::geometry3D;
+  contract.overflow = geo::OverflowPolicy::reject;
+  contract.maxVertices = geo::kMaximumVertices;
+  contract.maxIndices = geo::kMaximumIndices;
+  contract.maxAttributes = 32;
+  const auto cube = geo::lowerMeshGenerator(9901, 9901, 1, geo::OperationCode::cube, {1, 1, 1, 0}, contract, error);
+  check(cube.has_value(), "subdivision admission fixture cube lowers");
+  if (!cube) return;
+  const auto value = geo::lowerSubdivisionSurface(*cube, 9902, 1, 2, {}, false, contract, error);
+  check(value.has_value(), "subdivision admission fixture lowers");
+  if (!value) return;
+  const auto admitted = geo::admitValue(*value, contract, geo::ResourceLimits{}, {}, error);
+  check(admitted.has_value(), "subdivision admission fixture admits");
+  if (!admitted) return;
+  const auto bytes = geo::lowerRuntimePlan(contract, *admitted);
+  TestBackend backend;
+  helper::GeometryCorePlanRuntime runtime(backend);
+  const helper::PlanOwnerIdentity previewOwner{1, 1, 1, 1, 1, helper::PlanUse::preview};
+  const helper::PlanOwnerIdentity exportOwner{2, 1, 1, 1, 1, helper::PlanUse::exportRender};
+  const auto preview = runtime.admitPreview(previewOwner, bytes, geo::ResourceLimits{}, {}, error);
+  const auto exportUse = runtime.admitExport(exportOwner, bytes, geo::ResourceLimits{}, {}, error);
+  const auto indexCount = [](const helper::AdmittedPlanValue &plan) {
+    return std::get<geo::GeometryData>(plan.value().descriptor().data).indices.size();
+  };
+  check(preview && indexCount(*preview->plan) == 144, "preview admits the viewport level's 24 quads");
+  check(exportUse && indexCount(*exportUse->plan) == 576, "export admits the render level's 96 quads");
+}
+
 int main() {
+  subdivisionSurfaceUseSelectsItsLevel();
   { std::string error; const bool passed=verifyParticlePointsBodyAuthority(error); check(passed,error.c_str()); }
   { std::string error; const bool passed=verifyParticleBodyMinimumNativeProofOracles(error); check(passed,error.c_str()); }
 #if !defined(_WIN32)
@@ -5869,6 +6059,10 @@ int main() {
   spectrumInstancesRetainBandIdentity();
   spectrumInstancerLayoutsRetainPlacementAuthority();
   curveRibbonsRetainSourceAndTopology();
+  groovedDiscPlaneCarriesUvThroughSceneCompose();
+  sceneCompositionGrowsToTheGlassRingSize();
+  sceneCompositionAdmitsOneMillionTriangles();
+  sceneCompositionGrowsPastEveryFormerCap();
   meshGeneratorsRoundtripAndRejectInvalidPlans();
   gridLoweringExactTopologyBoundsAndRefusals();
   legacyContractsMigrate();

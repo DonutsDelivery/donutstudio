@@ -200,8 +200,8 @@ bool verifyNativeRetainedSdfSurface(arbitgpu::NativeFixtureSceneBackend& backend
   const auto reject = [&](const char* message) { error = message; return false; };
   PortContract meshContract;
   meshContract.carrier = CarrierKind::geometry3D;
-  meshContract.maxVertices = HarmonicMIDI::grid::Visual3DScene::kMaxVertices;
-  meshContract.maxIndices = HarmonicMIDI::grid::Visual3DScene::kMaxIndices;
+  meshContract.maxVertices = HarmonicMIDI::grid::Visual3DScene::kInitialVertices;
+  meshContract.maxIndices = HarmonicMIDI::grid::Visual3DScene::kInitialIndices;
   meshContract.maxAttributes = 3; meshContract.attributes = sdfSurfaceAttributes(surfaceId);
   const auto makeSurface = [&](unsigned cells, double radius) {
     sdfsurface::Request request;

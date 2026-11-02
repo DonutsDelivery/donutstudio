@@ -38,6 +38,7 @@
 #include "sdf_visual_plan_execution.h"
 #include "typed_scene_pass_plan.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -694,8 +695,7 @@ inline bool admitParticleParameters(const std::string& xml,
                     return refuseFamily("Collider family entries must be object:plan pairs");
                 const auto object=std::stoull(entry.substr(0,colon));
                 if (object==0 || object>std::numeric_limits<std::uint32_t>::max()
-                    || (!binding->meshFamily.empty() && object<=binding->meshFamily.back().object)
-                    || binding->meshFamily.size()>=HarmonicMIDI::grid::Visual3DScene::kMaxObjects)
+                    || (!binding->meshFamily.empty() && object<=binding->meshFamily.back().object))
                     return refuseFamily("Collider family objects must be distinct nonzero scene IDs in increasing order");
                 videorender::ParticleColliderFamilyChild child;
                 child.object=static_cast<std::uint32_t>(object);
@@ -833,7 +833,7 @@ inline std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission> adm
     error.clear();
     try {
     ParticlePointsBodyEnvelope envelope;
-    if (!caller || !caller->onCallerThread() || !caller->charge(particlePointsBodyIssuanceCensusWork)
+    if (!caller || !caller->onCallerThread() || !caller->charge(particlePointsBodyIssuanceCensusWork(particlePointsBodyOperationCount(compiled)))
         || !ParticlePointsBodySourceAdmission::issuanceEnvelope(compiled,payload,bodyPlan,envelope)) {
         error="Paired particle source has no bounded compiled decoder schedule"; return {};
     }
@@ -1064,6 +1064,18 @@ public:
     // and executeVisualLayerPlan fails only the frames that build that clip,
     // naming it. Capacity and resource-budget failures still refuse everything.
     void containLayerLoweringFailures (bool contain) noexcept { containLayerLoweringFailures_ = contain; }
+
+    // What admission accounted for this plan on this canvas, or null. A read-only query
+    // uses this: accounting decodes the plan again, and on a large scene that takes seconds.
+    const VisualPlanResourceUsage* admittedResources (int clipId, uint64_t revision,
+                                                      int canvasWidth, int canvasHeight) const
+    {
+        for (const auto& admitted : admittedResources_)
+            if (admitted.clipId == clipId && admitted.revision == revision
+                && admitted.canvasWidth == canvasWidth && admitted.canvasHeight == canvasHeight)
+                return &admitted.usage;
+        return nullptr;
+    }
 
     // The reason a contained clip was refused at this revision, or null.
     const std::string* refusedLowering (int clipId, uint64_t revision) const
@@ -1449,6 +1461,14 @@ private:
     VisualPlanTelemetry* telemetryOwner_ = &telemetry_;
     VisualPlanResourceReceipt resourceReceipt_;
     VisualPlanBudgetReceipt budgetReceipt_;
+    struct AdmittedResources final
+    {
+        int clipId = 0;
+        uint64_t revision = 0;
+        int canvasWidth = 0, canvasHeight = 0;
+        VisualPlanResourceUsage usage;
+    };
+    std::vector<AdmittedResources> admittedResources_;
     std::shared_ptr<TemporalAuthority> temporalAuthority_;
 
 };
@@ -2792,8 +2812,6 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             if (!visualimportedscenerender::decode(
                     importedSceneRender->payloadXml, request)
                 || request.sceneSnapshot == nullptr
-                || visualimportedscenerender::encode(request)
-                    != importedSceneRender->payloadXml
                 || importedSceneRender->backendCapability
                     != visualimportedscenerender::kRenderBackendCapability
                 || importedSceneRender->nodeId < 0
@@ -3099,7 +3117,12 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 { return operation.kind == "visual.3d.camera.perspective"; });
             const auto lightOperation = std::find_if(
                 plan.operations.begin(), plan.operations.end(), [](const auto& operation)
-                { return operation.kind == "visual.3d.light.directional"; });
+                { return operation.kind == "visual.3d.light.directional"
+                    || operation.kind == "visual.3d.light.environment"; });
+            // An Environment light sends from port 0 and has no transform. Its record
+            // rides this Render operation's request.light.
+            const bool lightUsesTransform = hasLight && lightOperation != plan.operations.end()
+                && lightOperation->kind != "visual.3d.light.environment";
             const auto transformFor = [&](const auto& consumer)
             {
                 if (consumer == plan.operations.end()) return plan.operations.end();
@@ -3111,8 +3134,8 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             };
             const auto cameraTransformOperation = transformFor(cameraOperation);
             const auto lightTransformOperation = transformFor(lightOperation);
-            const int transformCount = (hasCamera ? 1 : 0) + (hasLight ? 1 : 0)
-                - (hasCamera && hasLight && cameraTransformOperation == lightTransformOperation ? 1 : 0);
+            const int transformCount = (hasCamera ? 1 : 0) + (lightUsesTransform ? 1 : 0)
+                - (hasCamera && lightUsesTransform && cameraTransformOperation == lightTransformOperation ? 1 : 0);
             if (hasDeformation
                 != (importedDeformation != plan.operations.end()))
             {
@@ -3239,7 +3262,11 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     && exactControlPort(cameraTransformOperation->nodeId, 0, "out", "transform3D")
                     && exactControlPort(cameraOperation->nodeId, 0, "in", "transform3D")
                     && exactControlPort(cameraOperation->nodeId, 1, "out", "camera");
-            if (hasLight)
+            if (hasLight && !lightUsesTransform)
+                exactPorts = exactPorts && lightOperation != plan.operations.end()
+                    && exactControlPort(lightOperation->nodeId, 0, "out", "light")
+                    && request.light->kind == HarmonicMIDI::grid::SceneLightKind::Environment;
+            else if (hasLight)
                 exactPorts = exactPorts && lightOperation != plan.operations.end()
                     && lightTransformOperation != plan.operations.end()
                     && exactControlPort(lightTransformOperation->nodeId, 0, "out", "transform3D")
@@ -3371,7 +3398,10 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                             && (&operation == &*cameraOperation
                                 || &operation == &*cameraTransformOperation)
                             && operation.backendCapability == "control-eval")
-                        || (hasLight && lightOperation != plan.operations.end()
+                        || (hasLight && !lightUsesTransform && lightOperation != plan.operations.end()
+                            && &operation == &*lightOperation
+                            && operation.backendCapability == "control-eval")
+                        || (lightUsesTransform
                             && lightTransformOperation != plan.operations.end()
                             && (&operation == &*lightOperation || &operation == &*lightTransformOperation)
                             && operation.backendCapability == "control-eval")
@@ -3581,6 +3611,35 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     value = expectedId;
                     return true;
                 };
+                // Lowers each dependency first with an explicit stack, in the order the
+                // recursion would, so a long chain cannot exhaust the thread's stack.
+                const auto lowerDependencies = [&](int root)
+                {
+                    std::vector<std::pair<int, std::uint8_t>> pending { { root, std::uint8_t { 0 } } };
+                    std::unordered_set<int> open { root };
+                    while (! pending.empty())
+                    {
+                        const int nodeId = pending.back().first;
+                        const auto contract = contracts.find (nodeId);
+                        if (contract == contracts.end() || valuesByNode.count (nodeId) != 0
+                            || pending.back().second >= contract->second.inputCount)
+                        {
+                            pending.pop_back();
+                            open.erase (nodeId);
+                            surfacematerial::ValueId finished = 0;
+                            if (nodeId != root && ! lowerValue (nodeId, finished)) return false;
+                            continue;
+                        }
+                        const int input = pending.back().second++;
+                        const auto incoming = std::find_if (
+                            plan.edges.begin(), plan.edges.end(), [&](const auto& edge)
+                            { return edge.toNodeId == nodeId && edge.toPort == input; });
+                        if (incoming == plan.edges.end()) continue;
+                        if (! open.insert (incoming->fromNodeId).second) return false;
+                        pending.emplace_back (incoming->fromNodeId, std::uint8_t { 0 });
+                    }
+                    return true;
+                };
 
                 for (const auto output : surfacematerial::kSurfaceOutputs)
                 {
@@ -3594,6 +3653,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                             [&](const auto& edge)
                             { return edge.toNodeId == materialTerminalNode
                                 && edge.toPort == port; }) != 1
+                        || ! lowerDependencies (incoming->fromNodeId)
                         || ! lowerValue (incoming->fromNodeId, value))
                     {
                         validMaterialGraph = false;
@@ -3712,8 +3772,9 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 expectedEdges.insert(cameraTransformEdgeIdentity);
                 expectedEdges.insert(cameraEdgeIdentity);
             }
-            if (hasLight && lightOperation != plan.operations.end()
-                && lightTransformOperation != plan.operations.end())
+            if (hasLight && !lightUsesTransform && lightOperation != plan.operations.end())
+                expectedEdges.insert({ lightOperation->nodeId, 0, importedSceneRender->nodeId, 6 });
+            if (lightUsesTransform && lightTransformOperation != plan.operations.end())
             {
                 expectedEdges.insert({ lightTransformOperation->nodeId, 0, lightOperation->nodeId, 0 });
                 expectedEdges.insert({ lightOperation->nodeId, 1, importedSceneRender->nodeId, 6 });
@@ -3734,7 +3795,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                         == expectedNoMaterialOperations
                     && plan.edges.size()
                         == static_cast<std::size_t>((hasDeformation ? 6 : 1)
-                            + (hasCamera ? 2 : 0) + (hasLight ? 2 : 0) + (hasNoteInstances ? 3 : 0)
+                            + (hasCamera ? 2 : 0) + (hasLight ? (lightUsesTransform ? 2 : 1) : 0) + (hasNoteInstances ? 3 : 0)
                             + (hasOutput ? 1 : 0))
                     && materialTerminal == plan.operations.end();
             visualanimationimport::Request deformationRequest;
@@ -3776,7 +3837,8 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 hasDeformation ? 1 : 0);
             expectCount ("cameras", countOperationsOfKind ("visual.3d.camera.perspective"), hasCamera ? 1 : 0);
             expectCount ("transforms", countOperationsOfKind ("visual.3d.transform"), transformCount);
-            expectCount ("lights", countOperationsOfKind ("visual.3d.light.directional"), hasLight ? 1 : 0);
+            expectCount ("lights", countOperationsOfKind ("visual.3d.light.directional")
+                + countOperationsOfKind ("visual.3d.light.environment"), hasLight ? 1 : 0);
             expectCount ("surfaceMaterials", countOperationsOfKind ("visual.surface.material"),
                 hasSurfaceMaterial ? 1 : 0);
             expectCount ("diffractionMaterials", static_cast<int> (std::count_if (
@@ -3849,6 +3911,10 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
             }
             execution.structuralRevision = plan.structuralRevision;
             execution.transform = execution.effects = execution.mask = false;
+            // An asset request's wire has no revisions of its own. Its material's does,
+            // and the author writes the request's evaluation revision there.
+            if (!request.sceneSnapshot && request.material)
+                request.evaluationRevision = request.material->evaluationRevision;
             execution.importedSceneRender = std::move(request);
             if (hasMaterialFrame)
             {
@@ -6224,6 +6290,7 @@ inline bool VisualPlanExecutionState::admitPlans (
     }
     const auto derivedLimits = VisualBackendResourceLimits::forCanvas(canvasWidth, canvasHeight);
     const auto& limits = backendLimits != nullptr ? *backendLimits : derivedLimits;
+    admittedResources_.clear();
     uint64_t totalAllocatedFrameBytes = 0;
     uint64_t totalAllocatedFrameSlots = 0;
     uint64_t totalPeakLiveFrames = 0;
@@ -6260,6 +6327,7 @@ inline bool VisualPlanExecutionState::admitPlans (
         }
         if (! directFixtureWithoutProducerAccounting)
         {
+            admittedResources_.push_back({ plan.clipId, plan.structuralRevision, canvasWidth, canvasHeight, usage });
             if (! checkedAccumulateVisualPlanBytes(
                     totalAllocatedFrameBytes, usage.allocatedFrameBytes, 0))
             {
@@ -6436,6 +6504,16 @@ inline bool VisualPlanExecutionState::admitPlans (
         const auto loweringNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin).count());
         loweringSamples.push_back({ loweringNs, slot.lowered });
+        // Tells a size-driven lowering from a node-driven one. A log filter, not a limit.
+        if (loweringNs >= 100000000u)
+        {
+            std::size_t payloadBytes = 0;
+            for (const auto& operation : plan.operations)
+                payloadBytes += operation.payloadXml.size();
+            std::fprintf (stderr, "[diagnostic] visual plan lowering clip=%d payloadBytes=%zu nodes=%zu operations=%zu loweringMs=%.1f\n",
+                          plan.clipId, payloadBytes, plan.nodeKinds.size(), plan.operations.size(),
+                          static_cast<double> (loweringNs) / 1.0e6);
+        }
         if (! slot.lowered)
         {
             telemetry().recordFailedLowering(loweringError);

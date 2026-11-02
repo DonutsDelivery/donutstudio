@@ -1229,6 +1229,87 @@ void main() {
         layer.fromLayer = &fromLayer;
         return checkRender(owner, layer, pixels, error, "curated starter transition renders");
     };
+#if !defined(ARBIT_STRICT_METAL_FIXTURE)
+    // The curated transition carrier has no plan, so FlatShaderKey holds an empty
+    // planDigest at all three of its sites. Two different transitions on one clip,
+    // revision and node must still each get their own program, in any order. Two
+    // operations with the same source do share a key and a program, so the frame
+    // must take its progress from the operation and not from the first preparer.
+    {
+        constexpr int sharedClip = 640;
+        constexpr std::uint64_t sharedRevision = 900;
+        const auto carrierFor = [&](const StarterTransitionFixture& fixture, double progress)
+            -> videowire::ImmutableCuratedShaderTransition
+        {
+            const auto source = readTextFile(
+                std::string(ARBIT_SHADER_PACK_ROOT) + "/vidvox-isf/ISF/" + fixture.file);
+            error.clear();
+            const auto plan = curatedTransitionPlan(
+                fixture.id, source, progress, 0.4, sharedRevision, error);
+            if (plan == nullptr) return {};
+            const auto& planned = plan->operations.front();
+            auto operation = std::make_shared<videowire::CuratedShaderTransitionOperation>();
+            operation->nodeId = planned.nodeId;
+            operation->fromNodeId = planned.inputNodeIds[0];
+            operation->toNodeId = planned.inputNodeIds[1];
+            operation->payload = *planned.transitionPayload;
+            operation->parameterValues = planned.payload.parameterValues;
+            return operation;
+        };
+        const std::array<videowire::ImmutableCuratedShaderTransition, 3> carriers {
+            carrierFor(starterTransitions[0], 0.5),
+            carrierFor(starterTransitions[1], 0.5),
+            carrierFor(starterTransitions[0], 0.2)
+        };
+        const auto renderCarrier = [&](std::size_t index, std::vector<std::uint8_t>& pixels)
+        {
+            videorender::LayerDesc fromLayer;
+            fromLayer.texture = previewPair[0];
+            fromLayer.texWidth = kWidth;
+            fromLayer.texHeight = kHeight;
+            videorender::LayerDesc layer;
+            layer.clipId = sharedClip;
+            layer.visualPlanStructuralRevision = sharedRevision;
+            layer.curatedShaderTransition = carriers[index];
+            layer.texture = previewPair[1];
+            layer.texWidth = kWidth;
+            layer.texHeight = kHeight;
+            layer.fromLayer = &fromLayer;
+            return checkRender(preview, layer, pixels, error,
+                               "curated carrier with an empty plan digest renders");
+        };
+        ok &= check(carriers[0] != nullptr && carriers[1] != nullptr && carriers[2] != nullptr,
+                    "curated carrier fixtures are admitted");
+        if (carriers[0] != nullptr && carriers[1] != nullptr && carriers[2] != nullptr)
+        {
+            std::array<std::vector<std::uint8_t>, 3> isolated;
+            for (std::size_t index = 0; index < isolated.size(); ++index)
+            {
+                preview.clearClipShader(sharedClip);
+                ok &= renderCarrier(index, isolated[index]);
+            }
+            ok &= check(isolated[0] != isolated[1],
+                        "different sources under an empty digest render different pixels");
+            ok &= check(isolated[0] != isolated[2],
+                        "one source at two progress values renders different pixels");
+            constexpr std::array<std::array<std::size_t, 4>, 3> orders {{
+                {{ 0, 1, 2, 0 }}, {{ 2, 1, 0, 2 }}, {{ 1, 2, 0, 1 }}
+            }};
+            for (const auto& order : orders)
+            {
+                preview.clearClipShader(sharedClip);
+                for (const auto index : order)
+                {
+                    std::vector<std::uint8_t> pixels;
+                    ok &= renderCarrier(index, pixels);
+                    ok &= check(pixels == isolated[index],
+                                "empty digest cache never serves another transition's result");
+                }
+            }
+        }
+        preview.clearClipShader(sharedClip);
+    }
+#endif
     for (std::size_t index = 0; index < starterTransitions.size(); ++index)
     {
         const auto& fixture = starterTransitions[index];

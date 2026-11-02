@@ -92,6 +92,24 @@ int main()
         invalid = wire;
         invalid["version"] = 1;
         check(!videocontrol::parsePlanJson(invalid, plan, error), "legacy version cannot hide window data");
+        {
+            // 10 MiB of real sink identity. The 2 MiB check this replaces rejected the whole plan.
+            auto large = wire;
+            const std::string paramId(10u * 1024u * 1024u, 'p');
+            large["operations"][1]["targetClipId"] = 99;
+            large["operations"][1]["targetNodeId"] = 7;
+            large["operations"][1]["targetParamId"] = paramId;
+            check(large.dump().size() > 10u * 1024u * 1024u, "large plan fixture exceeds 10 MiB");
+            videocontrol::Plan decoded;
+            check(videocontrol::parsePlanJson(large, decoded, error), "10 MiB Signal plan admits");
+            check(decoded.operations.size() == 2 && decoded.operations[1].targetParamId == paramId,
+                  "10 MiB Signal plan reads back whole");
+            videocontrol::Executor largeExecutor;
+            check(largeExecutor.bind(decoded, error), "10 MiB Signal plan binds");
+            const auto& values = largeExecutor.evaluate({}, {}, {}, 0, 0, 1, 29.97);
+            check(values.size() == 1 && std::abs(values[0].value - 0.15f) < 1.0e-7f,
+                  "10 MiB Signal plan evaluates its frame column");
+        }
         check(videocontrol::parsePlanJson(wire, plan, error), "valid plan still parses after refusals");
         plan.numSlots = 2;
         plan.operations.push_back(valueOp(77, 0.625f, 1));

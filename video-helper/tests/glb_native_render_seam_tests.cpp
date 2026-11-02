@@ -210,7 +210,17 @@ std::vector<std::uint8_t> starterWithTransformTrack(bool meshTarget, bool keepMo
     const auto sampler = animation["samplers"].size();
     animation["samplers"].push_back({{"input",input}, {"output",output}, {"interpolation","LINEAR"}});
     animation["channels"].push_back({{"sampler",sampler}, {"target",{{"node",meshTarget ? 0 : 1}, {"path","translation"}}}});
-    if (!keepMorph) animation["channels"].erase(animation["channels"].begin());
+    if (!keepMorph)
+    {
+        // The decoder refuses an unused sampler, and morph targets keep the mesh
+        // bound whether or not a clip animates them.
+        animation["channels"] = nlohmann::json::array({{{"sampler",0}, {"target",{{"node",1}, {"path","translation"}}}}});
+        animation["samplers"] = nlohmann::json::array({{{"input",input}, {"output",output}, {"interpolation","LINEAR"}}});
+        auto& staticMesh = root["meshes"][0];
+        staticMesh.erase("weights");
+        staticMesh.erase("extras");
+        staticMesh["primitives"][0].erase("targets");
+    }
     if (meshTarget)
     {
         root["nodes"][0]["children"] = {2};
@@ -478,6 +488,38 @@ private:
     std::string backend_;
 };
 
+// The fake has no pixels. This holds what a draw would read for its
+// geometry, placement and material, so a change that never reaches the draw leaves
+// them equal.
+std::vector<float> drawnFrameContent (const HarmonicMIDI::grid::Visual3DScene& scene,
+    const arbitgpu::NativeFixtureSurfaceMaterialProgram* material,
+    const arbitgpu::NativeFixtureSceneRuntimeInputs& inputs)
+{
+    std::vector<float> content;
+    const auto add = [&] (const auto& values) { content.insert (content.end(), values.begin(), values.end()); };
+    for (std::size_t index = 0; index < scene.vertexCount; ++index)
+    {
+        const auto& position = scene.vertices[index].position;
+        add (std::array<float, 3> {position.x, position.y, position.z});
+    }
+    for (std::size_t index = 0; index < scene.objectCount; ++index)
+    {
+        const auto& translation = scene.objects[index].transform.translation;
+        add (std::array<float, 3> {translation.x, translation.y, translation.z});
+    }
+    for (std::size_t index = 0; index < scene.materialCount; ++index)
+    {
+        const auto& color = scene.materials[index].baseColor;
+        add (std::array<float, 3> {color.x, color.y, color.z});
+    }
+    if (inputs.objectWorlds)
+        for (const auto& entry : *inputs.objectWorlds) add (entry.world);
+    add (inputs.objectTranslationOffset);
+    if (material != nullptr)
+        for (const auto character : material->bindingDigest) content.push_back (static_cast<float> (character));
+    return content;
+}
+
 class FakeBackend final : public arbitgpu::NativeFixtureSceneBackend
 {
 public:
@@ -517,6 +559,7 @@ public:
         ++submissions;
         submittedScene = scene.get();
         lastRuntimeInputs = runtimeInputs;
+        lastDrawnContent = drawnFrameContent (*scene, preparedProgram.get(), runtimeInputs);
         arbitgpu::NativeFixtureSceneSubmission result;
         if (rejectSubmission)
         {
@@ -544,6 +587,7 @@ public:
     int preparations = 0;
     const HarmonicMIDI::grid::Visual3DScene* submittedScene = nullptr;
     arbitgpu::NativeFixtureSceneRuntimeInputs lastRuntimeInputs;
+    std::vector<float> lastDrawnContent;
 };
 
 class FakeDeformationResources final : public arbitgpu::NativeDeformationResources
@@ -1549,6 +1593,8 @@ void compositionIncumbentChargesLeaves()
     second.payload = store.resolvePreview(secondKey);
     second.operation.asset = secondKey;
     second.operation.sourceStableId = 943;
+    second.operation.deformationStableId = 944;
+    second.operation.schedule = {943, 944};
     std::string error;
     // Smallest free composition ledger with which the frame renders.
     const auto threshold = [&](bool heldLeaves) {
@@ -1699,8 +1745,9 @@ void smoothGlassDiscreteGratingAdmissionChecks()
     check(bool(fixture), "ordinary mixed caustic fixture owns real closed glass and authored discrete IR");
     if (!fixture) return;
     const auto& request = *fixture->diffractionMaterial;
-    check(!admitDiffractionMaterialBinding(fixture->sceneSnapshot, request, Target::OpenGl, error, true),
-        "default mixed admission preserves zero-slope finite-lobe refusal");
+    const auto finiteLobe = admitDiffractionMaterialBinding(fixture->sceneSnapshot, request, Target::OpenGl, error, true);
+    check(finiteLobe && finiteLobe->consumer() == Consumer::FiniteLobe,
+        "default mixed admission takes a zero slope as a delta lobe on the finite-lobe route");
     for (const auto target : {Target::OpenGl, Target::Metal})
     {
         const auto binding = admitDiffractionMaterialBinding(fixture->sceneSnapshot, request, target, error, true,
@@ -1756,6 +1803,49 @@ void smoothGlassDiscreteGratingAdmissionChecks()
             &*invalid.diffractionMaterial, &*invalid.glassCaustic) && refusedBackend.preparations == 0,
             "discrete admission refuses overlapping, foreign, dynamic, rough or nondispersive owners");
     }
+}
+
+// A converging preview publishes one material per sample. Only a real input change admits again.
+void repeatedSurfacePublicationAdmitsOnce()
+{
+    std::string error;
+    const auto fixture = mixedSurfaceDiffractionFixture(error);
+    check(fixture.has_value(), "the publication fixture builds");
+    if (!fixture) return;
+    FakeBackend backend; backend.backendInfo.backend = "opengl";
+    videohelper::gltf::GlbNativeRenderSeam seam(backend);
+    videohelper::gltf::GlbNativeSceneAdmission admission; admission.scene = fixture->sceneSnapshot;
+    videohelper::geometry::TimelineSceneEvaluationInputs inputs {};
+    const auto publish = [&](const auto& programs, const videohelper::geometry::TimelineSceneEvaluationInputs* key) {
+        return seam.publishSurfacePrograms(admission, programs, {}, error, &*fixture->diffractionMaterial, nullptr, key);
+    };
+    check(publish(fixture->surfacePrograms, &inputs) && seam.surfaceMaterialAdmissions() == 1, "the first sample admits");
+    check(publish(fixture->surfacePrograms, &inputs) && publish(fixture->surfacePrograms, &inputs)
+        && seam.surfaceMaterialAdmissions() == 1, "repeated samples with equal inputs do not admit");
+    inputs[0] ^= 1;
+    check(publish(fixture->surfacePrograms, &inputs) && seam.surfaceMaterialAdmissions() == 2, "a new time admits");
+    inputs[9] += 1;
+    check(publish(fixture->surfacePrograms, &inputs) && seam.surfaceMaterialAdmissions() == 3, "a new score generation admits");
+    check(publish(fixture->surfacePrograms, nullptr) && publish(fixture->surfacePrograms, nullptr)
+        && seam.surfaceMaterialAdmissions() == 5, "a caller naming no inputs admits every time");
+    check(publish(fixture->surfacePrograms, &inputs) && seam.surfaceMaterialAdmissions() == 6
+        && publish(fixture->surfacePrograms, &inputs) && seam.surfaceMaterialAdmissions() == 6, "named inputs reuse again");
+    auto advanced = fixture->surfacePrograms;
+    for (auto& entry : advanced) entry.program.material.evaluationRevision += 1;
+    // The operation carries one evaluation revision, so the diffraction request moves with the programs.
+    auto advancedDiffraction = *fixture->diffractionMaterial;
+    advancedDiffraction.evaluationRevision += 1;
+    check(seam.publishSurfacePrograms(admission, advanced, {}, error, &advancedDiffraction, nullptr, &inputs)
+        && seam.surfaceMaterialAdmissions() == 7, "a changed program request admits");
+    seam.clearSurfaceMaterial(admission);
+    check(publish(fixture->surfacePrograms, &inputs) && seam.surfaceMaterialAdmissions() == 8, "a cleared material admits");
+    auto changedScene = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*fixture->sceneSnapshot);
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> nextScene = changedScene;
+    auto nextPrograms = fixture->surfacePrograms;
+    for (auto& entry : nextPrograms) entry.program.material.sceneSnapshot = nextScene;
+    admission.scene = nextScene;
+    publish(nextPrograms, &inputs);
+    check(seam.surfaceMaterialAdmissions() == 9, "a new scene admits");
 }
 
 void mixedSurfaceDiffractionAdmissionChecks()
@@ -1933,6 +2023,22 @@ void staticImportedObjectModulationTargetsExactSourceNode()
     publishPreparation(request);
     videohelper::modelpayload::ImportedSceneExecutionReceipt preview, exported;
     check(execution.executePreview(request, preview, error), "static selected node reaches the real payload execution seam");
+    {
+        // A leased plan's text is scanned once per publication, and a new publication's change still retires.
+        auto lease = std::make_shared<int>(1);
+        const auto scans = execution.staticPayloadScans();
+        const auto text = request.staticPayloadIdentity;
+        execution.publishStaticPayload(request.clipId, request.projectGeneration, request.helperGeneration, text, lease);
+        execution.publishStaticPayload(request.clipId, request.projectGeneration, request.helperGeneration, text, lease);
+        execution.publishStaticPayload(request.clipId, request.projectGeneration, request.helperGeneration, text, lease);
+        check(execution.staticPayloadScans() == scans + 1, "repeated samples in one publication scan the payload once");
+        lease = std::make_shared<int>(2);
+        execution.publishStaticPayload(request.clipId, request.projectGeneration, request.helperGeneration, text, lease);
+        check(execution.staticPayloadScans() == scans + 2, "a new publication scans the payload again");
+        execution.publishStaticPayload(request.clipId, request.projectGeneration, request.helperGeneration, text);
+        execution.publishStaticPayload(request.clipId, request.projectGeneration, request.helperGeneration, text);
+        check(execution.staticPayloadScans() == scans + 4, "a caller with no publication always scans");
+    }
     if (!preview.valid()) return;
     const auto scene = preview.admission.scene;
     const auto targeted = backend.lastRuntimeInputs;
@@ -2006,7 +2112,23 @@ void staticImportedObjectModulationTargetsExactSourceNode()
     genuineRetirement(bad, "genuinely published changed content cannot use selected-target retirement deferral");
     bad = request; ++bad.structuralRevision; ++bad.evaluationRevision; bad.objectNodeStableId = 99;
     bad.staticPayloadIdentity = serializedIdentity(bad);
-    genuineRetirement(bad, "changed graph revision retains genuine immediate publication retirement");
+    {
+        // A plain operation encodes no request revision, so publication sees only the changed node.
+        auto sameRevision = request; sameRevision.objectNodeStableId = 99;
+        const auto preparations = backend.preparations, submissions = backend.submissions;
+        publishPreparation(bad);
+        check(bad.staticPayloadIdentity == serializedIdentity(sameRevision)
+            && !execution.executePreview(bad, preview, error) && preview.valid()
+            && backend.preparations == preparations && backend.submissions == submissions,
+            "a graph revision is not in the plain identity, so its selection refusal keeps the owner and receipt");
+        publishPreparation(bad);
+        check(!execution.executeExport(bad, exported, error) && exported.valid()
+            && backend.preparations == preparations && backend.submissions == submissions,
+            "Export refuses that selection and keeps its receipt too");
+        publishPreparation(request);
+        check(execution.executePreview(request, preview, error) && backend.preparations == preparations,
+            "a retry after that refusal reuses the source preparation");
+    }
     bad = request; bad.objectNodeStableId = 99; bad.staticPayloadIdentity = serializedIdentity(bad) + "\n";
     genuineRetirement(bad, "noncanonical serialized publication cannot defer retirement through a partial identity match");
     bad = request; ++bad.projectGeneration; bad.objectNodeStableId = 99;
@@ -2212,18 +2334,21 @@ void staticLocalDocumentAndRefusalBoundaries()
             "a genuinely evaluated static candidate renders once with object worlds covering the drawn objects");
     }
     // Later refusals are measured against the candidate render that now succeeds.
-    const auto renderedNative = receipt.frame.rendered.nativeFrame;
-    const auto renderedPreparations = backend.preparations, renderedSubmissions = backend.submissions;
+    const auto renderedPreparations = backend.preparations;
+    auto renderedSubmissions = backend.submissions;
     request.objectLocalTransform.scale = {2,2,2};
     check(!execution.executePreview(request, receipt, error) && error.find("not representable") != std::string::npos
-        && receipt.admission.scene == incumbentScene && receipt.frame.rendered.nativeFrame == renderedNative,
+        && !receipt.valid() && backend.preparations == renderedPreparations && backend.submissions == renderedSubmissions,
         "inherited source-camera scale refuses without coercion or candidate publication");
     request.objectLocalTransform.scale = {1.00005,1,1};
     check(!execution.executePreview(request, receipt, error) && error.find("not representable") != std::string::npos
-        && receipt.admission.scene == incumbentScene && receipt.frame.rendered.nativeFrame == renderedNative
-        && backend.preparations == renderedPreparations && backend.submissions == renderedSubmissions,
+        && !receipt.valid() && backend.preparations == renderedPreparations && backend.submissions == renderedSubmissions,
         "small authored camera scale refuses rather than being coerced to unit scale");
     request.objectLocalTransform.scale = {1,1,1};
+    check(execution.executePreview(request, receipt, error) && receipt.admission.scene == incumbentScene
+        && backend.preparations == renderedPreparations,
+        "guarded local refusals preserve the released static source preparation");
+    renderedSubmissions = backend.submissions;
     // Use separate exact assets so final camera/light component limits are
     // reached by the real decoder, local evaluator and final-record issuance.
     const auto componentRefusal = [&](nlohmann::json source, const char* id, const char* diagnostic) {
@@ -2232,9 +2357,8 @@ void staticLocalDocumentAndRefusalBoundaries()
         check(publish(store,transferId.c_str(),sourceKey,sourceBytes), "bounded record fixture publishes exact source");
         auto candidate=request;candidate.asset=sourceKey;candidate.objectLocalTransform.translation={0,0,10000};
         check(!execution.executePreview(candidate,receipt,error) && error.find(diagnostic)!=std::string::npos
-            && receipt.admission.scene==incumbentScene && receipt.frame.rendered.nativeFrame==renderedNative
-            && backend.preparations==renderedPreparations && backend.submissions==renderedSubmissions,
-            "transformed camera/light component overflow refuses before record issuance and preserves incumbent");
+            && !receipt.valid() && backend.preparations==renderedPreparations && backend.submissions==renderedSubmissions,
+            "transformed camera/light component overflow refuses before record issuance and native work");
     };
     auto cameraBound=root;cameraBound["nodes"][3]["translation"]={0,0,999999};
     componentRefusal(cameraBound,"static-local-camera-bound","final camera record");
@@ -2245,16 +2369,16 @@ void staticLocalDocumentAndRefusalBoundaries()
     check(publish(store,"static-local-inherited-scale-transfer",inheritedKey,inheritedBytes), "inherited scale fixture publishes exact bytes");
     auto inherited=request;inherited.asset=inheritedKey;
     check(!execution.executePreview(inherited,receipt,error) && error.find("not representable")!=std::string::npos
-        && receipt.admission.scene==incumbentScene && receipt.frame.rendered.nativeFrame==renderedNative
-        && backend.preparations==renderedPreparations && backend.submissions==renderedSubmissions,
+        && !receipt.valid() && backend.preparations==renderedPreparations && backend.submissions==renderedSubmissions,
         "tight source rigid interpretation refuses an intentional small inherited camera scale");
     request.objectLocalTransform.meshStableId = 1;
     check(!execution.executePreview(request, receipt, error) && error.find("original node") != std::string::npos,
         "a meshless local parent cannot borrow a mesh-backed same-node selector");
     request.objectLocalTransform = {};
-    check(execution.executePreview(request, receipt, error) && receipt.admission.scene == incumbentScene
-        && backend.preparations == renderedPreparations,
-        "guarded local refusals preserve the released static source preparation");
+    // Attempts on other assets above replaced the owner, so the source prepares once more.
+    check(execution.executePreview(request, receipt, error) && receipt.admission.scene != incumbentScene
+        && backend.preparations == renderedPreparations + 1,
+        "a retry after refused attempts on other assets prepares its source once");
 }
 
 // Checked object worlds name distinct drawn objects. A single leaf lists each of
@@ -2393,17 +2517,54 @@ void staticLocalSingleObjectWorldContract()
         && nearTranslation(&(*backend.lastRuntimeInputs.objectWorlds)[0].world, 1.0f, 0.0f, 0.0f),
         "the Triangle mesh preview carries its checked local translation");
     const auto previewWorlds = backend.lastRuntimeInputs.objectWorlds;
+    const auto localContent = backend.lastDrawnContent;
+    const auto localPreparations = backend.preparations;
+    check(execution.executePreview(request, receipt, error) && backend.lastDrawnContent == localContent,
+        "an unchanged local transform draws the same content");
     request.objectLocalTransform.translation[0] = 2;
     check(execution.executeExport(request, receipt, error)
         && backend.lastRuntimeInputs.objectWorlds && backend.lastRuntimeInputs.objectWorlds->size() == 1
         && nearTranslation(&(*backend.lastRuntimeInputs.objectWorlds)[0].world, 2.0f, 0.0f, 0.0f)
         && !arbitgpu::sameNativeImportedObjectWorlds(previewWorlds, backend.lastRuntimeInputs.objectWorlds),
         "an export carries the changed translation under a different world identity");
+    // Vertices stay in object space, so a moved object changes the draw without new geometry.
+    check(backend.lastDrawnContent != localContent && backend.preparations == localPreparations,
+        "a changed local transform changes the drawn content over the same preparation");
     request.objectLocalTransform = {};
     const auto restoredSubmissions = backend.submissions;
     check(execution.executePreview(request, receipt, error)
         && backend.submissions == restoredSubmissions + 1 && !backend.lastRuntimeInputs.objectWorlds,
         "a neutral request after a local one renders once and sends no object worlds");
+
+    // A real source change on the published route: the owner goes and the new file is drawn.
+    const auto identity = [] (const ImportedSceneRequest& selected) {
+        visualimportedscenerender::Request operation;
+        operation.sourceStableId = 1; operation.renderStableId = 2;
+        operation.asset = selected.asset; operation.sceneIndex = selected.sceneIndex;
+        videowire::CompiledVisualLayerPlan plan;
+        plan.operations.push_back({1, std::string(visualimportedscenerender::kRenderNodeKind),
+            std::string(visualimportedscenerender::kRenderBackendCapability), visualimportedscenerender::encode(operation)});
+        return videohelper::importedscene::exactImportedScenePayloadIdentity(plan);
+    };
+    request.staticPayloadIdentity = identity(request);
+    check(execution.executePreview(request, receipt, error), "the source fixture draws under its published identity");
+    const auto sourceContent = backend.lastDrawnContent;
+    const auto sourceScene = receipt.admission.scene;
+    const auto sourcePreparations = backend.preparations;
+    check(execution.executePreview(request, receipt, error) && backend.lastDrawnContent == sourceContent
+        && backend.preparations == sourcePreparations && receipt.admission.scene == sourceScene,
+        "an unchanged source file draws the same content over the same preparation");
+    auto movedRoot = triangleRoot();
+    movedRoot["nodes"][0]["translation"] = {3, 0, 0};
+    const auto movedBytes = makeGlb(movedRoot, triangleBin());
+    const auto movedKey = exactKey("static-local-moved-source", movedBytes);
+    check(publish(store, "static-local-moved-source-transfer", movedKey, movedBytes), "the changed source file publishes");
+    auto movedSource = request;
+    movedSource.asset = movedKey;
+    movedSource.staticPayloadIdentity = identity(movedSource);
+    check(execution.executePreview(movedSource, receipt, error) && backend.preparations == sourcePreparations + 1
+        && receipt.admission.scene != sourceScene && backend.lastDrawnContent != sourceContent,
+        "a changed source file prepares again and changes the drawn content");
 }
 
 // Motion steps for checked static-local worlds. A moved world steps back to its
@@ -2968,6 +3129,7 @@ void importedObjectLocalAuthoredChainOrder(videohelper::modelpayload::Store& pay
 
 int main()
 {
+    repeatedSurfacePublicationAdmitsOnce();
     staticImportedObjectModulationTargetsExactSourceNode();
     importedPrototypeSelectionBorrowsExactScene();
     staticLocalDocumentAndRefusalBoundaries();
@@ -3341,8 +3503,9 @@ int main()
         lightOnlyRequest.operation.asset = lightOnlyKey; lightOnlyRequest.operation.meshStableId = 0;
         lightOnlyRequest.runtimeInputs.imageOutput = renderpassoutput::Output::Motion;
         const auto beforeLightOnly = motionBackend.submissions;
-        check(!motionExecution.executePreview(lightOnlyRequest, receipt, error) && !receipt.valid()
-            && motionBackend.submissions == beforeLightOnly,
+        const bool lightOnlyDrew = motionExecution.executePreview(lightOnlyRequest, receipt, error);
+        check(!lightOnlyDrew && !receipt.valid() && motionBackend.submissions == beforeLightOnly
+            && error.find("Motion pass requires the native retained deformation consumer") != std::string::npos,
             "skin/morph consumer does not broadly enable camera/light-only animation Motion");
     }
     importedObjectMatrixHistory(payloads);
@@ -4336,21 +4499,52 @@ int main()
     materialRequest.binding.surfaceMaterialRevision = 1;
     productRequest.material = materialRequest;
     {
+        // A changed material program prepares again and changes what is drawn.
+        FakeBackend materialBackend; materialBackend.backendInfo.backend = "opengl";
+        videohelper::modelpayload::ImportedScenePayloadExecution materialExecution(payloads, materialBackend);
+        auto request = productRequest; request.clipId = 74;
+        videohelper::modelpayload::ImportedSceneExecutionReceipt receipt;
+        check(materialExecution.executePreview(request, receipt, error) && !receipt.usedLastGoodMaterial,
+            "the material fixture draws its own program");
+        const auto materialContent = materialBackend.lastDrawnContent;
+        const auto materialPreparations = materialBackend.preparations;
+        check(materialExecution.executePreview(request, receipt, error)
+            && materialBackend.lastDrawnContent == materialContent && materialBackend.preparations == materialPreparations,
+            "an unchanged material draws the same content over the same preparation");
+        auto recolored = materialProgram;
+        recolored.operations[static_cast<std::size_t> (surfacematerial::OutputSemantic::BaseColor)].literal
+            = {0.1f, 0.2f, 0.9f, 0.0f};
+        const auto recoloredAdmission = surfacematerial::admit (recolored, error);
+        check(recoloredAdmission.has_value(), "the changed material is an admitted program");
+        if (recoloredAdmission)
+        {
+            request.material->program = recolored;
+            request.material->binding.surfaceMaterialDigest = recoloredAdmission->structuralDigest();
+            request.material->programRevision = request.material->structuralRevision
+                = request.material->binding.surfaceMaterialRevision = materialRequest.programRevision + 1;
+            check(materialExecution.executePreview(request, receipt, error) && !receipt.usedLastGoodMaterial
+                && materialBackend.preparations == materialPreparations + 1
+                && materialBackend.lastDrawnContent != materialContent,
+                "a changed material program prepares again and changes the drawn content");
+        }
+    }
+    {
         FakeBackend vertexBackend; vertexBackend.backendInfo.backend = "opengl";
         videohelper::modelpayload::ImportedScenePayloadExecution vertexExecution(payloads, vertexBackend);
         auto request = productRequest; request.frame = {0,60,1}; request.clipId = 73;
         request.material->vertexModifier = videohelper::test::audioNormalDisplacement();
         request.runtimeInputs.imageOutput = renderpassoutput::Output::Motion;
         videohelper::modelpayload::ImportedSceneExecutionReceipt receipt;
-        check(!vertexExecution.executePreview(request, receipt, error) && !receipt.valid()
-            && vertexBackend.submissions == 0 && error.find("vertex processor") != std::string::npos,
-            "imported Motion refuses material vertex displacement without previous processor inputs");
+        check(vertexExecution.executePreview(request, receipt, error) && receipt.valid()
+            && vertexBackend.submissions == 1 && !vertexBackend.lastRuntimeInputs.previousMotion,
+            "imported Motion admits a graph vertex program, whose first frame has no predecessor");
         request.runtimeInputs.imageOutput = renderpassoutput::Output::Color;
         check(vertexExecution.executePreview(request, receipt, error), "material vertex Color route remains available");
         request.material.reset(); request.frame.frame = 1;
         request.runtimeInputs.imageOutput = renderpassoutput::Output::Motion;
-        check(vertexExecution.executePreview(request, receipt, error) && !vertexBackend.lastRuntimeInputs.previousMotion,
-            "Color with unsupported vertex geometry cannot become next Motion predecessor");
+        check(vertexExecution.executePreview(request, receipt, error) && vertexBackend.lastRuntimeInputs.previousMotion
+            && vertexBackend.lastRuntimeInputs.previousMotion->timeSeconds == 0.0f,
+            "a frame drawn with a graph vertex program becomes the next Motion predecessor");
     }
     {
         FakeDeformationBackend vertexBackend; vertexBackend.retainedDeformationMotion = true;
@@ -4367,6 +4561,11 @@ int main()
         // A position and time program runs again over the prior skinned or
         // morphed pose, so it keeps the retained history.
         request.material->vertexModifier = videohelper::test::timeAxisDisplacement();
+        check(!vertexExecution.executePreview(request, receipt, error)
+            && error.find("different immutable request") != std::string::npos,
+            "a vertex program swapped at one revision reports the publish conflict, not the last good program");
+        request.material->programRevision = request.material->structuralRevision
+            = request.material->binding.surfaceMaterialRevision = materialRequest.programRevision + 1;
         const bool firstExecuted = vertexExecution.executePreview(request, receipt, error);
         if (!firstExecuted) std::fprintf(stderr, "animated vertex Motion: %s\n", error.c_str());
         check(firstExecuted && receipt.valid() && !vertexBackend.lastRuntimeInputs.previousMotion,
@@ -4379,6 +4578,12 @@ int main()
             && vertexBackend.lastRuntimeInputs.previousMotion->timeSeconds == 0.0f
             && vertexBackend.lastRuntimeInputs.timeSeconds == static_cast<float>(1.0 / 24.0),
             "the vertex program's next Motion frame receives the prior pose and prior time");
+        auto caustic = request; caustic.runtimeInputs.glassCaustic.emplace();
+        const auto submissionsBeforeCaustic = vertexBackend.submissions;
+        check(receipt.valid() && !vertexExecution.executePreview(caustic, receipt, error) && !receipt.valid()
+            && vertexBackend.submissions == submissionsBeforeCaustic
+            && error.find("exact retained Scene3D snapshot owner") != std::string::npos,
+            "an animated glass caustic refusal clears the caller's earlier frame");
     }
     {
         FakeDeformationBackend nestedBackend;
@@ -4573,8 +4778,8 @@ int main()
            "the product route rejects deformation when no native deformation backend is owned");
     productRequest.deformation.reset();
 
-    check (payloads.erase (productKey)
-           && productPreview.payload->bytes() == glb,
+    check (payloads.erase (productKey) && diffractionPreview.valid()
+           && diffractionPreview.payload->bytes() == glb,
            "successful receipts safely retain immutable bytes after store eviction");
     FakeBackend texturedBackend;
     GlbNativeRenderSeam texturedSeam (texturedBackend);
@@ -4658,20 +4863,21 @@ int main()
     {
         arbitgpu::NativeFixtureSceneRuntimeInputs causticInputs;
         causticInputs.glassCaustic.emplace();
+        const auto submissionsBefore = backend.submissions;
         auto rejectedCaustic = preview;
         check(!seam.renderPreview(empty, RenderDimensions {32,32}, causticInputs, rejectedCaustic, error)
-              && !rejectedCaustic.rendered.nativeFrame && backend.submissions == 2,
+              && !rejectedCaustic.rendered.nativeFrame && backend.submissions == submissionsBefore,
               "caustic preview clears an earlier frame even when scene admission fails");
         rejectedCaustic = preview;
         check(!seam.renderExport(admission, RenderDimensions {96,64}, causticInputs, rejectedCaustic, error)
-              && !rejectedCaustic.rendered.nativeFrame && backend.submissions == 2,
+              && !rejectedCaustic.rendered.nativeFrame && backend.submissions == submissionsBefore,
               "caustic export cannot reuse ordinary Color after a malformed selection");
     }
 
-    std::vector<std::uint8_t> oversized (GlbNativeRenderSeam::kMaxSourceBytes + 1u);
-    check (! seam.admit (oversized, std::nullopt, admission, error)
-           && error == "GLB decode rejected: source exceeds the 16 MiB native-render bound",
-           "the public seam enforces its source bound before parsing");
+    std::vector<std::uint8_t> large (16u * 1024u * 1024u + 1u);
+    check (! seam.admit (large, std::nullopt, admission, error)
+           && error.find ("native-render bound") == std::string::npos,
+           "a source above the former 16 MiB bound fails on its content, never on its size");
 
     GlbNativeRenderSeam stubSeam (arbitgpu::nativeFixtureSceneBackend());
     GlbNativeFrameReceipt stubFrame;

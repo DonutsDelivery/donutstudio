@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -203,6 +204,68 @@ inline std::optional<arbitgpu::NativeSdfSceneBounds> nativeSdfSceneBounds (
     return bounds[program.rootIndex()];
 }
 
+struct NativeSdfEvaluationPlan final
+{
+    std::vector<std::int32_t> slots;
+    std::uint32_t slotCount = 0;
+    std::uint32_t steps = 0;
+    std::uint32_t expandedSteps = 0;
+};
+
+// A record gets a slot when two references reach it and every reference passes
+// the same point, so a query computes it once. Inputs precede their consumers.
+// References through different transforms ask at different points and run each
+// time: a graph that doubles those costs 2^depth per query, the stated limit.
+inline NativeSdfEvaluationPlan nativeSdfEvaluationPlan (
+    const std::vector<arbitgpu::NativeSdfCompiledRecord>& records,
+    std::uint32_t rootIndex, std::uint32_t schemaVersion)
+{
+    constexpr std::int64_t unreached = -1, mixed = -2;
+    NativeSdfEvaluationPlan plan;
+    plan.slots.assign (records.size(), -1);
+    std::vector<std::int64_t> pointOf (records.size(), unreached);
+    std::vector<std::uint32_t> references (records.size(), 0);
+    std::vector<std::uint64_t> runs (records.size(), 0), expandedRuns (records.size(), 0);
+    pointOf[rootIndex] = 0;
+    runs[rootIndex] = expandedRuns[rootIndex] = 1;
+    std::uint64_t steps = 0, expandedSteps = 0;
+    for (std::size_t index = records.size(); index-- > 0;)
+    {
+        const auto& record = records[index];
+        if (pointOf[index] == unreached) continue;
+        if (pointOf[index] != mixed && references[index] > 1)
+        {
+            plan.slots[index] = static_cast<std::int32_t> (plan.slotCount++);
+            runs[index] = 1;
+        }
+        steps = videowire::sdfSaturatingAdd (steps, runs[index]);
+        expandedSteps = videowire::sdfSaturatingAdd (expandedSteps, expandedRuns[index]);
+        const auto inputs = videowire::sdfOperationSchema (
+            static_cast<videowire::SdfOperation> (record.operation), schemaVersion).inputCount;
+        // Binary records and displacement pass their own point to their inputs.
+        const bool samePoint = inputs == 2
+            || record.operation == static_cast<std::uint32_t> (videowire::SdfOperation::displacement);
+        const auto point = samePoint || pointOf[index] == mixed
+            ? pointOf[index] : static_cast<std::int64_t> (index) + 1;
+        const auto reach = [&] (std::uint32_t input)
+        {
+            pointOf[input] = pointOf[input] == unreached || pointOf[input] == point ? point : mixed;
+            ++references[input];
+            runs[input] = videowire::sdfSaturatingAdd (runs[input], runs[index]);
+            expandedRuns[input] = videowire::sdfSaturatingAdd (expandedRuns[input], expandedRuns[index]);
+        };
+        if (inputs > 0) reach (record.input0);
+        if (inputs > 1) reach (record.input1);
+    }
+    const auto narrowed = [] (std::uint64_t count)
+    {
+        return static_cast<std::uint32_t> (std::min<std::uint64_t> (count, std::numeric_limits<std::uint32_t>::max()));
+    };
+    plan.steps = narrowed (steps);
+    plan.expandedSteps = narrowed (expandedSteps);
+    return plan;
+}
+
 inline std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram> compileNativeSdfProgram (
     const videowire::SdfIr& source, std::string& error, bool textTablesAvailable)
 {
@@ -323,36 +386,12 @@ inline std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram> compileNativeSd
         program->records_.push_back (record);
     }
 
-    std::vector<std::size_t> expandedSteps (program->records_.size(), 0);
-    std::function<std::size_t (std::size_t)> countSteps = [&] (std::size_t index)
-    {
-        if (expandedSteps[index] != 0) return expandedSteps[index];
-        const auto& record = program->records_[index];
-        const auto inputs = videowire::sdfOperationSchema (
-            static_cast<videowire::SdfOperation> (record.operation), program->schemaVersion_).inputCount;
-        std::size_t steps = 1;
-        const auto addChild = [&] (std::uint32_t child)
-        {
-            const auto childSteps = countSteps (child);
-            if (childSteps > arbitgpu::kNativeSdfMaximumEvaluationSteps - steps)
-                steps = arbitgpu::kNativeSdfMaximumEvaluationSteps + 1;
-            else
-                steps += childSteps;
-        };
-        if (inputs > 0) addChild (record.input0);
-        if (inputs > 1 && steps <= arbitgpu::kNativeSdfMaximumEvaluationSteps)
-            addChild (record.input1);
-        expandedSteps[index] = steps;
-        return steps;
-    };
     program->rootIndex_ = indices.at (admitted->rootId());
-    const auto evaluationSteps = countSteps (program->rootIndex_);
-    if (evaluationSteps > arbitgpu::kNativeSdfMaximumEvaluationSteps)
-    {
-        error = "native GPU SDF expanded evaluation capacity exceeded";
-        return {};
-    }
-    program->evaluationSteps_ = static_cast<std::uint32_t> (evaluationSteps);
+    auto evaluation = nativeSdfEvaluationPlan (program->records_, program->rootIndex_, program->schemaVersion_);
+    program->evaluationSteps_ = evaluation.steps;
+    program->expandedEvaluationSteps_ = evaluation.expandedSteps;
+    program->evaluationSlots_ = std::move (evaluation.slots);
+    program->evaluationSlotCount_ = evaluation.slotCount;
     if (! program->textResources_.empty())
     {
         videowire::SdfTextWorkBudget work;
@@ -370,8 +409,8 @@ inline std::shared_ptr<const arbitgpu::NativeSdfCompiledProgram> compileNativeSd
             const auto root = program->textIndexRoots_[program->textResourceIndices_[i]];
             nodeVisits[i] = program->textIndexNodes_[root].escape - root;
         }
-        if (schema.inputCount > 0) nodeVisits[i] += nodeVisits[record.input0];
-        if (schema.inputCount > 1) nodeVisits[i] += nodeVisits[record.input1];
+        if (schema.inputCount > 0) nodeVisits[i] = videowire::sdfSaturatingAdd (nodeVisits[i], nodeVisits[record.input0]);
+        if (schema.inputCount > 1) nodeVisits[i] = videowire::sdfSaturatingAdd (nodeVisits[i], nodeVisits[record.input1]);
     }
     program->textIndexNodeVisitsPerQuery_ = nodeVisits[program->rootIndex_];
     program->sceneBounds_ = nativeSdfSceneBounds (*program);
@@ -392,7 +431,6 @@ inline bool validateNativeSdfProgram (
         || program.rootIndex() >= program.records().size()
         || program.maximumDepth() > arbitgpu::kNativeSdfMaximumDepth
         || program.evaluationSteps() == 0
-        || program.evaluationSteps() > arbitgpu::kNativeSdfMaximumEvaluationSteps
         || program.structuralDigest().size() != 64
         || (program.schemaVersion() != videowire::kSdfIrSchemaVersion
             && program.schemaVersion() != videowire::kSdfIrTextSchemaVersion)
@@ -577,8 +615,17 @@ inline bool validateNativeSdfProgram (
             const auto root = program.textIndexRoots()[program.textResourceIndices()[i]];
             nodeVisits[i] = program.textIndexNodes()[root].escape - root;
         }
-        if (schema.inputCount > 0) nodeVisits[i] += nodeVisits[record.input0];
-        if (schema.inputCount > 1) nodeVisits[i] += nodeVisits[record.input1];
+        if (schema.inputCount > 0) nodeVisits[i] = videowire::sdfSaturatingAdd (nodeVisits[i], nodeVisits[record.input0]);
+        if (schema.inputCount > 1) nodeVisits[i] = videowire::sdfSaturatingAdd (nodeVisits[i], nodeVisits[record.input1]);
+    }
+    const auto evaluation = nativeSdfEvaluationPlan (program.records(), program.rootIndex(), program.schemaVersion());
+    if (evaluation.steps != program.evaluationSteps()
+        || evaluation.expandedSteps != program.expandedEvaluationSteps()
+        || evaluation.slots != program.evaluationSlots()
+        || evaluation.slotCount != program.evaluationSlotCount())
+    {
+        error = "native GPU SDF evaluation plan is invalid";
+        return false;
     }
     const auto expectedBounds = nativeSdfSceneBounds (program);
     if (nodeVisits[program.rootIndex()] != program.textIndexNodeVisitsPerQuery()
@@ -666,17 +713,6 @@ inline bool validateNativeSdfProgram (
     std::unordered_map<videowire::SdfStableId, std::uint32_t> indices;
     for (std::size_t index = 0; index < ordered.size(); ++index)
         indices.emplace (ordered[index]->stableId, static_cast<std::uint32_t> (index));
-    std::vector<std::size_t> steps (program.records().size(), 0);
-    std::function<std::size_t (std::uint32_t)> countSteps = [&] (std::uint32_t index)
-    {
-        if (steps[index] != 0) return steps[index];
-        const auto schema = videowire::sdfOperationSchema (
-            static_cast<videowire::SdfOperation> (program.records()[index].operation), program.schemaVersion());
-        std::size_t result = 1;
-        if (schema.inputCount > 0) result += countSteps (program.records()[index].input0);
-        if (schema.inputCount > 1) result += countSteps (program.records()[index].input1);
-        return steps[index] = result;
-    };
     for (std::size_t index = 0; index < ordered.size(); ++index)
     {
         const auto& sourceRecord = *ordered[index];
@@ -697,8 +733,7 @@ inline bool validateNativeSdfProgram (
                 return false;
             }
     }
-    if (program.rootIndex() != indices.at (admitted->rootId())
-        || program.evaluationSteps() != countSteps (program.rootIndex()))
+    if (program.rootIndex() != indices.at (admitted->rootId()))
     {
         error = "native GPU SDF compiled payload metadata does not match admitted geometry";
         return false;

@@ -225,9 +225,65 @@ inline void waterSurfaceTypedContract(Check check) {
   check(!validateWaterSurfaceGrid(hostile,shape,error),"water refuses nonfinite rest positions");
   auto cap=lowerGrid(10110,10110,1,32,32,0.1f,contract,error);
   check(cap && lowerWaterSurfaceSimulation(*cap,10111,10112,1,1,0,0,contract,error),
-        "water accepts exact 32 by 32 cap with finite float spacing");
-  auto over=lowerGrid(10120,10120,1,33,2,0.25f,contract,error);
-  check(over && !lowerWaterSurfaceSimulation(*over,10121,10122,1,1,0,0,contract,error),"water refuses over-cap axis");
+        "water accepts the former 32 by 32 cap with finite float spacing");
+  auto wide=lowerGrid(10120,10120,1,33,2,0.25f,contract,error);
+  check(wide && lowerWaterSurfaceSimulation(*wide,10121,10122,1,1,0,0,contract,error),"water accepts the former over-cap axis");
+  PortContract ocean=contract; ocean.maxVertices=kMaximumVertices; ocean.maxIndices=kMaximumIndices;
+  const auto errorNames=[&](std::initializer_list<std::string> parts) {
+    return std::all_of(parts.begin(),parts.end(),[&](const auto& part){return error.find(part)!=std::string::npos;});
+  };
+  // 0.1 has no exact float form, so this grid also pins the extent-scaled spacing tolerance.
+  auto oceanGrid=lowerGrid(10150,10150,1,256,256,0.1f,ocean,error);
+  check(bool(oceanGrid),"256 by 256 ocean grid lowers");
+  if (oceanGrid) {
+    const auto oceanWater=lowerWaterSurfaceSimulation(*oceanGrid,10151,10152,1,1,0,0,ocean,error);
+    check(oceanWater && admitValue(*oceanWater,ocean,error),"water admits a 256 by 256 grid");
+    check(bool(lowerDirectionalSurfaceWave(*oceanGrid,10153,10160,0.1,2,0,0.5,0,0,ocean,error)),
+          "directional wave admits a 256 by 256 grid");
+    check(!lowerWaterSurfaceSimulation(*oceanGrid,10151,10152,1,1,0,0,contract,error)
+          && errorNames({"256 by 256","65536",std::to_string(contract.maxVertices)}),
+          "a grid past its port's declared vertices names both counts");
+  }
+  auto large=lowerGrid(10170,10170,1,700,700,0.1f,ocean,error);
+  check(bool(large),"700 by 700 grid lowers as ordinary geometry");
+  if (large)
+    check(bool(lowerWaterSurfaceSimulation(*large,10171,10172,1,1,0,0,ocean,error)),
+          "water lowers a 700 by 700 grid, above the former byte budget");
+  // Thresholds come from evaluating this exact formula offline at several winds.
+  std::vector<WindSpectrumWave> windWaves;
+  check(windSpectrumWaves(10,0,0.2,4,63,windWaves,error),"wind spectrum synthesizes a 64 by 64 band");
+  const auto windHeights=[&](double seconds) {
+    std::vector<double> heights(64*64);
+    for (std::size_t y=0;y<64;++y) for (std::size_t x=0;x<64;++x)
+      heights[y*64+x]=windSpectrumHeight(windWaves,double(x),double(y),seconds);
+    return heights;
+  };
+  const auto windStart=windHeights(0),windLater=windHeights(0.5);
+  double windMean=0,windEnergy=0,alongWind=0,acrossWind=0,windChange=0;
+  for (const auto height : windStart) { windMean+=height/windStart.size(); windEnergy+=height*height/windStart.size(); }
+  for (std::size_t y=0;y+1<64;++y) for (std::size_t x=0;x+1<64;++x) {
+    const auto here=windStart[y*64+x];
+    alongWind+=std::pow(windStart[y*64+x+1]-here,2); acrossWind+=std::pow(windStart[(y+1)*64+x]-here,2);
+  }
+  for (std::size_t i=0;i<windStart.size();++i) windChange=std::max(windChange,std::abs(windLater[i]-windStart[i]));
+  check(std::abs(windMean)<0.04,"wind spectrum mean displacement stays near zero");
+  check(std::sqrt(windEnergy)>0.1 && std::sqrt(windEnergy)<0.3,"wind spectrum height follows its root mean square target");
+  check(alongWind>1.5*acrossWind,"wind spectrum slopes are steeper along the wind than across it");
+  const auto largest=std::max_element(windWaves.begin(),windWaves.end(),
+      [](const auto& a,const auto& b){return a.amplitude<b.amplitude;});
+  check(std::abs(std::atan2(largest->ky,largest->kx))<0.53,"largest wind wave runs within 30 degrees of the heading");
+  check(windChange>0.01,"wind spectrum evolves between two ticks");
+  auto windGrid=lowerGrid(10180,10180,1,64,64,1,ocean,error);
+  const auto windValue=windGrid ? lowerWindSpectrumSurfaceWave(*windGrid,10181,10182,0.2,10,0,ocean,error) : std::nullopt;
+  check(bool(windValue) && admitValue(*windValue,ocean,error),"wind spectrum lowers and admits a 64 by 64 grid");
+  const auto oceanWind=oceanGrid ? lowerWindSpectrumSurfaceWave(*oceanGrid,10190,10191,0.2,10,0,ocean,error) : std::nullopt;
+  check(bool(oceanWind) && admitValue(*oceanWind,ocean,error),"wind spectrum admits a 256 by 256 grid without refusal");
+  check(!lowerWindSpectrumSurfaceWave(*grid,10130,10131,0.2,0,0,contract,error)
+        && errorNames({"wind speed 0.000000","0.100000","60.000000","Use 10 m/s"}),
+        "wind spectrum refusal names a zero speed, its bounds and a usable speed");
+  check(!lowerWindSpectrumSurfaceWave(*grid,10130,10131,0.2,10,720,contract,error)
+        && errorNames({"wind heading 720.000000","360.000000","Use 0 degrees"}),
+        "wind spectrum refusal names an absurd heading, its bounds and a usable heading");
   check(!lowerWaterSurfaceSimulation(*grid,10130,10131,100,2,0,0,contract,error),"water refuses unstable Courant coefficient");
   check(!lowerWaterSurfaceSimulation(*grid,10130,10131,1,121,0,0,contract,error),"water refuses unstable damping");
   check(!lowerWaterSurfaceSimulation(*grid,10130,10131,1,2,std::numeric_limits<double>::infinity(),0,contract,error),

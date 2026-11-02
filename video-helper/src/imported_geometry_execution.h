@@ -45,7 +45,7 @@ inline std::optional<videowire::geometry::AdmittedValue> prepareAnimatedGeometry
   value.operations.front().retainedMesh=std::move(retained);
   videowire::geometry::PortContract contract;
   contract.carrier=videowire::geometry::CarrierKind::geometry3D;
-  contract.maxVertices=4096; contract.maxIndices=12288;
+  contract.maxVertices=videowire::geometry::kMaximumVertices; contract.maxIndices=videowire::geometry::kMaximumIndices;
   contract.maxAttributes=videowire::geometry::kMaximumAttributes;
   return videowire::geometry::admitValue(std::move(value),
       videowire::geometry::withAttributeContract(contract,admitted->descriptor()),{},error);

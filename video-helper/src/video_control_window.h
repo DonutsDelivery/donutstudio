@@ -12,7 +12,6 @@ inline constexpr int kMaxSignalFrames = 28801; // 60 seconds at 480 fps, plus th
 inline constexpr int kMaxSignalFrameValues = 32768;
 inline constexpr double kMaxSignalDurationSeconds = 60.0;
 inline constexpr std::int64_t kMaxSignalSampleWork = 8000000;
-inline constexpr int kMaxSignalPlanBytes = 2 * 1024 * 1024; // helper request cap is 16 MiB
 
 struct SignalWindow
 {

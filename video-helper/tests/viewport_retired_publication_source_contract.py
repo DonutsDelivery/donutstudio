@@ -71,6 +71,27 @@ if "if (! published)\n        {\n            pending_ = true;" not in gate:
 if viewport.count('closeForDeviceFailure("temporal sampling could not be committed"') != 1:
     errors.append("temporal sampling commit must keep exactly one device-close call")
 
+# The retirement reason is shared by every pushed field, which is what let the
+# trading-card row hold plan-error without naming its churn. The activity prints
+# the differing field set once per distinct set, and the names cover every field
+# the generation block compares.
+if "[viewport] imported frame source retired: fields=" not in viewport:
+    errors.append("activity does not print the differing retired field set")
+for field in (
+    "wantClose", "timeline", "publication", "score",
+    "seek", "loop", "source", "project",
+    "helper", "device", "backend", "scoreIdentity",
+    "beatMap", "fps", "beatTimeline",
+):
+    if '"' + field + '"' not in viewport:
+        errors.append("retired field names missing " + field)
+
+# Every plan-execute site prints its rejection before holding the frame. The
+# geometry-core branch was the one silent site, so its retired rejections never
+# reached the run log.
+if viewport.count('[viewport] visual plan execution rejected: %s') != 3:
+    errors.append("every plan-execute site must print its rejection exactly once")
+
 if errors:
     print("viewport retired-publication contract: " + "; ".join(errors), file=sys.stderr)
     raise SystemExit(1)

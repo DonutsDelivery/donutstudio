@@ -317,9 +317,10 @@ bool parseSnapshotJson (const Json& object, ShaderResolver&& resolveShader,
     if (object.contains("paramTimeline"))
     {
         const auto& timeline=object["paramTimeline"];
-        if (!timeline.is_array() || timeline.size()>262144)
-        { error="Simulation automation timeline capacity exceeded"; return false; }
+        if (!timeline.is_array())
+        { error="Malformed simulation automation timeline"; return false; }
         std::vector<videorender::VisualParameterSample> samples;
+        try {
         for (const auto& value:timeline)
         {
             if (!value.is_object() || !value.contains("paramId") || !value["paramId"].is_string()
@@ -328,6 +329,10 @@ bool parseSnapshotJson (const Json& object, ShaderResolver&& resolveShader,
             { error="Malformed simulation automation timeline"; return false; }
             samples.push_back({value["paramId"].template get<std::string>(),
                 value["atSec"].template get<double>(),value["value"].template get<double>()});
+        }
+        } catch (const std::bad_alloc&) {
+            error="Simulation automation allocation failed at "+std::to_string(timeline.size())+" samples";
+            return false;
         }
         auto admitted=std::make_shared<videorender::VisualParameterTimeline>();
         if (!admitted->bind(samples,error)) return false;

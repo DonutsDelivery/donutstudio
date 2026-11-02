@@ -6,8 +6,12 @@
 #include "fixture_texture_upload.h"
 #include "fixture_opaque_visibility.h"
 #include "fixture_smooth_glass.h"
+#include "fixture_glass_overdraw_probe.h"
 #include "fixture_glass_caustics_opengl.h"
+#include "fixture_preview_budget.h"
+#include "fixture_realtime_opengl.h"
 #include "fixture_rough_glass_tiles_opengl.h"
+#include "fixture_rough_lane_slices.h"
 #include "fixture_diffraction_transport.h"
 #include "fixture_diffraction_bands.h"
 #include "fixture_primary_object.h"
@@ -24,6 +28,7 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <exception>
 #include <atomic>
 #include <array>
 #include <cmath>
@@ -33,12 +38,14 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
 #include <set>
 #include <mutex>
 #include <optional>
+#include <atomic>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -87,9 +94,8 @@ layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec4 outNormal;
 layout(location = 2) out float outDepth;
 uniform int uNormalInspection;
-uniform vec4 uRecords[64];
-uniform vec4 uParameters0[64];
-uniform vec4 uParameters1[64];
+// One row per record: header, then the two parameter vectors.
+uniform sampler2D uRecordTable;
 uniform int uRootIndex;
 uniform float uEpsilon;
 uniform float uMaximumDistance;
@@ -245,13 +251,23 @@ float sceneDistanceWithMaterial(vec3 point, out int contributor) {
     int indices[32], stages[32], firstContributors[32]; vec3 points[32]; float firstValues[32];
     int top = 0; indices[0] = uRootIndex; stages[0] = 0; points[0] = point;
     float value = 0.0; contributor = -1;
-    for (int iteration = 0; iteration < 768; ++iteration) {
-        int index = indices[top]; ivec4 record = ivec4(uRecords[index]);
-        int operation = record.x; vec4 p0 = uParameters0[index], p1 = uParameters1[index];
+    float slotValues[SDF_SLOTS]; int slotContributors[SDF_SLOTS]; bool slotReady[SDF_SLOTS];
+    for (int slot = 0; slot < SDF_SLOTS; ++slot) slotReady[slot] = false;
+    // Records form a DAG no deeper than the stack, so the walk always ends.
+    while (true) {
+        int index = indices[top]; ivec4 record = ivec4(texelFetch(uRecordTable, ivec2(0, index), 0));
+        int operation = record.x, slot = int(texelFetch(uRecordTable, ivec2(3, index), 0).x);
+        if (stages[top] == 0 && slot >= 0 && slotReady[slot]) {
+            value = slotValues[slot]; contributor = slotContributors[slot];
+            if (top == 0) return value;
+            --top; continue;
+        }
+        vec4 p0 = texelFetch(uRecordTable, ivec2(1, index), 0), p1 = texelFetch(uRecordTable, ivec2(2, index), 0);
         if (operation <= 9 || operation == 27) {
             value = operation == 27 ? textDistance(index, points[top], p0.x)
                                     : primitiveDistance(operation, points[top], p0, p1);
             contributor = index;
+            if (slot >= 0) { slotValues[slot] = value; slotContributors[slot] = contributor; slotReady[slot] = true; }
             if (top == 0) return value;
             --top; continue;
         }
@@ -288,6 +304,7 @@ float sceneDistanceWithMaterial(vec3 point, out int contributor) {
                 value += p0.x * sin(p0.y * q.x) * sin(p0.y * q.y) * sin(p0.y * q.z);
             }
         }
+        if (slot >= 0) { slotValues[slot] = value; slotContributors[slot] = contributor; slotReady[slot] = true; }
         if (top == 0) return value;
         --top;
     }
@@ -417,7 +434,7 @@ void main() {
     if (uOutputPass == 3) {
         int contributor;
         sceneDistanceWithMaterial(point,contributor);
-        int code = contributor < 0 ? 0 : int(uRecords[contributor].w);
+        int code = contributor < 0 ? 0 : int(texelFetch(uRecordTable, ivec2(0, contributor), 0).w);
         outColor = vec4(vec3(code&255,(code>>8)&255,(code>>16)&255)/255.0,1.0); return;
     }
     if (uOutputPass == 4) { outColor = vec4(vec3(sceneCurvature(point)),1.0); return; }
@@ -594,9 +611,13 @@ public:
         const auto context = reinterpret_cast<GLFWwindow*> (identity);
         const auto generation = contextGenerations_[context];
         const ContextKey key { context, generation };
-        const auto found = programs_.find (key);
-        if (found != programs_.end())
+        for (auto found = programs_.begin(); found != programs_.end();)
         {
+            if (found->first.pointer != key.pointer || found->first.generation != key.generation)
+            {
+                ++found;
+                continue;
+            }
             if (glfwGetCurrentContext() == context)
             {
                 arbitgl::GlFuncs gl;
@@ -604,7 +625,7 @@ public:
                 if (arbitgl::loadGlFunctions (gl, missing))
                     gl.DeleteProgram (found->second);
             }
-            programs_.erase (found);
+            found = programs_.erase (found);
         }
         ++contextGenerations_[context];
     }
@@ -645,8 +666,7 @@ public:
         glGetIntegerv (GL_MAX_FRAGMENT_UNIFORM_COMPONENTS, &uniformComponents);
         arbitgl::GlFuncs gl;
         std::string consumerError;
-        if (textureUnits >= 8 && combinedUnits >= 8
-            && uniformComponents >= static_cast<int> (kNativeSdfMaximumRecords * 12 + 16)
+        if (textureUnits >= 9 && combinedUnits >= 9 && uniformComponents >= 64
             && arbitgl::loadGlFunctions (gl, consumerError))
         {
             const auto program = programForCurrentContext (gl, consumerError);
@@ -775,7 +795,7 @@ public:
         }
 
         const std::uint64_t backendProgramBytes = std::strlen (kVertexShader) + std::strlen (kFragmentShader);
-        const std::uint64_t uniformBytes = (kNativeSdfMaximumRecords * 12u * sizeof (float))
+        const std::uint64_t uniformBytes = (compiledProgram->records().size() * 16u * sizeof (float))
             + 4u * sizeof (float) + 12u * sizeof (int);
         const std::uint64_t attachmentBytes = static_cast<std::uint64_t> (request.width) * request.height * 20u;
         std::uint64_t admittedTextBytes = 0;
@@ -823,7 +843,8 @@ public:
         int previousProgram = 0;
         int previousVertexArray = 0;
         int previousTexture = 0, previousActiveTexture = 0, previousUnpackBuffer = 0;
-        std::array<int, 8> previousTableTextures {}, previousSamplers {};
+        std::array<int, 9> previousTableTextures {}, previousSamplers {};
+        unsigned recordTable = 0;
         constexpr std::array<unsigned, 6> unpackNames { GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH,
             GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_ROWS, GL_UNPACK_SWAP_BYTES, GL_UNPACK_LSB_FIRST };
         std::array<int, 6> previousUnpack {};
@@ -834,6 +855,8 @@ public:
         const bool depthWasEnabled = glIsEnabled (GL_DEPTH_TEST) == GL_TRUE;
         const bool cullWasEnabled = glIsEnabled (GL_CULL_FACE) == GL_TRUE;
         const bool scissorWasEnabled = glIsEnabled (GL_SCISSOR_TEST) == GL_TRUE;
+        int previousScissor[4] {};
+        glGetIntegerv (GL_SCISSOR_BOX, previousScissor);
         const bool rasterizerDiscardWasEnabled = glIsEnabled (GL_RASTERIZER_DISCARD) == GL_TRUE;
         const bool colorLogicOpWasEnabled = glIsEnabled (GL_COLOR_LOGIC_OP) == GL_TRUE;
         const bool framebufferSrgbWasEnabled = glIsEnabled (GL_FRAMEBUFFER_SRGB) == GL_TRUE;
@@ -866,6 +889,7 @@ public:
 
         auto cleanup = [&]
         {
+            if (recordTable != 0) glDeleteTextures (1, &recordTable);
             gl.BindFramebuffer (GL_DRAW_FRAMEBUFFER,
                                 static_cast<unsigned> (previousDrawFramebuffer));
             gl.BindFramebuffer (GL_READ_FRAMEBUFFER,
@@ -892,6 +916,7 @@ public:
             if (depthWasEnabled) glEnable (GL_DEPTH_TEST); else glDisable (GL_DEPTH_TEST);
             if (cullWasEnabled) glEnable (GL_CULL_FACE); else glDisable (GL_CULL_FACE);
             if (scissorWasEnabled) glEnable (GL_SCISSOR_TEST); else glDisable (GL_SCISSOR_TEST);
+            glScissor (previousScissor[0], previousScissor[1], previousScissor[2], previousScissor[3]);
             if (rasterizerDiscardWasEnabled) glEnable (GL_RASTERIZER_DISCARD); else glDisable (GL_RASTERIZER_DISCARD);
             if (colorLogicOpWasEnabled) glEnable (GL_COLOR_LOGIC_OP); else glDisable (GL_COLOR_LOGIC_OP);
             if (framebufferSrgbWasEnabled) glEnable (GL_FRAMEBUFFER_SRGB); else glDisable (GL_FRAMEBUFFER_SRGB);
@@ -990,7 +1015,7 @@ public:
         if (gl.CheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
             return fail ("OpenGL native SDF framebuffer is incomplete");
 
-        const auto program = programForCurrentContext (gl, result.error);
+        const auto program = programForCurrentContext (gl, result.error, compiledProgram->evaluationSlotCount());
         if (program == 0) return fail (result.error);
 
         gl.GenVertexArrays (1, &vertexArray);
@@ -1058,13 +1083,12 @@ public:
                 || glGetError() != GL_NO_ERROR)
                 return fail ("OpenGL native SDF text table allocation failed");
         }
-        std::array<float, kNativeSdfMaximumRecords * 4> gpuRecords {};
-        std::array<float, kNativeSdfMaximumRecords * 4> gpuParameters0 {};
-        std::array<float, kNativeSdfMaximumRecords * 4> gpuParameters1 {};
-        for (std::size_t index = 0; index < compiledProgram->records().size(); ++index)
+        const auto recordCount = compiledProgram->records().size();
+        std::vector<float> gpuRecords (recordCount * 16);
+        for (std::size_t index = 0; index < recordCount; ++index)
         {
             const auto& record = compiledProgram->records()[index];
-            const auto offset = index * 4;
+            const auto offset = index * 16;
             gpuRecords[offset] = static_cast<float> (record.operation);
             gpuRecords[offset + 1] = record.input0 == std::numeric_limits<std::uint32_t>::max()
                 ? -1.0f : static_cast<float> (record.input0);
@@ -1074,15 +1098,22 @@ public:
             // consume parameterCount; admission already checked the schema.
             gpuRecords[offset + 3] = static_cast<float> (
                 videohelper::sdf::nativeSdfMaterialColorCode (record.stableId));
-            std::copy_n (record.parameters.data(), 4, gpuParameters0.data() + offset);
-            std::copy_n (record.parameters.data() + 4, 4, gpuParameters1.data() + offset);
+            std::copy_n (record.parameters.data(), 8, gpuRecords.data() + offset + 4);
+            gpuRecords[offset + 12] = static_cast<float> (compiledProgram->evaluationSlots()[index]);
         }
-        gl.Uniform4fv (gl.GetUniformLocation (program, "uRecords"),
-                       static_cast<int> (kNativeSdfMaximumRecords), gpuRecords.data());
-        gl.Uniform4fv (gl.GetUniformLocation (program, "uParameters0"),
-                       static_cast<int> (kNativeSdfMaximumRecords), gpuParameters0.data());
-        gl.Uniform4fv (gl.GetUniformLocation (program, "uParameters1"),
-                       static_cast<int> (kNativeSdfMaximumRecords), gpuParameters1.data());
+        glGenTextures (1, &recordTable);
+        gl.ActiveTexture (GL_TEXTURE0 + 8);
+        gl.BindSampler (8, 0);
+        glBindTexture (GL_TEXTURE_2D, recordTable);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, 4, static_cast<int> (recordCount), 0,
+                      GL_RGBA, GL_FLOAT, gpuRecords.data());
+        if (recordTable == 0 || glGetError() != GL_NO_ERROR)
+            return fail ("OpenGL native SDF record table allocation failed");
+        gl.Uniform1i (gl.GetUniformLocation (program, "uRecordTable"), 8);
         gl.Uniform1i (gl.GetUniformLocation (program, "uRootIndex"),
                       static_cast<int> (compiledProgram->rootIndex()));
         gl.Uniform1f (gl.GetUniformLocation (program, "uEpsilon"),
@@ -1107,14 +1138,36 @@ public:
         glDisable (GL_BLEND);
         glDisable (GL_DEPTH_TEST);
         glDisable (GL_CULL_FACE);
-        glDisable (GL_SCISSOR_TEST);
+        glEnable (GL_SCISSOR_TEST);
         glDisable (GL_RASTERIZER_DISCARD);
         glDisable (GL_COLOR_LOGIC_OP);
         glDisable (GL_FRAMEBUFFER_SRGB);
         glPolygonMode (GL_FRONT_AND_BACK, GL_FILL);
         glColorMask (GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glDrawArrays (GL_TRIANGLES, 0, 3);
-        glFinish();
+        // The draw goes out in scissor bands aimed at half the dispatch limit, so a
+        // heavy program never holds the GPU past one pixel. Each pixel depends only on
+        // its own coordinates, so band sizes change when it reaches the GPU and not
+        // its value. The budget counts record runs, which carries a band size from one
+        // program to a heavier one in proportion.
+        const auto pixelWork = std::max<std::uint64_t> (1, compiledProgram->evaluationSteps())
+            * std::max<std::uint64_t> (1, request.maximumSteps);
+        auto bands = bandBudget();
+        std::uint32_t bandX = 0, bandY = 0;
+        while (bandY < request.height)
+        {
+            const auto band = roughglasstiles::nextBand (bands.units() / pixelWork,
+                request.width, request.height, bandX, bandY);
+            glScissor (static_cast<int> (band.x), static_cast<int> (band.y),
+                       static_cast<int> (band.columns), static_cast<int> (band.rows));
+            const auto started = std::chrono::steady_clock::now();
+            glDrawArrays (GL_TRIANGLES, 0, 3);
+            glFinish();
+            bands.observe (band.pixels() * pixelWork, std::chrono::steady_clock::now() - started);
+            ++frame->receipt_.dispatchBands;
+            bandX += band.columns;
+            if (bandX >= request.width) { bandX = 0; bandY += band.rows; }
+        }
+        storeBandBudget (bands);
         if (glGetError() != GL_NO_ERROR)
             return fail ("OpenGL native SDF draw reported a GPU error");
 
@@ -1129,9 +1182,10 @@ private:
     {
         GLFWwindow* pointer = nullptr;
         std::uint64_t generation = 0;
+        std::uint32_t slots = 1;
         bool operator== (const ContextKey& other) const noexcept
         {
-            return pointer == other.pointer && generation == other.generation;
+            return pointer == other.pointer && generation == other.generation && slots == other.slots;
         }
     };
     struct ContextKeyHash final
@@ -1139,19 +1193,38 @@ private:
         std::size_t operator() (const ContextKey& key) const noexcept
         {
             return std::hash<GLFWwindow*> {} (key.pointer)
-                ^ (std::hash<std::uint64_t> {} (key.generation) << 1u);
+                ^ (std::hash<std::uint64_t> {} (key.generation) << 1u)
+                ^ (std::hash<std::uint32_t> {} (key.slots) << 2u);
         }
     };
-    unsigned programForCurrentContext (const arbitgl::GlFuncs& gl, std::string& error) const
+    roughglasstiles::SliceBudget bandBudget() const
+    {
+        std::lock_guard<std::mutex> lock (programMutex_);
+        return bandBudget_;
+    }
+    void storeBandBudget (const roughglasstiles::SliceBudget& budget) const
+    {
+        std::lock_guard<std::mutex> lock (programMutex_);
+        bandBudget_ = budget;
+    }
+
+    // The slot array lives in shader locals, so it sizes the program. Sizes round up
+    // to a power of two to keep the number of compiled programs small.
+    unsigned programForCurrentContext (const arbitgl::GlFuncs& gl, std::string& error,
+                                       std::uint32_t slotCount = 0) const
     {
         std::lock_guard<std::mutex> lock (programMutex_);
         const auto context = glfwGetCurrentContext();
-        const ContextKey key { context, contextGenerations_[context] };
+        std::uint32_t slots = 1;
+        while (slots < slotCount) slots *= 2;
+        const ContextKey key { context, contextGenerations_[context], slots };
         const auto found = programs_.find (key);
         if (found != programs_.end()) return found->second;
 
         const auto vertex = compileShader (gl, GL_VERTEX_SHADER, kVertexShader, error);
-        const auto fragment = compileShader (gl, GL_FRAGMENT_SHADER, kFragmentShader, error);
+        const std::string fragmentText = "#version 330 core\n#define SDF_SLOTS " + std::to_string (slots) + "\n"
+            + (std::strchr (kFragmentShader, '\n') + 1);
+        const auto fragment = compileShader (gl, GL_FRAGMENT_SHADER, fragmentText.c_str(), error);
         if (vertex == 0 || fragment == 0)
         {
             if (vertex != 0) gl.DeleteShader (vertex);
@@ -1183,6 +1256,7 @@ private:
     mutable std::mutex programMutex_;
     mutable std::unordered_map<ContextKey, unsigned, ContextKeyHash> programs_;
     mutable std::unordered_map<GLFWwindow*, std::uint64_t> contextGenerations_;
+    mutable roughglasstiles::SliceBudget bandBudget_ { 1, std::uint64_t (1) << 62u };
 };
 
 class OpenGlRenderPassOutputBackend final : public RenderPassOutputBackend
@@ -1737,7 +1811,9 @@ void main(){ vec3 n=normalize(texture(uSource,vUv).xyz); outColor=vec4(n*0.5+0.5
                       std::tan (camera.verticalFovRadians * 0.5f),
                       static_cast<float> (payload.extent.width) / payload.extent.height,
                       camera.nearPlane, camera.farPlane);
-        set3 ("uEmission", material.emissive);
+        { float emission[3]{material.emissive.x,material.emissive.y,material.emissive.z};
+          arbitgpu::analyticsky::clipRasterRadiance (emission);
+          set3 ("uEmission", {emission[0],emission[1],emission[2]}); }
         gl.Uniform1ui (gl.GetUniformLocation (program, "uMaterialId"), material.id.value);
         gl.Uniform1ui (gl.GetUniformLocation (program, "uObjectId"), object.id.value);
         glDrawElements (GL_TRIANGLES, static_cast<int> (object.indexCount),
@@ -2335,8 +2411,39 @@ std::uint64_t nextFixtureRendererGeneration() noexcept
     return ++generation;
 }
 
+// Runs a cleanup once: at its first call, or at scope exit if nothing called it.
+template <typename Cleanup>
+class ScopeCleanup final
+{
+public:
+    explicit ScopeCleanup (Cleanup functionIn) : function (std::move (functionIn)) {}
+    ScopeCleanup (const ScopeCleanup&) = delete;
+    ScopeCleanup& operator= (const ScopeCleanup&) = delete;
+    ~ScopeCleanup()
+    {
+        try { (*this)(); }
+        catch (...) {}
+    }
+    void operator()()
+    {
+        if (done) return;
+        done = true;
+        function();
+    }
+
+private:
+    Cleanup function;
+    bool done = false;
+};
+
+// Restores the saved state once: at restore(), or when it leaves scope, so an
+// allocation failure unwinding a frame cannot leave the caller's GL state wrong.
 struct OpenGlFixtureState final
 {
+    OpenGlFixtureState (const OpenGlFixtureState&) = delete;
+    OpenGlFixtureState& operator= (const OpenGlFixtureState&) = delete;
+    ~OpenGlFixtureState() { restore(); }
+
     explicit OpenGlFixtureState (const arbitgl::GlFuncs& functions) : gl (functions)
     {
         glGetIntegerv (GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
@@ -2385,6 +2492,8 @@ struct OpenGlFixtureState final
 
     void restore() const noexcept
     {
+        if (restored) return;
+        restored = true;
         for (std::size_t unit = 0; unit < textureBindings.size(); ++unit)
         {
             gl.ActiveTexture (GL_TEXTURE0 + static_cast<unsigned> (unit));
@@ -2434,6 +2543,7 @@ struct OpenGlFixtureState final
     }
 
     const arbitgl::GlFuncs& gl;
+    mutable bool restored = false;
     int drawFramebuffer = 0;
     int readFramebuffer = 0;
     int program = 0;
@@ -2503,7 +2613,8 @@ uniform float uSkyBackground;
 uniform mat4 uObjectMatrix;
 uniform float uTangentHandednessSign;
 uniform int uUseInstanceMatrix;
-uniform vec4 uRawIdentifiers[64];
+uniform sampler2D uSceneTable;
+uniform int uLightCount;
 uniform int uRawObjectIndex;
 flat out vec4 vRawIdentifiers;
 flat out uint vDiffractionInstance;
@@ -2558,7 +2669,8 @@ void main() {
     vDiffractionInstance = uint(uRawObjectIndex * uDiffractionInstanceCount + gl_InstanceID);
     // Mode 1 is one Geometry instance per scene object; mode 2 is one scene
     // object drawn once per instance transform.
-    vRawIdentifiers = uRawIdentifiers[uUseInstanceMatrix == 1 ? gl_InstanceID : uRawObjectIndex];
+    int rawIdentifierRecord = 4 * uLightCount + (uUseInstanceMatrix == 1 ? gl_InstanceID : uRawObjectIndex);
+    vRawIdentifiers = texelFetch(uSceneTable, ivec2(rawIdentifierRecord % 1024, rawIdentifierRecord / 1024), 0);
     mat4 objectMatrix = uUseInstanceMatrix != 0
         ? mat4(aInstanceMatrix0, aInstanceMatrix1,
                aInstanceMatrix2, aInstanceMatrix3)
@@ -2680,11 +2792,13 @@ uniform vec4 uSky[5];
 uniform float uSkyBackground;
 uniform vec4 uLightRotation;
 uniform int uLightCount;
-uniform vec4 uLightRotations[16];
-uniform vec4 uLightColors[16];
-uniform vec4 uLightPositions[16];
-uniform vec4 uLightCones[16];
-uniform int uLightKinds[16];
+uniform sampler2D uSceneTable;
+vec4 sceneTableRead(int record) { return texelFetch(uSceneTable, ivec2(record % 1024, record / 1024), 0); }
+#define fixtureLightRotation(i) sceneTableRead(4 * (i))
+#define fixtureLightColor(i) sceneTableRead(4 * (i) + 1)
+#define fixtureLightPosition(i) sceneTableRead(4 * (i) + 2)
+#define fixtureLightCone(i) sceneTableRead(4 * (i) + 3)
+#define fixtureLightKind(i) int(sceneTableRead(4 * (i) + 3).z)
 uniform vec4 uDiffractionGeometry;
 uniform vec4 uDiffractionSecondaryGeometry;
 uniform vec4 uDiffractionMicrostructure;
@@ -2720,6 +2834,9 @@ layout(location=7) out vec2 outRawMotion;
 )glsl";
 
 const char* kFixturePassCompositeShader = R"glsl(
+#ifdef FIXTURE_REALTIME
+vec3 gRealtimeFog = vec3(1.0);
+#endif
 // Scene-linear Color is stored as RGBA16F, whose largest finite value is 65504.
 // A brighter finite highlight is stored at that ceiling and stays finite.
 // NaN and infinity pass through unchanged, so readback checks still refuse them.
@@ -2748,6 +2865,9 @@ vec4 compositePass(vec4 color) {
         if (uPassTransforms[i].y > 0.5)
             fog = mix(pow((fog + 0.055) / 1.055, vec3(2.4)), fog / 12.92,
                 lessThanEqual(fog, vec3(0.04045)));
+#ifdef FIXTURE_REALTIME
+        fog *= gRealtimeFog;
+#endif
         uint identity = uint(uPassReferences[i].x) | (uint(uPassReferences[i].y) << 16u);
         vec4 value = vec4(color.rgb, outRawMask);
         if (mode == 1) value = vec4(mix(color.rgb, fog, depth * p.w), outRawMask);
@@ -2845,7 +2965,8 @@ float besselJ(int order, float argument) {
     int magnitude = order < 0 ? -order : order;
     float halfArgument = 0.5 * argument;
     float term = 1.0;
-    for (int factor = 1; factor <= 8; ++factor)
+    // The third-family convolution reaches order 12.
+    for (int factor = 1; factor <= 12; ++factor)
         if (factor <= magnitude)
             term *= halfArgument / float(factor);
     float sum = term;
@@ -2853,39 +2974,64 @@ float besselJ(int order, float argument) {
         term *= -(halfArgument * halfArgument)
               / (float(seriesIndex) * float(magnitude + seriesIndex));
         sum += term;
+        // Past the peak; no later term can round into the float sum.
+        if (abs(term) <= 2.98e-8 * abs(sum))
+            break;
     }
     return sum;
 }
 
-float profileEfficiency(int profile, int signedOrder, float duty,
-                        float phase, vec2 terracePhase) {
+vec2 profileAmplitude(int profile, int signedOrder, float duty,
+                      float phase, vec2 terracePhase) {
     if (profile == profileBinaryRectangular) {
-        if (signedOrder == 0) {
-            vec2 amplitude = vec2(1.0 - duty, 0.0) + duty * terracePhase;
-            return dot(amplitude, amplitude);
-        }
+        if (signedOrder == 0)
+            return vec2(1.0 - duty, 0.0) + duty * terracePhase;
         float order = float(signedOrder);
-        float aperture = sin(pi * order * duty) / (pi * order);
-        float rotation = -pi * order * duty;
-        vec2 amplitude = aperture * complexMultiply(
-            terracePhase - vec2(1.0, 0.0),
-            vec2(cos(rotation), sin(rotation)));
-        return dot(amplitude, amplitude);
+        // Measured from the groove centre, so the three families of a lattice
+        // share a centre of symmetry.
+        return sin(pi * order * duty) / (pi * order)
+            * (terracePhase - vec2(1.0, 0.0));
     }
     if (profile == profileSinusoidal) {
-        float amplitude = besselJ(signedOrder, 0.5 * phase);
-        return amplitude * amplitude;
+        // exp(i b cos x) = sum i^m J_m(b) exp(i m x).
+        int magnitude = signedOrder < 0 ? -signedOrder : signedOrder;
+        float bessel = besselJ(magnitude, 0.5 * phase);
+        int quarterTurns = magnitude - 4 * (magnitude / 4);
+        return quarterTurns == 0 ? vec2(bessel, 0.0)
+            : quarterTurns == 1 ? vec2(0.0, bessel)
+            : quarterTurns == 2 ? vec2(-bessel, 0.0) : vec2(0.0, -bessel);
     }
     if (profile == profileBlazedSawtooth) {
         float orderFrequency = -2.0 * pi * float(signedOrder);
-        vec2 ramp = complexExponentialIntegral(
-            phase / duty + orderFrequency, 0.0, duty);
-        vec2 land = complexExponentialIntegral(orderFrequency, duty, 1.0);
-        vec2 amplitude = ramp + land;
-        return dot(amplitude, amplitude);
+        return complexExponentialIntegral(phase / duty + orderFrequency, 0.0, duty)
+            + complexExponentialIntegral(orderFrequency, duty, 1.0);
     }
-    return 0.0;
+    return vec2(0.0);
 }
+
+float latticeEfficiency(int profile, int primary, int secondary,
+                        bool crossed, bool thirdFamily, float duty,
+                        float phase, vec2 terracePhase) {
+    vec2 first = profileAmplitude(profile, primary, duty, phase, terracePhase);
+    if (!crossed)
+        return dot(first, first);
+    if (!thirdFamily) {
+        vec2 second = profileAmplitude(profile, secondary, duty, phase, terracePhase);
+        return dot(first, first) * dot(second, second);
+    }
+    // The third family's reciprocal vector is g1/d1 - g2/d2, so its order r
+    // lands on (m + r, n - r) and the amplitudes convolve. Radius 4 matches
+    // kThirdFamilyConvolutionRadius.
+    vec2 sum = vec2(0.0);
+    for (int r = -4; r <= 4; ++r)
+        sum += complexMultiply(
+            complexMultiply(
+                profileAmplitude(profile, primary - r, duty, phase, terracePhase),
+                profileAmplitude(profile, secondary + r, duty, phase, terracePhase)),
+            profileAmplitude(profile, r, duty, phase, terracePhase));
+    return dot(sum, sum);
+}
+
 
 void resolveGrooveGeometry(vec2 uv, out vec4 geometry,
                            out vec4 secondaryGeometry) {
@@ -2921,6 +3067,9 @@ float diffractionOrderContribution(int primaryOrder,
                                    int profile,
                                    float duty,
                                    float sigma) {
+    // Slope 0 is a delta lobe, which a sampled light direction never meets.
+    if (sigma <= 0.0)
+        return 0.0;
     int firstOrder = int(round(uDiffractionMicrostructure.w));
     int lastOrder = int(uDiffractionControl.x + 0.5);
     int primaryMagnitude = primaryOrder < 0 ? -primaryOrder : primaryOrder;
@@ -2956,11 +3105,7 @@ float diffractionOrderContribution(int primaryOrder,
     float phase = 2.0 * pi * uDiffractionGeometry.w
         * (incident.z + expectedOutgoingCosine) / wavelength;
     vec2 terracePhase = vec2(cos(phase), sin(phase));
-    float efficiency = coherent * profileEfficiency(
-        profile, primaryOrder, duty, phase, terracePhase);
-    if (crossedTwoDimensional)
-        efficiency *= profileEfficiency(
-            profile, secondaryOrder, duty, phase, terracePhase);
+    float efficiency = coherent * latticeEfficiency(profile, primaryOrder, secondaryOrder, crossedTwoDimensional, uDiffractionControl.z > 0.5, duty, phase, terracePhase);
     efficiency *= expectedOutgoingCosine / incident.z;
     return efficiency * lobe;
 }
@@ -3005,7 +3150,7 @@ vec3 integrateDiffractionEnvironment(vec3 outgoing, vec3 tangent,
     int lastOrder = int(uDiffractionControl.x + 0.5);
     int profile = int(uDiffractionControl.y + 0.5);
     float duty = uDiffractionMicrostructure.x;
-    float sigma = max(2.0 * uDiffractionRoughness.y, 1.0e-4);
+    float sigma = 2.0 * uDiffractionRoughness.y;
     vec3 xyz = vec3(0.0);
     float whiteY = 0.0;
     for (int wavelengthIndex = 0; wavelengthIndex < 8; ++wavelengthIndex) {
@@ -3034,8 +3179,7 @@ vec3 integrateDiffractionEnvironment(vec3 outgoing, vec3 tangent,
                 float z = sqrt(max(0.0, 1.0 - dot(xy, xy)));
                 float phase = 2.0 * pi * geometry.w * (outgoing.z + z) / wavelength;
                 vec2 terrace = vec2(cos(phase), sin(phase));
-                float efficiency = profileEfficiency(profile, primary, duty, phase, terrace);
-                if (crossed) efficiency *= profileEfficiency(profile, secondary, duty, phase, terrace);
+                float efficiency = latticeEfficiency(profile, primary, secondary, crossed, uDiffractionControl.z > 0.5, duty, phase, terrace);
                 if (primary != 0 || secondary != 0) efficiency *= z / outgoing.z;
                 float height = 2.0 * pi * uDiffractionRoughness.x * (outgoing.z + z) / wavelength;
                 efficiency *= exp(-height * height);
@@ -3067,15 +3211,21 @@ vec3 integrateDiffractionEnvironment(vec3 outgoing, vec3 tangent,
 
 bool diffractionTableValid() {
     return uDiffractionSampleControl.z==8.0 && uDiffractionSampleControl.w==1.0
-        && uDiffractionSampleControl.x>=1.0 && uDiffractionSampleControl.x<=32.0
-        && uDiffractionSampleControl.y>=1.0 && uDiffractionSampleControl.y<=32.0
+        && uDiffractionSampleControl.x>=1.0 && uDiffractionSampleControl.y>=1.0
         && floor(uDiffractionSampleControl.x)==uDiffractionSampleControl.x
         && floor(uDiffractionSampleControl.y)==uDiffractionSampleControl.y
         && textureSize(uDiffractionSamples,0).x==512
         && (uDiffractionSampleControl.x+uDiffractionSampleControl.y)*8.0
             <=float(textureSize(uDiffractionSamples,0).x*textureSize(uDiffractionSamples,0).y);
 }
-vec3 diffractionDiagnostic() { return vec3(uintBitsToFloat(0x7fc00000u)); }
+// Diagnostic payloads carry the refusal branch in quiet-NaN bits 10..17, so
+// the whole-output host readback can count reasons per pixel: 1 table invalid,
+// 2 direct source query incomplete, 3 sample segment query incomplete, 4
+// sample source query incomplete, 5 spectral bands nonfinite, 6 degenerate UV
+// derivatives, 7 invalid BSDF efficiency sum. Payload 0 is the released
+// unattributed encoding (the Metal lane keeps it until its own change).
+vec3 diffractionDiagnosticReason(int reason) { return vec3(uintBitsToFloat(0x7fc00000u | (uint(reason) << 10u))); }
+vec3 diffractionDiagnostic() { return diffractionDiagnosticReason(0); }
 vec4 diffractionSample(int sampleIndex, int lane) {
     int index = sampleIndex * 8 + lane;
     return texelFetch(uDiffractionSamples, ivec2(index % 512, index / 512), 0);
@@ -3099,7 +3249,7 @@ float diffractionTriangleBsdf(int band, vec2 uv, vec3 incident, vec3 outgoing) {
     int lastOrder = int(uDiffractionControl.x + 0.5);
     int profile = int(uDiffractionControl.y + 0.5);
     float wavelength = uDiffractionSpectral[band].x;
-    float sigma = max(2.0*uDiffractionRoughness.y, 1.0e-4);
+    float sigma = 2.0*uDiffractionRoughness.y;
     float radiance = 0.0, efficiencySum = 0.0;
     int firstPrimary = -lastOrder, lastPrimary = lastOrder;
     if (!crossed) {
@@ -3119,17 +3269,18 @@ float diffractionTriangleBsdf(int band, vec2 uv, vec3 incident, vec3 outgoing) {
             float z = sqrt(max(0.0,1.0-square));
             float phase = 2.0*pi*geometry.w*(incident.z+z)/wavelength;
             vec2 terrace = vec2(cos(phase),sin(phase));
-            float efficiency = profileEfficiency(profile,primary,uDiffractionMicrostructure.x,phase,terrace);
-            if (crossed) efficiency *= profileEfficiency(profile,secondary,uDiffractionMicrostructure.x,phase,terrace);
+            float efficiency = latticeEfficiency(profile, primary, secondary, crossed, uDiffractionControl.z > 0.5, uDiffractionMicrostructure.x, phase, terrace);
             float height = 2.0*pi*uDiffractionRoughness.x*(incident.z+z)/wavelength;
             efficiency *= exp(-height*height)*z/incident.z;
             vec2 delta = outgoing.xy-centre;
-            radiance += efficiency*exp(-dot(delta,delta)/(2.0*sigma*sigma))/(2.0*pi*sigma*sigma);
+            // Slope 0 is a delta lobe, which a sampled light direction never meets.
+            if (sigma > 0.0)
+                radiance += efficiency*exp(-dot(delta,delta)/(2.0*sigma*sigma))/(2.0*pi*sigma*sigma);
             efficiencySum += efficiency;
         }
     }
     if (!diffractionSceneFinite(efficiencySum) || efficiencySum > 1.0002)
-        return uintBitsToFloat(0x7fc00000u);
+        return uintBitsToFloat(0x7fc00000u | (7u << 10u));
     return radiance * spectralReflectance(wavelength,int(uDiffractionControl.w+0.5),
         uDiffractionMicrostructure.y,uDiffractionMicrostructure.z);
 }
@@ -3147,16 +3298,23 @@ vec3 diffractionBandsToRgb(float bands[8]) {
 }
 // Exact endpoint checks distinguish an admitted nearer blocker from a stale or
 // missing endpoint. Refusal is propagated as diagnostic Color for the whole frame.
+// A ray in the endpoint triangle's plane can miss it or clip a neighbour by
+// rounding. Its cosine weight is nearly zero, so it counts as unseen.
+float diffractionEndpointTolerance(vec3 normal, vec3 direction) {
+    return uDiffractionRayMinimum/max(abs(dot(normal,direction)),0.01);
+}
 bool diffractionEndpoint(DiffractionClosestHit hit, uint objectId, uint materialId,
-    uint instanceId, uint triangleId, vec3 normal, float distance, out bool complete) {
-    complete = hit.status == 1;
-    if (!complete) return false;
-    if (hit.distance < distance-uDiffractionRayMinimum) return false;
-    complete = hit.objectId==objectId && hit.materialId==materialId
-        && hit.instanceId==instanceId && hit.triangleId==triangleId
-        && abs(hit.distance-distance)<=uDiffractionRayMinimum
+    uint instanceId, uint triangleId, vec3 normal, vec3 direction, float distance, out bool complete) {
+    complete = abs(dot(normal,direction))<0.01;
+    if (hit.status != 1) return false;
+    bool same = hit.objectId==objectId && hit.materialId==materialId
+        && hit.instanceId==instanceId && hit.triangleId==triangleId;
+    float allowed = diffractionEndpointTolerance(normal,direction);
+    if (hit.distance < distance-(same ? allowed : uDiffractionRayMinimum)) { complete=true; return false; }
+    bool matched = same && abs(hit.distance-distance)<=allowed
         && dot(hit.outwardNormal,normal)>=1.0-1.0e-5;
-    return complete;
+    complete = complete || matched;
+    return matched;
 }
 bool diffractionSegment(int sampleIndex, vec3 pixelNormal, out vec3 toSample,
     out float distance, out bool complete) {
@@ -3167,18 +3325,19 @@ bool diffractionSegment(int sampleIndex, vec3 pixelNormal, out vec3 toSample,
     complete = diffractionSceneFinite(distance) && distance>2.0*uDiffractionRayMinimum
         && distance+uDiffractionRayMinimum<=uDiffractionSourceDirectionTrace.w;
     if (!complete) return false;
-    DiffractionClosestHit forward = diffractionSceneClosestHit(vWorldPosition,toSample,
-        uDiffractionRayMinimum,distance+uDiffractionRayMinimum,uDiffractionQueryControl);
-    DiffractionClosestHit backward = diffractionSceneClosestHit(p.xyz,-toSample,
-        uDiffractionRayMinimum,distance+uDiffractionRayMinimum,uDiffractionQueryControl);
+    vec3 sampleNormal = diffractionSample(sampleIndex,1).xyz;
+    DiffractionClosestHit forward = diffractionSceneClosestHit(vWorldPosition,toSample,uDiffractionRayMinimum,
+        min(uDiffractionSourceDirectionTrace.w,distance+diffractionEndpointTolerance(sampleNormal,toSample)),uDiffractionQueryControl);
+    DiffractionClosestHit backward = diffractionSceneClosestHit(p.xyz,-toSample,uDiffractionRayMinimum,
+        min(uDiffractionSourceDirectionTrace.w,distance+diffractionEndpointTolerance(pixelNormal,toSample)),uDiffractionQueryControl);
     if (forward.status<0 || backward.status<0 || forward.status>1 || backward.status>1) {
         complete=false; return false;
     }
     bool forwardComplete, backwardComplete;
     bool forwardVisible = diffractionEndpoint(forward,diffractionId(ids.xy),diffractionId(ids.zw),
-        uint(identity.x),uint(identity.y),diffractionSample(sampleIndex,1).xyz,distance,forwardComplete);
+        uint(identity.x),uint(identity.y),sampleNormal,toSample,distance,forwardComplete);
     bool backwardVisible = diffractionEndpoint(backward,outRawObjectId,outRawMaterialId,
-        vDiffractionInstance,uint(gl_PrimitiveID % uDiffractionTriangleCount),pixelNormal,distance,backwardComplete);
+        vDiffractionInstance,uint(gl_PrimitiveID % uDiffractionTriangleCount),pixelNormal,toSample,distance,backwardComplete);
     complete = forwardComplete && backwardComplete;
     return forwardVisible && backwardVisible;
 }
@@ -3189,23 +3348,31 @@ float diffractionSourceVisibility(vec3 position, out bool complete) {
     return hit.status==0 ? 1.0 : 0.0;
 }
 vec3 evaluateTriangleDiffraction(vec3 tangent, vec3 bitangent, vec3 normal, vec3 outgoing) {
-    if (!diffractionTableValid()) return diffractionDiagnostic();
+    if (!diffractionTableValid()) return diffractionDiagnosticReason(1);
     bool complete;
     float direct = diffractionSourceVisibility(vWorldPosition,complete);
-    if (!complete) return diffractionDiagnostic();
+    if (!complete) return diffractionDiagnosticReason(2);
     vec3 incident = diffractionLocal(uDiffractionSourceDirectionTrace.xyz,tangent,bitangent,normal);
     float bands[8];
     #pragma optionNV(unroll none)
     for (int b=0; b<8; ++b) bands[b] = direct*uDiffractionSourceRadiance[b/4][b%4]
         *max(incident.z,0.0)*diffractionTriangleBsdf(b,vUv,incident,outgoing);
+    int receiverFirst=0,receiverStride=1;
+    float realtimeStride=1.0;
+#ifdef FIXTURE_REALTIME
+    // Each pixel gathers every Nth receiver row from its own start, weighted by N, with
+    // N the square root of the row count. Every row still lights some pixels.
+    receiverStride=max(1,int(sqrt(uDiffractionSampleControl.x)));
+    receiverFirst=int(realtimeNoise()*float(receiverStride));
+    realtimeStride=float(receiverStride);
+#endif
     #pragma optionNV(unroll none)
-    for (int r=0; r<32; ++r) {
-        if (float(r)>=uDiffractionSampleControl.x) break;
+    for (int r=receiverFirst; float(r)<uDiffractionSampleControl.x; r+=receiverStride) {
         vec3 direction; float distance;
         bool visible = diffractionSegment(r,normal,direction,distance,complete);
-        if (!complete) return diffractionDiagnostic();
+        if (!complete) return diffractionDiagnosticReason(3);
         float source = diffractionSourceVisibility(diffractionSample(r,0).xyz,complete);
-        if (!complete) return diffractionDiagnostic();
+        if (!complete) return diffractionDiagnosticReason(4);
         if (!visible) continue;
         vec3 receiverNormal = diffractionSample(r,1).xyz;
         float receiverCosine = max(dot(receiverNormal,-direction),0.0);
@@ -3213,10 +3380,10 @@ vec3 evaluateTriangleDiffraction(vec3 tangent, vec3 bitangent, vec3 normal, vec3
         vec3 local = diffractionLocal(direction,tangent,bitangent,normal);
         float weight = diffractionSample(r,0).w*receiverCosine*max(local.z,0.0)/(pi*distance*distance);
         #pragma optionNV(unroll none)
-        for (int b=0; b<8; ++b) bands[b] += weight*lightCosine*uDiffractionSourceRadiance[b/4][b%4]
+        for (int b=0; b<8; ++b) bands[b] += realtimeStride*weight*lightCosine*uDiffractionSourceRadiance[b/4][b%4]
             *diffractionSample(r,4+b/4)[b%4]*diffractionTriangleBsdf(b,vUv,local,outgoing);
     }
-    for (int b=0; b<8; ++b) if (!diffractionSceneFinite(bands[b])) return diffractionDiagnostic();
+    for (int b=0; b<8; ++b) if (!diffractionSceneFinite(bands[b])) return diffractionDiagnosticReason(5);
     return diffractionBandsToRgb(bands);
 }
 float diffractionScatterCoverage(vec2 uv) {
@@ -3238,12 +3405,11 @@ float diffractionScatterCoverage(vec2 uv) {
 }
 vec3 evaluateSpectralReceiver(vec3 normal, out bool receiver) {
     receiver=true;
-    if (!diffractionTableValid()) return diffractionDiagnostic();
+    if (!diffractionTableValid()) return diffractionDiagnosticReason(1);
     receiver=false;
     int receiverIndex=-1;
     #pragma optionNV(unroll none)
-    for (int r=0; r<32; ++r) {
-        if (float(r)>=uDiffractionSampleControl.x) break;
+    for (int r=0; float(r)<uDiffractionSampleControl.x; ++r) {
         vec4 ids=diffractionSample(r,2);
         if (diffractionId(ids.xy)==outRawObjectId && diffractionId(ids.zw)==outRawMaterialId) {
             receiverIndex=r; receiver=true; break;
@@ -3252,20 +3418,27 @@ vec3 evaluateSpectralReceiver(vec3 normal, out bool receiver) {
     if (!receiver) return vec3(0.0);
     bool complete;
     float source=diffractionSourceVisibility(vWorldPosition,complete);
-    if (!complete) return diffractionDiagnostic();
+    if (!complete) return diffractionDiagnosticReason(2);
     float bands[8];
     #pragma optionNV(unroll none)
     for (int b=0; b<8; ++b) bands[b]=source*max(dot(normal,uDiffractionSourceDirectionTrace.xyz),0.0)
         *uDiffractionSourceRadiance[b/4][b%4];
+    int gratingFirst=0,gratingStride=1;
+    float realtimeStride=1.0;
+#ifdef FIXTURE_REALTIME
+    // The same gather as the grating's, over the grating rows.
+    gratingStride=max(1,int(sqrt(uDiffractionSampleControl.y)));
+    gratingFirst=int(realtimeNoise()*float(gratingStride));
+    realtimeStride=float(gratingStride);
+#endif
     #pragma optionNV(unroll none)
-    for (int g=0; g<32; ++g) {
-        if (float(g)>=uDiffractionSampleControl.y) break;
+    for (int g=gratingFirst; float(g)<uDiffractionSampleControl.y; g+=gratingStride) {
         int index=int(uDiffractionSampleControl.x)+g;
         vec3 direction; float distance;
         bool visible=diffractionSegment(index,normal,direction,distance,complete);
-        if (!complete) return diffractionDiagnostic();
+        if (!complete) return diffractionDiagnosticReason(3);
         float sourceVisible=diffractionSourceVisibility(diffractionSample(index,0).xyz,complete);
-        if (!complete) return diffractionDiagnostic();
+        if (!complete) return diffractionDiagnosticReason(4);
         if (!visible) continue;
         vec3 n=diffractionSample(index,1).xyz;
         vec4 t=diffractionSample(index,6),bt=diffractionSample(index,7);
@@ -3274,14 +3447,46 @@ vec3 evaluateSpectralReceiver(vec3 normal, out bool receiver) {
         float weight=diffractionSample(index,0).w*max(dot(normal,direction),0.0)
             *max(outgoing.z,0.0)/(distance*distance)*diffractionScatterCoverage(vec2(t.w,bt.w));
         #pragma optionNV(unroll none)
-        for (int b=0; b<8; ++b) bands[b]+=weight*sourceVisible*uDiffractionSourceRadiance[b/4][b%4]
+        for (int b=0; b<8; ++b) bands[b]+=realtimeStride*weight*sourceVisible*uDiffractionSourceRadiance[b/4][b%4]
             *max(localLight.z,0.0)*diffractionTriangleBsdf(b,vec2(t.w,bt.w),localLight,outgoing);
     }
     for (int b=0; b<8; ++b) {
         bands[b]*=diffractionSample(receiverIndex,4+b/4)[b%4]/pi;
-        if (!diffractionSceneFinite(bands[b])) return diffractionDiagnostic();
+        if (!diffractionSceneFinite(bands[b])) return diffractionDiagnosticReason(5);
     }
     return diffractionBandsToRgb(bands);
+}
+
+// Brushed relief, the same field as Path Trace's brushedRelief (integrator_body.inl):
+// three octaves of streaks across v, turning the normal towards dP/dv.
+float streakCellHash(int cell, uint salt) {
+    uint x = uint(cell) * 2654435761u + salt * 40503u;
+    x ^= x >> 15u;
+    x *= 2246822519u;
+    x ^= x >> 13u;
+    x *= 3266489917u;
+    x ^= x >> 16u;
+    return float(x) / 4294967296.0;
+}
+float streakCell(int k, float u, uint salt) {
+    float rate = 3.0 + floor(4.0 * streakCellHash(k, salt + 1u));
+    float along = 0.55 + 0.45 * sin(6.2831853 * (u * rate + streakCellHash(k, salt + 2u)));
+    return (2.0 * streakCellHash(k, salt) - 1.0) * along;
+}
+float streakOctave(vec2 uv, float spacing, uint salt) {
+    float position = uv.y / spacing;
+    float cell = floor(position);
+    float f = position - cell;
+    float s = f * f * (3.0 - 2.0 * f);
+    int k = int(cell);
+    return streakCell(k, uv.x, salt) * (1.0 - s) + streakCell(k + 1, uv.x, salt) * s;
+}
+vec3 brushedReliefNormal(vec3 normal, vec3 tangent, vec2 uv, vec3 toView, vec4 roughness) {
+    if (roughness.z <= 0.0) return normal;
+    float relief = (streakOctave(uv, roughness.w, 1u) + 0.7 * streakOctave(uv, roughness.w * 0.5, 11u)
+        + 0.5 * streakOctave(uv, roughness.w * 0.25, 23u)) / 0.435;
+    vec3 tilted = normalize(normal + roughness.z * relief * cross(normal, tangent));
+    return dot(tilted, toView) > 1.0e-4 ? tilted : normal;
 }
 
 vec3 evaluateDiffraction() {
@@ -3293,14 +3498,15 @@ vec3 evaluateDiffraction() {
     vec2 duvdy = dFdy(vUv);
     float determinant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
     if (abs(determinant) <= 1.0e-8)
-        return uDiffractionSampleControl.w == 1.0 ? diffractionDiagnostic() : vec3(0.0);
+        return uDiffractionSampleControl.w == 1.0 ? diffractionDiagnosticReason(6) : vec3(0.0);
     vec3 tangent = normalize((dpdx * duvdy.y - dpdy * duvdx.y) / determinant);
+    vec3 toViewWorld = normalize(uCameraTranslation - vWorldPosition);
+    normal = brushedReliefNormal(normal, tangent, vUv, toViewWorld, uDiffractionRoughness);
     tangent = normalize(tangent - normal * dot(normal, tangent));
     vec3 bitangent = normalize(cross(normal, tangent));
     if (dot(bitangent, (-dpdx * duvdy.x + dpdy * duvdx.x) / determinant) < 0.0)
         bitangent = -bitangent;
 
-    vec3 toViewWorld = normalize(uCameraTranslation - vWorldPosition);
     vec3 incident = uDiffractionIncidentDirectionAndIntensity.xyz;
     vec3 outgoing = vec3(dot(toViewWorld, tangent), dot(toViewWorld, bitangent),
                          dot(toViewWorld, normal));
@@ -3312,7 +3518,7 @@ vec3 evaluateDiffraction() {
         return integrateDiffractionEnvironment(outgoing, tangent, bitangent, normal);
     if (uDiffractionEnvironment.x == 2.0) {
         if (uLightCount == 0) return vec3(0.0);
-        vec3 toLight = normalize(rotateQ(uLightRotations[0], vec3(0.0, 0.0, 1.0)));
+        vec3 toLight = normalize(rotateQ(fixtureLightRotation(0), vec3(0.0, 0.0, 1.0)));
         incident = vec3(dot(toLight, tangent), dot(toLight, bitangent), dot(toLight, normal));
     }
     if (incident.z <= 1.0e-6) return vec3(0.0);
@@ -3331,8 +3537,8 @@ vec3 evaluateDiffraction() {
         resolveGrooveGeometry(vUv, oneDimensionalGeometry, unusedSecondaryGeometry);
     float pixelAngularFootprint = 0.5 * max(length(dFdx(outgoing.xy)),
                                             length(dFdy(outgoing.xy)));
-    float sigma = max(2.0 * uDiffractionRoughness.y,
-                      max(pixelAngularFootprint, 1.0e-4));
+    float sigma = uDiffractionRoughness.y > 0.0
+        ? max(2.0 * uDiffractionRoughness.y, pixelAngularFootprint) : 0.0;
     vec3 xyz = vec3(0.0);
     float referenceWhiteY = 0.0;
 
@@ -3401,7 +3607,7 @@ vec3 evaluateDiffraction() {
         float energy = uDiffractionIncidentDirectionAndIntensity.w
                      * spectral.y * pathTransport * quadrature * reflectance
                      * wavelengthRadiance * incident.z;
-        if (uDiffractionEnvironment.x == 2.0) energy *= uLightColors[0].w;
+        if (uDiffractionEnvironment.x == 2.0) energy *= fixtureLightColor(0).w;
         xyz += energy * vec3(spectral.z, spectral.w, spectralZ.x);
         referenceWhiteY += quadrature * spectral.w;
     }
@@ -3469,6 +3675,13 @@ void main() {
         outRawMask=0.0; outRawMaterialId=0u; outRawObjectId=0u; outRawMotion=vec2(0.0);
         vec3 radiance=uSky[0].w>1.5 ? environmentImageRadiance(vWorldPosition,uSky[0],uSky[1])
             : analyticSkyRadiance(vWorldPosition,uSky[0],uSky[1],uSky[2],uSky[3],uSky[4]);
+        // Probe: name a nonfinite sky result so the whole-output readback can
+        // attribute it to this branch before the branch bounds it to zero. The
+        // payload is a literal because non-diffraction program variants compile
+        // without diffractionDiagnosticReason, and those variants draw sky too.
+        if (any(isnan(radiance))||any(isinf(radiance))) {
+            outColor=vec4(vec3(uintBitsToFloat(0x7fc00000u|(8u<<10u))),1.0); return;
+        }
         outColor=compositePass(vec4(radiance,1.0));
         return;
     }
@@ -3511,7 +3724,20 @@ void main() {
                 || evaluationIndex < evaluationSchedule.z)
             ? max(evaluateDiffraction(), vec3(0.0)) : vLitBase;
         if (any(isnan(diffraction)) || any(isinf(diffraction))) {
-            outColor = vec4(diffraction, 1.0); return;
+            // A tagged diagnostic payload (bits 10..17 in 1..7) names an
+            // invalid or truncated query and refuses the whole frame. Every
+            // other nonfinite is arithmetic from a degenerate pixel frame --
+            // silhouette UV derivatives or an edge-on geometric normal collapse
+            // to zero and normalize to NaN. No query was invalid there, so the
+            // bounded physical answer is zero diffraction for that pixel.
+            uvec3 diagnosticPayload = floatBitsToUint(diffraction);
+            bool namedRefusal = false;
+            for (int component = 0; component < 3; ++component) {
+                uint reason = (diagnosticPayload[component] >> 10u) & 0xffu;
+                namedRefusal = namedRefusal || (reason >= 1u && reason <= 7u);
+            }
+            if (namedRefusal) { outColor = vec4(diffraction, 1.0); return; }
+            diffraction = vec3(0.0);
         }
         outColor = vec4((uDiffractionPathIndex == 0 ? vLitBase * (1.0 - clamp(occupancy, 0.0, 1.0))
             : vec3(0.0)) + diffraction * clamp(occupancy, 0.0, 1.0), 1.0);
@@ -3524,10 +3750,29 @@ void main() {
             + (uDiffractionPathIndex == 0 ? vec3(vNoteAppearance.a) : vec3(0.0)));
         return;
     }
-    if (uDiffractionSampleControl.w == 1.0) {
+    bool receiverTransport = uDiffractionSampleControl.w == 1.0;
+#ifdef FIXTURE_REALTIME
+    // The reflection phase blends over the transport that phase 0 wrote.
+    if (int(uRealtimeControl.x) == 1) receiverTransport = false;
+#endif
+    if (receiverTransport) {
         bool receiver;
         vec3 color = evaluateSpectralReceiver(diffractionGeometricNormal(),receiver);
-        if (receiver) { outColor=vec4(color,1.0); return; }
+        if (receiver) {
+            // Probe: a receiver result that is neither finite nor a tagged
+            // transport refusal is attributed to this branch before it is
+            // bounded to zero.
+            if (any(isnan(color))||any(isinf(color))) {
+                uvec3 payload=floatBitsToUint(color);
+                bool named=false;
+                for (int c=0;c<3;++c) {
+                    uint r=(payload[c]>>10u)&0xffu;
+                    named=named||(r>=1u&&r<=7u);
+                }
+                if (!named) { outColor=vec4(diffractionDiagnosticReason(12),1.0); return; }
+            }
+            outColor=vec4(color,1.0); return;
+        }
     }
 #endif
     vec4 texel = texture(uBaseTexture, baseUv);
@@ -3568,7 +3813,7 @@ void main() {
     // Private receipt pass reuses this exact linked program and draw schedule.
     // Locations 0, 2 and 3 are routed to frame-owned RGBA32F scratch targets.
     if (imageOutput == -1) {
-#if FIXTURE_SMOOTH_GLASS
+#if FIXTURE_SMOOTH_GLASS && FIXTURE_ROUGH_GLASS
         if(uGlassTransport.x==1.0 && uRoughCameraControl.x==2.0) discard;
         if ((uGlassTransport.x != 1.0 && uGlassTransport.x != 2.0) || roughness <= 0.0) discard;
         vec3 terminal, masked, tail;
@@ -3585,7 +3830,9 @@ void main() {
         outRawEmission = vec4(tail,uGlassTransport.x==1.0 && uRoughCameraControl.x==2.0?float(microEvents):float(status));
         return;
 #else
-        // Without smooth glass, uGlassTransport.x is 0 for every draw and this block always discards.
+        // Without smooth glass, uGlassTransport.x is 0 for every draw. Without rough glass,
+        // every glass draw has roughness 0, so the full block would reach a discard at its
+        // roughness <= 0.0 test. Either way this block always discards.
         discard;
 #endif
     }
@@ -3607,6 +3854,7 @@ void main() {
     }
 #if FIXTURE_SMOOTH_GLASS
     if (uGlassTransport.x > 0.5) {
+#if FIXTURE_ROUGH_GLASS
         if(uGlassTransport.x==1.0 && roughness>0.0 && uRoughCameraControl.x==2.0) {
             ivec2 pixel=ivec2(floor(vec2(gl_FragCoord.x,uRoughCameraControl.w-gl_FragCoord.y)));
             ivec2 local=pixel-ivec2(uSelectedRoughTile.xy);
@@ -3624,9 +3872,18 @@ void main() {
             outColor=vec4(0.0,0.0,0.0,1.0);
             return;
         }
+#endif
         bool complete;
         int glassStatus=GLASS_SMOOTH_STATUS_UNCLASSIFIED;
         vec3 glass;
+#if !FIXTURE_ROUGH_GLASS
+        // Every glass draw of this program has roughness 0, so the selection below takes one of
+        // its two smooth arms. The rough walks are not in the text.
+        if (uGlassTransport.x == 2.0)
+            glass = thinInterfaceTransport(uCameraTranslation,vWorldPosition,normal,complete,glassStatus);
+        else
+            glass = glassTransport(uCameraTranslation,vWorldPosition,complete,glassStatus);
+#else
         if (uGlassTransport.x == 2.0 && roughness == 0.0)
             glass = thinInterfaceTransport(uCameraTranslation,vWorldPosition,normal,complete,glassStatus);
         else if (uGlassTransport.x == 2.0) {
@@ -3648,6 +3905,7 @@ void main() {
             complete = status == (uRoughCameraControl.x==2.0?33:1);
             glassStatus = glassRoughReason(status);
         }
+#endif
         // Finite radiance past the RGBA16F maximum is a bright highlight, such
         // as a dispersed sun or specular path. It is stored at the ceiling.
         // Only NaN or infinity marks the pixel -2 and refuses the frame.
@@ -3664,6 +3922,12 @@ void main() {
     vec3 directCoat = vec3(0.0);
     vec3 skyBase = vec3(0.0);
     vec3 toView = uCameraTranslation - vWorldPosition;
+#ifdef FIXTURE_REALTIME
+    if (int(uRealtimeControl.x) == 1) {
+        outColor = realtimeReflection(vWorldPosition, normal, toView, vBaseColor * texel.rgb, metallic, roughness, dielectric);
+        return;
+    }
+#endif
 #if FIXTURE_STAM_LAYER
     // Diffraction layer over the material's BSDF (stam_diffraction_layer.h).
     bool stamLayerOn = uStamLayer[0].w > 0.5;
@@ -3674,18 +3938,19 @@ void main() {
     float stamStratum = stamLayerStratum(gl_FragCoord.xy);
 #endif
     #pragma optionNV(unroll none)
-    for (int lightIndex = 0; lightIndex < 16; ++lightIndex) {
-        if (lightIndex >= uLightCount) break;
-        int kind = uLightKinds[lightIndex];
+    for (int lightIndex = 0; lightIndex < uLightCount; ++lightIndex) {
+        int kind = fixtureLightKind(lightIndex);
         if (kind == 2) {
             if (uSky[0].w>0.5) {
 #if FIXTURE_STAM_LAYER
                 vec3 stamSkyBefore = skyBase;
 #endif
-                if (transmission==0.0 && uAlphaModeCutoff.x==0.0 && alpha>=1.0)
+                // A transmissive surface keeps its sky reflection, or nothing but a few
+                // percent of ambient draws. The light it transmits leaves the diffuse term.
+                if (transmission>0.0 || (uAlphaModeCutoff.x==0.0 && alpha>=1.0))
                     skyBase+=uSky[0].w>1.5
-                        ? environmentImageBase(vBaseColor*texel.rgb,metallic,roughness,dielectric,normal,toView,uSky[0],uSky[1])
-                        : analyticSkyBase(vBaseColor*texel.rgb,metallic,roughness,dielectric,
+                        ? environmentImageBase(vBaseColor*texel.rgb*(1.0-transmission),metallic,roughness,dielectric,normal,toView,uSky[0],uSky[1])
+                        : analyticSkyBase(vBaseColor*texel.rgb*(1.0-transmission),metallic,roughness,dielectric,
                             normal,toView,uSky[0],uSky[1],uSky[2],uSky[3],uSky[4]);
 #if FIXTURE_STAM_LAYER
                 // The sky term becomes coat + orders + base sky * specularScale.
@@ -3693,27 +3958,33 @@ void main() {
                     skyBase = stamSkyBefore + stamLayerEnvironmentCompose(stamParams, stamSurface, stamView,
                         stamBaseSpecular, skyBase - stamSkyBefore, stamStratum);
 #endif
-            } else lighting += uLightColors[lightIndex].rgb * uLightColors[lightIndex].a;
+            } else lighting += fixtureLightColor(lightIndex).rgb * fixtureLightColor(lightIndex).a;
             continue;
         }
-        vec3 delta = uLightPositions[lightIndex].xyz - vWorldPosition;
-        vec3 toLight = kind == 0 ? rotateQ(uLightRotations[lightIndex], vec3(0.0, 0.0, 1.0)) : baseSurfaceUnit(delta);
+        vec3 delta = fixtureLightPosition(lightIndex).xyz - vWorldPosition;
+        vec3 toLight = kind == 0 ? rotateQ(fixtureLightRotation(lightIndex), vec3(0.0, 0.0, 1.0)) : baseSurfaceUnit(delta);
         float attenuation = 1.0;
         if (kind == 1 || kind == 3) {
             float lightDistance = length(delta);
             attenuation = 1.0 / max(lightDistance * lightDistance, 1.0);
-            float range = uLightPositions[lightIndex].w;
+            float range = fixtureLightPosition(lightIndex).w;
             if (range > 0.0) attenuation *= pow(clamp(1.0 - lightDistance / range, 0.0, 1.0), 2.0);
             if (kind == 3) {
-                vec3 spotDirection = rotateQ(uLightRotations[lightIndex], vec3(0.0, 0.0, -1.0));
-                float coneCosine = dot(spotDirection, baseSurfaceUnit(vWorldPosition - uLightPositions[lightIndex].xyz));
-                attenuation *= smoothstep(uLightCones[lightIndex].y, uLightCones[lightIndex].x, coneCosine);
+                vec3 spotDirection = rotateQ(fixtureLightRotation(lightIndex), vec3(0.0, 0.0, -1.0));
+                float coneCosine = dot(spotDirection, baseSurfaceUnit(vWorldPosition - fixtureLightPosition(lightIndex).xyz));
+                attenuation *= smoothstep(fixtureLightCone(lightIndex).y, fixtureLightCone(lightIndex).x, coneCosine);
             }
         }
-        vec3 radiance = uLightColors[lightIndex].rgb * uLightColors[lightIndex].a * attenuation;
+        vec3 radiance = fixtureLightColor(lightIndex).rgb * fixtureLightColor(lightIndex).a * attenuation;
+#ifdef FIXTURE_REALTIME
+        float visibility = uAlphaModeCutoff.x == 0.0 && transmission == 0.0 && alpha >= 1.0
+            ? realtimeSoftVisibility(vWorldPosition,vWorldNormal,
+                toLight,kind == 0 ? 3.402823e38 : length(delta)) : 1.0;
+#else
         float visibility = uAlphaModeCutoff.x == 0.0 && transmission == 0.0 && alpha >= 1.0
             ? opaqueVisibility(vWorldPosition,vWorldNormal,
                 toLight,kind == 0 ? 3.402823e38 : length(delta),uOpaqueControl) : 1.0;
+#endif
         directBase += radiance * baseSurfaceDirect(vBaseColor * texel.rgb, metallic, roughness,
             dielectric, transmission, normal, toLight, toView) * visibility;
 #if FIXTURE_STAM_LAYER
@@ -3725,6 +3996,10 @@ void main() {
 #endif
         directCoat += radiance * max(dot(normal, baseSurfaceUnit(toLight)), 0.0);
     }
+#ifdef FIXTURE_REALTIME
+    if (uSky[0].w > 0.5 && uAlphaModeCutoff.x == 0.0 && transmission == 0.0 && alpha >= 1.0)
+        skyBase *= realtimeSkyVisibility(vWorldPosition, vWorldNormal);
+#endif
     float diffuseWeight = (1.0 - metallic) * (1.0 - 0.5 * roughness) * (1.0 - transmission);
     float specularWeight = mix(dielectric, 1.0, metallic) * (1.0 - roughness);
     float occlusion = uTexturePresence.z > 0.5
@@ -3736,6 +4011,21 @@ void main() {
     outColor.rgb = vNoteAppearance.rgb * (outColor.rgb + vec3(vNoteAppearance.a));
     if (vInstanceIdentityColor.a > 0.5)
         outColor = vec4(vInstanceIdentityColor.rgb, 1.0);
+#ifdef FIXTURE_REALTIME
+    if (int(uRealtimeControl.x) == 2 && uGlassTransport.x > 0.5) {
+        outColor.rgb = realtimeGlass(vWorldPosition, normal, toView, vBaseColor * texel.rgb, roughness, dielectric,
+            outColor.rgb, directBase + emissive);
+        outColor.a = 1.0;
+    }
+    gRealtimeFog = realtimeFogLight(vWorldPosition);
+#endif
+    // Probe: name a nonfinite base-shading result so the whole-output readback
+    // can attribute it to this branch before the branch bounds it to zero. The
+    // payload is a literal because non-diffraction program variants compile
+    // without diffractionDiagnosticReason, and those variants draw base too.
+    if (any(isnan(outColor))||any(isinf(outColor))) {
+        outColor = vec4(vec3(uintBitsToFloat(0x7fc00000u|(9u<<10u))), 1.0); return;
+    }
     outColor = compositePass(outColor);
 }
 )glsl";
@@ -3785,7 +4075,11 @@ void main() {
     outRawObjectId = texelFetch(uRawObjectId, pixel, 0).r;
     outRawMotion = texelFetch(uRawMotion, pixel, 0).rg;
     vec4 color = texelFetch(uAccumulatedColor, pixel, 0);
-    if (any(isnan(color)) || any(isinf(color))) { outColor = color; return; }
+    if (any(isnan(color)) || any(isinf(color))) {
+        // Probe: the pre-resolve accumulation carried the nonfinite pixel.
+        outColor = vec4(vec3(uintBitsToFloat(0x7fc00000u | (11u << 10u))), 1.0);
+        return;
+    }
     if (uImageOutput != 0) {
         vec3 image = vec3(0.0);
         if (uImageOutput == 1) image = vec3(outLinearDepth);
@@ -3803,6 +4097,11 @@ void main() {
         outColor = vec4(image, color.a);
     } else {
         outColor = compositePass(color);
+    }
+    if (any(isnan(outColor)) || any(isinf(outColor))) {
+        // Probe: the resolve itself produced the nonfinite pixel from finite
+        // input, before the branch is bounded to zero.
+        outColor = vec4(vec3(uintBitsToFloat(0x7fc00000u | (10u << 10u))), 1.0);
     }
 }
 )glsl";
@@ -4256,12 +4555,12 @@ struct RoughSelectedCamera final
     }
     bool run(const roughglasstiles::Tile& tile,const roughglasstiles::FrameKey& key,
         const smoothglass::Prepared& prepared,unsigned fragmentProgram,
-        const std::array<float,4>& queryControl,const std::array<std::array<float,4>,64>& emission,
+        const std::array<float,4>& queryControl,unsigned sceneTable,
         std::array<NativeRawPassPixels,3>& receipts,std::vector<roughglasstiles::NativeTileReceipt::Work>& work,
-        std::vector<std::array<std::uint32_t,4>>& identities,std::uint64_t completedWork,std::string& error) {
+        std::vector<std::array<std::uint32_t,4>>& identities,std::vector<std::array<float,3>>& normals,std::vector<std::array<float,3>>& positions,std::uint64_t completedWork,std::string& error) {
 #if defined(__APPLE__)
-        (void)tile;(void)key;(void)prepared;(void)fragmentProgram;(void)queryControl;(void)emission;
-        (void)receipts;(void)work;(void)identities;(void)completedWork;
+        (void)tile;(void)key;(void)prepared;(void)fragmentProgram;(void)queryControl;(void)sceneTable;
+        (void)receipts;(void)work;(void)identities;(void)normals;(void)positions;(void)completedWork;
         error="OpenGL v2 selected camera compute is unavailable on this backend";return false;
 #else
         if(!tile.pixels() || tile.pixels()>capacity || !prepared.roughConsumer.selectedComputeV2)
@@ -4308,19 +4607,13 @@ struct RoughSelectedCamera final
                 gl.Uniform4f(loc("uGlassTransport"),1,p.transmissionIorClearcoat[3],float(prepared.object.value&65535u),float(prepared.object.value>>16));
                 gl.Uniform4fv(loc("uSurfaceCoating"),1,p.transmissionIorClearcoat.data());
                 gl.Uniform1f(loc("uRoughness"),prepared.roughness);
-                gl.Uniform4fv(loc("uGlassReceivers[0]"),64,prepared.receivers[0].data());
-                gl.Uniform4fv(loc("uGlassEmission[0]"),64,emission[0].data());
+                int activeUnit=GL_TEXTURE0;glGetIntegerv(GL_ACTIVE_TEXTURE,&activeUnit);
+                gl.ActiveTexture(GL_TEXTURE11);gl.BindSampler(11,0);glBindTexture(GL_TEXTURE_2D,sceneTable);gl.ActiveTexture(unsigned(activeUnit));
+                gl.Uniform1i(loc("uSceneTable"),11);gl.Uniform1i(loc("uSceneTableObjects"),int(prepared.receivers.size()));
                 gl.Uniform1i(loc("uOpaqueVisibility"),5);gl.Uniform1i(loc("uEnvironmentImage"),7);
                 copy("uOpaqueControl",4);copy("uAmbient",3);
                 int lightCount=0;getInt(fragmentProgram,gl.GetUniformLocation(fragmentProgram,"uLightCount"),&lightCount);
                 gl.Uniform1i(loc("uLightCount"),lightCount);
-                for(int i=0;i<16;++i) {
-                    for(const char* array:{"uLightRotations","uLightColors","uLightPositions","uLightCones"})
-                        copy((std::string(array)+"["+std::to_string(i)+"]").c_str(),4);
-                    const auto name="uLightKinds["+std::to_string(i)+"]";
-                    const auto from=gl.GetUniformLocation(fragmentProgram,name.c_str()),to=loc(name.c_str());
-                    if(from>=0 && to>=0) {int kind=0;getInt(fragmentProgram,from,&kind);gl.Uniform1i(to,kind);}
-                }
                 for(int i=0;i<5;++i)copy(("uSky["+std::to_string(i)+"]").c_str(),4);
             }
             // local_size_x=1 gives precisely one invocation per admitted pixel.
@@ -4335,45 +4628,40 @@ struct RoughSelectedCamera final
                 for(const auto& primary:selected)if(primary.state[0]<0 || primary.state[0]>1 || primary.state[1]!=1)
                 {error="OpenGL selected camera closest-hit selection did not complete";return false;}
             } else {
-                std::size_t next=0;
-                while(next<selected.size()) {
-                    if(completedWork>smoothglass::kMaximumCameraMicroWork)
-                    {error="OpenGL selected camera whole-frame executed work exceeds its bound";return false;}
-                    const auto reserve=(smoothglass::kMaximumCameraMicroWork-completedWork)/smoothglass::kMaximumCameraPixelMicroWork;
-                    std::size_t end=next;std::uint64_t starts=0;
-                    while(end<selected.size()) {
-                        const bool glass=selected[end].state[0]==1 && selected[end].ids[0]==prepared.object.value;
-                        if(glass && starts==reserve)break;
-                        starts+=glass?1u:0u;++end;
-                    }
-                    if(end==next)
-                    {error="OpenGL selected camera whole-frame work reserve exhausted before transport";return false;}
-                    // Disjoint pixel ranges consume completed selection records.
-                    // Reserve their worst case before execution, then charge the
-                    // native events before admitting the next range.
-                    gl.Uniform1ui(loc("uDispatchOffset"),unsigned(next));
-                    gl.DispatchCompute(unsigned(end-next),1,1);
+                std::vector<std::uint8_t> glass(selected.size());
+                for(std::size_t pixel=0;pixel<selected.size();++pixel)
+                    glass[pixel]=selected[pixel].state[0]==1 && selected[pixel].ids[0]==prepared.object.value;
+                roughglasstiles::LaneSlicer slicer(std::move(glass));
+                roughglasstiles::LaneSlice slice;
+                while(slicer.next(laneBudget,slice)) {
+                    gl.Uniform1ui(loc("uDispatchOffset"),slice.firstPixel);
+                    gl.Uniform1i(loc("uLaneBegin"),int(slice.laneBegin));gl.Uniform1i(loc("uLaneEnd"),int(slice.laneEnd));
+                    gl.DispatchCompute(slice.pixelCount,1,1);
                     gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT|GL_BUFFER_UPDATE_BARRIER_BIT);
-                    if(!roughglasstiles::opengl::completeSubmission(gl,error)
-                        || !read(1,results.data()+next,(end-next)*sizeof(Result),next*sizeof(Result)))
-                    {if(error.empty())error="OpenGL selected camera completed transport readback failed";return false;}
-                    for(std::size_t pixel=next;pixel<end;++pixel) {
-                        const auto& result=results[pixel];
-                        const bool glass=selected[pixel].state[0]==1 && selected[pixel].ids[0]==prepared.object.value;
-                        if(result.ids!=selected[pixel].ids || result.work[0]!=1 || result.work[1]!=(glass?1u:0u)
-                            || result.work[3]>smoothglass::kMaximumCameraMicroEvents
-                            || (glass && result.color[3]!=smoothglass::kMultipleScatterCameraComplete)
-                            || (!glass && result.work[3]!=0))
-                        {error="OpenGL selected camera native invocation did not complete within its work reserve";return false;}
-                        completedWork+=std::uint64_t(result.work[3])*smoothglass::kCameraMicroWorkPerEvent;
-                    }
-                    next=end;
+                    std::chrono::nanoseconds held{};
+                    if(!roughglasstiles::opengl::completeSubmission(gl,error,&held))
+                    {if(error.empty())error="OpenGL selected camera completed transport failed";return false;}
+                    laneBudget.observe(slice.units,held);
                 }
+                if(!read(1,results.data(),results.size()*sizeof(Result)))
+                {if(error.empty())error="OpenGL selected camera completed transport readback failed";return false;}
+                for(std::size_t pixel=0;pixel<selected.size();++pixel) {
+                    const auto& result=results[pixel];
+                    const bool isGlass=selected[pixel].state[0]==1 && selected[pixel].ids[0]==prepared.object.value;
+                    if(result.ids!=selected[pixel].ids || result.work[0]!=1 || result.work[1]!=(isGlass?1u:0u)
+                        || result.work[3]>smoothglass::kMaximumCameraMicroEvents
+                        || (isGlass && result.color[3]!=smoothglass::kMultipleScatterCameraComplete)
+                        || (!isGlass && result.work[3]!=0))
+                    {error="OpenGL "+smoothglass::selectedCameraFailure(isGlass?result.color[3]:0.0f);return false;}
+                    completedWork+=std::uint64_t(result.work[3])*smoothglass::kCameraMicroWorkPerEvent;
+                }
+                if(completedWork>smoothglass::kMaximumCameraMicroWork)
+                {error="OpenGL selected camera tile executed work exceeds its bound";return false;}
             }
         }
         if(!read(2,work.data(),work.size()*sizeof(roughglasstiles::NativeTileReceipt::Work)))
         {error="OpenGL selected camera completed atomic counter readback failed";return false;}
-        identities.resize(tile.pixels());
+        identities.resize(tile.pixels());normals.resize(tile.pixels());positions.resize(tile.pixels());
         for(auto& receipt:receipts)receipt={NativeTexturePixelFormat::Rgba32Float,tile.width,tile.height,std::vector<std::uint8_t>(tile.pixels()*16)};
         std::vector<std::array<float,4>> sharedColor(tile.pixels()*3);
         for(std::size_t i=0;i<results.size();++i) {
@@ -4386,7 +4674,7 @@ struct RoughSelectedCamera final
                     || result.work[2]!=result.masked[3] || result.work[3]!=result.tail[3]))
                 || (!glass && (result.work[2]!=1 || result.work[3]!=0)))
             {error="OpenGL selected camera native primary or executed-work record is incomplete";return false;}
-            identities[i]=result.ids;
+            identities[i]=result.ids;normals[i]={primary.normal[0],primary.normal[1],primary.normal[2]};positions[i]={primary.position[0],primary.position[1],primary.position[2]};
             std::memcpy(receipts[0].bytes.data()+i*16,result.terminal.data(),16);
             std::memcpy(receipts[1].bytes.data()+i*16,result.masked.data(),16);
             std::memcpy(receipts[2].bytes.data()+i*16,result.tail.data(),16);
@@ -4418,7 +4706,7 @@ struct Selection {vec4 ray,position,normal;uvec4 ids;ivec4 state;};
 struct Result {vec4 color,terminal,masked,tail;uvec4 ids,work;};
 layout(std430,binding=2) buffer ActualWork {uvec4 executed[];};
 )glsl";
-        source+=transport?"layout(std430,binding=0) readonly buffer Primary {Selection primary[];};\nlayout(std430,binding=1) writeonly buffer Results {Result results[];};\n"
+        source+=transport?"uniform int uLaneBegin,uLaneEnd;\nlayout(std430,binding=0) readonly buffer Primary {Selection primary[];};\nlayout(std430,binding=1) buffer Results {Result results[];};\n"
             :"layout(std430,binding=0) writeonly buffer Primary {Selection primary[];};\n";
         // The glass query resets the shared query macros before its own namespace.
         if(transport)source+=opaquevisibility::glslShader(true);
@@ -4443,7 +4731,11 @@ void main() {
     primary[index].state=ivec4(hit.status,1,0,0);
 }
 )glsl";
-        source+="uniform float uRoughness;\nuniform vec4 uSurfaceCoating,uSky[5];\nuniform vec3 uAmbient;\nuniform int uLightCount,uLightKinds[16];\nuniform vec4 uLightRotations[16],uLightColors[16],uLightPositions[16],uLightCones[16];\n";
+        source+="uniform float uRoughness;\nuniform vec4 uSurfaceCoating,uSky[5];\nuniform vec3 uAmbient;\nuniform int uLightCount;\nuniform sampler2D uSceneTable;\n"
+            "vec4 sceneTableRead(int record){return texelFetch(uSceneTable,ivec2(record%1024,record/1024),0);}\n"
+            "#define fixtureLightRotation(i) sceneTableRead(4*(i))\n#define fixtureLightColor(i) sceneTableRead(4*(i)+1)\n"
+            "#define fixtureLightPosition(i) sceneTableRead(4*(i)+2)\n#define fixtureLightCone(i) sceneTableRead(4*(i)+3)\n"
+            "#define fixtureLightKind(i) int(sceneTableRead(4*(i)+3).z)\n";
         source+=analyticsky::shader(false)+environmentimage::shader(false)
             +smoothglass::transportShader(false,true,true);
         const std::string material=kFixtureFragmentShaderTail;
@@ -4453,21 +4745,26 @@ void main() {
 void main() {
     uint index=gl_GlobalInvocationID.x+uDispatchOffset;
     Selection selection=primary[index];
-    Result result;result.color=vec4(0.0);result.terminal=vec4(0.0);result.masked=vec4(0.0);result.tail=vec4(0.0);
-    result.ids=selection.ids;result.work=uvec4(0u);
+    Result result=results[index];
+    if(uLaneBegin==0) {
+        result.color=vec4(0.0);result.terminal=vec4(0.0);result.masked=vec4(0.0);result.tail=vec4(0.0);
+        result.ids=selection.ids;result.work=uvec4(0u);
+    }
     uint volume=uint(uGlassTransport.z)|(uint(uGlassTransport.w)<<16u);
-    if(selection.state.x==1 && selection.ids.x==volume) {
+    if(selection.state.x==1 && selection.ids.x==volume && (uLaneBegin==0 || result.color.w==float(GLASS_CAMERA_V2_RUNNING))) {
         GlassClosestHit first;first.status=selection.state.x;first.distance=selection.position.w;
-        first.position=selection.position.xyz;first.outwardNormal=selection.normal.xyz;
+        first.position=selection.position.xyz;first.outwardNormal=selection.normal.xyz;first.shadingNormal=selection.normal.xyz;
         first.objectId=selection.ids.x;first.materialId=selection.ids.y;first.instanceId=selection.ids.z;first.triangleId=selection.ids.w;
         first.entering=selection.normal.w==1.0;
-        vec3 terminal,masked,tail;int status,queries,events;
-        atomicAdd(executed[index].y,1u); // Count the actual expensive entry before any event walk.
+        vec3 terminal=result.terminal.rgb,masked=result.masked.rgb,tail=result.tail.rgb;
+        int status,queries=int(result.masked.w),events=int(result.tail.w);
+        if(uLaneBegin==0) atomicAdd(executed[index].y,1u); // Count the actual expensive entry before any event walk.
+        int queriesBefore=max(queries,1),eventsBefore=events;
         vec3 color=roughGlassTransportV2Selected(uCameraTranslation,selection.ray.xyz,first,uRoughness,false,
-            glassCameraPixelKey(cameraPixel(index)),terminal,masked,tail,status,queries,events);
+            glassCameraPixelKey(cameraPixel(index)),uLaneBegin,uLaneEnd,result.color.rgb,terminal,masked,tail,status,queries,events);
         result.color=vec4(color,float(status));result.terminal=vec4(terminal,float(status));
         result.masked=vec4(masked,float(queries));result.tail=vec4(tail,float(events));
-        atomicAdd(executed[index].z,uint(queries-1));atomicAdd(executed[index].w,uint(events));
+        atomicAdd(executed[index].z,uint(queries-queriesBefore));atomicAdd(executed[index].w,uint(events-eventsBefore));
     }
     memoryBarrierBuffer();
     result.work=executed[index];
@@ -4481,6 +4778,7 @@ void main() {
     std::array<std::shared_ptr<OpenGlQueryProgram>,2> queryOwners{};
     std::array<unsigned,2> programs{};std::array<unsigned,3> buffers{};
     unsigned texture=0;std::uint64_t capacity=0;bool saved=false;
+    roughglasstiles::SliceBudget laneBudget;
     int previousGeneric=0;std::array<int,3> previousBuffers{};
 #if !defined(__APPLE__)
     std::array<GLint64,3> previousStarts{},previousSizes{};
@@ -4530,13 +4828,21 @@ enum : unsigned
     // The Preview camera walk budget (smoothglass::previewCameraTransportShader). Only the
     // Preview glass variant of a smooth-glass program sets it. No prepare mask carries it.
     kFixtureFragmentGlassPreview = 1u << 4,
+    // Smooth glass whose programs all have roughness 0 (smoothglass::smoothOnlyCameraGlass),
+    // without diffraction. The text then sets FIXTURE_ROUGH_GLASS 0, which drops the rough
+    // branches of main, and cuts the rough walks (smoothOnlyCameraTransportShader). The grating
+    // path never sets it, so AllFeatures leaves it out.
+    kFixtureFragmentSmoothOnlyGlass = 1u << 5,
+    // The Realtime engine's program (fixture_realtime_opengl.h). It carries no glass
+    // walk, so it never sits beside the smooth glass bit.
+    kFixtureFragmentRealtime = 1u << 6,
 };
 
 struct OpenGlFixtureUniformLocations final
 {
     int sky = -1, skyBackground = -1, environmentImage = -1;
     int opaqueTexture = -1, opaqueControl = -1;
-    int glassTexture = -1, glassControl = -1, glassTransport = -1, glassReceivers = -1, glassEmission = -1;
+    int glassTexture = -1, glassControl = -1, glassTransport = -1;
     int glassTransport2 = -1;
     int roughCameraControl = -1;
     int objectMatrix = -1;
@@ -4557,11 +4863,6 @@ struct OpenGlFixtureUniformLocations final
     int lightPositionRange = -1;
     int lightKind = -1;
     int lightCount = -1;
-    std::array<int, 16> lightRotations {};
-    std::array<int, 16> lightColors {};
-    std::array<int, 16> lightPositions {};
-    std::array<int, 16> lightCones {};
-    std::array<int, 16> lightKinds {};
     int baseTexture = -1;
     int metallicRoughnessTexture = -1;
     int normalTexture = -1;
@@ -4571,7 +4872,7 @@ struct OpenGlFixtureUniformLocations final
     int emissiveTexturePresence = -1;
     int alphaModeCutoff = -1;
     int imageOutput = -1;
-    int rawIdentifiers = -1, rawObjectIndex = -1;
+    int sceneTable = -1, sceneTableObjects = -1, rawObjectIndex = -1;
     int passProgramControl = -1, passModes = -1, passColors = -1, passReferences = -1, passTransforms = -1;
     int motionRotation = -1, motionTranslationScale = -1;
     int previousCameraRotation = -1, previousCameraTranslation = -1, previousProjection = -1;
@@ -4630,11 +4931,11 @@ struct OpenGlFixtureUniformLocations final
             && noteInstanceTransforms >= 0
             && noteInstanceIndex >= 0 && noteMeshScale >= 0
             && noteAppearanceLow >= 0 && noteAppearanceHigh >= 0;
-        // Smooth glass: the transport GLSL (fixture_smooth_glass.h) declares these and reads
-        // GU_GlassReceivers and GU_GlassEmission. The glass query reads glassTexture and glassControl.
+        // Smooth glass: the transport GLSL (fixture_smooth_glass.h) reads receivers and emission
+        // from the scene table. The glass query reads glassTexture and glassControl.
         // The paired caustic volume text also reads GU_GlassTransport2.
         const bool glass = ! smoothGlass
-            || (glassTexture >= 0 && glassControl >= 0 && glassReceivers >= 0 && glassEmission >= 0
+            || (glassTexture >= 0 && glassControl >= 0
                 && (! causticVolume || glassTransport2 >= 0));
         // Diffraction: the #if FIXTURE_DIFFRACTION blocks and diffractionQueryShader. materialKind is
         // read only by the diffraction block in main. diffractionInstanceCount reaches the fragment
@@ -4663,6 +4964,310 @@ struct OpenGlFixtureUniformLocations final
     }
 };
 
+#ifndef GL_FRAGMENT_SHADER_INVOCATIONS_ARB
+#define GL_FRAGMENT_SHADER_INVOCATIONS_ARB 0x82F4
+#endif
+
+// ARBIT_GL_GLASS_OVERDRAW_PROBE=1 turns on the closed-glass overdraw probe. Read once.
+bool glassOverdrawProbeEnabled()
+{
+    static const bool enabled = glassoverdraw::enabledValue(std::getenv(glassoverdraw::kEnvironment));
+    return enabled;
+}
+
+// The depth prepass of walked glass draws in the closed-glass bands is off by default. In the
+// 24 Oct measurement it cost more than it saved. HUD frame time rose from 271 to 330 ms in Fast
+// and from 796 to 943 ms in Accurate. ARBIT_GL_GLASS_DEPTH_PREPASS=1 turns it on. The variable
+// is read every frame, so one test process can render a frame each way and compare the bytes.
+bool glassDepthPrepassEnabled()
+{
+    const char* value = std::getenv("ARBIT_GL_GLASS_DEPTH_PREPASS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+// GL half of the closed-glass overdraw probe (fixture_glass_overdraw_probe.h). It exists
+// only when the probe is enabled. Each object draw of the glass bands gets one
+// fragment-invocation query, one samples-passed query and one GL_TIME_ELAPSED query.
+// The Preview glass timer around the bands uses GL_TIMESTAMP counters, not
+// GL_TIME_ELAPSED, and the draw scopes never overlap, so at most one time-elapsed query
+// is active at any moment. Each draw is tagged with its camera walk mode, taken from the
+// uGlassTransport.x value it shades with (glassTransportMode in the draw path). A walked
+// draw's depth prepass runs before its queries begin, so the counts and the time cover the
+// shading draw alone, which runs the walk only on fragments that passed GL_EQUAL.
+//
+// Visible pixels come from the raw object-id image (COLOR_ATTACHMENT6, rawTextures[4]),
+// not from depth. In this frame the id image is cleared to 0 after the depth clear, the
+// optional sky triangle writes id 0 with depth off, and nothing else draws before the
+// bands, so a nonzero id was left by a band-loop draw. After the bands, one full-screen
+// pass per drawn object discards every pixel whose id differs, inside GL_SAMPLES_PASSED,
+// and one more pass counts every nonzero id. Draw buffers are GL_NONE and depth test is off
+// for these passes, so they write nothing. A recorded set is read on a later frame once
+// every query reports available. Until then no new set is recorded, so the probe never
+// waits and never reads pixels back.
+class GlassOverdrawProbe final
+{
+public:
+    bool beginFrame(const arbitgl::GlFuncs& gl, std::uint32_t width, std::uint32_t height)
+    {
+        recording_ = false;
+        if (!load(gl)) return false;
+        if (pending_ && !collect()) return false;
+        recording_ = true;
+        used_ = 0;
+        coverageUsed_ = 0;
+        frame_ = {};
+        frame_.width = width;
+        frame_.height = height;
+        return true;
+    }
+    void beginDraw(std::uint32_t object, std::uint8_t mode)
+    {
+        if (!recording_ || drawing_) return;
+        if (used_ == invocationQueries_.size())
+        {
+            const auto grow = std::max<std::size_t>(16, used_);
+            invocationQueries_.resize(used_ + grow);
+            samplesQueries_.resize(used_ + grow);
+            timeQueries_.resize(used_ + grow);
+            queryObjects_.resize(used_ + grow);
+            genQueries_(GLsizei(grow), invocationQueries_.data() + used_);
+            genQueries_(GLsizei(grow), samplesQueries_.data() + used_);
+            genQueries_(GLsizei(grow), timeQueries_.data() + used_);
+        }
+        queryObjects_[used_] = {object, mode};
+        beginQuery_(GL_FRAGMENT_SHADER_INVOCATIONS_ARB, invocationQueries_[used_]);
+        beginQuery_(GL_SAMPLES_PASSED, samplesQueries_[used_]);
+        beginQuery_(GL_TIME_ELAPSED, timeQueries_[used_]);
+        drawing_ = true;
+    }
+    void endDraw()
+    {
+        if (!drawing_) return;
+        endQuery_(GL_TIME_ELAPSED);
+        endQuery_(GL_SAMPLES_PASSED);
+        endQuery_(GL_FRAGMENT_SHADER_INVOCATIONS_ARB);
+        drawing_ = false;
+        ++used_;
+    }
+    void endFrame(const arbitgl::GlFuncs& gl, std::uint32_t bands, unsigned objectIdTexture)
+    {
+        if (!recording_) return;
+        recording_ = false;
+        frame_.bands = bands;
+        // Distinct drawn objects in first-draw order. Slot 0 counts every nonzero id.
+        coverageObjects_.assign(1, 0u);
+        for (std::size_t index = 0; index < used_; ++index)
+            if (std::find(coverageObjects_.begin() + 1, coverageObjects_.end(), queryObjects_[index].first)
+                == coverageObjects_.end())
+                coverageObjects_.push_back(queryObjects_[index].first);
+        if (coverageProgram_ != 0 && coverageVao_ != 0 && objectIdTexture != 0)
+        {
+            if (coverageQueries_.size() < coverageObjects_.size())
+            {
+                const auto old = coverageQueries_.size();
+                coverageQueries_.resize(coverageObjects_.size());
+                genQueries_(GLsizei(coverageQueries_.size() - old), coverageQueries_.data() + old);
+            }
+            GLint program = 0, vertexArray = 0, activeTexture = GL_TEXTURE0, texture = 0, sampler = 0;
+            GLint viewport[4] {};
+            std::array<GLint, 8> drawBuffers {};
+            GLboolean colorMask[4] {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+            glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+            glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vertexArray);
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTexture);
+            glGetIntegerv(GL_VIEWPORT, viewport);
+            for (std::size_t i = 0; i < drawBuffers.size(); ++i)
+                glGetIntegerv(GLenum(GL_DRAW_BUFFER0 + i), &drawBuffers[i]);
+            glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+            const bool depthTest = glIsEnabled(GL_DEPTH_TEST) == GL_TRUE;
+            const bool scissor = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
+            const bool cull = glIsEnabled(GL_CULL_FACE) == GL_TRUE;
+            gl.ActiveTexture(GL_TEXTURE0);
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+            glGetIntegerv(GL_SAMPLER_BINDING, &sampler);
+            const GLenum none = GL_NONE;
+            gl.DrawBuffers(1, &none);
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_CULL_FACE);
+            glViewport(0, 0, int(frame_.width), int(frame_.height));
+            glBindTexture(GL_TEXTURE_2D, objectIdTexture);
+            gl.BindSampler(0, 0);
+            gl.UseProgram(coverageProgram_);
+            gl.BindVertexArray(coverageVao_);
+            gl.Uniform1i(coverageTextureLocation_, 0);
+            for (std::size_t slot = 0; slot < coverageObjects_.size(); ++slot)
+            {
+                gl.Uniform1ui(coverageObjectLocation_, coverageObjects_[slot]);
+                beginQuery_(GL_SAMPLES_PASSED, coverageQueries_[slot]);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                endQuery_(GL_SAMPLES_PASSED);
+            }
+            coverageUsed_ = coverageObjects_.size();
+            gl.BindVertexArray(static_cast<unsigned>(vertexArray));
+            gl.UseProgram(static_cast<unsigned>(program));
+            gl.BindSampler(0, static_cast<unsigned>(sampler));
+            glBindTexture(GL_TEXTURE_2D, static_cast<unsigned>(texture));
+            gl.ActiveTexture(static_cast<GLenum>(activeTexture));
+            glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            std::array<GLenum, 8> restoredBuffers {};
+            for (std::size_t i = 0; i < drawBuffers.size(); ++i) restoredBuffers[i] = GLenum(drawBuffers[i]);
+            gl.DrawBuffers(8, restoredBuffers.data());
+            glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+            if (cull) glEnable(GL_CULL_FACE);
+            if (scissor) glEnable(GL_SCISSOR_TEST);
+            if (depthTest) glEnable(GL_DEPTH_TEST);
+        }
+        pending_ = used_ != 0 || coverageUsed_ != 0;
+    }
+    // Called with the owning context current.
+    void release(const arbitgl::GlFuncs& gl)
+    {
+        if (deleteQueries_ != nullptr)
+        {
+            if (!invocationQueries_.empty()) deleteQueries_(GLsizei(invocationQueries_.size()), invocationQueries_.data());
+            if (!samplesQueries_.empty()) deleteQueries_(GLsizei(samplesQueries_.size()), samplesQueries_.data());
+            if (!timeQueries_.empty()) deleteQueries_(GLsizei(timeQueries_.size()), timeQueries_.data());
+            if (!coverageQueries_.empty()) deleteQueries_(GLsizei(coverageQueries_.size()), coverageQueries_.data());
+        }
+        if (coverageProgram_ != 0) gl.DeleteProgram(coverageProgram_);
+        if (coverageVao_ != 0) gl.DeleteVertexArrays(1, &coverageVao_);
+        invocationQueries_.clear(); samplesQueries_.clear(); timeQueries_.clear(); coverageQueries_.clear();
+        coverageProgram_ = 0; coverageVao_ = 0;
+    }
+
+private:
+    bool load(const arbitgl::GlFuncs& gl)
+    {
+        if (state_ == State::Ready) return true;
+        if (state_ == State::Unsupported) return false;
+        GLint major = 0, minor = 0;
+        glGetIntegerv(GL_MAJOR_VERSION, &major);
+        glGetIntegerv(GL_MINOR_VERSION, &minor);
+        const bool statistics = glfwExtensionSupported("GL_ARB_pipeline_statistics_query") == GLFW_TRUE
+            || major > 4 || (major == 4 && minor >= 6);
+        beginQuery_ = reinterpret_cast<PFNGLBEGINQUERYPROC>(glfwGetProcAddress("glBeginQuery"));
+        endQuery_ = reinterpret_cast<PFNGLENDQUERYPROC>(glfwGetProcAddress("glEndQuery"));
+        genQueries_ = reinterpret_cast<PFNGLGENQUERIESPROC>(glfwGetProcAddress("glGenQueries"));
+        deleteQueries_ = reinterpret_cast<PFNGLDELETEQUERIESPROC>(glfwGetProcAddress("glDeleteQueries"));
+        queryAvailable_ = reinterpret_cast<PFNGLGETQUERYOBJECTIVPROC>(glfwGetProcAddress("glGetQueryObjectiv"));
+        queryResult_ = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VPROC>(glfwGetProcAddress("glGetQueryObjectui64v"));
+        if (!statistics || !beginQuery_ || !endQuery_ || !genQueries_ || !deleteQueries_
+            || !queryAvailable_ || !queryResult_)
+        {
+            std::fprintf(stderr, "[gl] glass overdraw probe off: GL_ARB_pipeline_statistics_query unavailable (GL %d.%d)\n",
+                         major, minor);
+            state_ = State::Unsupported;
+            return false;
+        }
+        // uObject 0 keeps every nonzero id. Any other value keeps only that id.
+        static const char* vertex = "#version 330 core\n"
+            "const vec2 p[3] = vec2[3](vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));\n"
+            "void main() { gl_Position = vec4(p[gl_VertexID], 0.0, 1.0); }\n";
+        static const char* fragment = "#version 330 core\n"
+            "uniform usampler2D uObjectIds;\n"
+            "uniform uint uObject;\n"
+            "void main() {\n"
+            "    uint id = texelFetch(uObjectIds, ivec2(gl_FragCoord.xy), 0).r;\n"
+            "    if (uObject == 0u ? id == 0u : id != uObject) discard;\n"
+            "}\n";
+        std::string error;
+        const auto vs = compileFixtureShader(gl, GL_VERTEX_SHADER, vertex, error);
+        const auto fs = vs != 0 ? compileFixtureShader(gl, GL_FRAGMENT_SHADER, fragment, error) : 0u;
+        if (vs != 0 && fs != 0)
+        {
+            coverageProgram_ = gl.CreateProgram();
+            gl.AttachShader(coverageProgram_, vs);
+            gl.AttachShader(coverageProgram_, fs);
+            gl.LinkProgram(coverageProgram_);
+            int linked = 0;
+            gl.GetProgramiv(coverageProgram_, GL_LINK_STATUS, &linked);
+            if (linked != GL_TRUE) { gl.DeleteProgram(coverageProgram_); coverageProgram_ = 0; error = "link failed"; }
+        }
+        if (vs != 0) gl.DeleteShader(vs);
+        if (fs != 0) gl.DeleteShader(fs);
+        if (coverageProgram_ != 0)
+        {
+            coverageTextureLocation_ = gl.GetUniformLocation(coverageProgram_, "uObjectIds");
+            coverageObjectLocation_ = gl.GetUniformLocation(coverageProgram_, "uObject");
+            gl.GenVertexArrays(1, &coverageVao_);
+        }
+        if (coverageProgram_ == 0 || coverageVao_ == 0)
+            std::fprintf(stderr, "[gl] glass overdraw probe: coverage pass unavailable, covered=0 (%s)\n", error.c_str());
+        state_ = State::Ready;
+        return true;
+    }
+    // Reads the recorded set when every query is available. Never waits.
+    bool collect()
+    {
+        GLint available = GL_TRUE;
+        for (std::size_t index = 0; index < used_ && available == GL_TRUE; ++index)
+        {
+            queryAvailable_(invocationQueries_[index], GL_QUERY_RESULT_AVAILABLE, &available);
+            if (available == GL_TRUE)
+                queryAvailable_(samplesQueries_[index], GL_QUERY_RESULT_AVAILABLE, &available);
+            if (available == GL_TRUE)
+                queryAvailable_(timeQueries_[index], GL_QUERY_RESULT_AVAILABLE, &available);
+        }
+        for (std::size_t slot = 0; slot < coverageUsed_ && available == GL_TRUE; ++slot)
+            queryAvailable_(coverageQueries_[slot], GL_QUERY_RESULT_AVAILABLE, &available);
+        if (available != GL_TRUE) return false;
+        for (std::size_t index = 0; index < used_; ++index)
+        {
+            GLuint64 invocations = 0, samples = 0, nanoseconds = 0;
+            queryResult_(invocationQueries_[index], GL_QUERY_RESULT, &invocations);
+            queryResult_(samplesQueries_[index], GL_QUERY_RESULT, &samples);
+            queryResult_(timeQueries_[index], GL_QUERY_RESULT, &nanoseconds);
+            glassoverdraw::accumulate(frame_, queryObjects_[index].first, queryObjects_[index].second,
+                                      invocations, samples, nanoseconds);
+        }
+        for (std::size_t slot = 0; slot < coverageUsed_; ++slot)
+        {
+            GLuint64 pixels = 0;
+            queryResult_(coverageQueries_[slot], GL_QUERY_RESULT, &pixels);
+            if (slot == 0) frame_.covered = pixels;
+            else glassoverdraw::entryFor(frame_, coverageObjects_[slot], glassoverdraw::kOrdinary).visible = pixels;
+        }
+        pending_ = false;
+        ++measured_;
+        if (glassoverdraw::shouldLog(measured_))
+            std::fputs(glassoverdraw::formatLine(frame_).c_str(), stderr);
+        return true;
+    }
+
+    enum class State : std::uint8_t { Unloaded, Ready, Unsupported };
+    State state_ = State::Unloaded;
+    PFNGLBEGINQUERYPROC beginQuery_ = nullptr;
+    PFNGLENDQUERYPROC endQuery_ = nullptr;
+    PFNGLGENQUERIESPROC genQueries_ = nullptr;
+    PFNGLDELETEQUERIESPROC deleteQueries_ = nullptr;
+    PFNGLGETQUERYOBJECTIVPROC queryAvailable_ = nullptr;
+    PFNGLGETQUERYOBJECTUI64VPROC queryResult_ = nullptr;
+    std::vector<GLuint> invocationQueries_, samplesQueries_, timeQueries_, coverageQueries_;
+    std::vector<std::pair<std::uint32_t, std::uint8_t>> queryObjects_;
+    std::vector<std::uint32_t> coverageObjects_;
+    unsigned coverageProgram_ = 0, coverageVao_ = 0;
+    int coverageTextureLocation_ = -1, coverageObjectLocation_ = -1;
+    std::size_t used_ = 0, coverageUsed_ = 0;
+    std::uint64_t measured_ = 0;
+    bool recording_ = false, drawing_ = false, pending_ = false;
+    glassoverdraw::FrameCounts frame_ {};
+};
+
+// Brackets one object draw of the closed-glass bands. Null when the probe is off.
+class GlassOverdrawDrawScope final
+{
+public:
+    GlassOverdrawDrawScope(GlassOverdrawProbe* probe, std::uint32_t object, std::uint8_t mode) : probe_(probe)
+    { if (probe_ != nullptr) probe_->beginDraw(object, mode); }
+    ~GlassOverdrawDrawScope() { if (probe_ != nullptr) probe_->endDraw(); }
+    GlassOverdrawDrawScope(const GlassOverdrawDrawScope&) = delete;
+    GlassOverdrawDrawScope& operator=(const GlassOverdrawDrawScope&) = delete;
+private:
+    GlassOverdrawProbe* probe_;
+};
+
 class OpenGlFixtureSceneResources final : public NativeFixtureSceneResources
 {
 public:
@@ -4688,6 +5293,11 @@ public:
         std::array<unsigned, 2> glassTimer {};
         bool glassTimerPending = false;
         double lastGlassGpuMilliseconds = -1.0;
+        // Rate for the closed glass bands, kept across frames.
+        roughglasstiles::GlassBandBudget glassBandBudget {roughglasstiles::kFirstGlassBandPixels, smoothglass::kClosedGlassBandPixels};
+        std::uint32_t glassTimedBands = 0;
+        // Created only when ARBIT_GL_GLASS_OVERDRAW_PROBE=1, on the first closed-glass frame.
+        std::unique_ptr<GlassOverdrawProbe> glassOverdraw;
         ~SharedProgram()
         {
             // Scene resources and the context cache release their program leases
@@ -4700,6 +5310,7 @@ public:
                 if (glassTimer[0] != 0)
                     if (const auto deleteQueries = reinterpret_cast<PFNGLDELETEQUERIESPROC>(glfwGetProcAddress("glDeleteQueries")))
                         deleteQueries(2, glassTimer.data());
+                if (glassOverdraw) glassOverdraw->release(gl);
                 if (id != 0) gl.DeleteProgram(id);
                 if (diffractionResolveId != 0) gl.DeleteProgram(diffractionResolveId);
                 if (diffractionResolveVao != 0) gl.DeleteVertexArrays(1, &diffractionResolveVao);
@@ -4745,13 +5356,15 @@ public:
     {
         return vertexArray != 0 || vertexBuffer != 0 || previousVertexBuffer != 0 || indexBuffer != 0
             || instanceBuffer != 0
-            || ! textures.empty() || environmentTexture!=0 || program != 0;
+            || ! textures.empty() || environmentTexture!=0 || sceneTableTexture!=0 || program != 0;
     }
 
     void destroyUnlocked() noexcept
     {
         if (environmentTexture) glDeleteTextures(1,&environmentTexture);
         environmentTexture=0; environmentResident.reset(); environmentBudget.reset();
+        if (sceneTableTexture) glDeleteTextures(1,&sceneTableTexture);
+        sceneTableTexture=0;
         if (! textures.empty())
             glDeleteTextures (static_cast<int> (textures.size()), textures.data());
         textureCharges.clear();
@@ -4775,8 +5388,33 @@ public:
         causticProgramSet.reset();
         causticQueryProgram.reset();queryContext.reset();
         for(auto& buffer:previewSpectrumBuffers)if(buffer){gl.DeleteBuffers(1,&buffer);buffer=0;}
+        previewSpectrumBufferBytes={};
         previewSpectrumKey.reset();previewSpectrumSchedule.reset();
         releasePreviewCausticJobUnlocked();
+        for(auto& ring:pooledCausticBufferRings)
+            for(auto& buffer:ring.handles)if(buffer) {gl.DeleteBuffers(1,&buffer);buffer=0;}
+        if(pooledCausticSplat) {gl.DeleteBuffers(1,&pooledCausticSplat);pooledCausticSplat=0;}
+        pooledCausticSplatBytes=0;
+        if(pendingBaseColorDelete) {glDeleteTextures(1,&pendingBaseColorDelete);pendingBaseColorDelete=0;}
+        pendingBaseColorBytes=0;pendingBaseColorWidth=0;pendingBaseColorHeight=0;
+        if(pooledResolveColor) {glDeleteTextures(1,&pooledResolveColor);pooledResolveColor=0;}
+        pooledResolveColorBytes=0;pooledResolveColorWidth=0;pooledResolveColorHeight=0;
+        if(pooledBaseColor) {glDeleteTextures(1,&pooledBaseColor);pooledBaseColor=0;}
+        pooledBaseColorBytes=0;
+        if(pooledDepthSet.depthTexture)glDeleteTextures(1,&pooledDepthSet.depthTexture);
+        if(pooledDepthSet.accumulation)glDeleteTextures(1,&pooledDepthSet.accumulation);
+        glDeleteTextures(static_cast<int>(pooledDepthSet.raw.size()),pooledDepthSet.raw.data());
+        pooledDepthSet={};
+        if(pooledRasterTriple.owner)glDeleteTextures(1,&pooledRasterTriple.owner);
+        if(pooledRasterTriple.triangle)glDeleteTextures(1,&pooledRasterTriple.triangle);
+        if(pooledRasterTriple.depth)glDeleteTextures(1,&pooledRasterTriple.depth);
+        pooledRasterTriple={};
+        if(pooledCameraAttach.depthTexture)glDeleteTextures(1,&pooledCameraAttach.depthTexture);
+        if(pooledCameraAttach.framebuffer)gl.DeleteFramebuffers(1,&pooledCameraAttach.framebuffer);
+        pooledCameraAttach={};
+        for(auto& pending:pendingCausticBufferDeletes)
+            if(pending) {gl.DeleteBuffers(1,&pending);pending=0;}
+        if(pendingDeleteFence) {gl.DeleteSync(pendingDeleteFence);pendingDeleteFence=nullptr;}
         for (auto* resident : {&residentOpaque, &residentGlass})
         {
             if (resident->texture != 0) glDeleteTextures(1, &resident->texture);
@@ -4817,7 +5455,7 @@ public:
     // beside it. The destructor's else branch runs when ownerContext is not current. It
     // skips destroyUnlocked, so its charges release with the members while the GL objects
     // survive until ownerContext dies. The environment texture is charged through
-    // environmentBudget, which is the same decoded byte count.
+    // environmentBudget, which is the decoded byte count and its mip levels.
     unsigned vertexArray = 0;
     unsigned vertexBuffer = 0;
     residency::ResidencyCharge vertexBufferCharge;
@@ -4848,6 +5486,8 @@ public:
     // One charge per entry in textures, in the same order.
     std::vector<residency::ResidencyCharge> textureCharges;
     unsigned environmentTexture=0;
+    // Filled per frame from the const resources, on the owning GL context.
+    mutable unsigned sceneTableTexture=0;
     videohelper::environmentimage::ResidentPtr environmentResident;
     std::shared_ptr<environmentimage::GpuBudget> environmentBudget;
     unsigned program = 0;
@@ -4861,6 +5501,86 @@ public:
     // The schedule the retained spectrum was traced for. A frame with the same schedule
     // resolves it while its own submission is still on the GPU.
     mutable std::optional<OpenGlCausticScheduleKey> previewSpectrumSchedule;
+    // The retained spectrum's sizes, so the buffers the next adoption releases are pooled.
+    mutable std::array<std::uint64_t,2> previewSpectrumBufferBytes{};
+    // The frame's per-submission caustic buffers return here instead of being deleted.
+    // The next submission binds this storage and only re-allocates it when its size
+    // changed, so a frame under GPU backlog does not stall on fresh buffer allocation.
+ 
+    mutable unsigned pooledCausticSplat=0;
+    mutable std::size_t pooledCausticSplatBytes=0;
+    // The base Color texture a resolved frame replaced. Report defers it here and
+    // the next frame's early stage reaps it, once its glass bands and resolve drain.
+    mutable unsigned pendingBaseColorDelete=0;
+    mutable std::uint64_t pendingBaseColorBytes=0;
+    mutable unsigned pendingBaseColorWidth=0, pendingBaseColorHeight=0;
+    // The base camera attachment set cycles between the frame's release and the
+    // next allocation, mirroring the resolve Color cycle: verify63 measured the
+    // base frame's texture allocations at 257-303 ms behind a busy glass batch.
+    struct PooledCameraDepthSet {
+        unsigned depthTexture=0;
+        unsigned accumulation=0;
+        std::array<unsigned,6> raw{};
+        std::uint64_t key=0;
+    };
+    mutable unsigned pooledBaseColor=0;
+    mutable std::uint64_t pooledBaseColorBytes=0;
+    mutable unsigned pooledBaseColorWidth=0, pooledBaseColorHeight=0;
+    mutable PooledCameraDepthSet pooledDepthSet;
+    // The caustic raster triple (owner, triangle, depth) cycles across frame
+    // releases the same way, so the per-frame bulk delete stops blocking.
+    struct PooledRasterTriple {
+        unsigned owner=0;
+        unsigned triangle=0;
+        unsigned depth=0;
+        std::uint64_t key=0;
+    };
+    mutable PooledRasterTriple pooledRasterTriple;
+    // The base camera's depth attachment and framebuffer cycle the same way:
+    // the completeness check against fresh per-frame storage was the wait the
+    // fbo split named.
+    struct PooledCameraAttach {
+        unsigned depthTexture=0;
+        unsigned framebuffer=0;
+        std::uint64_t key=0;
+        bool stencil=false;
+    };
+    mutable PooledCameraAttach pooledCameraAttach;
+    // Four deep per slot so a refill never deletes a buffer whose readers may
+    // still be on the GPU: verify71 measured that delete at 197 ms inside the
+    // adoption and verify72 its reap at 251 ms. The entries stay compacted and
+    // front-oldest, so a full ring evicts the oldest — several frames retired
+    // when the steady state of two ever overflows.
+    struct PooledBufferRing {
+        std::array<unsigned,4> handles{};
+        std::array<std::uint64_t,4> bytes{};
+    };
+    mutable std::array<PooledBufferRing,7> pooledCausticBufferRings{};
+    // Ring evictions park here for the queue-idle reap instead of deleting
+    // mid-run: verify73 measured even a four-frames-older eviction delete at
+    // 209 ms, and verify75's rapid phase produced about fifteen evictions — so
+    // the lot is burst-sized and its overflow, the only immediate delete left,
+    // should not fire within a burst.
+    mutable std::array<unsigned,32> pendingCausticBufferDeletes{};
+    // The lot's own fence: commands submitted before the latest park. The
+    // queue-idle reap polls this instead of glFinish-ing the whole queue,
+    // which also waited on the Preview submission that is polled, never
+    // waited on.
+    mutable GLsync pendingDeleteFence=nullptr;
+    // Drift counters: pushes grow against takes across a run, and the eviction
+    // print reports both so the site that pushes without a take is visible.
+    mutable std::uint64_t pooledCausticPushes=0;
+    mutable std::uint64_t pooledCausticTakes=0;
+    mutable std::uint64_t pooledCausticEvictions=0;
+    // Wall milliseconds of this frame's start, so the reap can prove the queue
+    // idle: a gap beyond the longest measured GPU tail means the parked entries
+    // can retire free (verify74: reaping them every frame waited 251 ms regardless
+    // of the buffer's age).
+    mutable std::uint64_t lastCausticFrameWallMs=0;
+    // The resolve Color target cycles: pending base -> pooled -> next resolve.
+    mutable unsigned pooledResolveColor=0;
+    mutable std::uint64_t pooledResolveColorBytes=0;
+    mutable unsigned pooledResolveColorWidth=0, pooledResolveColorHeight=0;
     // The Preview caustic submission still on the GPU, under fixtureMutex(). Its fence
     // is polled, never waited on. It owns its spectrum, the copied splat counters and
     // its GPU timestamps. The frame that finds it signalled adopts its spectrum as the
@@ -4870,6 +5590,7 @@ public:
         GLsync fence=nullptr;
         std::chrono::steady_clock::time_point submitted;
         std::array<unsigned,2> spectrum{};
+        std::array<std::uint64_t,2> spectrumBytes{};
         unsigned counters=0;
         std::array<unsigned,4> stamps{};
         OpenGlCausticScheduleKey schedule;
@@ -4877,16 +5598,90 @@ public:
         // The single-pixel identity a splat overflow declines splatting for.
         std::string singlePixelIdentity;
         bool splat=false,overBudgetCounted=false;
+        // Submitted by an Accurate Preview. Its time never steps the budget ladder, which
+        // only Fast (Preview budget) frames consult.
+        bool exportBudgets=false;
     };
     mutable std::optional<PreviewCausticJob> previewCausticJob;
     // A schedule whose late splat counters overflowed. Its next submissions deposit single pixels.
     mutable std::string previewSplatDeclined;
+    // The latched Accurate Preview refusal, under fixtureMutex(). See OpenGlCausticRefusalKey.
+    mutable OpenGlCausticRefusalLatch accurateCausticRefusal;
+    // Return an owned frame buffer to the pool, or delete it when its slot is taken.
+    static void shiftPooledCausticRing(PooledBufferRing& ring) noexcept
+    {
+        for(unsigned i=0;i+1<ring.handles.size();++i)
+        {ring.handles[i]=ring.handles[i+1];ring.bytes[i]=ring.bytes[i+1];}
+        ring.handles.back()=0;ring.bytes.back()=0;
+    }
+    void poolCausticBufferUnlocked(unsigned slot,unsigned buffer,std::uint64_t bytes) const noexcept
+    {
+        if(!buffer)return;
+        auto& ring=pooledCausticBufferRings[slot];
+        if(ring.handles[0]&&ring.handles[3])
+        {
+            // Full: the front is the oldest, four frames by construction. Park it
+            // for the queue-idle reap — verify73 measured this delete at 209 ms
+            // against a deep queue. The first four evictions report the drift so
+            // the push-without-take site can be named.
+            const unsigned evicted=ring.handles[0];
+            static int evictLogged=0;
+            if(evictLogged<4)
+            {
+                ++evictLogged;
+                unsigned lot=0;
+                for(auto& pending:pendingCausticBufferDeletes)if(pending)++lot;
+                std::fprintf(stderr,"[gl] caustic ring evict: slot=%u lot=%u pushes=%llu takes=%llu evicts=%llu\n",
+                    slot,lot,static_cast<unsigned long long>(pooledCausticPushes),
+                    static_cast<unsigned long long>(pooledCausticTakes),
+                    static_cast<unsigned long long>(pooledCausticEvictions));
+            }
+            ++pooledCausticEvictions;
+            bool parked=false;
+            for(auto& pending:pendingCausticBufferDeletes)
+                if(!pending) {pending=evicted;parked=true;break;}
+            if(!parked)gl.DeleteBuffers(1,&evicted);
+            else
+            {
+                // Fence what the lot covers now: everything submitted before
+                // this park, which includes every reader of every buffer parked
+                // so far. The newest park supersedes the previous fence.
+                if(pendingDeleteFence)gl.DeleteSync(pendingDeleteFence);
+                pendingDeleteFence=gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
+            }
+            shiftPooledCausticRing(ring);
+        }
+        ++pooledCausticPushes;
+        unsigned at=0;while(at<ring.handles.size()&&ring.handles[at])++at;
+        ring.handles[at]=buffer;ring.bytes[at]=bytes;
+    }
+    unsigned takePooledCausticBufferUnlocked(unsigned slot,std::uint64_t& bytes) const noexcept
+    {
+        auto& ring=pooledCausticBufferRings[slot];
+        if(!ring.handles[0])return 0;
+        ++pooledCausticTakes;
+        const unsigned buffer=ring.handles[0];
+        bytes=ring.bytes[0];
+        shiftPooledCausticRing(ring);
+        return buffer;
+    }
+    void poolCausticSplatUnlocked(unsigned buffer,std::size_t bytes) const noexcept
+    {
+        if(!buffer)return;
+        if(pooledCausticSplat) {gl.DeleteBuffers(1,&buffer);return;}
+        pooledCausticSplat=buffer;pooledCausticSplatBytes=bytes;
+    }
     void releasePreviewCausticJobUnlocked() const noexcept
     {
         if(!previewCausticJob)return;
         auto& job=*previewCausticJob;
         if(job.fence)gl.DeleteSync(job.fence);
-        for(auto& buffer:job.spectrum)if(buffer)gl.DeleteBuffers(1,&buffer);
+        // The pair maps to pool indices {2,6} — the same mapping the frame stash,
+        // the early path and frame prep use. slot+2 put the second spectrum at
+        // index 3, whose only taker is the resident-skipped work-table branch, so
+        // it piled up until the ring evicted (verify77: slot=3, deficit +1 per
+        // eviction).
+        for(unsigned slot:{0u,1u})poolCausticBufferUnlocked(slot?6u:2u,job.spectrum[slot],job.spectrumBytes[slot]);
         if(job.counters)gl.DeleteBuffers(1,&job.counters);
         if(job.stamps[0])
             if(const auto deleteQueries=reinterpret_cast<PFNGLDELETEQUERIESPROC>(glfwGetProcAddress("glDeleteQueries")))
@@ -5145,6 +5940,9 @@ class OpenGlFixtureSceneFrame final : public NativeFixtureSceneFrame, public gla
 public:
     ~OpenGlFixtureSceneFrame() override
     {
+        // Destruction is the receipt's replacement: the mark must not defer the
+        // final release into a destroyed object.
+        receiptReadTarget_ = false;
         if(ownerContext==nullptr&&!rasterCaptureProgram&&!cameraCoverageResults&&!failedCameraCoverageResources
             &&std::none_of(queryPrograms.begin(),queryPrograms.end(),[](const auto& owner){return bool(owner);}))return;
         std::lock_guard<std::mutex> lock (fixtureMutex());
@@ -5186,6 +5984,10 @@ public:
 
     void releaseTexturesUnlocked() noexcept
     {
+        // While this frame is the receipt's current read target its textures
+        // stay: pool-return and deletion wait for releaseReceiptReadTarget() or
+        // the destructor's clear above.
+        if(receiptReadTarget_) return;
         nativeAttempts={};nativeAttemptCount=0;nativeAttemptBytes=gratingNativeWork=gratingNativeDepositionWork=0;
         directReceiverResults.reset();failedReceiverResources.reset();activeReceiverStorage=0;
         cameraCoverageResults.reset();failedCameraCoverageResources.reset();activeCameraCoverageStorage=0;
@@ -5202,9 +6004,27 @@ public:
         roughReceiptTextures = {};
         roughReceiptComplete = false;
         roughTileSchedule.reset(); roughTileAggregate = {};
-        if (staticResources) staticResources->gl.DeleteBuffers(static_cast<int>(causticBuffers.size()), causticBuffers.data());
-        glDeleteTextures(static_cast<int>(causticTextures.size()), causticTextures.data());
-        causticBuffers = {}; causticTextures = {}; causticReadback.reset(); causticSinglePixelIdentity.clear();
+        {
+            // The frame's own caustic buffers and raster textures, timed where the
+            // frame is released: a disposal that waits on the GPU shows up here.
+            loopstep::Scope releaseScope ("gl:frame-release-caustic");
+            if (staticResources) staticResources->gl.DeleteBuffers(static_cast<int>(causticBuffers.size()), causticBuffers.data());
+            // The raster triple returns to the resource pool for the next frame's
+            // prep instead of blocking here (verify65 measured this delete at 255
+            // and 253 ms); the owned query texture, if any, still falls to the
+            // bulk delete below.
+            if(staticResources && causticTextures[1] && causticTextures[2] && causticTextures[3]
+                && staticResources->pooledRasterTriple.owner == 0)
+            {
+                staticResources->pooledRasterTriple.owner=causticTextures[1];
+                staticResources->pooledRasterTriple.triangle=causticTextures[2];
+                staticResources->pooledRasterTriple.depth=causticTextures[3];
+                staticResources->pooledRasterTriple.key=std::uint64_t(width_)|(std::uint64_t(height_)<<32);
+                causticTextures[1]=causticTextures[2]=causticTextures[3]=0;
+            }
+            glDeleteTextures(static_cast<int>(causticTextures.size()), causticTextures.data());
+            causticBuffers = {}; causticTextures = {}; causticReadback.reset(); causticSinglePixelIdentity.clear();
+        }
         gratingStagingBinding.reset();gratingStagingSubmission={};
         if(directionalSourceBuffer&&staticResources)staticResources->gl.DeleteBuffers(1,&directionalSourceBuffer);
         directionalSourceBuffer=0;directionalSourceUpload={};
@@ -5218,6 +6038,26 @@ public:
         gratingCameraSpectrumTexture=0;
         if (glassTexture != 0) glDeleteTextures(1, &glassTexture);
         if (opaqueTexture != 0) glDeleteTextures(1, &opaqueTexture);
+        // The camera attachments return to the resource pools for the next
+        // frame's allocation instead of blocking the destructor behind a busy
+        // glass batch (verify63 measured this release at up to 255 ms).
+        if(staticResources && texture_ != 0 && staticResources->pooledBaseColor == 0)
+        {
+            staticResources->pooledBaseColor = texture_;
+            staticResources->pooledBaseColorBytes = std::uint64_t(width_) * height_ * (linearColor ? 8u : 4u);
+            staticResources->pooledBaseColorWidth = width_; staticResources->pooledBaseColorHeight = height_;
+            texture_ = 0;
+        }
+        if(staticResources && depthTexture_ != 0 && staticResources->pooledDepthSet.depthTexture == 0)
+        {
+            staticResources->pooledDepthSet.depthTexture = depthTexture_;
+            staticResources->pooledDepthSet.accumulation = accumulationTexture_;
+            staticResources->pooledDepthSet.raw = rawTextures;
+            staticResources->pooledDepthSet.key = std::uint64_t(width_) | (std::uint64_t(height_) << 32);
+            depthTexture_ = 0;
+            accumulationTexture_ = 0;
+            rawTextures = {};
+        }
         if (depthTexture_ != 0) glDeleteTextures(1, &depthTexture_);
         if (accumulationTexture_ != 0) glDeleteTextures(1, &accumulationTexture_);
         glDeleteTextures(static_cast<int>(rawTextures.size()), rawTextures.data());
@@ -5237,6 +6077,8 @@ public:
     {
         return reinterpret_cast<std::uintptr_t> (staticResources.get());
     }
+    void markReceiptReadTarget() const noexcept override { receiptReadTarget_ = true; }
+    void releaseReceiptReadTarget() const noexcept override { receiptReadTarget_ = false; }
     NativeTextureViewDescriptor colorTextureDescriptor() const noexcept override
     {
         if (privateCameraAttachments) return {};
@@ -5262,7 +6104,10 @@ public:
     {
         if (privateCameraAttachments) return {};
         for (std::size_t i = 2; i < renderpasscomposite::kInputs.size(); ++i)
-            if (renderpasscomposite::kInputs[i] == output)
+            // A frame without pooled raw textures has no composite input of its
+            // own; descriptor slots with texture 0 would fail the completeness
+            // check, so the receipt descriptor below carries the frame instead.
+            if (renderpasscomposite::kInputs[i] == output && rawTextures[i - 2] != 0)
                 return { backend_, NativeTextureViewKind::Texture2D, rawFormats[i - 2],
                     rawTextures[i - 2], rawTextures[i - 2], width_, height_, 1, true,
                     reinterpret_cast<std::uintptr_t>(ownerContext), rendererGeneration_,
@@ -5490,7 +6335,15 @@ public:
         if (!descriptor.complete() || !rawPassFormatMatches(output, descriptor.format)
             || !nativeFixtureDimensionsWithinBounds(width_, height_)
             || !staticResources || glfwGetCurrentContext() != ownerContext)
-        { error = "OpenGL raw pass requires its live owning context and supported attachment"; return false; }
+        {
+            std::fprintf (stderr,
+                "[gl] raw pass rejected: complete=%d format=%d private=%d raw0=%u tex=%u resources=%p current=%p owner=%p\n",
+                (int) descriptor.complete(), (int) rawPassFormatMatches (output, descriptor.format),
+                (int) privateCameraAttachments, rawTextures.empty() ? 0u : rawTextures[0],
+                descriptor.imageHandle != 0 ? 1u : 0u,
+                (void*) staticResources.get(), (void*) glfwGetCurrentContext(), (void*) ownerContext);
+            error = "OpenGL raw pass requires its live owning context and supported attachment"; return false;
+        }
         return readTextureOwned(descriptor, pixels, error);
     }
     bool readTextureOwned(const NativeTextureViewDescriptor& descriptor, NativeRawPassPixels& pixels,
@@ -5548,6 +6401,7 @@ public:
     }
 
     std::array<unsigned, 6> rawTextures {};
+    mutable bool receiptReadTarget_ = false;
     inline static constexpr std::array<NativeTexturePixelFormat, 6> rawFormats {
         NativeTexturePixelFormat::Rgba16Float, NativeTexturePixelFormat::Rgba16Float,
         NativeTexturePixelFormat::R8Unorm, NativeTexturePixelFormat::R32Uint,
@@ -5558,9 +6412,35 @@ public:
 // its existing owner, but does not mark them rendered or publish their views.
 static bool allocateFixtureCameraAttachments(
     const arbitgl::GlFuncs& gl, OpenGlFixtureSceneFrame* frame, bool diffractionFrame,
-    unsigned& framebuffer, unsigned& depthAttachment, std::string& error)
+    unsigned& framebuffer, unsigned& depthAttachment, std::string& error, bool stencil = false)
 {
-    glGenTextures (1, &frame->texture_);
+    // The base Color and the depth/raw set come back from the previous frame's
+    // release when the size and presence match, so the allocation no longer waits
+    // on a glass batch that is still executing.
+    const std::uint64_t baseColorBytes = std::uint64_t (frame->width_) * frame->height_ * (frame->linearColor ? 8u : 4u);
+    bool pooledBase = false;
+    if (frame->staticResources && frame->staticResources->pooledBaseColor
+        && frame->staticResources->pooledBaseColorWidth == frame->width_
+        && frame->staticResources->pooledBaseColorHeight == frame->height_
+        && frame->staticResources->pooledBaseColorBytes == baseColorBytes)
+    {
+        frame->texture_ = frame->staticResources->pooledBaseColor;
+        frame->staticResources->pooledBaseColor = 0;
+        frame->staticResources->pooledBaseColorBytes = 0;
+        frame->staticResources->pooledBaseColorWidth = 0; frame->staticResources->pooledBaseColorHeight = 0;
+        pooledBase = true;
+    }
+    else
+    {
+        if (frame->staticResources && frame->staticResources->pooledBaseColor)
+        {
+            glDeleteTextures (1, &frame->staticResources->pooledBaseColor);
+            frame->staticResources->pooledBaseColor = 0;
+            frame->staticResources->pooledBaseColorBytes = 0;
+        frame->staticResources->pooledBaseColorWidth = 0; frame->staticResources->pooledBaseColorHeight = 0;
+        }
+        glGenTextures (1, &frame->texture_);
+    }
     glBindTexture (GL_TEXTURE_2D, frame->texture_);
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -5568,9 +6448,37 @@ static bool allocateFixtureCameraAttachments(
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage2D (GL_TEXTURE_2D, 0, frame->linearColor ? GL_RGBA16F : GL_RGBA8, static_cast<int> (frame->width_),
-                  static_cast<int> (frame->height_), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    if (diffractionFrame)
+    if (!pooledBase)
+        glTexImage2D (GL_TEXTURE_2D, 0, frame->linearColor ? GL_RGBA16F : GL_RGBA8, static_cast<int> (frame->width_),
+                      static_cast<int> (frame->height_), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // The grating staging path sets privateCameraAttachments on the shared scene
+    // frame and never clears it, so one abandoned staging attempt hides every
+    // later composite read behind the descriptor's empty return. An ordinary
+    // fixture render rewrites these attachments from this frame's own content,
+    // and staging re-asserts the flag before any staged view is exposed, so the
+    // ordinary setup resets it here.
+    frame->privateCameraAttachments = false;
+    const std::uint64_t depthSetKey = std::uint64_t (frame->width_) | (std::uint64_t (frame->height_) << 32);
+    bool pooledDepth = false;
+    if (frame->staticResources && frame->staticResources->pooledDepthSet.depthTexture
+        && frame->staticResources->pooledDepthSet.key == depthSetKey
+        && ((frame->staticResources->pooledDepthSet.accumulation != 0) == diffractionFrame))
+    {
+        frame->depthTexture_ = frame->staticResources->pooledDepthSet.depthTexture;
+        frame->accumulationTexture_ = frame->staticResources->pooledDepthSet.accumulation;
+        frame->rawTextures = frame->staticResources->pooledDepthSet.raw;
+        frame->staticResources->pooledDepthSet = {};
+        pooledDepth = true;
+    }
+    else if (frame->staticResources && frame->staticResources->pooledDepthSet.depthTexture)
+    {
+        auto& stale = frame->staticResources->pooledDepthSet;
+        if (stale.depthTexture) glDeleteTextures (1, &stale.depthTexture);
+        if (stale.accumulation) glDeleteTextures (1, &stale.accumulation);
+        glDeleteTextures (static_cast<int> (stale.raw.size()), stale.raw.data());
+        frame->staticResources->pooledDepthSet = {};
+    }
+    if (diffractionFrame && !pooledDepth)
     {
         glGenTextures(1, &frame->accumulationTexture_);
         glBindTexture(GL_TEXTURE_2D, frame->accumulationTexture_);
@@ -5581,17 +6489,26 @@ static bool allocateFixtureCameraAttachments(
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, static_cast<int>(frame->width_),
             static_cast<int>(frame->height_), 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
     }
-    glGenTextures (1, &frame->depthTexture_);
-    glBindTexture (GL_TEXTURE_2D, frame->depthTexture_);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage2D (GL_TEXTURE_2D, 0, GL_R32F,
-                  static_cast<int> (frame->width_), static_cast<int> (frame->height_), 0,
-                  GL_RED, GL_FLOAT, nullptr);
+    if (!pooledDepth)
+    {
+        glGenTextures (1, &frame->depthTexture_);
+        glBindTexture (GL_TEXTURE_2D, frame->depthTexture_);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_R32F,
+                      static_cast<int> (frame->width_), static_cast<int> (frame->height_), 0,
+                      GL_RED, GL_FLOAT, nullptr);
+    }
+    // A pre-set depth attachment or framebuffer came from the caller's pool
+    // consume: its storage already exists at this size and format, so only the
+    // fresh path creates storage. verify66 proved the completeness check against
+    // fresh storage was the wait class the fbo split named.
+    if (depthAttachment == 0)
+    {
     glGenTextures (1, &depthAttachment);
     glBindTexture (GL_TEXTURE_2D, depthAttachment);
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -5600,9 +6517,19 @@ static bool allocateFixtureCameraAttachments(
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
     glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage2D (GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24,
-                  static_cast<int> (frame->width_), static_cast<int> (frame->height_), 0,
-                  GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
+    // The closed-glass bands use the stencil for their depth prepass. The private grating
+    // camera checks for DEPTH_COMPONENT24, and rough frames blit into a DEPTH_COMPONENT24
+    // receipt depth, so they keep the depth-only format.
+    if (stencil)
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8,
+                      static_cast<int> (frame->width_), static_cast<int> (frame->height_), 0,
+                      GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, nullptr);
+    else
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24,
+                      static_cast<int> (frame->width_), static_cast<int> (frame->height_), 0,
+                      GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
+    }
+    if (framebuffer == 0)
     gl.GenFramebuffers (1, &framebuffer);
     gl.BindFramebuffer (GL_FRAMEBUFFER, framebuffer);
     gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -5610,10 +6537,19 @@ static bool allocateFixtureCameraAttachments(
                                  ? frame->accumulationTexture_ : frame->texture_, 0);
     gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
                              GL_TEXTURE_2D, frame->depthTexture_, 0);
-    gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+    gl.FramebufferTexture2D (GL_FRAMEBUFFER, stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
                              GL_TEXTURE_2D, depthAttachment, 0);
     const std::array<int, 6> rawFormats { GL_RGBA16F, GL_RGBA16F, GL_R8, GL_R32UI, GL_R32UI, GL_RG16F };
-    glGenTextures(6, frame->rawTextures.data());
+    // d430b58d91 moved raw storage into the depth set but dropped the fresh-path
+    // generation: a frame no pool supplied configured and attached six zero
+    // handles, and every raw read - the smooth-glass completion check's Normal
+    // read on a blocking glass render among them - then failed the frame. A
+    // zero raw set generates its six textures and the storage pass below
+    // configures them; a pooled set keeps the storage its releasing frame made.
+    const bool freshRawSet = frame->rawTextures[0] == 0;
+    if (freshRawSet)
+        glGenTextures (static_cast<int> (frame->rawTextures.size()), frame->rawTextures.data());
+    if (!pooledDepth || freshRawSet)
     for (std::size_t i = 0; i < frame->rawTextures.size(); ++i)
     {
         glBindTexture(GL_TEXTURE_2D, frame->rawTextures[i]);
@@ -5624,9 +6560,12 @@ static bool allocateFixtureCameraAttachments(
         glTexImage2D(GL_TEXTURE_2D, 0, rawFormats[i], static_cast<int>(frame->width_),
             static_cast<int>(frame->height_), 0, i == 5 ? GL_RG : i < 2 ? GL_RGBA : i == 2 ? GL_RED : GL_RED_INTEGER,
             i == 5 || i < 2 ? GL_FLOAT : i == 2 ? GL_UNSIGNED_BYTE : GL_UNSIGNED_INT, nullptr);
+    }
+    // The framebuffer is fresh every time, so its raw attachments run on a pool
+    // hit too; only the storage creation above is skipped.
+    for (std::size_t i = 0; i < frame->rawTextures.size(); ++i)
         gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + 2 + static_cast<unsigned>(i),
             GL_TEXTURE_2D, frame->rawTextures[i], 0);
-    }
     const unsigned drawBuffers[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
         GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4,
         GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT6, GL_COLOR_ATTACHMENT7 };
@@ -5853,10 +6792,22 @@ struct OpenGlFixtureInFlightProgram
     std::chrono::steady_clock::time_point submitted {};
 };
 
+// The smooth-only glass program is opt-in: ARBIT_GL_SMOOTH_ONLY_GLASS_PROGRAM=1 turns it on.
+// Cutting the rough code makes the paired Lighthouse program (water plus glass volume) exceed
+// the NVIDIA fragment instruction limit ("too many instructions" at link), so the starter
+// scenes could not render on an RTX 4070 (24 Oct). The single closed-glass program links.
+// The variable is read at each program choice, before the program lookup, and only there.
+bool smoothOnlyGlassProgramRequested() noexcept
+{
+    const char* value = std::getenv ("ARBIT_GL_SMOOTH_ONLY_GLASS_PROGRAM");
+    return value != nullptr && std::strcmp (value, "1") == 0;
+}
+
 // Decided from the prepared material programs and grating admission, before the program
 // lookup. Smooth glass is on when any program has a nonzero transport mode, the value that
 // each draw uploads to uGlassTransport.x. Diffraction is on when any program is a diffraction
-// material. The grating path turns on both. Each test errs toward on.
+// material. The grating path turns on both. Each of those tests errs toward on. The
+// smooth-only bit errs toward off: any rough, NaN or diffraction program keeps the rough text.
 unsigned fixtureFragmentFeatures (const NativeFixtureSurfaceMaterialProgram* root, bool distinctGrating) noexcept
 {
     if (distinctGrating) return kFixtureFragmentAllFeatures;
@@ -5873,6 +6824,11 @@ unsigned fixtureFragmentFeatures (const NativeFixtureSurfaceMaterialProgram* roo
         for (const auto& object : root->objectPrograms)
             if (object) visit (*object);
     }
+    if (realtimeengine::active())
+        return (features & ~static_cast<unsigned> (kFixtureFragmentSmoothGlass)) | kFixtureFragmentRealtime;
+    if (features == kFixtureFragmentSmoothGlass || features == (kFixtureFragmentSmoothGlass | kFixtureFragmentStamLayer))
+        if (smoothOnlyGlassProgramRequested() && smoothglass::smoothOnlyCameraGlass (root))
+            features |= kFixtureFragmentSmoothOnlyGlass;
     return features;
 }
 
@@ -5883,12 +6839,119 @@ std::string fixtureProgramCacheKey (const std::string& vertexSource, unsigned fe
     return vertexSource + "\nfragmentFeatures=" + std::to_string (features);
 }
 
+// The Fast Preview camera walk cap. ARBIT_GL_GLASS_PREVIEW_VISITS=<1..64> replaces
+// kPreviewCameraVisits in the Preview glass variant text, and only there. The Accurate
+// and export program text never reads it. The variable is read once per process.
+std::uint32_t fastPreviewGlassVisits()
+{
+    static const std::uint32_t visits = []
+    {
+        const auto value = smoothglass::parsePreviewCameraVisitsOverride (std::getenv ("ARBIT_GL_GLASS_PREVIEW_VISITS"));
+        if (! value) return smoothglass::kPreviewCameraVisits;
+        std::fprintf (stderr, "[gl] glass preview visits override=%u\n", static_cast<unsigned> (*value));
+        return *value;
+    }();
+    return visits;
+}
+
+// ARBIT_GL_DUMP_GLASS_PROGRAM=<dir> writes each distinct linked smooth-glass scene
+// program to <dir>: glass-<label>-<format>.bin from glGetProgramBinary and
+// glass-<label>.glsl with the fragment text. The label is preview or export and an
+// FNV-1a hash of the fragment text. On NVIDIA the binary holds the NV assembly with
+// its register and local memory counts. Empty when the variable is unset.
+const std::string& glassProgramDumpDirectory()
+{
+    static const std::string directory = []
+    {
+        const char* value = std::getenv ("ARBIT_GL_DUMP_GLASS_PROGRAM");
+        return std::string (value != nullptr ? value : "");
+    }();
+    return directory;
+}
+
+// A dumped binary needs the retrievable hint before the link. It is set only while the
+// dump is on, so a normal run links exactly as before.
+void setGlassDumpRetrievableHint (const arbitgl::GlFuncs& gl, unsigned program, unsigned features)
+{
+#if defined(__APPLE__)
+    (void) gl; (void) program; (void) features;
+#else
+    if (glassProgramDumpDirectory().empty() || (features & kFixtureFragmentSmoothGlass) == 0) return;
+    if (gl.ProgramParameteri != nullptr && program != 0)
+        gl.ProgramParameteri (program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+#endif
+}
+
+void dumpGlassProgram (const arbitgl::GlFuncs& gl, unsigned program, unsigned features, bool preview,
+                       const std::string& fragmentSource)
+{
+    const auto& directory = glassProgramDumpDirectory();
+    if (directory.empty() || program == 0 || (features & kFixtureFragmentSmoothGlass) == 0
+        || fragmentSource.empty()) return;
+    std::uint32_t hash = 2166136261u;
+    for (const unsigned char c : fragmentSource) hash = (hash ^ c) * 16777619u;
+    char hashText[16] = {};
+    std::snprintf (hashText, sizeof (hashText), "%08x", static_cast<unsigned> (hash));
+    const std::string label = std::string (preview ? "preview-" : "export-") + hashText;
+    static std::mutex dumpMutex;
+    static std::set<std::string> dumped;
+    {
+        const std::lock_guard lock (dumpMutex);
+        if (! dumped.insert (label).second) return;
+    }
+    std::error_code ignored;
+    std::filesystem::create_directories (directory, ignored);
+    const auto write = [] (const std::string& path, const void* data, std::size_t size)
+    {
+        auto* file = std::fopen (path.c_str(), "wb");
+        if (file == nullptr) return false;
+        const bool ok = std::fwrite (data, 1, size, file) == size;
+        return std::fclose (file) == 0 && ok;
+    };
+    const auto sourcePath = directory + "/glass-" + label + ".glsl";
+    std::fprintf (stderr, "[gl] glass program dump %s: source %s %s\n", label.c_str(), sourcePath.c_str(),
+        write (sourcePath, fragmentSource.data(), fragmentSource.size()) ? "written" : "write failed");
+#if defined(__APPLE__)
+    (void) gl;
+    std::fprintf (stderr, "[gl] glass program dump %s: binary skipped, no program binary entry points on macOS\n", label.c_str());
+#else
+    if (gl.GetProgramBinary == nullptr)
+    {
+        std::fprintf (stderr, "[gl] glass program dump %s: binary skipped, GL_ARB_get_program_binary missing\n", label.c_str());
+        return;
+    }
+    GLint length = 0;
+    gl.GetProgramiv (program, GL_PROGRAM_BINARY_LENGTH, &length);
+    if (length <= 0)
+    {
+        std::fprintf (stderr, "[gl] glass program dump %s: binary skipped, GL_PROGRAM_BINARY_LENGTH is 0\n", label.c_str());
+        return;
+    }
+    std::vector<std::uint8_t> binary (static_cast<std::size_t> (length));
+    GLsizei written = 0;
+    GLenum format = 0;
+    gl.GetProgramBinary (program, length, &written, &format, binary.data());
+    if (written <= 0 || written > length)
+    {
+        std::fprintf (stderr, "[gl] glass program dump %s: binary skipped, glGetProgramBinary wrote %d bytes\n",
+            label.c_str(), static_cast<int> (written));
+        return;
+    }
+    char formatText[16] = {};
+    std::snprintf (formatText, sizeof (formatText), "%x", static_cast<unsigned> (format));
+    const auto binaryPath = directory + "/glass-" + label + "-" + formatText + ".bin";
+    std::fprintf (stderr, "[gl] glass program dump %s: binary %s (%d bytes) %s\n", label.c_str(), binaryPath.c_str(),
+        static_cast<int> (written), write (binaryPath, binary.data(), static_cast<std::size_t> (written)) ? "written" : "write failed");
+#endif
+}
+
 std::string fixtureFragmentShaderSource (unsigned features)
 {
     const bool smoothGlass = (features & kFixtureFragmentSmoothGlass) != 0;
     const bool diffraction = (features & kFixtureFragmentDiffraction) != 0;
     const bool causticVolume = smoothGlass && (features & kFixtureFragmentCausticVolume) != 0;
     const bool layered = (features & kFixtureFragmentStamLayer) != 0;
+    const bool roughGlass = smoothGlass && (features & kFixtureFragmentSmoothOnlyGlass) == 0;
     // The head opens with the version line. The defines go directly after it.
     const std::string version = "#version 330 core\n";
     const std::string head = kFixtureFragmentShaderHead;
@@ -5896,6 +6959,8 @@ std::string fixtureFragmentShaderSource (unsigned features)
         + std::string ("#define FIXTURE_SMOOTH_GLASS ") + (smoothGlass ? "1" : "0") + "\n"
         + std::string ("#define FIXTURE_DIFFRACTION ") + (diffraction ? "1" : "0") + "\n"
         + std::string ("#define FIXTURE_STAM_LAYER ") + (layered ? "1" : "0") + "\n"
+        + std::string ("#define FIXTURE_ROUGH_GLASS ") + (roughGlass ? "1" : "0") + "\n"
+        + std::string ((features & kFixtureFragmentRealtime) != 0 ? "#define FIXTURE_REALTIME 1\n" : "")
         + head.substr (version.size());
     // The smooth-glass transport text declares these two uniforms. Without it, declare them here.
     if (! smoothGlass) text += "uniform vec4 uRoughCameraControl;\nuniform vec4 uGlassTransport;\n";
@@ -5903,18 +6968,33 @@ std::string fixtureFragmentShaderSource (unsigned features)
     text += opaquevisibility::glslShader() + analyticsky::shader (false) + environmentimage::shader (false) + kFixturePassCompositeShader;
     if (smoothGlass)
     {
+        auto query = smoothglass::queryShader (false);
         auto transport = smoothglass::transportShader (false, true, false, causticVolume);
         // A missing Preview anchor returns empty text, which the variant build refuses.
         if ((features & kFixtureFragmentGlassPreview) != 0)
         {
-            transport = smoothglass::previewCameraTransportShader (std::move (transport));
-            if (transport.empty()) return {};
+            query = smoothglass::previewQueryShader (std::move (query));
+            transport = smoothglass::previewCameraTransportShader (std::move (transport), fastPreviewGlassVisits());
+            if (query.empty() || transport.empty()) return {};
         }
-        text += smoothglass::queryShader (false) + transport;
+        // With FIXTURE_ROUGH_GLASS 0, main calls no rough walk, so the cut changes no result.
+        // If an anchor moved, the full text still links and draws the same bytes.
+        if (! roughGlass)
+        {
+            if (auto smooth = smoothglass::smoothOnlyCameraTransportShader (transport); ! smooth.empty())
+                transport = std::move (smooth);
+            else
+            {
+                static std::once_flag logged;
+                std::call_once (logged, [] { std::fprintf (stderr, "[gl] smooth-only glass cut skipped: anchor missing\n"); });
+            }
+        }
+        text += query + transport;
     }
     if (diffraction) text += diffractionQueryShader();
     // The diffraction layer reads uSky through the analytic sky and environment image shaders above.
     if (layered) text += stamlayer::glslShader();
+    if ((features & kFixtureFragmentRealtime) != 0) text += realtimeengine::glslShader();
     text += kFixtureFragmentShaderTail;
     return text;
 }
@@ -5934,8 +7014,6 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.glassTransport = location("uGlassTransport");
     uniforms.glassTransport2 = location("uGlassTransport2");
     uniforms.roughCameraControl = location("uRoughCameraControl");
-    uniforms.glassReceivers = location("uGlassReceivers[0]");
-    uniforms.glassEmission = location("uGlassEmission[0]");
     uniforms.objectMatrix = location ("uObjectMatrix");
     uniforms.tangentHandednessSign = location ("uTangentHandednessSign");
     uniforms.useInstanceMatrix = location("uUseInstanceMatrix");
@@ -5961,15 +7039,6 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.lightPositionRange = location ("uLightPositionRange");
     uniforms.lightKind = location ("uLightKind");
     uniforms.lightCount = location ("uLightCount");
-    for (std::size_t lightIndex = 0; lightIndex < 16; ++lightIndex)
-    {
-        const auto suffix = "[" + std::to_string (lightIndex) + "]";
-        uniforms.lightRotations[lightIndex] = location (("uLightRotations" + suffix).c_str());
-        uniforms.lightColors[lightIndex] = location (("uLightColors" + suffix).c_str());
-        uniforms.lightPositions[lightIndex] = location (("uLightPositions" + suffix).c_str());
-        uniforms.lightCones[lightIndex] = location (("uLightCones" + suffix).c_str());
-        uniforms.lightKinds[lightIndex] = location (("uLightKinds" + suffix).c_str());
-    }
     uniforms.baseTexture = location ("uBaseTexture");
     uniforms.metallicRoughnessTexture = location ("uMetallicRoughnessTexture");
     uniforms.normalTexture = location ("uNormalTexture");
@@ -5979,7 +7048,8 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.emissiveTexturePresence = location ("uEmissiveTexturePresence");
     uniforms.alphaModeCutoff = location ("uAlphaModeCutoff");
     uniforms.imageOutput = location ("uImageOutput");
-    uniforms.rawIdentifiers = location("uRawIdentifiers[0]");
+    uniforms.sceneTable = location("uSceneTable");
+    uniforms.sceneTableObjects = location("uSceneTableObjects");
     uniforms.rawObjectIndex = location("uRawObjectIndex");
     uniforms.passProgramControl = location("uPassProgramControl");
     uniforms.passModes = location("uPassModes[0]");
@@ -6089,6 +7159,7 @@ std::string submitFixtureProgram (const arbitgl::GlFuncs& gl,
     gl.ShaderSource (entry.fragmentShader, 1, &fragment, nullptr);
     gl.CompileShader (entry.fragmentShader);
     binaryCache.prepareLink (entry.program);
+    setGlassDumpRetrievableHint (gl, entry.program, fragmentFeatures);
     gl.AttachShader (entry.program, entry.vertexShader);
     gl.AttachShader (entry.program, entry.fragmentShader);
     gl.LinkProgram (entry.program);
@@ -6140,10 +7211,12 @@ const OpenGlFixtureSceneResources::SharedProgram* advancePreviewGlassProgram (
         shared->previewId = shared->previewVertexShader = shared->previewFragmentShader = 0;
         shared->previewFragmentSource.clear();
         state = State::Failed;
+        smoothglass::previewGlassVariantFailures().fetch_add (1, std::memory_order_relaxed);
         std::fprintf (stderr, "[gl] preview glass program off: %s\n", reason.c_str());
         return nullptr;
     };
     const auto install = [&] () -> const OpenGlFixtureSceneResources::SharedProgram* {
+        dumpGlassProgram (gl, shared->previewId, features, true, shared->previewFragmentSource);
         readFixtureUniformLocations (gl, shared->previewId, shared->previewUniforms);
         if (! shared->previewUniforms.complete (features)) return fail ("incomplete uniform locations");
         state = State::Ready;
@@ -6197,11 +7270,24 @@ const OpenGlFixtureSceneResources::SharedProgram* advancePreviewGlassProgram (
 // in memory, and the disk binary cache keys each one on its full source text. A set
 // outlives scene preparations, so a re-prepare reuses it instead of compiling again.
 // The splat programs are in every set, so Preview never links one on a cold frame.
-constexpr std::size_t kCausticProgramCount = 10;
+constexpr std::size_t kCausticProgramCount = 11;
 constexpr std::size_t kCausticSplatNormaliserProgram = 6, kCausticSplatKeyProgram = 7,
     kCausticSplatSegmentProgram = 8, kCausticSplatGatherProgram = 9;
+constexpr std::size_t kCausticSpectrumClearProgram = 10;
 using OpenGlCausticStageSources = std::vector<std::pair<unsigned, std::string>>;
 constexpr char kCausticDiskKeySecond[] = "donutstudio glass caustic program";
+
+// The early spectrum clear: a queue-side dispatch that writes the zeros the
+// frames need, so the clear never blocks the CPU behind the glass batch that is
+// still executing (verify58 163-266 ms, verify67 250-255 ms of glClearBufferData).
+std::string openGlCausticSpectrumClearSource()
+{
+    return R"(#version 450
+layout(local_size_x=256) in;
+layout(std430,binding=0) buffer Spectrum { uint v[]; };
+uniform uint uCount;
+void main(){ uint id=gl_GlobalInvocationID.x; if(id<uCount) v[id]=0u; })";
+}
 
 std::string openGlCausticQuerySource (bool multipleScatter, bool rough)
 {
@@ -6239,6 +7325,7 @@ std::array<OpenGlCausticStageSources, kCausticProgramCount> openGlCausticProgram
     sources[kCausticSplatKeyProgram] = {{GL_COMPUTE_SHADER,gc::opengl::splatKeySource()}};
     sources[kCausticSplatSegmentProgram] = {{GL_COMPUTE_SHADER,gc::opengl::splatSegmentSource()}};
     sources[kCausticSplatGatherProgram] = {{GL_COMPUTE_SHADER,gc::opengl::splatGatherSource()}};
+    sources[kCausticSpectrumClearProgram] = {{GL_COMPUTE_SHADER,openGlCausticSpectrumClearSource()}};
     return sources;
 }
 
@@ -6314,6 +7401,10 @@ struct OpenGlCausticContextPrograms
     std::map<std::string, std::shared_ptr<OpenGlCausticProgramSet>> ready;
     std::map<std::string, OpenGlCausticInFlight> inFlight;
     std::chrono::steady_clock::time_point lastPendingLog {};
+    // One true per completed in-flight set for the readiness seam. Re-armed
+    // while anything is still linking or nothing is in flight, so a lost wake
+    // (a produce skipped for another reason) cannot latch it off for ever.
+    bool completionReported = false;
 };
 
 // Access holds fixtureMutex. Context teardown erases only the current context.
@@ -6534,9 +7625,13 @@ OpenGlCausticProgramAcquire acquireOpenGlCausticProgramsUnlocked (bool multipleS
         if (cache.parallelCompile == 1)
             gl.MaxShaderCompilerThreads (0xFFFFFFFFu);
     }
-    // Without the extension no status query avoids a wait, so the programs are
-    // finished here, as the scene program is.
-    if (cache.parallelCompile != 1) wait = true;
+    // Without the extension no status query avoids a wait, but a Preview still
+    // must not block: this acquire distinguishes the two by wait alone, so a
+    // caller that asked for pending (wait=false) keeps it whatever parallel
+    // compile reports. The pending result lets the renderer present its base
+    // frame and pick the programs up on a later tick; blocking callers arrive
+    // with wait=true and still finish the programs here.
+    (void) wait;
     FixtureProgramBinaryDriver binaryDriver (gl);
     arbitglprogramcache::ProgramBinaryCache binaryCache (binaryDriver, arbitglprogramcache::cacheDirectory());
     // Every program is marked retrievable before its link. The query program's binary
@@ -6577,17 +7672,25 @@ OpenGlCausticProgramAcquire acquireOpenGlCausticProgramsUnlocked (bool multipleS
         bool complete = true;
         {
             loopstep::Scope pollScope ("gl:caustic-program-poll");
-            for (const auto& stage : flying->second.stages)
-            {
-                if (stage.loadedBinary) continue;
-                int done = GL_FALSE;
-                gl.GetProgramiv (stage.program, GL_COMPLETION_STATUS_KHR, &done);
-                if (done != GL_TRUE)
+            // GL_COMPLETION_STATUS_KHR exists only with KHR_parallel_shader_
+            // compile; without the extension GetProgramiv treats the pname as an
+            // invalid enum and leaves done at GL_FALSE, so a Preview would report
+            // Pending for ever and only an input would ever advance it. A driver
+            // without the extension links synchronously inside the submit above,
+            // so the stages are taken as complete here, the same bail-out
+            // startFixtureProgramLink makes at its parallelCompile != 1 check.
+            if (cache.parallelCompile == 1)
+                for (const auto& stage : flying->second.stages)
                 {
-                    complete = false;
-                    break;
+                    if (stage.loadedBinary) continue;
+                    int done = GL_FALSE;
+                    gl.GetProgramiv (stage.program, GL_COMPLETION_STATUS_KHR, &done);
+                    if (done != GL_TRUE)
+                    {
+                        complete = false;
+                        break;
+                    }
                 }
-            }
         }
         if (! complete)
         {
@@ -6704,18 +7807,75 @@ unsigned openGlCausticQueryProgramForOwnerUnlocked (OpenGlCausticProgramSet& set
 template <typename Id>
 bool residentSameId(const Id& a, const Id& b) noexcept { return a == b; }
 
+// Names the first field two resident surface programs disagree on. A preview whose
+// material is re-admitted every frame reports the exact identity that moves, instead
+// of only that the pair does not match.
+const char* residentSurfaceProgramFirstDifference(const NativeFixtureSurfaceMaterialProgram& a,
+                                                  const NativeFixtureSurfaceMaterialProgram& b) noexcept
+{
+    if (a.kind != b.kind) return "material kind";
+    if (a.layoutVersion != b.layoutVersion) return "layout version";
+    if (a.backend != b.backend) return "backend";
+    if (bool(a.vertexProgram) != bool(b.vertexProgram)) return "vertex program";
+    if (a.baseColorSource != b.baseColorSource) return "base color source";
+    if (bool(a.importedBaseColorTexture) != bool(b.importedBaseColorTexture)) return "imported base color texture";
+    if (bool(a.frameEndpoint) != bool(b.frameEndpoint)) return "graph frame endpoint";
+    if (a.diffractionPathCount != b.diffractionPathCount) return "diffraction path count";
+    if (bool(a.diffractionLightingAdmission) != bool(b.diffractionLightingAdmission))
+        return "diffraction lighting admission";
+    if (bool(a.spectralReflectance) != bool(b.spectralReflectance)) return "spectral reflectance";
+    if (bool(a.diffractionLayer) != bool(b.diffractionLayer)) return "diffraction layer";
+    if (!residentSameId(a.object, b.object)) return "object";
+    if (a.bindingDigest != b.bindingDigest) return "binding digest";
+    if (a.programIdentity != b.programIdentity) return "program identity";
+    if (a.timeMixEndColor != b.timeMixEndColor) return "time mix end color";
+    if (a.roughGlassScatteringVersion != b.roughGlassScatteringVersion)
+        return "rough glass scattering version";
+    if (!residentSameId(a.authoredScene, b.authoredScene)) return "authored scene";
+    if (!residentSameId(a.authoredMaterial, b.authoredMaterial)) return "authored material";
+    if (a.structuralRevision != b.structuralRevision) return "structural revision";
+    if (a.materialRevision != b.materialRevision) return "material revision";
+    if (a.parameters.baseColorMetallic != b.parameters.baseColorMetallic) return "base color metallic";
+    if (a.parameters.emissionRoughness != b.parameters.emissionRoughness) return "emission roughness";
+    if (a.parameters.normalOpacity != b.parameters.normalOpacity) return "normal opacity";
+    if (a.parameters.transmissionIorClearcoat != b.parameters.transmissionIorClearcoat)
+        return "transmission ior clearcoat";
+    if (a.parameters.identifiers != b.parameters.identifiers) return "parameter identifiers";
+    if (a.objectPrograms.size() != b.objectPrograms.size()) return "object program count";
+    for (std::size_t i = 0; i < a.objectPrograms.size(); ++i)
+    {
+        if (!a.objectPrograms[i] || !b.objectPrograms[i]) return "object program slot";
+        if (const char* nested =
+                residentSurfaceProgramFirstDifference(*a.objectPrograms[i], *b.objectPrograms[i]))
+            return nested;
+    }
+    return nullptr;
+}
+
 bool residentSurfaceProgramMatches(const NativeFixtureSurfaceMaterialProgram& a,
                                    const NativeFixtureSurfaceMaterialProgram& b) noexcept
 {
     using Program = NativeFixtureSurfaceMaterialProgram;
-    const auto plain = [](const Program& p) {
+    // The refresh keeps the prepared static resources and replaces only the water's
+    // vertex range, so the two programs have to agree — not be plain. Requiring both
+    // sides to carry no spectral reflectance, texture or graph endpoint refused a
+    // scene where both sides carry it, which kept a still docked preview preparing
+    // from scratch every frame; the previous owner was destroyed with that prepare,
+    // and the submitted caustic went with it.
+    const auto residentAdmissible = [](const Program& p) {
         return p.kind == NativeFixtureMaterialKind::SurfacePbr && p.layoutVersion == Program::kLayoutVersion
-            && p.backend == NativeFixtureMaterialBackend::OpenGl && !p.vertexProgram
-            && p.baseColorSource == Program::BaseColorSource::ConstantLinear
-            && !p.importedBaseColorTexture && !p.frameEndpoint && p.diffractionPathCount == 0
-            && !p.diffractionLightingAdmission && !p.spectralReflectance && !p.diffractionLayer;
+            && p.backend == NativeFixtureMaterialBackend::OpenGl;
     };
-    if (!plain(a) || !plain(b) || !residentSameId(a.object, b.object)
+    if (!residentAdmissible(a) || !residentAdmissible(b)
+        || bool(a.vertexProgram) != bool(b.vertexProgram)
+        || a.baseColorSource != b.baseColorSource
+        || bool(a.importedBaseColorTexture) != bool(b.importedBaseColorTexture)
+        || bool(a.frameEndpoint) != bool(b.frameEndpoint)
+        || a.diffractionPathCount != b.diffractionPathCount
+        || bool(a.diffractionLightingAdmission) != bool(b.diffractionLightingAdmission)
+        || bool(a.spectralReflectance) != bool(b.spectralReflectance)
+        || bool(a.diffractionLayer) != bool(b.diffractionLayer)
+        || !residentSameId(a.object, b.object)
         || a.bindingDigest != b.bindingDigest || a.programIdentity != b.programIdentity
         || a.timeMixEndColor != b.timeMixEndColor || a.roughGlassScatteringVersion != b.roughGlassScatteringVersion
         || !residentSameId(a.authoredScene, b.authoredScene) || !residentSameId(a.authoredMaterial, b.authoredMaterial)
@@ -6750,10 +7910,7 @@ bool residentSceneStructureMatches(const HarmonicMIDI::grid::Visual3DScene& prep
         || prepared.objectCount != next.objectCount || prepared.materialCount != next.materialCount
         || prepared.textureCount != next.textureCount || prepared.textureTexelCount != next.textureTexelCount
         || prepared.lightCount != next.lightCount || prepared.cameraCount != next.cameraCount
-        || dynamic >= next.objectCount || next.vertexCount > Visual3DScene::kMaxVertices
-        || next.indexCount > Visual3DScene::kMaxIndices || next.objectCount > Visual3DScene::kMaxObjects
-        || next.materialCount > Visual3DScene::kMaxMaterials || next.textureCount > Visual3DScene::kMaxTextures
-        || next.lightCount > Visual3DScene::kMaxLights || next.cameraCount > Visual3DScene::kMaxCameras
+        || dynamic >= next.objectCount
         || next.textureTexelCount > next.textureTexels.size() || prepared.textureTexelCount > prepared.textureTexels.size()
         || !residentSameId(prepared.instancedObject, next.instancedObject)
         || prepared.objectInstanceCount != next.objectInstanceCount
@@ -6967,7 +8124,7 @@ bool planResidentRefit(const opaquevisibility::Prepared& query, const HarmonicMI
     {
         const auto [node, depth] = pending.back();
         pending.pop_back();
-        if (++visited > opaquevisibility::kMaximumBlasNodes || std::size_t(node) + 1 >= texels.size()) return false;
+        if (++visited > texels.size() || std::size_t(node) + 1 >= texels.size()) return false;
         if (depths.size() <= depth) depths.resize(depth + 1);
         const float marker = texels[node + 1][3];
         if (marker != 0.0f)
@@ -7073,6 +8230,13 @@ bool createResidentRefitBuffers(const arbitgl::GlFuncs& gl, OpenGlFixtureSceneRe
 // tail. A grown or new texture takes one full allocation. Otherwise only the
 // span of tail texels that changed since the last frame is written, with
 // glTexSubImage2D; an unchanged tail writes nothing.
+// The queried device value, stated the way the codebase reports device failures.
+std::string nativeTextureAxisError(const char* what, std::size_t required, int maximumTextureSize)
+{
+    return std::string("OpenGL ") + what + " needs " + std::to_string(required)
+        + " texels on one axis and this device's GL_MAX_TEXTURE_SIZE is " + std::to_string(maximumTextureSize);
+}
+
 bool updateResidentQuery(const arbitgl::GlFuncs& gl, OpenGlFixtureSceneResources::ResidentQueryTexture& resident,
                          const opaquevisibility::Prepared& prepared, const opaquevisibility::FrameTail& tail,
                          int maximumTextureSize, bool& written, std::string& error)
@@ -7091,7 +8255,7 @@ bool updateResidentQuery(const arbitgl::GlFuncs& gl, OpenGlFixtureSceneResources
     {
         const auto height = std::max(tail.height, resident.staticTexels == prepared.texels.size() ? resident.height : 0);
         if (maximumTextureSize < int(width) || maximumTextureSize < int(height))
-        { error = "OpenGL resident query exceeds native texture dimensions"; return false; }
+        { error = nativeTextureAxisError("resident query", std::max<std::size_t>(width, height), maximumTextureSize); return false; }
         std::vector<opaquevisibility::Texel> staging(width * height);
         std::copy(prepared.texels.begin(), prepared.texels.end(), staging.begin());
         std::copy(tail.texels.begin(), tail.texels.end(), staging.begin() + std::ptrdiff_t(tail.begin));
@@ -7323,18 +8487,128 @@ public:
                 videowire::geometry::CarrierKind::geometry3D))
             | (1u << static_cast<unsigned> (
                 videowire::geometry::CarrierKind::instances3D));
-        capabilities.maxVertices = HarmonicMIDI::grid::Visual3DScene::kMaxVertices;
-        capabilities.maxIndices = HarmonicMIDI::grid::Visual3DScene::kMaxIndices;
+        capabilities.maxVertices = videowire::geometry::kMaximumVertices;
+        capabilities.maxIndices = videowire::geometry::kMaximumIndices;
         capabilities.maxPoints = 1;
         capabilities.maxCurvePoints = 1;
         capabilities.maxSplines = 1;
-        capabilities.maxInstances = HarmonicMIDI::grid::Visual3DScene::kMaxObjects;
-        capabilities.maxFieldElements = HarmonicMIDI::grid::Visual3DScene::kMaxVertices;
+        capabilities.maxInstances = videowire::geometry::kMaximumInstances;
+        capabilities.maxFieldElements = videowire::geometry::kMaximumFieldElements;
         capabilities.maxAttributes = videowire::geometry::kMaximumAttributes;
         capabilities.maxOperations = videowire::geometry::kMaximumOperations;
         capabilities.maxDispatches = videowire::geometry::kMaximumDispatches;
-        capabilities.maxBufferBytes = 64u * 1024u * 1024u;
+        capabilities.maxBufferBytes = videowire::geometry::kMaximumBufferBytes;
         return capabilities;
+    }
+
+    // Admission-time warm. Submits this context's fixture program link without
+    // building scene resources: the first prepare that needs the program finds the
+    // entry in flight and polls it exactly as if that prepare had submitted it.
+    // Nothing here is required for correctness, so every failure returns silently
+    // and the first frame reports what it always reported.
+    void startFixtureProgramLink (
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& requestedMaterialProgram,
+        bool distinctGrating, bool causticVolume) override
+    {
+        // The async submit branch of the prepare is the diffraction-free path
+        // only, and the driver must offer parallel shader compile for it.
+        if (distinctGrating) return;
+        // The context is thread-local, so this check is safe without the lock.
+        // Taking fixtureMutex() first would park a context-less caller (the
+        // model_payload_preview RPC reaches here on its own thread) behind a
+        // whole export caustic frame and then have it return without doing
+        // anything; the post-lock check below still covers a context that goes
+        // away while waiting.
+        if (glfwGetCurrentContext() == nullptr) return;
+        // The link scope reported 9630 ms around a 13 ms submit, so the wait is
+        // either the fixture lock or the tail; this names the lock's share.
+        std::optional<loopstep::Scope> lockScope;
+        lockScope.emplace ("gl:fixture-link-lock");
+        std::lock_guard<std::mutex> lock (fixtureMutex());
+        lockScope.reset ();
+        if (glfwGetCurrentContext() == nullptr) return;
+        // Between the instant lock and the 13 ms submit scope the wait lives; the
+        // context/function load plus the program snapshot report first, then the
+        // shader source generation.
+        std::optional<loopstep::Scope> gapScope;
+        gapScope.emplace ("gl:fixture-link-context");
+        arbitgl::GlFuncs gl;
+        std::string missing;
+        if (! arbitgl::loadGlFunctions (gl, missing)) return;
+        arbitgl::loadGlProgramBinaryFunctions (gl);
+        arbitgl::loadGlParallelShaderCompileFunctions (gl);
+        gapScope.emplace ("gl:fixture-link-state");
+        OpenGlFixtureState previous (gl);
+        gapScope.emplace ("gl:fixture-link-snapshot-only");
+        const auto materialProgram = snapshotNativeSurfaceProgram (requestedMaterialProgram);
+        // context 8662 ms covered load-through-vertex; each replacement prints the
+        // previous span's share.
+        gapScope.emplace ("gl:fixture-link-snapshot");
+        auto& contextCache = programCache_[glfwGetCurrentContext()];
+        if (contextCache.parallelCompile < 0)
+        {
+            contextCache.parallelCompile = arbitgl::hasParallelShaderCompile (gl) ? 1 : 0;
+            if (contextCache.parallelCompile == 1)
+                gl.MaxShaderCompilerThreads (0xFFFFFFFFu);
+        }
+        if (contextCache.parallelCompile != 1) { previous.restore(); return; }
+        gapScope.emplace ("gl:fixture-link-parallel");
+        std::string vertexError;
+        const auto vertexSource = fixtureVertexModifierShader (kFixtureVertexShader,
+            materialProgram != nullptr ? materialProgram->vertexProgram.get() : nullptr,
+            videohelper::materialprogram::BackendTarget::OpenGl, vertexError);
+        if (vertexSource.empty() || ! vertexError.empty()) { previous.restore(); return; }
+        // Replacing the engaged context scope prints its share: the snapshot,
+        // cache map, parallel-compile init and the vertex modifier generation.
+        gapScope.emplace ("gl:fixture-link-source");
+        const auto fragmentFeatures = fixtureFragmentFeatures (materialProgram.get(), distinctGrating)
+            | (causticVolume && ! distinctGrating
+                ? static_cast<unsigned> (kFixtureFragmentCausticVolume) : 0u);
+        const auto programCacheKey = fixtureProgramCacheKey (vertexSource, fragmentFeatures);
+        if (contextCache.programs.find (programCacheKey) != contextCache.programs.end()
+            || contextCache.inFlight.find (programCacheKey) != contextCache.inFlight.end())
+        { previous.restore(); return; }
+        const auto recentlyRetired = [&] ()
+        {
+            const auto found = contextCache.retiredAt.find (programCacheKey);
+            return found != contextCache.retiredAt.end()
+                && std::chrono::steady_clock::now() - found->second <= kFixtureResubmitWindow;
+        };
+        if (recentlyRetired()) { previous.restore(); return; }
+        const auto fragmentSource = fixtureFragmentShaderSource (fragmentFeatures);
+        if (fragmentSource.empty()) { previous.restore(); return; }
+        FixtureProgramBinaryDriver binaryDriver (gl);
+        arbitglprogramcache::ProgramBinaryCache binaryCache (binaryDriver,
+            arbitglprogramcache::cacheDirectory());
+        OpenGlFixtureInFlightProgram entry;
+        std::string submitError;
+        {
+            loopstep::Scope submitScope ("gl:fixture-scene-program-submit");
+            submitError = submitFixtureProgram (gl, binaryCache, vertexSource,
+                fragmentSource, fragmentFeatures, entry);
+        }
+        if (! submitError.empty()) { previous.restore(); return; }
+        ++contextCache.submitCount;
+        while (contextCache.inFlight.size() >= kMaximumInFlightFixturePrograms)
+        {
+            const auto oldest = std::min_element (contextCache.inFlight.begin(),
+                contextCache.inFlight.end(),
+                [] (const auto& a, const auto& b)
+                { return a.second.submitted < b.second.submitted; });
+            const auto evictedKey = oldest->first;
+            deleteInFlightObjects (oldest->second);
+            contextCache.inFlight.erase (oldest);
+            contextCache.retiredAt[evictedKey] = std::chrono::steady_clock::now();
+            ++contextCache.evictionCount;
+        }
+        const auto submittedFeatures = entry.fragmentFeatures;
+        contextCache.inFlight.emplace (programCacheKey, std::move (entry));
+        contextCache.pendingActive = true;
+        contextCache.lastPendingLog = std::chrono::steady_clock::now();
+        std::fprintf (stderr, "[gl] fixture program warm-submitted: features=0x%x key=%08x\n",
+            submittedFeatures,
+            static_cast<unsigned> (std::hash<std::string> {}(programCacheKey)));
+        previous.restore();
     }
 
     NativeFixtureScenePreparation prepare (
@@ -7371,12 +8645,11 @@ public:
         std::lock_guard<std::mutex> lock (fixtureMutex());
         if (scene == nullptr || ! validateVisual3DScene (*scene).valid()
             || scene->objectCount == 0 || scene->materialCount == 0
-            || scene->lightCount > Visual3DScene::kMaxLights
-            || scene->cameraCount == 0 || scene->cameraCount > Visual3DScene::kMaxCameras
+            || scene->cameraCount == 0
             || visual3d_detail::findById (scene->cameras, scene->cameraCount,
                                           scene->activeCamera) == nullptr)
         {
-            result.error = "OpenGL fixture preparation requires a bounded renderable scene";
+            result.error = "OpenGL fixture preparation requires a renderable scene";
             return result;
         }
         const auto& sceneMaterial = scene->materials[0];
@@ -7427,12 +8700,20 @@ public:
         glGetIntegerv (GL_MAX_TEXTURE_SIZE, &maximumTextureExtent);
         std::size_t textureBytes = sizeof (SceneTexelRgba8);
         fixturetexture::SceneMipLayouts textureLayouts;
+        for (std::size_t index = 0; index < scene->textureCount; ++index)
+        {
+            const auto axis = std::max (scene->textures[index].width, scene->textures[index].height);
+            if (axis > static_cast<std::uint32_t> (std::max (maximumTextureExtent, 0)))
+            {
+                result.error = nativeTextureAxisError ("scene texture", axis, maximumTextureExtent);
+                return result;
+            }
+        }
         if (maximumTextureExtent <= 0
             || ! fixturetexture::sceneMipLayouts (*scene, 1,
-                static_cast<std::uint32_t> (maximumTextureExtent),
-                fixturetexture::kMaximumTextureBytes, textureBytes, textureLayouts))
+                static_cast<std::uint32_t> (maximumTextureExtent), textureBytes, textureLayouts))
         {
-            result.error = "OpenGL fixture texture bounds, sampler settings or allocation budget are invalid";
+            result.error = "OpenGL fixture texture bounds or sampler settings are invalid, or their host allocation failed";
             return result;
         }
         const auto generateMipmap = reinterpret_cast<PFNGLGENERATEMIPMAPPROC> (
@@ -7476,6 +8757,12 @@ public:
             }
         };
         const std::unique_ptr<int,decltype(privateCleanup)> privateGuard(&privateToken,privateCleanup);
+        // An exception unwinds under fixtureMutex, which the resources' destructor would take again.
+        ScopeCleanup releaseOnThrow { [&] {
+            if (std::uncaught_exceptions() == 0 || ! resources) return;
+            resources->destroyUnlocked();
+            resources->ownerContext = nullptr;
+        } };
 
         resources->snapshot = scene;
         resources->materialProgram = materialProgram;
@@ -7560,6 +8847,9 @@ public:
         // mask, key and fragment text are the released single-dielectric ones.
         const auto fragmentFeatures = fixtureFragmentFeatures (materialProgram.get(), distinctGrating != nullptr)
             | (causticVolume != nullptr && distinctGrating == nullptr ? static_cast<unsigned> (kFixtureFragmentCausticVolume) : 0u);
+        smoothglass::glassProgramDecisions().fetch_add (1, std::memory_order_relaxed);
+        if ((fragmentFeatures & kFixtureFragmentSmoothOnlyGlass) != 0)
+            smoothglass::smoothOnlyProgramChoices().fetch_add (1, std::memory_order_relaxed);
         const auto programCacheKey = fixtureProgramCacheKey (vertexSource, fragmentFeatures);
         // Solid-body and harmonic-geometry frames can release every scene lease
         // before the next preparation. Retain only the immutable linked program
@@ -7747,7 +9037,10 @@ public:
             }
         }
         const bool selectedCompute=roughSelectedComputeCapability(resources->gl);
-        if (!smoothglass::prepare(scene, materialProgram, resources->instanceAppearances,
+        // Realtime draws no glass walk, so it prepares none. A grating leaf's frame keeps
+        // its full program, whose query this preparation fills.
+        if ((!realtimeengine::active() || distinctGrating)
+            && !smoothglass::prepare(scene, materialProgram, resources->instanceAppearances,
                 resources->smoothGlass, result.error,
                 {NativeFixtureMaterialBackend::OpenGl, true, true, true, smoothglass::kMultipleScatterVersion,selectedCompute},distinctGrating,
                 causticVolume)) return fail(result.error);
@@ -7760,14 +9053,12 @@ public:
                 resources->smoothGlass.enabled ? &resources->smoothGlass : nullptr)) return fail(result.error);
         if (environment.resident)
         {
-            if (std::any_of(resources->instanceAppearances.begin(),resources->instanceAppearances.end(),
-                [](const auto& a){return a.color[3]<1;})) return fail("HDR environment requires opaque instance appearance");
             resources->environmentResident=environment.resident;
             resources->environmentBudget=environment.gpuBudget;
             int imageLimit=0; glGetIntegerv(GL_MAX_TEXTURE_SIZE,&imageLimit);
             if (imageLimit<static_cast<int>(environment.resident->image.metadata.width)
                 || imageLimit<static_cast<int>(environment.resident->image.metadata.height))
-                return fail("HDR environment exceeds native texture dimensions");
+                return fail(nativeTextureAxisError("HDR environment",std::max(environment.resident->image.metadata.width,environment.resident->image.metadata.height),imageLimit));
             gl.ActiveTexture(GL_TEXTURE0); gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
             glPixelStorei(GL_UNPACK_ALIGNMENT,1); glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
             glPixelStorei(GL_UNPACK_SKIP_PIXELS,0); glPixelStorei(GL_UNPACK_SKIP_ROWS,0);
@@ -7780,9 +9071,13 @@ public:
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,0);
+            for (std::size_t mip=0;mip<environment.mips.size();++mip)
+                glTexImage2D(GL_TEXTURE_2D,GLint(mip+1),GL_RGBA32F,std::max<int>(metadata.width>>(mip+1),1),std::max<int>(metadata.height>>(mip+1),1),
+                    0,GL_RGBA,GL_FLOAT,environment.mips[mip].data());
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,GLint(environment.mips.size()));
             if (!resources->environmentTexture || glGetError()!=GL_NO_ERROR) return fail("HDR environment float upload failed");
             std::vector<std::array<float,4>>().swap(environment.texels);
+            environment.mips.clear();
         }
         if (!opaquevisibility::prepareScene(*scene, materialProgram.get(),
                 resources->instanceAppearances, resources->opaqueVisibility, result.error,
@@ -7983,6 +9278,7 @@ public:
                 if(fragmentShader==0) return fail(result.error);
                 shared->id=gl.CreateProgram();
                 binaryCache.prepareLink(shared->id);
+                setGlassDumpRetrievableHint(gl,shared->id,fragmentFeatures);
                 gl.AttachShader(shared->id,vertexShader); gl.AttachShader(shared->id,fragmentShader); gl.LinkProgram(shared->id);
                 int linked=0; gl.GetProgramiv(shared->id,GL_LINK_STATUS,&linked);
                 if(linked!=GL_TRUE) {
@@ -8001,6 +9297,9 @@ public:
             resources->sharedProgram=shared;
         }
         resources->program=resources->sharedProgram->id;
+        // The fragment text is rebuilt only while the dump is on.
+        if (! glassProgramDumpDirectory().empty() && (fragmentFeatures & kFixtureFragmentSmoothGlass) != 0)
+            dumpGlassProgram (gl, resources->program, fragmentFeatures, false, fixtureFragmentShaderSource (fragmentFeatures));
         // The Preview glass variant is built from this exact key's sources.
         if (resources->sharedProgram->vertexSource.empty())
         {
@@ -8093,14 +9392,70 @@ public:
             || (glass.causticVolume.present && glass.causticVolume.roughness != 0.0f)
             || glass.query.mode != opaquevisibility::AdmissionMode::allSurfaces
             || !residentSurfaceProgramMatches (*resources.materialProgram, *materialProgram))
+        {
+            // Named once per change: a Preview whose water refit never plans cannot go
+            // resident, and a non-resident schedule changes with every water step, so
+            // the poll drops each finished caustic submission.
+            std::string why;
+            const auto bad = [&] (bool ok, const char* name) { if (! ok && why.empty()) why = name; };
+            bad (resources.ownerContext == glfwGetCurrentContext () && resources.queryContext
+                 && resources.queryContext->active, "context or query context");
+            bad (! resources.gratingLeaf, "grating leaf");
+            bad (! resources.instancedSharedGeometry, "instanced shared geometry");
+            bad (! resources.usePreviousDeformation && resources.deformedWindings.empty (),
+                 "retained deformation");
+            bad (resources.environmentTexture == 0, "environment texture");
+            bad (resources.instanceAppearances.empty (), "instance appearances");
+            bad (resources.vertexBuffer != 0, "vertex buffer");
+            bad (glass.enabled, "glass disabled");
+            bad (glass.roughness == 0.0f, "glass roughness");
+            bad (glass.transport == surfacematerial::TransportMode::ThinInterface, "glass transport");
+            bad (! glass.distinctGrating, "distinct grating");
+            bad (! (glass.causticVolume.present && glass.causticVolume.roughness != 0.0f),
+                 "caustic volume roughness");
+            bad (glass.query.mode == opaquevisibility::AdmissionMode::allSurfaces, "query admission mode");
+            // Names the exact identity the pair disagrees on, and which side carries it:
+            // a preview whose material program is re-admitted every frame would otherwise
+            // only say "mismatch".
+            {
+                if (! residentSurfaceProgramMatches (*resources.materialProgram, *materialProgram))
+                {
+                    const char* field = residentSurfaceProgramFirstDifference (*resources.materialProgram,
+                                                                              *materialProgram);
+                    bad (false, field ? field : "material program");
+                }
+            }
+            static std::mutex mutex; static std::string last;
+            const std::lock_guard lock (mutex);
+            const std::string text = why.empty() ? "unknown" : why;
+            if (last != text)
+            {
+                last = text;
+                std::fprintf (stderr, "[gl] caustic resident refresh refused: %s\n", text.c_str ());
+            }
             return false;
+        }
         const auto& prepared = *resources.snapshot;
+        // Names the first refusal after the admission block, so one run says where the
+        // water refit plan stops. Unplanned is what the docked preview cannot draw.
+        const auto refusedNow = [&] (const char* why) {
+            static std::mutex mutex; static std::string last;
+            const std::lock_guard lock (mutex);
+            if (last != why)
+            {
+                last = why;
+                std::fprintf (stderr, "[gl] resident refresh refused: %s\n", why);
+            }
+            return false;
+        };
         std::size_t dynamic = prepared.objectCount;
-        for (std::size_t o = 0; o < prepared.objectCount && o < Visual3DScene::kMaxObjects; ++o)
+        for (std::size_t o = 0; o < prepared.objectCount; ++o)
             if (prepared.objects[o].id == glass.object) dynamic = o;
-        if (dynamic >= prepared.objectCount || resources.opaqueVisibility.objectMesh[dynamic] >= 0) return false;
+        if (dynamic >= prepared.objectCount || resources.opaqueVisibility.objectMesh[dynamic] >= 0)
+            return refusedNow ("dynamic water object missing or opaque-admitted");
         const auto mesh = glass.query.objectMesh[dynamic];
-        if (mesh < 0 || std::size_t (mesh) >= glass.query.meshes.size()) return false;
+        if (mesh < 0 || std::size_t (mesh) >= glass.query.meshes.size())
+            return refusedNow ("water mesh index out of range");
         const auto& water = prepared.objects[dynamic];
         for (std::size_t o = 0; o < prepared.objectCount; ++o)
         {
@@ -8109,7 +9464,7 @@ public:
             if (glass.query.objectMesh[o] == mesh
                 || (other.vertexCount != 0 && other.firstVertex < water.firstVertex + water.vertexCount
                     && water.firstVertex < other.firstVertex + other.vertexCount))
-                return false;
+                return refusedNow ("another object shares the water mesh or vertex range");
         }
         auto& refit = resources.residentRefit;
         auto& gl = resources.gl;
@@ -8120,16 +9475,17 @@ public:
         if (!refit.planned
                 ? !residentSceneMatches (prepared, *scene, dynamic) || !validateVisual3DScene (*scene).valid()
                 : !residentSceneStructureMatches (prepared, *scene, dynamic))
-            return false;
+            return refusedNow (refit.planned ? "resident scene structure changed" : "resident scene mismatch or invalid");
         if (!refit.planned)
         {
-            if (!roughSelectedComputeCapability (gl) || !gl.BindImageTexture) return false;
+            if (!roughSelectedComputeCapability (gl) || !gl.BindImageTexture)
+                return refusedNow ("compute capability or image load store missing");
             refit.bufferSubData = glfwGetProcAddress ("glBufferSubData");
             OpenGlFixtureSceneResources::ResidentRefit plan;
             plan.bufferSubData = refit.bufferSubData;
             if (plan.bufferSubData == nullptr
                 || !planResidentRefit (glass.query, prepared, dynamic, std::size_t (mesh), plan))
-                return false;
+                return refusedNow ("resident refit plan failed");
             OpenGlFixtureState previous (gl);
             const bool created = createResidentRefitObjects (gl, plan);
             previous.restore();
@@ -8138,13 +9494,13 @@ public:
                 if (plan.program != 0) gl.DeleteProgram (plan.program);
                 for (auto* buffer : {&plan.cornerBuffer, &plan.nodeBuffer, &plan.worldBuffer})
                     if (*buffer != 0) gl.DeleteBuffers (1, buffer);
-                return false;
+                return refusedNow ("resident refit object creation failed");
             }
             plan.planned = true;
             refit = std::move (plan);
         }
         if (refit.object != dynamic || refit.firstVertex != water.firstVertex || refit.vertexCount != water.vertexCount)
-            return false;
+            return refusedNow ("water refit range changed");
         int previousArray = 0;
         glGetIntegerv (GL_ARRAY_BUFFER_BINDING, &previousArray);
         gl.BindBuffer (GL_ARRAY_BUFFER, resources.vertexBuffer);
@@ -8159,12 +9515,27 @@ public:
             // The buffer no longer matches the prepared snapshot. Render refuses
             // these resources, and the caller's next prepare replaces them.
             resources.snapshot = nullptr;
-            return false;
+            return refusedNow ("water vertex upload failed");
         }
         resources.snapshot = scene;
         resources.smoothGlass.sourceScene = scene;
         ++refit.vertexRevision;
         return true;
+#endif
+    }
+
+    // A still docked preview never changes its snapshot, so the refresh above never
+    // runs again after the first prepare. The caller uses this to take it once for
+    // the refit plan, which is what makes the caustic schedule resident.
+    bool residentRefitPlanned (const std::shared_ptr<const NativeFixtureSceneResources>& nativeResources) const override
+    {
+#if defined(__APPLE__)
+        (void) nativeResources;
+        return false;
+#else
+        const std::lock_guard<std::mutex> lock (fixtureMutex());
+        const auto resources = std::dynamic_pointer_cast<const OpenGlFixtureSceneResources> (nativeResources);
+        return resources != nullptr && resources->residentRefit.planned;
 #endif
     }
 
@@ -8343,6 +9714,8 @@ public:
         const auto& gl = resources->gl;
         const auto noteInstances = prepareNativeNoteInstances(runtimeInputs);
         const bool roughGlassFrame = resources->smoothGlass.enabled && resources->smoothGlass.roughness > 0;
+        const bool realtimeFrame = resources->sharedProgram
+            && (resources->sharedProgram->fragmentFeatures & kFixtureFragmentRealtime) != 0;
         // Glass Caustics off: encode the camera-only SDR Color like the caustic
         // route's linear Color reaches the compositor (see cameraOnlyDisplayEncode).
         const bool cameraOnlyEncode = smoothglass::cameraOnlyDisplayEncode(resources->smoothGlass,
@@ -8390,11 +9763,11 @@ public:
                 return renderpassoutput::detail::checkedMultiply(count, bytes, amount)
                     && renderpassoutput::detail::checkedAdd(resident, amount, resident);
             };
-            // Query frame tables are each bounded by the existing 1024x2048
-            // authority. Charge both GPU tables and both host staging copies,
-            // prepared tables, static owners, runtime leases and tile depth.
-            bool memory = charge(4 * std::uint64_t(opaquevisibility::kTextureWidth)
-                    * opaquevisibility::kTextureHeight, sizeof(opaquevisibility::Texel))
+            // Query frame tables are sized from this scene. Charge both GPU tables
+            // and both host staging copies, the scene table, prepared tables,
+            // static owners, runtime leases and tile depth.
+            bool memory = charge(4 * opaquevisibility::sceneQueryPayloadTexels(*scene, noteInstances.admitted ? visualnoteinstancing::kMaximumInstances : 0), sizeof(opaquevisibility::Texel))
+                && charge(4 * std::uint64_t(scene->lightCount) + 3 * std::uint64_t(scene->objectCount), sizeof(float) * 4u)
                 && charge(resources->opaqueVisibility.texels.capacity()
                     + resources->smoothGlass.query.texels.capacity(), sizeof(opaquevisibility::Texel))
                 && charge(resources->opaqueVisibility.meshes.capacity()
@@ -8414,7 +9787,10 @@ public:
                 && charge(roughSchedule->tiles().size()>1 ? roughSchedule->maximumTilePixels() : 0,
                     sizeof(std::uint32_t))
                 && charge(smoothglass::multipleScatterCamera(resources->smoothGlass)?roughSchedule->maximumTilePixels():0,
-                    RoughSelectedCamera::residentBytesPerPixel);
+                    RoughSelectedCamera::residentBytesPerPixel)
+                // Both owners of every pixel, kept until the frame's border pixels are checked.
+                && charge(smoothglass::multipleScatterCamera(resources->smoothGlass)?roughSchedule->pixels():0,
+                    sizeof(std::array<std::uint32_t,4>)+1);
             const auto chargeProgram = [&](const NativeFixtureSurfaceMaterialProgram& program) {
                 return charge(program.bindingDigest.capacity()+program.programIdentity.capacity()
                     +program.diffractionProductDigest.capacity(), 3)
@@ -8472,11 +9848,24 @@ public:
             if (!diffractiontransportnative::buildFrame(*prepared,
                     opaquevisibility::noteInstances(visibilityMatrices, noteInstances), width, height,
                     diffractionTransportFrame, result.error)) return result;
+            std::uint64_t diffractionPixelQueries = 0;
+            if (!nativeFixtureDiffractionPixelQueries(std::size_t(diffractionTransportFrame.sampleControl[0]),
+                    std::size_t(diffractionTransportFrame.sampleControl[1]), diffractionPixelQueries))
+            {
+                result.error = "OpenGL fixture diffraction query count does not fit 64 bits";
+                return result;
+            }
+            nativeFixtureDiffractionSplitBandsByQueries(diffractionBands, diffractionPixelQueries);
             if (maximumTextureSize < static_cast<int>(diffractiontransportnative::kTextureWidth)
                 || maximumTextureSize < static_cast<int>(diffractionTransportFrame.height)
                 || maximumTextureSize < static_cast<int>(opaquevisibility::kTextureWidth)
                 || maximumTextureSize < static_cast<int>(diffractionTransportFrame.query.height))
-            { result.error = "OpenGL diffraction table/query exceeds native texture dimensions"; return result; }
+            {
+                result.error = nativeTextureAxisError("diffraction table/query", std::max({std::size_t(diffractiontransportnative::kTextureWidth),
+                    std::size_t(diffractionTransportFrame.height),std::size_t(opaquevisibility::kTextureWidth),
+                    std::size_t(diffractionTransportFrame.query.height)}), maximumTextureSize);
+                return result;
+            }
         }
         if (noteInstances.admitted)
         {
@@ -8494,6 +9883,12 @@ public:
         }
         OpenGlFixtureState previous (gl);
         auto frame = std::make_shared<OpenGlFixtureSceneFrame>();
+        // An exception unwinds under fixtureMutex, which the frame's destructor would take again.
+        ScopeCleanup releaseFrameOnThrow { [&] {
+            if (std::uncaught_exceptions() == 0 || ! frame) return;
+            frame->releaseTexturesUnlocked();
+            frame->ownerContext = nullptr;
+        } };
         frame->width_ = width;
         frame->height_ = height;
         frame->ownerContext = glfwGetCurrentContext();
@@ -8507,18 +9902,40 @@ public:
         unsigned roughReceiptFramebuffer = 0;
         unsigned roughReceiptDepth = 0;
         unsigned depthAttachment = 0;
-        auto cleanup = [&]
+        // The closed-glass bands get a stencil, so the frame turns the stencil test off and
+        // cleanup turns it back on when the caller had it on.
+        const bool glassBandStencil = resources->smoothGlass.enabled && !roughGlassFrame;
+        bool restoreStencilTest = false;
+        ScopeCleanup cleanup { [&]
         {
-            if (framebuffer != 0) gl.DeleteFramebuffers (1, &framebuffer);
+            if (restoreStencilTest) glEnable (GL_STENCIL_TEST);
+            restoreStencilTest = false;
+            // The camera depth attachment and framebuffer return to the pool for
+            // the next base render instead of deleting fresh-storage objects under
+            // a busy queue (verify66: scene-base held 257 ms on its slow frame).
+            if (framebuffer != 0 && depthAttachment != 0 && resources
+                && resources->pooledCameraAttach.depthTexture == 0)
+            {
+                resources->pooledCameraAttach.depthTexture = depthAttachment;
+                resources->pooledCameraAttach.framebuffer = framebuffer;
+                resources->pooledCameraAttach.key = std::uint64_t(width) | (std::uint64_t(height) << 32);
+                resources->pooledCameraAttach.stencil = glassBandStencil;
+                depthAttachment = 0;
+                framebuffer = 0;
+            }
+            else
+            {
+                if (framebuffer != 0) gl.DeleteFramebuffers (1, &framebuffer);
+                if (depthAttachment != 0) glDeleteTextures (1, &depthAttachment);
+            }
             if (resolveFramebuffer != 0) gl.DeleteFramebuffers(1, &resolveFramebuffer);
             if (roughReceiptFramebuffer != 0) gl.DeleteFramebuffers(1, &roughReceiptFramebuffer);
-            if (depthAttachment != 0) glDeleteTextures (1, &depthAttachment);
             if (roughReceiptDepth != 0) glDeleteTextures(1, &roughReceiptDepth);
             roughReceiptDepth = 0;
             framebuffer = resolveFramebuffer = roughReceiptFramebuffer = 0;
             depthAttachment = 0;
             previous.restore();
-        };
+        } };
         auto fail = [&] (std::string error)
         {
             cleanup();
@@ -8536,8 +9953,32 @@ public:
         glPixelStorei (GL_UNPACK_ROW_LENGTH, 0);
         glPixelStorei (GL_UNPACK_SKIP_PIXELS, 0);
         glPixelStorei (GL_UNPACK_SKIP_ROWS, 0);
+        // The base camera's depth attachment and framebuffer cycle through the
+        // resource pool: consumed here, returned by cleanup below, so the
+        // completeness check never waits on fresh storage behind a busy queue.
+        {
+            const auto attachKey = std::uint64_t(width) | (std::uint64_t(height) << 32);
+            auto& pooled = resources->pooledCameraAttach;
+            if (pooled.depthTexture && pooled.key == attachKey && pooled.stencil == glassBandStencil)
+            {
+                depthAttachment = pooled.depthTexture;
+                framebuffer = pooled.framebuffer;
+                pooled = {};
+            }
+            else if (pooled.depthTexture)
+            {
+                glDeleteTextures(1, &pooled.depthTexture);
+                if (pooled.framebuffer) gl.DeleteFramebuffers(1, &pooled.framebuffer);
+                pooled = {};
+            }
+        }
         if (!allocateFixtureCameraAttachments(gl, frame.get(), diffractionFrame,
-                framebuffer, depthAttachment, result.error)) return fail(result.error);
+                framebuffer, depthAttachment, result.error, glassBandStencil)) return fail(result.error);
+        if (glassBandStencil && glIsEnabled (GL_STENCIL_TEST) == GL_TRUE)
+        {
+            glDisable (GL_STENCIL_TEST);
+            restoreStencilTest = true;
+        }
 
         if (roughGlassFrame)
         {
@@ -8638,9 +10079,9 @@ public:
             storeFixtureVec3 (values.baseColor, material.baseColor, material.opacity);
             storeFixtureVec3 (values.emissive, material.emissive);
         }
-        for (std::size_t channel = 0; channel < 3; ++channel)
-            values.emissive[channel] *= runtimeInputs.emissionGain;
+        arbitgpu::analyticsky::clipRasterRadiance (values.emissive.data(), runtimeInputs.emissionGain);
         storeFixtureVec3 (values.ambient, scene->ambientColor);
+        arbitgpu::analyticsky::clipRasterRadiance (values.ambient.data());
         values.lightRotation = { 0.0f, 0.0f, 0.0f, 1.0f };
         std::string lightTargetError;
         if (!validNativeImportedLightOverrideTargets (*scene, runtimeInputs, lightTargetError))
@@ -8662,12 +10103,14 @@ public:
                     values.ambient[0] += light.color.x * light.intensity;
                     values.ambient[1] += light.color.y * light.intensity;
                     values.ambient[2] += light.color.z * light.intensity;
+                    arbitgpu::analyticsky::clipRasterRadiance (values.ambient.data());
                 }
             }
             else
             {
                 storeFixtureQuaternion (values.lightRotation, light.transform.rotation);
                 storeFixtureVec3 (values.lightColorIntensity, light.color, light.intensity);
+                arbitgpu::analyticsky::clipRasterLight (values.lightColorIntensity.data());
                 if (light.kind == SceneLightKind::Point)
                     storeFixtureVec3 (values.lightPositionRange,
                                       light.transform.translation, light.range);
@@ -8692,16 +10135,27 @@ public:
             glClearColor (0.0f, 0.0f, 0.0f, 0.0f);
         glClearDepth (1.0);
         glClear (GL_DEPTH_BUFFER_BIT);
-        const float background[4] {
+        // A camera-hidden environment still lights and reflects; only the backdrop is skipped.
+        // The skipped pixels are opaque black, as Path Trace sees no world on a camera ray.
+        bool skyCameraVisible = true;
+        for (std::size_t i=0;i<lightCount;++i)
+            if (lightAt(i).kind==SceneLightKind::Environment && !lightAt(i).environmentCameraVisible)
+                skyCameraVisible = false;
+        const bool cameraHiddenBackdrop = !skyCameraVisible
+            && runtimeInputs.imageOutput == renderpassoutput::Output::Color
+            && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage);
+        const float stageBackground[4] {
             cameraOnlyEncode ? smoothglass::displayEncode(7.0f / 255.0f) : 7.0f / 255.0f,
             cameraOnlyEncode ? smoothglass::displayEncode(10.0f / 255.0f) : 10.0f / 255.0f,
             cameraOnlyEncode ? smoothglass::displayEncode(18.0f / 255.0f) : 18.0f / 255.0f, 1.0f };
+        const float hiddenBackdrop[4] { 0, 0, 0, 1 };
+        const float* background = cameraHiddenBackdrop ? hiddenBackdrop : stageBackground;
         const float emptyPass[4] { 0, 0, 0, 0 };
         const float farDepth[4] { 1, 0, 0, 0 };
         const unsigned emptyIdentity[4] { 0, 0, 0, 0 };
         gl.ClearBufferfv(GL_COLOR, 0, diffractionFrame ? emptyPass
             : runtimeInputs.imageOutput == renderpassoutput::Output::Color
-                && !runtimeInputs.passComposite ? background : emptyPass);
+                && (!runtimeInputs.passComposite || cameraHiddenBackdrop) ? background : emptyPass);
         gl.ClearBufferfv(GL_COLOR, 1, farDepth);
         for (int attachment = 2; attachment < 5; ++attachment) gl.ClearBufferfv(GL_COLOR, attachment, emptyPass);
         gl.ClearBufferuiv(GL_COLOR, 5, emptyIdentity);
@@ -8715,12 +10169,21 @@ public:
         }
         // A Preview smooth-glass draw uses the Preview walk variant once it is linked
         // (advancePreviewGlassProgram). Export and rough or diffraction frames keep the
-        // prepared program, so their text, uniforms and draws are unchanged.
-        const bool previewGlassFrame = runtimeInputs.previewUse && resources->smoothGlass.enabled
-            && !roughGlassFrame && !diffractionFrame;
-        const auto* previewGlassProgram = previewGlassFrame
+        // prepared program, so their text, uniforms and draws are unchanged. An Accurate
+        // Preview (previewbudget::exportBudgets) draws the prepared export program too, and
+        // never builds the variant; it keeps the Preview timer and flushed bands below.
+        // Tier K S4: the budget, not the draw class, picks the walk - a Fast
+        // export (Preview budget) builds the same Preview walk variant a Fast
+        // Preview does, and every Accurate draw keeps the prepared program, its
+        // text, uniforms and draws exactly as before.
+        const bool previewGlassFrame = !previewbudget::exportBudgets()
+            && resources->smoothGlass.enabled && !roughGlassFrame && !diffractionFrame;
+        const bool previewGlassWalk = previewGlassFrame && !previewbudget::exportBudgets();
+        const auto* previewGlassProgram = previewGlassWalk
             ? advancePreviewGlassProgram (gl, resources->sharedProgram.get()) : nullptr;
         const unsigned sceneProgram = previewGlassProgram ? previewGlassProgram->previewId : resources->program;
+        if (previewGlassProgram != nullptr)
+            smoothglass::previewGlassVariantFrames().fetch_add (1, std::memory_order_relaxed);
         gl.UseProgram (sceneProgram);
         gl.BindVertexArray (resources->vertexArray);
         if (priorScenePositions)
@@ -8781,7 +10244,7 @@ public:
         {
 #if !defined(__APPLE__)
             if (maximumTextureSize < static_cast<int>(opaquevisibility::kTextureWidth))
-                return fail("OpenGL opaque visibility RGBA32F payload exceeds native texture dimensions");
+                return fail(nativeTextureAxisError("opaque visibility RGBA32F payload", opaquevisibility::kTextureWidth, maximumTextureSize));
             if (resources->residentEmptyTexture == 0)
             {
                 // One zero row for a disabled query. Allocated once per resource lifetime.
@@ -8876,7 +10339,7 @@ public:
             result.stats.opaqueVisibilityBytes = visibilityFrame.texels.size() * sizeof(opaquevisibility::Texel);
             if (maximumTextureSize < static_cast<int>(opaquevisibility::kTextureWidth) ||
                 maximumTextureSize < static_cast<int>(visibilityFrame.height))
-                return fail("OpenGL opaque visibility RGBA32F payload exceeds native texture dimensions");
+                return fail(nativeTextureAxisError("opaque visibility RGBA32F payload", std::max<std::size_t>(opaquevisibility::kTextureWidth, visibilityFrame.height), maximumTextureSize));
             gl.ActiveTexture(GL_TEXTURE5);
             glGenTextures(1, &frame->opaqueTexture);
             glBindTexture(GL_TEXTURE_2D, frame->opaqueTexture);
@@ -8897,7 +10360,7 @@ public:
                 if (!opaquevisibility::frame(resources->smoothGlass.query,
                         opaquevisibility::noteInstances(visibilityMatrices, noteInstances), glassFrame, result.error)) return fail(result.error);
             } else glassFrame.texels.resize(opaquevisibility::kTextureWidth);
-            if (maximumTextureSize < static_cast<int>(glassFrame.height)) return fail("OpenGL glass query exceeds native texture dimensions");
+            if (maximumTextureSize < static_cast<int>(glassFrame.height)) return fail(nativeTextureAxisError("glass query", glassFrame.height, maximumTextureSize));
             gl.ActiveTexture(GL_TEXTURE6);
             glGenTextures(1, &frame->glassTexture);
             glBindTexture(GL_TEXTURE_2D, frame->glassTexture);
@@ -8916,11 +10379,8 @@ public:
         gl.Uniform1i(gl.GetUniformLocation(sceneProgram,"uSelectedRoughResult"),10);
         gl.Uniform1f(gl.GetUniformLocation(sceneProgram,"uSelectedRoughResolve"),0);
         gl.Uniform4fv(locations.glassControl, 1, glassControl.data());
-        gl.Uniform4fv(locations.glassReceivers, 64, resources->smoothGlass.receivers[0].data());
-        auto glassEmission = resources->smoothGlass.emission;
-        for (auto& emission : glassEmission) for (std::size_t channel=0; channel<3; ++channel) emission[channel]*=runtimeInputs.emissionGain;
-        gl.Uniform4fv(locations.glassEmission, 64, glassEmission[0].data());
         result.stats.smoothGlassTransportApplied = resources->smoothGlass.enabled;
+        result.stats.realtimeProgramApplied = realtimeFrame;
         result.stats.smoothGlassQueryBytes = resources->smoothGlass.enabled ? glassQueryBytes : 0;
         // Separate bindings from opaque shadow unit 5, glass unit 6 and HDR unit 7.
         const auto uploadDiffraction = [&](unsigned unit, unsigned& texture, std::size_t textureWidth,
@@ -9011,15 +10471,6 @@ public:
             const auto displacementLimits = fixtureVertexDisplacementLimits (materialProgram->vertexProgram.get());
             gl.Uniform4fv(locations.vertexDisplacementLimits, static_cast<int> (kVertexDisplacementLimitCapacity / 4), displacementLimits.data());
         }
-        std::array<std::array<float, 4>, Visual3DScene::kMaxObjects> rawIdentifiers {};
-        for (std::size_t i = 0; i < scene->objectCount; ++i)
-        {
-            const auto& object = scene->objects[i];
-            rawIdentifiers[i] = { static_cast<float>(object.material.value & 65535u),
-                static_cast<float>(object.material.value >> 16u), static_cast<float>(object.id.value & 65535u),
-                static_cast<float>(object.id.value >> 16u) };
-        }
-        gl.Uniform4fv(locations.rawIdentifiers, static_cast<int>(rawIdentifiers.size()), rawIdentifiers[0].data());
         gl.Uniform1i(locations.rawObjectIndex, 0);
         auto passProgram = renderpasscomposite::gpuProgram(scenePassProgram(runtimeInputs));
         passProgram.control[2] = runtimeInputs.linearColor ? 1.0f : 0.0f;
@@ -9051,7 +10502,11 @@ public:
             if (locations.stamLayer >= 0)
                 gl.Uniform4fv(locations.stamLayer, GLsizei(stamlayer::kUniformVec4Count), layer[0].data());
         }
-        gl.Uniform4f(locations.glassTransport, surfacePbr ? float(materialProgram->parameters.identifiers[1]) : 0.0f,
+        // Mirrors uGlassTransport.x: the frame default here, then each per-draw write below.
+        // The uniform persists between draws, so a draw that writes nothing keeps the last
+        // value, and the overdraw probe classifies the draw by this current value.
+        float glassTransportMode = surfacePbr ? float(materialProgram->parameters.identifiers[1]) : 0.0f;
+        gl.Uniform4f(locations.glassTransport, glassTransportMode,
             coating[3], float(resources->smoothGlass.object.value & 65535u), float(resources->smoothGlass.object.value >> 16u));
         // Frame default. Each scene object draw below names its own partner dielectric.
         if (locations.glassTransport2 >= 0)
@@ -9079,21 +10534,56 @@ public:
         gl.Uniform1i (locations.lightKind,
                       lightCount == 1 && lightAt(0).kind == SceneLightKind::Point ? 1 : 0);
         gl.Uniform1i (locations.lightCount, static_cast<int> (lightCount));
+        // Lights and per-object records live in one RGBA32F table sized from the
+        // scene: four texels per light, then raw identifiers, receivers and emission.
+        const auto tableObjects = static_cast<std::size_t> (scene->objectCount);
+        const auto tableRecords = 4 * lightCount + 3 * tableObjects;
+        const auto tableHeight = std::max<std::size_t> (1, (tableRecords + 1023) / 1024);
+        if (maximumTextureSize < 1024 || static_cast<std::size_t> (maximumTextureSize) < tableHeight)
+            return fail (nativeTextureAxisError ("scene table", std::max<std::size_t> (1024, tableHeight), maximumTextureSize));
+        std::vector<std::array<float, 4>> sceneTable (1024 * tableHeight, std::array<float, 4> {});
         for (std::size_t lightIndex = 0; lightIndex < lightCount; ++lightIndex)
         {
             const auto& light = lightAt(lightIndex);
-            std::array<float, 4> rotation {}, color {}, position {}, cones {};
-            storeFixtureQuaternion (rotation, light.transform.rotation);
-            storeFixtureVec3 (color, light.color, light.intensity);
-            storeFixtureVec3 (position, light.transform.translation, light.range);
-            cones = { std::cos (light.innerConeAngle),
-                      std::cos (light.outerConeAngle), 0.0f, 0.0f };
-            gl.Uniform4fv (locations.lightRotations[lightIndex], 1, rotation.data());
-            gl.Uniform4fv (locations.lightColors[lightIndex], 1, color.data());
-            gl.Uniform4fv (locations.lightPositions[lightIndex], 1, position.data());
-            gl.Uniform4fv (locations.lightCones[lightIndex], 1, cones.data());
-            gl.Uniform1i (locations.lightKinds[lightIndex], static_cast<int> (light.kind));
+            auto* record = &sceneTable[4 * lightIndex];
+            storeFixtureQuaternion (record[0], light.transform.rotation);
+            storeFixtureVec3 (record[1], light.color, light.intensity);
+            arbitgpu::analyticsky::clipRasterLight (record[1].data());
+            storeFixtureVec3 (record[2], light.transform.translation, light.range);
+            record[3] = { std::cos (light.innerConeAngle), std::cos (light.outerConeAngle),
+                          static_cast<float> (light.kind), 0.0f };
         }
+        const auto receiverRecords = 4 * lightCount + tableObjects, emissionRecords = receiverRecords + tableObjects;
+        const auto& smoothGlassTable = resources->smoothGlass;
+        for (std::size_t i = 0; i < tableObjects; ++i)
+        {
+            const auto& object = scene->objects[i];
+            sceneTable[4 * lightCount + i] = { static_cast<float>(object.material.value & 65535u),
+                static_cast<float>(object.material.value >> 16u), static_cast<float>(object.id.value & 65535u),
+                static_cast<float>(object.id.value >> 16u) };
+            if (i < smoothGlassTable.receivers.size()) sceneTable[receiverRecords + i] = smoothGlassTable.receivers[i];
+            if (i < smoothGlassTable.emission.size())
+            {
+                auto emission = smoothGlassTable.emission[i];
+                arbitgpu::analyticsky::clipRasterRadiance (emission.data(), runtimeInputs.emissionGain);
+                sceneTable[emissionRecords + i] = emission;
+            }
+        }
+        if (resources->sceneTableTexture == 0) glGenTextures (1, &resources->sceneTableTexture);
+        gl.ActiveTexture (GL_TEXTURE11);
+        gl.BindSampler (11, 0);
+        glBindTexture (GL_TEXTURE_2D, resources->sceneTableTexture);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, 1024, static_cast<int> (tableHeight), 0,
+                      GL_RGBA, GL_FLOAT, sceneTable.data());
+        if (resources->sceneTableTexture == 0 || glGetError() != GL_NO_ERROR)
+            return fail ("OpenGL scene table allocation failed");
+        gl.ActiveTexture (GL_TEXTURE0);
+        gl.Uniform1i (locations.sceneTable, 11);
+        gl.Uniform1i (locations.sceneTableObjects, static_cast<int> (tableObjects));
         analyticsky::Uniforms sky {};
         for (std::size_t i=0;i<lightCount;++i)
             if (lightAt(i).kind==SceneLightKind::Environment && lightAt(i).sky.version!=0)
@@ -9128,7 +10618,7 @@ public:
         std::uint32_t submittedNoteInstanceCount = 0;
         std::uint32_t objectInstanceDrawCount = 0;
         std::uint32_t submittedObjectInstanceCount = 0;
-        if (sky[0][3]>0.5f && materialKind!=NativeFixtureMaterialKind::DiffractionReflective
+        if (sky[0][3]>0.5f && skyCameraVisible && materialKind!=NativeFixtureMaterialKind::DiffractionReflective
             && runtimeInputs.imageOutput==renderpassoutput::Output::Color
             && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage))
         {
@@ -9142,7 +10632,10 @@ public:
         std::uint32_t surfaceDrawCount = 0;
         const auto gratingValues = values;
         bool diffractionComplete = true;
-        const auto validateDiffractionDraw = [&](unsigned texture = 0) {
+        std::vector<float> lastGoodReadback;
+        std::string lastGoodSite;
+        const auto validateDiffractionDraw = [&](unsigned texture = 0,
+            const std::string& site = "scene") {
             // Preview skips the whole-output host readback and CPU validation.
             if (!authoredDiffraction || runtimeInputs.previewUse) return true;
             GLint savedTexture = 0, savedBuffer = 0;
@@ -9163,20 +10656,215 @@ public:
             gl.BindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<unsigned>(savedBuffer));
             for (std::size_t i=0; i<names.size(); ++i) glPixelStorei(names[i], saved[i]);
             if (readError != GL_NO_ERROR) { result.error="OpenGL diffraction whole-output readback failed"; return false; }
-            if (!diffractiontransportnative::validateWholeOutput(completion, width, height, result.error))
+            std::size_t firstBad = 0;
+            if (!diffractiontransportnative::validateWholeOutput(completion, width, height, result.error, &firstBad))
+            {
+                result.error += " [validate site: " + std::string(site) + "]";
+                // Attribute the pixel through the same fragments' AOV writes: an
+                // object id means a surface fragment owned the pixel; all-zero
+                // ids with a zero mask mean no fragment wrote its AOVs.
+                const std::size_t controlPixel =
+                    std::size_t(width) / 2 + (std::size_t(height) / 8) * std::size_t(width);
+                const auto sample = [&](renderpassoutput::Output output, const char* name,
+                                        std::size_t pixelIndex)
+                {
+                    arbitgpu::NativeRawPassPixels pixels;
+                    std::string readError;
+                    if (!frame->readRawPassOwned(output, pixels, readError))
+                    { result.error += std::string(" [") + name + ": unavailable]"; return; }
+                    const std::size_t w = pixels.width, hh = pixels.height;
+                    if (w == 0 || hh == 0 || pixelIndex >= w * hh)
+                    { result.error += std::string(" [") + name + ": out of range]"; return; }
+                    unsigned channels = 0, bytesPerChannel = 0;
+                    switch (pixels.format)
+                    {
+                        case arbitgpu::NativeTexturePixelFormat::R32Uint: channels=1; bytesPerChannel=4; break;
+                        case arbitgpu::NativeTexturePixelFormat::R32Float: channels=1; bytesPerChannel=4; break;
+                        case arbitgpu::NativeTexturePixelFormat::Rgba32Float: channels=4; bytesPerChannel=4; break;
+                        case arbitgpu::NativeTexturePixelFormat::Rgba16Float: channels=4; bytesPerChannel=2; break;
+                        case arbitgpu::NativeTexturePixelFormat::R8Unorm: channels=1; bytesPerChannel=1; break;
+                        case arbitgpu::NativeTexturePixelFormat::Rgba8Unorm: channels=4; bytesPerChannel=1; break;
+                        default: result.error += std::string(" [") + name + ": unsupported format]"; return;
+                    }
+                    const std::size_t offset = pixelIndex * channels * bytesPerChannel;
+                    if (offset + channels * bytesPerChannel > pixels.bytes.size())
+                    { result.error += std::string(" [") + name + ": short buffer]"; return; }
+                    char text[96] = {};
+                    int written = 0;
+                    written += std::snprintf(text + written, sizeof(text) - written, " [%s=", name);
+                    for (unsigned c = 0; c < channels && written < 88; ++c)
+                    {
+                        const unsigned char* data = pixels.bytes.data() + offset + std::size_t(c) * bytesPerChannel;
+                        std::uint32_t word = 0;
+                        if (bytesPerChannel == 4) std::memcpy(&word, data, 4);
+                        else if (bytesPerChannel == 2) { std::uint16_t half = 0; std::memcpy(&half, data, 2); word = half; }
+                        else word = data[0];
+                        written += std::snprintf(text + written, sizeof(text) - written,
+                            c ? ",%08x" : "%08x", word);
+                    }
+                    if (written < int(sizeof(text)) - 2) text[written++] = ']';
+                    result.error += text;
+                };
+                sample(renderpassoutput::Output::Mask, "mask", firstBad);
+                sample(renderpassoutput::Output::ObjectId, "objectId", firstBad);
+                sample(renderpassoutput::Output::MaterialId, "materialId", firstBad);
+                sample(renderpassoutput::Output::Normal, "normal", firstBad);
+                sample(renderpassoutput::Output::Depth, "depth", firstBad);
+                sample(renderpassoutput::Output::Emission, "emission", firstBad);
+                sample(renderpassoutput::Output::Mask, "cMask", controlPixel);
+                sample(renderpassoutput::Output::Normal, "cNormal", controlPixel);
+                sample(renderpassoutput::Output::ObjectId, "cObjectId", controlPixel);
+                sample(renderpassoutput::Output::Depth, "cDepth", controlPixel);
+                {
+                    GLint drawFbo = 0, attachmentName = 0;
+                    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+                    using GetAttachmentProc = void (APIENTRY*)(GLenum, GLenum, GLenum, GLint*);
+                    static GetAttachmentProc getAttachment = reinterpret_cast<GetAttachmentProc>(
+                        glfwGetProcAddress("glGetFramebufferAttachmentParameteriv"));
+                    if (getAttachment != nullptr)
+                        getAttachment(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &attachmentName);
+                    const GLenum fboStatus = gl.CheckFramebufferStatus(GL_FRAMEBUFFER);
+                    GLint currentProgram = 0;
+                    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
+                    GLboolean writemask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+                    glGetBooleanv(GL_COLOR_WRITEMASK, writemask);
+                    GLint drawBuffer0 = GL_NONE;
+                    glGetIntegerv(GL_DRAW_BUFFER0, &drawBuffer0);
+                    // Uniform state of the program whose draw just ran: the
+                    // composite pass mode count and the background/image flags.
+                    const auto uniformFloat = [&](GLint location) -> float {
+                        if (location < 0 || currentProgram == 0) return -1.0f;
+                        float value = -2.0f;
+                        using GetUniformfvProc = void (APIENTRY*)(GLuint, GLint, GLfloat*);
+                        static GetUniformfvProc getter = reinterpret_cast<GetUniformfvProc>(
+                            glfwGetProcAddress("glGetUniformfv"));
+                        if (getter != nullptr)
+                            getter(static_cast<GLuint>(currentProgram), location, &value);
+                        return value;
+                    };
+                    // All eight draw-buffer routings: attachments 1..7 routed
+                    // to GL_NONE explain AOVs and linear depth staying cleared
+                    // while Color still changes.
+                    GLint drawBuffers[8] = {};
+                    for (int i = 0; i < 8; ++i)
+                        glGetIntegerv(GLenum(GL_DRAW_BUFFER0 + i), &drawBuffers[i]);
+                    // Resolve the key uniform locations INSIDE the program that
+                    // actually drew: a -1 means its fragment source is not the
+                    // fixture shader the probes live in.
+                    const auto locationIn = [&](const char* name) -> GLint {
+                        if (currentProgram == 0) return -99;
+                        using GetLocProc = GLint (APIENTRY*)(GLuint, const GLchar*);
+                        static GetLocProc getter = reinterpret_cast<GetLocProc>(
+                            glfwGetProcAddress("glGetUniformLocation"));
+                        return getter != nullptr
+                            ? getter(static_cast<GLuint>(currentProgram), name) : -98;
+                    };
+                    const GLint locPass = locationIn("uPassProgramControl");
+                    const GLint locSky = locationIn("uSkyBackground");
+                    const GLint locImage = locationIn("uImageOutput");
+                    const GLint locMaterial = locationIn("uMaterialKind");
+                    const GLint locSample = locationIn("uDiffractionSampleControl");
+                    const float passCount = locPass >= 0 ? uniformFloat(locPass) : -1.0f;
+                    const float skyFlag = locSky >= 0 ? uniformFloat(locSky) : -1.0f;
+                    const float imageFlag = locImage >= 0 ? uniformFloat(locImage) : -1.0f;
+                    char ids[448] = {};
+                    std::snprintf(ids, sizeof(ids),
+                        " [sceneFbo=%u drawFbo=%d att0=%u fboStatus=%x accumulation=%u texture=%u"
+                        " prog=%d mask=%d%d%d%d passCount=%g sky=%g img=%g"
+                        " locPass=%d locSky=%d locImage=%d locMaterial=%d locSample=%d"
+                        " bufs=%x,%x,%x,%x,%x,%x,%x,%x]",
+                        framebuffer, drawFbo, static_cast<unsigned>(attachmentName),
+                        static_cast<unsigned>(fboStatus),
+                        frame->accumulationTexture_, frame->texture_,
+                        currentProgram,
+                        writemask[0] != 0, writemask[1] != 0, writemask[2] != 0, writemask[3] != 0,
+                        static_cast<double>(passCount), static_cast<double>(skyFlag),
+                        static_cast<double>(imageFlag),
+                        locPass, locSky, locImage, locMaterial, locSample,
+                        static_cast<unsigned>(drawBuffers[0]), static_cast<unsigned>(drawBuffers[1]),
+                        static_cast<unsigned>(drawBuffers[2]), static_cast<unsigned>(drawBuffers[3]),
+                        static_cast<unsigned>(drawBuffers[4]), static_cast<unsigned>(drawBuffers[5]),
+                        static_cast<unsigned>(drawBuffers[6]), static_cast<unsigned>(drawBuffers[7]));
+                    result.error += ids;
+                }
+                if (lastGoodReadback.size() == completion.size() && !lastGoodReadback.empty())
+                {
+                    std::size_t changed = 0;
+                    std::size_t minX = width, minY = height, maxX = 0, maxY = 0;
+                    for (std::size_t i = 0; i < completion.size(); ++i)
+                    {
+                        if (completion[i] == lastGoodReadback[i]) continue;
+                        ++changed;
+                        const std::size_t pixel = i / 4;
+                        const std::size_t px = pixel % width, py = pixel / width;
+                        minX = std::min(minX, px); maxX = std::max(maxX, px);
+                        minY = std::min(minY, py); maxY = std::max(maxY, py);
+                    }
+                    if (changed != 0)
+                    {
+                        char delta[224] = {};
+                        std::snprintf(delta, sizeof(delta),
+                            " [delta since %s: changed=%zu bbox=(%zu,%zu)-(%zu,%zu)]",
+                            lastGoodSite.c_str(), changed, minX, minY, maxX, maxY);
+                        result.error += delta;
+                    }
+                    else
+                        result.error += " [delta: no pixels changed since " + lastGoodSite + "]";
+                }
                 return false;
+            }
+            lastGoodReadback = completion;
+            lastGoodSite = site;
             return true;
         };
         bool roughReceiptPass = false;
+        // Set only around the closed-glass bands while the overdraw probe records.
+        GlassOverdrawProbe* glassOverdrawProbe = nullptr;
+        // Set only around the closed-glass bands. Walked glass draws then lay depth first.
+        bool glassDepthPrepass = false;
+        // Realtime's phases: 0 opaque, 1 reflections, 2 glass. An image other than Color
+        // draws once at -1, with the soft shadows and no snapshots. A grating frame draws
+        // its grating after phase 0, so reflections and glass read the diffraction orders.
+        int realtimePhase = -1;
+        const bool realtimePhased = realtimeFrame
+            && runtimeInputs.imageOutput == renderpassoutput::Output::Color
+            && !(runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage);
+        const bool realtimePasses = realtimePhased && !diffractionFrame;
+        const bool realtimeGratingPasses = realtimePhased && mixedMaterials;
+        std::array<unsigned, 2> realtimeTextures {};
+        const auto realtimeSnapshot = [&] {
+            for (unsigned index = 0; index < realtimeTextures.size(); ++index)
+            {
+                gl.ActiveTexture(GL_TEXTURE14 + index);
+                glBindTexture(GL_TEXTURE_2D, realtimeTextures[index]);
+                glReadBuffer(GL_COLOR_ATTACHMENT0 + index);
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, int(width), int(height));
+            }
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            gl.ActiveTexture(GL_TEXTURE0);
+        };
+        const auto realtimeGlassObject = [&](HarmonicMIDI::grid::SceneObjectId id) {
+            const auto* program = nativeSurfaceForObject(materialProgram.get(), id);
+            return program && program->parameters.identifiers[1] != 0;
+        };
         const auto drawSurfaces = [&](int stage) {
+            if (realtimeFrame)
+            {
+                gl.Uniform4f(gl.GetUniformLocation(sceneProgram, "uRealtimeControl"), float(realtimePhase), 0.0f, 0.0f, 0.0f);
+                gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uRealtimeColor"), 14);
+                gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uRealtimeDepth"), 15);
+            }
             gl.Uniform1i(locations.materialKind, static_cast<int>(NativeFixtureMaterialKind::SurfacePbr));
             if (diffractionFrame) {
                 auto linearPass = passProgram;
                 linearPass.control = {0.0f, 0.0f, 1.0f, 0.0f};
                 gl.Uniform4fv(locations.passProgramControl, 1, linearPass.control.data());
-                gl.Uniform3f(locations.ambient, scene->ambientColor.x, scene->ambientColor.y, scene->ambientColor.z);
+                { float ambient[3]{scene->ambientColor.x,scene->ambientColor.y,scene->ambientColor.z};
+                  arbitgpu::analyticsky::clipRasterRadiance(ambient);
+                  gl.Uniform3f(locations.ambient, ambient[0], ambient[1], ambient[2]); }
             }
-            glDepthFunc(roughReceiptPass ? GL_EQUAL : GL_LESS);
+            glDepthFunc(roughReceiptPass || realtimePhase == 1 ? GL_EQUAL : GL_LESS);
 
             const diffractionmaterial::PhysicalDiffractionGpuParameters emptyDiffraction {};
             const auto& diffraction = authoredDiffraction
@@ -9232,8 +10920,27 @@ public:
                               [] (const auto& left, const auto& right)
                               { return left.first > right.first; });
             for (const auto& blend : blendedDraws) drawOrder.push_back (blend.second);
-            std::array<OpenGlInstanceGpuRecord, Visual3DScene::kMaxObjects>
-                instanceRecords {};
+            // Glass draws back to front whether or not it blends, so each one sees the last.
+            if (realtimePhase == 2)
+            {
+                std::vector<std::pair<float, std::size_t>> glassDraws;
+                for (const auto objectIndex : drawOrder)
+                {
+                    if (!realtimeGlassObject(scene->objects[objectIndex].id)) continue;
+                    const auto matrix = nativeObjectWorldMatrix (runtimeInputs.objectWorlds.get(),
+                        scene->objects[objectIndex], fixtureWorldMatrix (*scene, scene->objects[objectIndex]));
+                    const auto dx = matrix[12] - values.cameraTranslation[0];
+                    const auto dy = matrix[13] - values.cameraTranslation[1];
+                    const auto dz = matrix[14] - values.cameraTranslation[2];
+                    glassDraws.emplace_back (dx * dx + dy * dy + dz * dz, objectIndex);
+                }
+                std::stable_sort (glassDraws.begin(), glassDraws.end(),
+                                  [] (const auto& left, const auto& right)
+                                  { return left.first > right.first; });
+                drawOrder.clear();
+                for (const auto& glass : glassDraws) drawOrder.push_back (glass.second);
+            }
+            std::vector<OpenGlInstanceGpuRecord> instanceRecords (scene->objectCount);
             if (resources->instancedSharedGeometry)
             {
                 std::vector<videowire::geometry::StableId> diagnosticStableIdentities;
@@ -9270,8 +10977,7 @@ public:
                         resources->diagnosticInstanceIdentityColors ? 1.0f : 0.0f };
                     instanceRecords[index].color=resources->instanceAppearances[index].color;
                     instanceRecords[index].emission=resources->instanceAppearances[index].emission;
-                    for (std::size_t channel=0;channel<3;++channel)
-                        instanceRecords[index].emission[channel]*=runtimeInputs.emissionGain;
+                    arbitgpu::analyticsky::clipRasterRadiance(instanceRecords[index].emission.data(),runtimeInputs.emissionGain);
                 }
                 gl.BindBuffer(GL_ARRAY_BUFFER, resources->instanceBuffer);
                 gl.BufferData(GL_ARRAY_BUFFER,
@@ -9294,8 +11000,8 @@ public:
                 }
                 const auto world = multiplyFixtureMatrices(fixtureTransformMatrix(runtimeTransform),
                     fixtureWorldMatrix(*scene, *instanced));
-                std::array<OpenGlInstanceGpuRecord, Visual3DScene::kMaxObjectInstances> objectRecords {};
-                std::array<std::pair<float, std::size_t>, Visual3DScene::kMaxObjectInstances> order {};
+                std::vector<OpenGlInstanceGpuRecord> objectRecords (scene->objectInstanceCount);
+                std::vector<std::pair<float, std::size_t>> order (scene->objectInstanceCount);
                 for (std::size_t index = 0; index < scene->objectInstanceCount; ++index)
                 {
                     const auto matrix = nativeObjectInstanceMatrix(world, scene->objectInstances[index]);
@@ -9336,13 +11042,17 @@ public:
                     || (!resources->instanceAppearances.empty() && resources->instanceAppearances[objectIndex].color[3] < 1.0f)
                     || (queued && queued->alphaMode == SceneAlphaMode::Blend);
                 if (stage >= 0 && blendDraw != (stage == 1)) continue;
+                if (realtimePhase >= 0 && realtimePhase != 2
+                    && (realtimeGlassObject(drawObject.id) || (realtimePhase == 1 && blendDraw))) continue;
+                if (realtimePhase == 2) realtimeSnapshot();
                 gl.Uniform1i(locations.rawObjectIndex, static_cast<int>(objectIndex));
                 gl.Uniform1i(locations.diffractionTriangleCount, static_cast<int>((drawObject.indexCount ? drawObject.indexCount : drawObject.vertexCount)/3));
                 const auto identityColor = render3dimage::identityColor (
                     runtimeInputs.imageOutput == renderpassoutput::Output::MaterialId
                         ? drawObject.material.value : drawObject.id.value);
-                gl.Uniform4f (locations.imageOutput, roughReceiptPass ? -1.0f
-                    : static_cast<float> (diffractionFrame ? renderpassoutput::Output::Color : runtimeInputs.imageOutput),
+                const float drawImageOutput = roughReceiptPass ? -1.0f
+                    : static_cast<float> (diffractionFrame ? renderpassoutput::Output::Color : runtimeInputs.imageOutput);
+                gl.Uniform4f (locations.imageOutput, drawImageOutput,
                               identityColor[0], identityColor[1], identityColor[2]);
                 const auto* drawMaterial = visual3d_detail::findById (
                     scene->materials, scene->materialCount, drawObject.material);
@@ -9362,6 +11072,23 @@ public:
                     nativeObjectWorldMatrix (runtimeInputs.objectWorlds.get(), drawObject,
                         fixtureWorldMatrix (*scene, drawObject)));
                 const auto* drawProgram = nativeSurfaceForObject(materialProgram.get(), drawObject.id);
+                // An identity view answers "which surface is visible here", and
+                // through a closed glass volume that is the surface the color
+                // view shows through its refraction. Skipping the volume draw in
+                // the material- and object-id views keeps the receiver identities
+                // behind the dome - the lighthouse/lantern/rock coverage the
+                // acceptance proves - while the thin-interface ocean and every
+                // opaque receiver keep their own. Normal color rendering is
+                // untouched: this branch only runs when imageOutput selects an
+                // identity view, outside the diffraction and rough-receipt
+                // submissions that force their own output.
+                if (!roughReceiptPass && !diffractionFrame
+                    && (runtimeInputs.imageOutput == renderpassoutput::Output::MaterialId
+                        || runtimeInputs.imageOutput == renderpassoutput::Output::ObjectId)
+                    && drawProgram != nullptr
+                    && drawProgram->parameters.identifiers[1]
+                        == static_cast<std::uint32_t> (surfacematerial::TransportMode::ClosedVolume))
+                    continue;
                 if (drawMaterial != nullptr)
                 {
                     storeFixtureVec3 (values.baseColor, drawMaterial->baseColor,
@@ -9397,8 +11124,9 @@ public:
                     }
                     // The caustic volume draw shades the volume with the water as its partner.
                     // Without a volume this is the released upload and no partner location exists.
+                    glassTransportMode = drawProgram ? float(drawProgram->parameters.identifiers[1]) : 0.0f;
                     gl.Uniform4fv(locations.glassTransport, 1, smoothglass::cameraTransport(resources->smoothGlass, drawObject.id,
-                        drawProgram ? float(drawProgram->parameters.identifiers[1]) : 0.0f, drawCoating[3]).data());
+                        glassTransportMode, drawCoating[3]).data());
                     if (locations.glassTransport2 >= 0)
                         gl.Uniform4fv(locations.glassTransport2, 1,
                             smoothglass::cameraPartner(resources->smoothGlass, drawObject.id).data());
@@ -9413,8 +11141,7 @@ public:
                         if (appearance.metallic>=0) values.materialParams[0]=appearance.metallic;
                         if (appearance.roughness>=0) values.materialParams[1]=appearance.roughness;
                     }
-                    for (std::size_t channel = 0; channel < 3; ++channel)
-                        values.emissive[channel] *= runtimeInputs.emissionGain;
+                    arbitgpu::analyticsky::clipRasterRadiance (values.emissive.data(), runtimeInputs.emissionGain);
                     gl.Uniform4fv (locations.baseColor, 1, values.baseColor.data());
                     gl.Uniform4fv(locations.timeMixEndColorAndTime, 1, values.timeMixEndColorAndTime.data());
                     gl.Uniform4fv (locations.materialParams, 1,
@@ -9457,6 +11184,13 @@ public:
                         worldText (priorEntry).c_str (),
                         worldText (currentEntry).c_str ());
                 }
+                // Probe: validate before this object's draw so a poison produced
+                // by the previous object (whose post-draw path may be skipped by
+                // a continue) is caught at the exact iteration boundary.
+                if (authoredDiffraction
+                    && !validateDiffractionDraw(0,
+                        "pre-draw#" + std::to_string(objectIndex)))
+                { diffractionComplete = false; return; }
                 const bool objectInstanceDraw = drawObject.id == scene->instancedObject;
                 gl.Uniform1i(locations.useInstanceMatrix,
                              resources->instancedSharedGeometry ? 1 : objectInstanceDraw ? 2 : 0);
@@ -9522,6 +11256,18 @@ public:
                 {
                     glDisable (GL_BLEND);
                     glDepthMask (roughReceiptPass ? GL_FALSE : GL_TRUE);
+                }
+                if (realtimePhase == 1)
+                {
+                    glEnable (GL_BLEND);
+                    for (unsigned attachment = 1; attachment < 8; ++attachment) gl.Disablei(GL_BLEND, attachment);
+                    gl.BlendFuncSeparate (GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+                    glDepthMask (GL_FALSE);
+                }
+                else if (realtimePhase == 2)
+                {
+                    glDisable (GL_BLEND);
+                    glDepthMask (GL_TRUE);
                 }
                 if (drawObject.indexCount == 0)
                     continue;
@@ -9591,6 +11337,65 @@ public:
                 const auto indexOffset = reinterpret_cast<const void*> (
                     static_cast<std::uintptr_t> (drawObject.firstIndex)
                     * sizeof (std::uint32_t));
+                // Depth prepass for a walked glass draw in the closed-glass bands. The same
+                // program draws the object first with color writes off and Output::Mask in
+                // uImageOutput, which runs the alpha test and returns before the walk. It tests
+                // GL_LESS and writes stencil 1 where it wins. The shading draw then needs
+                // GL_EQUAL depth and stencil 1, writes stencil 0 and no depth. A fragment that
+                // ties an earlier object's depth never set stencil, so the earlier object keeps
+                // the pixel, and of several tied fragments of this object the first one shades.
+                // Both match the single GL_LESS draw. The vertex shader never reads
+                // uImageOutput, so both draws produce the same gl_Position and the same depth.
+                // Blended draws, other image outputs and the selected rough camera, whose
+                // shading discards after the image-output test, keep the single GL_LESS draw.
+                const bool depthPrepass = glassDepthPrepass && !resources->instancedSharedGeometry
+                    && alphaMode != SceneAlphaMode::Blend && drawImageOutput == 0.0f
+                    && glassTransportMode > 0.5f
+                    && !(glassTransportMode == 1.0f
+                         && resources->smoothGlass.roughConsumer.version == smoothglass::kMultipleScatterVersion);
+                struct DepthPrepassRestore
+                {
+                    bool active;
+                    ~DepthPrepassRestore()
+                    {
+                        if (! active) return;
+                        glDisable (GL_STENCIL_TEST);
+                        glDepthMask (GL_TRUE);
+                        glDepthFunc (GL_LESS);
+                    }
+                } const depthPrepassRestore { depthPrepass };
+                if (depthPrepass)
+                {
+                    GLboolean colorMask[4] {};
+                    glGetBooleanv (GL_COLOR_WRITEMASK, colorMask);
+                    glEnable (GL_STENCIL_TEST);
+                    glStencilFunc (GL_ALWAYS, 1, 0xff);
+                    glStencilOp (GL_KEEP, GL_KEEP, GL_REPLACE);
+                    glColorMask (GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                    glDepthMask (GL_TRUE);
+                    glDepthFunc (GL_LESS);
+                    gl.Uniform4f (locations.imageOutput, static_cast<float> (renderpassoutput::Output::Mask),
+                                  identityColor[0], identityColor[1], identityColor[2]);
+                    gl.Uniform1i (locations.noteInstanceIndex, objectInstanceDraw ? 0 : -1);
+                    gl.DrawElementsInstanced (GL_TRIANGLES, static_cast<int> (drawObject.indexCount),
+                        GL_UNSIGNED_INT, indexOffset, static_cast<int> (objectInstanceDraw
+                            ? scene->objectInstanceCount : noteInstances.count));
+                    glassoverdraw::depthPrepassDraws().fetch_add (1, std::memory_order_relaxed);
+                    glColorMask (colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+                    gl.Uniform4f (locations.imageOutput, drawImageOutput,
+                                  identityColor[0], identityColor[1], identityColor[2]);
+                    glStencilFunc (GL_EQUAL, 1, 0xff);
+                    glStencilOp (GL_KEEP, GL_KEEP, GL_ZERO);
+                    glDepthMask (GL_FALSE);
+                    glDepthFunc (GL_EQUAL);
+                }
+                // Ends this object's probe queries when the iteration leaves. The walk mode is
+                // the uGlassTransport.x value this draw shades with (glassTransportMode), so the
+                // tag names the walk the draw runs. With the probe off nothing else is evaluated.
+                // The scope opens after the depth prepass draw, so only the shading draw counts.
+                const GlassOverdrawDrawScope overdrawScope (glassOverdrawProbe, drawObject.id.value,
+                    glassOverdrawProbe != nullptr ? glassoverdraw::walkMode(glassTransportMode)
+                                                  : std::uint8_t (glassoverdraw::kOrdinary));
                 if (resources->instancedSharedGeometry)
                 {
                     for (std::size_t noteIndex = 0; noteIndex < noteInstances.count; ++noteIndex)
@@ -9626,8 +11431,13 @@ public:
                 gl.DrawElementsInstanced(GL_TRIANGLES,
                     static_cast<int>(drawObject.indexCount), GL_UNSIGNED_INT,
                     indexOffset, static_cast<int>(noteInstances.count));
-                if (authoredDiffraction && drawProgram && drawProgram->spectralReflectance
-                    && !validateDiffractionDraw()) { diffractionComplete=false; return; }
+                if (authoredDiffraction
+                    && !validateDiffractionDraw(0,
+                        "draw[s" + std::to_string(stage)
+                        + "#" + std::to_string(objectIndex)
+                        + "id" + std::to_string(drawObject.id.value)
+                        + (drawProgram && drawProgram->spectralReflectance ? "*spec" : "")
+                        + "]")) { diffractionComplete=false; return; }
                 if (noteInstances.admitted)
                 {
                     ++noteInstanceDrawCount;
@@ -9638,10 +11448,55 @@ public:
             gl.Uniform4fv(locations.motionRotation, 1, motion.rotation.data());
             gl.Uniform4fv(locations.motionTranslationScale, 1, motion.translationScale.data());
         };
+        struct SnapshotTextures
+        {
+            std::array<unsigned, 2>& ids;
+            ~SnapshotTextures() { if (ids[0] != 0 || ids[1] != 0) glDeleteTextures (2, ids.data()); }
+        } const snapshotTextures { realtimeTextures };
+        // Draws phases 1 and 2 over what the frame holds now. False if a snapshot has no texture.
+        const auto realtimeReflectionAndGlass = [&] {
+            glGenTextures (2, realtimeTextures.data());
+            for (unsigned index = 0; index < realtimeTextures.size(); ++index)
+            {
+                gl.ActiveTexture (GL_TEXTURE14 + index);
+                gl.BindSampler (14 + index, 0);
+                glBindTexture (GL_TEXTURE_2D, realtimeTextures[index]);
+                const auto filter = index == 0 ? GL_LINEAR : GL_NEAREST;
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D (GL_TEXTURE_2D, 0, index == 1 ? GL_R32F : frame->linearColor || diffractionFrame ? GL_RGBA16F : GL_RGBA8,
+                              int(width), int(height), 0, index == 1 ? GL_RED : GL_RGBA, GL_FLOAT, nullptr);
+            }
+            if (realtimeTextures[0] == 0 || realtimeTextures[1] == 0)
+                return false;
+            realtimeSnapshot();
+            realtimePhase = 1;
+            drawSurfaces (-1);
+            realtimePhase = 2;
+            drawSurfaces (-1);
+            realtimePhase = -1;
+            glDisable (GL_BLEND);
+            glDepthMask (GL_TRUE);
+            glDepthFunc (GL_LESS);
+            return true;
+        };
         if (materialKind == NativeFixtureMaterialKind::DiffractionReflective)
         {
+            // Probe: validate both Color targets before any scene draw. The
+            // readback inspects frame->accumulationTexture_ while the scene may
+            // draw into frame->texture_; whichever one already reads nonfinite
+            // names the poisoned buffer.
+            if (authoredDiffraction && !validateDiffractionDraw(0, "before-draws@accumulation"))
+                return fail(result.error);
+            if (authoredDiffraction && !validateDiffractionDraw(frame->texture_, "before-draws@texture"))
+                return fail(result.error);
+            realtimePhase = realtimeGratingPasses ? 0 : -1;
             if (mixedMaterials) drawSurfaces(0);
             if (!diffractionComplete) return fail(result.error);
+            if (authoredDiffraction && !validateDiffractionDraw(0, "post-stage0"))
+                return fail(result.error);
             values = gratingValues;
             const auto* gratingDeformed = resources->deformedWindingFor (object.firstVertex);
             const bool gratingJointsMixed = mixedMaterials && gratingDeformed != nullptr
@@ -9711,6 +11566,7 @@ public:
             {
                 if (band != 0)
                 {
+                    glFlush();
                     const unsigned attachments[] {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
                         GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT6, GL_COLOR_ATTACHMENT7};
                     gl.DrawBuffers(8, attachments);
@@ -9788,7 +11644,7 @@ public:
                                           static_cast<int> (object.indexCount),
                                           GL_UNSIGNED_INT, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(object.firstIndex) * sizeof(std::uint32_t)),
                                           static_cast<int>(noteInstances.count));
-                if (authoredDiffraction && !validateDiffractionDraw()) return fail(result.error);
+                if (authoredDiffraction && !validateDiffractionDraw(0, "banded-draw")) return fail(result.error);
                 if (noteInstances.admitted)
                 {
                     ++noteInstanceDrawCount;
@@ -9803,8 +11659,14 @@ public:
                 gl.DrawBuffers(8, attachments);
                 drawSurfaces(1);
                 if (!diffractionComplete) return fail(result.error);
+                if (realtimeGratingPasses)
+                {
+                    if (!realtimeReflectionAndGlass())
+                        return fail("OpenGL Realtime snapshot allocation failed");
+                    if (!diffractionComplete) return fail(result.error);
+                }
             }
-            if (authoredDiffraction && !validateDiffractionDraw()) return fail(result.error);
+            if (authoredDiffraction && !validateDiffractionDraw(0, "scene-complete")) return fail(result.error);
             gl.GenFramebuffers(1, &resolveFramebuffer);
             gl.BindFramebuffer(GL_FRAMEBUFFER, resolveFramebuffer);
             gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -9818,7 +11680,7 @@ public:
             glDisable(GL_DEPTH_TEST);
             glDepthMask(GL_FALSE);
             const auto clearColor = runtimeInputs.imageOutput == renderpassoutput::Output::Color
-                && !runtimeInputs.passComposite ? background : emptyPass;
+                && (!runtimeInputs.passComposite || cameraHiddenBackdrop) ? background : emptyPass;
             gl.ClearBufferfv(GL_COLOR, 0, clearColor);
             if (runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage)
             {
@@ -9872,6 +11734,20 @@ public:
             };
             const bool selected=smoothglass::multipleScatterCamera(resources->smoothGlass);
             RoughSelectedCamera selectedCamera(gl,resources->queryContext,resources->rendererGeneration);
+            roughglasstiles::SelectedOwnerFrame selectedOwners;
+            std::array<float,4> selectedProjection{},selectedRotation{};std::array<float,3> selectedTranslation{};
+            if(selected) {
+                if(!selectedOwners.prepare(width,height,result.error))return fail(result.error);
+                using GetUniformfvProc=void (APIENTRY*)(GLuint,GLint,GLfloat*);
+                const auto getFloat=reinterpret_cast<GetUniformfvProc>(glfwGetProcAddress("glGetUniformfv"));
+                const int projection=gl.GetUniformLocation(resources->program,"uProjection");
+                const int rotation=gl.GetUniformLocation(resources->program,"uCameraRotation");
+                const int translation=gl.GetUniformLocation(resources->program,"uCameraTranslation");
+                if(!getFloat || projection<0 || rotation<0 || translation<0)return fail("OpenGL selected camera has no camera uniforms for its promoted depth");
+                getFloat(resources->program,projection,selectedProjection.data());
+                getFloat(resources->program,rotation,selectedRotation.data());
+                getFloat(resources->program,translation,selectedTranslation.data());
+            }
             if(selected && !selectedCamera.initialize(roughSchedule->maximumTilePixels(),result.error))return fail(result.error);
             for (const auto& tile : roughSchedule->tiles())
             {
@@ -9880,8 +11756,9 @@ public:
                 std::array<NativeRawPassPixels,3> receipts;
                 std::vector<roughglasstiles::NativeTileReceipt::Work> nativeWork;
                 std::vector<std::array<std::uint32_t,4>> selectedIds;
+                std::vector<std::array<float,3>> selectedNormals,selectedPositions;
                 if(selected && !selectedCamera.run(tile,roughKey,resources->smoothGlass,resources->program,
-                    glassControl,glassEmission,receipts,nativeWork,selectedIds,completion.aggregate().microWork,result.error))return fail(result.error);
+                    glassControl,resources->sceneTableTexture,receipts,nativeWork,selectedIds,selectedNormals,selectedPositions,0,result.error))return fail(result.error);
                 // Product attachments retain the full-frame viewport/camera.
                 // Scissor bounds Color and receipt work to this admitted job.
                 gl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
@@ -9965,25 +11842,47 @@ public:
                         tile.width, tile.height, format, pixels, result.error);
                 };
                 if (!readProduct(GL_COLOR_ATTACHMENT6, NativeTexturePixelFormat::R32Uint, objects)
-                    || !readProduct(GL_COLOR_ATTACHMENT5, NativeTexturePixelFormat::R32Uint, materials)
-                    || !readProduct(GL_COLOR_ATTACHMENT2, NativeTexturePixelFormat::Rgba16Float, normal)
+                    || !readProduct(GL_COLOR_ATTACHMENT5, NativeTexturePixelFormat::R32Uint, materials))
+                    return fail(result.error);
+                if(selected) {
+                    std::vector<std::size_t> promoted;
+                    if(!selectedOwners.reconcile(tile.x,tile.y,tile.width,tile.height,resources->smoothGlass.object.value,
+                        selectedIds,objects,materials,promoted,result.error))return fail(result.error);
+                    // The walk has normal, owners and first-hit depth. It has no emission or motion, and
+                    // the hardware depth buffer isn't written, so those keep what raster left here.
+                    gl.ActiveTexture(GL_TEXTURE0);
+                    for(const auto pixel:promoted) {
+                        const int x=int(tile.x+pixel%tile.width),y=int(bottom+tile.height-1-pixel/tile.width);
+                        const std::array<float,4> surface{selectedNormals[pixel][0],selectedNormals[pixel][1],selectedNormals[pixel][2],1.0f};
+                        const std::uint8_t mask=255;
+                        const float linearDepth=roughglasstiles::promotedLinearDepth(selectedPositions[pixel],selectedTranslation,selectedRotation,selectedProjection[2],selectedProjection[3]);
+                        glBindTexture(GL_TEXTURE_2D,frame->depthTexture_);glTexSubImage2D(GL_TEXTURE_2D,0,x,y,1,1,GL_RED,GL_FLOAT,&linearDepth);
+                        glBindTexture(GL_TEXTURE_2D,frame->rawTextures[0]);glTexSubImage2D(GL_TEXTURE_2D,0,x,y,1,1,GL_RGBA,GL_FLOAT,surface.data());
+                        glBindTexture(GL_TEXTURE_2D,frame->rawTextures[2]);glTexSubImage2D(GL_TEXTURE_2D,0,x,y,1,1,GL_RED,GL_UNSIGNED_BYTE,&mask);
+                        glBindTexture(GL_TEXTURE_2D,frame->rawTextures[3]);glTexSubImage2D(GL_TEXTURE_2D,0,x,y,1,1,GL_RED_INTEGER,GL_UNSIGNED_INT,&selectedIds[pixel][1]);
+                        glBindTexture(GL_TEXTURE_2D,frame->rawTextures[4]);glTexSubImage2D(GL_TEXTURE_2D,0,x,y,1,1,GL_RED_INTEGER,GL_UNSIGNED_INT,&selectedIds[pixel][0]);
+                    }
+                    if(glGetError()!=GL_NO_ERROR)return fail("OpenGL selected camera edge owner upload failed");
+                }
+                if (!readProduct(GL_COLOR_ATTACHMENT2, NativeTexturePixelFormat::Rgba16Float, normal)
                     || !readProduct(GL_COLOR_ATTACHMENT0, runtimeInputs.linearColor
                         ? NativeTexturePixelFormat::Rgba16Float : NativeTexturePixelFormat::Rgba8Unorm, color))
                     return fail(result.error);
                 if (!ownerValid()) return fail("OpenGL rough tile GPU frame owner changed during readback");
-                if(selected)for(std::size_t pixel=0;pixel<tile.pixels();++pixel) {
-                    std::uint32_t objectId=0,materialId=0;
-                    std::memcpy(&objectId,objects.bytes.data()+pixel*4,4);std::memcpy(&materialId,materials.bytes.data()+pixel*4,4);
-                    if(objectId!=selectedIds[pixel][0] || materialId!=selectedIds[pixel][1])
-                        return fail("OpenGL selected camera result differs from completed primary raster ownership");
-                }
                 const roughglasstiles::NativeTileReceipt receipt {true, &receipts[0], &receipts[1], &receipts[2],
                     &objects, &materials, &normal, &color,selected?&nativeWork:nullptr};
                 if (!completion.accept(roughKey, tile, receipt, result.error)) return fail(result.error);
             }
+            if(selected && !selectedOwners.finish(resources->smoothGlass.object.value,result.error))return fail(result.error);
             if (!ownerValid() || !completion.publish(roughKey, result.stats, frame->roughTileAggregate, result.error))
                 return fail(result.error.empty() ? "OpenGL rough tiled frame lost its publication owner" : result.error);
             if(selected) {
+                frame->roughTileAggregate.promotedPixels=selectedOwners.promotedPixels();
+                frame->roughTileAggregate.silhouettePixels=selectedOwners.silhouettePixels();
+                frame->roughTileAggregate.deferredOwnerPixels=selectedOwners.deferredPixels();
+                if(selectedOwners.promotedPixels())
+                    std::fprintf(stderr,"[gl] selected camera %ux%u: promoted %llu of %llu silhouette pixels, %llu checked at frame end\n",width,height,
+                        (unsigned long long)selectedOwners.promotedPixels(),(unsigned long long)selectedOwners.silhouettePixels(),(unsigned long long)selectedOwners.deferredPixels());
 #if !defined(__APPLE__)
                 if(resources->causticSubmissionSerial==std::numeric_limits<std::uint64_t>::max()
                     ||!roughglasstiles::opengl::completeSubmission(gl,result.error))return fail(result.error.empty()?"OpenGL selected query contract fence exhausted":result.error);
@@ -10012,11 +11911,23 @@ public:
             // One long glass submission trips the driver's context switch
             // timeout (see kClosedGlassBandPixels). Bands cover disjoint rows
             // of the full-frame viewport, so every pixel is shaded once.
-            const auto bandRows = smoothglass::closedGlassBandRows(width);
-            if (bandRows == 0) return fail("OpenGL closed glass band size is empty");
+            if (smoothglass::closedGlassBandRows(width) == 0) return fail("OpenGL closed glass band size is empty");
+            // At most kClosedGlassBandPixels each, and smaller when the last band or frame
+            // took long enough that a band would pass 33 ms. Without a program yet, the
+            // frame runs at the first size.
+            roughglasstiles::GlassBandBudget firstBandBudget {roughglasstiles::kFirstGlassBandPixels, smoothglass::kClosedGlassBandPixels};
+            auto& bandBudget = resources->sharedProgram ? resources->sharedProgram->glassBandBudget : firstBandBudget;
             // Export finishes every band. Preview flushes each band to the GPU and waits
-            // on none of them up to 2560x1440 (smoothglass::cameraWalkBudget).
-            const bool bandFinish = smoothglass::cameraWalkBudget(runtimeInputs.previewUse, width, height).bandFinish;
+            // on none of them up to 2560x1440 (smoothglass::cameraWalkBudget), in both
+            // render modes: a band covers the same rows either way, so the finish changes
+            // when the CPU waits, not a pixel. Larger Preview frames still finish each
+            // band. The draw's final wait below is a glFinish unless the caller set
+            // previewCallerWaits: the caustic route sets it on its Preview base, which
+            // then only flushes, and the renderer leaves it false on an ordinary
+            // Preview draw, which waits. Both predate the render mode; follow-up.
+            // A test run finishes every band so it can yield after each one.
+            const bool bandFinish = smoothglass::cameraWalkBudget(runtimeInputs.previewUse, width, height).bandFinish
+                || testpacing::enabled();
             // Preview glass GPU time: two timestamps around the bands, read one frame
             // late with one availability check, never waited on.
             auto* glassTimer = previewGlassFrame ? resources->sharedProgram.get() : nullptr;
@@ -10038,6 +11949,11 @@ public:
                         queryResult(glassTimer->glassTimer[0], GL_QUERY_RESULT, &begin);
                         queryResult(glassTimer->glassTimer[1], GL_QUERY_RESULT, &end);
                         glassTimer->lastGlassGpuMilliseconds = end >= begin ? double(end - begin) * 1e-6 : 0.0;
+                        // A flushed frame has no band times, so the last frame's mean band, raised
+                        // to its hardest band's measured share, sizes this one's.
+                        if (! bandFinish && glassTimer->glassTimedBands != 0)
+                            bandBudget.observe(std::uint64_t(width) * height / glassTimer->glassTimedBands,
+                                std::chrono::nanoseconds(std::int64_t(glassTimer->lastGlassGpuMilliseconds * 1e6 * roughglasstiles::kFlushedBandPeak / glassTimer->glassTimedBands)));
                         glassTimer->glassTimerPending = false;
                     }
                 }
@@ -10047,25 +11963,85 @@ public:
                     glassStamped = true;
                 }
             }
+            // ARBIT_GL_GLASS_OVERDRAW_PROBE=1: per-object invocation and samples-passed
+            // queries around these bands, read on a later frame without a wait.
+            GlassOverdrawProbe* overdraw = nullptr;
+            if (glassOverdrawProbeEnabled() && resources->sharedProgram)
+            {
+                auto& shared = *resources->sharedProgram;
+                if (!shared.glassOverdraw) shared.glassOverdraw = std::make_unique<GlassOverdrawProbe>();
+                if (shared.glassOverdraw->beginFrame(gl, width, height)) overdraw = shared.glassOverdraw.get();
+            }
+            glassOverdrawProbe = overdraw;
+            glassDepthPrepass = glassBandStencil && glassDepthPrepassEnabled();
             const auto bandsStarted = std::chrono::steady_clock::now();
             const bool bandScissorWasEnabled = glIsEnabled (GL_SCISSOR_TEST) == GL_TRUE;
             int bandScissorBox[4] = {};
             glGetIntegerv (GL_SCISSOR_BOX, bandScissorBox);
+            // The prepass changes the stencil function, operations, write mask and clear
+            // value. These are put back after the bands. Nothing in this backend sets
+            // separate back-face stencil state, so the GL 1.0 calls restore both faces.
+            std::array<GLint, 8> stencil {};
+            constexpr std::array<GLenum, 8> stencilNames { GL_STENCIL_FUNC, GL_STENCIL_REF,
+                GL_STENCIL_VALUE_MASK, GL_STENCIL_WRITEMASK, GL_STENCIL_FAIL,
+                GL_STENCIL_PASS_DEPTH_FAIL, GL_STENCIL_PASS_DEPTH_PASS, GL_STENCIL_CLEAR_VALUE };
+            if (glassDepthPrepass)
+            {
+                for (std::size_t i = 0; i < stencilNames.size(); ++i)
+                    glGetIntegerv (stencilNames[i], &stencil[i]);
+                glStencilMask (0xff);
+                glClearStencil (0);
+                glDisable (GL_SCISSOR_TEST);
+                glClear (GL_STENCIL_BUFFER_BIT);
+            }
             glEnable(GL_SCISSOR_TEST);
             std::uint32_t bandCount = 0;
-            for (std::uint32_t origin = 0; origin < height; origin += bandRows)
+            // The glass block, timed from its bands to its log: a slow Preview
+            // shows whether this pass or the draw tail below absorbed the frame.
+            loopstep::Scope bandsScope ("gl:glass-band-pass");
+            std::uint32_t largestBandRows = 0;
+            // A test run times each band on the GPU, to split its hold in the log.
+            std::array<GLuint, 2> bandStamps {};
+            const auto stampCounter = testpacing::enabled() ? reinterpret_cast<PFNGLQUERYCOUNTERPROC>(glfwGetProcAddress("glQueryCounter")) : nullptr;
+            const auto stampResult = testpacing::enabled() ? reinterpret_cast<PFNGLGETQUERYOBJECTUI64VPROC>(glfwGetProcAddress("glGetQueryObjectui64v")) : nullptr;
+            const auto stampGen = testpacing::enabled() ? reinterpret_cast<PFNGLGENQUERIESPROC>(glfwGetProcAddress("glGenQueries")) : nullptr;
+            const auto stampDelete = testpacing::enabled() ? reinterpret_cast<PFNGLDELETEQUERIESPROC>(glfwGetProcAddress("glDeleteQueries")) : nullptr;
+            const bool stampBands = stampCounter && stampResult && stampGen && stampDelete;
+            if (stampBands) stampGen(2, bandStamps.data());
+            for (std::uint32_t bandX = 0, origin = 0; origin < height;)
             {
-                glScissor(0, static_cast<int>(origin), static_cast<int>(width),
-                          static_cast<int>(std::min(bandRows, height - origin)));
+                const auto band = roughglasstiles::nextGlassBand(bandBudget, width, height, bandX, origin);
+                const auto rows = band.rows;
+                largestBandRows = std::max(largestBandRows, rows);
+                const auto bandStarted = std::chrono::steady_clock::now();
+                glScissor(static_cast<int>(band.x), static_cast<int>(origin), static_cast<int>(band.columns), static_cast<int>(rows));
+                if (stampBands) stampCounter(bandStamps[0], GL_TIMESTAMP);
                 drawSurfaces(-1);
+                if (stampBands) stampCounter(bandStamps[1], GL_TIMESTAMP);
+                const std::chrono::duration<double, std::milli> bandEncode = std::chrono::steady_clock::now() - bandStarted;
                 ++bandCount;
                 if (bandFinish)
                 {
                     loopstep::Scope bandFinishScope ("gl:closed-glass-band-finish");
                     glFinish();
+                    const std::chrono::nanoseconds held = std::chrono::steady_clock::now() - bandStarted;
+                    bandBudget.observe(band.pixels(), held);
+                    if (stampBands)
+                    {
+                        GLuint64 begin = 0, end = 0;
+                        stampResult(bandStamps[0], GL_QUERY_RESULT, &begin);
+                        stampResult(bandStamps[1], GL_QUERY_RESULT, &end);
+                        testpacing::logBand(band.columns, rows, band.pixels(), bandEncode.count(),
+                            end >= begin ? double(end - begin) * 1e-6 : 0.0, held);
+                    }
+                    testpacing::afterSubmission(held);
                 }
                 else glFlush();
+                bandX += band.columns;
+                if (bandX >= width) { bandX = 0; origin += rows; }
             }
+            if (stampBands) stampDelete(2, bandStamps.data());
+            if (glassTimer) glassTimer->glassTimedBands = bandCount;
             glScissor(bandScissorBox[0], bandScissorBox[1], bandScissorBox[2], bandScissorBox[3]);
             if (bandScissorWasEnabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
             if (glassStamped)
@@ -10073,6 +12049,19 @@ public:
                 queryCounter(glassTimer->glassTimer[1], GL_TIMESTAMP);
                 glassTimer->glassTimerPending = true;
             }
+            glassOverdrawProbe = nullptr;
+            if (glassDepthPrepass)
+            {
+                glDisable (GL_STENCIL_TEST);
+                glStencilFunc (static_cast<GLenum> (stencil[0]), stencil[1], static_cast<GLuint> (stencil[2]));
+                glStencilMask (static_cast<GLuint> (stencil[3]));
+                glStencilOp (static_cast<GLenum> (stencil[4]), static_cast<GLenum> (stencil[5]),
+                             static_cast<GLenum> (stencil[6]));
+                glClearStencil (stencil[7]);
+            }
+            glassDepthPrepass = false;
+            // The coverage passes run after the end timestamp, outside the glass GPU time.
+            if (overdraw) overdraw->endFrame(gl, bandCount, frame->rawTextures[4]);
             if (previewGlassFrame)
             {
                 // The base breakdown of a slow Preview glass frame, at most once a second.
@@ -10089,30 +12078,40 @@ public:
                     glassLogged = now;return true;
                 }();
                 if (glassLog)
-                    std::fprintf(stderr, "[gl] glass base preview %ux%u: bands %u of %u rows (%s), program %s, "
+                    std::fprintf(stderr, "[gl] glass base preview %ux%u: bands %u of up to %u rows (%s), program %s, "
                         "visits %u, encode %.1f ms, gpu glass %.1f ms (one frame late)\n",
-                        width, height, bandCount, bandRows, bandFinish ? "finished" : "flushed",
-                        previewGlassProgram ? "preview" : "export (preview variant pending)",
-                        previewGlassProgram ? smoothglass::kPreviewCameraVisits : 48u,
+                        width, height, bandCount, largestBandRows, bandFinish ? "finished" : "flushed",
+                        previewGlassProgram ? "preview" : previewGlassWalk ? "export (preview variant pending)" : "export (accurate)",
+                        previewGlassProgram ? fastPreviewGlassVisits() : 48u,
                         encodeMilliseconds, gpuMilliseconds);
             }
+        }
+        else if (realtimePasses)
+        {
+            realtimePhase = 0;
+            drawSurfaces (-1);
+            if (!realtimeReflectionAndGlass())
+                return fail ("OpenGL Realtime snapshot allocation failed");
         }
         else
         { drawSurfaces(-1); }
         // A Preview caustic base never waits here. It is flushed, and the caustic passes,
         // the resolve and the present read it in this context, after it in GL order.
+        {
+            loopstep::Scope drawFlushScope ("gl:fixture-draw-flush");
         if (!(runtimeInputs.previewUse && runtimeInputs.previewCallerWaits))
         {
             loopstep::Scope drawFinishScope ("gl:fixture-draw-finish");
             glFinish();
         }
         else glFlush();
+        }
         const auto gpuError = glGetError();
         if (gpuError != GL_NO_ERROR)
             return fail ("OpenGL fixture draw reported GPU error "
                          + std::to_string (static_cast<unsigned> (gpuError)));
         if (authoredDiffraction && runtimeInputs.linearColor
-            && !validateDiffractionDraw(frame->texture_)) return fail(result.error);
+            && !validateDiffractionDraw(frame->texture_, "resolve-output")) return fail(result.error);
         // Preview keeps the frame on the GPU: no Normal or Color readback and no CPU scan.
         // The glass shader already writes zero for a non-finite or incomplete glass pixel.
         if (resources->smoothGlass.enabled && !roughGlassFrame && !runtimeInputs.previewUse) {
@@ -10396,8 +12395,6 @@ public:
         NativeDeformationPreparation result;
         if (source->compositionOwner && !source->compositionOwner->matches(*source))
         { result.error = "native OpenGL composition batch has a foreign owner"; return result; }
-        if (source->draws.size() > HarmonicMIDI::grid::Visual3DScene::kMaxObjects)
-        { result.error = "native OpenGL deformation draw capacity exceeded"; return result; }
         OpenGlFixtureSceneBackend fixtureBackend;
         const auto fixture = fixtureBackend.prepare(source->scene, materialProgram);
         if (!fixture.prepared) { result.error = fixture.error; return result; }
@@ -10506,7 +12503,7 @@ public:
         resources->gl = gl;
         resources->source = source;
         resources->fixture = fixture;
-        auto fail = [&] (std::string error)
+        const auto releaseOwned = [&]
         {
             if (resources->computeProgram != 0)
                 gl.DeleteProgram (resources->computeProgram);
@@ -10520,6 +12517,14 @@ public:
                            static_cast<unsigned> (previousShaderStorageBuffer));
             previous.restore();
             resources->ownerContext = nullptr;
+        };
+        // An exception unwinds under fixtureMutex, which the resources' destructor would take again.
+        ScopeCleanup releaseOnThrow { [&] {
+            if (std::uncaught_exceptions() != 0 && resources) releaseOwned();
+        } };
+        auto fail = [&] (std::string error)
+        {
+            releaseOwned();
             result.error = std::move (error);
             return result;
         };
@@ -10818,7 +12823,7 @@ public:
             for (unsigned binding = 0; binding < previousBindings.size(); ++binding)
                 gl.GetIntegeri_v (GL_SHADER_STORAGE_BUFFER_BINDING, binding,
                                   &previousBindings[binding]);
-            const auto restore = [&]
+            ScopeCleanup restore { [&]
             {
                 previous.restore();
                 for (unsigned binding = 0; binding < previousBindings.size(); ++binding)
@@ -10826,7 +12831,7 @@ public:
                                        static_cast<unsigned> (previousBindings[binding]));
                 gl.BindBuffer (GL_SHADER_STORAGE_BUFFER,
                                static_cast<unsigned> (previousShaderStorageBuffer));
-            };
+            } };
             const auto object = std::find_if(source->scene->objects.begin(),
                 source->scene->objects.begin() + source->scene->objectCount,
                 [&](const auto& value) { return value.id == source->object; });
@@ -11357,7 +13362,7 @@ bool openGlCameraCoverageCosts(const OpenGlFixtureSceneFrame& frame,const OpenGl
     // lanes, parent program lanes and every fixed attempt. The byte gate stops
     // an oversized walk, so even a refused setup has a finite host envelope.
     // Local/world association additionally scans one bounded BLAS per triangle.
-    const auto passes=32ull*(HarmonicMIDI::grid::Visual3DScene::kMaxLights+std::size_t(OpenGlQueryArithmeticRole::Count)+1)
+    const auto passes=32ull*(attempt.cohort->sources().size()+std::size_t(OpenGlQueryArithmeticRole::Count)+1)
         *(OpenGlFixtureSceneFrame::kMaximumNativeAttempts+1);
     std::uint64_t association=0,source=0;
     if(!mul(renderpassoutput::kMaximumTotalBytes/4,passes,w[7])
@@ -11858,7 +13863,7 @@ public:
     GLFWwindow* context;
     std::uint64_t contextGeneration,rendererGeneration,oldBytes,workAfter=0,depositionAfter=0;
     double time;
-    std::array<SourceSeal,HarmonicMIDI::grid::Visual3DScene::kMaxLights> seals{};
+    std::vector<SourceSeal> seals;
     glasscaustics::DirectGratingTerminalNativeBudget budget;
     glasscaustics::DirectGratingTerminalOrderBounds reservation;
     const glasscaustics::DirectGratingTerminalOrderLedger* candidate=nullptr;
@@ -11882,7 +13887,7 @@ public:
 #else
         const auto resources=frame.staticResources;
         if(!lock.owns_lock()||directTerminalThreadLease!=this||frame.activeDirectTerminalLease!=this||frame.directGratingCohort.get()!=cohort||!cohort
-            ||sources.size()!=cohort->sources.size()||sources.size()>seals.size()||!resources||!resources->queryContext
+            ||sources.size()!=cohort->sources.size()||sources.size()!=seals.size()||!resources||!resources->queryContext
             ||!resources->queryContext->active||resources->queryContext->generation!=contextGeneration
             ||resources->queryContext->context!=context||glfwGetCurrentContext()!=context||frame.ownerContext!=context
             ||resources->ownerContext!=context||frame.rendererGeneration_!=rendererGeneration||resources->rendererGeneration!=rendererGeneration
@@ -11922,7 +13927,7 @@ public:
     GLFWwindow* context;
     std::uint64_t contextGeneration,rendererGeneration,generation,oldBytes,workAfter=0;
     double time;
-    std::array<OpenGlDirectTerminalLease::SourceSeal,HarmonicMIDI::grid::Visual3DScene::kMaxLights> seals{};
+    std::vector<OpenGlDirectTerminalLease::SourceSeal> seals;
     std::array<unsigned,5> common{}; // query, raster owners/triangle/depth, world triangles
     glasscaustics::DirectGratingTerminalReceiverNativeBudget budget;
     glasscaustics::DirectGratingTerminalReceiverBounds reservation;
@@ -11959,7 +13964,7 @@ public:
         const auto resources=frame.staticResources;
         if(!lock.owns_lock()||directReceiverThreadLease!=this||frame.activeDirectReceiverLease!=this
             ||frame.activeDirectTerminalLease||frame.directGratingCohort.get()!=cohort||!cohort||!cohort->binding
-            ||cohort->sources.empty()||cohort->sources.size()>seals.size()||terminal->owner()!=&frame
+            ||cohort->sources.empty()||cohort->sources.size()!=seals.size()||terminal->owner()!=&frame
             ||terminal->retained().incident.cohort!=cohort->binding||!(terminal->retained().incident.submission==cohort->submission)
             ||!resources||!resources->queryContext||!resources->queryContext->active
             ||resources->queryContext->generation!=contextGeneration||resources->queryContext->context!=context
@@ -12133,7 +14138,7 @@ bool OpenGlFixtureSceneFrame::beginDirectCohortTerminalLease(const glasscaustics
     else guard.lock();
     if(activeDirectTerminalLease||activeDirectReceiverLease||!directGratingCohort||!directGratingCohort->binding
         ||!(directGratingCohort->submission==expected)||!std::isfinite(time)||time!=gratingCameraEvaluationTime
-        ||sources.size()!=directGratingCohort->sources.size()||sources.empty()||sources.size()>HarmonicMIDI::grid::Visual3DScene::kMaxLights
+        ||sources.size()!=directGratingCohort->sources.size()||sources.empty()
         ||!staticResources||!staticResources->queryContext||ownerContext!=glfwGetCurrentContext())
     {error="OpenGL terminal begin requires its exact current common cohort";return false;}
     glasscaustics::DirectGratingTerminalNativeBudget native;
@@ -12143,6 +14148,7 @@ bool OpenGlFixtureSceneFrame::beginDirectCohortTerminalLease(const glasscaustics
     {error="OpenGL terminal lease registration exceeds storage cap";return false;}
     auto lease=std::make_unique<OpenGlDirectTerminalLease>(*this,std::move(guard),sources,time);lease->budget=native;
     lease->budget.retainedBytes+=overhead;
+    lease->seals.resize(sources.size());
     for(std::size_t i=0;i<sources.size();++i) {
         const auto* source=directGratingCohort->sources[i].get();const auto* batch=source?source->batch.get():nullptr;
         if(!batch||!batch->program||!batch->evidence){error="OpenGL terminal source has no completed native batch";return false;}
@@ -12249,6 +14255,7 @@ bool OpenGlFixtureSceneFrame::beginDirectTerminalReceiverLease(
     const auto generation=nextQueryOwnerGeneration();if(!generation)return false;
     auto lease=std::make_unique<OpenGlDirectTerminalReceiverLease>(*this,std::move(guard),terminal,time,generation);
     lease->budget=native;
+    lease->seals.resize(directGratingCohort->sources.size());
     for(std::size_t i=0;i<directGratingCohort->sources.size();++i) {
         const auto* source=directGratingCohort->sources[i].get();const auto* batch=source?source->batch.get():nullptr;
         if(!batch||!batch->program||!batch->evidence)return false;
@@ -13480,6 +15487,27 @@ struct OpenGlPreviewCausticPoll
     double elapsedMs=0,gpuRasterMilliseconds=0,gpuTraceMilliseconds=0,gpuDepositionMilliseconds=0;
     std::uint64_t splatGatherWork=0;
 };
+// One line when a Preview caustic's residency state changes. A resident schedule keeps
+// its identity across water steps, so the poll adopts its submission; without residency
+// every water step is a new identity and the docked preview never draws the caustic.
+void reportPreviewCausticResidency(const std::string& state)
+{
+    static std::mutex mutex;static std::string last;
+    const std::lock_guard lock(mutex);
+    if(last==state)return;
+    last=state;
+    std::fprintf(stderr,"[gl] caustic residency: %s\n",state.c_str());
+}
+// One line when a Preview submission reports whether it is still on the GPU, so a
+// preview that never wakes names the end that did not report it.
+void reportPreviewCausticSubmit(const std::string& state)
+{
+    static std::mutex mutex;static std::string last;
+    const std::lock_guard lock(mutex);
+    if(last==state)return;
+    last=state;
+    std::fprintf(stderr,"[gl] caustic submit report: %s\n",state.c_str());
+}
 // One line a second at most, for a Preview submission past its budget.
 bool previewCausticBudgetLogDue()
 {
@@ -13505,13 +15533,35 @@ OpenGlPreviewCausticPoll pollPreviewCausticJobUnlocked(const OpenGlFixtureSceneR
     const auto queryResult=reinterpret_cast<PFNGLGETQUERYOBJECTUI64VPROC>(glfwGetProcAddress("glGetQueryObjectui64v"));
     poll.elapsedMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-job.submitted).count();
     // A lost context never signals. Its submission is forgotten, not polled forever.
-    if(std::string resetError;!syncStatus||!job.fence||!causticContextIntact(resetError))
-    {resources.releasePreviewCausticJobUnlocked();return poll;}
+    std::string resetError;
+    bool contextIntact=false;
+    {
+    // verify68: this poll held 157-189 ms on frames whose submission was still on
+    // the GPU — the reset status query and the fence sync query are named
+    // separately to show which one waits.
+    loopstep::Scope pollResetScope("gl:caustic-poll-reset");
+    contextIntact=causticContextIntact(resetError);
+    }
+    if(!syncStatus||!job.fence||!contextIntact)
+    {
+        static int logged=0;
+        if(logged<4)
+        {
+            ++logged;
+            std::fprintf(stderr,"[gl] caustic poll released early: sync=%d fence=%d ctx=%d %s\n",
+                syncStatus!=nullptr?1:0,job.fence!=nullptr?1:0,contextIntact?1:0,resetError.c_str());
+        }
+        resources.releasePreviewCausticJobUnlocked();return poll;
+    }
     const auto ready=[&](unsigned index) {
         if(!job.stamps[index]||!queryAvailable)return false;
         int available=0;queryAvailable(job.stamps[index],GL_QUERY_RESULT_AVAILABLE,&available);return available!=0;
     };
-    int signalled=0;syncStatus(job.fence,GL_SYNC_STATUS,1,nullptr,&signalled);
+    int signalled=0;
+    {
+    loopstep::Scope pollSyncScope("gl:caustic-poll-sync");
+    syncStatus(job.fence,GL_SYNC_STATUS,1,nullptr,&signalled);
+    }
     if(signalled!=GL_SIGNALED)
     {
         poll.inFlight=true;
@@ -13519,7 +15569,7 @@ OpenGlPreviewCausticPoll pollPreviewCausticJobUnlocked(const OpenGlFixtureSceneR
         {
             // A submission still running past the severe multiple steps the ladder now, so
             // a slow device does not queue a second long submission behind it.
-            if(!job.overBudgetCounted&&!(poll.elapsedMs<kPreviewCausticSevereBudgetFactor*kPreviewCausticSubmitBudgetMilliseconds))
+            if(!job.overBudgetCounted&&!job.exportBudgets&&!(poll.elapsedMs<kPreviewCausticSevereBudgetFactor*kPreviewCausticSubmitBudgetMilliseconds))
             {job.overBudgetCounted=true;observeOpenGlPreviewCausticBudget(poll.elapsedMs);}
             // Name the stage still running from the timestamps that have landed.
             const char* step=!ready(1)?"gl:caustic-raster":!ready(2)?"gl:caustic-trace":"gl:caustic-deposition";
@@ -13529,6 +15579,15 @@ OpenGlPreviewCausticPoll pollPreviewCausticJobUnlocked(const OpenGlFixtureSceneR
         }
         return poll;
     }
+    {
+    // verify69: the poll's two status queries stayed under 1 ms while this tail
+    // held 250 and 128 — timestamps, counter copy and adoption are timed apart
+    // from the job release below.
+    loopstep::Scope pollReadScope("gl:caustic-poll-read");
+    {
+    // verify70: this tail held 240/156/146/101/95 while both status queries stayed
+    // under 1 ms — stamps, the counter read and the adoption are named apart.
+    loopstep::Scope pollStampsScope("gl:caustic-poll-stamps");
     // Signalled: the timestamps and counters below are complete, so no read waits.
     std::array<GLuint64,4> at{};std::array<bool,4> landed{};
     for(unsigned i=0;i<at.size();++i)if(ready(i)&&queryResult) {queryResult(job.stamps[i],GL_QUERY_RESULT,&at[i]);landed[i]=true;}
@@ -13537,13 +15596,16 @@ OpenGlPreviewCausticPoll pollPreviewCausticJobUnlocked(const OpenGlFixtureSceneR
     // The GPU time from raster start to deposition end does not count frames the viewport
     // did not ask for. Without timestamps the age stands in.
     const double gpuMilliseconds=landed[0]&&landed[3]?span(0,3):poll.elapsedMs;
-    if(!job.overBudgetCounted)observeOpenGlPreviewCausticBudget(gpuMilliseconds);
+    if(!job.overBudgetCounted&&!job.exportBudgets)observeOpenGlPreviewCausticBudget(gpuMilliseconds);
     if(decidePreviewCausticOverBudget(gpuMilliseconds,kPreviewCausticSubmitBudgetMilliseconds)&&previewCausticBudgetLogDue())
         std::fprintf(stderr,"[gl] caustic preview submit over budget: %.0f ms on the GPU (budget %.0f ms): "
             "gl:caustic-raster %.1f ms, gl:caustic-trace %.1f ms, gl:caustic-deposition %.1f ms\n",
             gpuMilliseconds,kPreviewCausticSubmitBudgetMilliseconds,
             poll.gpuRasterMilliseconds,poll.gpuTraceMilliseconds,poll.gpuDepositionMilliseconds);
+    }
     bool usable=true;
+    {
+    loopstep::Scope pollCountersScope("gl:caustic-poll-counters");
     if(job.splat)
     {
         std::uint32_t overflow=0,gatherWork=0;
@@ -13561,14 +15623,61 @@ OpenGlPreviewCausticPoll pollPreviewCausticJobUnlocked(const OpenGlFixtureSceneR
         }
         else poll.splatGatherWork=gatherWork;
     }
+    }
+    {
+    loopstep::Scope pollAdoptScope("gl:caustic-poll-adopt");
     if(usable&&current&&job.schedule==*current&&job.spectrum[0]&&job.spectrum[1])
     {
-        for(auto& buffer:resources.previewSpectrumBuffers)if(buffer){gl.DeleteBuffers(1,&buffer);buffer=0;}
-        resources.previewSpectrumBuffers=job.spectrum;job.spectrum={};
+        {
+        // verify71: this pool return held 197/180/91/44 while stamps and counters
+        // stayed under 1 ms — its refill now lands in the four-deep ring with no
+        // delete at all (verify72: this scope prints nothing).
+        loopstep::Scope adoptPoolScope("gl:caustic-adopt-pool");
+        for(unsigned slot:{0u,1u})
+            if(resources.previewSpectrumBuffers[slot])
+            {
+                resources.poolCausticBufferUnlocked(slot?6u:2u,resources.previewSpectrumBuffers[slot],resources.previewSpectrumBufferBytes[slot]);
+                resources.previewSpectrumBuffers[slot]=0;
+            }
+        }
+        resources.previewSpectrumBuffers=job.spectrum;resources.previewSpectrumBufferBytes=job.spectrumBytes;job.spectrum={};
         resources.previewSpectrumKey=job.exact;resources.previewSpectrumSchedule=job.schedule;
         poll.adopted=true;
     }
+    else if(usable&&current&&job.schedule!=*current)
+    {
+        // The submission finishes and is dropped instead of drawn. Named with both
+        // identities so a preview that never adopts says which component moves.
+        static int logged=0;
+        if(logged<4)
+        {
+            ++logged;
+            std::fprintf(stderr,"[gl] caustic schedule dropped: job=[%s] current=[%s] ctx=%d gen=%d size=%ux%u vs %ux%u\n",
+                job.schedule.scheduleIdentity.c_str(),current->scheduleIdentity.c_str(),
+                job.schedule.context==current->context?1:0,
+                job.schedule.rendererGeneration==current->rendererGeneration?1:0,
+                job.schedule.width,job.schedule.height,current->width,current->height);
+        }
+    }
+    {
+        // The signalled poll's verdict: adopted, dropped by identity, or dropped with
+        // unusable counters. Without this a preview that never draws the caustic only
+        // shows that it stopped asking.
+        static int logged=0;
+        if(logged<6)
+        {
+            ++logged;
+            std::fprintf(stderr,"[gl] caustic poll: adopted=%d usable=%d same=%d inFlight=%d elapsed=%.0f\n",
+                poll.adopted?1:0,usable?1:0,(current&&job.schedule==*current)?1:0,
+                poll.inFlight?1:0,poll.elapsedMs);
+        }
+    }
+    }
+    }
+    {
+    loopstep::Scope pollReleaseScope("gl:caustic-poll-release");
     resources.releasePreviewCausticJobUnlocked();
+    }
     return poll;
 }
 // The resident caustic frame's instances: the same objects with bitwise equal worlds.
@@ -13601,13 +15710,7 @@ bool residentCausticInputsMatch(const OpenGlFixtureSceneResources::ResidentCaust
     else
     {
         if(!validNativeImportedLightOverrideTargets(*scene,runtime,error))return false;
-        if(!runtime.animatedLights.empty())
-        {
-            if(runtime.animatedLights.size()!=scene->lightCount)return false;
-            for(std::size_t i=0;i<scene->lightCount;++i)
-                if(runtime.animatedLights[i].id!=scene->lights[i].id
-                    ||!sameSpectralSource(runtime.animatedLights[i].spectralSource,scene->lights[i].spectralSource))return false;
-        }
+        if(!animatedLightsOwnedByScene(*scene,runtime))return false;
         active=effectiveNativeLightRecord(*scene,runtime,std::size_t(owner-scene->lights.data()));
     }
     // gc::sourceInputs checks and bytes, without copying the prepared scene identity it prefixes.
@@ -13630,6 +15733,56 @@ bool residentCausticInputsMatch(const OpenGlFixtureSceneResources::ResidentCaust
 }
 #endif
 } // namespace
+
+// The viewport's readiness seam (card-lifecycle item e). The idle gate's wake
+// frames are a cap, not a completion signal: when a link takes longer than
+// kMaxCausticWakeFrames the cap expires before the adopting frame runs and the
+// preview freezes until some input forces one. This is the cheap per-tick poll
+// beside that cap: report-only, no adoption, and the same rule as the acquire
+// -- poll GL_COMPLETION_STATUS_KHR only when the parallel compile extension
+// exists (without it the submit already linked synchronously, so anything
+// still in flight counts as complete), skipping stages loaded from binary.
+// Latched per set: true once until the adopting frame's erase consumes it.
+bool takeOpenGlCausticProgramCompletion()
+{
+    auto* context = glfwGetCurrentContext();
+    if (context == nullptr) return false;
+    // The same access rule as the acquire: the cache map and every entry live
+    // under fixtureMutex, on the thread that owns the current context.
+    std::lock_guard<std::mutex> lock (fixtureMutex());
+    auto& contexts = openGlCausticProgramCache();
+    const auto found = contexts.find (context);
+    if (found == contexts.end() || ! found->second.loaded || found->second.inFlight.empty())
+    {
+        if (found != contexts.end()) found->second.completionReported = false;
+        return false;
+    }
+    auto& cache = found->second;
+    bool complete = true;
+    {
+        loopstep::Scope pollScope ("gl:caustic-completion-poll");
+        for (const auto& pending : cache.inFlight)
+        {
+            for (const auto& stage : pending.second.stages)
+            {
+                if (stage.loadedBinary) continue;
+                if (cache.parallelCompile != 1) continue;
+                int done = GL_FALSE;
+                cache.gl.GetProgramiv (stage.program, GL_COMPLETION_STATUS_KHR, &done);
+                if (done != GL_TRUE) { complete = false; break; }
+            }
+            if (! complete) break;
+        }
+    }
+    if (! complete)
+    {
+        cache.completionReported = false;
+        return false;
+    }
+    if (cache.completionReported) return false;
+    cache.completionReported = true;
+    return true;
+}
 
 OpenGlCausticProgramReadiness prepareOpenGlGlassCausticPrograms(bool multipleScatter,bool rough,
     NativeFixturePrepareUse use,std::string& error)
@@ -13683,9 +15836,10 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     if(degradation)degradation->clear();
     // Preview reductions assume the Preview plan's schedule, so a Preview caller that
     // passes another schedule is refused. Export callers may pick any valid schedule.
+    // An Accurate Preview's plan carries the export schedule.
     if(use==OpenGlCausticRenderUse::Preview)
     {
-        const auto expected=openGlCausticRenderPlan(use,width,height).scheduling;
+        const auto expected=openGlCausticRenderPlan(use,width,height,previewbudget::exportBudgets()).scheduling;
         if(scheduling.version!=expected.version||scheduling.entrySubdivisions!=expected.entrySubdivisions)
         {
             NativeFixtureSceneSubmission mismatch;
@@ -13705,9 +15859,25 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     const auto started=std::chrono::steady_clock::now();
     namespace gc=glasscaustics;
     using namespace HarmonicMIDI::grid;
+    // The frame's wall time is partitioned into named stages through loop_step_probe:
+    // prepare, scene base, frame lock, allocations, decide, compute prep and gaps,
+    // job store, composite and report. At the release threshold only a slow stage prints;
+    // ARBIT_LOOP_STEP_MS lowers it so one diagnostic run reads the split of a slow
+    // Preview frame instead of one unattributed span.
+    std::optional<loopstep::Scope> stageScope;
+    stageScope.emplace ("gl:caustic-prepare");
     // The caller passes plan.scheduling as the schedule. Export takes the default plan.
     const bool preview=use==OpenGlCausticRenderUse::Preview;
-    const auto plan=openGlCausticRenderPlan(use,width,height);
+    // Accurate render mode: this Preview draws the export caustic. It keeps every Preview
+    // wait and readback rule, and never steps the budget ladder or reduces or drops the
+    // caustic for a GL limit; a limit refuses it by name, as the export of the frame would.
+    const bool previewExportBudgets=preview&&previewbudget::exportBudgets();
+    // Tier K S4: a Fast export steps the same budget ladder a Fast Preview
+    // does - coarser entry, then render without the caustic - while an
+    // Accurate export (Export budget) refuses by name exactly as before.
+    const bool fastExportDraw=!preview&&!previewbudget::exportBudgets();
+    const bool previewDegrades=(preview||fastExportDraw)&&!previewExportBudgets;
+    const auto plan=openGlCausticRenderPlan(use,width,height,previewExportBudgets);
     const auto resources=std::dynamic_pointer_cast<const OpenGlFixtureSceneResources>(nativeResources);
     if(!resources||!resources->queryContext||!resources->queryContext->active||resources->gratingLeaf||!gc::consumerCanRender(gc::opengl::kConsumer,NativeFixtureMaterialBackend::OpenGl,smoothglass::causticRoughness(resources->smoothGlass),
             multipleScatterPolicy?multipleScatterPolicy->version:0)
@@ -13730,6 +15900,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     // The base scene-linear Color render without the caustic. A Preview frame whose caustic
     // cannot fit the GL limits publishes it and carries the reason as a non-fatal warning.
     const auto renderWithoutCaustic=[&](std::string reason) {
+        stageScope.reset();
         reportOpenGlCausticDegradation(reason);
         auto baseRuntime=runtime;baseRuntime.linearColor=true;baseRuntime.imageOutput=renderpassoutput::Output::Color;
         baseRuntime.passProgram.reset();baseRuntime.passComposite.reset();
@@ -13737,14 +15908,26 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         // instead: its consumers read it in this context, and a wait would also join any
         // caustic submission still on the GPU.
         baseRuntime.previewUse=preview;baseRuntime.previewCallerWaits=preview;
+        stageScope.emplace ("gl:caustic-scene-base");
         auto base=nativeFixtureSceneBackend().render(scene,nativeResources,width,height,baseRuntime);
+        stageScope.reset();
         if(base.rendered&&degradation)*degradation=std::move(reason);
+        if(preview)
+        {
+            // This frame traced no caustic, but a predecessor's submission may still be
+            // on the GPU, and only a later frame polls it.
+            stageScope.emplace ("gl:caustic-frame-lock");
+            const std::lock_guard<std::mutex> lock(fixtureMutex());
+            base.causticPending=resources->previewCausticJob.has_value();
+            reportPreviewCausticSubmit(std::string("base path pending=")+(base.causticPending?"1":"0"));
+            stageScope.reset();
+        }
         return base;
     };
     // The measured Preview budget. Off draws the scene without the caustic and Reduced traces
     // one entry subdivision coarser. A submission still on the GPU is polled, never waited on.
     std::string previewBudgetReason;
-    if(preview)
+    if(previewDegrades)
     {
         const auto level=openGlPreviewCausticBudgetLevel(previewBudgetReason);
         const auto smaller=level==OpenGlPreviewCausticLevel::Reduced?openGlCausticReducedEntrySubdivisions(scheduling.entrySubdivisions):0;
@@ -13760,7 +15943,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     const auto indexed64=reinterpret_cast<PFNGLGETINTEGER64I_VPROC>(glfwGetProcAddress("glGetInteger64i_v"));
     if(!integer64||!indexed64)
     {
-        if(preview)return renderWithoutCaustic("caustic off: GL storage limit query unavailable");
+        if(previewDegrades)return renderWithoutCaustic("caustic off: GL storage limit query unavailable");
         refused.error="OpenGL caustic storage limit query unavailable";return refused;
     }
     GLint64 maximumBlock=0;integer64(GL_MAX_SHADER_STORAGE_BLOCK_SIZE,&maximumBlock);
@@ -13772,9 +15955,13 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     int groupsY=0,maximumLocalY=0;
     gl.GetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT,1,&groupsY);gl.GetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_SIZE,1,&maximumLocalY);
     const auto nonNegative=[](auto value){return std::uint64_t(std::max<decltype(value)>(value,0));};
-    const OpenGlCausticDeviceLimits limits{nonNegative(maximumBlock),nonNegative(groups),nonNegative(maximumTexture),
+    OpenGlCausticDeviceLimits limits{nonNegative(maximumBlock),nonNegative(groups),nonNegative(maximumTexture),
         nonNegative(maximumThreads),nonNegative(maximumLocalX),nonNegative(bindings),nonNegative(computeBlocks),
         nonNegative(groupsY),nonNegative(maximumLocalY)};
+    // Test only: ARBIT_TEST_GL_CAUSTIC_LIMIT_SCALE lowers the size limits, read once, so a
+    // candidate can force the Accurate refusal. The scaled limits go into the refusal key.
+    static const std::optional<double> testLimitScale=parseOpenGlCausticLimitScale(std::getenv("ARBIT_TEST_GL_CAUSTIC_LIMIT_SCALE"));
+    if(testLimitScale)limits=scaleOpenGlCausticDeviceLimits(limits,*testLimitScale);
     std::vector<opaquevisibility::Instance> instances;
     for(std::size_t o=0;o<scene->objectCount;++o)
     {
@@ -13786,6 +15973,132 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         }
         instances.push_back({multiplyFixtureMatrices(fixtureTransformMatrix(transform),fixtureWorldMatrix(*scene,scene->objects[o])),o});
     }
+    // An Accurate Preview refused for a GL limit stays refused for the same key: the
+    // viewport asks again every tick, and this answers before the CPU caustic prepare,
+    // the schedule build or any GPU work. The key holds the evaluated camera, source light
+    // and instances the build reads from the runtime inputs; a frame they cannot key is
+    // never latched, so it always retries.
+    OpenGlCausticRefusalKey refusalKey;
+    bool refusalKeyed=false;
+    if(previewExportBudgets)
+    {
+        refusalKey.sceneContent=arbitgpu::causticSceneContentFingerprint(*scene);
+        refusalKey.resources=reinterpret_cast<std::uintptr_t>(resources.get());
+        refusalKey.context=reinterpret_cast<std::uintptr_t>(glfwGetCurrentContext());
+        refusalKey.rendererGeneration=resources->rendererGeneration;
+        refusalKey.source=source.value;refusalKey.glassObject=glassObject.value;refusalKey.glassMaterial=glassMaterial.value;
+        refusalKey.multipleScatter=multipleScatterPolicy?multipleScatterPolicy->version:0;refusalKey.policy=policy.identity();
+        refusalKey.scheduling=scheduling;refusalKey.width=width;refusalKey.height=height;
+        refusalKey.exportBudgets=true;refusalKey.limits=limits;refusalKey.instances=instances;
+        // The camera and source light exactly as the schedule build selects them.
+        std::string keyError;gc::Prepared probe;probe.glass.sourceScene=scene;SceneCameraRecord keyCamera;
+        const auto* sourceLight=visual3d_detail::findById(scene->lights,scene->lightCount,source);
+        const bool cameraKeyed=gc::selectCamera(probe,&runtime,keyCamera,refusalKey.cameraIdentity,keyError);
+        const bool lightKeyed=sourceLight&&(runtime.lightOverride?runtime.lightOverride->id==source
+            :validNativeImportedLightOverrideTargets(*scene,runtime,keyError)
+                &&animatedLightsOwnedByScene(*scene,runtime));
+        if(cameraKeyed&&lightKeyed)
+        {
+            refusalKey.light=effectiveNativeLightRecord(*scene,runtime,std::size_t(sourceLight-scene->lights.data()));
+            refusalKeyed=true;
+            const std::lock_guard<std::mutex> lock(fixtureMutex());
+            const bool held=resources->accurateCausticRefusal.latched;
+            // Copy before find(): a mismatch clears the latch, and the previous key is the
+            // only way to name which field drifted.
+            OpenGlCausticRefusalKey previous{};
+            if(held)previous=resources->accurateCausticRefusal.key;
+            if(held)
+            {
+                // The scene fingerprint runs only while a latch exists, so an idle
+                // Accurate preview pays nothing for the key.
+                refusalKey.sceneContent=arbitgpu::causticSceneContentFingerprint(*scene);
+                if(const auto* latched=resources->accurateCausticRefusal.find(refusalKey))
+                {
+                    // Bounded: proves the latch answered before any caustic work.
+                    static int hits=0;if(hits<20){++hits;std::fprintf(stderr,"[gl] caustic refusal latch hit\n");}
+                    refused.error=*latched;return refused;
+                }
+                // find() cleared a latch that did not match this frame. Name the first
+                // differing field so a per-tick key drift shows up in one run instead of
+                // being guessed at.
+                static int misses=0;
+                if(misses<20)
+                {
+                    ++misses;
+                    const auto scalar=[](const char* n,unsigned long long a,unsigned long long b)
+                    {if(a!=b)std::fprintf(stderr,"[gl] caustic refusal latch miss: %s old=%llu new=%llu\n",n,a,b);};
+                    scalar("sceneContent",previous.sceneContent,refusalKey.sceneContent);
+                    if(previous.sceneContent!=refusalKey.sceneContent)
+                    {
+                        // Which content family actually moved between the two frames.
+                        const auto segments=arbitgpu::causticSceneContentSegments(*scene);
+                        std::fprintf(stderr,"[gl] caustic refusal scene segments: scalars=%llu vertices=%llu indices=%llu objects=%llu materials=%llu textures=%llu cameras=%llu instances=%llu\n",
+                            static_cast<unsigned long long>(segments.scalars),
+                            static_cast<unsigned long long>(segments.vertices),
+                            static_cast<unsigned long long>(segments.indices),
+                            static_cast<unsigned long long>(segments.objects),
+                            static_cast<unsigned long long>(segments.materials),
+                            static_cast<unsigned long long>(segments.textures),
+                            static_cast<unsigned long long>(segments.cameras),
+                            static_cast<unsigned long long>(segments.instances));
+                    }
+                    scalar("resources",previous.resources,refusalKey.resources);
+                    scalar("context",previous.context,refusalKey.context);
+                    scalar("rendererGeneration",previous.rendererGeneration,refusalKey.rendererGeneration);
+                    scalar("source",previous.source,refusalKey.source);
+                    scalar("glassObject",previous.glassObject,refusalKey.glassObject);
+                    scalar("glassMaterial",previous.glassMaterial,refusalKey.glassMaterial);
+                    scalar("multipleScatter",previous.multipleScatter,refusalKey.multipleScatter);
+                    if(previous.policy!=refusalKey.policy)
+                        std::fprintf(stderr,"[gl] caustic refusal latch miss: policy\n");
+                    scalar("scheduling.version",previous.scheduling.version,refusalKey.scheduling.version);
+                    scalar("scheduling.entrySubdivisions",previous.scheduling.entrySubdivisions,refusalKey.scheduling.entrySubdivisions);
+                    scalar("width",previous.width,refusalKey.width);
+                    scalar("height",previous.height,refusalKey.height);
+                    scalar("exportBudgets",previous.exportBudgets,refusalKey.exportBudgets);
+                    if(previous.limits!=refusalKey.limits)
+                        std::fprintf(stderr,"[gl] caustic refusal latch miss: limits\n");
+                    if(previous.cameraIdentity!=refusalKey.cameraIdentity)
+                        std::fprintf(stderr,"[gl] caustic refusal latch miss: cameraIdentity old=%.80s new=%.80s\n",
+                            previous.cameraIdentity.c_str(),refusalKey.cameraIdentity.c_str());
+                    if(!sameCausticRefusalLight(previous.light,refusalKey.light))
+                        std::fprintf(stderr,"[gl] caustic refusal latch miss: light\n");
+                    if(!sameCausticRefusalInstances(previous.instances,refusalKey.instances))
+                        std::fprintf(stderr,"[gl] caustic refusal latch miss: instances old=%zu new=%zu\n",
+                            previous.instances.size(),refusalKey.instances.size());
+                }
+            }
+        }
+        else
+        {
+            const std::lock_guard<std::mutex> lock(fixtureMutex());
+            resources->accurateCausticRefusal.clear();
+            // A key that never validates is never latched, so this line distinguishes
+            // "keying fails" from "key drifts" without either being guessed at.
+            static int unkeyed=0;
+            if(unkeyed<20)
+            {
+                ++unkeyed;
+                std::fprintf(stderr,"[gl] caustic refusal key incomplete: camera=%d light=%d (%s)\n",
+                    cameraKeyed?1:0,lightKeyed?1:0,keyError.c_str());
+            }
+        }
+    }
+    // A GL limit refusal. Export names the limit. An Accurate Preview also says how to
+    // preview the scene, and latches the refusal when its key is complete.
+    const auto refuseLimit=[&](std::string message) {
+        if(!previewExportBudgets){refused.error=std::move(message);return refused;}
+        refused.error=openGlAccurateCausticRefusal(message);
+        if(refusalKeyed)
+        {
+            // The stored key carries the scene content fingerprint, computed here so an
+            // idle Accurate preview never pays for it.
+            refusalKey.sceneContent=arbitgpu::causticSceneContentFingerprint(*scene);
+            const std::lock_guard<std::mutex> lock(fixtureMutex());
+            resources->accurateCausticRefusal.latch(refusalKey,refused.error);
+        }
+        return refused;
+    };
     // Preview beside refreshed water (a structural cache hit) keeps the caustic
     // resident. The prepared caustic scene and its schedule depend only on the
     // static glass, receivers, sun, camera, instances and extent, so a frame with
@@ -13808,7 +16121,10 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     gc::Prepared builtPrepared;gc::Frame builtScheduled;
     gc::Prepared& prepared=residentCaustic?residentState.prepared:builtPrepared;
     gc::Frame& scheduled=residentCaustic?residentState.frame:builtScheduled;
-    if(!residentCaustic&&!gc::prepare(resources->smoothGlass,source,policy,prepared,refused.error))return refused;
+    {
+        loopstep::Scope glassPrepareScope ("gl:caustic-glass-prepare");
+        if(!residentCaustic&&!gc::prepare(resources->smoothGlass,source,policy,prepared,refused.error))return refused;
+    }
     const auto build=[&](gc::SchedulingDescription description,gc::Frame& output,std::string& error) {
         return multipleScatterPolicy
             ?gc::buildMultipleScatterFrame(prepared,instances,&runtime,width,height,description,*multipleScatterPolicy,output,error)
@@ -13821,8 +16137,9 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     if(residentCaustic)reducedReason=residentState.reducedReason;
     else
     {
+        loopstep::Scope fitScope ("gl:caustic-schedule-fit");
         if(!build(scheduling,scheduled,refused.error))return refused;
-        if(preview)
+        if(previewDegrades)
         {
             const auto planned=openGlCausticStorageDemand(scheduled,scheduled.bounds.deposition.paddedKeyCount);
             if(!openGlCausticLimitFailure(limits,planned).empty())
@@ -13866,8 +16183,31 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         // A Preview schedule whose late splat counters overflowed keeps single-pixel deposits.
         const bool splatDeclined=preview&&[&] {
             const std::lock_guard<std::mutex> lock(fixtureMutex());return resources->previewSplatDeclined==scheduled.identity;}();
-        if(trySplat&&!splatDeclined&&!gc::enableSplat(prepared,scheduled,splatError)&&!splatRefusalReported.exchange(true))
-            std::fprintf(stderr,"[gl] caustic splat unavailable, single-pixel deposits: %s\n",splatError.c_str());
+        if(trySplat&&!splatDeclined&&!gc::enableSplat(prepared,scheduled,splatError))
+        {
+            // The refusal names its own threshold but not the frame inputs that
+            // crossed it. Printing paths, visits, keyed slots and both caps once
+            // gives the next fix the exact arithmetic to work against: the gather
+            // cap is dispatch-pinned (the admitted sort stays one 2^20 key
+            // dispatch), so a budget change must be decided against these
+            // numbers, not guessed.
+            if(!splatRefusalReported.exchange(true))
+            {
+                const auto refusalPaths=std::uint64_t(scheduled.work.size());
+                const auto refusalVisits=scheduled.bounds.maximumDeposits/(refusalPaths?refusalPaths:1);
+                const auto refusalKeySlots=gc::splatKeySlots(scheduled);
+                std::fprintf(stderr,
+                    "[gl] caustic splat refused, single-pixel deposits: %s "
+                    "(paths=%llu visits=%llu keySlots=%llu keyed=%llu gatherCap=%llu passWorkCap=%llu)\n",
+                    splatError.c_str(),static_cast<unsigned long long>(refusalPaths),
+                    static_cast<unsigned long long>(refusalVisits),
+                    static_cast<unsigned long long>(refusalKeySlots),
+                    static_cast<unsigned long long>(refusalPaths*refusalKeySlots),
+                    static_cast<unsigned long long>(gc::splatGatherWorkCap()
+                        /(std::uint64_t(gc::kSplatTilesPerDeposit)*gc::kSplatTile*gc::kSplatTile)),
+                    static_cast<unsigned long long>(gc::kMaximumSplatPassWork));
+            }
+        }
     }
     const bool splat=scheduled.splatVersion==gc::kSplatVersion;
     gc::opengl::SplatScratchLayout splatLayout;
@@ -13875,9 +16215,9 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     {
         // Only a word count past the index range is a limit. A missing precondition is a bug.
         bool limit=false;const auto failure=gc::opengl::splatScratchLayoutFailure(scheduled,limit);
-        if(preview&&limit)return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");
-        refused.error=limit?"OpenGL caustic splat scratch layout exceeds its index range: "+failure
-            :"OpenGL caustic splat scratch layout is invalid: "+failure;
+        if(previewDegrades&&limit)return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");
+        if(limit)return refuseLimit("OpenGL caustic splat scratch layout exceeds its index range: "+failure);
+        refused.error="OpenGL caustic splat scratch layout is invalid: "+failure;
         return refused;
     }
     const auto pixels=std::uint64_t(width)*height;
@@ -13938,7 +16278,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             &&charge(cameraRoughSchedule->tiles().size(),roughglasstiles::Completion::metadataBytesPerTile())
             &&charge(2*runtime.animatedLights.capacity(),sizeof(SceneLightRecord))
             &&charge(1,sizeof(*resources)+sizeof(OpenGlFixtureSceneFrame))
-            &&charge(4*std::uint64_t(opaquevisibility::kTextureWidth)*opaquevisibility::kTextureHeight,sizeof(opaquevisibility::Texel))
+            &&charge(4*opaquevisibility::sceneQueryPayloadTexels(*scene),sizeof(opaquevisibility::Texel))
             &&charge(resources->opaqueVisibility.texels.capacity()+resources->smoothGlass.query.texels.capacity(),sizeof(opaquevisibility::Texel))
             &&charge(resources->opaqueVisibility.meshes.capacity()+resources->smoothGlass.query.meshes.capacity(),sizeof(opaquevisibility::Mesh));
     if(cameraRoughSchedule&&smoothglass::multipleScatterCamera(resources->smoothGlass))
@@ -13986,21 +16326,22 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     if(const auto failure=openGlCausticLimitFailure(limits,openGlCausticStorageDemand(scheduled,keyCount));!failure.empty()
         ||std::any_of(bytes.begin(),bytes.end(),[](auto size){return !size;}))
     {
-        if(preview&&!failure.empty()) {cameraRoughSchedule.reset();return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");}
+        if(previewDegrades&&!failure.empty()) {cameraRoughSchedule.reset();return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");}
         if(failure.empty()) {
             const auto empty=std::find(bytes.begin(),bytes.end(),std::uint64_t(0))-bytes.begin();
             refused.error=std::string("OpenGL caustic admitted storage has an empty ")+kOpenGlCausticStorageNames[std::size_t(empty)]+" buffer";
-        } else refused.error="OpenGL caustic admitted storage exceeds native GL limits: "+failure;
-        return refused;
+            return refused;
+        }
+        return refuseLimit("OpenGL caustic admitted storage exceeds native GL limits: "+failure);
     }
-    if(!gc::admitDepositionDevice(deposition,{std::uint64_t(maximumBlock),std::uint64_t(groups),32,4},refused.error))
+    if(!gc::admitDepositionDevice(deposition,{limits.maximumStorageBlockBytes,limits.maximumWorkGroupsX,32,4},refused.error))
     {
         // A real limit term is named with its need and max, and only it degrades Preview.
         // Otherwise the schedule itself is invalid, a bug both uses refuse unchanged.
         const auto failure=openGlCausticLimitFailure(limits,openGlCausticStorageDemand(scheduled,deposition.paddedKeyCount));
         if(failure.empty())return refused;
-        if(preview) {cameraRoughSchedule.reset();return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");}
-        refused.error="OpenGL caustic deposition exceeds native GL limits: "+failure;return refused;
+        if(previewDegrades) {cameraRoughSchedule.reset();return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");}
+        return refuseLimit("OpenGL caustic deposition exceeds native GL limits: "+failure);
     }
     // The splat passes add binding 7, 16x16 gather groups (four per tile), and dispatches
     // over the splat key count and every trace slot.
@@ -14011,8 +16352,8 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             scheduled.splat.tilesX,scheduled.splat.tilesY});
         if(!failure.empty())
         {
-            if(preview) {cameraRoughSchedule.reset();return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");}
-            refused.error="OpenGL caustic splat storage exceeds native GL limits: "+failure;return refused;
+            if(previewDegrades) {cameraRoughSchedule.reset();return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");}
+            return refuseLimit("OpenGL caustic splat storage exceeds native GL limits: "+failure);
         }
     }
     cameraRoughSchedule.reset();
@@ -14023,13 +16364,184 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     // flushed: the caustic passes and the resolve read it in this context, after it in GL
     // order, and no Preview step below waits on it.
     baseRuntime.previewUse=preview;baseRuntime.previewCallerWaits=preview;
+    // verify58 measured glClearBufferData at 163-266 ms inside prep-buffers on every
+    // slow frame: by then the base draw has enqueued this frame's glass bands, and the
+    // clear waits on them. Take the pooled spectrum and clear it here instead, while
+    // the queue still holds only the settled previous submission.
+    std::array<unsigned,2> earlySpectrum{};
+    std::array<std::uint64_t,2> earlySpectrumBytes{};
+    bool earlyCleared=false;
+    {
+    loopstep::Scope earlyClearScope ("gl:caustic-early-clear");
+    // verify66: the early clear held 250-251 ms of two slow frames — the pending
+    // reap is CPU work, the spectrum resize and clear can wait on the queue.
+    {
+    // The pool rings, the parked-delete lot and lastCausticFrameWallMs are
+    // fixtureMutex state: every receipt reader and this function's own frame-
+    // lock stage take the mutex, while the early stage used to run outside it,
+    // so a second render on another thread could race the Unlocked pool
+    // helpers and the reap writes. This scope ends before the base render, so
+    // readers are never blocked behind it.
+    std::lock_guard<std::mutex> earlyLock(fixtureMutex());
+    loopstep::Scope earlyMoveScope ("gl:caustic-early-move");
+    // The previous frame's replaced base Color has no readers left by now. Reaping it
+    // here, before this frame's glass bands exist, keeps glDeleteTextures out of the
+    // report span where verify59 measured it at 50-183 ms.
+    if(resources->pendingBaseColorDelete)
+    {
+        if(!resources->pooledResolveColor)
+        {
+            resources->pooledResolveColor=resources->pendingBaseColorDelete;
+            resources->pooledResolveColorBytes=resources->pendingBaseColorBytes;
+            resources->pooledResolveColorWidth=resources->pendingBaseColorWidth;
+            resources->pooledResolveColorHeight=resources->pendingBaseColorHeight;
+        }
+        else glDeleteTextures(1,&resources->pendingBaseColorDelete);
+        resources->pendingBaseColorDelete=0;resources->pendingBaseColorBytes=0;
+    }
+    // The parked ring evictions retire only when the queue can be proven idle:
+    // a gap since the previous frame's start beyond the longest measured GPU
+    // tail (roughly 700 ms worst case) means the glass batch finished, and a
+    // delete then costs nothing. verify74 measured the unconditional reap at
+    // 251 ms — buffer deletes wait on queue depth, never on buffer age. The
+    // rapid cadence parks instead; the four-second gap between drag steps
+    // always clears the lot.
+    {
+    const auto frameNowMs=std::uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    if(resources->lastCausticFrameWallMs&&frameNowMs>resources->lastCausticFrameWallMs
+        &&frameNowMs-resources->lastCausticFrameWallMs>800)
+    {
+        // The gap alone did not buy a cheap delete (verify75: 207 ms at a four
+        // second gap), so the reap drains first. At this gap the queue is ours,
+        // so the finish costs whatever stragglers the gap missed — and if it
+        // turns out to carry the wait, this scope says so.
+        loopstep::Scope reapFinishScope("gl:caustic-reap-finish");
+        // The reap's only need is that the lot's readers finished: everything
+        // submitted before the latest park, fenced there. Poll that fence with
+        // a zero timeout instead of glFinish-ing the whole queue -- the blanket
+        // finish also waited on the Preview submission the field comment says
+        // is polled, never waited on (verify74/75 measured 207-251 ms here).
+        const bool fenced=resources->pendingDeleteFence!=nullptr;
+        const int fenceState=fenced?gl.ClientWaitSync(resources->pendingDeleteFence,0,0):GL_WAIT_FAILED;
+        if(!fenced||fenceState==GL_ALREADY_SIGNALED||fenceState==GL_WAIT_FAILED)
+        {
+            // No usable fence (creation failed) or the work is done; an unknown
+            // fence state falls back to the old queue-wide proof rather than
+            // deleting buffers whose readers may still run.
+            if(!fenced||fenceState==GL_WAIT_FAILED)glFinish();
+            for(auto& pending:resources->pendingCausticBufferDeletes)
+                if(pending)
+                {
+                    gl.DeleteBuffers(1,&pending);
+                    pending=0;
+                }
+            if(fenced){gl.DeleteSync(resources->pendingDeleteFence);resources->pendingDeleteFence=nullptr;}
+        }
+        // GL_TIMEOUT_EXPIRED: the lot's readers are still running; leave it
+        // parked and let the next 800 ms gap poll the fence again.
+    }
+    resources->lastCausticFrameWallMs=frameNowMs;
+    }
+    }
+    {
+        loopstep::Scope earlySpectrumScope ("gl:caustic-early-spectrum");
+        const auto earlyClear=reinterpret_cast<PFNGLCLEARBUFFERDATAPROC>(glfwGetProcAddress("glClearBufferData"));
+        bool drained=false;
+        for(unsigned i=0;i<16;++i) {const auto code=glGetError();if(code==GL_NO_ERROR){drained=true;break;}
+            if(code==0x0507)break;}
+        // glClearBufferData waits whenever the queue still holds earlier frames
+        // (verify58 163-266 ms, verify67 250-255 ms): the driver zeroes the
+        // buffers only once their pending readers retire, and the CPU eats the
+        // wait. The clear runs as a compute dispatch from the caustic program set
+        // instead — a queue-side write the GPU orders behind those readers while
+        // the CPU returns at once. The renderer publishes the set only after every
+        // link completes, so this frame never waits on a compile, and a missing
+        // program keeps the clear fallback. The program text is variant-independent,
+        // so a still-valid context's set serves this frame regardless of variant.
+        unsigned clearProgram=0;
+        if(resources->causticProgramSet&&resources->causticProgramSet->context==glfwGetCurrentContext())
+            clearProgram=resources->causticProgramSet->programs[kCausticSpectrumClearProgram];
+        if((earlyClear||clearProgram)&&drained&&bytes[2]&&bytes[6])
+        {
+            bool ok=true;
+            const auto clearCountLocation=clearProgram?gl.GetUniformLocation(clearProgram,"uCount"):-1;
+            for(unsigned slot:{0u,1u})
+            {
+                const unsigned i=slot?6u:2u;
+                if(const unsigned pooled=resources->takePooledCausticBufferUnlocked(i,earlySpectrumBytes[slot]))
+                    earlySpectrum[slot]=pooled;
+                else gl.GenBuffers(1,&earlySpectrum[slot]);
+                if(!earlySpectrum[slot]) {ok=false;break;}
+                GLint previousBuffer=0;
+                gl.GetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,i,&previousBuffer);
+                gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,earlySpectrum[slot]);
+                if(earlySpectrumBytes[slot]!=bytes[i])
+                {
+                    gl.BufferData(GL_SHADER_STORAGE_BUFFER,std::ptrdiff_t(bytes[i]),nullptr,GL_DYNAMIC_COPY);
+                    earlySpectrumBytes[slot]=bytes[i];
+                }
+                // The compute clear writes indexed binding i, not the generic
+                // target the bind above set: point i at this slot's buffer for the
+                // dispatch, or the clear writes whatever sat at i before -- last
+                // frame's smaller buffer keeps its counts and the write can run
+                // past its end. The loop's restore below returns i to its previous
+                // owner.
+                gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,i,earlySpectrum[slot]);
+                if(clearProgram)
+                {
+                    gl.UseProgram(clearProgram);
+                    gl.Uniform1ui(clearCountLocation,unsigned(bytes[i]/4));
+                    gl.DispatchCompute((unsigned(bytes[i]/4)+255u)/256u,1,1);
+                    gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+                else earlyClear(GL_SHADER_STORAGE_BUFFER,GL_R32UI,GL_RED_INTEGER,GL_UNSIGNED_INT,nullptr);
+                ok=glGetError()==GL_NO_ERROR;
+                gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,i,unsigned(previousBuffer));
+                if(!ok)break;
+            }
+            if(ok)earlyCleared=true;
+        }
+        if(!earlyCleared)
+            for(unsigned slot:{0u,1u})
+                if(earlySpectrum[slot])
+                {
+                    resources->poolCausticBufferUnlocked(slot?6u:2u,earlySpectrum[slot],earlySpectrumBytes[slot]);
+                    earlySpectrum[slot]=0;earlySpectrumBytes[slot]=0;
+                }
+    }
+    }
+    stageScope.reset();
+    stageScope.emplace ("gl:caustic-scene-base");
     const auto baseStarted=std::chrono::steady_clock::now();
     auto result=nativeFixtureSceneBackend().render(scene,nativeResources,width,height,baseRuntime);
-    if(!result.rendered)return result;
+    if(!result.rendered)
+    {
+        for(unsigned slot:{0u,1u})
+            if(earlySpectrum[slot])
+            {
+                resources->poolCausticBufferUnlocked(slot?6u:2u,earlySpectrum[slot],earlySpectrumBytes[slot]);
+                earlySpectrum[slot]=0;earlySpectrumBytes[slot]=0;
+            }
+        return result;
+    }
     diagnostics.baseMilliseconds=elapsed(baseStarted);
+    stageScope.reset();
+    stageScope.emplace ("gl:caustic-frame-lock");
     auto frame=std::const_pointer_cast<OpenGlFixtureSceneFrame>(std::dynamic_pointer_cast<const OpenGlFixtureSceneFrame>(result.frame));
-    if(!frame) {refused.error="OpenGL caustic base frame has a foreign owner";return refused;}
+    if(!frame)
+    {
+        for(unsigned slot:{0u,1u})
+            if(earlySpectrum[slot])
+            {
+                resources->poolCausticBufferUnlocked(slot?6u:2u,earlySpectrum[slot],earlySpectrumBytes[slot]);
+                earlySpectrum[slot]=0;earlySpectrumBytes[slot]=0;
+            }
+        refused.error="OpenGL caustic base frame has a foreign owner";return refused;
+    }
     std::lock_guard<std::mutex> lock(fixtureMutex());
+    stageScope.reset();
+    stageScope.emplace ("gl:caustic-frame-allocations");
     OpenGlFixtureState previous(gl);
     if(resources->causticSubmissionSerial==std::numeric_limits<std::uint64_t>::max())
     {previous.restore();frame->releaseTexturesUnlocked();frame->ownerContext=nullptr;
@@ -14042,14 +16554,20 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     std::array<int,8> savedBindings{};
     std::array<GLint64,8> savedStarts{},savedSizes{};
     // Indexed range bindings are restored with their original offsets/sizes.
-    for(unsigned i=0;i<savedBindingCount;++i)
+    int savedStorage=0,savedPack=0;
     {
-        gl.GetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,i,&savedBindings[i]);
-        indexed64(GL_SHADER_STORAGE_BUFFER_START,i,&savedStarts[i]);
-        indexed64(GL_SHADER_STORAGE_BUFFER_SIZE,i,&savedSizes[i]);
+        // The indexed binding snapshot, timed on its own: these state queries
+        // are the first driver reads after the base submission.
+        loopstep::Scope stateSaveScope ("gl:caustic-state-save");
+        for(unsigned i=0;i<savedBindingCount;++i)
+        {
+            gl.GetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,i,&savedBindings[i]);
+            indexed64(GL_SHADER_STORAGE_BUFFER_START,i,&savedStarts[i]);
+            indexed64(GL_SHADER_STORAGE_BUFFER_SIZE,i,&savedSizes[i]);
+        }
+        glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING,&savedStorage);
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&savedPack);
     }
-    int savedStorage=0,savedPack=0;glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING,&savedStorage);
-    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&savedPack);
     const auto bindRange=reinterpret_cast<PFNGLBINDBUFFERRANGEPROC>(glfwGetProcAddress("glBindBufferRange"));
     if(!bindRange) {previous.restore();frame->releaseTexturesUnlocked();frame->ownerContext=nullptr;
         refused.error="OpenGL caustic indexed binding restoration unavailable";return refused;}
@@ -14059,6 +16577,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     if(!clearBufferData) {previous.restore();frame->releaseTexturesUnlocked();frame->ownerContext=nullptr;
         refused.error="OpenGL caustic spectrum clear unavailable";return refused;}
     unsigned rasterFbo=0,resolveFbo=0,vao=0,resolveTexture=0,splatBuffer=0;
+    std::size_t splatPoolBytes=0;
     // Preview: the copy of the splat counters its submission reads after the fence.
     unsigned previewCounters=0;
     // The context's caustic program set owns programs 1-9, and the query owner owns
@@ -14098,20 +16617,31 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     const auto stamp=[&](unsigned index) {
         if(stampQueries[index])queryCounter(stampQueries[index],GL_TIMESTAMP);
     };
-    const auto cleanup=[&] {
+    ScopeCleanup cleanup { [&] {
+        loopstep::Scope cleanupScope ("gl:caustic-cleanup-delete");
         if(stampQueries[0])deleteQueries(int(stampQueries.size()),stampQueries.data());
         if(rasterFbo)gl.DeleteFramebuffers(1,&rasterFbo);
         if(resolveFbo)gl.DeleteFramebuffers(1,&resolveFbo);
         if(vao)gl.DeleteVertexArrays(1,&vao);
-        if(resolveTexture)glDeleteTextures(1,&resolveTexture);
-        if(splatBuffer)gl.DeleteBuffers(1,&splatBuffer);
+        if(resolveTexture)
+        {
+            if(!resources->pooledResolveColor)
+            {
+                resources->pooledResolveColor=resolveTexture;
+                resources->pooledResolveColorBytes=std::uint64_t(width)*height*(runtime.linearColor?8u:4u);
+                resources->pooledResolveColorWidth=width;resources->pooledResolveColorHeight=height;
+            }
+            else glDeleteTextures(1,&resolveTexture);
+            resolveTexture=0;
+        }
+        resources->poolCausticSplatUnlocked(splatBuffer,splatPoolBytes);
         if(previewCounters)gl.DeleteBuffers(1,&previewCounters);
         for(unsigned i=0;i<savedBindingCount;++i)
             if(savedBindings[i]&&savedSizes[i]>0)bindRange(GL_SHADER_STORAGE_BUFFER,i,unsigned(savedBindings[i]),savedStarts[i],savedSizes[i]);
             else gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,i,unsigned(savedBindings[i]));
         gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,unsigned(savedStorage));gl.BindBuffer(GL_PIXEL_PACK_BUFFER,unsigned(savedPack));
         previous.restore();
-    };
+    } };
     // Resident tables lend their names to the frame for this submission only.
     // The frame never deletes them: they are taken back before any release.
     bool residentTables=false;
@@ -14119,9 +16649,29 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         if(!residentTables)return;
         frame->causticBuffers[3]=0;frame->causticBuffers[4]=0;frame->causticTextures[0]=0;
     };
+    // An exception gets what fail does, without the strings it allocates.
+    ScopeCleanup releaseOnThrow { [&] {
+        if(std::uncaught_exceptions()==0)return;
+        if(residentEligible)residentState.valid=false;
+        for(unsigned slot:{0u,1u})
+            if(earlySpectrum[slot])
+            {
+                resources->poolCausticBufferUnlocked(slot?6u:2u,earlySpectrum[slot],earlySpectrumBytes[slot]);
+                earlySpectrum[slot]=0;earlySpectrumBytes[slot]=0;
+            }
+        returnResidentTables();
+        cleanup();frame->releaseTexturesUnlocked();frame->ownerContext=nullptr;
+        resources->previewSpectrumKey.reset();
+    } };
     const auto fail=[&](const std::string& error) {
         // A failed frame leaves no resident schedule to trust.
         if(residentEligible)residentState.valid=false;
+        for(unsigned slot:{0u,1u})
+            if(earlySpectrum[slot])
+            {
+                resources->poolCausticBufferUnlocked(slot?6u:2u,earlySpectrum[slot],earlySpectrumBytes[slot]);
+                earlySpectrum[slot]=0;earlySpectrumBytes[slot]=0;
+            }
         returnResidentTables();
         cleanup();frame->releaseTexturesUnlocked();frame->ownerContext=nullptr;
         // A failed frame never leaves a retained Preview spectrum to reuse. A reset context
@@ -14129,7 +16679,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         resources->previewSpectrumKey.reset();
         if(std::string resetError;causticContextIntact(resetError))
             for(auto& buffer:resources->previewSpectrumBuffers)if(buffer)gl.DeleteBuffers(1,&buffer);
-        resources->previewSpectrumBuffers={};
+        resources->previewSpectrumBuffers={};resources->previewSpectrumBufferBytes={};
         NativeFixtureSceneSubmission failure;failure.error=error;return failure;
     };
     const auto baseOwnerValid=[&] {
@@ -14157,13 +16707,20 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     {
         try {
         // The renderer prepares these ahead of the frame, polling them while Preview frames
-        // stay pending, so this finds them ready. A caller that did not prepare them waits
-        // here, as an export does.
+        // stay pending, so this finds them ready. An export that did not prepare them
+        // waits here; a Preview never blocks its frame on the dispatch compile, because
+        // the produce thread's own fixture link waits on the lock this finish holds
+        // for the whole compile.
         std::shared_ptr<OpenGlCausticProgramSet> programSet;
         std::string programError;
-        if(acquireOpenGlCausticProgramsUnlocked(multipleScatterQuery,roughQuery,true,programSet,programError)
-            !=OpenGlCausticProgramAcquire::Ready||!programSet)
+        const bool wait = use!=OpenGlCausticRenderUse::Preview;
+        const auto acquired = acquireOpenGlCausticProgramsUnlocked(multipleScatterQuery,roughQuery,wait,programSet,programError);
+        if(acquired!=OpenGlCausticProgramAcquire::Ready||!programSet)
+        {
+            if(!wait&&acquired==OpenGlCausticProgramAcquire::Pending)
+            { result.causticPending=true; return result; }
             return fail(programError.empty()?"OpenGL glass caustic programs are unavailable":programError);
+        }
         const OpenGlCausticStageSources querySources{{GL_COMPUTE_SHADER,openGlCausticQuerySource(multipleScatterQuery,roughQuery)}};
         const auto linkedQuery=openGlCausticQueryProgramForOwnerUnlocked(*programSet,querySources);
         queryProgram=linkQueryArithmeticProgram(gl,resources->queryContext,resources->rendererGeneration,
@@ -14196,6 +16753,8 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         char text[96];std::snprintf(text,sizeof text,"%s of %llu bytes",what,static_cast<unsigned long long>(size));
         return fail(std::string("OpenGL caustic native allocation failed: ")+text+" ("+causticGlErrorName(code)+")");
     };
+    stageScope.reset();
+    stageScope.emplace ("gl:caustic-frame-decide");
     // Preview polls its submission still on the GPU, and adopts its spectrum when it has
     // signalled for this schedule. The schedule leaves out the resident water revision.
     std::optional<OpenGlCausticScheduleKey> previewSchedule;
@@ -14221,6 +16780,20 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     // in flight and holds no fence for one.
     const bool trace=!preview||(!spectrumReused&&!previewPoll.inFlight&&!previewPoll.declined&&!resources->previewCausticJob);
     const bool resolveCaustic=!preview||spectrumReused||previewLagged;
+    if(preview)
+    {
+        // What this frame decided about the caustic: resolved, submitted, or neither.
+        static int logged=0;
+        if(logged<24)
+        {
+            ++logged;
+            std::fprintf(stderr,"[gl] caustic frame %d: reused=%d lagged=%d inFlight=%d declined=%d job=%d trace=%d resolve=%d\n",
+                logged,spectrumReused?1:0,previewLagged?1:0,previewPoll.inFlight?1:0,previewPoll.declined?1:0,
+                resources->previewCausticJob?1:0,trace?1:0,resolveCaustic?1:0);
+        }
+    }
+    stageScope.reset();
+    stageScope.emplace ("gl:caustic-prep-residency");
     gc::EnergyLedger energy;
     const unsigned drawBuffers[]{GL_COLOR_ATTACHMENT0,GL_COLOR_ATTACHMENT1};
     if(!trace)
@@ -14242,33 +16815,39 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         // the caustic query's water refit plan, the water rows of the triangle table
         // and the query texture with its static texels and tail. Any refusal keeps
         // this frame on its own frame-owned tables, as before.
+        // Named on refusal, so one Preview run tells which establishment condition failed.
+        const char* residentEstablishRefusal=nullptr;
         const auto establishResidentCaustic=[&]()->bool {
+            residentEstablishRefusal=nullptr;
+            const auto refused=[&](const char* why)->bool {residentEstablishRefusal=why;return false;};
             residentState.splatBytes=0;
             const auto& owned=*prepared.glass.sourceScene;
             const auto w=waterRefit.object;
             if(w>=owned.objectCount||w>=instances.size()||!prepared.absorber.isValid()||owned.objects[w].id!=prepared.absorber
-                ||owned.objects[w].indexCount==0)return false;
+                ||owned.objects[w].indexCount==0)return refused("water is not the absorber object");
             const auto& water=owned.objects[w];
             const auto mesh=prepared.glass.query.objectMesh[w];
-            if(mesh<0||std::size_t(mesh)>=prepared.glass.query.meshes.size())return false;
+            if(mesh<0||std::size_t(mesh)>=prepared.glass.query.meshes.size())return refused("water has no glass query mesh");
             opaquevisibility::FrameTail tail;std::string error;
             if(!opaquevisibility::frameTail(prepared.glass.query,instances,tail,error)||tail.control!=scheduled.query.control
-                ||tail.height!=scheduled.query.height)return false;
+                ||tail.height!=scheduled.query.height)return refused("query tail changed");
             // The water's rows, in the build's object and index order, 8 texels each.
             std::size_t first=0;
             for(std::size_t o=0;o<w;++o)first+=owned.objects[o].indexCount/3;
             const std::size_t count=water.indexCount/3;
-            if(first+count>scheduled.triangles.size()||(first+count)*8>scheduled.triangleTexels.size())return false;
+            if(first+count>scheduled.triangles.size()||(first+count)*8>scheduled.triangleTexels.size())
+                return refused("schedule has no water triangle rows");
             std::vector<std::array<std::uint32_t,4>> corners;corners.reserve(count);
             for(std::size_t t=0;t<count;++t)
             {
                 const auto& triangle=scheduled.triangles[first+t];
-                if(triangle.object!=water.id.value||triangle.triangle!=t||triangle.instance!=w||!triangle.absorber)return false;
+                if(triangle.object!=water.id.value||triangle.triangle!=t||triangle.instance!=w||!triangle.absorber)
+                    return refused("water rows are not absorber triangles");
                 std::array<std::uint32_t,4> corner{};
                 for(unsigned v=0;v<3;++v)
                 {
                     const auto local=owned.indices[water.firstIndex+t*3+v];
-                    if(local>=water.vertexCount)return false;
+                    if(local>=water.vertexCount)return refused("water corner outside its vertex range");
                     corner[v]=water.firstVertex+local;
                 }
                 corner[3]=std::uint32_t((first+t)*8);
@@ -14276,7 +16855,8 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             }
             OpenGlFixtureSceneResources::ResidentRefit plan;
             plan.program=waterRefit.program;plan.locations=waterRefit.locations;plan.bufferSubData=waterRefit.bufferSubData;
-            if(!planResidentRefit(prepared.glass.query,owned,w,std::size_t(mesh),plan))return false;
+            if(!planResidentRefit(prepared.glass.query,owned,w,std::size_t(mesh),plan))
+                return refused("refit plan declined");
             auto& previousPlan=residentState.refit;
             for(auto* buffer:{&previousPlan.cornerBuffer,&previousPlan.nodeBuffer,&previousPlan.worldBuffer})
                 if(*buffer){gl.DeleteBuffers(1,buffer);*buffer=0;}
@@ -14284,20 +16864,22 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             if(!createResidentRefitBuffers(gl,plan))
             {
                 for(auto* buffer:{&plan.cornerBuffer,&plan.nodeBuffer,&plan.worldBuffer})if(*buffer)gl.DeleteBuffers(1,buffer);
-                return false;
+                return refused("refit buffers allocation");
             }
             plan.planned=true;residentState.refit=std::move(plan);
             for(auto* buffer:{&residentState.workBuffer,&residentState.triangleBuffer,&residentState.triangleCornerBuffer})
                 if(!*buffer)gl.GenBuffers(1,buffer);
-            if(!residentState.workBuffer||!residentState.triangleBuffer||!residentState.triangleCornerBuffer)return false;
+            if(!residentState.workBuffer||!residentState.triangleBuffer||!residentState.triangleCornerBuffer)
+                return refused("caustic table buffers allocation");
             const auto cornerBytes=corners.size()*sizeof(corners[0]);
             gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,residentState.triangleCornerBuffer);
             gl.BufferData(GL_SHADER_STORAGE_BUFFER,std::ptrdiff_t(cornerBytes),corners.data(),GL_STATIC_DRAW);
-            if(glGetError()!=GL_NO_ERROR)return false;
+            if(glGetError()!=GL_NO_ERROR)return refused("corner upload GL error");
             // A new schedule replaces every static texel, so the texture takes one full allocation.
             residentState.query.staticTexels=0;
             bool written=false;
-            if(!updateResidentQuery(gl,residentState.query,prepared.glass.query,tail,maximumTexture,written,error))return false;
+            if(!updateResidentQuery(gl,residentState.query,prepared.glass.query,tail,maximumTexture,written,error))
+                return refused("resident query upload");
             residentState.tail=std::move(tail);residentState.triangleCount=count;
             residentState.tableCharge=residency::ResidencyCharge(residency::BackingClass::fixtureScene,
                 residency::nominalBufferBytes(bytes[3])+residency::nominalBufferBytes(bytes[4])
@@ -14305,6 +16887,44 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             return true;
         };
         residentTables=residentCaustic||(establishCaustic&&establishResidentCaustic());
+        // The docked preview draws the caustic only when the schedule identity survives a
+        // water step, which needs residency. Name the first condition that fails, once per
+        // change, so one run tells which condition to fix.
+        if(preview)
+        {
+            std::string state;
+            const auto named=[&](bool ok,const char* name) {if(!ok){if(!state.empty())state+=", ";state+=name;}};
+            if(residentCaustic)state="resident";
+            else
+            {
+                const bool eligibleNow=!multipleScatterPolicy&&waterRefit.planned&&waterRefit.program!=0
+                    &&waterRefit.object<scene->objectCount&&smoothglass::causticRoughness(resources->smoothGlass)==0;
+                if(!eligibleNow)
+                {
+                    named(!multipleScatterPolicy,"multiple-scatter");
+                    named(waterRefit.planned&&waterRefit.program!=0&&waterRefit.object<scene->objectCount,"water-refit-unplanned");
+                    named(smoothglass::causticRoughness(resources->smoothGlass)==0,"rough-glass");
+                }
+                else if(residentTables)state="established this frame";
+                else if(!residentState.valid)
+                    state=std::string("eligible, establishment refused: ")
+                        +(residentEstablishRefusal?residentEstablishRefusal:"not attempted");
+                else
+                {
+                    named(residentState.context==glfwGetCurrentContext(),"context-changed");
+                    named(residentState.rendererGeneration==resources->rendererGeneration,"renderer-generation");
+                    named(residentState.width==width&&residentState.height==height,"size-changed");
+                    named(residentState.source==source,"source-changed");
+                    named(residentState.scheduling.version==scheduling.version
+                        &&residentState.scheduling.entrySubdivisions==scheduling.entrySubdivisions,"schedule-changed");
+                    named(residentState.policyIdentity==policy.identity(),"policy-changed");
+                    named(sameResidentCausticInstances(residentState.instances,instances),"instances-changed");
+                    named(residentCausticInputsMatch(residentState,scene,runtime),"camera-or-light-changed");
+                }
+                if(state.empty())state="no failing condition named";
+            }
+            reportPreviewCausticResidency(state);
+        }
         // A resident frame whose water moved rewrites the water rows of the triangle
         // table and refits the water BLAS and TLAS bounds of the query texture, on the
         // GPU from the vertex buffer the refresh wrote. Nothing else is written.
@@ -14323,12 +16943,32 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
                 return fail(result.error);
             residentState.revision=waterRefit.vertexRevision;
         }
+        stageScope.reset();
+        stageScope.emplace ("gl:caustic-prep-buffers");
+        std::array<std::uint64_t,7> takenBytes{};
+        std::size_t takenSplatBytes=0;
         // Resident tables lend the work and triangle table names; the rest are per frame.
-        for(unsigned i=0;i<7;++i)
-            if(residentTables&&(i==3||i==4))frame->causticBuffers[i]=i==3?residentState.workBuffer:residentState.triangleBuffer;
-            else gl.GenBuffers(1,&frame->causticBuffers[i]);
+        // Pooled storage binds its previous name instead of allocating a fresh one.
+        {
+            loopstep::Scope genScope ("gl:caustic-buffer-gen");
+            for(unsigned i=0;i<7;++i)
+                if(residentTables&&(i==3||i==4))frame->causticBuffers[i]=i==3?residentState.workBuffer:residentState.triangleBuffer;
+                else if((i==2||i==6)&&earlySpectrum[i==2?0:1])
+                {
+                    frame->causticBuffers[i]=earlySpectrum[i==2?0:1];
+                    takenBytes[i]=earlySpectrumBytes[i==2?0:1];
+                    earlySpectrum[i==2?0:1]=0;
+                }
+                else if(const unsigned pooled=resources->takePooledCausticBufferUnlocked(i,takenBytes[i]))
+                {
+                    frame->causticBuffers[i]=pooled;
+                }
+                else gl.GenBuffers(1,&frame->causticBuffers[i]);
+        }
         static constexpr const char* bufferNames[7]{"path receipt buffer","deposit receipt buffer","low spectrum buffer",
             "work table buffer","triangle table buffer","key buffer","high spectrum buffer"};
+        {
+        loopstep::Scope loopScope ("gl:caustic-buffer-loop");
         for(unsigned i=0;i<7;++i)
         {
             gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,frame->causticBuffers[i]);
@@ -14336,23 +16976,32 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             // The frame that set them up uploads them here, once.
             if(!residentCaustic||(i!=3&&i!=4))
             {
-                const void* input=i==3?static_cast<const void*>(scheduled.workTexels.data()):i==4?static_cast<const void*>(scheduled.triangleTexels.data()):nullptr;
-                gl.BufferData(GL_SHADER_STORAGE_BUFFER,std::ptrdiff_t(bytes[i]),input,(i<3||i>=5)?GL_DYNAMIC_COPY:GL_STATIC_DRAW);
-                if(auto failure=allocationFailed(bufferNames[i],bytes[i]))return *failure;
+                // Pooled storage of the same size keeps its allocation. [2] and [6]
+                // still clear below, so their contents start every frame empty.
+                if(takenBytes[i]!=bytes[i])
+                {
+                    loopstep::Scope uploadScope ("gl:caustic-buffer-upload");
+                    const void* input=i==3?static_cast<const void*>(scheduled.workTexels.data()):i==4?static_cast<const void*>(scheduled.triangleTexels.data()):nullptr;
+                    gl.BufferData(GL_SHADER_STORAGE_BUFFER,std::ptrdiff_t(bytes[i]),input,(i<3||i>=5)?GL_DYNAMIC_COPY:GL_STATIC_DRAW);
+                    if(auto failure=allocationFailed(bufferNames[i],bytes[i]))return *failure;
+                }
             }
-            if(i==2||i==6)
+            if((i==2||i==6)&&!earlyCleared)
             {
+                loopstep::Scope clearScope ("gl:caustic-spectrum-clear");
                 // Accumulated as uint bit patterns, so all-zero words are +0.0f.
                 clearBufferData(GL_SHADER_STORAGE_BUFFER,GL_R32UI,GL_RED_INTEGER,GL_UNSIGNED_INT,nullptr);
                 if(auto failure=allocationFailed(bufferNames[i],bytes[i]))return *failure;
             }
             gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,i,frame->causticBuffers[i]);
         }
+        }
         if(splat)
         {
-            // Transient: the render deletes it on every exit, so the frame never owns it.
-            // Resident tables keep the initial words on the GPU and a resident frame
-            // copies them in there, since the splat passes overwrite their counters.
+            loopstep::Scope splatSetupScope ("gl:caustic-splat-setup");
+            // The scratch returns to the frame pool on every exit instead of being
+            // deleted. Resident tables keep the initial words on the GPU and a resident
+            // frame copies them in there, since the splat passes overwrite their counters.
             if(establishCaustic)
                 residentState.copyBufferSubData=residentTables?glfwGetProcAddress("glCopyBufferSubData"):nullptr;
             const auto copyBuffer=residentTables
@@ -14365,13 +17014,24 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
                 catch(const std::bad_alloc&) {return fail("OpenGL caustic splat scratch allocation failed");}
             }
             const std::size_t wordBytes=residentWords?residentState.splatBytes:words.size()*sizeof(std::uint32_t);
-            gl.GenBuffers(1,&splatBuffer);
+            if(resources->pooledCausticSplat)
+            {
+                splatBuffer=resources->pooledCausticSplat;
+                takenSplatBytes=resources->pooledCausticSplatBytes;
+                resources->pooledCausticSplat=0;resources->pooledCausticSplatBytes=0;
+            }
+            else gl.GenBuffers(1,&splatBuffer);
             if(!splatBuffer)return fail("OpenGL caustic splat scratch allocation failed");
             gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,splatBuffer);
-            gl.BufferData(GL_SHADER_STORAGE_BUFFER,std::ptrdiff_t(wordBytes),residentWords?nullptr:words.data(),GL_DYNAMIC_COPY);
+            // Pooled storage of the right size keeps its allocation: a resident frame
+            // re-initializes it with the copy below, and every other case uploads here.
+            if(takenSplatBytes!=wordBytes||!residentWords)
+                gl.BufferData(GL_SHADER_STORAGE_BUFFER,std::ptrdiff_t(wordBytes),residentWords?nullptr:words.data(),GL_DYNAMIC_COPY);
             if(auto failure=allocationFailed("splat scratch buffer",wordBytes))return *failure;
+            splatPoolBytes=wordBytes;
             if(residentWords)
             {
+                loopstep::Scope splatCopyScope ("gl:caustic-splat-copy");
                 gl.BindBuffer(GL_COPY_READ_BUFFER,residentState.splatBuffer);
                 copyBuffer(GL_COPY_READ_BUFFER,GL_SHADER_STORAGE_BUFFER,0,0,std::ptrdiff_t(wordBytes));
                 gl.BindBuffer(GL_COPY_READ_BUFFER,0);
@@ -14389,23 +17049,53 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             }
             gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,gc::opengl::kSplatScratchBinding,splatBuffer);
         }
+        stageScope.reset();
+        stageScope.emplace ("gl:caustic-prep-textures");
         gl.ActiveTexture(GL_TEXTURE0);gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
         glPixelStorei(GL_UNPACK_ALIGNMENT,1);glPixelStorei(GL_UNPACK_ROW_LENGTH,0);glPixelStorei(GL_UNPACK_SKIP_PIXELS,0);glPixelStorei(GL_UNPACK_SKIP_ROWS,0);
-        // Resident tables lend their current query texture; the raster textures are per frame.
+        // Resident tables lend their current query texture; the raster triple comes
+        // back from the resource pool across frame releases instead of being
+        // regenerated and bulk-deleted every frame (verify65 measured that delete
+        // blocking up to 255 ms while the frame's own compute was still in flight).
+        const std::uint64_t rasterKey=std::uint64_t(width)|(std::uint64_t(height)<<32);
+        // A resize changes the key: evict the mismatched triple here, or the
+        // release-side owner==0 guard keeps refusing it, every frame allocates
+        // and bulk-deletes a fresh triple, and the stale one holds its ~300 MB
+        // at 4K until teardown.
+        if(resources->pooledRasterTriple.owner&&resources->pooledRasterTriple.key!=rasterKey)
+        {
+            glDeleteTextures(1,&resources->pooledRasterTriple.owner);
+            glDeleteTextures(1,&resources->pooledRasterTriple.triangle);
+            glDeleteTextures(1,&resources->pooledRasterTriple.depth);
+            resources->pooledRasterTriple={};
+        }
+        const bool pooledRaster=resources->pooledRasterTriple.owner
+            &&resources->pooledRasterTriple.key==rasterKey;
+        if(pooledRaster)
+        {
+            frame->causticTextures[1]=resources->pooledRasterTriple.owner;
+            frame->causticTextures[2]=resources->pooledRasterTriple.triangle;
+            frame->causticTextures[3]=resources->pooledRasterTriple.depth;
+            resources->pooledRasterTriple={};
+        }
         if(residentTables)
         {
             frame->causticTextures[0]=residentState.query.texture;
-            glGenTextures(3,frame->causticTextures.data()+1);
+            if(!pooledRaster)glGenTextures(3,frame->causticTextures.data()+1);
         }
-        else glGenTextures(int(frame->causticTextures.size()),frame->causticTextures.data());
+        else
+        {
+            glGenTextures(1,frame->causticTextures.data());
+            if(!pooledRaster)glGenTextures(3,frame->causticTextures.data()+1);
+        }
         for(unsigned i=residentTables?1u:0u;i<4;++i)
         {
             glBindTexture(GL_TEXTURE_2D,frame->causticTextures[i]);
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
             if(i==0)glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,opaquevisibility::kTextureWidth,scheduled.query.height,0,GL_RGBA,GL_FLOAT,scheduled.query.texels.data());
-            else if(i==3)glTexImage2D(GL_TEXTURE_2D,0,GL_DEPTH_COMPONENT32F,width,height,0,GL_DEPTH_COMPONENT,GL_FLOAT,nullptr);
-            else glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,width,height,0,GL_RGBA,GL_FLOAT,nullptr);
+            else if(!pooledRaster&&i==3)glTexImage2D(GL_TEXTURE_2D,0,GL_DEPTH_COMPONENT32F,width,height,0,GL_DEPTH_COMPONENT,GL_FLOAT,nullptr);
+            else if(!pooledRaster)glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,width,height,0,GL_RGBA,GL_FLOAT,nullptr);
             static constexpr const char* textureNames[4]{"query texture","raster owner texture","raster triangle texture","raster depth texture"};
             const std::uint64_t texels=i==0?std::uint64_t(opaquevisibility::kTextureWidth)*scheduled.query.height:std::uint64_t(width)*height;
             if(auto failure=allocationFailed(textureNames[i],texels*(i==3?4:16)))return *failure;
@@ -14413,19 +17103,42 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         if(std::any_of(frame->causticTextures.begin(),frame->causticTextures.end(),[](auto t){return !t;})
             ||std::any_of(frame->causticBuffers.begin(),frame->causticBuffers.end(),[](auto b){return !b;}))
             return fail("OpenGL caustic native allocation failed: a buffer or texture name is zero");
+        stageScope.reset();
+        stageScope.emplace ("gl:caustic-prep-setup");
+        // The raster framebuffer, the rasterizer state block and the attachment
+        // clears, each named separately: verify64 measured prep-setup holding
+        // 256-288 ms of every slow frame in phase B.
+        {
+        // verify65: prep-setup's whole hold (301, 256 ms) sits in this region —
+        // generation, attachment and the completeness check are named separately.
+        loopstep::Scope fboGenScope ("gl:caustic-fbo-gen");
         gl.GenVertexArrays(1,&vao);gl.BindVertexArray(vao);
         gl.GenFramebuffers(1,&rasterFbo);gl.BindFramebuffer(GL_FRAMEBUFFER,rasterFbo);
+        }
+        {
+        loopstep::Scope fboAttachScope ("gl:caustic-fbo-attach");
         gl.FramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,frame->causticTextures[1],0);
         gl.FramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT1,GL_TEXTURE_2D,frame->causticTextures[2],0);
         gl.FramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,frame->causticTextures[3],0);
         gl.DrawBuffers(2,drawBuffers);
+        }
+        {
+        loopstep::Scope fboCheckScope ("gl:caustic-fbo-check");
         if(!rasterFbo||!vao||gl.CheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)return fail("OpenGL caustic private raster attachments unavailable");
+        }
+        {
+        loopstep::Scope setupStateScope ("gl:caustic-setup-state");
         glViewport(0,0,width,height);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);glDepthMask(GL_TRUE);glDepthFunc(GL_LESS);
         glEnable(GL_DEPTH_TEST);glDisable(GL_BLEND);for(unsigned i=0;i<8;++i)gl.Disablei(GL_BLEND,i);
         glDisable(GL_SCISSOR_TEST);glDisable(GL_CULL_FACE);glDisable(GL_RASTERIZER_DISCARD);glDisable(GL_COLOR_LOGIC_OP);glDisable(GL_FRAMEBUFFER_SRGB);
+        }
+        {
+        loopstep::Scope setupClearsScope ("gl:caustic-setup-clears");
         glPolygonMode(GL_FRONT_AND_BACK,GL_FILL);glClearDepth(1);glClear(GL_DEPTH_BUFFER_BIT);
         const float zero[4]{};gl.ClearBufferfv(GL_COLOR,0,zero);gl.ClearBufferfv(GL_COLOR,1,zero);
-        const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.camera.transform.rotation;
+        }
+        
+const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.camera.transform.rotation;
         const auto uniforms=[&](unsigned program) {
             gl.UseProgram(program);const auto loc=[&](const char* n){return gl.GetUniformLocation(program,n);};
             gl.Uniform4f(loc("uCamera"),camera[0],camera[1],camera[2],0);
@@ -14441,6 +17154,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             if(plan.stageFences||(band&&plan.bandFences))return causticFence(gl,result.error);
             glFlush();return true;
         };
+        stageScope.reset();
         const auto rasterStarted=std::chrono::steady_clock::now();
         stamp(0);
         uniforms(programs[1]);
@@ -14474,6 +17188,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         stamp(2);
         if(!stageDone(false))return fail(result.error);
         diagnostics.traceMilliseconds=elapsed(traceStarted);
+        stageScope.emplace ("gl:caustic-compute-gap");
         // The bitonic sort sets these two uniforms per pass. Look them up once.
         const auto sortSpanLocation=gl.GetUniformLocation(programs[4],"uSortSpan");
         const auto sortDistanceLocation=gl.GetUniformLocation(programs[4],"uSortDistance");
@@ -14496,6 +17211,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             };
             // The private raster owners and triangle IDs, on units 0 and 1.
             for(unsigned i=0;i<2;++i) {gl.ActiveTexture(GL_TEXTURE0+i);gl.BindSampler(i,0);glBindTexture(GL_TEXTURE_2D,frame->causticTextures[1+i]);}
+            stageScope.reset();
             const auto normaliserStarted=std::chrono::steady_clock::now();
             const auto slots=std::uint64_t(scheduled.work.size())*policy.description().maximumVisits;
             // Bounded bands, each finished before the next (see kSplatGatherBandPixels).
@@ -14529,6 +17245,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT|GL_BUFFER_UPDATE_BARRIER_BIT);
             if(!stageDone(false))return fail(result.error);
             diagnostics.sortMilliseconds=elapsed(sortStarted);
+            stageScope.emplace ("gl:caustic-compute-gap");
             std::uint32_t overflow=0,gatherWork=0;
             if(!preview)
             {
@@ -14583,6 +17300,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             else
             {
                 readback->deposition.splatGatherWork=gatherWork;diagnostics.splatGatherWork=gatherWork;
+                stageScope.reset();
                 const auto gatherStarted=std::chrono::steady_clock::now();
                 splatUniforms(programs[kCausticSplatGatherProgram]);
                 constexpr auto groupsPerTile=gc::kSplatTile/gc::kSplatGatherGroup;
@@ -14602,6 +17320,7 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
                 diagnostics.reduceMilliseconds=elapsed(gatherStarted);
             }
         }
+        stageScope.reset();
         if(!splatGathered)
         {
             const auto sortStarted=std::chrono::steady_clock::now();
@@ -14632,6 +17351,8 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             if(!stageDone(false))return fail(result.error);
             diagnostics.reduceMilliseconds=elapsed(reduceStarted);
         }
+        stageScope.reset();
+        stageScope.emplace ("gl:caustic-compute-gap");
         const auto readbackStarted=std::chrono::steady_clock::now();
         if(plan.hostReceipt)
         {
@@ -14740,14 +17461,15 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
                     return fail("OpenGL caustic splat normaliser readback failed");
             }
             // Paths, deposits and keys now live in the host receipt. Their device
-            // storage is freed before validation; nothing reads these slots of an
-            // ordinary caustic frame again. The spectrum buffers stay for the resolve.
-            for(unsigned slot:{0u,1u,5u}) {gl.DeleteBuffers(1,&frame->causticBuffers[slot]);frame->causticBuffers[slot]=0;}
+            // storage returns to the frame pool before validation; nothing reads these
+            // slots of an ordinary caustic frame again. The spectrum buffers stay for
+            // the resolve.
+            for(unsigned slot:{0u,1u,5u}) {resources->poolCausticBufferUnlocked(slot,frame->causticBuffers[slot],bytes[slot]);frame->causticBuffers[slot]=0;}
             readback->deposition.version=gc::kDepositionVersion;readback->deposition.submission=submission;readback->deposition.complete=true;
             for(const auto& path:readback->paths)
             {
-                if(path.queryWork>gc::kMaximumFrameQueryWork||diagnostics.queryWork>gc::kMaximumFrameQueryWork-path.queryWork)
-                    return fail("OpenGL caustic completed query work exceeded admission");
+                if(path.queryWork>std::numeric_limits<std::uint64_t>::max()-diagnostics.queryWork)
+                    return fail("OpenGL caustic completed query work does not fit 64 bits");
                 diagnostics.queryWork+=path.queryWork;
             }
             diagnostics.readbackMilliseconds=elapsed(readbackStarted);
@@ -14756,31 +17478,37 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         }
         else
         {
-            // Preview draws Color only. Nothing reads its paths, deposits or keys, so they are
-            // freed unread, and the frame publishes no receipt or energy ledger.
-            for(unsigned slot:{0u,1u,5u}) {gl.DeleteBuffers(1,&frame->causticBuffers[slot]);frame->causticBuffers[slot]=0;}
+            // Preview draws Color only. Nothing reads its paths, deposits or keys, so they
+            // leave the frame unread through the pool, and the frame publishes no receipt
+            // or energy ledger.
+            for(unsigned slot:{0u,1u,5u}) {resources->poolCausticBufferUnlocked(slot,frame->causticBuffers[slot],bytes[slot]);frame->causticBuffers[slot]=0;}
             diagnostics.readbackMilliseconds=elapsed(readbackStarted);
             if(!baseOwnerValid())return fail("OpenGL caustic frame owner changed before Color publication");
             // The submission is fenced and left on the GPU. A later frame polls the fence and
-            // adopts the spectrum. GL keeps the storage of the names deleted above, and of the
+            // adopts the spectrum. GL keeps the storage of the names released above, and of the
             // frame's tables and raster, alive until the commands that read them complete.
+            stageScope.reset();
+            stageScope.emplace ("gl:caustic-job-store");
             stamp(3);
             const auto fence=gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
             if(!fence)return fail("OpenGL caustic Preview submission fence allocation failed");
             glFlush();
             OpenGlFixtureSceneResources::PreviewCausticJob job;
             job.fence=fence;job.submitted=std::chrono::steady_clock::now();
-            job.spectrum={frame->causticBuffers[2],frame->causticBuffers[6]};frame->causticBuffers[2]=0;frame->causticBuffers[6]=0;
+            job.spectrum={frame->causticBuffers[2],frame->causticBuffers[6]};job.spectrumBytes={bytes[2],bytes[6]};frame->causticBuffers[2]=0;frame->causticBuffers[6]=0;
             job.counters=previewCounters;previewCounters=0;
             job.stamps=stampQueries;stampQueries={};
             job.schedule=*previewSchedule;
             if(plan.reuseSpectrum)job.exact=reuseKey;
             job.singlePixelIdentity=residentCaustic?residentState.singlePixelIdentity:singlePixelIdentity;
-            job.splat=splat;
+            job.splat=splat;job.exportBudgets=previewExportBudgets;
             resources->releasePreviewCausticJobUnlocked();
             resources->previewCausticJob=std::move(job);
+            stageScope.reset();
         }
     }
+    stageScope.reset();
+    stageScope.emplace ("gl:caustic-composite");
     // Only validated GPU spectral storage is resolved into product Color.
     const auto resolveStarted=std::chrono::steady_clock::now();
     if(resolveCaustic)
@@ -14791,9 +17519,30 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
             gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,2,resources->previewSpectrumBuffers[0]);
             gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,6,resources->previewSpectrumBuffers[1]);
         }
-        glGenTextures(1,&resolveTexture);glBindTexture(GL_TEXTURE_2D,resolveTexture);
+        // The resolve target is the texture the last resolve published as base Color,
+        // drained through the pending slot: same size means no fresh allocation, and
+        // the draw below rewrites every pixel. verify62 measured this allocation at
+        // 256 ms inside composite on a slow frame.
+        const std::uint64_t resolveBytes=std::uint64_t(width)*height*(runtime.linearColor?8u:4u);
+        bool pooledResolve=false;
+        if(resources->pooledResolveColor&&resources->pooledResolveColorBytes==resolveBytes
+            &&resources->pooledResolveColorWidth==width&&resources->pooledResolveColorHeight==height)
+        {
+            resolveTexture=resources->pooledResolveColor;
+            resources->pooledResolveColor=0;resources->pooledResolveColorBytes=0;resources->pooledResolveColorWidth=0;resources->pooledResolveColorHeight=0;
+            pooledResolve=true;
+        }
+        else
+        {
+            if(resources->pooledResolveColor)
+            {glDeleteTextures(1,&resources->pooledResolveColor);resources->pooledResolveColor=0;resources->pooledResolveColorBytes=0;resources->pooledResolveColorWidth=0;resources->pooledResolveColorHeight=0;}
+            glGenTextures(1,&resolveTexture);
+        }
+        glBindTexture(GL_TEXTURE_2D,resolveTexture);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D,0,runtime.linearColor?GL_RGBA16F:GL_RGBA8,width,height,0,GL_RGBA,runtime.linearColor?GL_HALF_FLOAT:GL_UNSIGNED_BYTE,nullptr);
+        // A pooled target keeps its storage; the resolve draw rewrites every pixel.
+        if(!pooledResolve)
+            glTexImage2D(GL_TEXTURE_2D,0,runtime.linearColor?GL_RGBA16F:GL_RGBA8,width,height,0,GL_RGBA,runtime.linearColor?GL_HALF_FLOAT:GL_UNSIGNED_BYTE,nullptr);
         gl.GenFramebuffers(1,&resolveFbo);gl.BindFramebuffer(GL_FRAMEBUFFER,resolveFbo);
         gl.FramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,resolveTexture,0);gl.DrawBuffers(1,drawBuffers);
         if(!resolveTexture||!resolveFbo||gl.CheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)return fail("OpenGL caustic Color resolve allocation failed");
@@ -14818,6 +17567,8 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         }
         else glFlush();
     }
+    stageScope.reset();
+    stageScope.emplace ("gl:caustic-report");
     // Preview reports its submission's GPU times once its poll found them complete.
     if(previewPoll.adopted||previewPoll.declined)
     {
@@ -14826,7 +17577,8 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     }
     // The resolve was the last reader of the export spectrum buffers; the validated host
     // receipt keeps the eight bands. A Preview submission took its own spectrum with it.
-    for(unsigned slot:{2u,6u}) {gl.DeleteBuffers(1,&frame->causticBuffers[slot]);frame->causticBuffers[slot]=0;}
+    // An untaken spectrum returns to the frame pool for the next traced submission.
+    for(unsigned slot:{2u,6u}) {resources->poolCausticBufferUnlocked(slot,frame->causticBuffers[slot],bytes[slot]);frame->causticBuffers[slot]=0;}
     // Read the candidate without replacing the base frame's published view.
     NativeRawPassPixels color;
     auto descriptor=frame->colorTextureDescriptor();descriptor.imageHandle=resolveTexture;descriptor.textureViewHandle=resolveTexture;
@@ -14845,7 +17597,16 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
     }
     diagnostics.resolveMilliseconds=elapsed(resolveStarted);
     // A Preview frame with no spectrum to resolve publishes its base Color without the caustic.
-    if(resolveCaustic) {glDeleteTextures(1,&frame->texture_);frame->texture_=resolveTexture;resolveTexture=0;}
+    // The resolve replaced the base Color, but this frame's glass bands and resolve
+    // are still in flight above: defer the delete to the next frame's early stage.
+    if(resolveCaustic)
+    {
+        if(resources->pendingBaseColorDelete)glDeleteTextures(1,&resources->pendingBaseColorDelete);
+        resources->pendingBaseColorDelete=frame->texture_;
+        resources->pendingBaseColorWidth=frame->width_;resources->pendingBaseColorHeight=frame->height_;
+        resources->pendingBaseColorBytes=std::uint64_t(width)*height*(runtime.linearColor?8u:4u);
+        frame->texture_=resolveTexture;resolveTexture=0;
+    }
     frame->linearColor=runtime.linearColor;
     if(plan.hostReceipt) {frame->causticEnergy=energy;frame->causticReadback=std::move(readback);}
     frame->causticSinglePixelIdentity=singlePixelIdentity;
@@ -14901,7 +17662,17 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         residentState.prepared=std::move(builtPrepared);residentState.frame=std::move(builtScheduled);
         residentState.revision=waterRefit.vertexRevision;residentState.valid=true;
     }
-    cleanup();return result;
+    cleanup();
+    // fixtureMutex() is held from the admission above, so the submission this frame
+    // fenced (or the one it polled and left in flight) is read without another lock.
+    result.causticPending=resources->previewCausticJob.has_value();
+    if(preview)reportPreviewCausticSubmit(std::string("caustic path pending=")+(result.causticPending?"1":"0"));
+    // The pipeline reached its end: the discrete camera evaluator and combined
+    // finalizer validated this frame, so the staging privacy ends here and a
+    // composite read can take its receipt. Nothing else in the tree ever
+    // cleared the flag, so every completed glass frame stayed unreadable.
+    if(frame) frame->privateCameraAttachments=false;
+    return result;
 #endif
 }
 
@@ -14956,8 +17727,8 @@ NativeFixtureScenePreparation prepareOpenGlGlassGratingResources(
         // Reserve immutable snapshots, query preparation copies and static native
         // uploads before cloning a Scene or material or allocating GPU storage.
         if(!materialMemory||!charge(4,sizeof(*scene))||!charge(scene->textureTexels.size(),4*sizeof(SceneTexelRgba8))
-            ||!charge(4*opaquevisibility::kTextureWidth*opaquevisibility::kTextureHeight,sizeof(opaquevisibility::Texel))
-            ||!charge(8,sceneaov::detail::kMaximumSceneBytes)
+            ||!charge(4*opaquevisibility::sceneQueryPayloadTexels(*scene),sizeof(opaquevisibility::Texel))
+            ||!charge(8,sceneaov::detail::sceneWireBytes(*scene))
             ||!charge(scene->vertexCount,2*sizeof(SceneVertex))||!charge(scene->indexCount,2*sizeof(std::uint32_t))
             ||!charge(1,sizeof(OpenGlFixtureSceneResources))||total>renderpassoutput::kMaximumTotalBytes)
         {refused.error="OpenGL private mixed static storage exceeds the whole-frame cap";return refused;}
@@ -15045,7 +17816,14 @@ bool stageOpenGlGlassGratingFrame(
         {error="OpenGL private staging incumbent ownership or memory is invalid";return false;}
         gc::GratingIncidentBounds adjunct;
         // Binding preparation itself copies its frozen Frame and query authority.
-        if(!gc::calculateGratingIncidentBounds(scheduled,kMaximumNativeDiffractionTriangles,adjunct,error)
+        // The grating binding does not exist yet, so reserve for the scene's largest object.
+        std::size_t largestObjectTriangles=1;
+        for(std::size_t object=0;object<resources->snapshot->objectCount;++object)
+        {
+            const auto& candidate=resources->snapshot->objects[object];
+            largestObjectTriangles=std::max<std::size_t>(largestObjectTriangles,(candidate.indexCount?candidate.indexCount:candidate.vertexCount)/3);
+        }
+        if(!gc::calculateGratingIncidentBounds(scheduled,largestObjectTriangles,adjunct,error)
             ||!resources->queryContext||!resources->queryContext->active
             ||!charge(1,resources->queryContext->deferredBytes.load(std::memory_order_relaxed))
             ||!charge(3,adjunct.bytes)||!charge(pixels,36+fixtureLinearCameraStorageStride())
@@ -15131,6 +17909,13 @@ bool stageOpenGlGlassGratingFrame(
         if(!allocateFixtureCameraAttachments(gl,frame.get(),true,cameraFbo,
             frame->gratingCameraDepthAttachment,error)
             ||!fixtureCameraAttachmentsMatch(*frame,error)) {const auto message=error;return fail(message.c_str());}
+        // allocateFixtureCameraAttachments resets the flag for ordinary renders,
+        // and staging must re-assert it here, as the allocator's comment says:
+        // no camera draw has completed, so every staged view stays private until
+        // the exact discrete camera evaluator and the combined finalizer
+        // validate it. Without this second set the flag from above is gone the
+        // moment the call returns and the staging gates refuse their own frame.
+        frame->privateCameraAttachments=true;
         // No camera draw has completed. Keep every view private until the exact
         // discrete camera evaluator and the combined finalizer validate it.
         frame->causticDiagnostics.nativeStorageBytes+=pixels*fixtureLinearCameraStorageStride();
@@ -15162,7 +17947,19 @@ bool stageOpenGlGlassGratingFrame(
         const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.camera.transform.rotation;
         gl.Uniform4f(location("uCamera"),camera[0],camera[1],camera[2],0);gl.Uniform4f(location("uRotation"),rotation.x,rotation.y,rotation.z,rotation.w);
         gl.Uniform4f(location("uProjection"),std::tan(scheduled.camera.verticalFovRadians*.5f),float(width)/height,scheduled.camera.nearPlane,scheduled.camera.farPlane);
-        for(std::size_t t=0;t<scheduled.triangles.size();++t) {gl.Uniform1i(location("uTriangle"),int(t));glDrawArrays(GL_TRIANGLES,0,3);}
+        for(std::size_t t=0;t<scheduled.triangles.size();++t)
+        {
+            // The receiver-surface raster answers for a glass-penetrating
+            // camera ray, the same view splatCpuQuery resolves: through the
+            // caustic volume to the receiver behind it. A glass texel here can
+            // only overwrite that receiver under depth test, and
+            // causticSplatSurface rejects non-receivers anyway, so a dome
+            // drawing over the water turned its windows' texels into zeros the
+            // reference - which never sees the glass - still counts as
+            // radiance. Only receivers raster.
+            if(scheduled.triangles[t].glass)continue;
+            gl.Uniform1i(location("uTriangle"),int(t));glDrawArrays(GL_TRIANGLES,0,3);
+        }
         gl.MemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT|GL_TEXTURE_FETCH_BARRIER_BIT);
         const auto getUniform=reinterpret_cast<PFNGLGETUNIFORMFVPROC>(glfwGetProcAddress("glGetUniformfv"));
         if(!getUniform)return fail("OpenGL historical raster uniform capture is unavailable");
@@ -15574,7 +18371,7 @@ static bool produceOpenGlDirectGratingIrradianceCohortImpl(
             ||frame->ownerContext!=glfwGetCurrentContext()||resources->ownerContext!=frame->ownerContext
             ||frame->rendererGeneration_!=resources->rendererGeneration||!frame->privateCameraAttachments||frame->gratingCameraBaseComplete
             ||!frame->gratingCameraRuntime||!std::isfinite(evaluationTime)||evaluationTime!=frame->gratingCameraEvaluationTime
-            ||binding->sources().empty()||binding->sources().size()>HarmonicMIDI::grid::Visual3DScene::kMaxLights
+            ||binding->sources().empty()
             ||binding->inputs().empty()||binding->inputs().size()>gc::kMaximumEntrySamples
             ||binding->inputs().capacity()>2*binding->inputs().size())
         {error="OpenGL directional cohort requires an exact current private common frame";return false;}
@@ -15601,7 +18398,6 @@ static bool produceOpenGlDirectGratingIrradianceCohortImpl(
         {error="OpenGL directional cohort adds an owner to the actual frozen source roster";return false;}
         if(output.endpoints.capacity()>renderpassoutput::kMaximumTotalBytes/sizeof(gc::DirectGratingEndpointIrradianceSum)
             ||output.submission.frameIdentity.capacity()>renderpassoutput::kMaximumTotalBytes
-            ||sourceReadbacks.size()>HarmonicMIDI::grid::Visual3DScene::kMaxLights
             ||sourceReadbacks.capacity()>renderpassoutput::kMaximumTotalBytes/sizeof(gc::NativeDirectGratingContributionReadback))
         {error="OpenGL directional cohort incumbent storage exceeds the original cap";return false;}
         for(const auto& old:sourceReadbacks)if(old.samples.capacity()>renderpassoutput::kMaximumTotalBytes/sizeof(gc::NativeDirectGratingContributionSample)
@@ -16296,7 +19092,7 @@ static bool produceOpenGlGlassGratingReadback(
             ||!charge(1,frame->nativeAttemptBytes)
             ||!charge(1,frame->cameraGlassTraceBytes)
             ||!charge(1,sizeof(HarmonicMIDI::grid::Visual3DScene))
-            ||!charge(8,sceneaov::detail::kMaximumSceneBytes)
+            ||!charge(8,sceneaov::detail::sceneWireBytes(*resources->snapshot))
             ||!charge(resources->snapshot->textureTexels.size(),sizeof(HarmonicMIDI::grid::SceneTexelRgba8))
             ||!charge(resources->smoothGlass.query.texels.size(),2*sizeof(gc::Texel))
             ||!charge(resources->smoothGlass.query.meshes.size(),2*sizeof(opaquevisibility::Mesh))

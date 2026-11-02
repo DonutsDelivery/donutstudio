@@ -805,7 +805,7 @@ int main()
             malformed = *payload.scene;
             ++malformed.textureTexelCount;
             check(!validateVisual3DScene(malformed).valid(),
-                  "scene texel count cannot exceed the fixed aggregate cap");
+                  "scene texel count cannot exceed its allocated texels");
             malformed = *payload.scene;
             malformed.textureCount = 2;
             malformed.textures[1] = malformed.textures[0];
@@ -827,8 +827,7 @@ int main()
             for (std::size_t countIndex = 0; countIndex < 8; ++countIndex)
             {
                 std::vector<std::uint8_t> header(encoded.begin(), encoded.begin() + 56);
-                writeCount(header, countIndex, static_cast<std::uint32_t>(
-                    sceneaov::detail::kSceneCountLimits[countIndex] + 1));
+                writeCount(header, countIndex, 0xffffffffu);
                 Visual3DScene rejected;
                 check(!sceneaov::detail::decodeScene(header, rejected)
                       && rejected.textureTexels.empty(),
@@ -845,54 +844,61 @@ int main()
             check(!sceneaov::detail::decodeScene(truncated, rejected)
                   && rejected.textureTexels.empty(),
                   "trailing scene bytes cannot hide a mismatched array payload");
-            std::vector<std::uint8_t> hexOutput;
-            check(!sceneaov::detail::unhex(std::string(
-                      sceneaov::detail::kMaximumSceneBytes * 2 + 2, '0'), hexOutput)
-                  && hexOutput.empty(),
-                  "oversized hex input is rejected before the decoded wire allocation");
         }
-        // A second texture record needs its own upload budget even with the same image.
+        // A second texture record copies the same image, passing the former 1024 * 1024 total.
         textured.images.emplace_back();
         textured.images[0].width = 1024;
         textured.images[0].height = 1024;
         textured.images[0].decodedRgba8.resize(1024u * 1024u * 4u);
         textured.textures.push_back(textured.textures[0]);
         textured.materials[0].normalTexture = GlbTextureInfo {1, 0};
-        check(rejectedExactly(std::move(textured), "GLB decoded image texels exceed Visual3DScene capacity"),
-              "adapter texture capacity is aggregate across material texture records");
+        std::string twoError;
+        const auto two = adaptStaticGlbToVisual3DScene(textured, twoError);
+        check(two && two->textureCount == 2 && two->textureTexelCount == 2u * 1024u * 1024u
+              && validateVisual3DScene(*two).valid(),
+              "two full textures adapt past the former texel cap");
     }
     {
-        auto malformed = makeTriangleAsset();
-        malformed.materials.resize(Visual3DScene::kMaxMaterials + 1);
-        check(rejectedExactly(std::move(malformed),
-                              "GLB material count exceeds Visual3DScene capacity"),
-              "material capacity overflow is rejected before copying");
+        auto large = makeTriangleAsset();
+        large.materials.resize(33, large.materials[0]);
+        std::string largeError;
+        const auto scene = adaptStaticGlbToVisual3DScene(large, largeError);
+        check(scene && scene->materialCount == 33 && validateVisual3DScene(*scene).valid(),
+              "33 materials adapt past the former cap of 32");
     }
     {
-        auto malformed = makeTriangleAsset();
-        const auto primitive = malformed.meshes[0].primitives[0];
-        malformed.meshes[0].primitives.resize(Visual3DScene::kMaxObjects + 1, primitive);
-        check(rejectedExactly(std::move(malformed),
-                              "GLB primitive count exceeds Visual3DScene object capacity"),
-              "primitive instance overflow is rejected at the object capacity");
+        auto large = makeTriangleAsset();
+        const auto primitive = large.meshes[0].primitives[0];
+        large.meshes[0].primitives.resize(65, primitive);
+        std::string largeError;
+        const auto scene = adaptStaticGlbToVisual3DScene(large, largeError);
+        check(scene && scene->objectCount == 65 && validateVisual3DScene(*scene).valid(),
+              "65 primitives adapt past the former object cap of 64");
     }
     {
-        auto malformed = makeTriangleAsset();
-        auto& primitive = malformed.meshes[0].primitives[0];
-        primitive.positions.resize((Visual3DScene::kMaxVertices + 1) * 3, 0.0f);
-        primitive.normals.resize((Visual3DScene::kMaxVertices + 1) * 3, 0.0f);
-        primitive.texCoords0.resize((Visual3DScene::kMaxVertices + 1) * 2, 0.0f);
-        check(rejectedExactly(std::move(malformed),
-                              "GLB vertex data exceeds Visual3DScene capacity"),
-              "vertex capacity overflow is rejected before fixed-array writes");
+        auto large = makeTriangleAsset();
+        auto& primitive = large.meshes[0].primitives[0];
+        constexpr std::size_t kVertices = 100000;
+        primitive.positions.resize(kVertices * 3, 0.0f);
+        primitive.normals.resize(kVertices * 3, 0.0f);
+        for (std::size_t vertex = 0; vertex < kVertices; ++vertex)
+            primitive.normals[vertex * 3 + 2] = 1.0f;
+        primitive.texCoords0.resize(kVertices * 2, 0.0f);
+        std::string largeError;
+        const auto scene = adaptStaticGlbToVisual3DScene(large, largeError);
+        check(scene && scene->vertexCount == kVertices && validateVisual3DScene(*scene).valid(),
+              "100000 vertices adapt past the former cap of 4096");
     }
     {
-        auto malformed = makeTriangleAsset();
-        malformed.meshes[0].primitives[0].indices.resize(
-            Visual3DScene::kMaxIndices + 3, 0);
-        check(rejectedExactly(std::move(malformed),
-                              "GLB index data exceeds Visual3DScene capacity"),
-              "index capacity overflow is rejected before fixed-array writes");
+        auto large = makeTriangleAsset();
+        auto& indices = large.meshes[0].primitives[0].indices;
+        indices.resize(300000);
+        for (std::size_t index = 0; index < indices.size(); ++index)
+            indices[index] = static_cast<std::uint32_t>(index % 3);
+        std::string largeError;
+        const auto scene = adaptStaticGlbToVisual3DScene(large, largeError);
+        check(scene && scene->indexCount == 300000 && validateVisual3DScene(*scene).valid(),
+              "300000 indices adapt past the former cap of 12288");
     }
     {
         auto malformed = makeTriangleAsset();

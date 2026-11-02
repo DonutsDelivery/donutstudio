@@ -96,12 +96,46 @@ inline bool environmentImageCases(arbitgpu::NativeFixtureSceneBackend& backend,s
         if (!frame.rendered || !frame.frame || !frame.frame->readRawPass(renderpassoutput::Output::Color,pixels,error)
             || pixels.format!=arbitgpu::NativeTexturePixelFormat::Rgba16Float || pixels.bytes.size()!=65*65*8)
         {error="HDR environment native float output missing: "+frame.error+error;return false;}
-        for (std::size_t c=0;c<3;++c)
+        const auto centerMatches=[&](const arbitgpu::NativeRawPassPixels& image,const std::array<double,3>& expectedRgb,
+                                     const char* label)
         {
-            std::uint16_t half=0;std::memcpy(&half,pixels.bytes.data()+(32*65+32)*8+2*c,2);
-            const double actual=hdrimage::halfToFloat(half),expected=test.expected[c];
-            if (!std::isfinite(actual) || std::abs(actual-expected)>std::max(.001,expected*.001))
-            {error="HDR environment independent pixel row "+std::to_string(row)+" expected "+std::to_string(expected)+", got "+std::to_string(actual);return false;}
+            for (std::size_t c=0;c<3;++c)
+            {
+                std::uint16_t half=0;std::memcpy(&half,image.bytes.data()+(32*65+32)*8+2*c,2);
+                const double actual=hdrimage::halfToFloat(half),expected=expectedRgb[c];
+                if (!std::isfinite(actual) || std::abs(actual-expected)>std::max(.001,expected*.001))
+                {error=std::string(label)+" row "+std::to_string(row)+" expected "+std::to_string(expected)+", got "+std::to_string(actual);return false;}
+            }
+            return true;
+        };
+        if (!centerMatches(pixels,test.expected,"HDR environment independent pixel")) return false;
+        // Hidden from the camera: a backdrop pixel is opaque black, as in Path
+        // Trace, while a mirror still reflects the same image radiance, e.g. row 8
+        // reflects +Z, the direction row 2 sees directly. Each mirror frame shows
+        // both: the quad spans 60% of the view, so its corner pixel is backdrop.
+        {
+            auto hidden=scene; hidden.lights[0].environmentCameraVisible=false;
+            const auto hiddenSnapshot=std::make_shared<const Visual3DScene>(hidden);
+            const auto hiddenPrepared=backend.prepare(hiddenSnapshot);
+            if (!hiddenPrepared.prepared) {error="HDR environment hidden from camera refused: "+hiddenPrepared.error;return false;}
+            const auto hiddenFrame=backend.render(hiddenSnapshot,hiddenPrepared.resources,65,65,inputs);
+            arbitgpu::NativeRawPassPixels hiddenPixels;
+            if (!hiddenFrame.rendered || !hiddenFrame.frame
+                || !hiddenFrame.frame->readRawPass(renderpassoutput::Output::Color,hiddenPixels,error)
+                || hiddenPixels.bytes.size()!=pixels.bytes.size())
+            {error="HDR environment hidden from camera output missing: "+hiddenFrame.error+error;return false;}
+            const std::array<double,3> black {0,0,0};
+            if (!centerMatches(hiddenPixels,test.background ? black : test.expected,
+                               test.background ? "HDR environment hidden from camera backdrop"
+                                               : "HDR environment hidden from camera reflection")) return false;
+            const std::size_t backdropPixel=test.background ? 32*65+32 : 0;
+            for (std::size_t c=0;c<4;++c)
+            {
+                std::uint16_t half=0;std::memcpy(&half,hiddenPixels.bytes.data()+backdropPixel*8+2*c,2);
+                const double actual=hdrimage::halfToFloat(half),expected=c==3 ? 1 : 0;
+                if (!std::isfinite(actual) || std::abs(actual-expected)>.001)
+                {error="HDR environment hidden backdrop row "+std::to_string(row)+" channel "+std::to_string(c)+" expected "+std::to_string(expected)+", got "+std::to_string(actual);return false;}
+            }
         }
         const auto again=backend.render(snapshot,prepared.resources,65,65,inputs);
         arbitgpu::NativeRawPassPixels repeat;

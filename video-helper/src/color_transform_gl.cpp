@@ -115,6 +115,32 @@ vec3 encodeTransfer(vec3 value)
     return mix(encodedHigh, encodedLow, low);
 }
 
+// AgX. shared/AgxViewTransform.h has the sources and the scalar twin.
+vec3 agxViewTransform(vec3 radiance)
+{
+    const mat3 toRec2020 = mat3(vec3(0.6274039, 0.0690973, 0.0163914),
+                                vec3(0.3292830, 0.9195404, 0.0880133),
+                                vec3(0.0433131, 0.0113623, 0.8955953));
+    const mat3 fromRec2020 = mat3(vec3(1.6604910, -0.1245505, -0.0181507),
+                                  vec3(-0.5876411, 1.1328999, -0.1005789),
+                                  vec3(-0.0728499, -0.0083494, 1.1187296));
+    const mat3 inset = mat3(vec3(0.856627153315983, 0.137318972929847, 0.11189821299995),
+                            vec3(0.0951212405381588, 0.761241990602591, 0.0767994186031903),
+                            vec3(0.0482516061458583, 0.101439036467562, 0.811302368396859));
+    const mat3 outset = mat3(vec3(1.1271005818144368, -0.1413297634984383, -0.14132976349843826),
+                             vec3(-0.11060664309660323, 1.157823702216272, -0.11060664309660294),
+                             vec3(-0.016493938717834573, -0.016493938717834257, 1.2519364065950405));
+    const float minimumEv = -12.47393;
+    const float maximumEv = 4.026069;
+    vec3 x = inset * (toRec2020 * radiance);
+    x = clamp((log2(max(x, vec3(1.0e-10))) - minimumEv) / (maximumEv - minimumEv), 0.0, 1.0);
+    vec3 x2 = x * x;
+    vec3 x4 = x2 * x2;
+    x = 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x
+        + 0.4298 * x2 + 0.1191 * x - 0.00232;
+    return clamp(fromRec2020 * pow(max(outset * x, vec3(0.0)), vec3(2.2)), 0.0, 1.0);
+}
+
 void main()
 {
     vec4 sampled = texture(sourceTexture, uv);
@@ -133,6 +159,7 @@ void main()
         absoluteNits *= y > 0.0 ? mappedY / y : 0.0;
     }
     working = absoluteNits / luminance.z;
+    if (toneMap == 2) working = agxViewTransform(working);
     vec3 outputLinear = (workingToOutput * vec4(working, 1.0)).rgb;
     vec3 outputEncoded = encodeTransfer(outputLinear);
 

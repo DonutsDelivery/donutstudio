@@ -56,8 +56,8 @@ inline void waterReplaySourceBudget(Check check)
     check(inspected.sourceNotes==2048 && inspected.sourceLinks==300 && inspected.sourceAudioFrames==1200
         && inspected.sourceTempoPoints==20 && inspected.sourceMeterPoints==2 && inspected.audioPrefix==1
         && inspected.sourceRestPositions==9 && inspected.sourceRestVertexIds==9 && inspected.sourceRestIndices==24
-        && inspected.steps==1 && inspected.impulseCapacity==512,
-        "recipe retains complete source sizes and the real coverage prefix separately from event cap");
+        && inspected.steps==1 && inspected.impulseCapacity==2049,
+        "recipe retains complete source sizes and the real coverage prefix as the impulse capacity");
     check(inspected.at(Work::censusNotes)==2048 && inspected.at(Work::scoreNotes)==2048
         && inspected.at(Work::scoreMasterNotes)==2048 && inspected.at(Work::scoreLinks)==300
         && inspected.at(Work::primes)==12288 && inspected.at(Work::commas)==18432
@@ -75,12 +75,12 @@ inline void waterReplaySourceBudget(Check check)
         && inspected.at(Work::gridVertices)==9 && inspected.at(Work::gridIndices)==24
         && inspected.at(Work::gridIdentityCalls)==9 && inspected.at(Work::settingsValues)==12,
         "recipe separates canonical, grid, settings and master audio validation work");
-    check(inspected.at(Work::sortElements)==512 && inspected.at(Work::waveInitializationElements)==36
-        && inspected.at(Work::velocityCopyElements)==9 && inspected.at(Work::eventCursorChecks)==513
-        && inspected.at(Work::eventDeposits)==2048 && inspected.at(Work::stencilVertices)==9
+    check(inspected.at(Work::sortElements)==2049 && inspected.at(Work::waveInitializationElements)==36
+        && inspected.at(Work::velocityCopyElements)==9 && inspected.at(Work::eventCursorChecks)==2050
+        && inspected.at(Work::eventDeposits)==8196 && inspected.at(Work::stencilVertices)==9
         && inspected.at(Work::stencilHeightReads)==63 && inspected.at(Work::publicationTransfers)==1
         && inspected.bytes(Storage::waveArrays)==288
-        && inspected.bytes(Storage::impulses)==512*sizeof(waterreplay::Impulse)
+        && inspected.bytes(Storage::impulses)==2049*sizeof(waterreplay::Impulse)
         && inspected.bytes(Storage::noteIdentities)==2048*sizeof(int)
         && inspected.bytes(Storage::linkIdentities)==300*sizeof(int)
         && inspected.bytes(Storage::gridIdentities)==9*sizeof(StableId),
@@ -100,7 +100,7 @@ inline void waterReplaySourceBudget(Check check)
     check(replayWaterSurface(shortHistory,operation,mesh,grid,project,shortOutput,error) && shortOutput==direct
         && withBudget(shortHistory,operation,mesh,grid,frame,project,local,local,limits,
             [&](const auto&,const auto&,const auto&,const auto&,const auto&,double,double,double,const Recipe& recipe,std::string&) {
-                return recipe.impulseCapacity==512 && recipe.at(Work::scoreOnsetScan)==512
+                return recipe.impulseCapacity==513 && recipe.at(Work::scoreOnsetScan)==512
                     && recipe.at(Work::priorAnchorComparisons)==3072 && recipe.at(Work::tempoSegmentVisits)==9747;
             },error),"same 512 real impulses and identical released heights still require distinct complete source scan budgets");
     const auto refuseBudget = [&](const Limits& shortLimits,const char* message) {
@@ -145,7 +145,7 @@ inline void waterReplaySourceBudget(Check check)
     reject(extreme,audioOnly,project,local,local,"real source with unrepresentable prefix refuses without integer conversion");
     extreme.audioSampleRate = 61440*1201.0;
     reject(extreme,audioOnly,project,local,local,"extreme finite rate requires complete actual coverage rather than clamping source size");
-    reject(history,operation,10.001,local,local,"over-horizon query refuses before source consumer");
+    reject(history,operation,1e300,local,local,"query beyond the tick clock refuses before source consumer");
     reject(history,operation,project,local,local-1,"negative project query refuses");
     reject(history,operation,project,std::numeric_limits<double>::max(),-std::numeric_limits<double>::max(),
         "finite anchors with overflowing delta refuse");

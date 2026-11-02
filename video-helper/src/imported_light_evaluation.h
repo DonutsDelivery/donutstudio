@@ -4,6 +4,8 @@
 #include "../../shared/ImportedLightControl.h"
 #include "../../shared/Visual3DScene.h"
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 #include <utility>
@@ -54,9 +56,9 @@ inline bool evaluateImportedLights(const importedlightcontrol::Controls& control
         const auto multiplier = controls.intensityMultipliers.find(definition->second);
         if (multiplier == controls.intensityMultipliers.end()) continue;
         const double intensity = static_cast<double>(light.intensity) * multiplier->second;
-        if (!std::isfinite(intensity) || intensity < 0 || intensity > 1000000.0)
-        { error = "Imported light intensity exceeds the native scene bound"; return false; }
-        light.intensity = static_cast<float>(intensity);
+        if (!std::isfinite(intensity) || intensity < 0)
+        { error = "Imported light intensity must be finite"; return false; }
+        light.intensity = static_cast<float>(std::min(intensity, static_cast<double>(std::numeric_limits<float>::max())));
     }
     frameLights = std::move(candidate);
     return true;

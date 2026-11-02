@@ -65,15 +65,14 @@ int main()
 
     check (Visual3DScene::kSchemaVersion == 1,
            "scene schema version is stable");
-    check (Visual3DScene::kMaxVertices == 4096
-           && Visual3DScene::kMaxIndices == 12288
-           && Visual3DScene::kMaxObjects == 64
-           && Visual3DScene::kMaxMaterials == 32
-           && Visual3DScene::kMaxTextures == 16
-           && Visual3DScene::kMaxTextureTexels == 1024u * 1024u
-           && Visual3DScene::kMaxLights == 16
-           && Visual3DScene::kMaxCameras == 8,
-           "scene record capacities are fixed");
+    check (Visual3DScene::kInitialVertices == 4096
+           && Visual3DScene::kInitialIndices == 12288
+           && Visual3DScene::kInitialObjects == 64
+           && Visual3DScene::kInitialMaterials == 32
+           && Visual3DScene::kInitialTextures == 16
+           && Visual3DScene::kInitialLights == 16
+           && Visual3DScene::kInitialCameras == 8,
+           "scene records start at these lengths");
     check (Visual3DSceneRenderContract::kBackendRequirement
                == Visual3DSceneBackendRequirement::NativeGpu
            && ! Visual3DSceneRenderContract::kAllowsCpuImageFallback,

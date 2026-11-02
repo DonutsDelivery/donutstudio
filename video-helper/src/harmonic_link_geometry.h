@@ -6,7 +6,12 @@
 #include "../../shared/VisualHarmonicLinkGeometryContract.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace videohelper::harmonicgeometry
@@ -28,7 +33,7 @@ inline constexpr videowire::geometry::StableId kLinkMaterialId = 0x01F0F0F0ull;
 inline std::optional<videowire::geometry::ValueDescriptor> lower(
     const visualharmonicgeometry::Mapping& mapping,
     const std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame>& frame,
-    std::string& error, harmonicprobe::Receipt* receipt = nullptr)
+    std::string& error, harmonicprobe::Receipt* receipt = nullptr, bool budgeted = true)
 {
     using namespace videowire::geometry;
     error.clear();
@@ -52,76 +57,130 @@ inline std::optional<videowire::geometry::ValueDescriptor> lower(
         value.attributes.push_back({attribute, {}});
     if (!frame) return value;
 
-    arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
-    inputs.canonicalBlockCFrame = frame;
-    inputs.noteInstanceMapping = mapping.notes;
-    const auto notes = arbitgpu::prepareNativeNoteInstances(inputs);
-    if (mapping.notes.schemaVersion == visualnoteinstancing::kDirectAxesMappingSchemaVersion
-        && !notes.admitted)
-    {
-        error = "Harmonic link endpoint coordinates exceed the geometry bounds";
-        return std::nullopt;
-    }
-    std::array<int, arbitblockc::kMaxNotes> instanceForRow;
-    instanceForRow.fill(-1);
-    for (std::size_t index = 0; index < notes.count; ++index)
-        instanceForRow[notes.canonicalRows[index]] = static_cast<int>(index);
     // Pass one collects the links that have a segment. The link count then fixes the level of detail
     // for the whole set, and pass two emits them.
     struct CollectedLink final
     {
-        int row = 0;
-        int master = 0;
-        int slave = 0;
+        std::int64_t identity = 0;
+        std::int64_t masterIdentity = 0;
+        std::int64_t slaveIdentity = 0;
+        float slaveHarmonic = 0;
+        float masterHarmonic = 0;
         Vec3 start {};
         Vec3 end {};
         Vec3 side {};
     };
     std::vector<CollectedLink> collected;
-    collected.reserve(static_cast<std::size_t>(frame->linkRows()));
-    for (int row = 0; row < frame->linkRows(); ++row)
+    const auto collect = [&](std::int64_t identity, std::int64_t masterIdentity, std::int64_t slaveIdentity,
+                             float slaveHarmonic, float masterHarmonic, Vec3 start, Vec3 end)
     {
-        const auto offset = static_cast<std::size_t>(row) * 4;
-        for (std::size_t channel = 0; channel < 2; ++channel)
-        {
-            const auto endpoint = frame->linkTextureValues[offset + channel];
-            if (endpoint < 0 || endpoint >= frame->noteRows() || std::floor(endpoint) != endpoint)
-            {
-                error = "Harmonic link references an invalid canonical note row";
-                return std::nullopt;
-            }
-        }
-        const auto slaveRow = static_cast<int>(frame->linkTextureValues[offset]);
-        const auto masterRow = static_cast<int>(frame->linkTextureValues[offset + 1]);
-        const auto slave = instanceForRow[static_cast<std::size_t>(slaveRow)];
-        const auto master = instanceForRow[static_cast<std::size_t>(masterRow)];
-        if (slave < 0 || master < 0) continue;
-        const auto& a = notes.transforms[static_cast<std::size_t>(master)];
-        const auto& b = notes.transforms[static_cast<std::size_t>(slave)];
-        const Vec3 start { a[0], a[1], a[2] };
-        const Vec3 end { b[0], b[1], b[2] };
-        const Vec3 direction { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+        const Vec3 direction { end.x - start.x, end.y - start.y, end.z - start.z };
         const auto length = std::sqrt(direction.x * direction.x + direction.y * direction.y
                                        + direction.z * direction.z);
         if (!std::isfinite(length))
         {
             error = "Harmonic link endpoint coordinates exceed the geometry bounds";
-            return std::nullopt;
+            return false;
         }
         // Coincident notes have no connecting segment.
-        if (length <= 0.000001f) continue;
-        collected.push_back({ row, master, slave, start, end,
-                              linkSideHalfWidth(direction, mapping.notes.meshScale) });
+        if (length > 0.000001f)
+            collected.push_back({ identity, masterIdentity, slaveIdentity, slaveHarmonic, masterHarmonic,
+                                  start, end, linkSideHalfWidth(direction, mapping.notes.meshScale) });
+        return true;
+    };
+    if (budgeted)
+    {
+        arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+        inputs.canonicalBlockCFrame = frame;
+        inputs.noteInstanceMapping = mapping.notes;
+        const auto notes = arbitgpu::prepareNativeNoteInstances(inputs);
+        if (mapping.notes.schemaVersion == visualnoteinstancing::kDirectAxesMappingSchemaVersion
+            && !notes.admitted)
+        {
+            error = "Harmonic link endpoint coordinates exceed the geometry bounds";
+            return std::nullopt;
+        }
+        std::array<int, arbitblockc::kMaxNotes> instanceForRow;
+        instanceForRow.fill(-1);
+        for (std::size_t index = 0; index < notes.count; ++index)
+            instanceForRow[notes.canonicalRows[index]] = static_cast<int>(index);
+        collected.reserve(static_cast<std::size_t>(frame->linkRows()));
+        for (int row = 0; row < frame->linkRows(); ++row)
+        {
+            const auto offset = static_cast<std::size_t>(row) * 4;
+            for (std::size_t channel = 0; channel < 2; ++channel)
+            {
+                const auto endpoint = frame->linkTextureValues[offset + channel];
+                if (endpoint < 0 || endpoint >= frame->noteRows() || std::floor(endpoint) != endpoint)
+                {
+                    error = "Harmonic link references an invalid canonical note row";
+                    return std::nullopt;
+                }
+            }
+            const auto slaveRow = static_cast<int>(frame->linkTextureValues[offset]);
+            const auto masterRow = static_cast<int>(frame->linkTextureValues[offset + 1]);
+            const auto slave = instanceForRow[static_cast<std::size_t>(slaveRow)];
+            const auto master = instanceForRow[static_cast<std::size_t>(masterRow)];
+            if (slave < 0 || master < 0) continue;
+            const auto& a = notes.transforms[static_cast<std::size_t>(master)];
+            const auto& b = notes.transforms[static_cast<std::size_t>(slave)];
+            if (!collect(frame->linkIdentities[static_cast<std::size_t>(row)],
+                         notes.identities[static_cast<std::size_t>(master)],
+                         notes.identities[static_cast<std::size_t>(slave)],
+                         frame->linkTextureValues[offset + 2], frame->linkTextureValues[offset + 3],
+                         { a[0], a[1], a[2] }, { b[0], b[1], b[2] }))
+                return std::nullopt;
+        }
     }
-    if (!visualharmonicgeometry::admitLinkCount(mapping.shape, mapping.curvaturePercent,
-                                                mapping.segments, collected.size(), error))
+    else
+    {
+        // A retained scene reads the whole score. The frame's rows stop at the
+        // shader textures' 128 notes and 256 links, and this mesh uses no texture.
+        const auto& score = *frame->sourceScore;
+        const auto beat = frame->packedBeat;
+        std::unordered_map<int, Vec3> residents;
+        residents.reserve(score.notes.size());
+        for (const auto& note : score.notes)
+        {
+            if (note.muted || arbitblockc::BlockCPacker::residency(
+                    note, beat, frame->historyBeats(), frame->lookaheadBeats()) <= 0)
+                continue;
+            const auto texels = arbitblockc::BlockCPacker::noteTexels(note, score, beat, -1);
+            const auto axis = [&](visualnoteinstancing::MappingAxis mappingAxis)
+            {
+                return arbitgpu::nativeNoteAxisValue(mappingAxis, texels.data(), frame->rootFrequencyHz);
+            };
+            residents[note.id] = { axis(mapping.notes.x) * mapping.notes.xScale,
+                                   axis(mapping.notes.y) * mapping.notes.yScale,
+                                   axis(mapping.notes.z) * mapping.notes.zScale };
+        }
+        collected.reserve(score.links.size());
+        for (const auto& link : score.links)
+        {
+            const auto master = residents.find(link.masterNoteId);
+            const auto slave = residents.find(link.slaveNoteId);
+            if (master == residents.end() || slave == residents.end()) continue;
+            if (!collect(link.id, link.masterNoteId, link.slaveNoteId,
+                         static_cast<float>(link.slaveHarmonic), static_cast<float>(link.masterHarmonic),
+                         master->second, slave->second))
+                return std::nullopt;
+        }
+    }
+    // The raster route's contract has a vertex budget. A retained scene has none,
+    // so it keeps full detail at any link count.
+    if (budgeted && !visualharmonicgeometry::admitLinkCount(mapping.shape, mapping.curvaturePercent,
+                                                            mapping.segments, collected.size(), error))
         return std::nullopt;
-    const auto effective = visualharmonicgeometry::effectiveLinkLayout(
-        mapping.shape, mapping.curvaturePercent, mapping.segments, collected.size());
+    auto effective = visualharmonicgeometry::effectiveLinkLayout(
+        mapping.shape, mapping.curvaturePercent, mapping.segments, budgeted ? collected.size() : 1);
+    // A retained scene is lit and path traced, so its links are round. The flat strip stays on the
+    // raster route, which draws them self-lit.
+    if (!budgeted) effective.layout = linkTubeLayout(mapping.shape, effective);
     // Corner IDs stride by the requested corner count, so each link keeps its ID range when the
     // level of detail steps down.
-    const auto stride = static_cast<std::uint64_t>(visualharmonicgeometry::effectiveLinkLayout(
-        mapping.shape, mapping.curvaturePercent, mapping.segments, 1).layout.vertices);
+    const auto stride = budgeted ? static_cast<std::uint64_t>(visualharmonicgeometry::effectiveLinkLayout(
+        mapping.shape, mapping.curvaturePercent, mapping.segments, 1).layout.vertices)
+        : static_cast<std::uint64_t>(effective.layout.vertices);
     const auto corners = static_cast<std::uint64_t>(effective.layout.vertices);
     auto& mesh = std::get<GeometryData>(value.data);
     mesh.positions.reserve(collected.size() * effective.layout.vertices);
@@ -129,9 +188,13 @@ inline std::optional<videowire::geometry::ValueDescriptor> lower(
     mesh.indices.reserve(collected.size() * effective.layout.triangles * 3);
     for (const auto& link : collected)
     {
-        appendLinkShape(mesh, mapping.shape, mapping.curvaturePercent, effective,
-                        link.start, link.end, link.side);
-        const auto identity = frame->linkIdentities[static_cast<std::size_t>(link.row)];
+        if (budgeted)
+            appendLinkShape(mesh, mapping.shape, mapping.curvaturePercent, effective,
+                            link.start, link.end, link.side);
+        else
+            appendLinkTube(mesh, mapping.shape, mapping.curvaturePercent, effective,
+                           link.start, link.end, link.side);
+        const auto identity = link.identity;
         const auto unsignedIdentity = identity < 0
             ? static_cast<std::uint64_t>(-identity) * 2 - 1
             : static_cast<std::uint64_t>(identity) * 2;
@@ -142,11 +205,9 @@ inline std::optional<videowire::geometry::ValueDescriptor> lower(
         }
         for (std::uint64_t corner = 0; corner < corners; ++corner)
             mesh.vertexIds.push_back(unsignedIdentity * stride + corner + 1);
-        const auto offset = static_cast<std::size_t>(link.row) * 4;
         const double attributes[] { static_cast<double>(identity),
-            static_cast<double>(notes.identities[static_cast<std::size_t>(link.master)]),
-            static_cast<double>(notes.identities[static_cast<std::size_t>(link.slave)]),
-            frame->linkTextureValues[offset + 2], frame->linkTextureValues[offset + 3] };
+            static_cast<double>(link.masterIdentity), static_cast<double>(link.slaveIdentity),
+            link.slaveHarmonic, link.masterHarmonic };
         for (std::size_t attribute = 0; attribute < 5; ++attribute)
             for (std::size_t triangle = 0; triangle < effective.layout.triangles; ++triangle)
                 value.attributes[attribute].elements.push_back({{attributes[attribute], 0, 0, 0}});
@@ -163,7 +224,7 @@ inline std::optional<videowire::geometry::ValueDescriptor> lower(
 // supplies real ones. They use the mapping's own shape and detail, and a width of at least 0.34 so
 // the sculpture reads at the module's resting state. Identities are fixed, so repeated frames match.
 inline std::optional<videowire::geometry::ValueDescriptor> restingSculpture(
-    const visualharmonicgeometry::Mapping& mapping, std::string& error)
+    const visualharmonicgeometry::Mapping& mapping, std::string& error, bool round = false)
 {
     using namespace videowire::geometry;
     auto value = lower(mapping, nullptr, error);
@@ -191,16 +252,22 @@ inline std::optional<videowire::geometry::ValueDescriptor> restingSculpture(
     if (!visualharmonicgeometry::admitLinkCount(mapping.shape, mapping.curvaturePercent,
                                                 mapping.segments, links.size(), error))
         return std::nullopt;
-    const auto effective = visualharmonicgeometry::effectiveLinkLayout(
+    auto effective = visualharmonicgeometry::effectiveLinkLayout(
         mapping.shape, mapping.curvaturePercent, mapping.segments, links.size());
-    const auto stride = static_cast<std::uint64_t>(visualharmonicgeometry::effectiveLinkLayout(
-        mapping.shape, mapping.curvaturePercent, mapping.segments, 1).layout.vertices);
+    if (round) effective.layout = linkTubeLayout(mapping.shape, effective);
+    const auto stride = round ? static_cast<std::uint64_t>(effective.layout.vertices)
+        : static_cast<std::uint64_t>(visualharmonicgeometry::effectiveLinkLayout(
+            mapping.shape, mapping.curvaturePercent, mapping.segments, 1).layout.vertices);
     const auto corners = static_cast<std::uint64_t>(effective.layout.vertices);
     auto& mesh = std::get<GeometryData>(value->data);
     for (std::size_t index = 0; index < links.size(); ++index)
     {
-        appendLinkShape(mesh, mapping.shape, mapping.curvaturePercent, effective,
-                        links[index].start, links[index].end, links[index].side);
+        if (round)
+            appendLinkTube(mesh, mapping.shape, mapping.curvaturePercent, effective,
+                           links[index].start, links[index].end, links[index].side);
+        else
+            appendLinkShape(mesh, mapping.shape, mapping.curvaturePercent, effective,
+                            links[index].start, links[index].end, links[index].side);
         const auto unsignedIdentity = static_cast<std::uint64_t>(index + 1) * 2;
         for (std::uint64_t corner = 0; corner < corners; ++corner)
             mesh.vertexIds.push_back(unsignedIdentity * stride + corner + 1);
@@ -211,6 +278,48 @@ inline std::optional<videowire::geometry::ValueDescriptor> restingSculpture(
                 value->attributes[attribute].elements.push_back({{attributes[attribute], 0, 0, 0}});
     }
     return value;
+}
+
+// How many distinct links a lowered value draws. Every triangle carries its link's identity.
+inline std::size_t linkCount(const videowire::geometry::ValueDescriptor& value)
+{
+    if (value.attributes.empty()) return 0;
+    std::unordered_set<double> identities;
+    for (const auto& element : value.attributes[0].elements)
+        identities.insert(element.components[0]);
+    return identities.size();
+}
+
+// This frame's mesh for one link object of a retained scene: the score's links,
+// or the resting sculpture while the score has none.
+inline bool replaceSceneMesh(const videowire::geometry::HarmonicLinkSceneBinding& binding,
+    const std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame>& frame,
+    int width, int height, HarmonicMIDI::grid::Visual3DScene& scene, std::string& error)
+{
+    auto value = lower(binding.mapping, frame, error, harmonicprobe::activeReceipt, false);
+    if (!value) return false;
+    const bool resting = std::get<videowire::geometry::GeometryData>(value->data).positions.empty();
+    if (resting)
+    {
+        if (harmonicprobe::activeReceipt != nullptr)
+            ++harmonicprobe::activeReceipt->emptyLayerCount;
+        value = restingSculpture(binding.mapping, error, true);
+        if (!value) return false;
+    }
+    auto& mesh = std::get<videowire::geometry::GeometryData>(value->data);
+    // Printed when the counts change, so a frame's links can be told from its pixels.
+    {
+        const auto drawn = linkCount(*value);
+        const auto authored = frame ? frame->sourceScore->links.size() : std::size_t {};
+        static std::atomic<std::uint64_t> lastCounts { ~std::uint64_t {} };
+        const auto counts = (static_cast<std::uint64_t>(drawn) << 32) | authored;
+        if (lastCounts.exchange(counts) != counts)
+            std::fprintf(stderr, "[links] scene mesh links=%zu scoreLinks=%zu vertices=%zu resting=%d\n",
+                         drawn, authored, mesh.positions.size(), resting ? 1 : 0);
+    }
+    if (binding.fitToView)
+        videowire::geometry::fitHarmonicLinksToView(mesh.positions, width, height);
+    return videowire::geometry::replaceHarmonicLinkSceneMesh(binding, mesh, scene, error);
 }
 
 template <typename LayerDesc>
@@ -234,36 +343,10 @@ inline bool render(const visualharmonicgeometry::Mapping& mapping,
         value = restingSculpture(mapping, error);
         if (!value) return false;
     }
-    auto& positions = std::get<videowire::geometry::GeometryData>(value->data).positions;
-    auto minimum = positions.front();
-    auto maximum = minimum;
-    for (const auto& position : positions)
-    {
-        minimum.x = std::min(minimum.x, position.x);
-        minimum.y = std::min(minimum.y, position.y);
-        minimum.z = std::min(minimum.z, position.z);
-        maximum.x = std::max(maximum.x, position.x);
-        maximum.y = std::max(maximum.y, position.y);
-        maximum.z = std::max(maximum.z, position.z);
-    }
     // Keep the musical mapping in lower(). Fit the image value before native
     // admission so the scene and its retained draw use the same coordinates.
-    const auto visibleHeight = 10.0f * std::tan(0.7853981634f * 0.5f);
-    const auto visibleWidth = visibleHeight * static_cast<float>(width) / static_cast<float>(height);
-    const auto extentX = std::max(maximum.x - minimum.x, 0.001f);
-    const auto extentY = std::max(maximum.y - minimum.y, 0.001f);
-    const auto displayScale = std::clamp(std::min(visibleWidth * 0.65f / extentX,
-                                                visibleHeight * 0.65f / extentY), 0.01f, 3.0f);
-    const videowire::geometry::Vec3 center {
-        (minimum.x + maximum.x) * 0.5f,
-        (minimum.y + maximum.y) * 0.5f,
-        (minimum.z + maximum.z) * 0.5f };
-    for (auto& position : positions)
-    {
-        position.x = (position.x - center.x) * displayScale;
-        position.y = (position.y - center.y) * displayScale;
-        position.z = (position.z - center.z) * displayScale;
-    }
+    videowire::geometry::fitHarmonicLinksToView(
+        std::get<videowire::geometry::GeometryData>(value->data).positions, width, height);
     const auto contract = visualharmonicgeometry::geometryContract();
     const auto admittedValue = videowire::geometry::admitValue(std::move(*value), contract, {}, error);
     if (!admittedValue) return false;

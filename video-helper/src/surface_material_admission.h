@@ -438,12 +438,12 @@ inline std::string structuralDigest(const ProgramDescription& program)
     appendU32(bytes, static_cast<std::uint32_t>(program.operations.size()));
     for (const auto& operation : program.operations)
     {
-        appendU16(bytes, operation.id);
+        appendU32(bytes, operation.id);
         appendU8(bytes, static_cast<std::uint8_t>(operation.kind));
         appendU8(bytes, static_cast<std::uint8_t>(operation.resultType));
         appendU8(bytes, operation.inputCount);
         for (const auto input : operation.inputs)
-            appendU16(bytes, input);
+            appendU32(bytes, input);
         for (const auto value : operation.literal)
             appendFloat(bytes, value);
         appendU8(bytes, static_cast<std::uint8_t>(operation.semantic));
@@ -451,7 +451,7 @@ inline std::string structuralDigest(const ProgramDescription& program)
         appendU32(bytes, operation.unsignedLiteral);
     }
     for (std::size_t index = 0; index < outputCount(program.version); ++index)
-        appendU16(bytes, program.outputs[index]);
+        appendU32(bytes, program.outputs[index]);
     if (program.version == kSpectralWireVersion)
         appendU8(bytes, static_cast<std::uint8_t>(program.transport));
 
@@ -596,7 +596,7 @@ inline bool boundedResult(const EvaluatedValue& result, std::string& error)
 }
 
 inline bool evaluateOperation(const Operation& operation,
-                              const std::array<EvaluatedValue, kMaximumOperations>& values,
+                              const std::vector<EvaluatedValue>& values,
                               const MaterialEvaluationInputs& inputs,
                               EvaluatedValue& result,
                               std::string& error)
@@ -734,7 +734,7 @@ inline float clampPbr(float value, float lower, float upper) noexcept
 
 inline bool makeParameterBlock(
     const ProgramDescription& program,
-    const std::array<EvaluatedValue, kMaximumOperations>& values,
+    const std::vector<EvaluatedValue>& values,
     SurfacePbrParameterBlock& block,
     std::string& error)
 {
@@ -780,13 +780,13 @@ inline bool makeParameterBlock(
     if (program.version == kSpectralWireVersion)
     {
         const auto dispersion = output(OutputSemantic::Dispersion).floating[0];
-        if (!std::isfinite(dispersion) || dispersion < 0.0f || dispersion > kMaximumCauchyB)
-            return reject(error, "surface material dispersion must be Cauchy B within [0, 0.02] micrometres squared");
+        if (!std::isfinite(dispersion) || dispersion < 0.0f)
+            return reject(error, "surface material dispersion must be a finite nonnegative Cauchy B in micrometres squared");
         for (const auto wavelength : kGlassIorAdmissionWavelengths)
         {
             const auto index = wavelengthIor(block.transmissionIorClearcoat[1], dispersion, wavelength);
-            if (!std::isfinite(index) || index < kMinimumMaterialIor || index > kMaximumMaterialIor)
-                return reject(error, "surface material wavelength IOR exceeds [1, 3]");
+            if (!std::isfinite(index))
+                return reject(error, "surface material wavelength IOR is not finite");
         }
         block.transmissionIorClearcoat[3] = dispersion;
     }
@@ -804,7 +804,7 @@ inline bool evaluateReferenceProgram(const ProgramDescription& program,
     if (!validateEvaluationInputs(inputs, error))
         return false;
 
-    std::array<EvaluatedValue, kMaximumOperations> values {};
+    std::vector<EvaluatedValue> values(program.operations.size());
     // Admission makes IDs contiguous, so ascending storage order is the stable
     // reference evaluation order.
     for (std::size_t index = 0; index < program.operations.size(); ++index)

@@ -204,12 +204,12 @@ private:
     std::int64_t geometryTick=std::numeric_limits<std::int64_t>::min();
     std::uint64_t geometryWaterIdentity=0;
     std::int64_t geometryWaterStart=0, geometryWaterEnd=0;
-    std::array<std::int64_t,1201+kParticleReplayMaxEvents> boundaries {};
+    std::vector<std::int64_t> boundaries;
     // Visited score events that carry an adapter weight, sorted by window-relative
     // tick. Each one is also a boundary, so an interval that starts at its tick
     // sees it. The attractor span is evaluated on the boundary grid.
     struct ScoreAdapterEvent { std::int64_t tick = 0; ParticleScoreEvent event {}; };
-    std::array<ScoreAdapterEvent,kParticleReplayMaxEvents> scoreEvents {};
+    std::vector<ScoreAdapterEvent> scoreEvents;
     int scoreEventCount=0;
     // Score attractors pull toward this height, the middle of the planar frame.
     static constexpr float kScoreAttractorY=0.5f;
@@ -304,19 +304,25 @@ private:
         previousParameterTime=double(startTicks)/ticksPerSecond-(input.historyProjectSeconds-clipSeconds);
         if (p.historicalReplay)
         {
-            boundaries[static_cast<std::size_t>(boundaryCount++)] = 0;
-            for (std::int64_t tick = stepTicks; tick < ageTicks; tick += stepTicks)
-                boundaries[static_cast<std::size_t>(boundaryCount++)] = tick;
-            if (!visitParticleScoreEvents(p, window, [&](std::int64_t tick, const ParticleScoreEvent& event)
+            try {
+                boundaries.resize(static_cast<std::size_t>(boundaryCount));
+                scoreEvents.resize(static_cast<std::size_t>(scoreEventCount));
+                boundaries.push_back(0);
+                for (std::int64_t tick = stepTicks; tick < ageTicks; tick += stepTicks)
+                    boundaries.push_back(tick);
+                visitParticleScoreEvents(p, window, [&](std::int64_t tick, const ParticleScoreEvent& event)
                 {
-                    boundaries[static_cast<std::size_t>(boundaryCount++)] = tick;
+                    boundaries.push_back(tick);
                     if (event.kick > 0 || event.emission > 0 || event.attractor > 0)
-                        scoreEvents[static_cast<std::size_t>(scoreEventCount++)] = {tick, event};
-                }, p.scoreImpulseGain, p.scoreEmitGain, p.scoreAttractGain)) {
-                if (diagnostic) *diagnostic=particleEventCapDiagnostic(p,window,"Coupled replay exceeds 512 note/audio event boundaries");
+                        scoreEvents.push_back({tick, event});
+                }, p.scoreImpulseGain, p.scoreEmitGain, p.scoreAttractGain);
+                boundaries.push_back(ageTicks);
+            } catch (const std::bad_alloc&) {
+                if (diagnostic) *diagnostic="Particle replay could not allocate its "+std::to_string(boundaries.size())+" event boundaries";
                 return false;
             }
-            boundaries[static_cast<std::size_t>(boundaryCount++)] = ageTicks;
+            boundaryCount = static_cast<int>(boundaries.size());
+            scoreEventCount = static_cast<int>(scoreEvents.size());
             std::sort(boundaries.begin(), boundaries.begin() + boundaryCount);
             boundaryCount = static_cast<int>(std::unique(boundaries.begin(), boundaries.begin() + boundaryCount) - boundaries.begin());
             std::sort(scoreEvents.begin(), scoreEvents.begin() + scoreEventCount,

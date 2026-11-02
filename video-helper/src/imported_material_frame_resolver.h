@@ -3,8 +3,30 @@
 #include "visual_plan_executor.h"
 #include "imported_animation_visual_plan_execution.h"
 
+#include <cstdio>
+#include <mutex>
+
 namespace videohelper::importedscene
 {
+// One state-throttled record for the composed Imported Frame decode and lease.
+// This resolver is the path the activity retires, so a row whose card never
+// paints must show here whether a frame was ever requested, decoded and leased.
+inline void recordImportedFrameResolve (bool ok, int width, int height,
+                                        const std::string& reason)
+{
+    static std::mutex resolveMutex;
+    static std::string lastResolve;
+    const std::lock_guard lock (resolveMutex);
+    const std::string text = std::string (ok ? "material-frame resolve ok "
+                                             : "material-frame resolve failed ")
+        + std::to_string (width) + "x" + std::to_string (height)
+        + (reason.empty() ? std::string() : " " + reason);
+    if (lastResolve != text)
+    {
+        lastResolve = text;
+        std::fprintf (stderr, "[gl] %s\n", text.c_str());
+    }
+}
 // Constructed only by the production composition below. A bare decoder callback
 // cannot exempt imported Layer Source from the legacy safe refusal.
 class ImportedMaterialFrameResolver
@@ -194,7 +216,8 @@ public:
                 if (!activity(failure)) return false;
                 auto* decoded = decode(selected,media,leaf,failure);
                 if (!decoded || !activity(failure))
-                { if (failure.empty()) failure = "Material Frame source could not decode its selected exact time"; return false; }
+                { if (failure.empty()) failure = "Material Frame source could not decode its selected exact time";
+                  recordImportedFrameResolve (false, 0, 0, failure); return false; }
                 const bool hdr = decoded->hdrFrame.width > 0;
                 const auto width = hdr ? decoded->hdrFrame.width : decoded->texW;
                 const auto height = hdr ? decoded->hdrFrame.height : decoded->texH;
@@ -206,7 +229,9 @@ public:
                 auto image = lease(*decoded,policy,failure);
                 if (!activity(failure) || !arbitgpu::validMaterialFrameTexture(image)
                     || image->width() != std::uint32_t(width) || image->height() != std::uint32_t(height))
-                { if (failure.empty()) failure = "Material Frame source lease differs from its decoded owner extent"; return false; }
+                { if (failure.empty()) failure = "Material Frame source lease differs from its decoded owner extent";
+                  recordImportedFrameResolve (false, width, height, failure); return false; }
+                recordImportedFrameResolve (true, width, height, {});
                 std::uint64_t actual = 0;
                 if (!videowire::materialFrameImageBytes(image->width(),image->height(),
                     arbitgpu::materialFrameIsLinear(image->colorTextureDescriptor()),available,actual,failure)

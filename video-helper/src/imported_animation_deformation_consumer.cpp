@@ -251,17 +251,6 @@ gltf::GlbAnimationDecodeOptions nativeImportedAnimationDecodeOptions(
     options.admission.admitSkins = true;
     options.admission.limits.maxContainerBytes
         = std::min(options.admission.limits.maxContainerBytes, size);
-    options.admission.limits.maxTextures = HarmonicMIDI::grid::Visual3DScene::kMaxTextures;
-    options.admission.limits.maxImages = HarmonicMIDI::grid::Visual3DScene::kMaxTextures;
-    options.admission.limits.maxSamplers = HarmonicMIDI::grid::Visual3DScene::kMaxTextures;
-    options.admission.limits.maxEmbeddedImageBytes
-        = HarmonicMIDI::grid::Visual3DScene::kMaxTextureTexels * 4u;
-    options.admission.limits.maxImageWidth
-        = HarmonicMIDI::grid::Visual3DScene::kMaxTextureDimension;
-    options.admission.limits.maxImageHeight
-        = HarmonicMIDI::grid::Visual3DScene::kMaxTextureDimension;
-    options.admission.limits.maxDecodedImageBytes
-        = HarmonicMIDI::grid::Visual3DScene::kMaxTextureTexels * 4u;
     options.admission.supportedRequiredExtensions = {"KHR_lights_punctual"};
     options.admission.sceneIndex = sceneIndex;
     options.retainGeometryHierarchy = true;

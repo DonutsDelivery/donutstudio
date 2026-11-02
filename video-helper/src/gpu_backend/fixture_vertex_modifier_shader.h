@@ -43,9 +43,9 @@ inline const char* fixturePreviousSourcePosition (bool metal) noexcept
 //
 // A bounded displacement limit is read from a uniform, not written into the source,
 // so one source text serves every limit and the GL program cache hits across a sweep.
-// The Nth bounded displacement in instruction order reads entry N of the uniform
-// array, which fixtureVertexDisplacementLimits fills per draw. The GL and Metal
-// uniform arrays hold sixteen vec4 values.
+// Admission refuses a terminal output anywhere but the root, so a program has exactly
+// one bounded displacement and it reads entry 0, which fixtureVertexDisplacementLimits
+// fills per draw. The rest of the array only keeps the GL and Metal uniform layouts.
 inline constexpr std::size_t kVertexDisplacementLimitCapacity = 64;
 static_assert (kVertexDisplacementLimitCapacity == 16 * 4,
                "the vertex displacement limit uniform arrays hold sixteen vec4 values");
@@ -55,11 +55,9 @@ inline std::array<float, kVertexDisplacementLimitCapacity> fixtureVertexDisplace
 {
     std::array<float, kVertexDisplacementLimitCapacity> limits {};
     if (program == nullptr) return limits;
-    std::size_t index = 0;
     for (const auto& instruction : program->vertexInstructions())
-        if (instruction.operation == videowire::VertexModifierOperation::boundedDisplacementOutput
-            && index < kVertexDisplacementLimitCapacity)
-            limits[index++] = static_cast<float> (instruction.parameters[0]);
+        if (instruction.operation == videowire::VertexModifierOperation::boundedDisplacementOutput)
+            limits[0] = static_cast<float> (instruction.parameters[0]);
     return limits;
 }
 
@@ -92,13 +90,8 @@ inline std::string fixtureVertexModifierShader (
                                const std::string& spectrum, const std::string& position,
                                const std::string& output)
         {
-            const auto value = [&prefix] (std::uint16_t slot) { return prefix + std::to_string (slot); };
-            const auto limitUniform = [metal] (std::size_t index)
-            {
-                return std::string (metal ? "u.vertexDisplacementLimits[" : "uVertexDisplacementLimits[")
-                    + std::to_string (index / 4u) + "][" + std::to_string (index % 4u) + "]";
-            };
-            std::size_t displacementCount = 0;
+            const auto value = [&prefix] (std::uint32_t slot) { return prefix + std::to_string (slot); };
+            const std::string limitUniform = metal ? "u.vertexDisplacementLimits[0][0]" : "uVertexDisplacementLimits[0][0]";
             for (const auto& instruction : program->vertexInstructions())
             {
                 using Operation = videowire::VertexModifierOperation;
@@ -146,16 +139,9 @@ inline std::string fixtureVertexModifierShader (
                         expression = number (p[2]) + " + " + expression + " * " + number (p[3] - p[2]);
                         break;
                     case Operation::boundedDisplacementOutput:
-                    {
-                        if (displacementCount >= kVertexDisplacementLimitCapacity)
-                        {
-                            error = "Native vertex program has too many bounded displacement limits";
-                            return false;
-                        }
-                        expression = a + " + " + b + " * min(1.0, " + limitUniform (displacementCount++)
+                        expression = a + " + " + b + " * min(1.0, " + limitUniform
                             + " / max(length(" + b + "), 0.000001))";
                         break;
-                    }
                     default:
                         error = "Native vertex execution does not support external control banks or noise yet";
                         return false;

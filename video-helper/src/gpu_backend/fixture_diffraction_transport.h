@@ -1,8 +1,12 @@
 #pragma once
 
 #include "fixture_opaque_visibility.h"
+
+#include <array>
+#include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 
 namespace arbitgpu::diffractiontransportnative
 {
@@ -13,6 +17,14 @@ inline constexpr std::size_t kTextureWidth = 512;
 inline constexpr std::size_t kSampleStride = 8;
 inline constexpr std::uint32_t kTableVersion = 1;
 inline constexpr float kRayMinimumDistance = 1.0e-5f;
+// Below this cosine a segment carries no visible light, so endpoint rounding cannot refuse it.
+inline constexpr float kEndpointGrazingCosine=0.01f;
+// A float32 ray's rounding grows with its length, about 1e-6 of it once the origin,
+// direction and hit distance have each rounded. The orb's 40 m floor and wall put
+// endpoints past 10 m, where the fixed ray minimum alone is below that rounding.
+inline constexpr float kEndpointRelativeRounding=4.0e-6f;
+inline float endpointTolerance(float minimum,float distance,float cosine)
+{return std::max(minimum,distance*kEndpointRelativeRounding)/std::max(cosine,kEndpointGrazingCosine);}
 
 // A backend keeps this unavailable until its owned shader consumes this exact
 // table/query ABI and its readback turns every invalid query into submission
@@ -36,13 +48,99 @@ inline bool consumerCanRender(const ConsumerContract& consumer, NativeFixtureMat
 // Native shaders publish nonfinite diagnostic Color on invalid/truncated query.
 // The owner must read the complete scene-linear Color attachment before it can
 // publish ANY output from that frame, including non-Color AOV requests.
-inline bool validateWholeOutput(const std::vector<float>& rgba,std::uint32_t width,
-    std::uint32_t height,std::string& error)
+// The diagnostic payload (quiet-NaN bits 10..17) names the refusal branch, so
+// the refusal reports a per-reason pixel count instead of one anonymous
+// sentence: this is a debug readback of the frame that already refused, not a
+// shipped log.
+inline constexpr std::uint32_t diagnosticReason(float value) noexcept
 {
-    if (!nativeFixtureDimensionsWithinBounds(width,height) || rgba.size()!=std::uint64_t(width)*height*4
-        || std::any_of(rgba.begin(),rgba.end(),[](float value){return !std::isfinite(value) || std::abs(value)>surfacematerial::kMaximumLinearColorComponent;}))
-    {error="Native diffraction whole-output readback is incomplete, nonfinite or unrepresentable";return false;}
-    error.clear();return true;
+    std::uint32_t bits=0;std::memcpy(&bits,&value,sizeof(bits));
+    return (bits>>10u)&0xffu;
+}
+// The shader guard classifies a diagnostic payload the same way: bits 10..17
+// in 1..7 name a refusal branch the frame must honor; every other NaN payload
+// (the released unattributed encoding, or arithmetic NaN from a degenerate
+// pixel frame such as a silhouette tangent) is not a named refusal.
+inline bool diagnosticPayloadIsNamedRefusal(std::uint32_t bits) noexcept
+{
+    const auto reason=(bits>>10u)&0xffu;
+    return reason>=1u && reason<=7u;
+}
+inline const char* diagnosticReasonName(std::uint32_t reason)
+{
+    switch (reason)
+    {
+        case 1: return "table invalid";
+        case 2: return "direct source query incomplete";
+        case 3: return "sample segment query incomplete";
+        case 4: return "sample source query incomplete";
+        case 5: return "spectral bands nonfinite";
+        case 6: return "degenerate UV derivatives";
+        case 7: return "invalid BSDF efficiency sum";
+        case 8: return "sky output nonfinite";
+        case 9: return "base surface output nonfinite";
+        case 10: return "resolve output nonfinite";
+        case 11: return "pre-resolve accumulation nonfinite";
+        case 12: return "receiver output nonfinite";
+        default: break;
+    }
+    return "unattributed";
+}
+inline bool validateWholeOutput(const std::vector<float>& rgba,std::uint32_t width,
+    std::uint32_t height,std::string& error,std::size_t* firstBadOut=nullptr)
+{
+    if (!nativeFixtureDimensionsWithinBounds(width,height) || rgba.size()!=std::uint64_t(width)*height*4)
+    {error="Native diffraction whole-output readback size is incomplete: got "+std::to_string(rgba.size())
+        +" floats for "+std::to_string(width)+"x"+std::to_string(height);return false;}
+    std::array<std::uint64_t,13> reasons{};
+    std::uint64_t infinite=0,overrange=0,unlisted=0;
+    float maximumMagnitude=0.0f;
+    std::uint32_t firstBadBits=0;
+    std::size_t firstBadPixel=0;
+    std::size_t minX=width,minY=height,maxX=0,maxY=0;
+    bool healthy=true;
+    std::size_t pixel=0;
+    for (float value:rgba)
+    {
+        ++pixel;
+        if (std::isfinite(value) && std::abs(value)<=surfacematerial::kMaximumLinearColorComponent) continue;
+        healthy=false;
+        if (!firstBadBits) { std::memcpy(&firstBadBits,&value,sizeof(value)); firstBadPixel=pixel/4; }
+        { const std::size_t bx=(pixel/4)%width, by=(pixel/4)/width;
+          minX=std::min(minX,bx); maxX=std::max(maxX,bx);
+          minY=std::min(minY,by); maxY=std::max(maxY,by); }
+        if (std::isnan(value))
+        {
+            const auto reason=diagnosticReason(value);
+            if (reason<reasons.size()) ++reasons[reason];
+            else ++unlisted;
+        }
+        else if (std::isinf(value)) ++infinite;
+        else
+        {
+            ++overrange;
+            maximumMagnitude=std::max(maximumMagnitude,std::abs(value));
+        }
+    }
+    if (healthy) {error.clear();return true;}
+    if (firstBadOut) *firstBadOut=firstBadPixel;
+    error="Native diffraction whole-output readback is incomplete, nonfinite or unrepresentable";
+    std::string detail;
+    for (std::size_t reason=0;reason<reasons.size();++reason)
+        if (reasons[reason]) detail+=" "+std::string(diagnosticReasonName(static_cast<std::uint32_t>(reason)))+": "+std::to_string(reasons[reason]);
+    if (unlisted) detail+=" unlisted NaN payload: "+std::to_string(unlisted);
+    if (infinite) detail+=" infinite: "+std::to_string(infinite);
+    if (overrange) detail+=" overrange: "+std::to_string(overrange)+" (max "+std::to_string(maximumMagnitude)+")";
+    if (!detail.empty()) error+=" ("+detail.substr(1)+")";
+    if (firstBadBits)
+    {
+        char hex[64]={};std::snprintf(hex,sizeof(hex),"%08x at (%zu,%zu)",
+            firstBadBits,firstBadPixel%width,firstBadPixel/width);
+        error+=" first bad pixel: 0x";error+=hex;
+        error+=" bbox ("+std::to_string(minX)+","+std::to_string(minY)+")-("
+            +std::to_string(maxX)+","+std::to_string(maxY)+")";
+    }
+    return false;
 }
 
 // RGBA32F rows, receiver samples first, then grating samples:
@@ -150,9 +248,8 @@ inline bool prepareScene(const HarmonicMIDI::grid::Visual3DScene& scene,
             for (float rho:surface->spectralReflectance->coefficients) bits(candidate.identity,rho);
         }
     }
-    if (!receivers || !receiverTriangles || !gratingTriangles
-        || receiverTriangles>kMaximumNativeDiffractionTriangles || gratingTriangles>kMaximumNativeDiffractionTriangles)
-        return refuse("Native diffraction actual triangle table exceeds its receiver/grating budget");
+    if (!receivers || !receiverTriangles || !gratingTriangles)
+        return refuse("Native diffraction scene needs a receiver triangle and a grating triangle");
     if (!opaquevisibility::prepareScene(scene,&program,{},candidate.query,error,
         opaquevisibility::AdmissionMode::allSurfaces,true)) return false;
     output=std::move(candidate);error.clear();return true;
@@ -163,7 +260,6 @@ inline bool appendSamples(const Prepared& prepared, const std::vector<opaquevisi
 {
     const auto& scene=*prepared.scene;
     const auto& root=*prepared.program;
-    std::size_t triangleCount=0;
     for (std::size_t instance=0;instance<instances.size();++instance)
     {
         const auto& placement=instances[instance];
@@ -172,9 +268,6 @@ inline bool appendSamples(const Prepared& prepared, const std::vector<opaquevisi
         const auto* surface=nativeSurfaceForObject(&root,object.id);
         if ((grating && surface!=&root) || (!grating && (!surface || surface==&root || !surface->spectralReflectance))) continue;
         const auto count=object.indexCount?object.indexCount:object.vertexCount;
-        triangleCount+=count/3;
-        if (triangleCount>kMaximumNativeDiffractionTriangles)
-        {error="Native diffraction expanded triangle instances exceed table budget";return false;}
         Matrix inverse;
         if (!opaquevisibility::inverse(placement.world,inverse)) {error="Native diffraction transform is invalid";return false;}
         for (std::size_t at=0;at<count;at+=3)
@@ -270,7 +363,6 @@ inline bool validateQueries(const Prepared& prepared, const Frame& frame, std::s
     };
     if (!std::isfinite(frame.sampleControl[0]) || !std::isfinite(frame.sampleControl[1])
         || frame.sampleControl[0]<1 || frame.sampleControl[1]<1
-        || frame.sampleControl[0]>kMaximumNativeDiffractionSamples || frame.sampleControl[1]>kMaximumNativeDiffractionSamples
         || std::floor(frame.sampleControl[0])!=frame.sampleControl[0] || std::floor(frame.sampleControl[1])!=frame.sampleControl[1]
         || frame.sampleControl[0]+frame.sampleControl[1]!=frame.samples.size())
         return refuse("Native diffraction query sample counts are invalid");
@@ -289,14 +381,22 @@ inline bool validateQueries(const Prepared& prepared, const Frame& frame, std::s
             for (auto& a:direction) a/=distance;
             Point reciprocal=direction;for (auto& a:reciprocal) a=-a;
             opaquevisibility::ClosestHit forward,backward;
-            if (!trace(receiver,direction,distance+minimum,forward) || !trace(grating,reciprocal,distance+minimum,backward)) return false;
-            if (!forward.status || !backward.status) return refuse("Native diffraction reciprocal query missed its endpoint");
+            const auto tolerance=[&](const Sample& expected)
+            {return endpointTolerance(minimum,distance,std::abs(dot(expected.normal,direction)));};
+            if (!trace(receiver,direction,std::min(maximum,distance+tolerance(grating)),forward)
+                || !trace(grating,reciprocal,std::min(maximum,distance+tolerance(receiver)),backward)) return false;
             const auto endpoint=[&](const opaquevisibility::ClosestHit& hit,const Sample& expected)
             {
-                if (hit.distance<distance-minimum) return true; // strictly nearer admitted opaque blocker
-                return hit.objectId==expected.object && hit.materialId==expected.material && hit.instanceId==expected.instance
-                    && hit.triangleId==expected.triangle && std::abs(hit.distance-distance)<=minimum
-                    && dot(hit.outwardNormal,expected.normal)>=1.0f-1.0e-5f;
+                // A ray lying in the triangle's plane can miss it or clip a
+                // neighbour by rounding. Its cosine weight is nearly zero.
+                const bool grazing=std::abs(dot(expected.normal,direction))<kEndpointGrazingCosine;
+                if (!hit.status) return grazing;
+                const bool same=hit.objectId==expected.object && hit.materialId==expected.material
+                    && hit.instanceId==expected.instance && hit.triangleId==expected.triangle;
+                const float allowed=tolerance(expected);
+                if (hit.distance<distance-(same?allowed:minimum)) return true; // strictly nearer admitted opaque blocker
+                return grazing || (same && std::abs(hit.distance-distance)<=allowed
+                    && dot(hit.outwardNormal,expected.normal)>=1.0f-1.0e-5f);
             };
             if (!endpoint(forward,grating) || !endpoint(backward,receiver))
                 return refuse("Native diffraction reciprocal endpoint object/material/triangle identity is stale");
@@ -308,7 +408,7 @@ inline bool buildFrame(const Prepared& prepared,const std::vector<opaquevisibili
     std::uint32_t width,std::uint32_t height,Frame& output,std::string& error)
 {
     if (!prepared.scene || !prepared.program) {error="Native diffraction table is not prepared";return false;}
-    std::array<bool,64> covered{};
+    std::vector<char> covered(prepared.scene->objectCount,0);
     for (const auto& instance:instances)
     {
         if (instance.object>=prepared.scene->objectCount) {error="Native diffraction instance object is invalid";return false;}
@@ -331,9 +431,14 @@ inline bool buildFrame(const Prepared& prepared,const std::vector<opaquevisibili
     if (!root || root>=candidate.query.texels.size()) {error="Native diffraction query topology is empty";return false;}
     const auto& allowance=candidate.query.texels[root-1];
     const auto work=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
-    if (!nativeFixtureDiffractionQueryWorkWithinBudget(width,height,receivers,gratings,work)
+    std::uint64_t queries=0;
+    if (!nativeFixtureDiffractionFrameQueries(width,height,receivers,gratings,work,queries)
         || !nativeFixtureDiffractionWorkWithinBudget(*prepared.program,width,height,std::max(receivers,gratings)))
-    {error="Native diffraction sample/query/lobe frame work exceeds budget";return false;}
+    {error="Native diffraction frame work does not fit 64 bits for "+std::to_string(receivers)+" receiver and "
+        +std::to_string(gratings)+" grating samples";return false;}
+    // Shaders read these counts as floats, so each must stay an exact integer.
+    if (receivers+gratings>=std::size_t(opaquevisibility::kExactFloatIndexRange))
+    {error="Native diffraction sample count "+std::to_string(receivers+gratings)+" has no exact float form";return false;}
     candidate.sampleControl={float(receivers),float(gratings),float(kSampleStride),float(kTableVersion)};
     if (!validateQueries(prepared,candidate,error)) return false;
     for (const auto& s:candidate.samples)

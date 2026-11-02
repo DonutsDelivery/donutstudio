@@ -32,6 +32,7 @@
 
 #include <array>
 #include <limits>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -61,7 +62,27 @@ struct PackResult
     float beat = std::numeric_limits<float>::quiet_NaN();
     int noteCount = 0;   // highest occupied row + 1 (loop bound, see header note)
     int linkCount = 0;   // edges with both endpoints resident
+    // Left out because the textures are full, not because they are out of the
+    // history and lookahead window. A link counts when it lost an endpoint to
+    // the note limit too.
+    int droppedNotes = 0;
+    int droppedLinks = 0;
 };
+
+// Goes when the texture limits go: storage buffers remove both.
+inline std::string scoreDropWarning (int droppedNotes, int droppedLinks)
+{
+    if (droppedNotes <= 0 && droppedLinks <= 0)
+        return {};
+    std::string left;
+    if (droppedNotes > 0)
+        left = std::to_string (droppedNotes) + (droppedNotes == 1 ? " note" : " notes");
+    if (droppedLinks > 0)
+        left += (left.empty() ? "" : " and ") + std::to_string (droppedLinks)
+              + (droppedLinks == 1 ? " link" : " links");
+    return "Score visuals hold " + std::to_string (kMaxNotes) + " notes and "
+         + std::to_string (kMaxLinks) + " links at a time, so they left out " + left + ".";
+}
 
 class BlockCPacker
 {
@@ -85,6 +106,26 @@ public:
                           float historyBeats, float lookaheadBeats)
     {
         return arbitmod::timelineResidency (n, beat, historyBeats, lookaheadBeats);
+    }
+
+    // One note's texels at a beat, in row layout:
+    // texel0: midiNote, velocity/127, ageBeats, remainBeats
+    // texel1: frame-resolved freqHz, centsFromRoot, trackId, isRoot
+    // texel2: e2,e3,e5,e7
+    // texel3: e11,e13, masterRow, pitch bend in semitones
+    static std::array<float, kTexelsPerNote * 4> noteTexels (const Note& n, const Score& score,
+                                                             float beat, int masterRow)
+    {
+        const float bentFrequency = arbitmod::pitchFrequencyAtBeat (n, beat);
+        return { static_cast<float> (n.midiNote), arbitmod::clamp01 (n.velocity / 127.0f),
+                 beat - n.startBeat, // negative for lookahead notes
+                 n.endBeat() - beat,
+                 bentFrequency, arbitmod::centsFromRoot (bentFrequency, score.rootFreq),
+                 static_cast<float> (n.trackId), n.isRoot ? 1.0f : 0.0f,
+                 n.primes[0], n.primes[1], n.primes[2], n.primes[3],
+                 n.primes[4], n.primes[5], static_cast<float> (masterRow),
+                 n.freqHz > 0.0f && bentFrequency > 0.0f
+                     ? 12.0f * std::log2 (bentFrequency / n.freqHz) : 0.0f };
     }
 
     int rowOf (int noteId) const
@@ -125,8 +166,13 @@ public:
                            return a.note->startBeat < b.note->startBeat;
                        return a.note->id < b.note->id;
                    });
+        std::unordered_set<int> cutIds;
         if (candidates.size() > static_cast<size_t> (kMaxNotes))
+        {
+            for (size_t index = kMaxNotes; index < candidates.size(); ++index)
+                cutIds.insert (candidates[index].note->id);
             candidates.resize (kMaxNotes);
+        }
 
         std::unordered_set<int> selectedIds;
         selectedIds.reserve (candidates.size());
@@ -179,14 +225,22 @@ public:
             writeNote (out.notesTex, row, *n, score, beat);
         }
         out.noteCount = maxRow + 1;
+        out.droppedNotes = static_cast<int> (cutIds.size());
 
         // 5. Link edges: both endpoints must be resident.
         for (const auto& l : score.links)
         {
             const int sRow = rowOf (l.slaveNoteId);
             const int mRow = rowOf (l.masterNoteId);
-            if (sRow < 0 || mRow < 0) continue;
-            if (out.linkCount >= kMaxLinks) break;
+            if (sRow < 0 || mRow < 0)
+            {
+                const bool sCut = cutIds.count (l.slaveNoteId) != 0;
+                const bool mCut = cutIds.count (l.masterNoteId) != 0;
+                if ((sCut && (mCut || mRow >= 0)) || (mCut && sRow >= 0))
+                    ++out.droppedLinks;
+                continue;
+            }
+            if (out.linkCount >= kMaxLinks) { ++out.droppedLinks; continue; }
             const size_t off = static_cast<size_t> (out.linkCount++) * 4u;
             out.linkIds[static_cast<std::size_t> (out.linkCount - 1)] = l.id;
             out.linksTex[off + 0] = static_cast<float> (sRow);
@@ -198,44 +252,13 @@ public:
     }
 
 private:
-    void set (std::vector<float>& tex, int row, int texel, int ch, float v) const
-    {
-        tex[(static_cast<size_t> (row) * kTexelsPerNote + static_cast<size_t> (texel)) * 4u
-            + static_cast<size_t> (ch)] = v;
-    }
-
     void writeNote (std::vector<float>& tex, int row, const Note& n,
                     const Score& score, float beat) const
     {
-        const float vel   = arbitmod::clamp01 (n.velocity / 127.0f);
-        const float age   = beat - n.startBeat;        // negative for lookahead notes
-        const float remain = n.endBeat() - beat;
-        const float bentFrequency = arbitmod::pitchFrequencyAtBeat (n, beat);
-        const float bendSemitones = n.freqHz > 0.0f && bentFrequency > 0.0f
-            ? 12.0f * std::log2 (bentFrequency / n.freqHz) : 0.0f;
-        const float cents = arbitmod::centsFromRoot (bentFrequency, score.rootFreq);
-        const int   masterRow = n.linkMasterId != 0 ? rowOf (n.linkMasterId) : -1;
-
-        // texel0: midiNote, velocity/127, ageBeats, remainBeats
-        set (tex, row, 0, 0, n.midiNote);
-        set (tex, row, 0, 1, vel);
-        set (tex, row, 0, 2, age);
-        set (tex, row, 0, 3, remain);
-        // texel1: frame-resolved freqHz, centsFromRoot, trackId, isRoot
-        set (tex, row, 1, 0, bentFrequency);
-        set (tex, row, 1, 1, cents);
-        set (tex, row, 1, 2, static_cast<float> (n.trackId));
-        set (tex, row, 1, 3, n.isRoot ? 1.0f : 0.0f);
-        // texel2: e2,e3,e5,e7
-        set (tex, row, 2, 0, n.primes[0]);
-        set (tex, row, 2, 1, n.primes[1]);
-        set (tex, row, 2, 2, n.primes[2]);
-        set (tex, row, 2, 3, n.primes[3]);
-        // texel3: e11,e13, masterRow, pitch bend in semitones
-        set (tex, row, 3, 0, n.primes[4]);
-        set (tex, row, 3, 1, n.primes[5]);
-        set (tex, row, 3, 2, static_cast<float> (masterRow));
-        set (tex, row, 3, 3, bendSemitones);
+        const int masterRow = n.linkMasterId != 0 ? rowOf (n.linkMasterId) : -1;
+        const auto texels = noteTexels (n, score, beat, masterRow);
+        std::copy (texels.begin(), texels.end(),
+                   tex.begin() + static_cast<std::ptrdiff_t> (row) * kTexelsPerNote * 4);
     }
 
     std::array<int, kMaxNotes> rowToNote_ {};

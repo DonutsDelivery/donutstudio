@@ -7,7 +7,9 @@
 #include "loop_step_probe.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -320,6 +322,71 @@ bool collectImportedLeafBindings(const gltf::GlbAnimationDocument& document,
     return true;
 }
 
+// A mesh no clip animates draws through the scene renderer at rest, so its authored
+// weights, and a skin's rest pose from its joints' node transforms, move into the
+// vertices. Returns null for ranges that don't fit the deformation mesh, or for a
+// skin the bake refuses, with its reason in error.
+std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> sceneAtRestWeights(
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+    const gltf::GlbAnimationDocument& document, const std::vector<gltf::GlbDeformationRenderBinding>& bindings,
+    std::string& error)
+{
+    error.clear();
+    if (!document.deformation) return nullptr;
+    std::shared_ptr<HarmonicMIDI::grid::Visual3DScene> rested;
+    for (const auto& binding : bindings)
+    {
+        const auto* mesh = document.deformation->findMesh(binding.mesh);
+        if (!mesh) return nullptr;
+        const auto id = static_cast<std::uint64_t>(binding.nodeIndex) * 65536u + 1u;
+        const auto end = scene->objects.begin() + scene->objectCount;
+        const auto object = std::find_if(scene->objects.begin(), end,
+            [id](const auto& candidate) { return candidate.id.value == id; });
+        if (object == end || mesh->vertexCount() > scene->vertexCount - object->firstVertex) return nullptr;
+        if (binding.skin.isValid() || mesh->skin().isValid())
+        {
+            arbitgpu::NativeDeformationScene source;
+            source.mesh = binding.mesh;
+            source.object = object->id;
+            source.scene = scene;
+            source.deformation = document.deformation;
+            source.morphBaseWeights = binding.morphBaseWeights;
+            source.skin = binding.skin.isValid() ? binding.skin : mesh->skin();
+            for (const auto& joint : binding.jointBaseTransforms)
+                source.jointBaseTransforms.push_back(
+                    {joint.skin, joint.joint, joint.translation, joint.rotation, joint.scale, joint.matrix});
+            if (!rested) rested = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*scene);
+            if (!arbitgpu::bakeNativeRestPose(source, *rested, error)) return nullptr;
+            continue;
+        }
+        const auto& targets = mesh->morphTargets();
+        for (std::size_t index = 0; index < targets.size() && index < binding.morphBaseWeights.size(); ++index)
+        {
+            const auto weight = binding.morphBaseWeights[index];
+            const auto& positions = targets[index].positionDeltas();
+            const auto& normals = targets[index].normalDeltas();
+            if (weight == 0.0f) continue;
+            if (positions.size() != mesh->vertexCount() * 3u) return nullptr;
+            if (!rested) rested = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*scene);
+            for (std::size_t vertex = 0; vertex < mesh->vertexCount(); ++vertex)
+            {
+                auto& out = rested->vertices[object->firstVertex + vertex];
+                out.position.x += weight * positions[vertex * 3u];
+                out.position.y += weight * positions[vertex * 3u + 1u];
+                out.position.z += weight * positions[vertex * 3u + 2u];
+                if (normals.size() != positions.size()) continue;
+                out.normal.x += weight * normals[vertex * 3u];
+                out.normal.y += weight * normals[vertex * 3u + 1u];
+                out.normal.z += weight * normals[vertex * 3u + 2u];
+                const auto length = std::sqrt(out.normal.x * out.normal.x + out.normal.y * out.normal.y
+                    + out.normal.z * out.normal.z);
+                if (length > 0.0f) { out.normal.x /= length; out.normal.y /= length; out.normal.z /= length; }
+            }
+        }
+    }
+    return rested ? std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>(std::move(rested)) : scene;
+}
+
 // Every drawn node whose mesh deforms needs its own exact binding.
 bool importedLeafDeformedNodesAreBound(const gltf::GlbStaticMeshDocument& decoded,
     const gltf::GlbAnimationDocument& document, const HarmonicMIDI::grid::Visual3DScene& adapted,
@@ -389,6 +456,8 @@ bool remapImportedLeafScene(HarmonicMIDI::grid::Visual3DScene& scene, std::size_
 // snapshot, exactly as one leaf joins it. Leaf 0 keeps its raw IDs. Leaf 1+
 // adopt leaf 0's cameras, lights and ambient color, which the composed scene
 // replaces with the procedural records anyway.
+} // namespace
+
 std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> composeImportedLeafScenes(
     const HarmonicMIDI::grid::Visual3DScene& procedural,
     const std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>>& leaves, std::string& error)
@@ -428,6 +497,9 @@ std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> composeImportedLeafScen
     }
     return gltf::composeImportedVisual3DScene(procedural, *imported, error);
 }
+
+namespace
+{
 
 // Logical storage of one further leaf sample in a multi-leaf frame: its
 // snapshot, morph schedules and scene sample, with the same capacity rules
@@ -555,6 +627,13 @@ ImportedAnimatedScenePayloadExecution::ImportedAnimatedScenePayloadExecution(
     arbitgpu::NativeFixtureSceneBackend& sceneBackend) noexcept
     : store_(store), renderer_(backend), sceneRenderer_(sceneBackend)
 {
+    // Bounded: pairs every fixture render entry with the instance that made it, so a
+    // per-frame rebuild shows up as a changing pointer.
+    static int made = 0;
+    ++made;
+    if (made <= 40)
+        std::fprintf (stderr, "[gl] animated exec ctor #%d sceneRenderer=%p\n", made,
+                      static_cast<const void*> (&sceneRenderer_));
 }
 
 bool ImportedAnimatedScenePayloadExecution::inspectCompatibility(
@@ -703,9 +782,9 @@ bool ImportedAnimatedScenePayloadExecution::executeSceneAnimationComposition(
     // Frame publication, light controls, runtime copies and wrappers have their
     // own allowance. No deformation frame schedule covers these allocations.
     if (!add(nodes,4*sizeof(std::array<float,16>)+5*sizeof(std::uint8_t))
-        || !add(4*Visual3DScene::kMaxLights,sizeof(SceneLightRecord))
-        || !add(3*Visual3DScene::kMaxCameras,sizeof(SceneCameraRecord))
-        || !add(request.importedLights.intensityMultipliers.size()+Visual3DScene::kMaxLights,
+        || !add(4*Visual3DScene::kInitialLights,sizeof(SceneLightRecord))
+        || !add(3*Visual3DScene::kInitialCameras,sizeof(SceneCameraRecord))
+        || !add(request.importedLights.intensityMultipliers.size()+Visual3DScene::kInitialLights,
             2*(sizeof(std::pair<const std::uint32_t,float>)+4*sizeof(void*)))
         || !add(request.runtimeInputs.materialFrameTextures.size(),
             2*(sizeof(decltype(request.runtimeInputs.materialFrameTextures)::value_type)+4*sizeof(void*)))
@@ -865,7 +944,8 @@ bool ImportedAnimatedScenePayloadExecution::executeSceneAnimationComposition(
             for (std::size_t i=0;i<count;++i)
             {
                 const auto id=records[i].id.value;
-                candidate->mappings_[candidate->mappingCount_++]={kind,id,imported?id:id|0x80000000u,imported};
+                candidate->mappings_.push_back({kind,id,imported?id:id|0x80000000u,imported});
+                ++candidate->mappingCount_;
             }
         };
         mappings(importedScene_->cameras,importedScene_->cameraCount,Mapping::Kind::Camera,true);
@@ -951,6 +1031,8 @@ void ImportedAnimatedScenePayloadExecution::clearSingleLeafState() noexcept
     parentOwner_.reset();
     sceneAnimationFrames_ = {}; sceneAnimationOwner_.reset();
     scene_.reset();
+    restWeightScene_.reset(); restWeightSource_.reset();
+    bakedDeformationScene_.reset(); bakedDeformationSource_.reset();
     importedScene_.reset();
     proceduralScene_.reset();
     baseScene_.reset();
@@ -1033,7 +1115,7 @@ bool ImportedAnimatedScenePayloadExecution::admit(
         return false;
     }
     if (proceduralScene && sourceCameraNodeId && !sceneAnimationBudget_->work(
-            HarmonicMIDI::grid::Visual3DScene::kMaxCameras, sizeof(HarmonicMIDI::grid::SceneCameraRecord), error)) return false;
+            HarmonicMIDI::grid::Visual3DScene::kInitialCameras, sizeof(HarmonicMIDI::grid::SceneCameraRecord), error)) return false;
     if (sourceCameraNodeId && !sourceCameraRecord(*decodedScene, *adapted, *sourceCameraNodeId))
         return reject(error, "selected imported camera is not a genuine camera in the admitted source scene");
     auto document = candidateConsumer.admittedDocument();
@@ -1106,16 +1188,12 @@ bool ImportedAnimatedScenePayloadExecution::admit(
         // operands for appendScene comparisons before entering that routine.
         for (const auto& light:imported->lights)
             if (!NativeSceneAnimationCompositionBudget::addLightIdentityBytes(light,4,bytes,error)
-                || !sceneAnimationBudget_->consumeLightIdentityWork(light,4*(Visual3DScene::kMaxLights+8))) return false;
+                || !sceneAnimationBudget_->consumeLightIdentityWork(light,4*(Visual3DScene::kInitialLights+8))) return false;
         for (const auto& light:proceduralScene->lights)
             if (!NativeSceneAnimationCompositionBudget::addLightIdentityBytes(light,5,bytes,error)
-                || !sceneAnimationBudget_->consumeLightIdentityWork(light,4*(Visual3DScene::kMaxLights+8))) return false;
+                || !sceneAnimationBudget_->consumeLightIdentityWork(light,4*(Visual3DScene::kInitialLights+8))) return false;
         animationAdmission=NativeSceneAnimationCompositionBudget::reserve(sceneAnimationBudget_,bytes,error);
         if (!animationAdmission) return false;
-        if (imported->cameraCount>Visual3DScene::kMaxCameras || imported->lightCount>Visual3DScene::kMaxLights
-            || proceduralScene->cameraCount>Visual3DScene::kMaxCameras-imported->cameraCount
-            || proceduralScene->lightCount>Visual3DScene::kMaxLights-imported->lightCount)
-            return reject(error,"camera/light composition exceeds the full scene record capacity");
         auto mapped=std::make_shared<Visual3DScene>(*proceduralScene);
         for (std::size_t i=0;i<mapped->cameraCount;++i)
         {
@@ -1138,6 +1216,9 @@ bool ImportedAnimatedScenePayloadExecution::admit(
         full->cameras=imported->cameras;full->cameraCount=imported->cameraCount;
         full->activeCamera=mapped->activeCamera;
         full->lights=imported->lights;full->lightCount=imported->lightCount;
+        Visual3DSceneGrowth recordGrowth;
+        recordGrowth.cameras=mapped->cameraCount;recordGrowth.lights=mapped->lightCount;
+        if (!growVisual3DScene(*full,recordGrowth,error)) return false;
         for (std::size_t i=0;i<mapped->cameraCount;++i) full->cameras[full->cameraCount++]=mapped->cameras[i];
         for (std::size_t i=0;i<mapped->lightCount;++i) full->lights[full->lightCount++]=mapped->lights[i];
         if (!validateVisual3DScene(*full).valid())
@@ -1150,9 +1231,6 @@ bool ImportedAnimatedScenePayloadExecution::admit(
         std::shared_ptr<const NativeCompositionRetentionBudget::Charge> parentAssembly;
         if (request.parentIntent)
         {
-            if (proceduralScene->objectCount>64 || imported->objectCount>64
-                || proceduralScene->objectCount>64-imported->objectCount)
-                return reject(error,"imported parent aggregate object count exceeds capacity");
             std::size_t p=0,i=0;
             if (!ImportedParentBindingOwner::sceneBytes(*proceduralScene,*sceneAnimationBudget_,p)
                 || !ImportedParentBindingOwner::sceneBytes(*imported,*sceneAnimationBudget_,i))
@@ -1440,33 +1518,20 @@ bool ImportedAnimatedScenePayloadExecution::admitCompositionLeaves(
     // The candidates vector is per-call staging, freed on return. Each leaf
     // record it holds is charged in that leaf's fixed reservation.
     std::vector<CompositionLeaf> candidates(inputs.size());
-    std::size_t objects = 0, materials = 0, textures = 0, texels = 0;
     for (std::size_t leaf = 0; leaf < inputs.size(); ++leaf)
     {
         auto& candidate = candidates[leaf];
         if (!admitCompositionLeaf(sceneAnimationBudget_, inputs[leaf], candidate, error)) return false;
         const auto& document = *candidate.document;
-        const auto& scene = *candidate.scene;
         // Each leaf keeps the single-leaf caps and its identities below the stride.
         if (!importedLeafCountFits(inputs.size(), document.nodes.size())
             || !importedLeafCountFits(inputs.size(), document.materials.size())
-            || !importedLeafCountFits(inputs.size(), document.textures.size())
-            || scene.objectCount > Visual3DScene::kMaxObjects || scene.materialCount > Visual3DScene::kMaxMaterials
-            || scene.textureCount > Visual3DScene::kMaxTextures || scene.textureTexelCount > Visual3DScene::kMaxTextureTexels)
+            || !importedLeafCountFits(inputs.size(), document.textures.size()))
         {
             error = "imported composition leaf " + std::to_string(leaf)
-                + " exceeds the per-leaf node, material or texture capacity";
+                + " has more nodes, materials or textures than the imported identity stride can name";
             return false;
         }
-        objects += scene.objectCount; materials += scene.materialCount;
-        textures += scene.textureCount; texels += scene.textureTexelCount;
-        // The composed scene holds every leaf's records at once. The sums
-        // leave out the procedural scene; executeComposition's join through
-        // appendScene and composeImportedVisual3DScene refuses any overflow
-        // with it before a scene or owner is published.
-        if (objects > Visual3DScene::kMaxObjects || materials > Visual3DScene::kMaxMaterials
-            || textures > Visual3DScene::kMaxTextures || texels > Visual3DScene::kMaxTextureTexels)
-            return reject(error, "imported composition leaves together exceed the scene object, material or texture capacity");
     }
     clearSingleLeafState();
     consumer_ = {};
@@ -1575,23 +1640,29 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     ImportedSceneParentReceiptStaging* parentStaging)
 {
     const bool pathTrace = sceneRenderer_.selectedEngine().engine == videorender::fixture3d::SceneEngineKind::PathTrace;
+    // Realtime draws no caustic: the fixture renderer drops the selection and names it.
+    const bool realtime = sceneRenderer_.selectedEngine().engine == videorender::fixture3d::SceneEngineKind::Realtime;
     const bool localTransform = !visualimportedobjectlocal::same(request.objectLocalTransform, {});
     // Glass caustics belong to the retained Scene3D snapshot owner on the static route.
     // The refusal sits ahead of every route that can render: the several-leaf branch
     // (executeComposition copies runtimeInputs and renders with no glass check of its
     // own), executeSceneAnimationComposition, and the one-leaf renderFrame. A one-leaf
     // local transform request keeps its own, more specific message below.
-    if (request.runtimeInputs.glassCaustic && (!request.compositionLeaves.empty() || !localTransform))
+    if (!realtime && request.runtimeInputs.glassCaustic && (!request.compositionLeaves.empty() || !localTransform))
+    {
+        // The earlier frame has no caustic, so it cannot stand in for this one.
+        if (!request.parentIntent) output = {};
         return reject(error, "Glass caustics require the exact retained Scene3D snapshot owner");
+    }
     // Several imported leaves take their own route; one leaf never reaches it.
     if (!request.compositionLeaves.empty())
     {
-        // The composition draws through the deformation renderer.
-        if (pathTrace)
-            return reject(error, visualimportedscenerender::kPathTraceMultipleImportedLeavesUnavailable.data());
         if (parentStaging || request.parentIntent)
             return reject(error, "Scene Compose refused: imported parenting with multiple imported leaves is not rendered yet");
-        return executeComposition(owner, request, output, error);
+        // A refused frame leaves no receipt, as on the one-leaf route.
+        const bool rendered = executeComposition(owner, request, output, error);
+        if (!rendered) output = {};
+        return rendered;
     }
     // S5a admits one rigid animated leaf with a non-neutral object-local transform.
     // The uses below are refused by name. Leaf shape checks follow admission, once
@@ -1608,7 +1679,7 @@ bool ImportedAnimatedScenePayloadExecution::execute(
             return reject(error, "Imported object local transforms with a selected source camera are not rendered yet");
         if (request.runtimeInputs.noteInstanceMapping)
             return reject(error, "Imported object local transforms with note instancing are not rendered yet");
-        if (request.runtimeInputs.glassCaustic)
+        if (!realtime && request.runtimeInputs.glassCaustic)
             return reject(error, "Imported object local transforms with glass caustics are not rendered yet");
         if (request.runtimeInputs.diffractionSourceProgram || request.runtimeInputs.diffractionEvaluatedProgram)
             return reject(error, "Imported object local transforms with diffraction gratings are not rendered yet");
@@ -1809,12 +1880,6 @@ bool ImportedAnimatedScenePayloadExecution::execute(
                 request.objectLocalTransform);
         if (refusal) return reject(error, refusal);
     }
-    // Bound meshes draw through the deformation renderer, which has no Path
-    // Trace engine. Without bindings the fixture scene renderer draws, and it
-    // honours the selection.
-    if (pathTrace && !bindings_.empty())
-        return reject(error, visualimportedscenerender::kPathTraceAnimatedMeshUnavailable.data());
-
     std::shared_ptr<const NativeSceneAnimationCompositionBudget::Charge> sampleCharge;
     if (composition && bindings_.empty())
     {
@@ -1854,6 +1919,30 @@ bool ImportedAnimatedScenePayloadExecution::execute(
                                        request.structuralRevision, evaluation, error);
     }
     if (!evaluated) return false;
+    // A bound mesh this frame doesn't deform draws through the fixture scene renderer
+    // at its authored weights, on either engine.
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> restScene;
+    std::string restRefusal;
+    const auto& pose = request.operation.pose;
+    if (!bindings_.empty() && !evaluation.deformation && !composition
+        && !pose.boneEnabled && !pose.morphEnabled && pose.morphWeightDeltas.empty())
+    {
+        if (restWeightSource_.lock() != scene_)
+        {
+            restWeightScene_ = sceneAtRestWeights(scene_, *consumer_.admittedDocument(), bindings_, restWeightError_);
+            restWeightSource_ = scene_;
+        }
+        restScene = restWeightScene_;
+        restRefusal = restWeightError_;
+    }
+    // Other bound meshes draw through the deformation renderer on Raster. Path Trace
+    // takes this frame's vertices baked below, once source_ exists.
+    if (pathTrace && !bindings_.empty() && !restScene && (composition || !evaluation.deformation))
+    {
+        auto refusal = std::string(visualimportedscenerender::kPathTraceAnimatedMeshUnavailable);
+        if (!restRefusal.empty()) refusal += ": " + restRefusal;
+        return reject(error, refusal.c_str());
+    }
     if (sampleCharge && evaluation.sceneAnimation)
         evaluation.sceneAnimation=retainSceneAnimationAllocation(evaluation.sceneAnimation,sampleCharge);
     if (request.parentIntent && !evaluation.deformation)
@@ -2205,12 +2294,11 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         {
             const auto nodes=baseScene_->nodes.size();
             const auto records=importedScene_->cameraCount+importedScene_->lightCount;
-            if (nodes>16384 || records>HarmonicMIDI::grid::Visual3DScene::kMaxCameras+HarmonicMIDI::grid::Visual3DScene::kMaxLights
-                || !chargeCallerWork(nodes,256) || !chargeCallerWork(records*nodes,64)
+            if (!chargeCallerWork(nodes,256) || !chargeCallerWork(records*nodes,64)
                 || !chargeCallerWork(evaluation.sceneAnimation->tracks().size(),128)) return false;
             const auto sampleBytes=nodes*(3*sizeof(std::array<float,16>)+2)
-                +2*(HarmonicMIDI::grid::Visual3DScene::kMaxCameras*sizeof(HarmonicMIDI::grid::SceneCameraRecord)
-                    +HarmonicMIDI::grid::Visual3DScene::kMaxLights*sizeof(HarmonicMIDI::grid::SceneLightRecord));
+                +2*(importedScene_->cameraCount*sizeof(HarmonicMIDI::grid::SceneCameraRecord)
+                    +importedScene_->lightCount*sizeof(HarmonicMIDI::grid::SceneLightRecord));
             if (bytes>NativeCompositionRetentionBudget::kMaximumBytes
                 || sampleBytes>NativeCompositionRetentionBudget::kMaximumBytes-bytes)
                 return reject(error,"selected camera composition sampling exceeds logical CPU capacity");
@@ -2255,7 +2343,10 @@ bool ImportedAnimatedScenePayloadExecution::execute(
         const char* message = refusal(program);
         for (const auto& value : program->objectPrograms)
             if (!message) message = refusal(value);
-        if (message) return rejectMotion(message);
+        // A refused publish fell back to the last good program. The publish
+        // error is the cause, not what that older program cannot do.
+        if (message) return rejectMotion(usedLastGoodMaterial && !materialDiagnostic.empty()
+            ? materialDiagnostic.c_str() : message);
     }
     const auto exactSeconds = static_cast<double>(request.frame.frame)
         * static_cast<double>(request.frame.rateDenominator)
@@ -2447,18 +2538,46 @@ bool ImportedAnimatedScenePayloadExecution::execute(
     bool renderPending = false;
     // Preview only. Taken from the scene renderer's frame, empty for the retained deformation renderer.
     std::string causticDegradation;
+    if (pathTrace && !bindings_.empty() && !restScene)
+    {
+        auto baked = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*scene_);
+        const auto bake = [&](const arbitgpu::NativeDeformationScene& draw)
+        { return arbitgpu::bakeNativeDeformation(draw, *evaluation.deformation, *baked, error); };
+        bool bakedAll = source_->draws.empty() ? bake(*source_) : true;
+        for (const auto& draw : source_->draws)
+            bakedAll = bakedAll && bake(*draw);
+        if (!bakedAll)
+        {
+            const auto refusal = std::string(visualimportedscenerender::kPathTraceAnimatedMeshUnavailable) + ": " + error;
+            return reject(error, refusal.c_str());
+        }
+        const bool unchanged = bakedDeformationScene_ && bakedDeformationSource_.lock() == scene_
+            && bakedDeformationScene_->vertexCount == baked->vertexCount
+            && std::memcmp(bakedDeformationScene_->vertices.data(), baked->vertices.data(),
+                           baked->vertexCount * sizeof(baked->vertices[0])) == 0;
+        if (!unchanged)
+        {
+            bakedDeformationScene_ = std::move(baked);
+            bakedDeformationSource_ = scene_;
+        }
+        restScene = bakedDeformationScene_;
+    }
     const auto renderFrame = [&]() {
         loopstep::Scope renderScope (owner == ImportedAnimationEvaluationOwner::Preview
             ? "advance:imported-scene:animated-render" : "advance:imported-scene:animated-export-render");
-        if (bindings_.empty())
+        if (bindings_.empty() || restScene)
         {
+            const auto& drawnScene = restScene ? restScene : scene_;
             videorender::fixture3d::RenderedFrame sceneFrame;
             surfacematerial::MaterialEvaluationInputs materialInputs;
             materialInputs.timeSeconds = runtimeInputs.timeSeconds;
+            // A baked or rest scene is scene_ with other vertices, and the material was admitted on scene_.
+            auto sceneInputs = runtimeInputs;
+            sceneInputs.materialAdmittedScene = scene_;
             const auto rendered = owner == ImportedAnimationEvaluationOwner::Preview
-                ? sceneRenderer_.renderPreview(scene_, material, materialInputs, runtimeInputs,
+                ? sceneRenderer_.renderPreview(drawnScene, material, materialInputs, sceneInputs,
                     {request.width, request.height}, videorender::animation3d::kNativeGpuCapability, sceneFrame, error)
-                : sceneRenderer_.renderExport(scene_, material, materialInputs, runtimeInputs,
+                : sceneRenderer_.renderExport(drawnScene, material, materialInputs, sceneInputs,
                     {request.width, request.height}, videorender::animation3d::kNativeGpuCapability, sceneFrame, error);
             if (!rendered) return false;
             if (sceneFrame.pending)
@@ -2517,8 +2636,7 @@ bool ImportedAnimatedScenePayloadExecution::execute(
                 || !sceneAnimationBudget_->consumeLightIdentityWork(light,4))
                 return reject(error,"imported parent frame light identity exceeds its reserved capacity");
         }
-        if (runtimeInputs.animatedLights.size()>HarmonicMIDI::grid::Visual3DScene::kMaxLights
-            || bytes>NativeCompositionRetentionBudget::kMaximumBytes-runtimeInputs.animatedLights.size()*sizeof(HarmonicMIDI::grid::SceneLightRecord))
+        if (bytes>NativeCompositionRetentionBudget::kMaximumBytes-runtimeInputs.animatedLights.size()*sizeof(HarmonicMIDI::grid::SceneLightRecord))
             return reject(error,"imported parent frame light records exceed logical CPU capacity");
         bytes+=runtimeInputs.animatedLights.size()*sizeof(HarmonicMIDI::grid::SceneLightRecord);
         // Environment light and modulation overrides are stored and compared with the frame.
@@ -2529,8 +2647,7 @@ bool ImportedAnimatedScenePayloadExecution::execute(
                 || !sceneAnimationBudget_->consumeLightIdentityWork(*runtimeInputs.lightOverride,4))
                 return reject(error,"imported parent frame light override identity exceeds its reserved capacity");
         }
-        if (runtimeInputs.lightOverrides.size()>HarmonicMIDI::grid::Visual3DScene::kMaxLights
-            || bytes>NativeCompositionRetentionBudget::kMaximumBytes
+        if (bytes>NativeCompositionRetentionBudget::kMaximumBytes
                 -runtimeInputs.lightOverrides.size()*sizeof(arbitgpu::NativeImportedLightOverride))
             return reject(error,"imported parent frame light overrides exceed logical CPU capacity");
         bytes+=runtimeInputs.lightOverrides.size()*sizeof(arbitgpu::NativeImportedLightOverride);
@@ -2735,7 +2852,7 @@ bool ImportedAnimatedScenePayloadExecution::executeComposition(ImportedAnimation
         operations[leaf] = std::move(operation);
     }
     if (identity == leafCount)
-        return reject(error, "Scene Compose refused: multiple imported leaves without animation are not rendered yet");
+        return reject(error, "native composition requires an animated leaf; static leaves draw on the static route");
 
     // A refused frame leaves the epoch where it was, as the one-leaf restore does.
     bool published = false;
@@ -2796,8 +2913,6 @@ bool ImportedAnimatedScenePayloadExecution::executeComposition(ImportedAnimation
         // leaf copy and the composed result, with their texel storage.
         std::size_t texels = request.proceduralScene->textureTexels.capacity();
         for (const auto& leaf : compositionLeaves_) texels += leaf.scene->textureTexels.capacity();
-        if (texels > Visual3DScene::kMaxTextureTexels * (scenecomposition::kMaximumImportedLeaves + 1))
-            return reject(error, "Scene Compose refused: imported leaf textures exceed the composed capacity");
         const auto bytes = (leafCount + 3) * sizeof(Visual3DScene) + 4 * texels * sizeof(SceneTexelRgba8)
             + sizeof(NativeCompositionRetentionBudget::Charge) + 8 * sizeof(std::shared_ptr<const void>);
         if (!sceneAnimationBudget_->work(bytes, 2, error)) return false;
@@ -3193,7 +3308,10 @@ bool ImportedAnimatedScenePayloadExecution::executeComposition(ImportedAnimation
         const char* message = refusal(program);
         for (const auto& value : program->objectPrograms)
             if (!message) message = refusal(value);
-        if (message) return rejectMotion(message);
+        // A refused publish fell back to the last good program. The publish
+        // error is the cause, not what that older program cannot do.
+        if (message) return rejectMotion(usedLastGoodMaterial && !materialDiagnostic.empty()
+            ? materialDiagnostic.c_str() : message);
     }
     const auto exactSeconds = static_cast<double>(request.frame.frame)
         * static_cast<double>(request.frame.rateDenominator)
@@ -3237,12 +3355,100 @@ bool ImportedAnimatedScenePayloadExecution::executeComposition(ImportedAnimation
         return rejectMotion("imported Motion node world table is malformed or exceeds the snapshot bound");
 
     const auto& identityDeformation = evaluations[identity].deformation;
-    const bool rendered = owner == ImportedAnimationEvaluationOwner::Preview
-        ? renderer_.renderPreview(source_, identityDeformation, program, runtimeInputs, request.width, request.height,
-            videorender::animation3d::kNativeGpuCapability, frame, error)
-        : renderer_.renderExport(source_, identityDeformation, program, runtimeInputs, request.width, request.height,
-            videorender::animation3d::kNativeGpuCapability, frame, error);
-    if (!rendered) return false;
+    if (sceneRenderer_.selectedEngine().engine == videorender::fixture3d::SceneEngineKind::PathTrace)
+    {
+        // Path Trace takes each animated leaf's vertices for this frame baked into the composed scene.
+        auto baked = std::make_shared<Visual3DScene>(*scene_);
+        for (std::size_t leaf = 0; leaf < leafCount; ++leaf)
+        {
+            const auto& admittedLeaf = compositionLeaves_[leaf];
+            if (!admittedLeaf.animated) continue;
+            const auto bakedLeaf = std::make_unique<Visual3DScene>(*admittedLeaf.scene);
+            for (const auto& binding : admittedLeaf.bindings)
+            {
+                arbitgpu::NativeDeformationScene draw;
+                draw.sourceStableId = operations[leaf].sourceStableId;
+                draw.deformationStableId = operations[leaf].deformationStableId;
+                draw.structuralRevision = request.structuralRevision;
+                draw.evaluationRevision = request.evaluationRevision;
+                draw.clip = clipOf(leaf);
+                draw.scene = admittedLeaf.scene;
+                draw.deformation = admittedLeaf.consumer.admittedDocument()->deformation;
+                draw.mesh = binding.mesh;
+                draw.skin = binding.skin;
+                draw.animationNodeStableId = binding.nodeIndex + 1u;
+                draw.object = {static_cast<std::uint32_t>(binding.nodeIndex * 65536u + 1u)};
+                draw.morphBaseWeights = binding.morphBaseWeights;
+                draw.batchMember = true;
+                for (const auto& base : binding.jointBaseTransforms)
+                    draw.jointBaseTransforms.push_back({base.skin, base.joint,
+                        base.translation, base.rotation, base.scale, base.matrix});
+                if (!arbitgpu::bakeNativeDeformation(draw, *evaluations[leaf].deformation, *bakedLeaf, error))
+                {
+                    const auto refusal = std::string(visualimportedscenerender::kPathTraceAnimatedMeshUnavailable) + ": " + error;
+                    return reject(error, refusal.c_str());
+                }
+                const auto composed = composedLeafObjectId(leaf, leafCount, draw.object);
+                const auto* from = visual3d_detail::findById(admittedLeaf.scene->objects, admittedLeaf.scene->objectCount, draw.object);
+                const auto* to = composed ? visual3d_detail::findById(scene_->objects, scene_->objectCount, *composed) : nullptr;
+                if (!from || !to || from->vertexCount != to->vertexCount)
+                    return leafError(leaf, "bound mesh has no matching composed object for Path Trace");
+                std::copy_n(bakedLeaf->vertices.begin() + from->firstVertex, from->vertexCount,
+                            baked->vertices.begin() + to->firstVertex);
+            }
+        }
+        const bool unchanged = bakedDeformationScene_ && bakedDeformationSource_.lock() == scene_
+            && bakedDeformationScene_->vertexCount == baked->vertexCount
+            && std::memcmp(bakedDeformationScene_->vertices.data(), baked->vertices.data(),
+                           baked->vertexCount * sizeof(baked->vertices[0])) == 0;
+        if (!unchanged)
+        {
+            bakedDeformationScene_ = std::move(baked);
+            bakedDeformationSource_ = scene_;
+        }
+        loopstep::Scope renderScope (owner == ImportedAnimationEvaluationOwner::Preview
+            ? "advance:imported-scene:animated-render" : "advance:imported-scene:animated-export-render");
+        videorender::fixture3d::RenderedFrame sceneFrame;
+        surfacematerial::MaterialEvaluationInputs materialInputs;
+        materialInputs.timeSeconds = runtimeInputs.timeSeconds;
+        auto sceneInputs = runtimeInputs;
+        sceneInputs.compositionFrame.reset();
+        sceneInputs.materialAdmittedScene = scene_;
+        const auto renderedScene = owner == ImportedAnimationEvaluationOwner::Preview
+            ? sceneRenderer_.renderPreview(bakedDeformationScene_, material, materialInputs, sceneInputs,
+                {request.width, request.height}, videorender::animation3d::kNativeGpuCapability, sceneFrame, error)
+            : sceneRenderer_.renderExport(bakedDeformationScene_, material, materialInputs, sceneInputs,
+                {request.width, request.height}, videorender::animation3d::kNativeGpuCapability, sceneFrame, error);
+        if (!renderedScene) return false;
+        if (sceneFrame.pending)
+        {
+            // Export never sees pending, so it refuses instead of publishing nothing.
+            if (owner != ImportedAnimationEvaluationOwner::Preview)
+                return reject(error, "imported animated export render returned pending");
+            output.pending = true;
+            error.clear();
+            return true;
+        }
+        frame.use = owner == ImportedAnimationEvaluationOwner::Preview
+            ? videorender::animation3d::RenderUse::Preview : videorender::animation3d::RenderUse::Export;
+        frame.source = source_; frame.nativeFrame = std::move(sceneFrame.nativeFrame);
+        frame.stats.drawCount = sceneFrame.stats.drawCount;
+        frame.stats.clipId = source_->clip.value; frame.stats.time = request.frame;
+        frame.stats.sourceStableId = source_->sourceStableId;
+        frame.stats.deformationStableId = source_->deformationStableId;
+        frame.stats.revision = request.structuralRevision;
+        frame.stats.staticUploadCount = sceneFrame.stats.staticUploadCount;
+        frame.stats.reusedStaticResources = sceneFrame.stats.reusedStaticResources;
+    }
+    else
+    {
+        const bool rendered = owner == ImportedAnimationEvaluationOwner::Preview
+            ? renderer_.renderPreview(source_, identityDeformation, program, runtimeInputs, request.width, request.height,
+                videorender::animation3d::kNativeGpuCapability, frame, error)
+            : renderer_.renderExport(source_, identityDeformation, program, runtimeInputs, request.width, request.height,
+                videorender::animation3d::kNativeGpuCapability, frame, error);
+        if (!rendered) return false;
+    }
     if (!motion.commit(request.frame.frame, request.frame.rateNumerator, request.frame.rateDenominator,
             request.width, request.height, runtimeInputs, identityDeformation, motionOwner))
         motion = {};

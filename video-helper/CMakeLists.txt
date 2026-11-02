@@ -167,6 +167,8 @@ add_executable(arbit-video-helper
     src/pathtrace/environment_map.cpp
     src/pathtrace/environment_resident.cpp
     src/pathtrace/integrator.cpp
+    src/pathtrace/devices/device_cpu.cpp
+    src/pathtrace/devices/device_registry.cpp
     src/pathtrace/lights.cpp
     src/pathtrace/scene_ingest.cpp
     src/pathtrace/thread_pool.cpp
@@ -206,6 +208,7 @@ elseif(GLFW3_FOUND AND OpenGL_FOUND)
     message(STATUS "arbit-video-helper: strict native OpenGL SDF backend enabled")
 else()
     target_sources(arbit-video-helper PRIVATE
+        src/diffraction_order_bsdf.cpp
         src/gpu_backend/backend_stub.cpp
         src/gpu_backend/cpu_scene_frame_stub.cpp
         src/optical_flow_source_upload_stub.cpp)
@@ -789,6 +792,16 @@ else()
 endif()
 add_test(NAME geometry_core_field_gate COMMAND arbit-geometry-core-field-gate-tests)
 
+add_executable(arbit-sdf-surface-work-tests tests/sdf_surface_work_tests.cpp)
+target_include_directories(arbit-sdf-surface-work-tests PRIVATE ../shared)
+target_compile_features(arbit-sdf-surface-work-tests PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(arbit-sdf-surface-work-tests PRIVATE /W4 /WX)
+else()
+    target_compile_options(arbit-sdf-surface-work-tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME sdf_surface_work COMMAND arbit-sdf-surface-work-tests)
+
 add_executable(arbit-geometry-core-operations-tests tests/geometry_core_operations_tests.cpp)
 target_include_directories(arbit-geometry-core-operations-tests PRIVATE src ../shared)
 target_compile_features(arbit-geometry-core-operations-tests PRIVATE cxx_std_17)
@@ -798,6 +811,19 @@ else()
     target_compile_options(arbit-geometry-core-operations-tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
 add_test(NAME geometry_core_operations COMMAND arbit-geometry-core-operations-tests)
+
+add_executable(arbit-geometry-subdivision-surface-tests
+    tests/geometry_subdivision_surface_tests.cpp
+    src/pathtrace/bvh.cpp)
+target_include_directories(arbit-geometry-subdivision-surface-tests PRIVATE src ../shared)
+target_compile_features(arbit-geometry-subdivision-surface-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-geometry-subdivision-surface-tests PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(arbit-geometry-subdivision-surface-tests PRIVATE /W4 /WX)
+else()
+    target_compile_options(arbit-geometry-subdivision-surface-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME geometry_subdivision_surface COMMAND arbit-geometry-subdivision-surface-tests)
 
 add_executable(arbit-geometry-core-field-cull-tests tests/geometry_core_field_cull_tests.cpp)
 target_include_directories(arbit-geometry-core-field-cull-tests PRIVATE src ../shared)
@@ -937,6 +963,8 @@ else()
 endif()
 add_test(NAME video_control_plan COMMAND arbit-video-control-plan-tests)
 
+add_test(NAME glass_ring_fringe_source_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/glass_ring_fringe_source_contract.py)
 add_test(NAME depth_primitives_source_contract
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/depth_primitives_source_contract.py)
 add_test(NAME renderer_geometry_closure_source_contract
@@ -1005,6 +1033,11 @@ else()
         -Wall -Wextra -Wpedantic -Werror)
 endif()
 add_test(NAME harmonic_link_shape COMMAND arbit-harmonic-link-shape-tests)
+add_executable(arbit-harmonic-link-uncapped-tests tests/harmonic_link_uncapped_tests.cpp)
+target_include_directories(arbit-harmonic-link-uncapped-tests PRIVATE src ../shared)
+target_link_libraries(arbit-harmonic-link-uncapped-tests PRIVATE nlohmann_json::nlohmann_json)
+target_compile_features(arbit-harmonic-link-uncapped-tests PRIVATE cxx_std_17)
+add_test(NAME harmonic_link_uncapped COMMAND arbit-harmonic-link-uncapped-tests)
 
 add_executable(arbit-note-identity-voice-reallocation-tests
     tests/note_identity_voice_reallocation_tests.cpp)
@@ -1345,6 +1378,15 @@ endif()
 add_test(NAME diffraction_material_admission
     COMMAND arbit-diffraction-material-admission-tests)
 
+add_executable(arbit-diffraction-order-core-tests
+    tests/diffraction_order_core_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-diffraction-order-core-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+add_test(NAME diffraction_order_core
+    COMMAND arbit-diffraction-order-core-tests)
+
 add_executable(arbit-diffraction-product-plans-compile-tests
     tests/diffraction_product_plans_compile_tests.cpp)
 target_include_directories(arbit-diffraction-product-plans-compile-tests PRIVATE
@@ -1473,13 +1515,40 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME glass_caustic_contract COMMAND arbit-glass-caustic-contract-tests)
+add_test(NAME analytic_sky_clouds_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/analytic_sky_clouds_source_contract.py)
 add_test(NAME glass_smooth_refusal_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/glass_smooth_refusal_source_contract.py)
+add_test(NAME camera_hidden_backdrop_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/camera_hidden_backdrop_source_contract.py)
 add_test(NAME lighthouse_paired_camera_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/lighthouse_paired_camera_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME graph_describe_advisory_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph_describe_advisory_contract.py)
+add_test(NAME visual_plan_refusal_reason_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/visual_plan_refusal_reason_contract.py)
+add_test(NAME transmissive_sky_reflection_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/transmissive_sky_reflection_contract.py)
+add_test(NAME environment_sample_footprint_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_sample_footprint_contract.py)
+add_test(NAME seam_scene_identity_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/seam_scene_identity_contract.py)
+add_test(NAME helper_resource_limit_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/helper_resource_limit_contract.py)
+add_test(NAME lighthouse_open_sea_starter_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/lighthouse_open_sea_starter_contract.py)
 add_test(NAME lighthouse_starter_walk_model
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/lighthouse_starter_walk_model.py)
@@ -1498,6 +1567,48 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME thin_water_entry_ownership COMMAND arbit-thin-water-entry-ownership-tests)
+
+add_executable(arbit-rough-selected-owner-tests
+    tests/rough_selected_owner_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-rough-selected-owner-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-rough-selected-owner-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME rough_selected_owner COMMAND arbit-rough-selected-owner-tests)
+
+add_executable(arbit-rough-version-route-tests
+    tests/rough_version_route_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-rough-version-route-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-rough-version-route-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME rough_version_route COMMAND arbit-rough-version-route-tests)
+
+add_executable(arbit-rough-lane-slices-tests
+    tests/rough_lane_slices_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-rough-lane-slices-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-rough-lane-slices-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME rough_lane_slices COMMAND arbit-rough-lane-slices-tests)
+
+add_executable(arbit-open-sea-sky-tests tests/open_sea_sky_tests.cpp)
+target_include_directories(arbit-open-sea-sky-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-open-sea-sky-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME open_sea_sky COMMAND arbit-open-sea-sky-tests)
 
 add_executable(arbit-glass-nested-shell-tests
     tests/glass_nested_shell_tests.cpp
@@ -1831,6 +1942,18 @@ endif()
 add_test(NAME color_transform_gamut_numeric
     COMMAND arbit-color-transform-gamut-numeric-tests)
 
+add_executable(arbit-agx-view-transform-numeric-tests
+    tests/agx_view_transform_numeric_tests.cpp)
+if(NOT MSVC)
+    target_compile_options(arbit-agx-view-transform-numeric-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME agx_view_transform_numeric
+    COMMAND arbit-agx-view-transform-numeric-tests)
+add_test(NAME agx_view_transform_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/agx_view_transform_source_contract.py)
+
 add_executable(arbit-render-pass-output-contract-tests
     ../plugin/Tests/RenderPassOutputContractTests.cpp)
 if(NOT MSVC)
@@ -1942,14 +2065,6 @@ if(EXISTS "${ARBIT_JUCE_SOURCE_DIR}/CMakeLists.txt" AND NOT MINGW)
         AUTHORITY_CURATED_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/../content/shader-packs/arbit-essentials/shaders/aurora_drift.fs"
         ARBIT_PROGRAMMABLE_TEST_MODE=1 ARBIT_PROGRAMMABLE_AUTHORITY_TEST_SEAM=1
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        add_executable(programmable-resource-limit-fixture
-            tests/resource_limit_fixture.cpp)
-        target_compile_definitions(programmable-production-lifecycle-tests PRIVATE
-            RESOURCE_LIMIT_FIXTURE="$<TARGET_FILE:programmable-resource-limit-fixture>")
-        add_dependencies(programmable-production-lifecycle-tests
-            programmable-resource-limit-fixture)
-    endif()
     target_link_libraries(programmable-production-lifecycle-tests PRIVATE
         juce::juce_core juce::juce_events)
     if(NOT MSVC)
@@ -1998,6 +2113,15 @@ add_test(NAME depth_cache_windows_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/depth_cache_windows_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME realtime_engine_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/realtime_engine_source_contract.py)
+add_test(NAME realtime_hdr_materials_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/realtime_hdr_materials_source_contract.py)
+add_test(NAME realtime_features_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/realtime_features_source_contract.py)
 add_test(NAME blend_modes_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/blend_modes_source_contract.py)
@@ -2143,6 +2267,28 @@ endif()
 add_test(NAME imported_animation_visual_plan_execution
     COMMAND arbit-imported-animation-visual-plan-execution-tests)
 
+add_executable(arbit-graph-describe-operation-tests
+    tests/graph_describe_operation_tests.cpp)
+target_include_directories(arbit-graph-describe-operation-tests PRIVATE src)
+target_link_libraries(arbit-graph-describe-operation-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+add_test(NAME graph_describe_operation
+    COMMAND arbit-graph-describe-operation-tests)
+
+add_executable(arbit-timeline-verified-plan-reuse-tests
+    tests/timeline_verified_plan_reuse_tests.cpp)
+target_include_directories(arbit-timeline-verified-plan-reuse-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_link_libraries(arbit-timeline-verified-plan-reuse-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-timeline-verified-plan-reuse-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME timeline_verified_plan_reuse
+    COMMAND arbit-timeline-verified-plan-reuse-tests)
+
 add_executable(arbit-imported-scene-visual-plan-execution-tests
     tests/imported_scene_visual_plan_execution_tests.cpp
     src/geometry_core_backend.cpp
@@ -2181,9 +2327,21 @@ add_test(NAME imported_scene_product_route_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/imported_scene_product_route_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME viewport_timeline_no_kill_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_timeline_no_kill_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME viewport_install_concurrent_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_install_concurrent_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME composite_probe_revision_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/composite_probe_revision_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME path_trace_stats_reply_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/path_trace_stats_reply_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_test(NAME sdf_product_route_source_contract
@@ -2277,6 +2435,14 @@ add_test(NAME imported_scene_preview_extent_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/imported_scene_preview_extent_source_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME render_mode_plumbing_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/render_mode_plumbing_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME geometry_core_key_light_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/geometry_core_key_light_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(arbit-export-telemetry-owner-tests tests/export_telemetry_owner_tests.cpp)
 target_include_directories(arbit-export-telemetry-owner-tests PRIVATE src)
@@ -2325,6 +2491,70 @@ add_test(NAME viewport_retired_publication_source_contract
 add_test(NAME viewport_deferred_visual_event_handback_source_contract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_deferred_visual_event_handback_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_volume_select_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_volume_select_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_admission_warm_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_admission_warm_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_caustic_pending_base_frame_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_caustic_pending_base_frame_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_caustic_completion_wake_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_caustic_completion_wake_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_diffraction_feature_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_diffraction_feature_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_dispatch_warm_order_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_dispatch_warm_order_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME viewport_retirement_replan_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_retirement_replan_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME viewport_preview_mix_carry_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/viewport_preview_mix_carry_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_private_camera_reset_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_private_camera_reset_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_receipt_texture_hold_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_receipt_texture_hold_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_pool_review_fixes_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_pool_review_fixes_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_identity_view_coverage_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_identity_view_coverage_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_caustic_refusal_numbers_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_caustic_refusal_numbers_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_caustic_splat_key_budget_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_caustic_splat_key_budget_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_caustic_radiance_detail_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_caustic_radiance_detail_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME fixture_splat_receiver_raster_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture_splat_receiver_raster_contract.py
             ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME gl_async_program_compile_source_contract
     COMMAND ${Python3_EXECUTABLE}
@@ -2456,6 +2686,8 @@ add_executable(arbit-pathtrace-integrator-tests
     src/pathtrace/bvh.cpp
     src/pathtrace/environment_map.cpp
     src/pathtrace/integrator.cpp
+    src/pathtrace/devices/device_cpu.cpp
+    src/diffraction_order_bsdf.cpp
     src/pathtrace/lights.cpp
     src/pathtrace/scene_ingest.cpp
     src/pathtrace/thread_pool.cpp)
@@ -2482,6 +2714,8 @@ add_executable(arbit-pathtrace-environment-tests
     src/pathtrace/environment_map.cpp
     src/pathtrace/environment_resident.cpp
     src/pathtrace/integrator.cpp
+    src/pathtrace/devices/device_cpu.cpp
+    src/diffraction_order_bsdf.cpp
     src/pathtrace/lights.cpp
     src/pathtrace/scene_ingest.cpp
     src/pathtrace/thread_pool.cpp)
@@ -2507,6 +2741,8 @@ add_executable(arbit-pathtrace-refraction-tests
     src/pathtrace/bvh.cpp
     src/pathtrace/environment_map.cpp
     src/pathtrace/integrator.cpp
+    src/pathtrace/devices/device_cpu.cpp
+    src/diffraction_order_bsdf.cpp
     src/pathtrace/lights.cpp
     src/pathtrace/scene_ingest.cpp
     src/pathtrace/thread_pool.cpp)
@@ -2521,6 +2757,57 @@ if(NOT MSVC)
 endif()
 add_test(NAME pathtrace_refraction COMMAND arbit-pathtrace-refraction-tests)
 
+# CPU path tracer grooved disc: a bound environment image reaching the output,
+# concentric grating frames from polar uv, and dispersed orders on a receiver.
+add_executable(arbit-pathtrace-grating-environment-tests
+    tests/pathtrace_grating_environment_tests.cpp
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bsdf.cpp
+    src/pathtrace/spectrum.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/environment_map.cpp
+    src/pathtrace/integrator.cpp
+    src/pathtrace/devices/device_cpu.cpp
+    src/diffraction_order_bsdf.cpp
+    src/pathtrace/lights.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp)
+target_include_directories(arbit-pathtrace-grating-environment-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-grating-environment-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-grating-environment-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-grating-environment-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_grating_environment COMMAND arbit-pathtrace-grating-environment-tests)
+
+# Relief scatter on a grating: Rayleigh-Rice lobe, furnaces and the plate's caustic.
+add_executable(arbit-pathtrace-relief-scatter-tests
+    tests/pathtrace_relief_scatter_tests.cpp
+    src/pathtrace/accumulator.cpp
+    src/pathtrace/bsdf.cpp
+    src/pathtrace/spectrum.cpp
+    src/pathtrace/bvh.cpp
+    src/pathtrace/environment_map.cpp
+    src/pathtrace/integrator.cpp
+    src/pathtrace/devices/device_cpu.cpp
+    src/diffraction_order_bsdf.cpp
+    src/pathtrace/lights.cpp
+    src/pathtrace/scene_ingest.cpp
+    src/pathtrace/thread_pool.cpp)
+target_include_directories(arbit-pathtrace-relief-scatter-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-relief-scatter-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-relief-scatter-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-relief-scatter-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_relief_scatter COMMAND arbit-pathtrace-relief-scatter-tests)
+
 # Path Trace render engine (Plan 3, PT-C1): the V27 engine field on the Render
 # wire, RenderScene cache reuse, progressive reset rules, the compositor output
 # format and export determinism. CPU only.
@@ -2532,6 +2819,8 @@ set(ARBIT_PATHTRACE_ENGINE_SOURCES
     src/pathtrace/engine.cpp
     src/pathtrace/environment_map.cpp
     src/pathtrace/integrator.cpp
+    src/pathtrace/devices/device_cpu.cpp
+    src/diffraction_order_bsdf.cpp
     src/pathtrace/lights.cpp
     src/pathtrace/scene_ingest.cpp
     src/pathtrace/thread_pool.cpp)
@@ -2549,6 +2838,27 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME pathtrace_engine COMMAND arbit-pathtrace-engine-tests)
+add_executable(arbit-harmonic-link-scene-tests tests/harmonic_link_scene_tests.cpp)
+target_include_directories(arbit-harmonic-link-scene-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-harmonic-link-scene-tests PRIVATE cxx_std_17)
+add_test(NAME harmonic_link_scene COMMAND arbit-harmonic-link-scene-tests)
+
+# Tier K S2: an Accurate Preview draws the export budgets. The CPU build pins the
+# caustic plan and budget scope and compares Path Trace preview with export.
+add_executable(arbit-render-mode-preview-parity-tests
+    tests/render_mode_preview_parity_tests.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-render-mode-preview-parity-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-render-mode-preview-parity-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-render-mode-preview-parity-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-render-mode-preview-parity-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME render_mode_preview_parity COMMAND arbit-render-mode-preview-parity-tests)
 
 # Path Trace routes (Plan 3, PT-C1): glass material mapping, input refusals,
 # the FixtureSceneRenderer engine branch and the imported animated routes. A
@@ -2575,6 +2885,7 @@ add_executable(arbit-pathtrace-route-tests
     src/gpu_backend/cpu_scene_frame_stub.cpp
     src/pathtrace_fixture_engine.cpp
     src/pathtrace/environment_resident.cpp
+    src/pathtrace/devices/device_registry.cpp
     ${ARBIT_PATHTRACE_ENGINE_SOURCES})
 target_include_directories(arbit-pathtrace-route-tests PRIVATE
     src
@@ -2605,6 +2916,193 @@ target_link_libraries(arbit-pathtrace-timing PRIVATE Threads::Threads)
 if(NOT MSVC)
     target_compile_options(arbit-pathtrace-timing PRIVATE
         -Wall -Wextra -Werror)
+endif()
+
+# Single-source integrator (Plan 3, Tier V): drives the path loop through the
+# device interface on the CPU device, the reference the GPU devices match.
+add_executable(arbit-pathtrace-device-tests
+    tests/pathtrace_device_tests.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-pathtrace-device-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-device-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-device-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-device-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_device COMMAND arbit-pathtrace-device-tests)
+
+# What a failed device pass leaves in the host film, through a fake device.
+add_executable(arbit-pathtrace-device-failure-tests
+    tests/pathtrace_device_failure_tests.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-pathtrace-device-failure-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-device-failure-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-device-failure-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-device-failure-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_device_failure COMMAND arbit-pathtrace-device-failure-tests)
+
+# One process-wide pool for Path Trace and the denoiser: the thread count stays
+# at the core count, and films match a private pool's bit for bit.
+add_executable(arbit-pathtrace-shared-pool-tests
+    tests/pathtrace_shared_pool_tests.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-pathtrace-shared-pool-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-pathtrace-shared-pool-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-shared-pool-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-shared-pool-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_shared_pool COMMAND arbit-pathtrace-shared-pool-tests)
+add_executable(arbit-pathtrace-tile-denormal-tests
+    tests/pathtrace_tile_denormal_tests.cpp
+    src/pathtrace/thread_pool.cpp)
+target_include_directories(arbit-pathtrace-tile-denormal-tests PRIVATE src)
+target_link_libraries(arbit-pathtrace-tile-denormal-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-tile-denormal-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_tile_denormal COMMAND arbit-pathtrace-tile-denormal-tests)
+
+# The Path Trace device list (Plan 3): Auto order, unavailable reports and the
+# load probe, against stand-in machines. Needs no SDK or driver.
+add_executable(arbit-pathtrace-device-registry-tests
+    tests/pathtrace_device_registry_tests.cpp
+    src/pathtrace/devices/device_registry.cpp)
+target_include_directories(arbit-pathtrace-device-registry-tests PRIVATE src)
+target_compile_features(arbit-pathtrace-device-registry-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-pathtrace-device-registry-tests PRIVATE ${CMAKE_DL_LIBS})
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-device-registry-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_device_registry COMMAND arbit-pathtrace-device-registry-tests)
+add_executable(arbit-pathtrace-kernel-compile-notice-tests tests/pathtrace_kernel_compile_notice_tests.cpp)
+target_include_directories(arbit-pathtrace-kernel-compile-notice-tests PRIVATE src)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-kernel-compile-notice-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_kernel_compile_notice COMMAND arbit-pathtrace-kernel-compile-notice-tests)
+add_executable(arbit-pathtrace-kernel-build-gate-tests tests/pathtrace_kernel_build_gate_tests.cpp)
+target_include_directories(arbit-pathtrace-kernel-build-gate-tests PRIVATE src)
+find_package(Threads REQUIRED)
+target_link_libraries(arbit-pathtrace-kernel-build-gate-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-kernel-build-gate-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_kernel_build_gate COMMAND arbit-pathtrace-kernel-build-gate-tests)
+add_test(NAME optix_sdk_discovery
+    COMMAND ${CMAKE_COMMAND} -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/optix_sdk_discovery
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/optix_sdk_discovery_test.cmake)
+add_test(NAME pathtrace_optix_device_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/pathtrace_optix_device_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME pathtrace_frame_layer_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/pathtrace_frame_layer_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME pathtrace_device_portability_source_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/pathtrace_device_portability_source_contract.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+# The device registry loads vendor runtimes at run time.
+target_link_libraries(arbit-video-helper PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(arbit-pathtrace-route-tests PRIVATE ${CMAKE_DL_LIBS})
+
+# OptiX device of the path integrator. The SDK is a build-time input found by
+# discovery; a machine without it builds everything else and says so. The SDK's
+# optixInit needs the OS loader and, on Windows, cfgmgr32.
+include(cmake/OptiXDiscovery.cmake)
+option(ARBIT_OPTIX_DISCOVERY "Look for the OptiX SDK and build the OptiX device if it is there" ON)
+set(OptiX_INSTALL_DIR "" CACHE PATH "OptiX SDK root (the directory holding include/optix.h); also read from the environment")
+set(ARBIT_OPTIX_SDK_DIR "")
+if(ARBIT_OPTIX_DISCOVERY)
+    set(arbit_optix_explicit_dir "${OptiX_INSTALL_DIR}")
+    if(NOT arbit_optix_explicit_dir)
+        set(arbit_optix_explicit_dir "$ENV{OptiX_INSTALL_DIR}")
+    endif()
+    arbit_optix_default_roots(arbit_optix_roots)
+    arbit_find_optix_sdk(ARBIT_OPTIX_SDK_DIR arbit_optix_version arbit_optix_detail
+        "${arbit_optix_explicit_dir}" ${arbit_optix_roots})
+    if(ARBIT_OPTIX_SDK_DIR)
+        arbit_cuda_default_roots(arbit_cuda_roots)
+        arbit_find_cuda_headers(ARBIT_OPTIX_CUDA_INCLUDE_DIR ${arbit_cuda_roots})
+        if(NOT ARBIT_OPTIX_CUDA_INCLUDE_DIR)
+            set(arbit_optix_detail "${arbit_optix_detail} has no cuda.h to compile against (looked in CUDA_PATH, CUDA_HOME, nvcc's toolkit, /opt/cuda and /usr/local/cuda)")
+            set(ARBIT_OPTIX_SDK_DIR "")
+        endif()
+    endif()
+else()
+    set(arbit_optix_detail "ARBIT_OPTIX_DISCOVERY is OFF")
+endif()
+
+function(arbit_add_optix_device target)
+    target_sources(${target} PRIVATE src/pathtrace/devices/device_optix_host.cpp)
+    target_compile_definitions(${target} PRIVATE ARBIT_HAVE_OPTIX=1)
+    target_include_directories(${target} SYSTEM PRIVATE "${ARBIT_OPTIX_SDK_DIR}/include" "${ARBIT_OPTIX_CUDA_INCLUDE_DIR}")
+    if(WIN32)
+        target_link_libraries(${target} PRIVATE cfgmgr32)
+    endif()
+endfunction()
+
+if(ARBIT_OPTIX_SDK_DIR)
+    message(STATUS "OptiX device: building the host code, ${arbit_optix_detail}")
+    arbit_add_optix_device(arbit-video-helper)
+    arbit_add_optix_device(arbit-pathtrace-route-tests)
+else()
+    message(STATUS "OptiX device: not built, ${arbit_optix_detail}. Path Trace reports OptiX as unavailable and Auto uses the next loadable device")
+endif()
+
+# The integrator kernel, compiled to PTX by nvcc and embedded in the helper. It
+# builds whenever the SDK and nvcc are here. nvcc runs as a plain command because
+# the kernel needs only its PTX pass, and CMake's CUDA language support would also
+# have to accept the machine's host compiler.
+option(ARBIT_OPTIX_KERNEL_ENABLED "Compile the OptiX integrator kernel when the SDK and nvcc are found" ON)
+if(ARBIT_OPTIX_KERNEL_ENABLED AND ARBIT_OPTIX_SDK_DIR)
+    find_program(ARBIT_NVCC nvcc HINTS /opt/cuda/bin "$ENV{CUDA_PATH}/bin")
+    if(ARBIT_NVCC)
+        set(arbit_optix_ptx "${CMAKE_CURRENT_BINARY_DIR}/device_optix.ptx")
+        set(arbit_optix_embed "${CMAKE_CURRENT_BINARY_DIR}/device_optix_ptx.cpp")
+        add_custom_command(OUTPUT "${arbit_optix_ptx}"
+            COMMAND "${ARBIT_NVCC}" -std=c++17 --ptx --expt-relaxed-constexpr --machine=64 --relocatable-device-code=true
+                    -MD -MF "${arbit_optix_ptx}.d"
+                    -I "${ARBIT_OPTIX_SDK_DIR}/include"
+                    -I "${ARBIT_OPTIX_CUDA_INCLUDE_DIR}"
+                    -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                    -I "${CMAKE_CURRENT_SOURCE_DIR}/../shared"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/src/pathtrace/devices/device_optix.cu" -o "${arbit_optix_ptx}"
+            DEPENDS src/pathtrace/devices/device_optix.cu
+            DEPFILE "${arbit_optix_ptx}.d"
+            COMMENT "Compiling the OptiX kernel"
+            VERBATIM)
+        add_custom_command(OUTPUT "${arbit_optix_embed}"
+            COMMAND ${CMAKE_COMMAND} -DPTX=${arbit_optix_ptx} -DOUT=${arbit_optix_embed}
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/OptiXEmbedKernel.cmake"
+            DEPENDS "${arbit_optix_ptx}" cmake/OptiXEmbedKernel.cmake
+            VERBATIM)
+        foreach(target arbit-video-helper arbit-pathtrace-route-tests)
+            target_sources(${target} PRIVATE "${arbit_optix_embed}")
+            target_compile_definitions(${target} PRIVATE ARBIT_HAVE_OPTIX_KERNEL=1)
+        endforeach()
+        message(STATUS "OptiX kernel: building with ${ARBIT_NVCC}")
+    else()
+        message(STATUS "OptiX kernel: not built, no nvcc found")
+    endif()
+elseif(ARBIT_OPTIX_KERNEL_ENABLED)
+    message(STATUS "OptiX kernel: not built, ${arbit_optix_detail}")
 endif()
 
 if(GLFW3_FOUND AND OpenGL_FOUND)
@@ -2981,6 +3479,46 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
         COMMAND arbit-opengl-fixture-scene-backend-tests)
     set_tests_properties(opengl_fixture_scene_backend PROPERTIES
         LABELS "native-fixture-runtime;native-surface-material-runtime"
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    # Tier K S2: the settled Accurate Preview caustic frame equals the export frame.
+    add_executable(arbit-opengl-render-mode-preview-parity-tests
+        tests/render_mode_preview_parity_tests.cpp
+        tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/animation_mix.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/diffraction_order_bsdf.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp
+        src/color_transform_gl.cpp)
+    target_include_directories(arbit-opengl-render-mode-preview-parity-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-render-mode-preview-parity-tests PRIVATE
+        ARBIT_RENDER_MODE_PARITY_GL=1
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-render-mode-preview-parity-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-render-mode-preview-parity-tests PRIVATE
+            -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
+    endif()
+    add_test(NAME opengl_render_mode_preview_parity
+        COMMAND arbit-opengl-render-mode-preview-parity-tests)
+    set_tests_properties(opengl_render_mode_preview_parity PROPERTIES
+        LABELS "native-fixture-runtime"
         TIMEOUT 60
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE)

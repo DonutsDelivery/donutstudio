@@ -3,6 +3,7 @@
 #include "../../shared/GeometryTimelineSceneBinding.h"
 
 #include <cstring>
+#include <limits>
 #include <map>
 #include <tuple>
 
@@ -64,7 +65,10 @@ inline bool sameScene(const Scene& a,const Scene& b) noexcept {
       || a.objectCount!=b.objectCount || a.materialCount!=b.materialCount
       || a.textureCount!=b.textureCount || a.textureTexelCount!=b.textureTexelCount
       || a.lightCount!=b.lightCount || a.cameraCount!=b.cameraCount
-      || a.textureTexels.size()!=b.textureTexels.size()) return false;
+      || a.textureTexels.size()!=b.textureTexels.size()
+      || a.vertices.size()!=b.vertices.size() || a.objects.size()!=b.objects.size()
+      || a.materials.size()!=b.materials.size() || a.textures.size()!=b.textures.size()
+      || a.lights.size()!=b.lights.size() || a.cameras.size()!=b.cameras.size()) return false;
   // Compare declared fields, including unused fixed records, without padding.
   for (std::size_t i=0;i<a.vertices.size();++i) {
     const auto& x=a.vertices[i]; const auto& y=b.vertices[i];
@@ -106,6 +110,7 @@ inline bool sameScene(const Scene& a,const Scene& b) noexcept {
         || !sameVector(x.color,y.color) || !sameFloat(x.intensity,y.intensity)
         || !sameFloat(x.range,y.range) || !sameFloat(x.innerConeAngle,y.innerConeAngle)
         || !sameFloat(x.outerConeAngle,y.outerConeAngle) || !sameAnalyticSky(x.sky,y.sky)
+        || x.environmentCameraVisible!=y.environmentCameraVisible
         || !sameEnvironmentImage(x.environmentImage,y.environmentImage)
         || !sameSpectralSource(x.spectralSource,y.spectralSource)) return false;
   }
@@ -119,78 +124,95 @@ inline bool sameScene(const Scene& a,const Scene& b) noexcept {
 }
 
 // Source schedule for validateVisual3DScene, sameScene and the binding joins.
-// Use fixed capacities even for sparse scenes: replay/default construction can
+// Use allocated lengths even for sparse scenes: replay/default construction can
 // visit records absent from the authored counts. Early returns only reduce work.
-inline bool deriveSceneWork(std::size_t children,std::size_t texels,
+// These are visit estimates, not sizes, so they saturate: a huge scene's cubic
+// worst case is an estimate that stays at the top of size_t, never a failure.
+inline bool visitAdd(std::size_t a,std::size_t b,std::size_t& out) noexcept {
+  out=a>std::numeric_limits<std::size_t>::max()-b ? std::numeric_limits<std::size_t>::max() : a+b;
+  return true;
+}
+inline bool visitMul(std::size_t a,std::size_t b,std::size_t& out) noexcept {
+  out=b!=0 && a>std::numeric_limits<std::size_t>::max()/b ? std::numeric_limits<std::size_t>::max() : a*b;
+  return true;
+}
+inline bool visitAddMul(std::size_t a,std::size_t b,std::size_t& out) noexcept {
+  std::size_t product=0; visitMul(a,b,product); return visitAdd(out,product,out);
+}
+inline bool deriveSceneWork(const Scene& scene,std::size_t children,std::size_t texels,
     std::size_t environmentBytes,std::size_t text,std::size_t childRecordBytes,
     Envelope& out) noexcept {
-  constexpr auto O=Scene::kMaxObjects, M=Scene::kMaxMaterials, T=Scene::kMaxTextures;
-  constexpr auto L=Scene::kMaxLights, C=Scene::kMaxCameras;
-  constexpr auto V=Scene::kMaxVertices, I=Scene::kMaxIndices;
+  const auto O=scene.objects.size(), M=scene.materials.size(), T=scene.textures.size();
+  const auto L=scene.lights.size(), C=scene.cameras.size();
+  const auto V=scene.vertices.size(), I=scene.indices.size();
   constexpr auto S=diffractionmaterial::kMaximumSpectralSamples;
   std::size_t calls=0,perValidation=0,searches=0,depths=0,multiplies=0;
   std::size_t completeRecords=0,bindingVisits=0,copies=0,stringPasses=0,terms=0;
   // Initial admission, one validTimelineSceneBinding per admitted child, then
   // two validations per future replacement. Cache reuse needs only the first.
-  if (!checkedMul(children,3,calls) || !checkedAdd(calls,1,calls)
-      || !checkedMul(O,O+1,depths) || !checkedMul(O,O,multiplies)
-      || !checkedAdd(depths,multiplies,terms)
-      || !checkedMul(terms,O,searches) || !checkedMul(calls,searches,out.hierarchyLookupVisits)
-      || !checkedMul(calls,terms,out.hierarchyDepthIterations)
-      || !checkedAdd(multiplies,O,terms) || !checkedMul(calls,terms,out.matrixConstructions)
-      || !checkedMul(calls,multiplies,terms) || !checkedMul(terms,4*4*4,out.matrixMultiplyTerms)
+  if (!visitMul(children,3,calls) || !visitAdd(calls,1,calls)
+      || !visitMul(O,O+1,depths) || !visitMul(O,O,multiplies)
+      || !visitAdd(depths,multiplies,terms)
+      || !visitMul(terms,O,searches) || !visitMul(calls,searches,out.hierarchyLookupVisits)
+      || !visitMul(calls,terms,out.hierarchyDepthIterations)
+      || !visitAdd(multiplies,O,terms) || !visitMul(calls,terms,out.matrixConstructions)
+      || !visitMul(calls,multiplies,terms) || !visitMul(terms,4*4*4,out.matrixMultiplyTerms)
       // Each matrixFor initializes and transfers 16 elements. Each multiply
       // zeroes 16 and assigns 16 world elements. Postchecks read 9 scale, 18 dot and 3
       // translation elements. Each of the 64 terms reads two and updates one
       // result element. Arithmetic inside each term is fixed.
-      || !checkedMul(out.matrixConstructions,16+16,out.matrixElementVisits)
-      || !addArrayBytes(terms,16+16+3*4*4*4,out.matrixElementVisits)
-      || !addArrayBytes(calls,O*(9+18+3),out.matrixElementVisits)
-      || !checkedMul(calls,O*(3+3),out.matrixPostcheckIterations)) return false;
+      || !visitMul(out.matrixConstructions,16+16,out.matrixElementVisits)
+      || !visitAddMul(terms,16+16+3*4*4*4,out.matrixElementVisits)
+      || !visitMul(O,9+18+3,terms)
+      || !visitAddMul(calls,terms,out.matrixElementVisits)
+      || !visitMul(O,3+3,terms)
+      || !visitMul(calls,terms,out.matrixPostcheckIterations)) return false;
   out.sceneValidationCalls=calls;
   // All duplicateIdAt earlier-record scans, parent-presence lookup, both
   // hierarchy searches, object material lookup, five material texture lookups
   // and the active-camera lookup. Object index ranges can overlap, so validation
   // must reserve O*I index checks rather than assume one pass over indices.
   for (const auto count : {O,M,T,L,C})
-    if (!addArrayBytes(count,count-1,perValidation)) return false;
+    if (count!=0) visitAddMul(count,count-1,perValidation);
   perValidation/=2;
-  if (!checkedAdd(perValidation,searches,perValidation)
-      || !addArrayBytes(O,O+M+I,perValidation)
-      || !addArrayBytes(M,5*T,perValidation)
-      || !checkedAdd(perValidation,C,perValidation)
-      || !checkedAdd(perValidation,1+T+M+2*O+V+2*L+C,perValidation)
+  // Each term below is at most a few times a live length, which cannot wrap:
+  // every length is held in memory by records larger than this multiplier.
+  if (!visitAdd(perValidation,searches,perValidation)
+      || !visitAddMul(O,O+M+I,perValidation)
+      || !visitAddMul(M,5*T,perValidation)
+      || !visitAdd(perValidation,C,perValidation)
+      || !visitAdd(perValidation,1+T+M+2*O+V+2*L+C,perValidation)
       // Three sky channel checks; two spectral arrays and directional
       // coefficients have S entries each, including version-zero comparisons.
-      || !checkedAdd(calls,1,terms)
-      || !checkedMul(terms,L*(3+3*S),out.lightChannelVisits)
-      || !checkedMul(calls,perValidation,out.sceneRecordVisits)
-      || !checkedAdd(V+I+O+M+T+L+C,texels,completeRecords)
+      || !visitAdd(calls,1,terms)
+      || !visitMul(terms,L*(3+3*S),out.lightChannelVisits)
+      || !visitMul(calls,perValidation,out.sceneRecordVisits)
+      || !visitAdd(V+I+O+M+T+L+C,texels,completeRecords)
       // One exact full-scene cache comparison. Three binding range scans:
       // initial admission, admitted baseline and future replacement baseline.
-      || !checkedMul(children,3*O,out.rangeComparisons)
+      || !visitMul(children,3*O,out.rangeComparisons)
       // Five object searches: initial/range, baseline, retained child, future
       // baseline and future replacement. Three material searches accompany the
       // admission baseline and both future baseline/replacement joins. Three
       // binding-record passes cover canonical order, exact plan equality and
       // backend equality. Each fixed scene header is one record visit.
-      || !checkedMul(children,5*O+3*M+2*V+3*I+3,bindingVisits)
-      || !checkedAdd(out.sceneRecordVisits,completeRecords+1,out.sceneRecordVisits)
-      || !checkedAdd(out.sceneRecordVisits,out.rangeComparisons,out.sceneRecordVisits)
-      || !checkedAdd(out.sceneRecordVisits,bindingVisits,out.sceneRecordVisits)
+      || !visitMul(children,5*O+3*M+2*V+3*I+3,bindingVisits)
+      || !visitAdd(out.sceneRecordVisits,completeRecords+1,out.sceneRecordVisits)
+      || !visitAdd(out.sceneRecordVisits,out.rangeComparisons,out.sceneRecordVisits)
+      || !visitAdd(out.sceneRecordVisits,bindingVisits,out.sceneRecordVisits)
       // Frozen copy, future composed-scene copy, and three default candidate
       // scenes per child. Include every fixed record and texture element.
-      || !checkedMul(children,3,copies) || !checkedAdd(copies,2,copies)
-      || !checkedMul(copies,completeRecords,out.sceneCopyElements)
+      || !visitMul(children,3,copies) || !visitAdd(copies,2,copies)
+      || !visitMul(copies,completeRecords,out.sceneCopyElements)
       // Admission/future baseline append and future evaluated append each
       // write vertices and indices, then replacement writes vertices once.
-      || !addArrayBytes(children,4*V+3*I,out.sceneCopyElements)
+      || !visitAddMul(children,4*V+3*I,out.sceneCopyElements)
       // Validator strings, full cache equality, scene copies, binding equality
       // and retention. Backend identity comparisons are bounded by child bytes.
-      || !checkedAdd(calls,copies,stringPasses) || !checkedAdd(stringPasses,1,stringPasses)
-      || !checkedMul(stringPasses,environmentBytes,out.sceneStringByteVisits)
-      || !addArrayBytes(text,2,out.sceneStringByteVisits)
-      || !addArrayBytes(children,childRecordBytes,out.sceneStringByteVisits)) return false;
+      || !visitAdd(calls,copies,stringPasses) || !visitAdd(stringPasses,1,stringPasses)
+      || !visitMul(stringPasses,environmentBytes,out.sceneStringByteVisits)
+      || !visitAddMul(text,2,out.sceneStringByteVisits)
+      || !visitAddMul(children,childRecordBytes,out.sceneStringByteVisits)) return false;
   return true;
 }
 
@@ -200,30 +222,28 @@ inline bool deriveSceneWork(std::size_t children,std::size_t texels,
 inline bool deriveEnvelope(const Scene& scene,const std::vector<TimelineSceneBinding>& bindings,
     const ResourceLimits& limits,std::size_t childRecordBytes,Envelope& out,std::string& error) {
   std::size_t text=0,binary=0,operations=0,environmentBytes=0;
-  // Entry schedule: at most 13 count predicates, 64 binding size/identity
-  // records and 16 light string-capacity records. Contents are untouched.
-  if (bindings.empty() || bindings.size()>Scene::kMaxObjects
-      || scene.vertexCount>Scene::kMaxVertices || scene.indexCount>Scene::kMaxIndices
-      || scene.objectCount>Scene::kMaxObjects || scene.materialCount>Scene::kMaxMaterials
-      || scene.textureCount>Scene::kMaxTextures || scene.lightCount>Scene::kMaxLights
-      || scene.cameraCount>Scene::kMaxCameras || scene.textureTexelCount>Scene::kMaxTextureTexels
+  // Entry schedule: 13 count predicates, every binding's size and identity
+  // record, and every light's string capacity. Contents are untouched.
+  if (bindings.empty()
+      || scene.vertexCount>scene.vertices.size() || scene.indexCount>scene.indices.size()
+      || scene.objectCount>scene.objects.size() || scene.materialCount>scene.materials.size()
+      || scene.textureCount>scene.textures.size() || scene.lightCount>scene.lights.size()
+      || scene.cameraCount>scene.cameras.size()
       || scene.textureTexelCount!=scene.textureTexels.size()
       || scene.vertexCount>limits.maxVertices || scene.indexCount>limits.maxIndices) {
-    error="Timeline scene family exceeds scene counts or 1..64 binding capacity"; return false;
+    error="Timeline scene family needs at least one binding and scene counts that match its allocated records"; return false;
   }
   for (const auto& binding : bindings) {
     const auto n=binding.loweredPlan.size();
     if (!binding.object.isValid() || n==0 || n%2!=0
-        || !checkedAdd(text,n,text) || text>kMaximumTimelineScenePlanBytes
-        || !checkedAdd(binary,n/2,binary) || binary>kMaximumTimelineScenePlanBytes/2) {
-      error="Timeline scene family exceeds aggregate lowered text or binary capacity"; return false;
+        || !checkedAdd(text,n,text) || !checkedAdd(binary,n/2,binary)) {
+      error="Timeline scene family has an invalid lowered plan or its plan sizes overflow"; return false;
     }
     // Every operation has at least 41 wire bytes. This upper bound does not
     // inspect untrusted operation records or allocate decoder staging.
     if (!checkedAdd(operations,n/2/41,operations)) return false;
   }
-  operations=std::min(operations,std::min<std::size_t>(128,limits.maxOperations));
-  if (operations<bindings.size()) { error="Timeline scene family has no remaining operation budget"; return false; }
+  operations=std::max(operations,bindings.size());
   for (const auto& light : scene.lights) {
     if (!checkedAdd(environmentBytes,light.environmentImage.asset.contentSha256.capacity(),environmentBytes)
         || !checkedAdd(environmentBytes,light.environmentImage.asset.id.capacity(),environmentBytes)
@@ -235,9 +255,11 @@ inline bool deriveEnvelope(const Scene& scene,const std::vector<TimelineSceneBin
   std::size_t mesh=sizeof(GeometryData),attributes=0,field=sizeof(FieldData),replay=0,sources=0;
   std::size_t descriptorCopies=0,replayCopies=0,waterElements=0,dependencyElements=0;
   std::size_t childBytes=0,descriptorBytes=0,waterBytes=0;
-  const auto vertices=std::min<std::size_t>(Scene::kMaxVertices,limits.maxVertices);
-  const auto indices=std::min<std::size_t>(Scene::kMaxIndices,limits.maxIndices);
-  const auto elements=std::min(Scene::kMaxVertices,limits.maxFieldElements);
+  // Live scene lengths. A generator that outgrows them allocates what it needs
+  // when it runs, and a failed allocation reports itself there.
+  const auto vertices=scene.vertices.size();
+  const auto indices=scene.indices.size();
+  const auto elements=scene.vertices.size();
   const auto attributeCount=std::min(limits.maxAttributes,binary/22);
   if (!checkedAdd(childRecordBytes,sizeof(TimelineSceneBinding),childBytes)
       || !checkedMul(bindings.size(),2,descriptorCopies)
@@ -263,8 +285,8 @@ inline bool deriveEnvelope(const Scene& scene,const std::vector<TimelineSceneBin
       || !checkedAdd(mesh,sizeof(OperationRecord),waterBytes)) goto overflow;
   out={};
   out.entryCountChecks=13;
-  if (!checkedAdd(bindings.size(),Scene::kMaxLights,out.entryRecordVisits)
-      || !deriveSceneWork(bindings.size(),scene.textureTexels.size(),environmentBytes,
+  if (!checkedAdd(bindings.size(),scene.lights.size(),out.entryRecordVisits)
+      || !deriveSceneWork(scene,bindings.size(),scene.textureTexels.size(),environmentBytes,
           text,childRecordBytes,out)) goto overflow;
   out.retainedBytes=sceneBytes;
   if (!checkedAdd(out.retainedBytes,bindings.size(),out.retainedBytes)) goto overflow;
@@ -277,7 +299,7 @@ inline bool deriveEnvelope(const Scene& scene,const std::vector<TimelineSceneBin
   out.attemptBytes=out.retainedBytes;
   // Parser/lowered staging, descriptor clones, all retained replay maps, water
   // rest meshes/heights/operation copies and three complete candidate scenes.
-  if (!addArrayBytes(128,3*sizeof(std::size_t),out.attemptBytes)
+  if (!addArrayBytes(operations,3*sizeof(std::size_t),out.attemptBytes)
       || !addArrayBytes(3,sceneBytes,out.attemptBytes)
       || !addArrayBytes(4,binary,out.attemptBytes)
       || !addArrayBytes(replayCopies,replay,out.attemptBytes)
@@ -285,20 +307,23 @@ inline bool deriveEnvelope(const Scene& scene,const std::vector<TimelineSceneBin
       || !addArrayBytes(waterElements,sizeof(double)*2+sizeof(StableId),out.attemptBytes)
       || !addArrayBytes(dependencyElements,8*sizeof(StableId),out.attemptBytes)
       || !addArrayBytes(operations,16*sizeof(std::map<StableId,StableId>),out.attemptBytes)
-      || !checkedMul(text,8,out.decodeByteVisits)
-      || !checkedMul(operations,3,out.replayIterations)
-      || !checkedMul(operations,3,out.admissionReplayIterations)
-      || !checkedMul(dependencyElements,9,out.planPairVisits)
-      || !checkedMul(operations,elements,out.fieldElementVisits)
-      || !checkedMul(out.fieldElementVisits,8,out.fieldElementVisits)
-      || !checkedMul(operations,indices,out.normalIndexVisits)
-      || !checkedMul(out.normalIndexVisits,8,out.normalIndexVisits)
-      || !checkedMul(operations,vertices,out.waterSampleElements)) goto overflow;
+      || !visitMul(text,8,out.decodeByteVisits)
+      || !visitMul(operations,3,out.replayIterations)
+      || !visitMul(operations,3,out.admissionReplayIterations)
+      || !visitMul(dependencyElements,9,out.planPairVisits)
+      || !visitMul(operations,elements,out.fieldElementVisits)
+      || !visitMul(out.fieldElementVisits,8,out.fieldElementVisits)
+      || !visitMul(operations,indices,out.normalIndexVisits)
+      || !visitMul(out.normalIndexVisits,8,out.normalIndexVisits)
+      || !visitMul(operations,vertices,out.waterSampleElements)) goto overflow;
   if (out.attemptBytes>limits.maxBufferBytes) {
-    error="Timeline scene family exceeds its logical retained/attempt storage budget"; return false;
+    error="Timeline scene family needs "+std::to_string(out.attemptBytes)+" bytes and its caller allows "
+        +std::to_string(limits.maxBufferBytes); return false;
   }
   error.clear(); return true;
 overflow:
-  error="Timeline scene family storage or work envelope overflow"; return false;
+  error="Timeline scene family storage size overflows size_t: "+std::to_string(bindings.size())+" bindings, "
+      +std::to_string(operations)+" operations, "+std::to_string(scene.vertices.size())+" vertices, "
+      +std::to_string(scene.indices.size())+" indices"; return false;
 }
 } // namespace videohelper::geometry::timelinefamily

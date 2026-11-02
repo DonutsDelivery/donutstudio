@@ -83,39 +83,42 @@ void checkFixtureTextureUploads()
     MipLayout fox;
     check (mipLayout (1024, 1024, 9987, 16384, fox), "original Fox extent admits eleven mip levels");
     std::size_t bytes = 4;
-    check (accountBytes (fox, 1, kMaximumTextureBytes, bytes) && bytes == 5592408,
+    check (accountBytes (fox, 1, bytes) && bytes == 5592408,
            "GL charges every Fox mip and one white fallback");
     bytes = 4;
-    check (accountBytes (fox, 2, 11184812, bytes) && bytes == 11184812,
-           "Metal charges both Fox role copies and one white fallback at the exact budget");
+    check (accountBytes (fox, 2, bytes) && bytes == 11184812,
+           "Metal charges both Fox role copies and one white fallback");
     bytes = 4;
-    check (! accountBytes (fox, 2, 11184811, bytes) && bytes == 4
-               && ! accountBytes (fox, 0, kMaximumTextureBytes, bytes)
-               && ! accountBytes (fox, std::numeric_limits<std::size_t>::max(), kMaximumTextureBytes, bytes)
-               && ! accountBytes (fox, 1, 0, bytes)
-               && ! accountBytes (fox, 1, kMaximumTextureBytes + 1, bytes),
-           "invalid budgets and copy counts fail without changing allocation accounting");
+    check (! accountBytes (fox, 0, bytes)
+               && ! accountBytes (fox, std::numeric_limits<std::size_t>::max(), bytes)
+               && bytes == 4,
+           "invalid copy counts fail without changing allocation accounting");
+    bytes = std::numeric_limits<std::size_t>::max() - 1;
+    check (! accountBytes (fox, 1, bytes) && bytes == std::numeric_limits<std::size_t>::max() - 1,
+           "overflowing byte totals fail without changing allocation accounting");
     MipLayout importedFallback;
     check (mipLayout (2, 2, 9728, 16384, importedFallback), "imported material fallback has one level");
     bytes = 0;
-    check (accountBytes (importedFallback, 1, kMaximumTextureBytes, bytes) && bytes == 16,
+    check (accountBytes (importedFallback, 1, bytes) && bytes == 16,
            "an imported fallback replaces the white allocation without charging phantom texels");
     mipLayout (1024, 1024, 9728, 16384, importedFallback);
     bytes = 0;
-    check (accountBytes (importedFallback, 1, kMaximumTextureBytes, bytes)
-               && accountBytes (fox, 2, kMaximumTextureBytes, bytes) && bytes == 15379112,
+    check (accountBytes (importedFallback, 1, bytes)
+               && accountBytes (fox, 2, bytes) && bytes == 15379112,
            "both Fox role chains and an owned full-size imported fallback fit the retained budget");
     MipLayout rejected;
     check (! mipLayout (0, 1, 9987, 16384, rejected)
                && ! mipLayout (1, 0, 9987, 16384, rejected)
-               && ! mipLayout (1024, 1025, 9987, 16384, rejected)
                && ! mipLayout (1024, 1024, 9987, 512, rejected)
                && ! mipLayout (1, 1, 9987, 0, rejected)
-               && ! mipLayout (65536, 1, 9987, 65536, rejected)
                && ! mipLayout (UINT32_MAX, UINT32_MAX, 9987, UINT32_MAX, rejected)
                && ! mipLayout (1, 1, 9988, 16384, rejected)
                && rejected.levelCount == 0,
-           "zero, overflow, source-cap, device-cap, mip-count and filter violations are rejected");
+           "zero, overflow, device-cap and filter violations are rejected");
+    MipLayout uncapped;
+    check (mipLayout (1024, 1025, 9987, 16384, uncapped) && uncapped.levelCount == 11
+               && mipLayout (65536, 1, 9987, 65536, uncapped) && uncapped.levelCount == 17,
+           "only the device extent limits a source, and its whole mip chain is built");
 
     auto scene = std::make_unique<Visual3DScene>();
     scene->textureTexels = { SceneTexelRgba8 {}, {}, {}, {} };
@@ -125,34 +128,50 @@ void checkFixtureTextureUploads()
     scene->textures[1] = scene->textures[0];
     SceneMipLayouts layouts;
     bytes = 4;
-    check (sceneMipLayouts (*scene, 2, 16384, 84, bytes, layouts) && bytes == 84,
+    check (sceneMipLayouts (*scene, 2, 16384, bytes, layouts) && bytes == 84,
            "aliased texture records charge separate uploads while preserving shared source storage");
-    bytes = 4;
-    check (! sceneMipLayouts (*scene, 2, 16384, 83, bytes, layouts) && bytes == 4,
-           "whole-scene preflight fails atomically when the final copy exceeds budget");
+    check (layouts.size() == 2, "the mip layout list is sized from the scene's texture records");
     scene->textures[1].magFilter = 9987;
-    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+    check (! sceneMipLayouts (*scene, 1, 16384, bytes, layouts),
            "mipmap modes are invalid magnification filters");
     scene->textures[1].magFilter = 9729;
     scene->textures[1].wrapS = 0;
-    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+    check (! sceneMipLayouts (*scene, 1, 16384, bytes, layouts),
            "invalid horizontal wrapping is rejected before upload");
     scene->textures[1].wrapS = 10497;
     scene->textures[1].wrapT = 0;
-    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+    check (! sceneMipLayouts (*scene, 1, 16384, bytes, layouts),
            "invalid vertical wrapping is rejected before upload");
     scene->textures[1].wrapT = 10497;
     scene->textures[1].firstTexel = 1;
-    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+    check (! sceneMipLayouts (*scene, 1, 16384, bytes, layouts),
            "source range must fit the populated texels before upload");
     scene->textures[1].firstTexel = 0;
-    scene->textureTexelCount = kMaximumSourceTexels + 1;
-    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
-           "aggregate source storage cannot exceed one million RGBA8 texels");
     scene->textureTexelCount = 4;
-    scene->textureCount = Visual3DScene::kMaxTextures + 1;
-    check (! sceneMipLayouts (*scene, 1, 16384, kMaximumTextureBytes, bytes, layouts),
+    scene->textureCount = scene->textures.size() + 1;
+    check (! sceneMipLayouts (*scene, 1, 16384, bytes, layouts),
            "texture record count is checked before reading records");
+    {
+        // 40 textures and 1,048,577 source texels, past the former 16 and 1,048,576.
+        auto grown = std::make_unique<Visual3DScene>();
+        HarmonicMIDI::grid::Visual3DSceneCapacity capacity = HarmonicMIDI::grid::kVisual3DSceneDefaultCapacity;
+        capacity.textures = 40;
+        capacity.textureTexels = 1024u * 1024u + 1u;
+        check (allocateVisual3DSceneBuffers (*grown, capacity).allocated(), "the grown texture scene allocates");
+        grown->textureTexels.resize (capacity.textureTexels);
+        grown->textureTexelCount = capacity.textureTexels;
+        grown->textureCount = 40;
+        for (std::size_t index = 0; index < grown->textureCount; ++index)
+        {
+            grown->textures[index].width = grown->textures[index].height = 1;
+            grown->textures[index].firstTexel = static_cast<std::uint32_t> (index);
+        }
+        grown->textures[0].width = 1024;
+        grown->textures[0].height = 1024;
+        bytes = 0;
+        check (sceneMipLayouts (*grown, 1, 16384, bytes, layouts) && layouts.size() == 40,
+               "mip layouts grow with the scene past every former texture binding");
+    }
 
     const std::array<SceneTexelRgba8, 4> image {{
         { 0, 0, 0, 0 }, { 255, 255, 255, 255 }, { 255, 255, 255, 255 }, { 0, 0, 0, 0 }
@@ -312,10 +331,12 @@ ProgramDescription translucentEmissiveTextureSurfaceProgram (
     std::uint32_t materialId, float opacityValue)
 {
     auto program = tintedImportedTextureSurfaceProgram (materialId);
-    program.outputs[static_cast<std::size_t> (OutputSemantic::Opacity)]
-        = constant (program, ValueType::Scalar, { opacityValue, 0.0f, 0.0f, 0.0f });
-    program.outputs[static_cast<std::size_t> (OutputSemantic::Emission)]
-        = constant (program, ValueType::Vec3, { 0.2f, 0.4f, 0.6f, 0.0f });
+    // Admission refuses unreachable operations, so the existing constants take the values.
+    const auto literal = [&program] (OutputSemantic output) -> std::array<float, 4>& {
+        return program.operations[program.outputs[static_cast<std::size_t> (output)] - 1].literal;
+    };
+    literal (OutputSemantic::Opacity) = { opacityValue, 0.0f, 0.0f, 0.0f };
+    literal (OutputSemantic::Emission) = { 0.2f, 0.4f, 0.6f, 0.0f };
     return program;
 }
 
@@ -518,8 +539,8 @@ int main()
         texture.texels.pop_back();
         check(!texture.valid(), "native texture upload rejects truncated storage");
         texture.texels.resize(texture.texelCount);
-        texture.width = Visual3DScene::kMaxTextureDimension + 1;
-        check(!texture.valid(), "native texture upload rejects excessive dimensions");
+        texture.width = 1025;
+        check(!texture.valid(), "native texture upload rejects a width its texels do not fill");
         texture.width = 1024;
         ++texture.texelCount;
         check(!texture.valid(), "native texture upload rejects excessive declared texels");
@@ -1271,10 +1292,8 @@ int main()
         zeroSlopeMaterial.structuralDigest = admitted->structuralDigest();
     check (admitDiffractionMaterialBinding (
                diffractionScene, zeroSlopeMaterial,
-               videohelper::materialprogram::BackendTarget::Metal, error) == nullptr
-           && error
-                == "native diffraction surface rendering requires RMS slope at least 0.0001 for a finite angular lobe",
-           "the native surface slice rejects an unresolved delta lobe");
+               videohelper::materialprogram::BackendTarget::Metal, error) != nullptr,
+           "rmsSlope 0 is admitted as a delta lobe");
 
     auto coloredLightValue = diffractionSceneValue;
     coloredLightValue.lights[0].color = { 1.0f, 0.9f, 0.8f };
@@ -1291,6 +1310,33 @@ int main()
                coloredLightScene, environmentOnly,
                videohelper::materialprogram::BackendTarget::Metal, error) != nullptr,
            "environment-only spectral lighting is independent of unused RGB scene-light metadata");
+    // A bound HDRI leaves one Environment Light in the scene. It reaches the
+    // material through the environment paths, so only a dark direct path passes.
+    auto environmentLightValue = diffractionSceneValue;
+    environmentLightValue.lights[0].kind = SceneLightKind::Environment;
+    environmentLightValue.lightCount = 1;
+    auto environmentLightScene = std::make_shared<const Visual3DScene> (environmentLightValue);
+    auto environmentDirect = diffractionMaterial;
+    environmentDirect.version = diffractionmaterialbinding::kEnvironmentWireVersion;
+    check (admitDiffractionMaterialBinding (
+               environmentLightScene, environmentDirect,
+               videohelper::materialprogram::BackendTarget::Metal, error) == nullptr
+           && error == "spectral environment direct lighting requires one white Directional Light; set Direct Intensity to zero for environment-only rendering",
+           "an Environment Light cannot also feed the spectral direct path");
+    error.clear();
+    check (admitDiffractionMaterialBinding (
+               environmentLightScene, environmentOnly,
+               videohelper::materialprogram::BackendTarget::Metal, error) != nullptr
+           && error.empty(),
+           "an Environment Light with zero Direct Intensity is admitted");
+    auto whiteDirectionalValue = diffractionSceneValue;
+    whiteDirectionalValue.lights[0].kind = SceneLightKind::Directional;
+    whiteDirectionalValue.lightCount = 1;
+    auto whiteDirectionalScene = std::make_shared<const Visual3DScene> (whiteDirectionalValue);
+    check (admitDiffractionMaterialBinding (
+               whiteDirectionalScene, environmentDirect,
+               videohelper::materialprogram::BackendTarget::Metal, error) != nullptr,
+           "one white Directional Light keeps its spectral direct path");
     auto legacyEnvironment = environmentOnly;
     legacyEnvironment.version = diffractionmaterialbinding::kWireVersion;
     check (admitDiffractionMaterialBinding (

@@ -100,6 +100,9 @@ struct LayerDesc
     // An explicitly linear image output. Ordinary SDR composition converts a
     // GPU copy to sRGB; HDR capture keeps this original half-float frame.
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> nativeLinearImage;
+    // What that SDR conversion runs before the sRGB encode: None or AgX, from the
+    // Render node. HDR capture reads the original frame and never sees it.
+    colortransform::ToneMap nativeLinearViewTransform = colortransform::ToneMap::None;
     // Export borrows this exact scene frame before clip compositing. Preview never reads it back.
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> rawExportFrame;
     std::uint32_t rawExportMask = 0;
@@ -400,9 +403,11 @@ struct ImageLayerDesc
 // byte texture. Until other layer/effect authorities declare their working space,
 // combining them with this explicit representation must fail before drawing.
 inline std::optional<colortransform::AdmittedTransform> nativeLinearImageToSrgb(
-    colortransform::Extent extent, colortransform::AdmissionFailure& failure)
+    colortransform::Extent extent, colortransform::ToneMap viewTransform,
+    colortransform::AdmissionFailure& failure)
 {
     colortransform::Description description;
+    description.toneMap = viewTransform;
     description.input = {extent, colortransform::PixelFormat::RGBA16F, colortransform::ColorSpace::LinearSRGB,
         colortransform::TransferFunction::Linear, colortransform::AlphaMode::Straight};
     description.output = {extent, colortransform::PixelFormat::RGBA8, colortransform::ColorSpace::SRGB,
@@ -450,7 +455,7 @@ struct SdrNativeImageLayers
                 || (actual.backend == "metal" && source.texture != 0))
             { error = "Linear image layer does not match its retained native frame descriptor"; return false; }
             if (hdrCapture) return true;
-            auto display = convert(frame, error);
+            auto display = convert(frame, source.nativeLinearViewTransform, error);
             if (!display) return false;
             if (!arbitgpu::materialFrameIsSrgb(display) || display->width() != actual.width
                 || display->height() != actual.height || display->backend() != actual.backend
@@ -673,7 +678,8 @@ public:
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseDecodedHdrFrameForDisplay(
         const DecodedHdrFrame& frame, std::string& error);
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseLinearImageForDisplay(
-        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error);
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame,
+        colortransform::ToneMap viewTransform, std::string& error);
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseShaderFrame(
         const LayerDesc& layer, std::string& error);
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseTemporalFrame(
@@ -1067,7 +1073,7 @@ private:
                        uFogColor = -1; } layer_;
     struct DrawShapeProg { unsigned prog = 0; int uTransform = -1, uCrop = -1,
                            uRect = -1, uRectB = -1, uOperation = -1, uColor = -1,
-                          uGradient = -1, uColorB = -1; } drawShape_;
+                          uGradient = -1, uColorB = -1, uCanvasRect = -1; } drawShape_;
     struct BlendProg { unsigned prog = 0; int uTransform = -1, uCrop = -1, uFrontTex = -1, uBackTex = -1, uOpacity = -1, uBlendMode = -1; } blend_;
     struct PreviewProg { unsigned prog = 0; int uFinal = -1, uPreview = -1, uLayout = -1,
                          uBackground = -1, uZoom = -1, uPan = -1, uSplit = -1; } preview_;

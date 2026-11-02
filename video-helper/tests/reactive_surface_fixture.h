@@ -67,8 +67,8 @@ inline std::optional<surfacematerialfield::Binding> reactiveSurfaceField(std::ui
   if (!admitted) return std::nullopt;
   surfacematerialfield::Binding binding;
   binding.sample.materialNode=9799; binding.sample.target=target;
-  // Dispersion is clamped to the Cauchy B cap (0.02). The timeline amount is
-  // 0.1 at t=0 and 0.55 at t=3, so unit gain saturates both samples equal.
+  // The timeline amount is 0.1 at t=0 and 0.55 at t=3. This gain keeps the
+  // dispersion samples at the small Cauchy B values real glass has.
   binding.sample.gain=target==8 ? -1 : target==12 ? 0.01 : 1;
   binding.sample.fieldPlan=encodeLoweredPlanText(lowerRuntimePlan(contract,*admitted));
   if (!surfacematerialfield::valid(binding,error)) return std::nullopt;

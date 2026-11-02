@@ -37,6 +37,7 @@
 // cells by their exact solid angle and samples uniformly in solid angle.
 
 #include "vec_math.h"
+#include "devices/device_interface.h"
 #include "../../../shared/Visual3DScene.h"
 
 #include <array>
@@ -73,9 +74,81 @@ EnvironmentPixels copyEnvironmentPixels (std::uint32_t width, std::uint32_t heig
 Vec3 environmentImageTint (const HarmonicMIDI::grid::SceneLightRecord& record) noexcept;
 float environmentImageOrientationRadians (const HarmonicMIDI::grid::SceneLightRecord& record) noexcept;
 
-class EnvironmentMap
+// The read side of a built map: plain data over borrowed buffers, so the same
+// lookup and sampling code runs on a device once the buffers are uploaded. An
+// EnvironmentMap owns the buffers its view reads.
+class EnvironmentMapView
 {
 public:
+    PT_SHARED_FN bool active() const noexcept { return texels_.data != nullptr; }
+    PT_SHARED_FN std::uint32_t width() const noexcept { return width_; }
+    PT_SHARED_FN std::uint32_t height() const noexcept { return height_; }
+    PT_SHARED_FN Vec3 tint() const noexcept { return tint_; }
+    PT_SHARED_FN float orientationRadians() const noexcept { return orientation_; }
+
+    // Raster texture coordinates of a direction and the direction of (u, v).
+    // Both take the orientation into account.
+    PT_SHARED_ENTRY Vec2 directionToUv (Vec3 direction) const noexcept;
+    PT_SHARED_ENTRY Vec3 uvToDirection (Vec2 uv) const noexcept;
+
+    // Filtered, tinted radiance arriving from a direction. 0 when inactive.
+    PT_SHARED_ENTRY Vec3 radiance (Vec3 direction) const noexcept;
+    // Solid-angle density of sample() for a direction.
+    PT_SHARED_ENTRY float pdf (Vec3 direction) const noexcept;
+    // A unit direction drawn in proportion to the cell weights. pdfOut is the
+    // density of the chosen cell, 0 (with a zero direction) on failure.
+    PT_SHARED_ENTRY Vec3 sample (Vec2 u, float& pdfOut) const noexcept;
+
+    // Integral of the tinted radiance over the sphere, from the cell means.
+    PT_SHARED_FN Vec3 integratedRadiance() const noexcept { return integrated_; }
+    // Largest untinted texel value per channel.
+    PT_SHARED_FN Vec3 maximumTexel() const noexcept { return maximumTexel_; }
+    // Solid angle of one cell of row `row`.
+    PT_SHARED_ENTRY float cellSolidAngle (std::uint32_t row) const noexcept;
+
+#if ! defined(__CUDACC__)
+    // This view with each buffer replaced by what upload returns for it.
+    template <typename Upload>
+    EnvironmentMapView deviceCopy (Upload&& upload) const
+    {
+        EnvironmentMapView copy = *this;
+        copy.texels_ = upload (texels_);
+        copy.marginal_ = upload (marginal_);
+        copy.conditional_ = upload (conditional_);
+        copy.cellSolidAngle_ = upload (cellSolidAngle_);
+        copy.rowCos_ = upload (rowCos_);
+        return copy;
+    }
+#endif
+
+protected:
+    device::BufferView<std::array<float, 3>> texels_;
+    std::uint32_t width_ = 0;
+    std::uint32_t height_ = 0;
+    Vec3 tint_ {};
+    float orientation_ = 0.0f;
+    device::BufferView<float> marginal_;      // height + 1 entries, 0 to 1
+    device::BufferView<float> conditional_;   // height rows of width + 1 entries, 0 to 1
+    device::BufferView<float> cellSolidAngle_;
+    device::BufferView<double> rowCos_;       // cos(pi * row / height), height + 1 entries
+    Vec3 integrated_ {};
+    Vec3 maximumTexel_ {};
+
+private:
+    PT_SHARED_ENTRY Vec3 texel (std::uint32_t x, std::uint32_t y) const noexcept;
+    PT_SHARED_ENTRY std::uint32_t rowOf (Vec3 unitDirection) const noexcept;
+    PT_SHARED_ENTRY std::uint32_t columnOf (float u) const noexcept;
+};
+
+class EnvironmentMap : public EnvironmentMapView
+{
+public:
+    EnvironmentMap() = default;
+    EnvironmentMap (const EnvironmentMap& other);
+    EnvironmentMap (EnvironmentMap&& other) noexcept;
+    EnvironmentMap& operator= (const EnvironmentMap& other);
+    EnvironmentMap& operator= (EnvironmentMap&& other) noexcept;
+
     // Returns false and leaves the map inactive when the pixels are missing,
     // the tint or orientation is not finite, the tint is negative, a texel is
     // negative or not finite, or the tinted image is black. Keeps a reference
@@ -83,48 +156,15 @@ public:
     bool build (const EnvironmentPixels& pixels, Vec3 tint, float orientationRadians);
     void clear() noexcept;
 
-    bool active() const noexcept { return texels_ != nullptr; }
-    std::uint32_t width() const noexcept { return width_; }
-    std::uint32_t height() const noexcept { return height_; }
-    Vec3 tint() const noexcept { return tint_; }
-    float orientationRadians() const noexcept { return orientation_; }
-
-    // Raster texture coordinates of a direction and the direction of (u, v).
-    // Both take the orientation into account.
-    Vec2 directionToUv (Vec3 direction) const noexcept;
-    Vec3 uvToDirection (Vec2 uv) const noexcept;
-
-    // Filtered, tinted radiance arriving from a direction. 0 when inactive.
-    Vec3 radiance (Vec3 direction) const noexcept;
-    // Solid-angle density of sample() for a direction.
-    float pdf (Vec3 direction) const noexcept;
-    // A unit direction drawn in proportion to the cell weights. pdfOut is the
-    // density of the chosen cell, 0 (with a zero direction) on failure.
-    Vec3 sample (Vec2 u, float& pdfOut) const noexcept;
-
-    // Integral of the tinted radiance over the sphere, from the cell means.
-    Vec3 integratedRadiance() const noexcept { return integrated_; }
-    // Largest untinted texel value per channel.
-    Vec3 maximumTexel() const noexcept { return maximumTexel_; }
-    // Solid angle of one cell of row `row`.
-    float cellSolidAngle (std::uint32_t row) const noexcept;
-
 private:
-    Vec3 texel (std::uint32_t x, std::uint32_t y) const noexcept;
-    std::uint32_t rowOf (Vec3 unitDirection) const noexcept;
-    std::uint32_t columnOf (float u) const noexcept;
+    // Points the view at the buffers below. Runs after every change to them.
+    void refreshView() noexcept;
 
-    std::shared_ptr<const EnvironmentTexels> texels_;
-    std::uint32_t width_ = 0;
-    std::uint32_t height_ = 0;
-    Vec3 tint_ {};
-    float orientation_ = 0.0f;
-    std::vector<float> marginal_;      // height + 1 entries, 0 to 1
-    std::vector<float> conditional_;   // height rows of width + 1 entries, 0 to 1
-    std::vector<float> cellSolidAngle_;
-    std::vector<double> rowCos_;       // cos(pi * row / height), height + 1 entries
-    Vec3 integrated_ {};
-    Vec3 maximumTexel_ {};
+    std::shared_ptr<const EnvironmentTexels> ownedTexels_;
+    std::vector<float> ownedMarginal_;
+    std::vector<float> ownedConditional_;
+    std::vector<float> ownedCellSolidAngle_;
+    std::vector<double> ownedRowCos_;
 };
 
 } // namespace videohelper::pathtrace

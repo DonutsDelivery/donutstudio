@@ -250,6 +250,110 @@ public:
     arbitgpu::NativeDeformationRuntimeInputs lastRuntimeInputs;
 };
 
+// The rest pose comes from the joints' node transforms. The fixture's bind pose is
+// identity and these rest transforms are not, so an assumed bind pose would fail.
+void testRestPoseBake()
+{
+    Fixture fixture;
+    if (! fixture.source)
+        return;
+    const auto scene = [&fixture]
+    {
+        auto value = fixture.sceneValue;
+        value.vertices[1].normal = { 1.0f, 0.0f, 0.0f };
+        value.vertices[1].tangent = { 0.0f, 1.0f, 0.0f, 1.0f };
+        return value;
+    }();
+    const auto withScene = [&fixture] (const HarmonicMIDI::grid::Visual3DScene& value)
+    {
+        auto source = *fixture.source;
+        source.scene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (value);
+        return source;
+    };
+    const auto& first = scene.vertices[0].position;
+    const auto& second = scene.vertices[1].position;
+    std::string error;
+
+    auto moved = withScene (scene);
+    moved.jointBaseTransforms[0].translation = { 1.0f, 2.0f, 3.0f };
+    auto output = scene;
+    check (arbitgpu::bakeNativeRestPose (moved, output, error) && error.empty(),
+           "a rest pose away from bind pose bakes");
+    check (near (output.vertices[0].position.x, first.x + 0.5f + 1.0f)
+               && near (output.vertices[0].position.y, first.y + 2.0f)
+               && near (output.vertices[0].position.z, first.z + 3.0f),
+           "the bake adds the authored morph and then the joint's rest transform");
+    check (near (output.vertices[1].position.x, second.x + 1.0f)
+               && near (output.vertices[1].normal.x, 1.0f),
+           "a translated rest pose leaves an unmorphed vertex's normal alone");
+
+    // A quarter turn about z after scaling x by two, which only the cofactor
+    // transform turns into the right normal.
+    const float halfRoot = std::sqrt (0.5f);
+    auto turned = withScene (scene);
+    turned.jointBaseTransforms[0].rotation = { 0.0f, 0.0f, halfRoot, halfRoot };
+    turned.jointBaseTransforms[0].scale = { 2.0f, 1.0f, 1.0f };
+    output = scene;
+    check (arbitgpu::bakeNativeRestPose (turned, output, error), "a turned, scaled rest pose bakes");
+    check (near (output.vertices[0].position.x, -first.y, 1.0e-4f)
+               && near (output.vertices[0].position.y, 2.0f * (first.x + 0.5f), 1.0e-4f),
+           "the morph moves the vertex before the joint scales and turns it");
+    check (near (output.vertices[1].position.x, -second.y, 1.0e-4f)
+               && near (output.vertices[1].position.y, 2.0f * second.x, 1.0e-4f)
+               && near (output.vertices[1].position.z, second.z, 1.0e-4f),
+           "skinned positions follow the rest transform");
+    check (near (output.vertices[1].normal.x, 0.0f, 1.0e-4f) && near (output.vertices[1].normal.y, 1.0f, 1.0e-4f),
+           "skinned normals are unit length through the cofactors");
+    check (near (output.vertices[1].tangent[0], -1.0f, 1.0e-4f) && near (output.vertices[1].tangent[1], 0.0f, 1.0e-4f)
+               && near (output.vertices[1].tangent[3], 1.0f),
+           "skinned tangents follow the linear part and keep their handedness");
+
+    auto mirrored = withScene (scene);
+    mirrored.jointBaseTransforms[0].scale = { -1.0f, 1.0f, 1.0f };
+    output = scene;
+    check (arbitgpu::bakeNativeRestPose (mirrored, output, error)
+               && near (output.vertices[1].normal.x, -1.0f) && near (output.vertices[1].tangent[3], -1.0f),
+           "a mirrored rest pose flips the normal side and the tangent handedness");
+
+    // The drawn world of a baked vertex must be the joint's, whatever the object's
+    // parents do. World is parent * object: translate z 10 and scale 2 over translate y 1.
+    auto parented = scene;
+    const HarmonicMIDI::grid::SceneObjectId parentId { 9001 };
+    parented.objects.resize (parented.objectCount + 1);
+    parented.objects[parented.objectCount] = {};
+    parented.objects[parented.objectCount].id = parentId;
+    parented.objects[parented.objectCount].transform.translation = { 0.0f, 0.0f, 10.0f };
+    parented.objects[parented.objectCount].transform.scale = { 2.0f, 2.0f, 2.0f };
+    ++parented.objectCount;
+    parented.objects[0].parent = parentId;
+    parented.objects[0].transform.translation = { 0.0f, 1.0f, 0.0f };
+    auto child = withScene (parented);
+    child.jointBaseTransforms[0].translation = { 1.0f, 2.0f, 3.0f };
+    output = parented;
+    check (arbitgpu::bakeNativeRestPose (child, output, error), "an object with a parent bakes");
+    const auto& baked = output.vertices[1].position;
+    check (near (2.0f * baked.x, second.x + 1.0f, 1.0e-4f)
+               && near (2.0f * (baked.y + 1.0f), second.y + 2.0f, 1.0e-4f)
+               && near (2.0f * baked.z + 10.0f, second.z + 3.0f, 1.0e-4f),
+           "the bake cancels the object's whole parent chain");
+
+    auto cyclic = parented;
+    cyclic.objects[cyclic.objectCount - 1].parent = cyclic.objects[0].id;
+    output = cyclic;
+    check (! arbitgpu::bakeNativeRestPose (withScene (cyclic), output, error)
+               && error == "native rest pose object hierarchy has no inverse",
+           "a parent cycle refuses by name");
+
+    auto singular = withScene (scene);
+    std::array<float, 16> flat {};
+    flat[15] = 1.0f;
+    singular.jointBaseTransforms[0].matrix = flat;
+    output = scene;
+    check (! arbitgpu::bakeNativeRestPose (singular, output, error)
+               && error == "native rest pose weighted skin is singular or nonfinite",
+           "a singular blend refuses by name");
+}
+
 void testFramePreparation()
 {
     Fixture fixture;
@@ -1327,6 +1431,7 @@ int main()
         "published skin and morph storage must have immutable pointee ownership");
 
     testFramePreparation();
+    testRestPoseBake();
     testCompositionCapabilities();
     testMultiLeafComposition();
     testSharedPreviewExportRoute();

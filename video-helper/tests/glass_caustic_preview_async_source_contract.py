@@ -82,7 +82,10 @@ forbid_waiting_sync(counters, "late counter read")
 # The poll reads the fence status and nothing else that waits.
 poll = region(backend, "OpenGlPreviewCausticPoll pollPreviewCausticJobUnlocked(", "\n}\n", "caustic poll")
 require(poll, "loopstep::Scope pollScope(\"gl:caustic-submit-poll\");", "caustic poll")
-require(poll, "int signalled=0;syncStatus(job.fence,GL_SYNC_STATUS,1,nullptr,&signalled);", "caustic poll")
+# The declaration stays function-scoped so signalled outlives the timing scope
+# that names this status read; the read form itself is the invariant.
+require(poll, "int signalled=0;", "caustic poll")
+require(poll, "syncStatus(job.fence,GL_SYNC_STATUS,1,nullptr,&signalled);", "caustic poll")
 require(poll, "if(signalled!=GL_SIGNALED)", "caustic poll")
 require(poll, "readPreviewCausticCountersAfterFence(gl,syncStatus,job,overflow,gatherWork)", "caustic poll")
 require(poll, "if(usable&&current&&job.schedule==*current&&job.spectrum[0]&&job.spectrum[1])", "caustic poll")

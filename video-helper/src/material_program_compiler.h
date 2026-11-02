@@ -27,13 +27,16 @@ inline constexpr std::uint32_t kProgramRecordVersion
     = videowire::kMaterialProgramIrSchemaVersion;
 inline constexpr std::size_t kMaximumSurfaceInstructions
     = surfacematerial::kMaximumOperations;
-inline constexpr std::size_t kMaximumVertexInstructions = 512;
+// A result slot is 32 bits and its top value means invalid, so this is the most
+// a vertex program can address. It comes from the program format.
+inline constexpr std::size_t kMaximumVertexInstructions = videowire::kMaterialProgramInvalidValueSlot;
 inline constexpr std::size_t kMaximumCombinedInstructions
     = kMaximumSurfaceInstructions + kMaximumVertexInstructions;
 inline constexpr std::size_t kMaximumControlParameterSlots = 4096;
 inline constexpr std::size_t kMaximumAudioParameterSlots = 64;
-inline constexpr std::size_t kMaximumCanonicalPayloadBytes = 128 * 1024;
-inline constexpr std::uint16_t kInvalidValueSlot
+// The payload size is stored as 32 bits.
+inline constexpr std::size_t kMaximumCanonicalPayloadBytes = 0xffffffffu;
+inline constexpr std::uint32_t kInvalidValueSlot
     = videowire::kMaterialProgramInvalidValueSlot;
 
 using SurfaceInstruction = videowire::MaterialProgramSurfaceInstruction;
@@ -77,12 +80,10 @@ struct CompilerCapabilities final
     std::uint32_t vertexIrVersion = videowire::kVertexModifierIrSchemaVersion;
     std::uint64_t supportedSurfaceOperations = 0;
     std::uint64_t supportedVertexOperations = 0;
-    std::uint32_t maximumSurfaceInstructions
-        = static_cast<std::uint32_t>(kMaximumSurfaceInstructions);
+    std::uint64_t maximumSurfaceInstructions = kMaximumSurfaceInstructions;
     std::uint32_t maximumVertexInstructions
         = static_cast<std::uint32_t>(kMaximumVertexInstructions);
-    std::uint32_t maximumCombinedInstructions
-        = static_cast<std::uint32_t>(kMaximumCombinedInstructions);
+    std::uint64_t maximumCombinedInstructions = kMaximumCombinedInstructions;
     std::uint16_t maximumTextureSlots
         = static_cast<std::uint16_t>(surfacematerial::kMaximumTextureSlots);
     std::uint16_t maximumControlParameterSlots
@@ -115,8 +116,8 @@ struct ProgramResourceUsage final
     std::uint16_t controlParameterSlots = 0;
     std::uint16_t audioParameterSlots = 0;
     std::uint16_t surfaceOutputBindings = 0;
-    std::uint16_t surfaceMaximumDepth = 0;
-    std::uint16_t vertexMaximumDepth = 0;
+    std::uint32_t surfaceMaximumDepth = 0;
+    std::uint32_t vertexMaximumDepth = 0;
     std::uint32_t surfaceInputSemanticMask = 0;
     std::uint64_t usedSurfaceOperationMask = 0;
     std::uint64_t usedVertexOperationMask = 0;
@@ -142,7 +143,7 @@ public:
     {
         return program_.surfaceInstructions;
     }
-    const std::array<std::uint16_t, surfacematerial::kProgramOutputCount>&
+    const std::array<std::uint32_t, surfacematerial::kProgramOutputCount>&
     surfaceOutputSlots() const noexcept
     {
         return program_.surfaceOutputSlots;
@@ -151,7 +152,7 @@ public:
     {
         return program_.vertexInstructions;
     }
-    std::uint16_t vertexOutputSlot() const noexcept { return program_.vertexOutputSlot; }
+    std::uint32_t vertexOutputSlot() const noexcept { return program_.vertexOutputSlot; }
     surfacematerial::TransportMode transport() const noexcept { return program_.transport; }
     bool hasSurfaceProgram() const noexcept { return !program_.surfaceInstructions.empty(); }
     bool hasVertexProgram() const noexcept { return !program_.vertexInstructions.empty(); }
@@ -173,9 +174,9 @@ private:
         std::string sourceIdentity,
         std::string programIdentity,
         std::vector<SurfaceInstruction> surfaceInstructions,
-        std::array<std::uint16_t, surfacematerial::kProgramOutputCount> surfaceOutputSlots,
+        std::array<std::uint32_t, surfacematerial::kProgramOutputCount> surfaceOutputSlots,
         std::vector<VertexInstruction> vertexInstructions,
-        std::uint16_t vertexOutputSlot, surfacematerial::TransportMode transport)
+        std::uint32_t vertexOutputSlot, surfacematerial::TransportMode transport)
         : capabilities_(std::move(capabilities)), resources_(std::move(resources)),
           sourceIdentity_(std::move(sourceIdentity)),
           programIdentity_(std::move(programIdentity)),
@@ -416,9 +417,9 @@ inline void appendCapabilities(std::vector<std::uint8_t>& bytes,
     appendU32(bytes, capabilities.vertexIrVersion);
     appendU64(bytes, capabilities.supportedSurfaceOperations);
     appendU64(bytes, capabilities.supportedVertexOperations);
-    appendU32(bytes, capabilities.maximumSurfaceInstructions);
+    appendU64(bytes, capabilities.maximumSurfaceInstructions);
     appendU32(bytes, capabilities.maximumVertexInstructions);
-    appendU32(bytes, capabilities.maximumCombinedInstructions);
+    appendU64(bytes, capabilities.maximumCombinedInstructions);
     appendU16(bytes, capabilities.maximumTextureSlots);
     appendU16(bytes, capabilities.maximumControlParameterSlots);
     appendU16(bytes, capabilities.maximumAudioParameterSlots);
@@ -437,8 +438,8 @@ inline void appendResources(std::vector<std::uint8_t>& bytes,
     appendU16(bytes, resources.controlParameterSlots);
     appendU16(bytes, resources.audioParameterSlots);
     appendU16(bytes, resources.surfaceOutputBindings);
-    appendU16(bytes, resources.surfaceMaximumDepth);
-    appendU16(bytes, resources.vertexMaximumDepth);
+    appendU32(bytes, resources.surfaceMaximumDepth);
+    appendU32(bytes, resources.vertexMaximumDepth);
     appendU32(bytes, resources.surfaceInputSemanticMask);
     appendU64(bytes, resources.usedSurfaceOperationMask);
     appendU64(bytes, resources.usedVertexOperationMask);
@@ -451,9 +452,9 @@ inline std::vector<std::uint8_t> canonicalPayload(
     const ProgramResourceUsage& resources,
     const std::string& sourceIdentityValue,
     const std::vector<SurfaceInstruction>& surfaceInstructions,
-    const std::array<std::uint16_t, surfacematerial::kProgramOutputCount>& surfaceOutputs,
+    const std::array<std::uint32_t, surfacematerial::kProgramOutputCount>& surfaceOutputs,
     const std::vector<VertexInstruction>& vertexInstructions,
-    std::uint16_t vertexOutput)
+    std::uint32_t vertexOutput)
 {
     static constexpr char domain[] = "DonutStudio/MaterialProgramRecord/v1";
     std::vector<std::uint8_t> bytes(std::begin(domain), std::end(domain) - 1);
@@ -466,41 +467,41 @@ inline std::vector<std::uint8_t> canonicalPayload(
     {
         appendU8(bytes, static_cast<std::uint8_t>(
                             videowire::MaterialProgramStage::surfaceFragment));
-        appendU16(bytes, instruction.resultSlot);
+        appendU32(bytes, instruction.resultSlot);
         appendU8(bytes, static_cast<std::uint8_t>(instruction.operation));
         appendU8(bytes, static_cast<std::uint8_t>(instruction.resultType));
         appendU8(bytes, instruction.inputCount);
-        for (const auto input : instruction.inputs) appendU16(bytes, input);
+        for (const auto input : instruction.inputs) appendU32(bytes, input);
         for (const auto literal : instruction.literal) appendFloat(bytes, literal);
         appendU8(bytes, static_cast<std::uint8_t>(instruction.semantic));
         appendU16(bytes, instruction.parameter);
         appendU32(bytes, instruction.unsignedLiteral);
     }
     for (std::size_t index = 0; index < surfacematerial::outputCount(capabilities.surfaceIrVersion); ++index)
-        appendU16(bytes, surfaceOutputs[index]);
+        appendU32(bytes, surfaceOutputs[index]);
 
     appendU32(bytes, static_cast<std::uint32_t>(vertexInstructions.size()));
     for (const auto& instruction : vertexInstructions)
     {
         appendU8(bytes, static_cast<std::uint8_t>(
                             videowire::MaterialProgramStage::vertexModifier));
-        appendU16(bytes, instruction.resultSlot);
+        appendU32(bytes, instruction.resultSlot);
         appendU64(bytes, instruction.sourceStableId);
         appendU8(bytes, static_cast<std::uint8_t>(instruction.operation));
         appendU8(bytes, static_cast<std::uint8_t>(instruction.resultType));
         appendU8(bytes, instruction.inputCount);
-        for (const auto input : instruction.inputs) appendU16(bytes, input);
+        for (const auto input : instruction.inputs) appendU32(bytes, input);
         appendU8(bytes, instruction.parameterCount);
         for (const auto parameter : instruction.parameters) appendDouble(bytes, parameter);
     }
-    appendU16(bytes, vertexOutput);
+    appendU32(bytes, vertexOutput);
     return bytes;
 }
 
 inline bool compileSurface(
     const surfacematerial::AdmittedSurfaceMaterialIR& admitted,
     std::vector<SurfaceInstruction>& instructions,
-    std::array<std::uint16_t, surfacematerial::kProgramOutputCount>& outputs,
+    std::array<std::uint32_t, surfacematerial::kProgramOutputCount>& outputs,
     ProgramResourceUsage& resources,
     std::string& error)
 {
@@ -517,12 +518,12 @@ inline bool compileSurface(
         }
 
         SurfaceInstruction instruction;
-        instruction.resultSlot = static_cast<std::uint16_t>(index);
+        instruction.resultSlot = static_cast<std::uint32_t>(index);
         instruction.operation = source.kind;
         instruction.resultType = source.resultType;
         instruction.inputCount = source.inputCount;
         for (std::size_t input = 0; input < source.inputCount; ++input)
-            instruction.inputs[input] = static_cast<std::uint16_t>(source.inputs[input] - 1);
+            instruction.inputs[input] = source.inputs[input] - 1;
         instruction.literal = source.literal;
         for (auto& literal : instruction.literal)
             if (literal == 0.0f) literal = 0.0f;
@@ -557,12 +558,12 @@ inline bool compileSurface(
     }
 
     for (std::size_t index = 0; index < surfacematerial::outputCount(program.version); ++index)
-        outputs[index] = static_cast<std::uint16_t>(program.outputs[index] - 1);
+        outputs[index] = program.outputs[index] - 1;
     resources.surfaceInstructions = static_cast<std::uint32_t>(instructions.size());
     resources.textureSlots = program.textureSlotCount;
     resources.surfaceOutputBindings
         = static_cast<std::uint16_t>(surfacematerial::outputCount(program.version));
-    resources.surfaceMaximumDepth = static_cast<std::uint16_t>(admitted.maximumDepth());
+    resources.surfaceMaximumDepth = static_cast<std::uint32_t>(admitted.maximumDepth());
     resources.surfaceParameterBlockBytes
         = static_cast<std::uint32_t>(sizeof(surfacematerial::SurfacePbrParameterBlock));
     return true;
@@ -571,7 +572,7 @@ inline bool compileSurface(
 inline bool compileVertex(
     const vertexmodifier::AdmittedVertexModifierIr& admitted,
     std::vector<VertexInstruction>& instructions,
-    std::uint16_t& output,
+    std::uint32_t& output,
     ProgramResourceUsage& resources,
     std::string& error)
 {
@@ -595,7 +596,7 @@ inline bool compileVertex(
     for (std::size_t index = 0; index < records.size(); ++index)
         if (dependencies[index] == 0) ready.emplace(records[index].stableId, index);
 
-    std::vector<std::uint16_t> slots(records.size(), kInvalidValueSlot);
+    std::vector<std::uint32_t> slots(records.size(), kInvalidValueSlot);
     instructions.reserve(records.size());
     while (!ready.empty())
     {
@@ -610,7 +611,7 @@ inline bool compileVertex(
         }
 
         VertexInstruction instruction;
-        instruction.resultSlot = static_cast<std::uint16_t>(instructions.size());
+        instruction.resultSlot = static_cast<std::uint32_t>(instructions.size());
         instruction.sourceStableId = source.stableId;
         instruction.operation = source.operation;
         instruction.resultType = source.resultType;
@@ -656,7 +657,7 @@ inline bool compileVertex(
     }
     output = slots[sourceIndices.at(admitted.rootId())];
     resources.vertexInstructions = static_cast<std::uint32_t>(instructions.size());
-    resources.vertexMaximumDepth = static_cast<std::uint16_t>(admitted.maximumDepth());
+    resources.vertexMaximumDepth = static_cast<std::uint32_t>(admitted.maximumDepth());
     resources.maximumVertexDisplacement = admitted.maximumDisplacement();
     return true;
 }
@@ -710,10 +711,10 @@ inline std::optional<MaterialProgramRecord> compileMaterialProgram(
     if (surface) capabilities.surfaceIrVersion = surface->program().version;
     ProgramResourceUsage resources;
     std::vector<SurfaceInstruction> surfaceInstructions;
-    std::array<std::uint16_t, surfacematerial::kProgramOutputCount> surfaceOutputs;
+    std::array<std::uint32_t, surfacematerial::kProgramOutputCount> surfaceOutputs;
     surfaceOutputs.fill(kInvalidValueSlot);
     std::vector<VertexInstruction> vertexInstructions;
-    std::uint16_t vertexOutput = kInvalidValueSlot;
+    std::uint32_t vertexOutput = kInvalidValueSlot;
 
     if (surface != nullptr
         && !detail::compileSurface(*surface, surfaceInstructions, surfaceOutputs,

@@ -412,7 +412,7 @@ RenderResult render (const Visual3DScene& scene,
         for (std::size_t channel = 0; channel < kBackground.size(); ++channel)
             result.rgba[pixel * 4 + channel] = kBackground[channel];
 
-    std::array<ProjectedVertex, Visual3DScene::kMaxVertices> projected {};
+    std::vector<ProjectedVertex> projected (scene.vertices.size());
     for (std::size_t objectIndex = 0; objectIndex < scene.objectCount; ++objectIndex)
     {
         const auto& object = scene.objects[objectIndex];

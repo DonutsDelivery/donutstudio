@@ -2,8 +2,59 @@
 
 #include <algorithm>
 
+#if defined(__SSE2__) || defined(_M_X64)
+#define PT_TILE_FLUSHES_DENORMALS 1
+#include <xmmintrin.h>
+#endif
+
 namespace videohelper::pathtrace
 {
+
+namespace
+{
+// The pool and threadIndex of the tile running on this thread.
+thread_local const ThreadPool* tilePool = nullptr;
+thread_local unsigned tileThreadIndex = 0;
+
+// A tile flushes denormals to zero. Float order powers underflow on a crossed grating, and
+// x86 takes a slow path for each one: the stock orb on CPU went from 5.85 to 16.7 s/sample.
+// A caller keeps its own mode afterwards, as it may go on to audio or encoding work.
+#if PT_TILE_FLUSHES_DENORMALS
+class DenormalFlush
+{
+public:
+    DenormalFlush() noexcept : previous (_mm_getcsr()) { _mm_setcsr (previous | kFlushToZero | kDenormalsAreZero); }
+    ~DenormalFlush() { _mm_setcsr (previous); }
+
+private:
+    static constexpr unsigned kFlushToZero = 0x8000, kDenormalsAreZero = 0x0040;
+    const unsigned previous;
+};
+#else
+struct DenormalFlush {};
+#endif
+
+struct TileScope
+{
+    TileScope (const ThreadPool* pool, unsigned threadIndex) noexcept
+        : previousPool (tilePool), previousIndex (tileThreadIndex)
+    {
+        tilePool = pool;
+        tileThreadIndex = threadIndex;
+    }
+    ~TileScope()
+    {
+        tilePool = previousPool;
+        tileThreadIndex = previousIndex;
+    }
+    TileScope (const TileScope&) = delete;
+    TileScope& operator= (const TileScope&) = delete;
+
+    const ThreadPool* previousPool;
+    unsigned previousIndex;
+    const DenormalFlush flush;
+};
+} // namespace
 
 Tile TileGrid::tile (std::uint32_t index) const noexcept
 {
@@ -39,85 +90,131 @@ ThreadPool::~ThreadPool()
         worker.join();
 }
 
-void ThreadPool::drain (Pass& pass, unsigned threadIndex)
+ThreadPool::Pass* ThreadPool::claimFromAnyPass()
 {
-    const std::uint32_t count = pass.grid->tileCount();
-    for (;;)
+    for (std::size_t offset = 0; offset < passes_.size(); ++offset)
     {
-        if (pass.cancel->isCancelled() || pass.failed.load (std::memory_order_acquire))
-            return;
-        const std::uint32_t index = pass.nextTile.fetch_add (1, std::memory_order_relaxed);
-        if (index >= count)
-            return;
-        try
+        const std::size_t index = (nextPass_ + offset) % passes_.size();
+        if (passes_[index]->claimable())
         {
-            (*pass.fn) (pass.grid->tile (index), threadIndex);
-            pass.completed.fetch_add (1, std::memory_order_relaxed);
-        }
-        catch (...)
-        {
-            std::lock_guard<std::mutex> lock (pass.errorMutex);
-            if (! pass.error)
-                pass.error = std::current_exception();
-            pass.failed.store (true, std::memory_order_release);
-            return;
+            nextPass_ = index + 1;
+            return passes_[index];
         }
     }
+    return nullptr;
+}
+
+// Called with mutex_ held, returns with it held, and releases it around fn.
+void ThreadPool::runClaimedTile (Pass& pass, std::uint32_t tileIndex, unsigned threadIndex)
+{
+    std::exception_ptr error;
+    mutex_.unlock();
+    try
+    {
+        const TileScope scope (this, threadIndex);
+        (*pass.fn) (pass.grid->tile (tileIndex), threadIndex);
+    }
+    catch (...)
+    {
+        error = std::current_exception();
+    }
+    mutex_.lock();
+    if (error)
+    {
+        if (! pass.error)
+            pass.error = error;
+        pass.failed = true;
+    }
+    else
+    {
+        ++pass.completed;
+    }
+    --pass.running;
+    // A waiting caller's pass may have been cancelled, so every tile wakes them.
+    progress_.notify_all();
 }
 
 void ThreadPool::workerLoop (unsigned threadIndex)
 {
-    std::uint64_t seenGeneration = 0;
+    std::unique_lock<std::mutex> lock (mutex_);
     for (;;)
     {
-        Pass* pass = nullptr;
+        if (stopping_)
+            return;
+        Pass* pass = claimFromAnyPass();
+        if (pass == nullptr)
         {
-            std::unique_lock<std::mutex> lock (mutex_);
-            wake_.wait (lock, [&] { return stopping_ || passGeneration_ != seenGeneration; });
-            if (stopping_)
-                return;
-            seenGeneration = passGeneration_;
-            pass = pass_;
+            wake_.wait (lock);
+            continue;
         }
-        drain (*pass, threadIndex);
-        {
-            std::lock_guard<std::mutex> lock (mutex_);
-            if (--busyWorkers_ == 0)
-                done_.notify_all();
-        }
+        const std::uint32_t tileIndex = pass->nextTile++;
+        ++pass->running;
+        runClaimedTile (*pass, tileIndex, threadIndex);
     }
+}
+
+TilePassResult ThreadPool::runNested (const TileGrid& grid, const CancellationToken& cancel, const TileFunction& fn)
+{
+    TilePassResult result;
+    result.tileCount = grid.tileCount();
+    for (std::uint32_t index = 0; index < result.tileCount && ! cancel.isCancelled(); ++index)
+    {
+        fn (grid.tile (index), tileThreadIndex);
+        ++result.tilesCompleted;
+    }
+    result.cancelled = result.tilesCompleted < result.tileCount;
+    return result;
 }
 
 TilePassResult ThreadPool::runTiles (const TileGrid& grid, const CancellationToken& cancel, const TileFunction& fn)
 {
-    std::lock_guard<std::mutex> submit (submitMutex_);
+    if (tilePool == this)
+        return runNested (grid, cancel, fn);
+
     Pass pass;
     pass.grid = &grid;
     pass.cancel = &cancel;
     pass.fn = &fn;
-    {
-        // Every worker joins every pass, even an empty one, so busyWorkers_
-        // counts exactly the threads that still hold a pointer to pass.
-        std::lock_guard<std::mutex> lock (mutex_);
-        pass_ = &pass;
-        ++passGeneration_;
-        busyWorkers_ = static_cast<unsigned> (workers_.size());
-    }
+    pass.tileCount = grid.tileCount();
+
+    std::unique_lock<std::mutex> lock (mutex_);
+    passes_.push_back (&pass);
     wake_.notify_all();
-    drain (pass, 0);
+    for (;;)
     {
-        std::unique_lock<std::mutex> lock (mutex_);
-        done_.wait (lock, [&] { return busyWorkers_ == 0; });
-        pass_ = nullptr;
+        if (pass.claimable() && ! callerSeatTaken_)
+        {
+            callerSeatTaken_ = true;
+            while (pass.claimable())
+            {
+                const std::uint32_t tileIndex = pass.nextTile++;
+                ++pass.running;
+                runClaimedTile (pass, tileIndex, 0);
+            }
+            callerSeatTaken_ = false;
+            progress_.notify_all();
+        }
+        if (! pass.claimable() && pass.running == 0)
+            break;
+        progress_.wait (lock);
     }
+    passes_.erase (std::find (passes_.begin(), passes_.end(), &pass));
 
     TilePassResult result;
-    result.tileCount = grid.tileCount();
-    result.tilesCompleted = pass.completed.load (std::memory_order_relaxed);
+    result.tileCount = pass.tileCount;
+    result.tilesCompleted = pass.completed;
     result.cancelled = result.tilesCompleted < result.tileCount && cancel.isCancelled();
+    lock.unlock();
     if (pass.error)
         std::rethrow_exception (pass.error);
     return result;
+}
+
+ThreadPool& sharedThreadPool()
+{
+    // Never destroyed: a render thread can still be inside a pass at exit.
+    static ThreadPool* const pool = new ThreadPool();
+    return *pool;
 }
 
 } // namespace videohelper::pathtrace

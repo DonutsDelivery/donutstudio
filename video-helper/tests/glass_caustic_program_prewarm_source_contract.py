@@ -169,8 +169,12 @@ if refusal_at < 0 or start_at < 0 or refusal_at > start_at:
 require(renderer, "causticRoughQuery = selectedMaterial->parameters.emissionRoughness[3] > 0.0f;\n        if (causticRoughQuery)\n            multipleScatterPolicy.emplace();", "renderer")
 
 # Kernel splat programs are part of the prewarmed set, so the async compile and the
-# disk binary cache cover them like the trace, sort and reduce programs.
-require(backend, "constexpr std::size_t kCausticProgramCount = 10;", "caustic program set")
+# disk binary cache cover them like the trace, sort and reduce programs. The early
+# spectrum clear dispatch rides the same set so its compile stays in this pipeline
+# and never in the render that consumes it.
+require(backend, "constexpr std::size_t kCausticProgramCount = 11;", "caustic program set")
+require(backend, "constexpr std::size_t kCausticSpectrumClearProgram = 10;", "caustic program set")
+require(backend, "sources[kCausticSpectrumClearProgram] = {{GL_COMPUTE_SHADER,openGlCausticSpectrumClearSource()}};", "caustic program set")
 for needle in ("sources[kCausticSplatNormaliserProgram] = {{GL_COMPUTE_SHADER,gc::opengl::splatNormaliserSource()}};",
                "sources[kCausticSplatKeyProgram] = {{GL_COMPUTE_SHADER,gc::opengl::splatKeySource()}};",
                "sources[kCausticSplatSegmentProgram] = {{GL_COMPUTE_SHADER,gc::opengl::splatSegmentSource()}};",
@@ -373,7 +377,17 @@ for needle in ("if(use!=OpenGlCausticRenderUse::Preview)return plan;",
     require(plan, needle, "caustic render plan")
 require(header, "bool hostReceipt=true,stageFences=true,bandFences=true,reuseSpectrum=false;", "caustic render plan")
 require(header, "OpenGlCausticRenderUse use=OpenGlCausticRenderUse::Export,", "caustic render declaration")
-require(render, "const auto plan=openGlCausticRenderPlan(use,width,height);", "caustic render")
+require(render, "const auto plan=openGlCausticRenderPlan(use,width,height,previewExportBudgets);", "caustic render")
+# Tier K S2: an Accurate Preview (previewbudget::exportBudgets) keeps the export schedule and
+# never degrades; only a Fast Preview takes the coarser schedule, the ladder and the GL-limit
+# reduction. Both keep every Preview wait and readback rule.
+require(render, "const bool previewExportBudgets=preview&&previewbudget::exportBudgets();", "caustic render")
+require(render, "const bool previewDegrades=preview&&!previewExportBudgets;", "caustic render")
+require(plan, "if(!exportSchedule)plan.scheduling.entrySubdivisions=kPreviewCausticEntrySubdivisions;", "caustic render plan")
+require(render, "std::string previewBudgetReason;\n    if(previewDegrades)\n    {\n        const auto level=openGlPreviewCausticBudgetLevel(previewBudgetReason);", "caustic budget ladder")
+require(render, "job.splat=splat;job.exportBudgets=previewExportBudgets;", "caustic budget ladder")
+if backend.count("observeOpenGlPreviewCausticBudget(") != 2 or backend.count("!job.exportBudgets") != 2:
+    errors.append("only Fast Preview caustic submissions may step the budget ladder")
 require(render, "const bool trySplat=!preview||openGlCausticPreviewSplatAllowed(scheduled);", "caustic render")
 stage = region(render, "const auto stageDone=[&](bool band) {", "};", "caustic stage sync")
 require(stage, "if(plan.stageFences||(band&&plan.bandFences))return causticFence(gl,result.error);", "caustic stage sync")
@@ -427,7 +441,7 @@ require(render, "if(slowLog)\n        std::fprintf(stderr,", "caustic timing log
 require(render, "resources->previewSpectrumKey.reset();\n        if(std::string resetError;causticContextIntact(resetError))", "caustic fail drops reuse")
 require(render, "resources->previewSpectrumBuffers={};", "caustic fail drops reuse")
 # A Preview caller must pass the Preview plan's schedule.
-require(render, "const auto expected=openGlCausticRenderPlan(use,width,height).scheduling;", "preview schedule check")
+require(render, "const auto expected=openGlCausticRenderPlan(use,width,height,previewbudget::exportBudgets()).scheduling;", "preview schedule check")
 require(render, "scheduling.entrySubdivisions!=expected.entrySubdivisions", "preview schedule check")
 require(render, '"[gl] caustic preview %ux%u %.1f ms: cpu base', "caustic timing log")
 
@@ -452,23 +466,25 @@ forbid(render, "exceeds native bindings, buffer or dispatch limits", "caustic re
 forbid(render, "(max SSBO \"", "caustic render")
 require(header, '"%.1f MiB"', "caustic limit failure")
 require(header, '"splat needs 8 storage bindings, max "+count(limits.storageBindings);', "caustic splat limit failure")
-for needle in ("if(preview)\n        {\n            const auto planned=openGlCausticStorageDemand(scheduled,scheduled.bounds.deposition.paddedKeyCount);",
+for needle in ("if(previewDegrades)\n        {\n            const auto planned=openGlCausticStorageDemand(scheduled,scheduled.bounds.deposition.paddedKeyCount);",
                "if(decision.admission!=OpenGlCausticAdmission::Reduced)return renderWithoutCaustic(decision.reason);",
                "scheduled=std::move(reducedFrame);reducedReason=decision.reason;",
-               "if(preview&&!failure.empty()) {cameraRoughSchedule.reset();return renderWithoutCaustic(",
-               '} else refused.error="OpenGL caustic admitted storage exceeds native GL limits: "+failure;',
-               'refused.error="OpenGL caustic splat storage exceeds native GL limits: "+failure;return refused;',
-               'if(preview&&limit)return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");',
-               'if(preview)return renderWithoutCaustic("caustic off: GL storage limit query unavailable");',
+               "if(previewDegrades&&!failure.empty()) {cameraRoughSchedule.reset();return renderWithoutCaustic(",
+               'return refuseLimit("OpenGL caustic admitted storage exceeds native GL limits: "+failure);',
+               'return refuseLimit("OpenGL caustic splat storage exceeds native GL limits: "+failure);',
+               "if(!previewExportBudgets){refused.error=std::move(message);return refused;}",
+               'if(previewDegrades&&limit)return renderWithoutCaustic("caustic off: exceeds GL limits ("+failure+")");',
+               'if(previewDegrades)return renderWithoutCaustic("caustic off: GL storage limit query unavailable");',
                "const auto failure=openGlCausticLimitFailure(limits,openGlCausticStorageDemand(scheduled,deposition.paddedKeyCount));\n        if(failure.empty())return refused;",
                "const auto failure=openGlCausticSplatLimitFailure(limits,{splatLayout.words,keyCount,",
                "if(base.rendered&&degradation)*degradation=std::move(reason);",
                "if(!reducedReason.empty()) {reportOpenGlCausticDegradation(reducedReason);if(degradation)*degradation=std::move(reducedReason);}"):
     require(render, needle, "caustic limit degrade")
-# Every degrade is Preview only.
+# Every degrade is Fast Preview only: an Accurate Preview refuses like its export.
 for line in render.splitlines():
-    if "return renderWithoutCaustic(" in line and "preview" not in line and "decision.admission" not in line:
-        errors.append("caustic render degrades outside a Preview branch: " + line.strip())
+    if ("return renderWithoutCaustic(" in line and "previewDegrades" not in line
+            and "decision.admission" not in line and "previewBudgetReason" not in line):
+        errors.append("caustic render degrades outside a Fast Preview branch: " + line.strip())
 without = region(render, "const auto renderWithoutCaustic=[&](std::string reason) {", "\n    };", "caustic degrade render")
 for needle in ("reportOpenGlCausticDegradation(reason);", "baseRuntime.linearColor=true;",
                "baseRuntime.imageOutput=renderpassoutput::Output::Color;",
@@ -496,11 +512,34 @@ for needle in ("int walks=sharedPaths?1:3,visits=sharedPaths?48:16;", "bool shar
 forbid(recipe, "GLASS_PREVIEW", "export transport text")
 budget = region(smooth, "inline CameraWalkBudget cameraWalkBudget(", "inline std::string previewCameraTransportShader(", "walk budget")
 require(budget, "if (!preview) return budget;", "walk budget")
+# Only the Preview rewrite ends a branch still inside the volume on the environment.
+# The export text keeps it absorbed and counted as truncated.
+require(recipe, "    return inside?vec3(0.0):weight*glassEnvironment(direction GX_PASS);", "export transport text")
+forbid(recipe, "    return weight*glassEnvironment(direction GX_PASS);", "export transport text")
+rewrite = region(smooth, "inline std::string previewCameraTransportShader(", "\n}\n", "preview rewrite")
+require(rewrite, "{\"    return inside?vec3(0.0):weight*glassEnvironment(direction GX_PASS);\\n\",\n         \"    return weight*glassEnvironment(direction GX_PASS);\\n\"},",
+        "preview rewrite")
+require(rewrite, "for (std::size_t edit = paired ? 0 : 5; edit < std::size(edits); ++edit)", "preview rewrite")
+# Preview sizes the walk arrays to the slots its visit cap can fill. Export keeps 16.
+for needle in ("int seams[GLASS_PREVIEW_PENDING];", "int seams[GLASS_PREVIEW_PAIR_PENDING];",
+               "\"if(pending>=GLASS_PREVIEW_PENDING) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}\", 2}",
+               "if(pending>=GLASS_PREVIEW_PAIR_PENDING) {", "for(int slot=1;slot<GLASS_PREVIEW_PAIR_PENDING;++slot)",
+               "+ \"\\n#define GLASS_PREVIEW_PENDING \" + std::to_string(previewPendingSlots(1, visits))",
+               "+ \"\\n#define GLASS_PREVIEW_PAIR_PENDING \" + std::to_string(previewPendingSlots(2, visits))"):
+    require(rewrite, needle, "preview rewrite")
+require(smooth, "return std::min<std::uint32_t>(kPendingBranchSlots, seeds + visits);", "preview slots")
+# Preview hands BVH children back by value instead of copying the stack through an inout array.
+query_rewrite = region(smooth, "inline std::string previewQueryShader(", "\n}\n", "preview query rewrite")
+for needle in ("out int pushFirst,out int pushSecond ST_ARGS", "if(pushed>0) nodes[pending++]=pushFirst;",
+               "if(pushed>1) meshNodes[meshPending++]=pushSecond;"):
+    require(query_rewrite, needle, "preview query rewrite")
 require(smooth, "std::uint32_t pairVisits = 48, dispersivePairVisits = 16, singleVisits = 64, singleChannelWalks = 3;", "walk budget")
 require(smooth, "inline constexpr std::uint64_t kPreviewUnfencedGlassPixels = 2560ull*1440ull;", "walk budget")
 fragment = region(backend, "std::string fixtureFragmentShaderSource (unsigned features)", "void readFixtureUniformLocations (", "fragment source")
 require(fragment, "if ((features & kFixtureFragmentGlassPreview) != 0)", "fragment source")
-require(fragment, "transport = smoothglass::previewCameraTransportShader (std::move (transport));", "fragment source")
+require(fragment, "transport = smoothglass::previewCameraTransportShader (std::move (transport), fastPreviewGlassVisits());", "fragment source")
+require(fragment, "query = smoothglass::previewQueryShader (std::move (query));", "fragment source")
+require(fragment, "if (query.empty() || transport.empty()) return {};", "fragment source")
 if backend.count("kFixtureFragmentGlassPreview") != 3:
     errors.append("kFixtureFragmentGlassPreview must appear only in the enum, the fragment source and the variant build")
 variant = region(backend, "const OpenGlFixtureSceneResources::SharedProgram* advancePreviewGlassProgram (", "\n}\n", "preview variant")
@@ -513,7 +552,10 @@ for needle in ("gl.CompileShader", "gl.LinkProgram", "glFinish"):
 if variant.find("finishFixtureProgram (entry)") < variant.find("if (linked != GL_TRUE) return nullptr;"):
     errors.append("the preview variant reads its link status only after the completion poll")
 draw = region(backend, "const bool previewGlassFrame = runtimeInputs.previewUse && resources->smoothGlass.enabled", "result.rendered = true;", "scene draw")
-for needle in ("&& !roughGlassFrame && !diffractionFrame;", "const unsigned sceneProgram = previewGlassProgram ? previewGlassProgram->previewId : resources->program;",
+for needle in ("&& !roughGlassFrame && !diffractionFrame;",
+               "const bool previewGlassWalk = previewGlassFrame && !previewbudget::exportBudgets();",
+               "const auto* previewGlassProgram = previewGlassWalk\n            ? advancePreviewGlassProgram (gl, resources->sharedProgram.get()) : nullptr;",
+               "const unsigned sceneProgram = previewGlassProgram ? previewGlassProgram->previewId : resources->program;",
                "gl.UseProgram (sceneProgram);",
                "const bool bandFinish = smoothglass::cameraWalkBudget(runtimeInputs.previewUse, width, height).bandFinish;",
                "                if (bandFinish)\n                {\n                    loopstep::Scope bandFinishScope (\"gl:closed-glass-band-finish\");\n                    glFinish();\n                }\n                else glFlush();",

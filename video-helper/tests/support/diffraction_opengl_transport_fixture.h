@@ -340,10 +340,7 @@ inline bool verify(arbitgpu::NativeFixtureSceneBackend& backend,std::string& err
     auto valid=scene(true);if(!publishPhysics(valid,error))return false;
     const auto prepared=backend.prepare(valid.scene,std::make_shared<const arbitgpu::NativeFixtureSurfaceMaterialProgram>(valid.program));
     if(!prepared.prepared)return refuse("OpenGL authored spectral budget fixture did not prepare");
-    if(backend.render(valid.scene,prepared.resources,4096,4096).rendered)
-        return refuse("OpenGL authored spectral frame exceeded bounded lobe/query work");
-    // A smaller exact triangle table admits 4K without allocating a 4K GPU
-    // target here. The conservative default-32 estimate must not gate v3.
+    // An exact triangle table admits 4K without allocating a 4K GPU target here.
     auto small=scene(true);if(!publishPhysics(small,error))return false;
     for(std::size_t o=0;o<small.scene->objectCount;++o)small.scene->objects[o].indexCount=3;
     arbitgpu::diffractiontransportnative::Prepared smallPrepared;
@@ -351,8 +348,8 @@ inline bool verify(arbitgpu::NativeFixtureSceneBackend& backend,std::string& err
     if(!arbitgpu::diffractiontransportnative::prepareScene(*small.scene,small.program,small.program.sceneRevision,smallPrepared,error)
         || !arbitgpu::diffractiontransportnative::buildFrame(smallPrepared,nativeInstances(small),4096,4096,smallFrame,error))return false;
     if(smallFrame.sampleControl[0]!=4 || smallFrame.sampleControl[1]!=4
-        || arbitgpu::nativeFixtureDiffractionWorkWithinBudget(small.program,4096,4096))
-        return refuse("OpenGL actual-count 4K budget fixture lost its default-count boundary");
+        || !arbitgpu::nativeFixtureDiffractionWorkWithinBudget(small.program,4096,4096,4))
+        return refuse("OpenGL actual-count 4K frame lost its real sample counts");
     std::vector<float> aov;if(!nativePixels(backend,valid,aov,error,renderpassoutput::Output::Normal))return false;
     error.clear();return true;
 }

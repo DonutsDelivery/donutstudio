@@ -89,7 +89,6 @@ constexpr double kPi = 3.1415926535897932384626433832795;
 constexpr double kDirectionTolerance = 1.0e-9;
 constexpr double kGrazingCosine = 1.0e-8;
 constexpr double kGrazingCosineSquared = kGrazingCosine * kGrazingCosine;
-constexpr double kMaximumSpectralRadiance = 16.0;
 constexpr double kEnergyTolerance = 2.0e-10;
 
 
@@ -188,7 +187,7 @@ bool validInput(const EvaluationInput& input, std::size_t sampleCount,
     for (std::size_t index = 0; index < sampleCount; ++index)
     {
         const auto value = input.incidentSpectrum[index];
-        if (!finite(value) || value < 0.0 || value > kMaximumSpectralRadiance)
+        if (!finite(value) || value < 0.0)
         {
             failure = EvaluationFailure::InvalidSpectrum;
             return false;

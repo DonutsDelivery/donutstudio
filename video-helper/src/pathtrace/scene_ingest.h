@@ -15,6 +15,7 @@
 // - The camera uses its translation and rotation only (no parent, no scale)
 //   and looks down local -Z with +Y up.
 
+#include "devices/device_annotations.h"
 #include "vec_math.h"
 #include "bvh.h"
 #include "../../../shared/Visual3DScene.h"
@@ -22,6 +23,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace videohelper::pathtrace
@@ -40,11 +42,18 @@ struct TriangleAttributes
     std::uint32_t primitiveIndex = 0;           // triangle number within the object's index range
     bool mirrored = false;                      // world determinant < 0; vertices 1 and 2 swapped
     bool hasShadingNormals = false;             // false: shadingNormals repeat geometricNormal
+    bool authoredShading = false;               // Shade Mesh normals: curved shadow origins, no side rejection
     Vec3 geometricNormal {};                    // unit, front face by counter-clockwise winding
     std::array<Vec3, 3> shadingNormals {};      // unit, world space, in stored vertex order
     std::array<Vec2, 3> uvs {};
     // World tangent xyz (unit) and bitangent sign w, already corrected for mirroring.
     std::array<std::array<float, 4>, 3> tangents {};
+    // World dP/du at each corner, smoothed across the triangles that share the
+    // vertex and kept at its length, so it interpolates linearly over a triangle.
+    // A polar cap's circle tangent is linear in position, so the interpolated
+    // value is that tangent everywhere. Zero where the vertex has no single u
+    // direction (a cap's hub) or the mesh has no uv.
+    std::array<Vec3, 3> grooveTangents {};
 };
 
 struct IngestStats
@@ -64,6 +73,10 @@ struct IngestedScene
     std::vector<TriangleAttributes> triangles;
     Bounds bounds;
     IngestStats stats;
+    // Empty when ingested. Otherwise the scene counts more records than its
+    // buffers hold, nothing was ingested, and this names the buffer and both
+    // numbers.
+    std::string refusal;
 
     std::size_t triangleCount() const noexcept { return triangles.size(); }
     void clear() noexcept;
@@ -82,7 +95,8 @@ Mat4 transformMatrix (const HarmonicMIDI::grid::SceneTransform3D& transform) noe
 // Parent chain times local, with the raster's cycle guard (depth < objectCount).
 Mat4 objectWorldMatrix (const HarmonicMIDI::grid::Visual3DScene& scene, std::size_t objectIndex) noexcept;
 
-// Replaces out. Skipped geometry is counted in out.stats, never fatal.
+// Replaces out. Skipped geometry is counted in out.stats. A scene whose
+// counts exceed its allocated buffers is refused whole, see out.refusal.
 void ingestScene (const HarmonicMIDI::grid::Visual3DScene& scene, IngestedScene& out,
                   const IngestOptions& options = {});
 
@@ -102,9 +116,32 @@ struct PinholeCamera
 
     // Unit direction. tMin and tMax are the near and far planes measured along
     // this ray, so the traced depth range equals the raster clip range.
-    Ray generateRay (float pixelX, float pixelY) const noexcept;
+    PT_SHARED_FN Ray generateRay (float pixelX, float pixelY) const noexcept
+    {
+        const float ndcX = 2.0f * pixelX / static_cast<float> (width) - 1.0f;
+        const float ndcY = 1.0f - 2.0f * pixelY / static_cast<float> (height);
+        const Vec3 local { ndcX * tanHalfFov * aspect, ndcY * tanHalfFov, -1.0f };
+        const float localLength = length (local);
+        Ray ray;
+        ray.origin = position;
+        ray.direction = rotate (rotation, local) * (1.0f / localLength);
+        ray.tMin = nearPlane * localLength;
+        ray.tMax = farPlane * localLength;
+        return ray;
+    }
     // The raster vertex transform: false for points at or behind the eye.
-    bool project (Vec3 world, float& pixelX, float& pixelY, float& viewDepth) const noexcept;
+    PT_SHARED_FN bool project (Vec3 world, float& pixelX, float& pixelY, float& viewDepth) const noexcept
+    {
+        const Vec3 view = rotate (conjugate (rotation), world - position);
+        viewDepth = -view.z;
+        if (! (viewDepth > 0.0f))
+            return false;
+        const float ndcX = view.x / (tanHalfFov * aspect * viewDepth);
+        const float ndcY = view.y / (tanHalfFov * viewDepth);
+        pixelX = (ndcX + 1.0f) * 0.5f * static_cast<float> (width);
+        pixelY = (1.0f - ndcY) * 0.5f * static_cast<float> (height);
+        return std::isfinite (pixelX) && std::isfinite (pixelY);
+    }
 };
 
 // False for a non-finite record, fov outside (0, pi), near <= 0, far <= near,

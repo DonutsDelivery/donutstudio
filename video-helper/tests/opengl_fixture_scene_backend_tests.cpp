@@ -9,6 +9,7 @@
 #include "../src/diffraction_material_execution.h"
 #include "../src/fixture_scene_renderer.h"
 #include "../src/gpu_backend/fixture_environment_image.h"
+#include "../src/gpu_backend/fixture_realtime_opengl.h"
 #include "../src/gpu_backend/gpu_residency_ledger.h"
 #include "../src/diffractive_foil_admission.h"
 #include "../src/gl_loader.h"
@@ -19,6 +20,7 @@
 #include "support/base_surface_reflection_cases.h"
 #include "support/analytic_sky_cases.h"
 #include "support/environment_image_cases.h"
+#include "support/environment_material_cases.h"
 #include "support/smooth_glass_cases.h"
 #include "support/opengl_rough_glass_cases.h"
 #include "support/glass_caustic_oracle.h"
@@ -507,7 +509,7 @@ bool queryArithmeticSourceChecks()
         "CameraTraceInput cameraInput=inputs[sampleIndex];",
         "causticCameraRay(vec2(cameraInput.pixel.xy)+vec2(dx,dy),uRotation,uProjection,uExtent)",
         "sceneClosestHit(branch.origin,branch.direction,minimum,maximum,uOpaqueControl)",
-        "CAUSTIC_MAX_PENDING","CAUSTIC_MAX_VISITS","CAUSTIC_MAX_INTERFACES","uIor[band/4][band%4]",
+        "CAUSTIC_MAX_PENDING","CAUSTIC_MAX_VISITS","CAUSTIC_MAX_ANCESTRY_INTERFACES","uIor[band/4][band%4]",
         "precise float reflectedFraction=branch.fraction*visit.fresnel;",
         "precise float transmittedFraction=branch.fraction*(1.0-visit.fresnel);",
         "child.token=1u;","child.token=65u;","result[base+12]=path.ancestry[0]",
@@ -2960,15 +2962,15 @@ bool glassGratingIncidentNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
     std::array<gc::Texel,gc::kGratingIncidentStride> packed{};packed[22]={1,1,0,0};packed[14][0]=.5f;
     gc::NativeGratingIncident sentinel;sentinel.work=999;
     ok&=expect(!gc::opengl::decodeGratingIncident(packed.data(),sentinel)&&sentinel.work==999,"fractional native incident ID refuses before integral conversion");
-    for(unsigned instance:{9u,unsigned(HarmonicMIDI::grid::Visual3DScene::kMaxObjects-1)}) {
+    for(unsigned instance:{9u,63u,3000u}) {
         packed[14][0]=float(instance);
         ok&=expect(gc::opengl::decodeGratingIncident(packed.data(),sentinel)&&sentinel.hit.instanceId==instance,
             "native incident instance ordinals above the grating triangle count remain representable");
     }
     const auto incumbentInstance=sentinel.hit.instanceId;
-    packed[14][0]=float(HarmonicMIDI::grid::Visual3DScene::kMaxObjects);
+    packed[14][0]=float(arbitgpu::opaquevisibility::kExactFloatIndexRange)+2.0f;
     ok&=expect(!gc::opengl::decodeGratingIncident(packed.data(),sentinel)&&sentinel.hit.instanceId==incumbentInstance,
-        "native incident first out-of-range scene instance ordinal refuses atomically");
+        "native incident ordinal past exact float storage refuses atomically");
     sentinel.work=999;packed[14][0]=0;packed[23][0]=1;
     ok&=expect(!gc::opengl::decodeGratingIncident(packed.data(),sentinel)&&sentinel.work==999,"native incident nonzero reserved suffix refuses atomically");
     std::array<gc::Texel,gc::kGratingOrderStride> orderWords{};orderWords[0]={1,1,0,0};orderWords[1]={0,0,1,1};orderWords[3][0]=1;
@@ -4224,8 +4226,155 @@ bool residencyFixtureSceneOwnerChecks (arbitgpu::NativeFixtureSceneBackend& back
 
 } // namespace
 
+// Past every former Raster binding: 501,000 vertices, 1,485,000 indices, 3,000 objects,
+// 64 materials, 40 textures, 1,100,039 source texels, 40 lights, 9 cameras and 200 object
+// instances. The wall is the last object and takes its light from the fortieth lamp, so a
+// lit center pixel proves both records reach the shader through the scene table.
+bool largeRasterSceneRenders(arbitgpu::NativeFixtureSceneBackend& backend, const arbitgl::GlFuncs& gl)
+{
+    namespace grid = HarmonicMIDI::grid;
+    constexpr std::size_t kObjects = 3000, kStripTriangles = 165, kMaterials = 64, kTextures = 40;
+    constexpr std::size_t kLights = 40, kCameras = 9, kInstances = 200;
+    constexpr std::size_t kWideTexels = 1100u * 1000u;
+    grid::Visual3DSceneCapacity capacity = grid::kVisual3DSceneDefaultCapacity;
+    capacity.vertices = kObjects * (kStripTriangles + 2);
+    capacity.indices = kObjects * kStripTriangles * 3;
+    capacity.objects = kObjects;
+    capacity.materials = kMaterials;
+    capacity.textures = kTextures;
+    capacity.textureTexels = kWideTexels + (kTextures - 1);
+    capacity.lights = kLights;
+    capacity.cameras = kCameras;
+    capacity.objectInstances = kInstances;
+    auto scene = std::make_shared<grid::Visual3DScene>();
+    scene->id.value = 1;
+    const auto allocation = grid::allocateVisual3DSceneBuffers(*scene, capacity);
+    if (! expect(allocation.allocated(), "large Raster scene allocates"))
+        return false;
+
+    scene->cameraCount = kCameras;
+    for (std::size_t i = 0; i < kCameras; ++i)
+    {
+        scene->cameras[i].id.value = static_cast<std::uint32_t>(i + 1);
+        scene->cameras[i].transform.translation = { 0.0f, 25.0f, 50.0f };
+    }
+    scene->activeCamera.value = static_cast<std::uint32_t>(kCameras);
+
+    scene->textureCount = kTextures;
+    scene->textureTexelCount = capacity.textureTexels;
+    scene->textureTexels.resize(scene->textureTexelCount, grid::SceneTexelRgba8 { 255, 255, 255, 255 });
+    for (std::size_t i = 0; i < kTextures; ++i)
+    {
+        auto& texture = scene->textures[i];
+        texture.id.value = static_cast<std::uint32_t>(i + 1);
+        texture.width = i == 0 ? 1100 : 1;
+        texture.height = i == 0 ? 1000 : 1;
+        texture.firstTexel = i == 0 ? 0 : static_cast<std::uint32_t>(kWideTexels + i - 1);
+    }
+
+    scene->materialCount = kMaterials;
+    for (std::size_t i = 0; i < kMaterials; ++i)
+    {
+        scene->materials[i].id.value = static_cast<std::uint32_t>(i + 1);
+        scene->materials[i].baseColorTexture.value = static_cast<std::uint32_t>(i % kTextures + 1);
+    }
+
+    scene->lightCount = kLights;
+    for (std::size_t i = 0; i < kLights; ++i)
+    {
+        auto& light = scene->lights[i];
+        light.id.value = static_cast<std::uint32_t>(i + 1);
+        light.kind = grid::SceneLightKind::Point;
+        light.transform.translation = { 0.0f, 25.0f, 10.0f };
+        light.range = 1000.0f;
+        light.intensity = i + 1 == kLights ? 2000.0f : 0.0f;
+    }
+
+    for (std::uint32_t id = 1; id <= kObjects; ++id)
+    {
+        auto& object = scene->objects[scene->objectCount++];
+        object.id.value = id;
+        object.material.value = 1 + (id % kMaterials);
+        object.transform.translation = { 1000.0f + static_cast<float>(id), 0.0f, 0.0f };
+        object.firstVertex = static_cast<std::uint32_t>(scene->vertexCount);
+        object.vertexCount = kStripTriangles + 2;
+        object.firstIndex = static_cast<std::uint32_t>(scene->indexCount);
+        object.indexCount = 3 * kStripTriangles;
+        for (std::uint32_t v = 0; v < kStripTriangles + 2; ++v)
+        {
+            auto& vertex = scene->vertices[scene->vertexCount++];
+            vertex.position = { static_cast<float>(v / 2) * 0.001f, static_cast<float>(v % 2) * 0.001f, 0.0f };
+            vertex.normal = { 0.0f, 0.0f, 1.0f };
+        }
+        for (std::uint32_t t = 0; t < kStripTriangles; ++t)
+        {
+            const bool odd = (t % 2) != 0;
+            scene->indices[scene->indexCount++] = t;
+            scene->indices[scene->indexCount++] = odd ? t + 2 : t + 1;
+            scene->indices[scene->indexCount++] = odd ? t + 1 : t + 2;
+        }
+    }
+    // The last object spans the frame. Its strip is 0.082 by 0.001 before this scale.
+    auto& wall = scene->objects[kObjects - 1];
+    wall.transform.scale = { 1000.0f, 100000.0f, 1.0f };
+    wall.transform.translation = { -41.0f, -25.0f, 0.0f };
+
+    scene->instancedObject.value = 1;
+    scene->objectInstanceCount = kInstances;
+    for (std::size_t i = 0; i < kInstances; ++i)
+        scene->objectInstances[i].translation = { static_cast<float>(i), 0.0f, -1.0f };
+
+    const auto validation = grid::validateVisual3DScene(*scene);
+    bool ok = expect(validation.valid(), "large Raster scene validates");
+    if (! ok)
+        return false;
+
+    const auto prepared = backend.prepare(scene, nullptr);
+    ok &= expect(prepared.prepared, ("large Raster scene prepares: " + prepared.error).c_str());
+    if (! prepared.prepared)
+        return false;
+    const auto lit = backend.render(scene, prepared.resources, 64, 64, {});
+    ok &= expect(lit.rendered && lit.frame != nullptr, ("large Raster scene renders: " + lit.error).c_str());
+    if (! lit.rendered || ! lit.frame)
+        return false;
+    const std::size_t center = (32u * 64u + 32u) * 4u;
+    const auto litPixels = readRgba8(gl, lit.frame);
+
+    arbitgpu::NativeFixtureSceneRuntimeInputs identify;
+    identify.imageOutput = renderpassoutput::Output::ObjectId;
+    const auto identified = backend.render(scene, prepared.resources, 64, 64, identify);
+    ok &= expect(identified.rendered && identified.frame != nullptr, "large Raster scene renders its object identity output");
+    if (identified.rendered && identified.frame)
+    {
+        const auto pixels = readRgba8(gl, identified.frame);
+        const auto expected = render3dimage::identityColor(static_cast<std::uint32_t>(kObjects));
+        for (std::size_t channel = 0; channel < 3; ++channel)
+            ok &= expect(std::abs(static_cast<int>(pixels[center + channel])
+                    - static_cast<int>(std::lround(expected[channel] * 255.0f))) <= 1,
+                "the object at index 2,999 keeps its own identity");
+    }
+
+    auto unlit = std::make_shared<grid::Visual3DScene>(*scene);
+    unlit->lights[kLights - 1].intensity = 0.0f;
+    const auto unlitPrepared = backend.prepare(unlit, nullptr);
+    ok &= expect(unlitPrepared.prepared, ("large unlit Raster scene prepares: " + unlitPrepared.error).c_str());
+    if (unlitPrepared.prepared)
+    {
+        const auto dark = backend.render(unlit, unlitPrepared.resources, 64, 64, {});
+        ok &= expect(dark.rendered && dark.frame != nullptr, "large unlit Raster scene renders");
+        if (dark.rendered && dark.frame)
+        {
+            const auto darkPixels = readRgba8(gl, dark.frame);
+            ok &= expect(litPixels[center] > darkPixels[center] + 16,
+                "the fortieth light changes the wall through the scene table");
+        }
+    }
+    return ok;
+}
+
 int main()
 {
+    // These rows compare each authored walk against its own reference.
     if (! residencyLedgerChecks())
         return 1;
     if (! glfwInit())
@@ -4314,6 +4463,9 @@ int main()
     std::string environmentError;
     const bool environmentRendered=videohelper::tests::environmentImageCases(backend,environmentError);
     ok &= expect(environmentRendered,environmentError.c_str());
+    std::string environmentMaterialError;
+    const bool environmentMaterialRendered=videohelper::tests::environmentmaterialfixture::run(backend,environmentMaterialError);
+    ok &= expect(environmentMaterialRendered,environmentMaterialError.c_str());
     std::string skyError;
     const bool skyRendered=videohelper::tests::analyticSkyCases(backend,skyError);
     ok &= expect(skyRendered,skyError.c_str());
@@ -4546,6 +4698,7 @@ int main()
                           && repeated.stats.reusedStaticResources,
                       "inspection is deterministic and reuses native geometry");
     }
+    ok &= largeRasterSceneRenders(backend, gl);
     auto rawSceneValue = outputSceneValue;
     rawSceneValue.objects[0].id.value = 0xf1234567u;
     rawSceneValue.materials[0].id.value = 0xe2345678u;
@@ -5339,6 +5492,39 @@ int main()
                                     expected.rejectedAlternatives.end(), actualCenter)
                               == expected.rejectedAlternatives.end(),
                           "OpenGL pixels must reject black-output and wrong-transfer shading alternatives");
+
+            // The Color route the product draws: RGBA16F radiance, encoded once with
+            // the transfer the compositor applies. One byte of slack covers half-float
+            // precision against the oracle's binary64.
+            arbitgpu::NativeFixtureSceneRuntimeInputs linearInputs;
+            linearInputs.linearColor = true;
+            const auto linearPrepared = backend.prepare (starterScene, binding->nativeProgram());
+            arbitgpu::NativeRawPassPixels linearPixels;
+            std::string linearError;
+            bool linearRead = false;
+            if (linearPrepared.prepared)
+            {
+                const auto linearFrame = backend.render (starterScene, linearPrepared.resources, 65, 65, linearInputs);
+                linearRead = linearFrame.rendered
+                    && linearFrame.frame->readRawPass (renderpassoutput::Output::Color, linearPixels, linearError)
+                    && linearPixels.format == arbitgpu::NativeTexturePixelFormat::Rgba16Float;
+            }
+            ok &= expect (linearRead, "OpenGL starter renders on the linear Color route");
+            if (linearRead)
+            {
+                const std::size_t linearCenter = (32u * 65u + 32u) * 8u;
+                for (std::size_t channel = 0; channel < 3u; ++channel)
+                {
+                    std::uint16_t half = 0;
+                    std::memcpy (&half, linearPixels.bytes.data() + linearCenter + channel * 2u, 2u);
+                    const double radiance = std::clamp (static_cast<double> (hdrimage::halfToFloat (half)), 0.0, 1.0);
+                    const double encoded = radiance <= 0.0031308 ? 12.92 * radiance
+                                                                 : 1.055 * std::pow (radiance, 1.0 / 2.4) - 0.055;
+                    const int actual = static_cast<int> (std::floor (encoded * 255.0 + 0.5));
+                    ok &= expect (std::abs (actual - static_cast<int> (expected.displayCenterRgba8[channel])) <= 1,
+                                  "the once-encoded linear Color must match the pinned display oracle");
+                }
+            }
             sampledStarterPixels.insert (sampledStarterPixels.end(),
                                          actualCenter.begin(), actualCenter.end());
 
@@ -6666,6 +6852,69 @@ int main()
     const auto crossedPixels = crossedFrame.rendered
         ? readRgba8 (gl, crossedFrame.frame) : std::vector<std::uint8_t> {};
     reportCoverage ("diffraction-crossed", crossedPixels);
+    // A grating under Realtime draws the orders of the raster order sum. The measure is
+    // the red share of a lit pixel: one color across the card would give a spread of zero.
+    {
+        const arbitgpu::realtimeengine::Scope realtimeScope;
+        auto realtimePreparation = backend.prepare (diffractionScene, crossedProgram);
+        auto realtimeFrame = backend.render (
+            diffractionScene, realtimePreparation.resources, 96, 96, {});
+        const auto realtimePixels = realtimeFrame.rendered
+            ? readRgba8 (gl, realtimeFrame.frame) : std::vector<std::uint8_t> {};
+        float lowestRedShare = 1.0f, highestRedShare = 0.0f;
+        for (std::size_t at = 0; at + 3 < realtimePixels.size(); at += 4)
+        {
+            const float sum = float (realtimePixels[at]) + float (realtimePixels[at + 1]) + float (realtimePixels[at + 2]);
+            if (sum < 48.0f) continue;
+            const float share = float (realtimePixels[at]) / sum;
+            lowestRedShare = std::min (lowestRedShare, share);
+            highestRedShare = std::max (highestRedShare, share);
+        }
+        ok &= expect (realtimePreparation.prepared && realtimeFrame.rendered
+                          && realtimeFrame.stats.realtimeProgramApplied
+                          && realtimePixels == crossedPixels
+                          && highestRedShare - lowestRedShare > 0.05f,
+                      "OpenGL fixture Realtime grating draws wavelength-dependent diffraction orders");
+        realtimeFrame.frame.reset();
+    }
+    // The orders come from the grating's own lighting paths, under an analytic sky and
+    // under an image alike. The image shows in the backdrop and leaves the card's bytes.
+    {
+        visualenvironmentimage::Identity key;
+        std::string uploadError;
+        const bool uploaded = videohelper::tests::environmentmaterialfixture::upload (key, uploadError);
+        auto authored = std::make_shared<HarmonicMIDI::grid::Visual3DScene> (*diffractionScene);
+        auto& sky = authored->lights[authored->lightCount++];
+        sky = {};
+        sky.id = { 902 };
+        sky.kind = HarmonicMIDI::grid::SceneLightKind::Environment;
+        sky.color = { 1.0f, 1.0f, 1.0f };
+        sky.intensity = 1.0f;
+        sky.environmentImage = { 1, key, 0.0f, 0.0f };
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> hdrScene = authored;
+        const arbitgpu::realtimeengine::Scope realtimeScope;
+        auto hdrPreparation = backend.prepare (hdrScene, crossedProgram);
+        auto hdrFrame = backend.render (hdrScene, hdrPreparation.resources, 96, 96, {});
+        const auto hdrPixels = hdrFrame.rendered
+            ? readRgba8 (gl, hdrFrame.frame) : std::vector<std::uint8_t> {};
+        std::size_t cardPixels = 0, sameCardPixels = 0, changedBackdropPixels = 0;
+        for (std::size_t at = 0; at + 3 < hdrPixels.size() && at + 3 < crossedPixels.size(); at += 4)
+        {
+            const bool same = std::equal (hdrPixels.begin() + at, hdrPixels.begin() + at + 3, crossedPixels.begin() + at);
+            if (int (crossedPixels[at]) + crossedPixels[at + 1] + crossedPixels[at + 2] >= 48)
+            {
+                ++cardPixels;
+                sameCardPixels += same ? 1u : 0u;
+            }
+            else if (! same) ++changedBackdropPixels;
+        }
+        ok &= expect (uploaded && hdrPreparation.prepared && hdrFrame.rendered
+                          && hdrFrame.stats.realtimeProgramApplied
+                          && cardPixels > 0 && sameCardPixels * 10 >= cardPixels * 9
+                          && changedBackdropPixels > 0,
+                      "OpenGL fixture Realtime grating keeps its orders under an HDR environment");
+        hdrFrame.frame.reset();
+    }
 
     auto crossedDirectionDescription = crossedDescription;
     crossedDirectionDescription.geometry.directionUv

@@ -27,6 +27,8 @@ void check (bool condition, const char* message)
     }
 }
 
+void check (bool condition, const std::string& message) { check (condition, message.c_str()); }
+
 std::string noShader (const json&) { return {}; }
 
 struct NoOpticalBackend final : arbitgpu::NativeOpticalFlowExecutionBackend
@@ -461,6 +463,14 @@ int main()
     error.clear();
     check (videowire::validateCompiledVisualLayerPlans({}, { importedTyped }, false, error),
            "snapshot whitelist admits imported transform camera and directional-light operations");
+    {
+        auto environmentTyped = importedTyped;
+        environmentTyped.nodeKinds[3] = "visual.3d.light.environment";
+        environmentTyped.operations[3].kind = "visual.3d.light.environment";
+        error.clear();
+        check (videowire::validateCompiledVisualLayerPlans({}, { environmentTyped }, false, error) && error.empty(),
+               "snapshot whitelist admits imported environment-light operation: " + error);
+    }
     importedTyped.nodeKinds.insert(importedTyped.nodeKinds.begin() + 1, "visual.3d.light.point");
     importedTyped.nodeIds.insert(importedTyped.nodeIds.begin() + 1, 206);
     importedTyped.operations.insert(importedTyped.operations.begin() + 1,

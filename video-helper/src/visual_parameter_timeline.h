@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iterator>
 #include <map>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -15,10 +16,10 @@ public:
     bool bind(const std::vector<VisualParameterSample>& samples, std::string& error)
     {
         tracks_.clear();
-        if (samples.size()>262144) { error="Simulation automation exceeds 262144 samples"; return false; }
+        try {
         for (const auto& sample:samples)
         {
-            if (sample.paramId.empty() || sample.paramId.size()>256
+            if (sample.paramId.empty()
                 || !std::isfinite(sample.atSec) || sample.atSec<0 || !std::isfinite(sample.value))
             { error="Malformed simulation automation sample"; return false; }
             auto& track=tracks_[sample.paramId];
@@ -26,7 +27,11 @@ public:
             { error="Simulation automation sample times must increase strictly per destination"; return false; }
             track.emplace_back(sample.atSec,sample.value);
         }
-        if (tracks_.size()>128) { error="Simulation automation exceeds 128 destinations"; return false; }
+        } catch (const std::bad_alloc&) {
+            tracks_.clear();
+            error="Simulation automation allocation failed at "+std::to_string(samples.size())+" samples";
+            return false;
+        }
         return true;
     }
     void sample(const std::string& destination,double seconds,double& value) const

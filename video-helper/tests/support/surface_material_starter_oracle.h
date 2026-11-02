@@ -12,7 +12,7 @@
 
 namespace surfacematerialstarteroracle
 {
-inline constexpr int kSchemaVersion = 4;
+inline constexpr int kSchemaVersion = 5;
 inline constexpr std::uint64_t kFnv1a64OffsetBasis = 14695981039346656037ull;
 inline constexpr std::uint64_t kFnv1a64Prime = 1099511628211ull;
 
@@ -21,6 +21,7 @@ struct Material final
     std::string id;
     std::array<float, 20> pbr {};
     std::array<std::uint8_t, 4> centerRgba8 {};
+    std::array<std::uint8_t, 4> displayCenterRgba8 {};
     std::vector<std::array<std::uint8_t, 4>> rejectedAlternatives;
 };
 
@@ -29,6 +30,8 @@ struct Oracle final
     std::vector<Material> materials;
     std::string sampledRgba8Sha256;
     std::string sampledRgba8Fnv1a64;
+    std::string displayRgba8Sha256;
+    std::string displayRgba8Fnv1a64;
 };
 
 inline Oracle loadDocument (const nlohmann::json& root)
@@ -41,17 +44,23 @@ inline Oracle loadDocument (const nlohmann::json& root)
     Oracle result;
     result.sampledRgba8Sha256 = root.at ("sampledRgba8Sha256").get<std::string>();
     result.sampledRgba8Fnv1a64 = root.at ("sampledRgba8Fnv1a64").get<std::string>();
+    result.displayRgba8Sha256 = root.at ("displayRgba8Sha256").get<std::string>();
+    result.displayRgba8Fnv1a64 = root.at ("displayRgba8Fnv1a64").get<std::string>();
     for (const auto& source : root.at ("materials"))
     {
         Material material;
         material.id = source.at ("id").get<std::string>();
         const auto pbr = source.at ("pbrParameterBlock").get<std::vector<float>>();
         const auto center = source.at ("directionalLitCenterRgba8").get<std::vector<int>>();
-        if (pbr.size() != material.pbr.size() || center.size() != material.centerRgba8.size())
+        const auto display = source.at ("displayEncodedCenterRgba8").get<std::vector<int>>();
+        if (pbr.size() != material.pbr.size() || center.size() != material.centerRgba8.size()
+            || display.size() != material.displayCenterRgba8.size())
             throw std::runtime_error ("malformed Surface Material oracle row");
         std::copy (pbr.begin(), pbr.end(), material.pbr.begin());
         for (std::size_t index = 0; index < center.size(); ++index)
             material.centerRgba8[index] = static_cast<std::uint8_t> (center[index]);
+        for (std::size_t index = 0; index < display.size(); ++index)
+            material.displayCenterRgba8[index] = static_cast<std::uint8_t> (display[index]);
         for (const auto& alternative : source.at ("rejectedWrongShadingRgba8"))
         {
             const auto channels = alternative.get<std::vector<int>>();

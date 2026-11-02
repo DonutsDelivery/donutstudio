@@ -42,16 +42,16 @@ assert codes.pop("Trapped", None) == 2, "SmoothTransportStatus::Trapped must be 
 assert "inline constexpr std::uint16_t kTrappedNormalBits = 0x4000u;" in header
 assert struct.unpack("<H", struct.pack("<e", 2.0))[0] == 0x4000
 assert len(codes) == 17, codes
-assert sorted(codes.values()) == list(range(-19, -2)), codes
+assert sorted(codes.values()) == [c for c in range(-20, -2) if c != -10], codes
 assert len({negative_half_bits(v) for v in codes.values()}) == len(codes)
 assert negative_half_bits(-1) == 0xBC00 and negative_half_bits(-2) == 0xC000
 
-# Rough refusals (RoughTransportStatus -1 to -10) map to -20 to -29, after the smooth range.
+# Rough refusals (RoughTransportStatus -1 to -10) map to -21 to -30, after the smooth range.
 rough_enum = re.search(r"enum class RoughTransportStatus : int\s*\{(.*?)\};", header, re.S)
 assert rough_enum is not None, "RoughTransportStatus enum is missing"
 rough_refusals = {name: int(value) for name, value in re.findall(r"(\w+)=(-?\d+)", rough_enum.group(1)) if int(value) < 0}
-assert sorted(rough_refusals.values()) == list(range(-10, 0)), rough_refusals
-assert re.search(r"kRoughReasonBase=-19;", header), "rough reason base changed"
+assert sorted(rough_refusals.values()) == [c for c in range(-10, 0) if c != -5], rough_refusals
+assert re.search(r"kRoughReasonBase=-20;", header), "rough reason base changed"
 assert "constexpr int roughReasonCode(RoughTransportStatus status) { return kRoughReasonBase+int(status); }" in header
 
 # The shader receives one define per code, and every shader use names a define.
@@ -72,6 +72,7 @@ assert set(rough_reasons) == set(rough_refusals), (rough_reasons, rough_refusals
 assert '{negativeHalfBits(-1), "no reason recorded"}' in table.group(1)
 assert reasons["QueryBudget"] == "query refused: work budget"
 assert reasons["ThinFirstHit"] == "first hit is not the water surface"
+assert reasons["ThinFirstQuery"] == "first water-entry query refused or nonfinite"
 assert "{std::uint16_t(0), \"unrecognized normal value\"}" in table.group(1)
 
 # completeFrame keeps the message prefix and reports the first reason and counts.
@@ -85,19 +86,36 @@ start = header.index("vec3 glassTransport(vec3 camera,vec3 entry,out bool comple
 body = header[start:header.index("// Native callers must retain", start)]
 assert "complete=false;status=GLASS_SMOOTH_STATUS_UNCLASSIFIED;" in body
 exits = [line for line in body.splitlines() if "return vec3(0.0);" in line]
-assert len(exits) == 12, len(exits)
+assert len(exits) == 11, len(exits)
 assert "if(pending!=0) trapped=true;" in body
+# A path at the depth limit ends: the pixel keeps what it gathered.
+assert "if(depth>=GLASS_INTERFACE_DEPTH) {trapped=true;continue;}" in body
+assert "GLASS_SMOOTH_STATUS_DEPTH" not in header
+# A rough path at the depth limit ends too. Both closed walks report the path's
+# tracked power as absorbed, which closes the receipt but does not count as unresolved.
+assert "if(depth>=GLASS_INTERFACE_DEPTH) {tail[channel]+=power;continue;}" not in header
+assert header.count("if(depth>=GLASS_INTERFACE_DEPTH) {masked[channel]+=power;continue;}") == 2
+assert header.count("if(tail[channel]>GLASS_ROUGH_UNRESOLVED)") == 2
+assert "GLASS_ROUGH_STATUS_DEPTH" not in header
+# A rough walk out of visits or stack ends its branches as absorbed, heaviest visited first.
+assert "if(pending!=0) {status=GLASS_ROUGH_STATUS_VISITS;" not in header
+assert "if(pending>=16) {status=GLASS_ROUGH_STATUS_PENDING;" not in header
+assert header.count("for(int slot=0;slot<pending;++slot) masked[channel]+=powers[slot];") == 2
+assert header.count("if(powers[free]<=branchPower) masked[channel]+=powers[free];") == 2
+assert header.count("if(powers[slot]>powers[heaviest]) heaviest=slot;") == 2
+assert header.count("if(visit+1>=GLASS_ROUGH_VISITS) {masked[channel]+=power;continue;}") == 4
+assert header.count("if(masked[channel]+tail[channel]>GLASS_ROUGH_UNRESOLVED)") == 1
+assert "inline constexpr float kMaximumRoughUnresolvedPower = 0.0001f;" in header
+assert "inline constexpr float kRoughEnergyConservationTolerance = 0.00002f;" in header
 assert "if(complete&&trapped) status=GLASS_SMOOTH_STATUS_TRAPPED;" in body
 assert "GLASS_SMOOTH_STATUS_VISITS" not in body
 
-# completeFrame admits a few trapped pixels and refuses systemic trapping.
-assert "inline constexpr std::size_t kMaximumTrappedCameraPixels = 4096;" in header
-assert "inline constexpr double kMaximumTrappedCameraFraction = 0.005;" in header
+# completeFrame admits trapped pixels at any count.
 assert "if (alpha == kTrappedNormalBits) {" in header
-assert "if (admitTrappedCameraPixels(trapped,surface))" in header
-# Zero-roughness rough delegations keep refusing a trapped smooth walk, so the
-# rough receipt policy is unchanged.
-assert header.count("status=smoothComplete&&smoothStatus!=GLASS_SMOOTH_STATUS_TRAPPED?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;") == 3
+assert "admitTrappedCameraPixels" not in header
+assert "kMaximumTrappedCamera" not in header
+# A zero-roughness rough delegation publishes a trapped smooth walk too.
+assert header.count("status=smoothComplete?GLASS_ROUGH_STATUS_SMOOTH:GLASS_ROUGH_STATUS_QUERY;") == 3
 for line in exits:
     assert re.search(r"status=[^;]*GLASS_SMOOTH_STATUS_", line), line
 
@@ -147,7 +165,7 @@ assert "kThinEntryRelativeTolerance*distance" in header
 # of the entry still refuses.
 status = function_body("int thinEntryStatus(GlassClosestHit first,uint water,vec3 camera,vec3 incoming,vec3 entry GX_ARGS) {")
 assert "if(thinEntryOwned(first,water,camera,entry)) return 0;" in status
-assert "if(first.status!=1||!glassSceneFinite(first.distance)) return GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;" in status
+assert "if(first.status!=1||!glassSceneFinite(first.distance)) return GLASS_SMOOTH_STATUS_THIN_FIRST_QUERY;" in status
 assert "GlassClosestHit beyond=glassSceneClosestHit(camera,incoming,first.distance+thinEntryTolerance(camera,entry),3.402823e38,GU_GlassControl GX_QUERY);" in status
 assert "if(beyond.status<0) return beyond.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;" in status
 assert "return thinEntryOwned(beyond,water,camera,entry)?0:GLASS_SMOOTH_STATUS_THIN_FIRST_HIT;" in status

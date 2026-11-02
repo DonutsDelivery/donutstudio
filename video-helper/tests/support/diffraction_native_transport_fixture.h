@@ -4,13 +4,16 @@
 #include "../../../shared/DiffractionMaterialPresets.h"
 #include "../../src/gpu_backend/fixture_diffraction_transport.h"
 
+#include <optional>
+
 namespace triangletransporttests
 {
 // Reuse actual authored world triangles and the independent double oracle.
 // Native backends can change target and consume exactly this table contract.
-inline Fixture nativeFixture(bool nonplanar=false,double move=0,int blocker=0)
+inline Fixture nativeFixture(bool nonplanar=false,double move=0,int blocker=0,std::optional<double> sourceRadiance={})
 {
     auto f=fixture(nonplanar,move,blocker);
+    if(sourceRadiance)f.input.source.radiance.fill(*sourceRadiance);
     for(std::size_t o=0;o<f.scene->objectCount;++o)
     {
         const auto first=f.scene->objects[o].firstVertex;

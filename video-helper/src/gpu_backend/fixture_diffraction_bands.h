@@ -71,6 +71,21 @@ inline std::uint32_t nativeFixtureDiffractionBandEvaluationLimit (
         + nativeFixtureDiffractionBandOrigin (bands, band) * bands.width;
 }
 
+// A long submission trips the driver's context switch timeout, so receiver
+// transport splits its draw by the queries each row can run. A row is the
+// smallest band. This changes how the frame is submitted, never what it renders.
+inline constexpr std::uint64_t kNativeDiffractionQueriesPerSubmission = 16'777'216;
+inline void nativeFixtureDiffractionSplitBandsByQueries (
+    NativeFixtureDiffractionBands& bands, std::uint64_t queriesPerPixel) noexcept
+{
+    if (bands.width == 0 || bands.height == 0 || bands.bandHeight == 0 || queriesPerPixel == 0)
+        return;
+    const auto pixels = kNativeDiffractionQueriesPerSubmission / queriesPerPixel;
+    const auto rows = std::max<std::uint64_t> (1, pixels / bands.width);
+    bands.bandHeight = static_cast<std::uint32_t> (std::min<std::uint64_t> (bands.bandHeight, rows));
+    bands.bandCount = (bands.height + bands.bandHeight - 1) / bands.bandHeight;
+}
+
 // checkLobes is false for authored spectral-receiver (version 3) lighting.
 // That transport admits its own sample/query/lobe frame work in buildFrame.
 inline bool nativeFixtureDiffractionBandSchedule (
@@ -93,11 +108,6 @@ inline bool nativeFixtureDiffractionBandSchedule (
         return false;
 
     std::uint64_t rows = height;
-    if (checkLobes && material.diffractionLightingAdmission
-        && material.diffractionLightingAdmission->description().version == 3
-        && ! nativeFixtureDiffractionQueryWorkWithinBudget (width, height,
-            kMaximumNativeDiffractionSamples, kMaximumNativeDiffractionSamples, 1))
-        return false;
     if (checkLobes)
     {
         // The estimate is pixels times a per-material constant, so one row

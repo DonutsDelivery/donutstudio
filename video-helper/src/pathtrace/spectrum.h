@@ -46,6 +46,7 @@
 // distributed with colour-science, not taken from Cycles.
 
 #include "vec_math.h"
+#include "devices/device_tables.h"
 
 #include <array>
 #include <cmath>
@@ -70,38 +71,48 @@ struct Spectrum
 {
     std::array<float, kSpectrumChannels> v {};
 
-    static Spectrum constant (float x) noexcept
+    PT_SHARED_FN static Spectrum constant (float x) noexcept
     {
         Spectrum s;
-        s.v.fill (x);
+        for (int i = 0; i < kSpectrumChannels; ++i)
+            s[i] = x;
         return s;
     }
 
-    float operator[] (int i) const noexcept { return v[static_cast<std::size_t> (i)]; }
-    float& operator[] (int i) noexcept { return v[static_cast<std::size_t> (i)]; }
+    PT_SHARED_FN float operator[] (int i) const noexcept { return v[static_cast<std::size_t> (i)]; }
+    PT_SHARED_FN float& operator[] (int i) noexcept { return v[static_cast<std::size_t> (i)]; }
 
-    float maxValue() const noexcept
+    PT_SHARED_FN float maxValue() const noexcept
     {
         float m = v[0];
         for (int i = 1; i < kSpectrumChannels; ++i)
             m = m > v[static_cast<std::size_t> (i)] ? m : v[static_cast<std::size_t> (i)];
         return m;
     }
-    float average() const noexcept
+    PT_SHARED_FN float average() const noexcept
     {
         float sum = 0.0f;
         for (const float x : v)
             sum += x;
         return sum * (1.0f / static_cast<float> (kSpectrumChannels));
     }
-    bool finite() const noexcept
+    // Light past a float holds the largest float. A NaN stays, so finite() still catches it.
+    PT_SHARED_FN Spectrum saturated() const noexcept
+    {
+        Spectrum out = *this;
+        for (float& x : out.v)
+            if (x > std::numeric_limits<float>::max())
+                x = std::numeric_limits<float>::max();
+        return out;
+    }
+    PT_SHARED_FN bool finite() const noexcept
     {
         for (const float x : v)
             if (! std::isfinite (x))
                 return false;
         return true;
     }
-    bool anyPositive() const noexcept
+    PT_SHARED_FN bool anyPositive() const noexcept
     {
         for (const float x : v)
             if (x > 0.0f)
@@ -110,28 +121,28 @@ struct Spectrum
     }
 };
 
-inline Spectrum operator+ (const Spectrum& a, const Spectrum& b) noexcept
+PT_SHARED_FN Spectrum operator+ (const Spectrum& a, const Spectrum& b) noexcept
 {
     Spectrum r;
     for (int i = 0; i < kSpectrumChannels; ++i)
         r[i] = a[i] + b[i];
     return r;
 }
-inline Spectrum operator* (const Spectrum& a, const Spectrum& b) noexcept
+PT_SHARED_FN Spectrum operator* (const Spectrum& a, const Spectrum& b) noexcept
 {
     Spectrum r;
     for (int i = 0; i < kSpectrumChannels; ++i)
         r[i] = a[i] * b[i];
     return r;
 }
-inline Spectrum operator* (const Spectrum& a, float s) noexcept
+PT_SHARED_FN Spectrum operator* (const Spectrum& a, float s) noexcept
 {
     Spectrum r;
     for (int i = 0; i < kSpectrumChannels; ++i)
         r[i] = a[i] * s;
     return r;
 }
-inline Spectrum operator* (float s, const Spectrum& a) noexcept { return a * s; }
+PT_SHARED_FN Spectrum operator* (float s, const Spectrum& a) noexcept { return a * s; }
 
 // What the four channels of a path mean.
 struct Wavelengths
@@ -141,28 +152,31 @@ struct Wavelengths
     bool spectral = false;
 };
 
-Wavelengths rgbChannels() noexcept;
+PT_SHARED_ENTRY Wavelengths rgbChannels() noexcept;
 // Hero wavelength 380 + 400 u nm and its three rotated companions.
-Wavelengths sampleHeroWavelengths (float u) noexcept;
+PT_SHARED_ENTRY Wavelengths sampleHeroWavelengths (float u) noexcept;
 
 // RGB mode: (r, g, b, 0). Spectral mode: the basis spectrum at each channel's
 // wavelength, never negative.
-Spectrum upsampleRgb (Vec3 rgb, const Wavelengths& wavelengths) noexcept;
+PT_SHARED_ENTRY Spectrum upsampleRgb (Vec3 rgb, const Wavelengths& wavelengths) noexcept;
 // Linear sRGB of one path estimate. RGB mode: the first three channels.
 // Spectral mode: sum over channels of value * weight(lambda) * 400 / 4, the
 // Monte Carlo estimate of the colour integral with uniform wavelengths.
-Vec3 channelsToRgb (const Spectrum& value, const Wavelengths& wavelengths) noexcept;
+PT_SHARED_ENTRY Vec3 channelsToRgb (const Spectrum& value, const Wavelengths& wavelengths) noexcept;
 
 // Basis spectra (Br, Bg, Bb) at one wavelength, after the exact correction.
-Vec3 rgbBasisAt (float nm) noexcept;
+PT_SHARED_ENTRY Vec3 rgbBasisAt (float nm) noexcept;
 // Linear sRGB weight per nm at one wavelength. Each channel integrates to 1
 // over [380, 780] nm.
-Vec3 rgbMatchingWeightAt (float nm) noexcept;
+PT_SHARED_ENTRY Vec3 rgbMatchingWeightAt (float nm) noexcept;
 
 // Cauchy index n(lambda) = A + B / lambda^2, lambda in micrometres, with A
 // chosen so that n(d line) = iorD (SurfaceMaterialIR.h wavelengthIor).
-float cauchyIor (float iorD, float cauchyB, float nm) noexcept;
+PT_SHARED_ENTRY float cauchyIor (float iorD, float cauchyB, float nm) noexcept;
 // The Cauchy B of an Abbe number V_d = (n_d - 1) / (n_F - n_C).
-float cauchyBFromAbbe (float iorD, float abbe) noexcept;
+PT_SHARED_ENTRY float cauchyBFromAbbe (float iorD, float abbe) noexcept;
+
+// Host side of the device upload: the colour tables above (device_tables.h).
+void exportSpectrumTables (device::DeviceLookupTables& tables) noexcept;
 
 } // namespace videohelper::pathtrace

@@ -41,10 +41,14 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(Storage::count
 
 struct Limits final
 {
-    // Explicit independent refusal thresholds. These do not bound library cost.
+    // Unlimited unless a caller sets a threshold. A failed allocation is the refusal.
     std::array<std::uint64_t, static_cast<std::size_t>(Work::count)> work;
     std::array<std::uint64_t, static_cast<std::size_t>(Storage::count)> logicalBytes;
-    Limits() { work.fill(10000000); logicalBytes.fill(256ull * 1024 * 1024); }
+    Limits()
+    {
+        work.fill(std::numeric_limits<std::uint64_t>::max());
+        logicalBytes.fill(std::numeric_limits<std::uint64_t>::max());
+    }
 };
 
 struct Recipe final
@@ -119,8 +123,8 @@ inline bool preflight(const ParticleHistorySource& source,
         return refuse("Water source budget requires finite time anchors");
     recipe.projectQuerySeconds = projectSeconds + (requestedSeconds - sceneSeconds);
     if (!std::isfinite(recipe.projectQuerySeconds) || recipe.projectQuerySeconds < 0
-        || recipe.projectQuerySeconds > waterreplay::kMaximumSeconds)
-        return refuse("Water source budget requires a project query from zero through 10 seconds");
+        || recipe.projectQuerySeconds > waterreplay::kMaximumClockSeconds)
+        return refuse("Water source budget requires a project query from zero that its tick clock can represent");
     // The callback's canonical clock uses the global anchor, not the query.
     if (!frame || !source.score || !std::isfinite(frame->key.fps) || frame->key.fps <= 0)
         return refuse("Water source budget requires actual score and canonical clock sources");
@@ -184,7 +188,7 @@ inline bool preflight(const ParticleHistorySource& source,
         || !checkedMultiply(v, 4, wave) || !checkedMultiply(v, recipe.steps, copied)
         || !checkedMultiply(recipe.audioPrefix, 5, audioScalars) || !checkedMultiply(recipe.audioPrefix, 64, bands))
         return refuse("Water source schedule overflow");
-    recipe.impulseCapacity = std::min<std::uint64_t>(kParticleReplayMaxEvents, candidates);
+    recipe.impulseCapacity = candidates;
     if (!checkedAdd(recipe.steps, recipe.impulseCapacity, checks)
         || !checkedMultiply(recipe.impulseCapacity, 4, deposits) || !checkedMultiply(copied, 7, heightReads))
         return refuse("Water step schedule overflow");

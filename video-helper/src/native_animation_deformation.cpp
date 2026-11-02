@@ -154,6 +154,121 @@ const HarmonicMIDI::grid::SceneObjectRecord* findObject (
         if (scene.objects[index].id == id) return &scene.objects[index];
     return nullptr;
 }
+
+// Cofactors of a column-major 3x3 matrix, which match the uploaded weighted
+// matrix and the explicit cross-product normal transform in both shaders.
+std::array<float, 9> linearCofactors (const std::array<float, 9>& linear) noexcept
+{
+    return {
+        linear[4]*linear[8]-linear[5]*linear[7],
+        linear[5]*linear[6]-linear[3]*linear[8],
+        linear[3]*linear[7]-linear[4]*linear[6],
+        linear[7]*linear[2]-linear[8]*linear[1],
+        linear[8]*linear[0]-linear[6]*linear[2],
+        linear[6]*linear[1]-linear[7]*linear[0],
+        linear[1]*linear[5]-linear[2]*linear[4],
+        linear[2]*linear[3]-linear[0]*linear[5],
+        linear[0]*linear[4]-linear[1]*linear[3]};
+}
+
+struct JointBasePose
+{
+    std::unordered_map<std::uint64_t, std::size_t> indices;
+    std::vector<std::array<float, 3>> translations;
+    std::vector<std::array<float, 4>> rotations;
+    std::vector<std::array<float, 3>> scales;
+};
+
+bool readJointBasePose (const NativeDeformationScene& source,
+                        const visualdeformation::Skin& skin,
+                        JointBasePose& pose, std::string& error)
+{
+    pose.indices.reserve (skin.joints().size());
+    pose.translations.reserve (skin.joints().size());
+    pose.rotations.reserve (skin.joints().size());
+    pose.scales.reserve (skin.joints().size());
+    for (std::size_t index = 0; index < skin.joints().size(); ++index)
+    {
+        const auto& joint = skin.joints()[index];
+        const auto& base = source.jointBaseTransforms[index];
+        if (base.skin != skin.id() || base.joint != joint.id()
+            || ! finiteArray (base.translation) || ! finiteArray (base.rotation)
+            || ! finiteArray (base.scale)
+            || (base.matrix && !finiteArray(*base.matrix))
+            || base.scale[0] == 0.0f || base.scale[1] == 0.0f || base.scale[2] == 0.0f)
+        {
+            error = "native deformation base pose does not preserve exact joint identity";
+            return false;
+        }
+        const float rotationNorm = base.rotation[0] * base.rotation[0]
+            + base.rotation[1] * base.rotation[1]
+            + base.rotation[2] * base.rotation[2]
+            + base.rotation[3] * base.rotation[3];
+        if (! finite (rotationNorm) || std::abs (rotationNorm - 1.0f) > 0.001f)
+        {
+            error = "native deformation base joint rotation is not normalized";
+            return false;
+        }
+        pose.indices.emplace (joint.id().value, index);
+        pose.translations.push_back (base.translation);
+        pose.rotations.push_back (base.rotation);
+        pose.scales.push_back (base.scale);
+    }
+    return true;
+}
+
+// Writes one 4x4 per joint: inverseObject * jointWorld * inverseBind. Animated
+// frames and the rest bake both come through here.
+bool writeJointPalette (const NativeDeformationScene& source,
+                        const visualdeformation::Skin& skin,
+                        const JointBasePose& pose,
+                        const Matrix& inverseObject,
+                        float* jointPalette,
+                        NativeSceneMotionSample::ImportedNodeWorldMatrices* worlds,
+                        std::string& error)
+{
+    std::vector<Matrix> world (skin.joints().size());
+    std::vector<std::uint8_t> state (skin.joints().size(), 0);
+    std::function<bool(std::size_t)> resolve = [&] (std::size_t index)
+    {
+        if (state[index] == 2) return true;
+        if (state[index] == 1) return false;
+        state[index] = 1;
+        auto local = compose (pose.translations[index], pose.rotations[index], pose.scales[index]);
+        if (source.jointBaseTransforms[index].matrix)
+            local = multiply(*source.jointBaseTransforms[index].matrix, local);
+        const auto parent = skin.joints()[index].parent();
+        if (parent.isValid())
+        {
+            const auto found = pose.indices.find (parent.value);
+            if (found == pose.indices.end() || ! resolve (found->second)) return false;
+            world[index] = multiply (world[found->second], local);
+        }
+        else world[index] = local;
+        state[index] = 2;
+        return true;
+    };
+    const auto& inverseBind = skin.inverseBindMatrixValues();
+    for (std::size_t index = 0; index < skin.joints().size(); ++index)
+    {
+        if (! resolve (index))
+        {
+            error = "native deformation skin hierarchy is not resolvable";
+            return false;
+        }
+        Matrix bind {};
+        if (worlds)
+        {
+            if (!finiteArray(world[index]))
+            { error = "native deformation sampled node world is invalid"; return false; }
+            worlds->push_back({skin.joints()[index].id().value, world[index]});
+        }
+        std::copy_n (inverseBind.data() + index * 16, 16, bind.data());
+        const auto palette = multiply (inverseObject, multiply (world[index], bind));
+        std::copy (palette.begin(), palette.end(), jointPalette + index * 16);
+    }
+    return true;
+}
 } // namespace
 
 static bool prepareOriginalNativeDeformationFrame (
@@ -172,9 +287,8 @@ static bool prepareOriginalNativeDeformationFrame (
     if (!source.draws.empty())
     {
         if (!source.scene || !HarmonicMIDI::grid::validateVisual3DScene(*source.scene).valid()
-            || source.draws.size() > HarmonicMIDI::grid::Visual3DScene::kMaxObjects
             || source.batchMember)
-        { error = "native deformation scene batch exceeds its bounds"; return false; }
+        { error = "native deformation scene batch needs a valid scene and cannot nest"; return false; }
         std::vector<bool> occupied(source.scene->vertexCount, false);
         for (const auto& draw : source.draws)
         {
@@ -340,41 +454,12 @@ static bool prepareOriginalNativeDeformationFrame (
 
     if (skin != nullptr)
     {
-        std::unordered_map<std::uint64_t, std::size_t> indices;
-        indices.reserve (skin->joints().size());
-        std::vector<std::array<float, 3>> translations;
-        std::vector<std::array<float, 4>> rotations;
-        std::vector<std::array<float, 3>> scales;
-        translations.reserve (skin->joints().size());
-        rotations.reserve (skin->joints().size());
-        scales.reserve (skin->joints().size());
-        for (std::size_t index = 0; index < skin->joints().size(); ++index)
-        {
-            const auto& joint = skin->joints()[index];
-            const auto& base = source.jointBaseTransforms[index];
-            if (base.skin != skin->id() || base.joint != joint.id()
-                || ! finiteArray (base.translation) || ! finiteArray (base.rotation)
-                || ! finiteArray (base.scale)
-                || (base.matrix && !finiteArray(*base.matrix))
-                || base.scale[0] == 0.0f || base.scale[1] == 0.0f || base.scale[2] == 0.0f)
-            {
-                error = "native deformation base pose does not preserve exact joint identity";
-                return false;
-            }
-            const float rotationNorm = base.rotation[0] * base.rotation[0]
-                + base.rotation[1] * base.rotation[1]
-                + base.rotation[2] * base.rotation[2]
-                + base.rotation[3] * base.rotation[3];
-            if (! finite (rotationNorm) || std::abs (rotationNorm - 1.0f) > 0.001f)
-            {
-                error = "native deformation base joint rotation is not normalized";
-                return false;
-            }
-            indices.emplace (joint.id().value, index);
-            translations.push_back (base.translation);
-            rotations.push_back (base.rotation);
-            scales.push_back (base.scale);
-        }
+        JointBasePose basePose;
+        if (! readJointBasePose (source, *skin, basePose, error)) return false;
+        const auto& indices = basePose.indices;
+        auto& translations = basePose.translations;
+        auto& rotations = basePose.rotations;
+        auto& scales = basePose.scales;
         std::vector<bool> animated (skin->joints().size(), false);
         for (const auto& evaluation : snapshot.jointTransforms())
         {
@@ -491,49 +576,11 @@ static bool prepareOriginalNativeDeformationFrame (
             }
         }
 
-        std::vector<Matrix> world (skin->joints().size());
-        std::vector<std::uint8_t> state (skin->joints().size(), 0);
-        std::function<bool(std::size_t)> resolve = [&] (std::size_t index)
-        {
-            if (state[index] == 2) return true;
-            if (state[index] == 1) return false;
-            state[index] = 1;
-            auto local = compose (translations[index], rotations[index], scales[index]);
-            if (source.jointBaseTransforms[index].matrix)
-                local = multiply(*source.jointBaseTransforms[index].matrix, local);
-            const auto parent = skin->joints()[index].parent();
-            if (parent.isValid())
-            {
-                const auto found = indices.find (parent.value);
-                if (found == indices.end() || ! resolve (found->second)) return false;
-                world[index] = multiply (world[found->second], local);
-            }
-            else world[index] = local;
-            state[index] = 2;
-            return true;
-        };
         const auto inverseObject = originalInverse ? *originalInverse : inverseTrs (object->transform);
-        const auto& inverseBind = skin->inverseBindMatrixValues();
         if (sampledWorlds) candidateWorlds.reserve(skin->joints().size());
-        for (std::size_t index = 0; index < skin->joints().size(); ++index)
-        {
-            if (! resolve (index))
-            {
-                error = "native deformation skin hierarchy is not resolvable";
-                return false;
-            }
-            Matrix bind {};
-            if (sampledWorlds)
-            {
-                if (!finiteArray(world[index]))
-                { error = "native deformation sampled node world is invalid"; return false; }
-                candidateWorlds.push_back({skin->joints()[index].id().value, world[index]});
-            }
-            std::copy_n (inverseBind.data() + index * 16, 16, bind.data());
-            const auto palette = multiply (inverseObject, multiply (world[index], bind));
-            std::copy (palette.begin(), palette.end(),
-                       candidate.jointPalette.begin() + index * 16);
-        }
+        if (! writeJointPalette (source, *skin, basePose, inverseObject, candidate.jointPalette.data(),
+                                 sampledWorlds ? &candidateWorlds : nullptr, error))
+            return false;
     }
 
     bool sampledMorph = false;
@@ -782,9 +829,10 @@ std::shared_ptr<const NativeDeformationCompositionOwner> NativeDeformationCompos
         error=message; return {};
     };
     const bool single=leafCount==1;
-    // Each leaf keeps its own node bound. Several leaves address leaf k's
-    // node r as k * kImportedLeafIdStride + r, so each also stays below it.
-    const std::size_t leafNodeCapacity=single?std::size_t(4096):std::size_t(scenecomposition::kImportedLeafIdStride);
+    // A single leaf has the nodes it has. Several leaves address leaf k's node r
+    // as k * kImportedLeafIdStride + r, so each stays below that id stride.
+    const std::size_t leafNodeCapacity=single && leaves[0].input.document
+        ? leaves[0].input.document->nodes.size():std::size_t(scenecomposition::kImportedLeafIdStride);
     std::size_t identity=leafCount;
     for (std::size_t k=0; k<leafCount && identity==leafCount; ++k) if (leaves[k].input.animation) identity=k;
     const auto validLeaf=[&](std::size_t k) {
@@ -829,7 +877,7 @@ std::shared_ptr<const NativeDeformationCompositionOwner> NativeDeformationCompos
     // Several leaves add their retained leaf records and one hierarchy walk
     // per leaf at that leaf's node bound.
     const auto n=mappings.size();
-    std::size_t bytes=2*singleLeafBytes()+4096*sizeof(bool)+12288*sizeof(bool)+n*(sizeof(NativeDeformationScene)+sizeof(visualdeformation::DeformationAsset)
+    std::size_t bytes=2*singleLeafBytes()+composed->vertexCount*sizeof(bool)+composed->indexCount*sizeof(bool)+n*(sizeof(NativeDeformationScene)+sizeof(visualdeformation::DeformationAsset)
             +sizeof(visualdeformation::Skin)+sizeof(visualdeformation::Joint)+sizeof(visualdeformation::Mesh)
             +sizeof(visualdeformation::JointWeightSet)+sizeof(NativeDeformationJointBaseTransform)
             +sizeof(std::vector<std::uint32_t>)+sizeof(std::vector<float>))
@@ -837,7 +885,7 @@ std::shared_ptr<const NativeDeformationCompositionOwner> NativeDeformationCompos
         +leafListBytes(leafCount);
     std::size_t work=leafCount*(leafNodeCapacity*leafNodeCapacity*64+leafNodeCapacity*512)+n*n*256
         +composed->vertexCount*256+composed->indexCount*32
-        +n*5*Visual3DScene::kMaxTextureTexels*sizeof(SceneTexelRgba8);
+        +n*5*composed->textureTexels.size()*sizeof(SceneTexelRgba8);
     if (bytes>kMaximumLogicalBytes || work>kMaximumLogicalWork)
         return refuse("native composition incremental owner storage or work exceeds capacity");
     NativeDeformationCompositionOwner candidate;
@@ -884,8 +932,8 @@ std::shared_ptr<const NativeDeformationCompositionOwner> NativeDeformationCompos
     const auto sourceScene=[&](std::size_t i) -> const Visual3DScene& {
         return mappings[i].kind==Kind::Imported ? *leaves[leafOf[i]].input.scene : *candidate.procedural_;
     };
-    std::array<bool,Visual3DScene::kMaxVertices> vertices {};
-    std::array<bool,Visual3DScene::kMaxIndices> indices {};
+    std::vector<bool> vertices(candidate.composed_->vertexCount);
+    std::vector<bool> indices(candidate.composed_->indexCount);
     for (std::size_t i=0; i<n; ++i)
     {
         const auto& mapping=mappings[i];
@@ -1640,18 +1688,7 @@ bool prepareNativeDeformationFrame(const NativeDeformationScene& source,
                         for (std::size_t row=0;row<3;++row)
                             linear[column*3+row]+=weight*candidate.jointPalette[joint*16+column*4+row];
                 }
-                // These float cofactors match the uploaded weighted matrix and
-                // the explicit cross-product normal transform in both shaders.
-                std::array<float,9> cofactors {
-                    linear[4]*linear[8]-linear[5]*linear[7],
-                    linear[5]*linear[6]-linear[3]*linear[8],
-                    linear[3]*linear[7]-linear[4]*linear[6],
-                    linear[7]*linear[2]-linear[8]*linear[1],
-                    linear[8]*linear[0]-linear[6]*linear[2],
-                    linear[6]*linear[1]-linear[7]*linear[0],
-                    linear[1]*linear[5]-linear[2]*linear[4],
-                    linear[2]*linear[3]-linear[0]*linear[5],
-                    linear[0]*linear[4]-linear[1]*linear[3]};
+                auto cofactors=linearCofactors(linear);
                 const float determinant=linear[0]*cofactors[0]+linear[1]*cofactors[1]+linear[2]*cofactors[2];
                 if (!finiteArray(linear) || !finite(determinant) || determinant==0)
                 { error="native composition weighted skin is singular or nonfinite"; return false; }
@@ -1677,5 +1714,199 @@ bool prepareNativeDeformationFrame (
     if (source.compositionOwner)
     { error = "native composition requires its exact typed frame"; return false; }
     return prepareOriginalNativeDeformationFrame(source, snapshot, output, error, sampledWorlds);
+}
+
+namespace
+{
+// The inverse of the object's whole world transform. A skinned mesh ignores its
+// node's transform, so the palette cancels it, parents included.
+bool objectWorldInverse (const HarmonicMIDI::grid::Visual3DScene& scene,
+                         const HarmonicMIDI::grid::SceneObjectRecord& object,
+                         Matrix& inverse, std::string& error)
+{
+    inverse = inverseTrs (object.transform);
+    auto parentId = object.parent;
+    for (std::size_t depth = 0; parentId.isValid() && depth < scene.objectCount; ++depth)
+    {
+        const auto* parent = findObject (scene, parentId);
+        if (parent == nullptr)
+        {
+            error = "native rest pose object parent is missing";
+            return false;
+        }
+        inverse = multiply (inverse, inverseTrs (parent->transform));
+        parentId = parent->parent;
+    }
+    if (parentId.isValid() || ! finiteArray (inverse))
+    {
+        error = "native rest pose object hierarchy has no inverse";
+        return false;
+    }
+    return true;
+}
+
+// Writes one mesh's range of output: morphs, then the palette a skinned mesh has.
+// Without a skin the morphed vertices stay in object space.
+bool writeBakedVertices (const visualdeformation::Mesh& mesh, const HarmonicMIDI::grid::SceneObjectRecord& object,
+                         const HarmonicMIDI::grid::Visual3DScene& scene, const float* morphWeights,
+                         std::size_t morphCount, const float* palette, std::size_t jointCount,
+                         HarmonicMIDI::grid::Visual3DScene& output, std::string& error)
+{
+    const auto& targets = mesh.morphTargets();
+    const std::vector<std::uint32_t>* indices = nullptr;
+    const std::vector<float>* weights = nullptr;
+    if (palette != nullptr)
+    {
+        indices = &mesh.jointWeightSets()[0].jointIndices();
+        weights = &mesh.jointWeightSets()[0].weights();
+    }
+    const auto unit = [] (std::array<float, 3>& value)
+    {
+        const auto length = std::sqrt (value[0] * value[0] + value[1] * value[1] + value[2] * value[2]);
+        if (length <= 1.0e-8f) return false;
+        for (auto& component : value) component /= length;
+        return true;
+    };
+    for (std::size_t vertex = 0; vertex < mesh.vertexCount(); ++vertex)
+    {
+        const auto& in = scene.vertices[object.firstVertex + vertex];
+        std::array<float, 3> position { in.position.x, in.position.y, in.position.z };
+        std::array<float, 3> normal { in.normal.x, in.normal.y, in.normal.z };
+        std::array<float, 3> tangent { in.tangent[0], in.tangent[1], in.tangent[2] };
+        for (std::size_t target = 0; target < morphCount; ++target)
+        {
+            const auto add = [&] (std::array<float, 3>& value, const std::vector<float>& deltas)
+            {
+                if (deltas.size() != mesh.vertexCount() * 3) return;
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                    value[axis] += morphWeights[target] * deltas[vertex * 3 + axis];
+            };
+            add (position, targets[target].positionDeltas());
+            add (normal, targets[target].normalDeltas());
+            add (tangent, targets[target].tangentDeltas());
+        }
+
+        std::array<float, 9> linear { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+        std::array<float, 3> translation {};
+        if (palette != nullptr)
+        {
+            linear = {};
+            for (std::size_t slot = 0; slot < 4; ++slot)
+            {
+                const auto joint = std::size_t ((*indices)[vertex * 4 + slot]);
+                const auto weight = (*weights)[vertex * 4 + slot];
+                if (weight == 0) continue;
+                if (joint >= jointCount)
+                {
+                    error = "native rest pose skin joint is outside its palette";
+                    return false;
+                }
+                for (std::size_t row = 0; row < 3; ++row)
+                {
+                    for (std::size_t column = 0; column < 3; ++column)
+                        linear[column * 3 + row] += weight * palette[joint * 16 + column * 4 + row];
+                    translation[row] += weight * palette[joint * 16 + 12 + row];
+                }
+            }
+        }
+        auto cofactors = linearCofactors (linear);
+        const float determinant = linear[0] * cofactors[0] + linear[1] * cofactors[1] + linear[2] * cofactors[2];
+        if (! finiteArray (linear) || ! finiteArray (translation) || ! finite (determinant) || determinant == 0)
+        {
+            error = "native rest pose weighted skin is singular or nonfinite";
+            return false;
+        }
+        const auto times = [&linear] (const std::array<float, 3>& value, std::size_t row)
+        {
+            return linear[row] * value[0] + linear[3 + row] * value[1] + linear[6 + row] * value[2];
+        };
+        const std::array<float, 3> skinnedPosition {
+            times (position, 0) + translation[0], times (position, 1) + translation[1],
+            times (position, 2) + translation[2] };
+        std::array<float, 3> skinnedTangent { times (tangent, 0), times (tangent, 1), times (tangent, 2) };
+        std::array<float, 3> skinnedNormal;
+        for (std::size_t row = 0; row < 3; ++row)
+            skinnedNormal[row] = (cofactors[row] * normal[0] + cofactors[3 + row] * normal[1]
+                + cofactors[6 + row] * normal[2]) / determinant;
+        if (! finiteArray (skinnedPosition) || ! finiteArray (skinnedNormal) || ! finiteArray (skinnedTangent))
+        {
+            error = "native rest pose weighted skin is singular or nonfinite";
+            return false;
+        }
+        unit (skinnedNormal);
+        if (! unit (skinnedTangent)) skinnedTangent = { 1.0f, 0.0f, 0.0f };
+
+        auto& out = output.vertices[object.firstVertex + vertex];
+        out.position = { skinnedPosition[0], skinnedPosition[1], skinnedPosition[2] };
+        out.normal = { skinnedNormal[0], skinnedNormal[1], skinnedNormal[2] };
+        out.tangent = { skinnedTangent[0], skinnedTangent[1], skinnedTangent[2],
+                        in.tangent[3] * (determinant < 0 ? -1.0f : 1.0f) };
+    }
+    return true;
+}
+} // namespace
+
+bool bakeNativeRestPose (const NativeDeformationScene& source,
+                         HarmonicMIDI::grid::Visual3DScene& output, std::string& error)
+{
+    using namespace visualdeformation;
+    error.clear();
+    const auto* scene = source.scene.get();
+    const auto* mesh = source.deformation ? source.deformation->findMesh (source.mesh) : nullptr;
+    const auto* object = scene ? findObject (*scene, source.object) : nullptr;
+    if (mesh == nullptr || object == nullptr || output.vertexCount != scene->vertexCount
+        || object->firstVertex > scene->vertexCount
+        || mesh->vertexCount() > scene->vertexCount - object->firstVertex)
+    {
+        error = "native rest pose object and mesh ranges are incompatible";
+        return false;
+    }
+    const auto* skin = source.deformation->findSkin (source.skin.value_or (mesh->skin()));
+    if (skin == nullptr || skin->joints().empty() || mesh->jointWeightSets().size() != 1
+        || source.jointBaseTransforms.size() != skin->joints().size()
+        || mesh->jointWeightSets()[0].jointIndices().size() != mesh->vertexCount() * 4
+        || mesh->jointWeightSets()[0].weights().size() != mesh->vertexCount() * 4)
+    {
+        error = "native rest pose skin does not match its mesh";
+        return false;
+    }
+    if ((! source.morphBaseWeights.empty() && source.morphBaseWeights.size() != mesh->morphTargets().size())
+        || ! std::all_of (source.morphBaseWeights.begin(), source.morphBaseWeights.end(), finite))
+    {
+        error = "native rest pose morph weights do not match the mesh targets";
+        return false;
+    }
+    Matrix inverseObject;
+    if (! objectWorldInverse (*scene, *object, inverseObject, error)) return false;
+    JointBasePose pose;
+    if (! readJointBasePose (source, *skin, pose, error)) return false;
+    std::vector<float> palette (skin->joints().size() * 16);
+    if (! writeJointPalette (source, *skin, pose, inverseObject, palette.data(), nullptr, error))
+        return false;
+    return writeBakedVertices (*mesh, *object, *scene, source.morphBaseWeights.data(), source.morphBaseWeights.size(),
+                               palette.data(), skin->joints().size(), output, error);
+}
+
+bool bakeNativeDeformation (const NativeDeformationScene& source,
+                            const visualdeformation::AnimationDeformationSnapshot& snapshot,
+                            HarmonicMIDI::grid::Visual3DScene& output, std::string& error)
+{
+    error.clear();
+    const auto* scene = source.scene.get();
+    const auto* mesh = source.deformation ? source.deformation->findMesh (source.mesh) : nullptr;
+    const auto* object = scene ? findObject (*scene, source.object) : nullptr;
+    if (mesh == nullptr || object == nullptr || output.vertexCount != scene->vertexCount)
+    {
+        error = "native deformation bake object and mesh ranges are incompatible";
+        return false;
+    }
+    Matrix inverseObject;
+    if (! objectWorldInverse (*scene, *object, inverseObject, error)) return false;
+    NativeDeformationFrameData frame;
+    if (! prepareOriginalNativeDeformationFrame (source, snapshot, frame, error, nullptr, &inverseObject))
+        return false;
+    return writeBakedVertices (*mesh, *object, *scene, frame.morphWeights.data(), frame.morphTargetCount,
+                               frame.jointCount != 0 ? frame.jointPalette.data() : nullptr, frame.jointCount,
+                               output, error);
 }
 } // namespace arbitgpu

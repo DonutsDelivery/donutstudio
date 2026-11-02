@@ -63,14 +63,8 @@ struct GeometryExecutionCache final {
       : source(backend), runtime(source), familyEvaluator(runtime) {}
 
   static timelineevaluation::Limits productionFamilyEvaluationLimits() noexcept {
-    timelineevaluation::Limits limits;
-    // Match the released source-visit policy for these additional logical
-    // passes. Neither allowance measures elapsed CPU or allocator/driver work.
-    limits.maxWaterIdentityVisits = 10000000;
-    limits.maxWaterRestPositionVisits = 10000000;
-    limits.maxWaterMemoCopyElements = 10000000;
-    limits.maxWaterColumnDiscoveryVisits = 10000000;
-    return limits;
+    // Production sets no Water ceiling. Only a failed allocation stops a frame.
+    return {};
   }
 
   // Member order retires retained frames before their admission/resource owners.

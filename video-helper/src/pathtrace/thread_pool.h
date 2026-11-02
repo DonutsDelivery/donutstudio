@@ -1,12 +1,14 @@
 #pragma once
 
-// Fixed worker pool that renders an image as square tiles. Workers claim tiles
-// from one atomic counter, so each tile of a pass runs exactly once unless the
-// pass is cancelled. Cancellation stops new tiles from starting; tiles already
-// running finish, so a viewport restart waits for at most one tile per thread.
+// Fixed worker pool that renders an image as square tiles. Each tile of a pass
+// runs exactly once unless the pass is cancelled. Cancellation stops new tiles
+// from starting; tiles already running finish, so a viewport restart waits for
+// at most one tile per thread. Several passes can be live at once. Workers take
+// turns between them, and at most concurrency() threads run tiles at any moment.
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -82,37 +84,51 @@ public:
 
     using TileFunction = std::function<void (const Tile& tile, unsigned threadIndex)>;
 
-    // Runs fn once per tile and blocks until the pass ends. The caller renders
-    // too, as threadIndex 0. Passes from several threads run one at a time. If
-    // fn throws, the pass stops claiming tiles and runTiles rethrows the first
-    // exception after every thread has left the pass.
+    // Runs fn once per tile and blocks until the pass ends. One caller at a time
+    // renders its own pass as threadIndex 0; any other caller sleeps until that
+    // seat is free or the workers finish its pass. threadIndex is unique among
+    // the threads running tiles. If fn throws, the pass stops claiming tiles and
+    // runTiles rethrows the first exception after every thread has left the pass.
+    // Called from inside a tile of this pool, it runs the new pass on that thread
+    // under the same threadIndex, because waiting for the pool's other threads
+    // could deadlock.
     TilePassResult runTiles (const TileGrid& grid, const CancellationToken& cancel, const TileFunction& fn);
 
 private:
+    // mutex_ guards nextTile, running and the error, along with the pool's state.
     struct Pass
     {
         const TileGrid* grid = nullptr;
         const CancellationToken* cancel = nullptr;
         const TileFunction* fn = nullptr;
-        std::atomic<std::uint32_t> nextTile { 0 };
-        std::atomic<std::uint32_t> completed { 0 };
-        std::atomic<bool> failed { false };
+        std::uint32_t tileCount = 0;
+        std::uint32_t nextTile = 0;
+        std::uint32_t completed = 0;
+        unsigned running = 0;
+        bool failed = false;
         std::exception_ptr error;
-        std::mutex errorMutex;
+
+        bool claimable() const noexcept { return ! failed && nextTile < tileCount && ! cancel->isCancelled(); }
     };
 
     void workerLoop (unsigned threadIndex);
-    static void drain (Pass& pass, unsigned threadIndex);
+    Pass* claimFromAnyPass();
+    void runClaimedTile (Pass& pass, std::uint32_t tileIndex, unsigned threadIndex);
+    TilePassResult runNested (const TileGrid& grid, const CancellationToken& cancel, const TileFunction& fn);
 
     std::vector<std::thread> workers_;
-    std::mutex submitMutex_;
     std::mutex mutex_;
     std::condition_variable wake_;
-    std::condition_variable done_;
-    Pass* pass_ = nullptr;
-    std::uint64_t passGeneration_ = 0;
-    unsigned busyWorkers_ = 0;
+    std::condition_variable progress_;
+    std::vector<Pass*> passes_;
+    std::size_t nextPass_ = 0;
+    bool callerSeatTaken_ = false;
     bool stopping_ = false;
 };
+
+// The process's one pool for pure-CPU render work, sized to the core count, so
+// that every Path Trace engine and the denoiser together stay within the cores.
+// Starts its threads on first use and lives until the process exits.
+ThreadPool& sharedThreadPool();
 
 } // namespace videohelper::pathtrace

@@ -19,8 +19,8 @@ namespace videohelper::vertexmodifier
 
 struct AdmissionLimits final
 {
-    std::size_t maxOperations = 128;
-    std::size_t maxDepth = 32;
+    std::size_t maxOperations = std::numeric_limits<std::size_t>::max();
+    std::size_t maxDepth = std::numeric_limits<std::size_t>::max();
     std::size_t maxParametersPerRecord = videowire::kVertexModifierMaximumParametersPerRecord;
     videowire::VertexModifierStableId maxStableId = 9007199254740991ull;
     double maxAbsoluteParameter = 1000000.0;
@@ -205,10 +205,8 @@ inline std::optional<AdmittedVertexModifierIr> admitVertexModifierIr(
     using Operation = videowire::VertexModifierOperation;
     error.clear();
 
-    constexpr std::size_t absoluteOperationLimit = 512;
-    constexpr std::size_t absoluteDepthLimit = 64;
-    if (limits.maxOperations == 0 || limits.maxOperations > absoluteOperationLimit
-        || limits.maxDepth == 0 || limits.maxDepth > absoluteDepthLimit
+    if (limits.maxOperations == 0
+        || limits.maxDepth == 0
         || limits.maxParametersPerRecord > videowire::kVertexModifierMaximumParametersPerRecord
         || limits.maxStableId == 0 || ! std::isfinite(limits.maxAbsoluteParameter)
         || ! std::isfinite(limits.minPositiveParameter)
@@ -343,38 +341,51 @@ inline std::optional<AdmittedVertexModifierIr> admitVertexModifierIr(
 
     std::vector<std::uint8_t> colors(records.size(), 0);
     std::vector<std::size_t> depths(records.size(), 0);
-    std::function<bool(std::size_t)> visit = [&](std::size_t index)
+    // An explicit stack, so a long chain of records cannot exhaust the thread's stack.
+    std::vector<std::pair<std::size_t, std::size_t>> pending;
+    for (std::size_t first = 0; first < records.size(); ++first)
     {
-        if (colors[index] == 1)
+        if (colors[first] != 0) continue;
+        colors[first] = 1;
+        pending.emplace_back(first, 0);
+        while (! pending.empty())
         {
-            error = "vertex modifier IR contains a cycle";
-            return false;
+            const auto index = pending.back().first;
+            if (pending.back().second < records[index].inputCount)
+            {
+                const auto child = indices.at(records[index].inputs[pending.back().second++]);
+                if (colors[child] == 1)
+                {
+                    error = "vertex modifier IR contains a cycle";
+                    return std::nullopt;
+                }
+                if (colors[child] == 0)
+                {
+                    colors[child] = 1;
+                    pending.emplace_back(child, 0);
+                }
+                continue;
+            }
+            std::size_t depth = 1;
+            for (std::size_t input = 0; input < records[index].inputCount; ++input)
+                depth = std::max(depth, depths[indices.at(records[index].inputs[input])] + 1);
+            colors[index] = 2;
+            depths[index] = depth;
+            pending.pop_back();
         }
-        if (colors[index] == 2) return true;
-        colors[index] = 1;
-        std::size_t depth = 1;
-        for (std::size_t input = 0; input < records[index].inputCount; ++input)
-        {
-            const auto child = indices.at(records[index].inputs[input]);
-            if (! visit(child)) return false;
-            depth = std::max(depth, depths[child] + 1);
-        }
-        colors[index] = 2;
-        depths[index] = depth;
-        return true;
-    };
-    for (std::size_t index = 0; index < records.size(); ++index)
-        if (! visit(index)) return std::nullopt;
+    }
 
     std::vector<bool> rootReachable(records.size(), false);
-    std::function<void(std::size_t)> markReachable = [&](std::size_t index)
+    std::vector<std::size_t> reachablePending { rootIndex };
+    while (! reachablePending.empty())
     {
-        if (rootReachable[index]) return;
+        const auto index = reachablePending.back();
+        reachablePending.pop_back();
+        if (rootReachable[index]) continue;
         rootReachable[index] = true;
         for (std::size_t input = 0; input < records[index].inputCount; ++input)
-            markReachable(indices.at(records[index].inputs[input]));
-    };
-    markReachable(rootIndex);
+            reachablePending.push_back(indices.at(records[index].inputs[input]));
+    }
     if (std::find(rootReachable.begin(), rootReachable.end(), false) != rootReachable.end())
     {
         error = "vertex modifier IR contains a record unreachable from its root";

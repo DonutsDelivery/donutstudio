@@ -1,15 +1,21 @@
 #include "glb_native_render_seam.h"
 #include "material_program_compiler.h"
 #include "native_scene_animation_composition.h"
+#include "loop_step_probe.h"
+#include <optional>
 #include <type_traits>
 #include <limits>
 #include <new>
 #include "surface_material_binding_admission.h"
 #include "gpu_backend/fixture_smooth_glass.h"
+#if ! defined(__APPLE__) && ARBIT_HAVE_OPENGL_SDF_BACKEND
+#include "gpu_backend/fixture_glass_caustics_opengl.h"
+#endif
 #include "../../shared/VisualImportedSceneRenderOperationContract.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <string>
 #include <utility>
 
@@ -23,34 +29,6 @@ GlbAdmissionOptions nativeRenderOptions (
     std::optional<std::size_t> sceneIndex)
 {
     GlbAdmissionOptions options;
-    auto& limits = options.limits;
-    limits.maxContainerBytes = GlbNativeRenderSeam::kMaxSourceBytes;
-    limits.maxJsonBytes = GlbNativeRenderSeam::kMaxJsonBytes;
-    limits.maxBinBytes = GlbNativeRenderSeam::kMaxBinBytes;
-    limits.maxScenes = 64;
-    limits.maxNodes = Visual3DScene::kMaxObjects
-                    + Visual3DScene::kMaxCameras
-                    + Visual3DScene::kMaxLights;
-    limits.maxNodeDepth = 64;
-    limits.maxMeshes = Visual3DScene::kMaxObjects;
-    limits.maxPrimitives = Visual3DScene::kMaxObjects;
-    limits.maxMaterials = Visual3DScene::kMaxMaterials;
-    limits.maxTextures = Visual3DScene::kMaxTextures;
-    limits.maxImages = Visual3DScene::kMaxTextures;
-    limits.maxSamplers = Visual3DScene::kMaxTextures;
-    limits.maxCameras = Visual3DScene::kMaxCameras;
-    limits.maxLights = Visual3DScene::kMaxLights;
-    limits.maxDecodedVertices = Visual3DScene::kMaxVertices;
-    limits.maxDecodedIndices = Visual3DScene::kMaxIndices;
-    limits.maxDecodedBytes = Visual3DScene::kMaxVertices
-                           * sizeof (HarmonicMIDI::grid::SceneVertex)
-                           + Visual3DScene::kMaxIndices * sizeof (std::uint32_t)
-                           + Visual3DScene::kMaxTextureTexels
-                               * sizeof (HarmonicMIDI::grid::SceneTexelRgba8);
-    limits.maxEmbeddedImageBytes = Visual3DScene::kMaxTextureTexels * 4u;
-    limits.maxDecodedImageBytes = Visual3DScene::kMaxTextureTexels * 4u;
-    limits.maxImageWidth = Visual3DScene::kMaxTextureDimension;
-    limits.maxImageHeight = Visual3DScene::kMaxTextureDimension;
     options.admitAnimations = true;
     options.admitSkins = true;
     options.supportedRequiredExtensions = {"KHR_lights_punctual"};
@@ -142,7 +120,7 @@ bool coldClosureBytes(const GlbStaticMeshDocument& document,
     // reserve grows to each prefix. Its largest retired capacity overlaps the
     // final new range while the selected vector implementation relocates it.
     texels = 0; textureGrowthOverlapTexels = 0;
-    std::array<bool, Visual3DScene::kMaxTextures> copied {};
+    std::vector<bool> copied(document.textures.size());
     if (!budget->work(document.textures.size()*document.materials.size(), 5*64, error)) return false;
     for (const auto& material : document.materials)
         for (const auto* info : {&material.baseColorTexture, &material.metallicRoughnessTexture,
@@ -150,15 +128,13 @@ bool coldClosureBytes(const GlbStaticMeshDocument& document,
         {
             if (!*info) continue;
             const auto index = (*info)->texture;
-            if (index >= document.textures.size() || index >= copied.size())
+            if (index >= document.textures.size())
             { error = "static cold texture index is invalid"; return false; }
             if (copied[index]) continue;
             const auto& texture = document.textures[index];
             if (texture.source >= document.images.size())
             { error = "static cold texture source is invalid"; return false; }
             const auto count = document.images[texture.source].decodedRgba8.size()/4;
-            if (count > Visual3DScene::kMaxTextureTexels-texels)
-            { error = "static cold texture closure exceeds the existing scene bound"; return false; }
             textureGrowthOverlapTexels = texels;
             texels += count;
             copied[index] = true;
@@ -406,6 +382,14 @@ GlbNativeRenderSeam::GlbNativeRenderSeam (
     arbitgpu::NativeFixtureSceneBackend& backend) noexcept
     : backend_ (backend), renderer_ (backend)
 {
+    // Bounded: a seam that is rebuilt per frame would reset its fixture renderer's
+    // resource cache every frame, which is what stops the water refit from ever
+    // being planned in a still docked preview.
+    static int made = 0;
+    ++made;
+    if (made <= 40)
+        std::fprintf (stderr, "[gl] seam ctor #%d renderer=%p\n", made,
+                      static_cast<const void*> (&renderer_));
 }
 
 bool GlbNativeRenderSeam::admit (
@@ -420,8 +404,6 @@ bool GlbNativeRenderSeam::admit (
 {
     if (bytes == nullptr || size == 0)
         return fail (error, "GLB decode rejected", "source bytes are empty");
-    if (size > kMaxSourceBytes)
-        return fail (error, "GLB decode rejected", "source exceeds the 16 MiB native-render bound");
 
     using Budget = modelpayload::NativeSceneAnimationCompositionBudget;
     std::shared_ptr<const Budget::Charge> fixedCharge, closureCharge;
@@ -429,20 +411,14 @@ bool GlbNativeRenderSeam::admit (
     if (documentBudget && !optionalDocumentRetention)
     {
         // Named cold work precedes decoder/parser/image visits. Source bytes
-        // cover container/JSON/BIN scans; admitted decoded lanes and record
-        // ceilings cover expansion, original hierarchy and adapter products.
-        const auto limits = nativeRenderOptions(sceneIndex).limits;
-        constexpr std::uint64_t coldSourceVisit = 64, coldDecodedByteVisit = 8,
-            coldHierarchyVisit = 64, coldDecodedRecordVisit = 4096;
-        if (!documentBudget->work(size, coldSourceVisit, error)
-            || !documentBudget->work(limits.maxDecodedBytes, coldDecodedByteVisit, error)
-            || !documentBudget->work(limits.maxNodes*limits.maxNodes, coldHierarchyVisit, error)
-            || !documentBudget->work(limits.maxNodes, 6*4096+2*4096+coldHierarchyVisit, error)
-            || !documentBudget->work(limits.maxDecodedVertices+limits.maxDecodedIndices, coldDecodedRecordVisit, error)) return false;
+        // cover container/JSON/BIN scans. Expansion is charged from the parsed
+        // document, because no document ceiling exists to charge in advance.
+        constexpr std::uint64_t coldSourceVisit = 64;
+        if (!documentBudget->work(size, coldSourceVisit, error)) return false;
         const std::string empty;
         const auto fixedBytes = 2*sizeof(Visual3DScene)+sizeof(GlbNativeSceneAdmission)
             +sizeof(ColdRetention)+sizeof(Budget::Charge)
-            +4*Visual3DScene::kMaxLights*(empty.capacity()+1);
+            +4*Visual3DScene::kInitialLights*(empty.capacity()+1);
         fixedCharge = Budget::reserve(documentBudget, fixedBytes, error);
         if (!fixedCharge) return false;
     }
@@ -708,10 +684,20 @@ bool GlbNativeRenderSeam::publishSurfacePrograms (
     const geometrysurfacematerial::ObjectPrograms& programs,
     const videowire::geometry::RuntimeFieldEvaluation& evaluation, std::string& error,
     const diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest* diffraction,
-    const visualimportedscenerender::GlassCausticSelection* caustic)
+    const visualimportedscenerender::GlassCausticSelection* caustic,
+    const geometry::TimelineSceneEvaluationInputs* materialInputs)
 {
+    // The lighthouse window lost ~9.2 s in payload-lights minus pre-render, a
+    // one-time cost on the first publish of a scene's material (the second
+    // publish runs in ~1 ms), so this whole publication reports its share.
+    loopstep::Scope publishScope ("advance:imported-scene:seam-publish");
     if (!admission.valid() || programs.empty())
         return fail(error, "native Surface collection publication rejected", "scene or object programs are empty");
+    // Named first: the operation build, encode and identity hash run here before
+    // any section scope exists, and they are what remains unassigned in the cold
+    // 9.6-second publication total.
+    std::optional<loopstep::Scope> identityScope;
+    identityScope.emplace ("advance:imported-scene:seam-identity");
     const auto& request = programs.front().program.material;
     visualimportedscenerender::Request operation;
     operation.sourceStableId = admission.scene->id.value;
@@ -722,31 +708,82 @@ bool GlbNativeRenderSeam::publishSurfacePrograms (
     operation.surfacePrograms = programs;
     if (diffraction) operation.diffractionMaterial = *diffraction;
     if (caustic) operation.glassCaustic = *caustic;
-    if (!visualimportedscenerender::valid(operation))
+    // The scene is an immutable shared snapshot, and only a request that passed is kept here.
+    const bool unchangedRequest = lastIdentityRequest_ != nullptr
+        && lastIdentityRequest_->sceneSnapshot == operation.sceneSnapshot
+        && visualimportedscenerender::sameRequest(*lastIdentityRequest_, operation);
+    if (!unchangedRequest && !visualimportedscenerender::valid(operation))
         return fail(error, "native Surface collection publication rejected", "mixed object identities or revisions are invalid");
     if (request.programRevision < highestMaterialRevisionSeen_)
         return fail(error, "native Surface collection publication rejected", "program revision is stale");
     highestMaterialRevisionSeen_ = std::max(highestMaterialRevisionSeen_, request.programRevision);
-    const auto identity = videohelper::sha256Text(visualimportedscenerender::encode(operation));
+    // An unchanged request keeps its digest. A sea of a million vertices encodes to 276 MB,
+    // and this runs on every published sample.
+    if (!unchangedRequest)
+    {
+        lastIdentityDigest_ = videohelper::sha256Text(visualimportedscenerender::encode(operation));
+        lastIdentityRequest_ = std::make_shared<const visualimportedscenerender::Request>(operation);
+    }
+    const auto& identity = lastIdentityDigest_;
     const bool sameScene = materialScene_.lock() == admission.scene;
     if (sameScene && lastGoodMaterial_ && request.programRevision == lastGoodMaterialRevision_
         && (request.evaluationRevision < lastGoodMaterial_->evaluationRevision()
             || (request.evaluationRevision == lastGoodMaterial_->evaluationRevision()
                 && identity != lastSurfaceProgramsIdentity_)))
         return fail(error, "native Surface collection publication rejected", "revision names a different immutable object collection");
+    // A converging preview publishes the same material once per sample, and each admission
+    // validates the whole scene several times. Anything else that replaced the published
+    // material changes these owners.
+    if (unchangedRequest && sameScene && lastGoodMaterial_ && materialInputs && publishedMaterialInputs_
+        && *publishedMaterialInputs_ == *materialInputs && identity == lastSurfaceProgramsIdentity_
+        && publishedMaterial_.lock() == lastGoodMaterial_
+        && publishedDiffraction_.lock() == lastGoodDiffractionMaterial_)
+    { error.clear(); return true; }
+    const auto rememberPublication = [&]
+    {
+        publishedMaterialInputs_.reset();
+        if (materialInputs) publishedMaterialInputs_ = *materialInputs;
+        publishedMaterial_ = lastGoodMaterial_;
+        publishedDiffraction_ = lastGoodDiffractionMaterial_;
+    };
     using videohelper::materialprogram::BackendTarget;
     const auto backend = backend_.info().backend;
     const auto target = backend == "metal" ? BackendTarget::Metal
         : backend == "opengl" ? BackendTarget::OpenGl : BackendTarget::Invalid;
+    // The cold publication spends ~9046 ms in this function; name each heavy
+    // section so the next window run assigns the seconds to one of them.
+    identityScope.reset ();
+    std::optional<loopstep::Scope> sectionScope;
+    sectionScope.emplace ("advance:imported-scene:seam-material-admit");
+    ++surfaceMaterialAdmissions_;
     auto candidate = videorender::fixture3d::admitSurfaceMaterialCollection(admission.scene, programs, evaluation, target, error);
     if (!candidate) return false;
+    sectionScope.reset();
+    // The two unscoped warm regions: each submitted instantly on the observed
+    // runs, so any remaining unassigned publish time belongs to them or to a
+    // lock they wait on, and both now report.
+    std::optional<loopstep::Scope> warmScope;
+    warmScope.emplace ("advance:imported-scene:seam-dispatch-warm");
+    const auto* selectedMaterial = caustic
+        ? arbitgpu::nativeSurfaceForObject (candidate->nativeProgram().get(), caustic->glassObject)
+        : nullptr;
+    const bool exactGlass = selectedMaterial != nullptr
+        && selectedMaterial->authoredScene == admission.scene->id
+        && selectedMaterial->authoredMaterial == caustic->glassMaterial
+        && selectedMaterial->parameters.identifiers[0] == caustic->glassMaterial.value
+        && selectedMaterial->parameters.identifiers[1]
+            == static_cast<std::uint32_t> (
+                surfacematerial::TransportMode::ClosedVolume);
     std::shared_ptr<const videorender::fixture3d::AdmittedDiffractionMaterialBinding> grating;
     if (diffraction)
     {
         const auto consumer = caustic ? arbitgpu::NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders
                                      : arbitgpu::NativeFixtureDiffractionConsumer::FiniteLobe;
+        warmScope.reset ();
+        sectionScope.emplace ("advance:imported-scene:seam-grating");
         grating = videorender::fixture3d::admitDiffractionMaterialBinding(admission.scene, *diffraction, target, error, true, consumer);
         if (!grating) return false;
+        sectionScope.reset();
         if (caustic)
         {
             auto mixed = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram>(*grating->nativeProgram());
@@ -758,20 +795,52 @@ bool GlbNativeRenderSeam::publishSurfacePrograms (
             const arbitgpu::smoothglass::DistinctGratingAdmission gratingOwner {
                 grating->object(), grating->materialIR() };
             arbitgpu::smoothglass::Prepared prepared;
+            sectionScope.emplace ("advance:imported-scene:seam-smoothglass");
             if (!arbitgpu::smoothglass::prepare(admission.scene, mixed, {}, prepared, error, {}, &gratingOwner)) return false;
+            sectionScope.reset();
             if (!prepared.enabled || prepared.object != caustic->glassObject || prepared.material != caustic->glassMaterial)
                 return fail(error, "native discrete grating publication rejected", "selected closed glass owner is not retained");
         }
     }
+    // Fixture link immediately after the grating: it was the binding tail at the
+    // end of this 9.6-second publication, so the first frame waited for a link
+    // that could start at publication start. Its key needs the grating alone.
+    warmScope.emplace ("advance:imported-scene:seam-fixture-link");
+    if (exactGlass)
+    {
+        const bool volume = arbitgpu::smoothglass::causticVolumeNeedsSlot (
+            candidate->nativeProgram().get(), caustic->glassObject);
+        backend_.startFixtureProgramLink (candidate->nativeProgram(),
+                                          grating != nullptr, volume);
+    }
+    warmScope.reset ();
+    // The dispatch warm submits after the fixture link: the link's context
+    // initializes its parallel-compile state first, while the driver pool is
+    // still idle, and the dispatch compile then fills the pool for the overlap.
+    warmScope.emplace ("advance:imported-scene:seam-dispatch-warm");
+    if (exactGlass)
+    {
+#if ! defined(__APPLE__) && ARBIT_HAVE_OPENGL_SDF_BACKEND
+        const bool rough = selectedMaterial->parameters.emissionRoughness[3] > 0.0f;
+        std::string dispatchError;
+        arbitgpu::prepareOpenGlGlassCausticPrograms (rough, rough,
+            arbitgpu::NativeFixturePrepareUse::Preview, dispatchError);
+        if (! dispatchError.empty())
+            std::fprintf (stderr, "[gl] caustic dispatch warm skipped: %s\n",
+                          dispatchError.c_str());
+#endif
+    }
+    warmScope.reset ();
     if (sameScene && lastGoodMaterial_ && identity == lastSurfaceProgramsIdentity_
         && candidate->bindingDigest() == lastGoodMaterial_->bindingDigest())
-    { error.clear(); return true; }
+    { rememberPublication(); error.clear(); return true; }
     materialScene_ = admission.scene;
     lastGoodMaterial_ = std::move(candidate);
     lastGoodDiffractionMaterial_ = std::move(grating);
     lastSurfaceProgramsIdentity_ = identity;
     lastGoodMaterialRevision_ = request.programRevision;
     rejectedMaterialRevision_ = 0;
+    rememberPublication();
     error.clear(); return true;
 }
 

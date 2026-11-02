@@ -120,7 +120,8 @@ float besselJ(int order, float argument)
     const int magnitude = order < 0 ? -order : order;
     const float halfArgument = 0.5f * argument;
     float term = 1.0f;
-    for (int factor = 1; factor <= 8; ++factor)
+    // The third-family convolution reaches order 12.
+    for (int factor = 1; factor <= 12; ++factor)
     {
         if (factor <= magnitude)
             term *= halfArgument / float(factor);
@@ -131,47 +132,65 @@ float besselJ(int order, float argument)
         term *= -(halfArgument * halfArgument)
               / (float(seriesIndex) * float(magnitude + seriesIndex));
         sum += term;
+        // Past the peak; no later term can round into the float sum.
+        if (abs(term) <= 2.98e-8f * abs(sum))
+            break;
     }
     return sum;
 }
 
-float profileEfficiency(int profile, int signedOrder, float duty,
-                        float phase, float2 terracePhase)
-{
+float2 profileAmplitude(int profile, int signedOrder, float duty,
+                      float phase, float2 terracePhase) {
     constexpr float pi = 3.14159265358979323846f;
-    if (profile == profileBinaryRectangular)
-    {
+    if (profile == profileBinaryRectangular) {
         if (signedOrder == 0)
-        {
-            const float2 amplitude = float2(1.0f - duty, 0.0f)
-                                   + duty * terracePhase;
-            return dot(amplitude, amplitude);
-        }
-        const float order = float(signedOrder);
-        const float aperture = sin(pi * order * duty) / (pi * order);
-        const float rotation = -pi * order * duty;
-        const float2 amplitude = aperture * complexMultiply(
-            terracePhase - float2(1.0f, 0.0f),
-            float2(cos(rotation), sin(rotation)));
-        return dot(amplitude, amplitude);
+            return float2(1.0f - duty, 0.0f) + duty * terracePhase;
+        float order = float(signedOrder);
+        // Measured from the groove centre, so the three families of a lattice
+        // share a centre of symmetry.
+        return sin(pi * order * duty) / (pi * order)
+            * (terracePhase - float2(1.0f, 0.0f));
     }
-    if (profile == profileSinusoidal)
-    {
-        const float amplitude = besselJ(signedOrder, 0.5f * phase);
-        return amplitude * amplitude;
+    if (profile == profileSinusoidal) {
+        // exp(i b cos x) = sum i^m J_m(b) exp(i m x).
+        int magnitude = signedOrder < 0 ? -signedOrder : signedOrder;
+        float bessel = besselJ(magnitude, 0.5f * phase);
+        int quarterTurns = magnitude - 4 * (magnitude / 4);
+        return quarterTurns == 0 ? float2(bessel, 0.0f)
+            : quarterTurns == 1 ? float2(0.0f, bessel)
+            : quarterTurns == 2 ? float2(-bessel, 0.0f) : float2(0.0f, -bessel);
     }
-    if (profile == profileBlazedSawtooth)
-    {
-        const float orderFrequency = -2.0f * pi * float(signedOrder);
-        const float2 ramp = complexExponentialIntegral(
-            phase / duty + orderFrequency, 0.0f, duty);
-        const float2 land = complexExponentialIntegral(
-            orderFrequency, duty, 1.0f);
-        const float2 amplitude = ramp + land;
-        return dot(amplitude, amplitude);
+    if (profile == profileBlazedSawtooth) {
+        float orderFrequency = -2.0f * pi * float(signedOrder);
+        return complexExponentialIntegral(phase / duty + orderFrequency, 0.0, duty)
+            + complexExponentialIntegral(orderFrequency, duty, 1.0f);
     }
-    return -1.0f;
+    return float2(0.0f);
 }
+
+float latticeEfficiency(int profile, int primary, int secondary,
+                        bool crossed, bool thirdFamily, float duty,
+                        float phase, float2 terracePhase) {
+    float2 first = profileAmplitude(profile, primary, duty, phase, terracePhase);
+    if (!crossed)
+        return dot(first, first);
+    if (!thirdFamily) {
+        float2 second = profileAmplitude(profile, secondary, duty, phase, terracePhase);
+        return dot(first, first) * dot(second, second);
+    }
+    // The third family's reciprocal vector is g1/d1 - g2/d2, so its order r
+    // lands on (m + r, n - r) and the amplitudes convolve. Radius 4 matches
+    // kThirdFamilyConvolutionRadius.
+    float2 sum = float2(0.0f);
+    for (int r = -4; r <= 4; ++r)
+        sum += complexMultiply(
+            complexMultiply(
+                profileAmplitude(profile, primary - r, duty, phase, terracePhase),
+                profileAmplitude(profile, secondary + r, duty, phase, terracePhase)),
+            profileAmplitude(profile, r, duty, phase, terracePhase));
+    return dot(sum, sum);
+}
+
 
 fragment FragmentOut _main(constant Params& u [[buffer(0)]])
 {
@@ -229,10 +248,8 @@ fragment FragmentOut _main(constant Params& u [[buffer(0)]])
         const float zeroPhase = 4.0f * pi * u.geometry.w * u.incident.z / wavelength;
         const float2 zeroTerracePhase = float2(cos(zeroPhase), sin(zeroPhase));
 
-        const float zeroProfileEfficiency = profileEfficiency(
-            profile, 0, duty, zeroPhase, zeroTerracePhase);
-        const float zeroEfficiency = zeroCoherent * zeroProfileEfficiency
-            * (crossedTwoDimensional ? zeroProfileEfficiency : 1.0f);
+        const float zeroEfficiency = zeroCoherent * latticeEfficiency(profile, 0, 0,
+            crossedTwoDimensional, u.control.z > 0.5f, duty, zeroPhase, zeroTerracePhase);
         float higherEfficiency = 0.0f;
         float3 wavelengthDirectionMoment = zeroEfficiency
             * float3(-u.incident.xy, u.incident.z);
@@ -274,11 +291,8 @@ fragment FragmentOut _main(constant Params& u [[buffer(0)]])
                     * (u.incident.z + outgoing.z) / wavelength;
                 const float2 terracePhase = float2(cos(phase), sin(phase));
                 float efficiency = coherentRoughnessFraction(
-                    u, wavelength, outgoing.z) * profileEfficiency(
-                        profile, primaryOrder, duty, phase, terracePhase);
-                if (crossedTwoDimensional)
-                    efficiency *= profileEfficiency(
-                        profile, secondaryOrder, duty, phase, terracePhase);
+                    u, wavelength, outgoing.z) * latticeEfficiency(profile, primaryOrder, secondaryOrder,
+                        crossedTwoDimensional, u.control.z > 0.5f, duty, phase, terracePhase);
                 efficiency *= outgoing.z / u.incident.z;
                 higherEfficiency += efficiency;
                 wavelengthDirectionMoment += efficiency * outgoing;

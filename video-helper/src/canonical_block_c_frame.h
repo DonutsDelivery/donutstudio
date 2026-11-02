@@ -109,11 +109,17 @@ public:
     const std::array<FrozenNotationNote, arbitblockc::kMaxNotes> notationRows;
     const int noteRowCount;
     const int linkRowCount;
+    const int droppedNotes;
+    const int droppedLinks;
     const float packedBeat;
     const float rootFrequencyHz;
     const float scoreHistoryBeats;
     const float scoreLookaheadBeats;
     const std::array<float, 6> primeBasis;
+    // The whole score this frame was packed from. The rows above hold the 128
+    // notes and 256 links the shader textures have room for; a consumer that
+    // needs no texture reads every resident note here.
+    const std::shared_ptr<const arbitmod::Score> sourceScore;
 
     const auto& noteTexture() const noexcept { return noteTextureValues; }
     const auto& linkTexture() const noexcept { return linkTextureValues; }
@@ -131,20 +137,22 @@ public:
 private:
     friend class FrameProducer;
     CanonicalBlockCFrame (
-        FrameKey keyIn, int noteCount, int linkCount, float beat,
+        FrameKey keyIn, int noteCount, int linkCount, int notesDropped, int linksDropped, float beat,
         float rootFrequency, float history, float lookahead,
         std::array<float, kNoteTextureValues> notes,
         std::array<float, kLinkTextureValues> links,
         std::array<std::int64_t, arbitblockc::kMaxNotes> noteIds,
         std::array<std::int64_t, arbitblockc::kMaxLinks> linkIds,
-        std::array<FrozenNotationNote, arbitblockc::kMaxNotes> notation)
+        std::array<FrozenNotationNote, arbitblockc::kMaxNotes> notation,
+        std::shared_ptr<const arbitmod::Score> source)
         : version(kCanonicalBlockCFrameVersion), key(keyIn),
           noteTextureValues(std::move(notes)), linkTextureValues(std::move(links)),
           noteIdentities(std::move(noteIds)), linkIdentities(std::move(linkIds)),
           notationRows(std::move(notation)), noteRowCount(noteCount),
-          linkRowCount(linkCount), packedBeat(beat), rootFrequencyHz(rootFrequency),
+          linkRowCount(linkCount), droppedNotes(notesDropped), droppedLinks(linksDropped),
+          packedBeat(beat), rootFrequencyHz(rootFrequency),
           scoreHistoryBeats(history), scoreLookaheadBeats(lookahead),
-          primeBasis{{2, 3, 5, 7, 11, 13}}
+          primeBasis{{2, 3, 5, 7, 11, 13}}, sourceScore(std::move(source))
     {}
 };
 
@@ -308,9 +316,10 @@ public:
         }
         lastFrame_ = key.frame;
         last_ = std::shared_ptr<const CanonicalBlockCFrame>(new CanonicalBlockCFrame(
-            key, packed.noteCount, packed.linkCount, packed.beat, score->rootFreq,
+            key, packed.noteCount, packed.linkCount, packed.droppedNotes, packed.droppedLinks,
+            packed.beat, score->rootFreq,
             score->historyBeats, score->lookaheadBeats, std::move(notes), std::move(links),
-            packed.noteIds, packed.linkIds, std::move(notation)));
+            packed.noteIds, packed.linkIds, std::move(notation), score));
         return valid(last_) ? last_ : reject();
     }
 

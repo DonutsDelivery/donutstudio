@@ -1654,7 +1654,7 @@ kernel void glassCameraGratingTrace(constant CTParams& u [[buffer(0)]],device co
     float3 initial=causticCameraRay(float2(pixel)+offset,u.rotation,u.projection,float2(u.extent.xy));
     result.originMinimum=float4(u.camera.xyz,1e-5f);result.directionMaximum=float4(initial,u.projection.w);
     if(location>4u||any(pixel>=u.extent.xy)||result.input.pixel.w!=1u||u.glass.z!=1u
-        ||any(result.input.control!=uint4(u.extent.xy,0u,0u))||!sceneFinite(ior)||ior<1.0f||ior>3.0f) {
+        ||any(result.input.control!=uint4(u.extent.xy,0u,0u))||!sceneFinite(ior)||ior<1.0f) {
         result.work.y=2u;result.parameters.z=as_type<uint>(1.0f);results[index]=result;return;
     }
     CTBranch pending[16];uint size=1u,count=0u;CTBranch root={};

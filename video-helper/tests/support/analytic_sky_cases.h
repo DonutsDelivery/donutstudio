@@ -3,14 +3,123 @@
 #include "fixture_scene.h"
 #include "../../../shared/HdrImageOutputContract.h"
 #include "../../src/gpu_backend/backend.h"
+#include "../../src/gpu_backend/fixture_analytic_sky.h"
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <vector>
 
 namespace videohelper::tests
 {
+// Clouds must change what the frame shows. The sky is a flat (.1,.2,.8), so red is
+// .1 everywhere until a cloud covers it, and a cloud's ambient white comes from the
+// blue channel. The measure is cloudShare: the fraction of a 65 by 65 frame looking
+// 50 degrees up whose red exceeds .15. The thresholds come from evaluating the
+// recipe offline. There, coverage .35 gives a share of .42 and coverage 1 gives 1.
+inline bool analyticSkyCloudCases(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
+{
+    using namespace HarmonicMIDI::grid;
+    struct Clouds { float coverage=0, type=0, drift=0, heading=0; };
+    struct Frame { std::vector<std::uint8_t> bytes; std::vector<double> red; };
+    const auto render=[&](Clouds clouds,bool mirror,Frame& output) {
+        auto scene=fixture3d::makeScene();
+        scene.vertexCount=4; scene.indexCount=6;
+        scene.objects[0].vertexCount=4; scene.objects[0].indexCount=6;
+        scene.ambientColor={}; scene.lightCount=1;
+        scene.materials[0].baseColor={1,1,1}; scene.materials[0].baseColorTexture={};
+        scene.materials[0].metallic=1; scene.materials[0].roughness=.05f; scene.materials[0].emissive={};
+        auto& light=scene.lights[0]; light.kind=SceneLightKind::Environment; light.transform={};
+        light.color={1,1,1}; light.intensity=1;
+        light.sky.version=1;
+        light.sky.zenith=light.sky.horizon=light.sky.ground={.1f,.2f,.8f};
+        light.sky.sunIntensity=0; light.sky.sunRadiusDegrees=15;
+        light.sky.cloudCoverage=clouds.coverage; light.sky.cloudType=clouds.type;
+        light.sky.cloudDrift=clouds.drift; light.sky.cloudHeadingDegrees=clouds.heading;
+        scene.cameras[0].transform={};
+        scene.objects[0].transform={};
+        if (mirror)
+        {
+            // A plane tilted 30 degrees sends the camera's center ray 60 degrees up.
+            scene.objects[0].transform.rotation={-.2588190451f,0,0,.9659258263f};
+            scene.objects[0].transform.translation={0,-.5f,.1339745962f};
+            scene.cameras[0].transform.translation={0,0,5};
+        }
+        else
+        {
+            scene.objects[0].transform.translation={0,0,20};
+            scene.cameras[0].transform.rotation={.4226182617f,0,0,.906307787f};
+        }
+        const auto snapshot=std::make_shared<const Visual3DScene>(std::move(scene));
+        const auto prepared=backend.prepare(snapshot);
+        if (!prepared.prepared) {error=prepared.error;return false;}
+        arbitgpu::NativeFixtureSceneRuntimeInputs inputs; inputs.linearColor=true;
+        const auto frame=backend.render(snapshot,prepared.resources,65,65,inputs);
+        arbitgpu::NativeRawPassPixels pixels;
+        if (!frame.rendered || !frame.frame
+            || !frame.frame->readRawPass(renderpassoutput::Output::Color,pixels,error)
+            || pixels.bytes.size()!=65*65*8)
+        {error="Cloud frame missing owned native float pixels: "+frame.error+error;return false;}
+        output.bytes=pixels.bytes;
+        output.red.resize(65*65);
+        for (std::size_t i=0;i<output.red.size();++i)
+        {
+            std::uint16_t half=0;std::memcpy(&half,pixels.bytes.data()+i*8,2);
+            output.red[i]=hdrimage::halfToFloat(half);
+        }
+        return true;
+    };
+    const auto cloudShare=[](const Frame& frame) {
+        std::size_t count=0;
+        for (const auto red:frame.red) if (red>.15) ++count;
+        return static_cast<double>(count)/frame.red.size();
+    };
+    const auto spread=[](const Frame& frame) {
+        double mean=0,energy=0;
+        for (const auto red:frame.red) mean+=red/frame.red.size();
+        for (const auto red:frame.red) energy+=(red-mean)*(red-mean)/frame.red.size();
+        return std::sqrt(energy);
+    };
+    Frame clear,parked,some,drifted,streaky,turned,closed,partial;
+    if (!render({},false,clear) || !render({0,1,3,40},false,parked) || !render({.35f},false,some)
+        || !render({.35f,0,.5f},false,drifted) || !render({.35f,1},false,streaky)
+        || !render({.35f,0,0,90},false,turned) || !render({1},false,closed) || !render({.45f},false,partial))
+        return false;
+    if (cloudShare(clear)!=0 || spread(clear)>1e-3)
+    {error="Clear sky frame is not the flat authored radiance";return false;}
+    if (parked.bytes!=clear.bytes)
+    {error="Zero cloud coverage changed the clear sky bytes";return false;}
+    if (cloudShare(some)<.2 || cloudShare(some)>.7 || spread(some)<.1)
+    {error="Cloud coverage .35 did not draw broken clouds, share "+std::to_string(cloudShare(some))
+        +" spread "+std::to_string(spread(some));return false;}
+    if (cloudShare(closed)<.98)
+    {error="Cloud coverage 1 did not close the sky, share "+std::to_string(cloudShare(closed));return false;}
+    if (drifted.bytes==some.bytes || streaky.bytes==some.bytes || turned.bytes==some.bytes)
+    {error="Cloud drift, type or heading did not change the frame";return false;}
+    const auto center=32*65+32;
+    const auto uniforms=[] {
+        SceneLightRecord light; light.kind=SceneLightKind::Environment; light.color={1,1,1}; light.intensity=1;
+        light.sky.version=1; light.sky.zenith=light.sky.horizon=light.sky.ground={.1f,.2f,.8f};
+        light.sky.sunIntensity=0; light.sky.sunRadiusDegrees=15; light.sky.cloudCoverage=.45f;
+        return arbitgpu::analyticsky::uniforms(light);
+    }();
+    const auto twin=arbitgpu::analyticsky::radiance({0,.7660444431f,-.6427876097f},uniforms)[0];
+    if (std::abs(partial.red[center]-twin)>.02)
+    {error="Shader cloud radiance "+std::to_string(partial.red[center])+" differs from the C++ twin "
+        +std::to_string(twin);return false;}
+    // The BRDF path uses the same field, so a mirror must reflect the closed layer.
+    Frame clearMirror,closedMirror;
+    if (!render({},true,clearMirror) || !render({1},true,closedMirror)) return false;
+    if (clearMirror.red[center]>.12 || closedMirror.red[center]<.4)
+    {error="Mirror did not reflect the cloud layer: clear "+std::to_string(clearMirror.red[center])
+        +" closed "+std::to_string(closedMirror.red[center]);return false;}
+    std::cout << "analytic-sky-clouds backend=" << backend.info().backend
+              << " share=" << cloudShare(some) << " spread=" << spread(some)
+              << " closedShare=" << cloudShare(closed) << " mirror=" << closedMirror.red[center] << '\n';
+    return true;
+}
+
 // Authored independent binary64 visible-normal and cosine quadrature values.
 // No expected pixel is obtained by calling the production sky/BRDF function.
 inline bool analyticSkyCases(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
@@ -150,6 +259,6 @@ inline bool analyticSkyCases(arbitgpu::NativeFixtureSceneBackend& backend,std::s
         }
         std::cout << '\n';
     }
-    return true;
+    return analyticSkyCloudCases(backend,error);
 }
 } // namespace videohelper::tests

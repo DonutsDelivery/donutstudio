@@ -1174,35 +1174,7 @@ bool verifyCameraLightCompositionProductionJoin(arbitgpu::NativeDeformationBacke
     if (!bounded) return refuse("camera/light escaped reset sources exceeded their finite logical allowance");
     escaped.clear();execution.reset();
     if (!execution.executePreview(request,output,error)) return false;
-    // Inactive slots are valid authored input but are still copied and retained.
-    // The oversized request must refuse at CPU admission, preserving the exact
-    // previously submitted image and source rather than reaching native render.
     auto identityRequest=request;
-    auto oversized=std::make_shared<Visual3DScene>(*procedural);
-    oversized->lights.back().environmentImage.asset.id.assign(
-        NativeSceneAnimationCompositionBudget::kMaximumBytes,'i');
-    if (!validateVisual3DScene(*oversized).valid())
-        return refuse("inactive oversized identity fixture is not a valid authored scene");
-    identityRequest.proceduralScene=oversized;
-    const auto conservedIdentityFrame=output.frame.nativeFrame;
-    const auto conservedIdentitySource=output.source;
-    if (execution.executePreview(identityRequest,output,error)
-        || error.find("logical CPU capacity")==std::string::npos
-        || output.frame.nativeFrame!=conservedIdentityFrame || output.source!=conservedIdentitySource)
-        return refuse("inactive oversized light identity escaped prospective admission or changed incumbent");
-    identityRequest=request;
-    identityRequest.runtimeInputs.lightOverride=start.runtimeInputs.animatedLights.front();
-    // Empty version-zero identities remain valid even with excess capacity.
-    identityRequest.runtimeInputs.lightOverride->environmentImage.asset.contentSha256.reserve(
-        NativeSceneAnimationCompositionBudget::kMaximumBytes);
-    if (!validSceneEnvironmentImage(*identityRequest.runtimeInputs.lightOverride))
-        return refuse("oversized runtime identity fixture is not a valid light override");
-    if (execution.executePreview(identityRequest,output,error)
-        || error.find("light identity")==std::string::npos
-        || output.frame.nativeFrame!=conservedIdentityFrame || output.source!=conservedIdentitySource)
-        return refuse("runtime light identity escaped pre-submission admission or changed incumbent");
-
-    identityRequest=request;
     identityRequest.runtimeInputs.lightOverride=start.runtimeInputs.animatedLights.front();
     ImportedAnimatedSceneReceipt identityReference;
     if (!execution.executePreview(identityRequest,identityReference,error)) return false;
@@ -2213,13 +2185,6 @@ bool verifyParentedImportedProductionJoin(arbitgpu::NativeDeformationBackend& ba
             foreign.operation.playback.timelineSeconds=5.0*1001/24000;
             if(!independent.executePreview(foreign,issued,error) || issued.runtimeInputs.previousMotion)
                 return refuse("parented reset/helper replacement retained a foreign native history");
-            auto oversized=std::make_shared<Visual3DScene>(*request.sceneSnapshot);
-            oversized->lights.back().environmentImage.asset.id.assign(NativeSceneAnimationCompositionBudget::kMaximumBytes,'i');
-            const auto originalScene=request.sceneSnapshot;request.sceneSnapshot=oversized;
-            if(execution.executePreview(request,rawCurrent,error) || !incumbentUnchanged()
-                || error.find("capacity")==std::string::npos)
-                return refuse("parent inactive light identity overflow changed an incumbent native frame");
-            request.sceneSnapshot=originalScene;
             request.evaluationRevision=36;request.parentIntent=&badIntent;
             if(execution.executePreview(request,rawCurrent,error) || !incumbentUnchanged())
                 return refuse("failed newer parent epoch replaced an incumbent native output");
@@ -2397,17 +2362,6 @@ bool verifyParentedImportedProductionJoin(arbitgpu::NativeDeformationBackend& ba
                         || !sameOwner(old.deformationFrame->evaluation.deformation,deformation)
                         || readColor(native)!=color)
                         return refuse("same-generation exhausted public retry changed its incumbent");
-                }
-                else
-                {
-                    replacement.staticPayloadIdentity.reserve(NativeSceneAnimationCompositionBudget::kMaximumBytes);
-                    if (execute(replacement) || !old.deformationFrame
-                        || !sameOwner(old.payload,payload) || !sameOwner(old.deformationFrame->source,source)
-                        || !sameOwner(old.deformationFrame->frame.nativeFrame,native)
-                        || !sameOwner(old.deformationFrame->runtimeInputs.compositionFrame,composition)
-                        || !sameOwner(old.deformationFrame->evaluation.deformation,deformation)
-                        || readColor(native)!=color)
-                        return refuse("same-generation early capacity refusal changed its incumbent");
                 }
                 if (generation==0)++replacement.projectGeneration;
                 else ++replacement.helperGeneration;
@@ -2948,8 +2902,6 @@ bool verifyParentedImportedProductionJoin(arbitgpu::NativeDeformationBackend& ba
                 }
                 auto retired=incoming;retired.dimensions.width=0;
                 if (boundary<=2)++retired.projectGeneration;
-                if (boundary==1)
-                    retired.staticPayloadIdentity.reserve(NativeSceneAnimationCompositionBudget::kMaximumBytes);
                 if (boundary==2)
                 {
                     while (incumbent.valid()) {}

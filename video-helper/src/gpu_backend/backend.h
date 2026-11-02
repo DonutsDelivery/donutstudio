@@ -417,9 +417,14 @@ struct NativeSdfExecutionCapabilities
     }
 };
 
-inline constexpr std::size_t kNativeSdfMaximumRecords = 64;
+// A program holds as many records as the raymarch wire carries. OpenGL reads them
+// from a table sized to the program. Metal still copies them into a fixed uniform
+// array, so it admits fewer.
+inline constexpr std::size_t kNativeSdfMaximumRecords = 256;
+inline constexpr std::size_t kMetalSdfMaximumRecords = 64;
 inline constexpr std::size_t kNativeSdfMaximumDepth = 32;
-inline constexpr std::size_t kNativeSdfMaximumEvaluationSteps = 256;
+// Metal's interpreter still walks every reference inside a loop of 768 iterations.
+inline constexpr std::size_t kMetalSdfMaximumEvaluationSteps = 256;
 
 struct NativeSdfCompiledRecord final
 {
@@ -476,7 +481,14 @@ class NativeSdfCompiledProgram final
 public:
     std::uint32_t rootIndex() const noexcept { return rootIndex_; }
     std::uint32_t maximumDepth() const noexcept { return maximumDepth_; }
+    // Records one distance query runs after shared same-point records run once.
+    // Saturates: a graph of truly distinct points can double per level.
     std::uint32_t evaluationSteps() const noexcept { return evaluationSteps_; }
+    // Per record: its result slot, or -1 when nothing can reuse its result.
+    const std::vector<std::int32_t>& evaluationSlots() const noexcept { return evaluationSlots_; }
+    std::uint32_t evaluationSlotCount() const noexcept { return evaluationSlotCount_; }
+    // Records one query runs with no sharing: every reference walked. Saturates.
+    std::uint32_t expandedEvaluationSteps() const noexcept { return expandedEvaluationSteps_; }
     const std::vector<NativeSdfCompiledRecord>& records() const noexcept { return records_; }
     const std::string& structuralDigest() const noexcept { return structuralDigest_; }
     std::uint32_t schemaVersion() const noexcept { return schemaVersion_; }
@@ -526,6 +538,9 @@ private:
     std::uint32_t rootIndex_ = 0;
     std::uint32_t maximumDepth_ = 0;
     std::uint32_t evaluationSteps_ = 0;
+    std::vector<std::int32_t> evaluationSlots_;
+    std::uint32_t evaluationSlotCount_ = 0;
+    std::uint32_t expandedEvaluationSteps_ = 0;
     std::vector<NativeSdfCompiledRecord> records_;
     std::string structuralDigest_;
     std::uint32_t schemaVersion_ = videowire::kSdfIrSchemaVersion;
@@ -595,6 +610,7 @@ struct NativeSdfResourceReceipt final
     std::uint64_t geometryCacheBytes = 0;
     std::uint64_t backendProgramBytes = 0;
     std::uint64_t uniformBytes = 0;
+    std::uint64_t dispatchBands = 0;
     std::uint64_t attachmentBytes = 0;
     std::uint64_t totalBytes = 0;
     std::uint64_t transientUploadBytes = 0;
@@ -709,6 +725,8 @@ struct NativeFixtureSceneStats
     bool opaqueVisibilityUnsupportedVertexDeformation = false;
     std::uint64_t opaqueVisibilityBytes = 0;
     bool smoothGlassTransportApplied = false;
+    // The frame was drawn by the Realtime program, not the backend's raster one.
+    bool realtimeProgramApplied = false;
     std::uint64_t smoothGlassQueryBytes = 0;
     // Successful native shader-program builds performed by this preparation.
     std::uint32_t shaderProgramBuildCount = 0;
@@ -718,6 +736,11 @@ struct NativeFixtureSceneStats
     std::uint64_t roughGlassReceiptBytes = 0;
     double roughGlassMaximumEnergyResidual = 0;
     double roughGlassMaximumUnresolvedPower = 0;
+    // Power absorbed at the interface depth limit: sum over covered pixels and
+    // channels, largest single value, and pixels with a channel over 0.0001.
+    double roughGlassAbsorbedTotalPower = 0;
+    double roughGlassMaximumAbsorbedPower = 0;
+    std::uint64_t roughGlassAbsorbedPixelsOverLimit = 0;
 };
 
 // The compiler target is part of the immutable native-program receipt. Backends
@@ -758,12 +781,8 @@ struct NativeFixtureSurfaceMaterialProgram final
 
         bool valid() const noexcept
         {
-            using HarmonicMIDI::grid::Visual3DScene;
             return width > 0 && height > 0
-                && width <= Visual3DScene::kMaxTextureDimension
-                && height <= Visual3DScene::kMaxTextureDimension
                 && static_cast<std::uint64_t>(width) * height == texelCount
-                && texelCount <= Visual3DScene::kMaxTextureTexels
                 && texels.size() == texelCount;
         }
     };
@@ -837,7 +856,6 @@ inline bool validNativeFixtureSurfaceParameters (
         && parameters.transmissionIorClearcoat[1] <= surfacematerial::kMaximumMaterialIor
         && parameters.transmissionIorClearcoat[2] >= 0.0f && parameters.transmissionIorClearcoat[2] <= 1.0f
         && parameters.transmissionIorClearcoat[3] >= 0.0f
-        && parameters.transmissionIorClearcoat[3] <= surfacematerial::kMaximumCauchyB
         && parameters.identifiers[1] <= static_cast<std::uint32_t>(surfacematerial::TransportMode::ThinInterface)
         && (parameters.identifiers[1] == 1 || parameters.transmissionIorClearcoat[3] == 0.0f);
 }
@@ -895,7 +913,6 @@ inline bool validNativeSurfaceObjectPrograms(const NativeFixtureSurfaceMaterialP
     const HarmonicMIDI::grid::Visual3DScene& scene, NativeFixtureMaterialBackend backend)
 {
     using namespace HarmonicMIDI::grid;
-    if (root.objectPrograms.size() >= Visual3DScene::kMaxObjects) return false;
     std::set<std::uint32_t> objects;
     std::set<std::string> programs;
     const auto valid = [&](const NativeFixtureSurfaceMaterialProgram& program) {
@@ -908,7 +925,7 @@ inline bool validNativeSurfaceObjectPrograms(const NativeFixtureSurfaceMaterialP
             && !program.programIdentity.empty() && !program.bindingDigest.empty()
             && program.parameters.identifiers[0] == object->material.value
             && validNativeFixtureSurfaceParameters(program.parameters)
-            && (program.roughGlassScatteringVersion==1 || (program.roughGlassScatteringVersion==2
+            && (program.roughGlassScatteringVersion==1 || (program.roughGlassScatteringVersion<=2
                 && program.parameters.identifiers[1]==static_cast<std::uint32_t>(surfacematerial::TransportMode::ClosedVolume)))
             && (!program.spectralReflectance || surfacematerial::validSpectralReflectance(*program.spectralReflectance))
             && (!program.diffractionLayer || surfacematerial::validDiffractionLayer(*program.diffractionLayer))
@@ -985,7 +1002,6 @@ inline std::string nativeFixtureDiffractionProgramIdentity (
     appendHex(diffractionmaterial::kMaximumLightingPaths, 2);
     appendHex(diffractionmaterial::kMaximumIndirectBounces, 2);
     appendHex(diffractionmaterial::kMaximumSpectralSamples, 4);
-    appendFloat(diffractionmaterial::physicalcheckpoint::kMaximumSpectralRadiance);
     appendHex(lighting.pathCount, 2);
     for (std::size_t pathIndex = 0; pathIndex < (lighting.version == 3 ? lighting.paths.size() : lighting.pathCount); ++pathIndex)
     {
@@ -1021,7 +1037,6 @@ inline constexpr std::uint64_t kMaximumNativeFixtureDiffraction1DLobeEvaluations
     2'250'000'000ull;
 inline constexpr std::uint64_t kMaximumNativeFixtureDiffraction2DLobeEvaluations =
     525'000'000ull;
-inline constexpr float kMinimumNativeFixtureDiffractionRmsSlope = 1.0e-4f;
 // Discrete grating orders have no finite-lobe camera shader. Only the guarded
 // smooth-glass transport prerequisite may request their exact zero-slope IR.
 enum class NativeFixtureDiffractionConsumer : std::uint8_t
@@ -1088,7 +1103,7 @@ inline bool validNativeFixtureDiffractionParameters (
     }
     else if (! unit2 (value.secondaryGeometry.x, value.secondaryGeometry.y)
              || std::abs (value.geometry.x * value.secondaryGeometry.x
-                           + value.geometry.y * value.secondaryGeometry.y) > 1.0e-4f
+                           + value.geometry.y * value.secondaryGeometry.y) > 0.9999f
              || ! bounded (value.secondaryGeometry.z,
                             kMinimumGrooveSpacingNanometres,
                             kMaximumGrooveSpacingNanometres))
@@ -1113,7 +1128,8 @@ inline bool validNativeFixtureDiffractionParameters (
                     > diffractionmaterial::physicalcheckpoint::kMaximumSinusoidalPhaseArgument))
         || (profile == blazed && lattice == lattice2D
             && value.geometry.z != value.secondaryGeometry.z)
-        || value.control.z != 0.0f)
+        || (value.control.z != 0.0f
+            && ! (value.control.z == 1.0f && lattice == lattice2D)))
         return false;
 
     const auto coating = value.control.w;
@@ -1135,9 +1151,10 @@ inline bool validNativeFixtureDiffractionParameters (
         return false;
     if (value.coating.w != 0.0f
         || ! bounded (value.roughness.x, 0.0f, kMaximumRmsHeightNanometres)
-        || ! bounded (value.roughness.y, discrete?0.0f:kMinimumNativeFixtureDiffractionRmsSlope,
-                      kMaximumRmsSlope)
-        || value.roughness.z != 0.0f || value.roughness.w != 0.0f)
+        || ! bounded (value.roughness.y, 0.0f, kMaximumRmsSlope)
+        || ! bounded (value.roughness.z, 0.0f, kMaximumStreakSlope)
+        || ! (value.roughness.z == 0.0f ? value.roughness.w == 0.0f
+                                        : bounded (value.roughness.w, kMinimumStreakSpacingUv, kMaximumStreakSpacingUv)))
         return false;
 
     const auto directionLength = value.incident.x * value.incident.x
@@ -1222,8 +1239,7 @@ inline bool validNativeFixtureDiffractionParameters (
         const auto& spectral = value.spectral[index];
         const auto& spectralZ = value.spectralZ[index];
         if (spectral.x != physicalcheckpoint::kWavelengths[index]
-            || ! bounded (spectral.y, 0.0f,
-                          physicalcheckpoint::kMaximumSpectralRadiance)
+            || ! std::isfinite (spectral.y) || spectral.y < 0.0f
             || spectral.z != physicalcheckpoint::kCie1931[index][0]
             || spectral.w != physicalcheckpoint::kCie1931[index][1]
             || spectralZ.x != physicalcheckpoint::kCie1931[index][2]
@@ -1299,7 +1315,7 @@ inline bool validNativeFixtureDiffractionProgram (
                                && std::abs(length - 1.0f) <= 1.0e-4f
                                && (program.diffractionLightingAdmission->description().version != 1
                                    || value.z > 1.0e-6f) && std::isfinite(value.w)
-                               && value.w >= 0.0f && value.w <= 16.0f
+                               && value.w >= 0.0f
                                && kindDepthValid
                                && path.kindBounceAndReserved[2]
                                     == program.diffractionPatternMask
@@ -1400,7 +1416,6 @@ inline bool validNativeFixtureMaterialPrograms(const NativeFixtureSurfaceMateria
     if (!object || object->indexCount == 0 || root.vertexProgram || root.spectralReflectance || root.diffractionLayer
         || !validNativeFixtureDiffractionProgram(root, backend, object->id, sceneReceiverConsumer,consumer)) return false;
     if (root.objectPrograms.empty()) return root.object == scene.objects[0].id;
-    if (root.objectPrograms.size() >= Visual3DScene::kMaxObjects) return false;
     std::uint32_t previous = 0;
     std::optional<surfacematerialbinding::TextureSlotBinding::GraphFrameEndpoint> frame;
     if (root.baseColorSource == NativeFixtureSurfaceMaterialProgram::BaseColorSource::GraphFrameSrgbTexture) {
@@ -1431,40 +1446,51 @@ inline bool nativeFixtureDimensionsWithinBounds (std::uint32_t width,
         && static_cast<std::uint64_t> (width) * height <= kMaximumNativeFixturePixels;
 }
 
-inline constexpr std::size_t kMaximumNativeDiffractionTriangles = 8;
 inline constexpr unsigned kNativeDiffractionSubdivisions = 2;
-inline constexpr std::size_t kMaximumNativeDiffractionSamples =
-    kMaximumNativeDiffractionTriangles * kNativeDiffractionSubdivisions * kNativeDiffractionSubdivisions;
-inline constexpr std::uint64_t kMaximumNativeDiffractionQueries = 268'435'456;
-inline constexpr std::uint64_t kMaximumNativeDiffractionQueryWork = 8'589'934'592;
-// At the maximum 32 samples, 1080p reserves 201,141,280 queries. A 4K
-// frame reserves 804,558,880 and refuses; smaller exact tables can admit 4K.
-inline bool nativeFixtureDiffractionQueryWorkWithinBudget(std::uint32_t width,
-    std::uint32_t height, std::size_t receiverSamples, std::size_t gratingSamples,
-    std::uint64_t closestHitWork) noexcept
+// Closest-hit queries one covered pixel can run against the actual tables.
+// False only when the count does not fit 64 bits.
+inline bool nativeFixtureDiffractionPixelQueries(std::size_t receiverSamples, std::size_t gratingSamples,
+    std::uint64_t& queries) noexcept
 {
-    if (!nativeFixtureDimensionsWithinBounds(width, height) || receiverSamples == 0 || gratingSamples == 0
-        || receiverSamples > kMaximumNativeDiffractionSamples || gratingSamples > kMaximumNativeDiffractionSamples
-        || closestHitWork == 0) return false;
-    const auto pairs = std::uint64_t(receiverSamples) * gratingSamples;
-    const auto queries = std::uint64_t(width) * height *
-        (1 + 3 * std::max(receiverSamples, gratingSamples)) + receiverSamples + 2 * pairs;
-    return queries <= kMaximumNativeDiffractionQueries
-        && closestHitWork <= kMaximumNativeDiffractionQueryWork / queries;
+    const auto limit = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t larger = std::max(receiverSamples, gratingSamples);
+    if (receiverSamples == 0 || gratingSamples == 0 || larger > (limit - 1) / 3) return false;
+    queries = 1 + 3 * larger;
+    return true;
+}
+// The whole frame's query count from the actual tables. Work scales with the
+// scene; the only refusal is a count that does not fit 64 bits.
+inline bool nativeFixtureDiffractionFrameQueries(std::uint32_t width, std::uint32_t height,
+    std::size_t receiverSamples, std::size_t gratingSamples, std::uint64_t closestHitWork,
+    std::uint64_t& queries) noexcept
+{
+    const auto limit = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t perPixel = 0;
+    if (!nativeFixtureDimensionsWithinBounds(width, height) || closestHitWork == 0
+        || !nativeFixtureDiffractionPixelQueries(receiverSamples, gratingSamples, perPixel)) return false;
+    const auto pixels = std::uint64_t(width) * height;
+    if (perPixel > limit / pixels) return false;
+    const auto covered = pixels * perPixel;
+    const std::uint64_t receivers = receiverSamples, gratings = gratingSamples;
+    if (gratings > limit / receivers || receivers * gratings > (limit - receivers) / 2) return false;
+    const auto validation = receivers + 2 * receivers * gratings;
+    if (validation > limit - covered) return false;
+    queries = covered + validation;
+    return queries <= limit / closestHitWork;
 }
 
 inline std::uint64_t nativeFixtureDiffractionLobeEvaluations (
     const NativeFixtureSurfaceMaterialProgram& material,
     std::uint32_t width,
     std::uint32_t height,
-    std::size_t sceneSamples = kMaximumNativeDiffractionSamples) noexcept
+    std::size_t sceneSamples = 1) noexcept
 {
     if (material.kind != NativeFixtureMaterialKind::DiffractionReflective)
         return 0;
 
     if (material.diffractionPathCount == 0
         || material.diffractionPathCount > diffractionmaterial::kMaximumLightingPaths
-        || sceneSamples == 0 || sceneSamples > kMaximumNativeDiffractionSamples)
+        || sceneSamples == 0)
         return std::numeric_limits<std::uint64_t>::max();
     const auto& diffraction = material.diffractionPaths[0].material;
     const auto firstOrderValue = diffraction.microstructure.w;
@@ -1502,6 +1528,7 @@ inline std::uint64_t nativeFixtureDiffractionLobeEvaluations (
             && material.diffractionLightingAdmission->description().version == 2
         ? 11ull : material.diffractionLightingAdmission
             && material.diffractionLightingAdmission->description().version == 3
+            && sceneSamples < std::numeric_limits<std::uint64_t>::max()
             ? 1ull + sceneSamples : static_cast<std::uint64_t>(material.diffractionPathCount);
     if (pixels == 0 || wavelengthCount > std::numeric_limits<std::uint64_t>::max() / lobeCount
         || pathCount > std::numeric_limits<std::uint64_t>::max()
@@ -1516,19 +1543,25 @@ inline bool nativeFixtureDiffractionWorkWithinBudget (
     const NativeFixtureSurfaceMaterialProgram& material,
     std::uint32_t width,
     std::uint32_t height,
-    std::size_t sceneSamples = kMaximumNativeDiffractionSamples) noexcept
+    std::size_t sceneSamples = 1) noexcept
 {
-    if (sceneSamples == 0 || sceneSamples > kMaximumNativeDiffractionSamples) return false;
-    if (material.diffractionLightingAdmission && material.diffractionLightingAdmission->description().version == 3
-        && !nativeFixtureDiffractionQueryWorkWithinBudget(width,height,sceneSamples,sceneSamples,1)) return false;
+    if (sceneSamples == 0) return false;
     const auto estimate = nativeFixtureDiffractionLobeEvaluations (
         material, width, height, sceneSamples);
+    // Receiver transport work follows its actual sample tables. The per-draw
+    // lobe ceilings below belong to the fixed-path lighting versions.
+    const bool receiverTransport = material.diffractionLightingAdmission
+        && material.diffractionLightingAdmission->description().version == 3;
+    std::uint64_t queries = 0;
+    if (receiverTransport
+        && (!nativeFixtureDiffractionFrameQueries(width, height, sceneSamples, sceneSamples, 1, queries)
+            || estimate == std::numeric_limits<std::uint64_t>::max())) return false;
     const auto budget = material.diffractionPaths[0].material.secondaryGeometry.w
         == static_cast<float> (
             diffractionmaterial::GratingLattice::CrossedTwoDimensional)
         ? kMaximumNativeFixtureDiffraction2DLobeEvaluations
         : kMaximumNativeFixtureDiffraction1DLobeEvaluations;
-    if (estimate > budget)
+    if (!receiverTransport && estimate > budget)
         return false;
     if (material.diffractionFoilMaximumEvaluations == 0)
         return true;
@@ -1708,6 +1741,12 @@ public:
             : output == renderpassoutput::Output::Depth ? depthTextureDescriptor()
             : NativeTextureViewDescriptor {};
     }
+    // A frame published as a receipt's current read target keeps its textures
+    // alive: pool-return must not zero what the viewport can still read.
+    // Replacement of the receipt clears the mark; destruction clears it before
+    // the final release.
+    virtual void markReceiptReadTarget() const noexcept {}
+    virtual void releaseReceiptReadTarget() const noexcept {}
     virtual bool readColorFloatPixels (std::vector<float>& output) const
     {
         output.clear();
@@ -1808,6 +1847,11 @@ struct NativeFixtureSceneSubmission
     std::shared_ptr<const NativeFixtureSceneFrame> frame;
     NativeFixtureSceneStats stats {};
     std::string error;
+    // A Preview glass caustic left a fenced submission on the GPU. Nothing waits on
+    // it: a later frame polls the fence and adopts the spectrum. The viewport keeps
+    // producing frames while this holds, because a still preview would otherwise
+    // settle on the submitting frame and never draw the caustic. Export never sets it.
+    bool causticPending = false;
 };
 
 // Per-draw values are copied into the submission. They never participate in
@@ -1895,7 +1939,7 @@ inline bool sameNativeImportedObjectWorldSet(
 // checked where the admitted scene is known, by nativeImportedObjectWorldsCover.
 inline bool validNativeImportedObjectWorlds(const NativeImportedObjectWorlds& worlds) noexcept
 {
-    if (worlds.empty() || worlds.size() > HarmonicMIDI::grid::Visual3DScene::kMaxObjects) return false;
+    if (worlds.empty()) return false;
     for (std::size_t i = 0; i < worlds.size(); ++i)
     {
         const auto& entry = worlds[i];
@@ -2027,7 +2071,7 @@ struct NativeImportedLightOverride final
     }
 };
 
-// Kind-agnostic checks that need no scene: at most kMaxLights entries, strictly
+// Kind-agnostic checks that need no scene: strictly
 // increasing indexes, one flagged field each, and finite values. The target
 // light is checked where the backend reads it, because the list may be empty
 // and the scene's light count is not visible here.
@@ -2035,7 +2079,6 @@ inline bool validNativeImportedLightOverrideList(
     const std::vector<NativeImportedLightOverride>& overrides) noexcept
 {
     using namespace HarmonicMIDI::grid;
-    if (overrides.size() > Visual3DScene::kMaxLights) return false;
     bool first = true;
     std::size_t previous = 0;
     for (const auto& o : overrides) {
@@ -2148,6 +2191,8 @@ struct NativeImportedSceneRuntimeInputs final
     // With previewUse, the caller fences the frame itself, so the draw ends
     // without its final wait. The OpenGL caustic Preview sets it for its base.
     bool previewCallerWaits = false;
+    // The Realtime engine's draw, with no ray walks and no caustic. Also in the padding.
+    bool realtimeEngine = false;
     // Exact authored selection copied for this draw, never a native cache key.
     std::optional<visualimportedscenerender::GlassCausticSelection> glassCaustic;
     float timeSeconds = 0.0f;
@@ -2170,7 +2215,8 @@ struct NativeImportedSceneRuntimeInputs final
     std::array<float, 3> cameraTranslationOffset {};
     // Runtime camera rotation in degrees, composed like the object rotation.
     std::array<float, 3> cameraRotationDegrees {};
-    // Zero keeps the authored vertical field of view; otherwise degrees in [1, 179].
+    // Zero keeps the authored vertical field of view; otherwise degrees up to 179,
+    // from kMinimumCameraVerticalFovDegrees.
     float cameraVerticalFovDegrees = 0.0f;
     std::optional<HarmonicMIDI::grid::SceneCameraRecord> cameraOverride;
     std::optional<HarmonicMIDI::grid::SceneLightRecord> lightOverride;
@@ -2181,6 +2227,8 @@ struct NativeImportedSceneRuntimeInputs final
     std::vector<NativeImportedLightOverride> lightOverrides;
     float emissionGain = 1.0f;
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
+    // The scene a material was admitted on, when the draw is a copy of it with other vertices.
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> materialAdmittedScene;
     std::optional<visualnoteinstancing::Mapping> noteInstanceMapping;
     renderpassoutput::Output imageOutput = renderpassoutput::Output::Color;
     std::uint32_t rawExportMask = 0;
@@ -2277,9 +2325,8 @@ inline NativeSceneMotionSample sceneMotionSample(const NativeImportedSceneRuntim
 inline bool validSceneMotionPositions(
     const std::shared_ptr<const std::vector<HarmonicMIDI::grid::SceneVec3>>& positions) noexcept
 {
-    return !positions || (positions->size() <= HarmonicMIDI::grid::Visual3DScene::kMaxVertices
-        && std::all_of(positions->begin(), positions->end(), [](const HarmonicMIDI::grid::SceneVec3& value)
-            { return HarmonicMIDI::grid::visual3d_detail::finite(value); }));
+    return !positions || std::all_of(positions->begin(), positions->end(), [](const HarmonicMIDI::grid::SceneVec3& value)
+            { return HarmonicMIDI::grid::visual3d_detail::finite(value); });
 }
 
 inline std::optional<canonicalblockc::FrameKey> sceneMotionNoteOwner(
@@ -2398,7 +2445,7 @@ inline bool resolveDiffractionRuntimeProgram(
         const auto& a = authored->diffractionPaths[i].material;
         const auto& b = value->diffractionPaths[i].material;
         if (a.secondaryGeometry.w != b.secondaryGeometry.w || a.control.x != b.control.x
-            || a.control.y != b.control.y || a.control.w != b.control.w
+            || a.control.y != b.control.y || a.control.z != b.control.z || a.control.w != b.control.w
             || a.microstructure.w != b.microstructure.w || a.grooveField.x != b.grooveField.x)
         { error = "Diffraction runtime profile, lattice, coating, field and spectral schedule must remain authored"; return false; }
     }
@@ -2474,6 +2521,38 @@ struct NativeNoteInstanceBatch final
     bool admitted = false;
 };
 
+// One mapping axis of a note, read from its texels in Block C row layout.
+inline float nativeNoteAxisValue(visualnoteinstancing::MappingAxis axis, const float* texels,
+                                 float rootFrequencyHz) noexcept
+{
+    const auto texel = [texels](std::size_t column, std::size_t channel)
+    {
+        return texels[column * 4u + channel];
+    };
+    switch (axis)
+    {
+        case visualnoteinstancing::MappingAxis::Onset: return -texel(0, 2);
+        case visualnoteinstancing::MappingAxis::LogFrequency:
+            return std::log2(std::max(texel(1, 0), 0.000001f) / rootFrequencyHz);
+        case visualnoteinstancing::MappingAxis::Velocity: return texel(0, 1);
+        case visualnoteinstancing::MappingAxis::Duration: return texel(0, 2) + texel(0, 3);
+        case visualnoteinstancing::MappingAxis::Track: return texel(1, 2);
+        case visualnoteinstancing::MappingAxis::PitchBendSemitones: return texel(3, 3);
+        case visualnoteinstancing::MappingAxis::NoteAgeBeats: return texel(0, 2);
+        case visualnoteinstancing::MappingAxis::RemainingDurationBeats: return texel(0, 3);
+        case visualnoteinstancing::MappingAxis::RootFlag: return texel(1, 3);
+        case visualnoteinstancing::MappingAxis::MidiNote: return texel(0, 0);
+        case visualnoteinstancing::MappingAxis::ResolvedFrequencyHz: return texel(1, 0);
+        case visualnoteinstancing::MappingAxis::Prime2Exponent: return texel(2, 0);
+        case visualnoteinstancing::MappingAxis::Prime3Exponent: return texel(2, 1);
+        case visualnoteinstancing::MappingAxis::Prime5Exponent: return texel(2, 2);
+        case visualnoteinstancing::MappingAxis::Prime7Exponent: return texel(2, 3);
+        case visualnoteinstancing::MappingAxis::Prime11Exponent: return texel(3, 0);
+        case visualnoteinstancing::MappingAxis::Prime13Exponent: return texel(3, 1);
+    }
+    return 0.0f;
+}
+
 inline NativeNoteInstanceBatch prepareNativeNoteInstances(
     const NativeFixtureSceneRuntimeInputs& inputs) noexcept
 {
@@ -2491,39 +2570,16 @@ inline NativeNoteInstanceBatch prepareNativeNoteInstances(
     batch.admitted = true;
     batch.appearanceLow = mapping.appearanceLow;
     batch.appearanceHigh = mapping.appearanceHigh;
+    // Raster stores these emissions in RGBA16F, as clipRasterRadiance does for a material's.
+    batch.appearanceLow[3] = std::min(batch.appearanceLow[3], 60000.0f);
+    batch.appearanceHigh[3] = std::min(batch.appearanceHigh[3], 60000.0f);
     batch.meshScale = mapping.meshScale;
     const auto axisValue = [&frame](visualnoteinstancing::MappingAxis axis,
                                     std::size_t row) noexcept
     {
-        const auto texel = [&frame, row](std::size_t column, std::size_t channel)
-        {
-            return frame.noteTextureValues[(row * arbitblockc::kTexelsPerNote + column) * 4u
-                                           + channel];
-        };
-        switch (axis)
-        {
-            case visualnoteinstancing::MappingAxis::Onset: return -texel(0, 2);
-            case visualnoteinstancing::MappingAxis::LogFrequency:
-                return std::log2(std::max(texel(1, 0), 0.000001f)
-                                 / frame.rootFrequencyHz);
-            case visualnoteinstancing::MappingAxis::Velocity: return texel(0, 1);
-            case visualnoteinstancing::MappingAxis::Duration:
-                return texel(0, 2) + texel(0, 3);
-            case visualnoteinstancing::MappingAxis::Track: return texel(1, 2);
-            case visualnoteinstancing::MappingAxis::PitchBendSemitones: return texel(3, 3);
-            case visualnoteinstancing::MappingAxis::NoteAgeBeats: return texel(0, 2);
-            case visualnoteinstancing::MappingAxis::RemainingDurationBeats: return texel(0, 3);
-            case visualnoteinstancing::MappingAxis::RootFlag: return texel(1, 3);
-            case visualnoteinstancing::MappingAxis::MidiNote: return texel(0, 0);
-            case visualnoteinstancing::MappingAxis::ResolvedFrequencyHz: return texel(1, 0);
-            case visualnoteinstancing::MappingAxis::Prime2Exponent: return texel(2, 0);
-            case visualnoteinstancing::MappingAxis::Prime3Exponent: return texel(2, 1);
-            case visualnoteinstancing::MappingAxis::Prime5Exponent: return texel(2, 2);
-            case visualnoteinstancing::MappingAxis::Prime7Exponent: return texel(2, 3);
-            case visualnoteinstancing::MappingAxis::Prime11Exponent: return texel(3, 0);
-            case visualnoteinstancing::MappingAxis::Prime13Exponent: return texel(3, 1);
-        }
-        return 0.0f;
+        return nativeNoteAxisValue(axis,
+            frame.noteTextureValues.data() + row * arbitblockc::kTexelsPerNote * 4u,
+            frame.rootFrequencyHz);
     };
     const auto rowLimit = std::min<std::size_t>(
         static_cast<std::size_t>(frame.noteRows()), visualnoteinstancing::kMaximumInstances);
@@ -2758,11 +2814,27 @@ inline bool validNativeImportedLightOverrideTargets(const HarmonicMIDI::grid::Vi
     return true;
 }
 
+// The animated-lights ownership the build refuses on: the same count, and every
+// animated light keeps the id and spectral source of the scene light at its index.
+// The Accurate refusal latch key gates on this exact read as well, so an ownership
+// mismatch is never latched and always shows its own error.
+inline bool animatedLightsOwnedByScene(const HarmonicMIDI::grid::Visual3DScene& scene,
+    const NativeImportedSceneRuntimeInputs& runtime)
+{
+    if (runtime.animatedLights.empty()) return true;
+    if (runtime.animatedLights.size() != scene.lightCount) return false;
+    for (std::size_t i = 0; i < scene.lightCount; ++i)
+        if (runtime.animatedLights[i].id != scene.lights[i].id
+            || !sameSpectralSource(runtime.animatedLights[i].spectralSource, scene.lights[i].spectralSource))
+            return false;
+    return true;
+}
+
 // Zero keeps the authored field of view. Other values match the camera lowering range.
 inline bool validRuntimeCameraFov(float degrees) noexcept
 {
     return std::isfinite(degrees)
-        && (degrees == 0.0f || (degrees >= 1.0f && degrees <= 179.0f));
+        && (degrees == 0.0f || (degrees >= HarmonicMIDI::grid::kMinimumCameraVerticalFovDegrees && degrees <= 179.0f));
 }
 
 // Runtime camera adjustments on an authored camera record. Translation is added
@@ -3359,7 +3431,6 @@ inline bool validFixtureRuntimeInputs(
         && valid(inputs.cameraRotationDegrees, 360.0f)
         && validRuntimeCameraFov(inputs.cameraVerticalFovDegrees)
         && validFixtureCameraOverride(inputs.animatedCamera)
-        && inputs.animatedLights.size() <= HarmonicMIDI::grid::Visual3DScene::kMaxLights
         && HarmonicMIDI::grid::validSceneAnalyticSkySet(inputs.animatedLights.data(),inputs.animatedLights.size())
         && std::all_of(inputs.animatedLights.begin(), inputs.animatedLights.end(),
             [](auto light) {
@@ -3378,7 +3449,7 @@ inline bool validFixtureRuntimeInputs(
         && validFixtureLightOverride(inputs.lightOverride)
         && (!inputs.objectWorlds || validNativeImportedObjectWorlds(*inputs.objectWorlds))
         && std::isfinite(inputs.emissionGain)
-        && inputs.emissionGain >= 0.0f && inputs.emissionGain <= 64.0f
+        && inputs.emissionGain >= 0.0f
         && (static_cast<bool>(inputs.canonicalBlockCFrame)
                 == inputs.noteInstanceMapping.has_value())
         && (!inputs.canonicalBlockCFrame
@@ -3437,6 +3508,17 @@ public:
     // Release cached programs while their context is current, before destroying
     // it. Live scene-resource leases remain valid until their owners release them.
     virtual void releaseCachedProgramsForCurrentContext() noexcept {}
+    // Admission-time warm: an OpenGL context submits its fixture program link here
+    // when the admitted material makes the program key known, before the first
+    // frame renders, so a cold link starts at admission instead of at the first
+    // fixture prepare. Backends without an async link keep their own schedule.
+    virtual void startFixtureProgramLink (
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>&,
+        bool distinctGrating, bool causticVolume)
+    {
+        (void) distinctGrating;
+        (void) causticVolume;
+    }
     virtual NativeFixtureScenePreparation prepare (
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram = {},
@@ -3469,6 +3551,15 @@ public:
         (void) resources;
         (void) scene;
         (void) materialProgram;
+        return false;
+    }
+    // True once the backend has planned the resident water refit. A still preview
+    // keeps an identical snapshot, so the refresh above never runs on its own; the
+    // caller has to take it at least once or the caustic schedule never becomes
+    // resident, and a submitted Preview caustic is never adopted.
+    virtual bool residentRefitPlanned (const std::shared_ptr<const NativeFixtureSceneResources>& resources) const
+    {
+        (void) resources;
         return false;
     }
     virtual NativeFixtureSceneSubmission render (
@@ -3565,6 +3656,21 @@ bool prepareNativeDeformationFrame (
     const std::shared_ptr<const NativeDeformationCompositionFrame>& composition,
     NativeDeformationFrameData& output, std::string& error,
     NativeSceneMotionSample::ImportedNodeWorldMatrices* sampledWorlds = nullptr);
+
+// Moves a skinned mesh's rest pose into its vertices on the CPU, for a mesh no
+// clip animates: morphs at their authored weights, then the joints' node
+// transforms through the palette an animated frame uses. Reads source.scene and
+// writes the mesh's range of output, which is a copy of it. On refusal that range
+// may be partly written.
+bool bakeNativeRestPose (const NativeDeformationScene& source,
+                         HarmonicMIDI::grid::Visual3DScene& output, std::string& error);
+
+// The same bake for an evaluated frame: the weights and palette the deformation
+// renderer would upload, written into the mesh's range of output, for an engine
+// that traces the vertices it is given.
+bool bakeNativeDeformation (const NativeDeformationScene& source,
+                            const visualdeformation::AnimationDeformationSnapshot& snapshot,
+                            HarmonicMIDI::grid::Visual3DScene& output, std::string& error);
 
 struct NativeDeformationStats
 {

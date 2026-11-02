@@ -45,6 +45,7 @@
 // bsdf_util.h for lobe structure, closure selection and Fresnel handling, and
 // bsdf_microfacet.h bsdf_glass_ior for the Cauchy index of a dispersive glass.
 
+#include "devices/device_annotations.h"
 #include "spectrum.h"
 #include "vec_math.h"
 
@@ -115,28 +116,28 @@ struct Material
 
 // Fraction of light the surface stops: 1 opaque, 0 fully cut out. Opaque mode
 // ignores opacity, Mask compares it with the cutoff, Blend uses it directly.
-float materialCoverage (const Material& material) noexcept;
+PT_SHARED_ENTRY float materialCoverage (const Material& material) noexcept;
 
 // (1 - metallic) * transmission, clamped: the share of the dielectric lobe.
-float dielectricWeight (const Material& material) noexcept;
+PT_SHARED_ENTRY float dielectricWeight (const Material& material) noexcept;
 // A refracting boundary (closed volume or interface) with some transmission.
-bool isMediumBoundary (const Material& material) noexcept;
+PT_SHARED_ENTRY bool isMediumBoundary (const Material& material) noexcept;
 // A thin sheet with some transmission.
-bool isThinSheet (const Material& material) noexcept;
+PT_SHARED_ENTRY bool isThinSheet (const Material& material) noexcept;
 // The material's Cauchy B: dispersion, else the one its Abbe number implies.
-float materialCauchyB (const Material& material) noexcept;
+PT_SHARED_ENTRY float materialCauchyB (const Material& material) noexcept;
 // True when the material refracts and its index depends on the wavelength.
-bool materialDispersive (const Material& material) noexcept;
+PT_SHARED_ENTRY bool materialDispersive (const Material& material) noexcept;
 // Index of refraction at a wavelength (the d-line index when spectral is
 // false), clamped to [1, 3].
-float materialIorAt (const Material& material, float nm, bool spectral) noexcept;
+PT_SHARED_ENTRY float materialIorAt (const Material& material, float nm, bool spectral) noexcept;
 // Beer-Lambert absorption coefficient per scene unit for each channel, 0
 // when the material does not absorb by distance.
-Spectrum mediumAbsorption (const Material& material, const Wavelengths& wavelengths) noexcept;
+PT_SHARED_ENTRY Spectrum mediumAbsorption (const Material& material, const Wavelengths& wavelengths) noexcept;
 // Fraction of light a thin sheet passes straight through at |cos| = cosine,
 // excluding alpha coverage. etaD is the sheet's index over the surrounding
 // index at the d line. 0 for anything that is not a thin sheet.
-Spectrum straightTransmittance (const Material& material, float cosine, float etaD,
+PT_SHARED_ENTRY Spectrum straightTransmittance (const Material& material, float cosine, float etaD,
                                 const Wavelengths& wavelengths) noexcept;
 
 enum BsdfFlags : std::uint32_t
@@ -160,9 +161,9 @@ struct Frame
     Vec3 bitangent { 0.0f, 1.0f, 0.0f };
     Vec3 normal { 0.0f, 0.0f, 1.0f };
 
-    static Frame fromNormal (Vec3 n) noexcept;
-    Vec3 toLocal (Vec3 v) const noexcept { return { dot (v, tangent), dot (v, bitangent), dot (v, normal) }; }
-    Vec3 toWorld (Vec3 v) const noexcept { return tangent * v.x + bitangent * v.y + normal * v.z; }
+    PT_SHARED_ENTRY static Frame fromNormal (Vec3 n) noexcept;
+    PT_SHARED_FN Vec3 toLocal (Vec3 v) const noexcept { return { dot (v, tangent), dot (v, bitangent), dot (v, normal) }; }
+    PT_SHARED_FN Vec3 toWorld (Vec3 v) const noexcept { return tangent * v.x + bitangent * v.y + normal * v.z; }
 };
 
 enum class LobeKind : std::uint8_t
@@ -231,24 +232,26 @@ using SpectralBsdfEval = BasicBsdfEval<Spectrum>;
 using SpectralBsdfSample = BasicBsdfSample<Spectrum>;
 
 // Lobe-level functions in the local frame: z is the shading normal and wo.z > 0.
-std::uint32_t lobeFlags (const Lobe& lobe) noexcept;
-std::uint32_t lobeFlags (const SpectralLobe& lobe) noexcept;
-BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept;
-SpectralBsdfEval evalLobe (const SpectralLobe& lobe, Vec3 wo, Vec3 wi) noexcept;
+PT_SHARED_ENTRY std::uint32_t lobeFlags (const Lobe& lobe) noexcept;
+PT_SHARED_ENTRY std::uint32_t lobeFlags (const SpectralLobe& lobe) noexcept;
+PT_SHARED_ENTRY BsdfEval evalLobe (const Lobe& lobe, Vec3 wo, Vec3 wi) noexcept;
+PT_SHARED_ENTRY SpectralBsdfEval evalLobe (const SpectralLobe& lobe, Vec3 wo, Vec3 wi) noexcept;
 // uChoice picks reflection or transmission for dielectric and sheet lobes.
-bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& out) noexcept;
-bool sampleLobe (const SpectralLobe& lobe, Vec3 wo, float uChoice, Vec2 u, SpectralBsdfSample& out) noexcept;
+PT_SHARED_ENTRY bool sampleLobe (const Lobe& lobe, Vec3 wo, float uChoice, Vec2 u, BsdfSample& out) noexcept;
+PT_SHARED_ENTRY bool sampleLobe (const SpectralLobe& lobe, Vec3 wo, float uChoice, Vec2 u, SpectralBsdfSample& out) noexcept;
 
 // Exact unpolarized Fresnel reflectance of a dielectric interface. cosI is the
 // cosine on the incident side, eta the far index over the near index.
-float fresnelDielectric (float cosI, float eta) noexcept;
+PT_SHARED_ENTRY float fresnelDielectric (float cosI, float eta) noexcept;
 // Reflectance of a thin sheet: two parallel interfaces with incoherent
 // inter-reflection and no absorption, 2R / (1 + R).
-float thinSheetReflectance (float cosI, float eta) noexcept;
+PT_SHARED_ENTRY float thinSheetReflectance (float cosI, float eta) noexcept;
 
 // Directional albedo of the single-scatter GGX reflection lobe with Schlick
 // Fresnel, written as albedo = f0 * scale + bias. Tabulated once on first use.
-void ggxAlbedoScaleBias (float cosO, float alpha, float& scale, float& bias) noexcept;
+PT_SHARED_ENTRY void ggxAlbedoScaleBias (float cosO, float alpha, float& scale, float& bias) noexcept;
+// Host side of the device upload: the GGX albedo table (device_tables.h).
+void exportGgxTables (device::DeviceLookupTables& tables) noexcept;
 
 // Smallest GGX alpha of the opaque reflection lobes, the raster BRDF's floor.
 constexpr float kMinOpaqueGgxAlpha = 0.0025f;
@@ -262,31 +265,31 @@ public:
     static constexpr int kMaxLobes = 4;
 
     // Both normals unit length and on the side wo leaves from.
-    void reset (Vec3 shadingNormal, Vec3 geometricNormal) noexcept;
+    PT_SHARED_ENTRY void reset (Vec3 shadingNormal, Vec3 geometricNormal) noexcept;
     // Ignores a lobe with a non-positive or non-finite selection weight.
-    bool addLobe (const BasicLobe<Color>& lobe) noexcept;
+    PT_SHARED_ENTRY bool addLobe (const BasicLobe<Color>& lobe) noexcept;
     // Turns selection weights into probabilities. Call after the last addLobe.
-    void finalize() noexcept;
+    PT_SHARED_ENTRY void finalize() noexcept;
 
-    int lobeCount() const noexcept { return count_; }
-    const BasicLobe<Color>& lobe (int index) const noexcept { return lobes_[static_cast<std::size_t> (index)]; }
-    float selectionProbability (int index) const noexcept { return probability_[static_cast<std::size_t> (index)]; }
-    bool hasNonDelta() const noexcept { return nonDelta_; }
-    const Frame& frame() const noexcept { return frame_; }
+    PT_SHARED_FN int lobeCount() const noexcept { return count_; }
+    PT_SHARED_FN const BasicLobe<Color>& lobe (int index) const noexcept { return lobes_[static_cast<std::size_t> (index)]; }
+    PT_SHARED_FN float selectionProbability (int index) const noexcept { return probability_[static_cast<std::size_t> (index)]; }
+    PT_SHARED_FN bool hasNonDelta() const noexcept { return nonDelta_; }
+    PT_SHARED_FN const Frame& frame() const noexcept { return frame_; }
     // A dispersive rough dielectric is present: the path must carry the hero
     // wavelength only before this BSDF is evaluated or sampled.
-    bool requiresHeroWavelength() const noexcept { return heroOnly_; }
-    void requireHeroWavelength() noexcept { heroOnly_ = true; }
+    PT_SHARED_FN bool requiresHeroWavelength() const noexcept { return heroOnly_; }
+    PT_SHARED_FN void requireHeroWavelength() noexcept { heroOnly_ = true; }
 
     // World-space directions, both pointing away from the surface. Delta
     // lobes contribute nothing. A direction on the wrong side of the
     // geometric normal for its lobe type (reflection below, refraction above)
     // evaluates to zero.
-    BasicBsdfEval<Color> eval (Vec3 wo, Vec3 wi) const noexcept;
-    bool sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfSample<Color>& out) const noexcept;
+    PT_SHARED_ENTRY BasicBsdfEval<Color> eval (Vec3 wo, Vec3 wi) const noexcept;
+    PT_SHARED_ENTRY bool sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfSample<Color>& out) const noexcept;
 
 private:
-    BasicBsdfEval<Color> evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept;
+    PT_SHARED_ENTRY BasicBsdfEval<Color> evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept;
 
     Frame frame_ {};
     Vec3 geometricNormal_ { 0.0f, 0.0f, 1.0f };
@@ -322,12 +325,12 @@ struct DielectricSetup
 // the other side is taken to be air. Base colour, metallic, roughness and
 // transmission are clamped to [0, 1] and ior to [1.01, 3] here, so any input
 // keeps every lobe energy conserving.
-void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
+PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
                         Vec3 wo, bool entering, Bsdf& out) noexcept;
 
 // The same for the integrator's channels: colours are upsampled for the
 // wavelengths, and dielectric lobes refract with setup's ratios.
-void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
+PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
                         Vec3 wo, const Wavelengths& wavelengths, const DielectricSetup& setup,
                         SpectralBsdf& out) noexcept;
 

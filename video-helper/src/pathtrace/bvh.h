@@ -14,8 +14,10 @@
 // follows Waechter and Binder, "A Fast and Robust Method for Avoiding
 // Self-Intersection", Ray Tracing Gems, 2019.
 
+#include "devices/device_annotations.h"
 #include "vec_math.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -47,7 +49,7 @@ struct Hit
     float v = 0.0f;
     std::uint32_t triangle = kNoTriangle;
 
-    bool valid() const noexcept { return triangle != kNoTriangle; }
+    PT_SHARED_FN bool valid() const noexcept { return triangle != kNoTriangle; }
 };
 
 // Per-ray constants shared by every box and triangle test of one query.
@@ -75,10 +77,33 @@ bool intersectTriangle (const PreparedRay& ray, Vec3 p0, Vec3 p1, Vec3 p2,
 // Moves a surface point off its triangle along n, the geometric normal facing
 // the side the new ray leaves from. The step grows with |p|, so it stays a few
 // float ulps at any scale.
-Vec3 offsetRayOrigin (Vec3 p, Vec3 n) noexcept;
+PT_SHARED_FN Vec3 offsetRayOrigin (Vec3 p, Vec3 n) noexcept
+{
+    // Near the origin a fixed float step; elsewhere an integer step in the
+    // float's bit pattern, which scales with the exponent.
+    constexpr float originRegion = 1.0f / 32.0f;
+    constexpr float floatStep = 1.0f / 65536.0f;
+    constexpr float intStep = 256.0f;
+    Vec3 out;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        const float pc = p[axis];
+        const float nc = n[axis];
+        if (std::fabs (pc) < originRegion)
+        {
+            out[axis] = pc + floatStep * nc;
+            continue;
+        }
+        const auto steps = static_cast<std::int32_t> (intStep * nc);
+        const auto bits = static_cast<std::int32_t> (floatBits (pc));
+        const std::int32_t moved = bits + (pc < 0.0f ? -steps : steps);
+        out[axis] = bitsToFloat (static_cast<std::uint32_t> (moved));
+    }
+    return out;
+}
 
 // Origin for a ray leaving a surface at p in direction dir. Flips ng toward dir.
-inline Vec3 spawnRayOrigin (Vec3 p, Vec3 ng, Vec3 dir) noexcept
+PT_SHARED_FN Vec3 spawnRayOrigin (Vec3 p, Vec3 ng, Vec3 dir) noexcept
 {
     return offsetRayOrigin (p, dot (ng, dir) < 0.0f ? -ng : ng);
 }

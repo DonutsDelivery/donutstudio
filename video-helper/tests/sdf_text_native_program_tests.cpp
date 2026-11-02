@@ -269,8 +269,8 @@ void stagedWorkPlan()
         request.width = extent[0]; request.height = extent[1];
         NativeSdfRayWorkPlan plan;
         check (nativeSdfRayWorkPlan (request, plan, error) && plan.activePixelCount == std::uint64_t (extent[0]) * extent[1]
-            && ! admitNativeSdfStagedTextWork (request, receipt, error),
-            "ordinary1080/4K refuses until certified culling or a measured device policy exists");
+            && admitNativeSdfStagedTextWork (request, receipt, error),
+            "ordinary 1080/4K text is admitted, with its work in the receipt");
     }
     const auto admittedGeometry = admitSdfIr (request.geometry, {}, error);
     arbitgpu::NativeSdfExecutionCapabilities capabilities;
@@ -281,8 +281,8 @@ void stagedWorkPlan()
     capabilities.maxSteps = 512; capabilities.minEpsilon = .000001;
     capabilities.maxEpsilon = .1; capabilities.maxDistance = 1000;
     NativeSdfRenderControls controls; controls.output = arbitgpu::NativeSdfOutput::normal;
-    check (admittedGeometry && ! admitNativeSdfRender (*admittedGeometry, {320,180}, controls, capabilities, error),
-        "legacy consumer retains double-primary segment refusal");
+    check (admittedGeometry && admitNativeSdfRender (*admittedGeometry, {320,180}, controls, capabilities, error),
+        "a consumer without primary reuse is admitted too");
     capabilities.reusesPrimaryTrace = true;
     check (admittedGeometry && admitNativeSdfRender (*admittedGeometry, {320,180}, controls, capabilities, error),
         "explicit primary reuse capability selects staged admission without lowering quality");
@@ -364,12 +364,14 @@ void resourceOrderAndWork()
                && program->textResourceIndices()[2] == std::numeric_limits<std::uint32_t>::max(),
                "sorted resources preserve record references and non-text sentinel");
     }
-    // Shared DAG edges are repeated shader traversals, not unique-node work.
+    // A shared record runs once per query on OpenGL. Work charges stay per edge:
+    // Metal walks each reference, and they bound what a query can do.
     source.records[2].inputs = { 41,41 }; source.records.erase (source.records.begin() + 1);
     source.textOutlines.erase (std::remove_if (source.textOutlines.begin(), source.textOutlines.end(),
         [&](const auto& resource) { return resource.stableId == second.stableId; }), source.textOutlines.end());
     const auto repeated = videohelper::sdf::compileNativeSdfProgram (source, error, true);
-    check (repeated && repeated->evaluationSteps() == 3 && repeated->segmentVisitsPerQuery() == 16
+    check (repeated && repeated->evaluationSteps() == 2 && repeated->expandedEvaluationSteps() == 3
+           && repeated->segmentVisitsPerQuery() == 16
            && repeated->textIndexNodeVisitsPerQuery() == 6,
            "repeated DAG child edges charge record and segment work twice");
     source = textIr();
@@ -392,8 +394,8 @@ void resourceOrderAndWork()
     check (! videohelper::sdf::admitNativeSdfTextWork (source, {2,3}, controls, receipt, error, 2000, 1247),
            "segment budget includes normal and raw Depth work");
     controls.maximumSteps = 128; controls.output = arbitgpu::NativeSdfOutput::color;
-    check (! videohelper::sdf::admitNativeSdfTextWork (source, {1920,1080}, controls, receipt, error),
-           "default 1080p text remains refused by bounded policy, without reducing extent");
+    check (videohelper::sdf::admitNativeSdfTextWork (source, {1920,1080}, controls, receipt, error),
+           "default 1080p text is admitted");
     controls.maximumSteps = std::numeric_limits<std::uint32_t>::max();
     controls.output = arbitgpu::NativeSdfOutput::edgeDistance;
     check (! videohelper::sdf::admitNativeSdfTextWork (source,

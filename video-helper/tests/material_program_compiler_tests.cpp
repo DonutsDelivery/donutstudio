@@ -125,7 +125,7 @@ int main()
     check(defaultSurfaceInstruction.inputs.size() == 4
               && std::all_of(defaultSurfaceInstruction.inputs.begin(),
                              defaultSurfaceInstruction.inputs.end(),
-                             [](std::uint16_t slot)
+                             [](std::uint32_t slot)
                              { return slot == videowire::kMaterialProgramInvalidValueSlot; }),
           "every default surface input slot uses the invalid sentinel within the released four-input contract");
 
@@ -223,9 +223,9 @@ int main()
               && openGl->programIdentity().size() == 64,
           "source and program identities are SHA-256 digests");
     check(openGl->sourceIdentity()
-              == "b43f6feceba769a1261202fe922e937551307195b00360b45361aa41c6357b8b"
+              == "ec379c41bb03cf501c439cb911551e7709a9495ea1cce39e93a0d093e8d30ee9"
               && openGl->programIdentity()
-                   == "4a087bf7d1c522e9a47d15179840f6c5a7d180da3af25c2806dff5b1b24aaceb",
+                   == "02d22202d845fe34fec5eb39d53f0e7a3ee64eeef2b7e23766076da68a44a30b",
           "the reference program has stable cross-process structural digests");
 
     const auto reorderedVertex = videohelper::vertexmodifier::admitVertexModifierIr(
@@ -275,6 +275,105 @@ int main()
                                   BackendTarget::OpenGl, error, limits)
                && contains(error, "stage instruction"),
           "vertex instruction limits are enforced");
+    limits = {};
+    // A program above the old 512 instructions compiles. A balanced tree of adds
+    // keeps it within the depth limit, which is a separate bound.
+    const auto wideVertex = [] (int leaves)
+    {
+        VertexModifierIr largeVertex;
+        largeVertex.records.push_back(vertexRecord(10, VertexModifierOperation::importedPosition));
+        std::vector<std::uint64_t> level;
+        std::uint64_t nextId = 100;
+        for (int i = 0; i < leaves; ++i)
+        {
+            largeVertex.records.push_back(vertexRecord(nextId, VertexModifierOperation::vec3Constant, {}, { 0.0, 0.0, 0.0 }));
+            level.push_back(nextId++);
+        }
+        while (level.size() > 1)
+        {
+            std::vector<std::uint64_t> next;
+            for (std::size_t i = 0; i < level.size(); i += 2)
+            {
+                if (i + 1 == level.size()) { next.push_back(level[i]); continue; }
+                largeVertex.records.push_back(vertexRecord(nextId, VertexModifierOperation::vec3Add, { level[i], level[i + 1] }));
+                next.push_back(nextId++);
+            }
+            level = std::move(next);
+        }
+        largeVertex.rootId = nextId;
+        largeVertex.records.push_back(vertexRecord(nextId, VertexModifierOperation::boundedDisplacementOutput, { 10, level.front() }, { 0.5 }));
+        return largeVertex;
+    };
+    const auto largeVertex = wideVertex(300);
+    videohelper::vertexmodifier::AdmissionLimits largeLimits;
+    const auto admittedLarge = videohelper::vertexmodifier::admitVertexModifierIr(largeVertex, largeLimits, error);
+    check(admittedLarge.has_value(), "a vertex modifier above the old limit is admitted");
+    if (admittedLarge)
+    {
+        const auto largeProgram = compileMaterialProgram(nullptr, &*admittedLarge, BackendTarget::OpenGl, error);
+        check(largeProgram.has_value() && largeProgram->vertexInstructions().size() > 512,
+              "a vertex program above 512 instructions compiles");
+    }
+    // Half the records are leaves, so this passes the old 65535 instruction limit.
+    const auto admittedWide = videohelper::vertexmodifier::admitVertexModifierIr(wideVertex(33000), largeLimits, error);
+    check(admittedWide.has_value(), "a vertex modifier above 65535 records is admitted");
+    if (admittedWide)
+    {
+        const auto wideProgram = compileMaterialProgram(nullptr, &*admittedWide, BackendTarget::OpenGl, error);
+        check(wideProgram.has_value() && wideProgram->vertexInstructions().size() > 65535
+                  && wideProgram->vertexOutputSlot() == wideProgram->vertexInstructions().size() - 1
+                  && wideProgram->vertexInstructions().back().resultSlot == wideProgram->vertexOutputSlot(),
+              "a vertex program above 65535 instructions addresses every slot");
+    }
+    // A chain far past the old depth limits. A recursive walk would exhaust the stack.
+    VertexModifierIr deepVertex;
+    deepVertex.records.push_back(vertexRecord(1, VertexModifierOperation::importedPosition));
+    deepVertex.records.push_back(vertexRecord(2, VertexModifierOperation::vec3Constant, {}, { 0.0, 0.0, 0.0 }));
+    std::uint64_t deepPrevious = 2;
+    for (std::uint64_t id = 3; id < 200000; ++id)
+    {
+        deepVertex.records.push_back(vertexRecord(id, VertexModifierOperation::vec3Add, { deepPrevious, 2 }));
+        deepPrevious = id;
+    }
+    deepVertex.rootId = 200000;
+    deepVertex.records.push_back(vertexRecord(200000, VertexModifierOperation::boundedDisplacementOutput, { 1, deepPrevious }, { 0.5 }));
+    const auto admittedDeep = videohelper::vertexmodifier::admitVertexModifierIr(deepVertex, {}, error);
+    check(admittedDeep && admittedDeep->maximumDepth() == 199999,
+          "admission walks a chain of 200000 vertex records");
+    // The same for a surface program, past the old 128 limit and the old 16-bit slots.
+    ProgramDescription wideSurface;
+    std::vector<ValueId> wideLevel;
+    for (int i = 0; i < 33000; ++i)
+        wideLevel.push_back(append(wideSurface, OperationKind::FloatConstant, ValueType::Scalar));
+    while (wideLevel.size() > 1)
+    {
+        std::vector<ValueId> next;
+        for (std::size_t i = 0; i < wideLevel.size(); i += 2)
+            next.push_back(i + 1 == wideLevel.size() ? wideLevel[i]
+                : append(wideSurface, OperationKind::Add, ValueType::Scalar, { wideLevel[i], wideLevel[i + 1] }));
+        wideLevel = std::move(next);
+    }
+    const auto wideColor = append(wideSurface, OperationKind::ComposeVec3, ValueType::Vec3,
+                                  { wideLevel[0], wideLevel[0], wideLevel[0] });
+    const auto wideMaterialId = append(wideSurface, OperationKind::UIntConstant, ValueType::UInt);
+    for (const auto output : kSurfaceOutputs)
+    {
+        const auto type = outputType(output);
+        wideSurface.outputs[static_cast<std::size_t>(output)]
+            = type == ValueType::Vec3 ? wideColor : type == ValueType::UInt ? wideMaterialId : wideLevel[0];
+    }
+    const auto admittedWideSurface = admit(wideSurface, error);
+    check(admittedWideSurface.has_value(), "a surface program above 65535 operations is admitted");
+    if (admittedWideSurface)
+    {
+        const auto wideProgram = compileMaterialProgram(&*admittedWideSurface, nullptr, BackendTarget::OpenGl, error);
+        check(wideProgram.has_value() && wideProgram->surfaceInstructions().size() > 65535
+                  && wideProgram->surfaceInstructions().back().resultSlot
+                       == wideProgram->surfaceInstructions().size() - 1
+                  && wideProgram->surfaceOutputSlots()[static_cast<std::size_t>(OutputSemantic::MaterialId)]
+                       == wideProgram->surfaceInstructions().back().resultSlot,
+              "a surface program above 65535 instructions addresses every slot");
+    }
     limits = {};
     limits.combinedInstructions = 14;
     check(!compileMaterialProgram(&*admittedSurface, &*admittedVertex,

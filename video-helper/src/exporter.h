@@ -315,6 +315,9 @@ struct ExportProgress
     std::atomic<double> encodeFps { 0.0 };  // wall-clock encode rate
     std::atomic<int> phase { 0 };
     std::atomic<bool> abort { false };      // set by export_cancel
+    // The most notes and links any one frame's score left out.
+    std::atomic<int> droppedNotesPeak { 0 };
+    std::atomic<int> droppedLinksPeak { 0 };
     videowire::VisualPlanTelemetry visualTelemetry;
     std::mutex opticalFlowMutex;
     std::map<int, std::string> opticalFlowReceipts;

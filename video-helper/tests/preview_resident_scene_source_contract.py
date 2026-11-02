@@ -51,7 +51,8 @@ require(renderer, "const bool residentFrame = use == RenderUse::Preview && diffr
 forbid(renderer, "use == RenderUse::Preview && ! sceneInputs.glassCaustic", "renderer")
 require(renderer, "&& (residentFrame || ! cache_.residentRefreshed)\n", "renderer exact hit")
 hit = region(renderer, "bool structuralCacheHit = false;", "const bool staticReuse", "renderer structural hit")
-require(hit, "if (! exactCacheHit && residentFrame && cache_.native != nullptr", "renderer structural hit")
+require(hit, "if ((! exactCacheHit || refitPlanMissing) && residentFrame && cache_.native != nullptr", "renderer structural hit")
+require(renderer, "const bool refitPlanMissing = residentFrame && ! backend_.residentRefitPlanned (cache_.native);", "renderer plans the water refit once")
 require(hit, "backend_.refreshPreviewDeformedVertices (cache_.native, snapshot, nativeMaterial)", "renderer structural hit")
 require(hit, "cache_.residentRefreshed = true;", "renderer structural hit")
 require(renderer, "const bool staticReuse = exactCacheHit || structuralCacheHit;", "renderer")
@@ -208,7 +209,7 @@ for needle in ("const bool residentEligible=preview&&!multipleScatterPolicy&&wat
 # A resident frame neither prepares nor builds: the build and the Preview fit run
 # only in the branch that has no resident schedule.
 fit = region(caustic, "if(residentCaustic)reducedReason=residentState.reducedReason;", "if(scheduled.sourceDirectionalIrradiance.version)", "caustic schedule")
-if not fit.lstrip().startswith("if(residentCaustic)reducedReason=residentState.reducedReason;\n    else\n    {\n        if(!build(scheduling,scheduled,refused.error))return refused;"):
+if not fit.lstrip().startswith("if(residentCaustic)reducedReason=residentState.reducedReason;\n    else\n    {\n        loopstep::Scope fitScope (\"gl:caustic-schedule-fit\");\n        if(!build(scheduling,scheduled,refused.error))return refused;"):
     errors.append("caustic schedule must build only when no resident schedule is reused")
 # Lent resident names go back before every frame release, so the frame never deletes them.
 lend = region(caustic, "const auto returnResidentTables=[&] {", "cleanup();frame->releaseTexturesUnlocked();", "caustic lend")

@@ -714,8 +714,8 @@ inline bool roughTileCases(const arbitgpu::smoothglass::Prepared& prepared,std::
                              {3840,2160},{3841,2161},{1,9709}}) {
         std::shared_ptr<const Schedule> plan,replay;
         if(!scheduleFor(extent[0],extent[1],plan)||!scheduleFor(extent[0],extent[1],replay))return false;
-        if(!check(plan->tiles().size()==replay->tiles().size() && plan->tiles().size()<=kMaximumFrameJobs,
-                  "rough tile schedule replay or finite job bound failed"))return false;
+        if(!check(plan->tiles().size()==replay->tiles().size(),
+                  "rough tile schedule replay failed"))return false;
         std::vector<std::uint8_t> coverage(static_cast<std::size_t>(plan->pixels()));
         std::uint64_t pixels=0,queries=0;
         for(std::size_t i=0;i<plan->tiles().size();++i) {
@@ -906,7 +906,7 @@ inline bool roughMultipleReceiptCases(const arbitgpu::smoothglass::Prepared& v1,
     if(!reject(scan(prepared),"v2 micro-events exceeded scene-query ancestry"))return false;
     put(1,3,3073);
     put(0,0,.99999f);put(1,0,.00001f);
-    if(!reject(scan(prepared),"v2 masked power hid a recovered walk"))return false;
+    if(!scan(prepared)) {error="v2 absorbed power did not close its receipt: "+error;return false;}
     put(0,0,1);put(1,0,0);
     std::vector<tiles::NativeTileReceipt::Work> work;
     const auto receipt=[&](const auto& v) {
@@ -951,8 +951,10 @@ inline bool roughMultipleReceiptCases(const arbitgpu::smoothglass::Prepared& v1,
     tiles::Completion complete(plan);
     if(!complete.accept(key,plan->tiles()[0],receipt(pixels),error))return false;
     const auto before=complete.aggregate();auto second=storage(plan->tiles()[1]);
-    if(!reject(complete.accept(key,plan->tiles()[1],receipt(second),error),"v2 whole-frame work overflow published")
-        ||!complete.invalidated()||complete.aggregate().microWork!=before.microWork)return false;
+    // Two tiles of worst-case work pass one submission's bound, and the frame still completes.
+    if(!complete.accept(key,plan->tiles()[1],receipt(second),error)||complete.invalidated()
+        ||complete.aggregate().microWork<=before.microWork
+        ||complete.aggregate().microWork<=sg::kMaximumCameraMicroWork)return false;
     auto stale=key;stale.owner=std::make_shared<const int>(29);tiles::Completion owner(plan);
     if(!reject(owner.accept(stale,plan->tiles()[0],receipt(pixels),error),"v2 stale native owner accepted"))return false;
     // Lower actual event work permits all jobs while retaining deterministic totals.
@@ -965,7 +967,7 @@ inline bool roughMultipleReceiptCases(const arbitgpu::smoothglass::Prepared& v1,
     NativeFixtureSceneStats stats;tiles::Aggregate aggregate;
     if(!accepted.publish(key,stats,aggregate,error)||aggregate.microEvents!=274||aggregate.microWork!=2740)return false;
     auto large=key;large.width=3840;large.height=2160;
-    if(!reject(tiles::Schedule::admit(prepared,large,false,plan,error),"v2 unbounded full-size tile job schedule admitted"))return false;
+    if(!tiles::Schedule::admit(prepared,large,false,plan,error)) {error="v2 4K tile schedule refused before a walk ran: "+error;return false;}
     error.clear();return true;
 }
 inline bool roughNativeReceiptCases(videohelper::materialprogram::BackendTarget target,std::string& error)
@@ -1043,7 +1045,7 @@ inline bool roughNativeReceiptCases(videohelper::materialprogram::BackendTarget 
     };
     for(int code=-1;code>=-10;--code) {
         put(terminal,3,float(code));put(tail,3,float(code));
-        if(!refused("negative rough status accepted") ||error!=roughTransportDiagnostic(static_cast<RoughTransportStatus>(code)))return false;
+        if(!refused("negative rough status accepted") ||error.rfind(roughTransportDiagnostic(static_cast<RoughTransportStatus>(code)),0)!=0)return false;
     }
     for(const float invalid : {0.f,2.f,1.5f,std::numeric_limits<float>::infinity()}) {
         put(terminal,3,invalid);put(tail,3,invalid);
@@ -1064,9 +1066,9 @@ inline bool roughNativeReceiptCases(videohelper::materialprogram::BackendTarget 
         put(*plane,c,original);
     }
     put(terminal,0,.5f);if(!refused("nonconserving rough receipt accepted"))return false;
-    put(terminal,0,.9998f);put(masked,0,.00019f);
+    put(terminal,0,.9998f);put(tail,0,.00019f);
     if(!refused("over-bound unresolved power accepted"))return false;
-    put(terminal,0,.99998f);put(masked,0,.00001f);
+    put(terminal,0,.99998f);put(tail,0,.00001f);
     putId(material,0,prepared.material.value+1);
     if(!refused("rough receipt material mismatch accepted"))return false;
     putId(material,0,prepared.material.value);
@@ -1145,8 +1147,10 @@ inline bool run(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
         {.25f,1,20,1.5f,.004f,false,true,true},{.25f,1,20,1.5f,0,false,true,true},
         {.25f,1,20,1.5f,.004f,false,true,false,.5f,0,1},
         {.25f,1,20,1.5f,.004f,false,true,false,1,.15f,1},
-        {.25f,1.4f,20,1.5f,.004f,false,true,false,1,0,.25f}};
+        {.25f,1.4f,20,1.5f,.004f,false,true,false,1,0,.25f},
+        {.25f,1,20,1.5f,.02f,false,true},{.25f,1,20,1.5f,.1f,false,true}};
     D3 baseline{},dispersive{},splitPixels{};
+    double fringe=0;
     std::size_t row=0;
     for(const auto& test:rows) {
         auto authored=scene(test.slope,test.thickness,test.angle,test.inside);
@@ -1172,6 +1176,13 @@ inline bool run(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
             {error="zero dispersion split independent ray geometry";return false;}
         if(test.slope!=0&&test.b!=0 && std::abs(expected.firstExit[0][0]-expected.firstExit[2][0])<.001)
             {error="authored prism did not separate physical wavelength directions";return false;}
+        // Rows 2, 13 and 14 hold the same prism at B 0.004, 0.02 and 0.1. The native
+        // pixel check below holds each one to this oracle, so a cap fails it.
+        if(row==2||row>=13) {
+            const auto separation=std::abs(expected.firstExit[0][0]-expected.firstExit[2][0]);
+            if(separation<=fringe) {error="glass fringe did not widen with Cauchy B";return false;}
+            fringe=separation;
+        }
         auto snapshot=std::make_shared<const Visual3DScene>(std::move(authored));
         const auto material=binding(snapshot,target,test.ior,test.b,error);if(!material)return false;
         videorender::fixture3d::FixtureSceneRenderer renderer(backend);
@@ -1319,7 +1330,6 @@ inline bool run(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
         {arbitgpu::smoothglass::roughReasonCode(arbitgpu::smoothglass::RoughTransportStatus::InternalCamera),"(rough glass refuses internal camera; 1 pixel)"},
         {arbitgpu::smoothglass::roughReasonCode(arbitgpu::smoothglass::RoughTransportStatus::IncompleteQuery),"(rough glass query incomplete; 1 pixel)"},
         {arbitgpu::smoothglass::roughReasonCode(arbitgpu::smoothglass::RoughTransportStatus::IdentityOrMedium),"(rough glass identity or medium inconsistent; 1 pixel)"},
-        {arbitgpu::smoothglass::roughReasonCode(arbitgpu::smoothglass::RoughTransportStatus::InterfaceDepth),"(rough glass interface depth budget exhausted; 1 pixel)"},
         {arbitgpu::smoothglass::roughReasonCode(arbitgpu::smoothglass::RoughTransportStatus::PendingBranches),"(rough glass pending branch budget exhausted; 1 pixel)"},
         {arbitgpu::smoothglass::roughReasonCode(arbitgpu::smoothglass::RoughTransportStatus::RayVisits),"(rough glass ray query budget exhausted; 1 pixel)"},
         {arbitgpu::smoothglass::roughReasonCode(arbitgpu::smoothglass::RoughTransportStatus::UnresolvedEnergy),"(rough glass unresolved microfacet energy; 1 pixel)"},

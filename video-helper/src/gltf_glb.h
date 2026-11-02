@@ -14,32 +14,36 @@
 
 namespace videohelper::gltf
 {
+// Limits a caller may impose, for example on an untrusted preview. The defaults
+// impose none: a document allocates what it needs or the allocation fails.
+// JSON nesting stays finite because the JSON parser recurses on the stack.
 struct GlbLimits
 {
-    std::size_t maxContainerBytes = 256u * 1024u * 1024u;
-    std::size_t maxJsonBytes = 4u * 1024u * 1024u;
-    std::size_t maxBinBytes = 252u * 1024u * 1024u;
+    static constexpr std::size_t kUnbounded = ~std::size_t {};
+    std::size_t maxContainerBytes = kUnbounded;
+    std::size_t maxJsonBytes = kUnbounded;
+    std::size_t maxBinBytes = kUnbounded;
     std::size_t maxJsonNestingDepth = 64;
-    std::size_t maxScenes = 64;
-    std::size_t maxNodes = 16384;
-    std::size_t maxNodeDepth = 256;
-    std::size_t maxMeshes = 4096;
-    std::size_t maxPrimitives = 16384;
-    std::size_t maxMaterials = 4096;
-    std::size_t maxTextures = 4096;
-    std::size_t maxImages = 4096;
-    std::size_t maxSamplers = 4096;
-    std::size_t maxCameras = 256;
-    std::size_t maxLights = 256;
-    std::size_t maxAccessors = 65536;
-    std::size_t maxBufferViews = 65536;
-    std::size_t maxDecodedVertices = 4u * 1024u * 1024u;
-    std::size_t maxDecodedIndices = 12u * 1024u * 1024u;
-    std::size_t maxDecodedBytes = 512u * 1024u * 1024u;
-    std::size_t maxEmbeddedImageBytes = 128u * 1024u * 1024u;
-    std::size_t maxImageWidth = 8192;
-    std::size_t maxImageHeight = 8192;
-    std::size_t maxDecodedImageBytes = 256u * 1024u * 1024u;
+    std::size_t maxScenes = kUnbounded;
+    std::size_t maxNodes = kUnbounded;
+    std::size_t maxNodeDepth = kUnbounded;
+    std::size_t maxMeshes = kUnbounded;
+    std::size_t maxPrimitives = kUnbounded;
+    std::size_t maxMaterials = kUnbounded;
+    std::size_t maxTextures = kUnbounded;
+    std::size_t maxImages = kUnbounded;
+    std::size_t maxSamplers = kUnbounded;
+    std::size_t maxCameras = kUnbounded;
+    std::size_t maxLights = kUnbounded;
+    std::size_t maxAccessors = kUnbounded;
+    std::size_t maxBufferViews = kUnbounded;
+    std::size_t maxDecodedVertices = kUnbounded;
+    std::size_t maxDecodedIndices = kUnbounded;
+    std::size_t maxDecodedBytes = kUnbounded;
+    std::size_t maxEmbeddedImageBytes = kUnbounded;
+    std::size_t maxImageWidth = kUnbounded;
+    std::size_t maxImageHeight = kUnbounded;
+    std::size_t maxDecodedImageBytes = kUnbounded;
 };
 
 struct GlbAdmissionOptions

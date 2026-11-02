@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,7 +16,9 @@ namespace videorender
 {
 namespace waterreplay
 {
-inline constexpr double kMaximumSeconds = 10;
+// The tick clock stays exact in a double up to here, about ten years of project
+// time. This is the clock's range and not a length limit.
+inline constexpr double kMaximumClockSeconds = 9007199254740991.0 / kParticleReplayTicksPerSecond;
 
 struct Impulse
 {
@@ -59,8 +62,8 @@ public:
     {
         using namespace videowire::geometry;
         const auto refuse = [&](const char* reason) { error = reason; return false; };
-        if (!std::isfinite(projectSeconds) || projectSeconds < 0 || projectSeconds > waterreplay::kMaximumSeconds)
-            return refuse("Water replay requires project time from zero through 10 seconds; longer history is unavailable");
+        if (!std::isfinite(projectSeconds) || projectSeconds < 0 || projectSeconds > waterreplay::kMaximumClockSeconds)
+            return refuse("Water replay requires a project time from zero that its tick clock can represent");
         WaterSurfaceGrid verifiedGrid;
         if (!validateWaterSurfaceGrid(restMesh, verifiedGrid, error)) return false;
         if (grid.columns != verifiedGrid.columns || grid.rows != verifiedGrid.rows
@@ -75,6 +78,7 @@ public:
         const auto steps = projectTick / kParticleReplayStepTicks;
         const auto& controls = operation.field.values;
         std::vector<waterreplay::Impulse> impulses;
+        try {
         const auto add = [&](double seconds, int kind, std::int64_t identity,
                              double x, double y, double velocity)
         {
@@ -84,8 +88,6 @@ public:
             // event when query rounding crosses a step by less than half a tick.
             if (seconds < 0 || seconds > projectSeconds) return true;
             const auto tick = std::llround(seconds * kParticleReplayTicksPerSecond);
-            if (impulses.size() >= static_cast<std::size_t>(kParticleReplayMaxEvents))
-                return refuse("Water replay exceeds 512 score/audio impulses; history cannot be truncated");
             impulses.push_back({tick, identity, kind, x, y, velocity});
             return true;
         };
@@ -134,6 +136,10 @@ public:
                              controls[3] * std::clamp(double(frame.onset), 0.0, 1.0))) return false;
                 }
             }
+        }
+        } catch (const std::bad_alloc&) {
+            error = "Water replay could not allocate " + std::to_string(impulses.size() + 1) + " score/audio impulses";
+            return false;
         }
         std::sort(impulses.begin(), impulses.end(), [](const auto& a, const auto& b)
         {

@@ -313,8 +313,12 @@ void textOutlineContractChecks()
     check (! chargeSdfTextIrEvaluationWork (request.geometry, 4, graphBudget, error)
            && graphBudget.recordVisits == 0 && graphBudget.segmentVisits == 0, "graph work refuses atomically at segment budget");
     graphBudget = {};
+    check (chargeSdfTextIrEvaluationWork (request.geometry, std::numeric_limits<std::uint64_t>::max(), graphBudget, error)
+           && graphBudget.recordVisits == std::numeric_limits<std::uint64_t>::max(),
+           "query multiplication saturates its receipt instead of refusing");
+    graphBudget = {}; graphBudget.maximumRecordVisits = 1000;
     check (! chargeSdfTextIrEvaluationWork (request.geometry, std::numeric_limits<std::uint64_t>::max(), graphBudget, error),
-           "query multiplication is bounded before overflow");
+           "a saturated count still refuses against a limit the caller chose");
     request.geometry.records.back().inputs[1] = 2;
     check (encodeSdfRaymarchOperation (request).empty(), "cyclic v2 graphs refuse wire admission");
     request.geometry.records.back().inputs[1] = 1;

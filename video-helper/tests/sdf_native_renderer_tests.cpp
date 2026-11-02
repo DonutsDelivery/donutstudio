@@ -411,7 +411,7 @@ int main()
             refusedGeometry = std::make_shared<const AdmittedSdfIr> (std::move (*admittedText));
             dimensions = { 1920, 1080 };
             retirementBackend.reportedCapabilities.maxExtent = 1920;
-            retirementBackend.reportedCapabilities.maxPixels = 1920ull * 1080ull;
+            retirementBackend.reportedCapabilities.maxPixels = 1920ull * 1080ull - 1;
             retirementBackend.reportedCapabilities.supportedOperations[static_cast<std::size_t> (
                 videowire::SdfOperation::textExtrusion)] = true;
         }
@@ -428,9 +428,6 @@ int main()
                "refusal retires prior Color, Depth and Normal ownership and frame identity");
         check (retirementBackend.submissions == before + (failure >= 4 ? 1 : 0),
                "admission failures retire output before any backend dispatch");
-        if (failure == 3)
-            check (error == "SDF text evaluation work capacity exceeded",
-                   "text retirement fixture reaches bounded work refusal");
     }
 
     videowire::SdfRaymarchOperation wireOperation;

@@ -12,9 +12,14 @@ inline std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission> adm
 }
 namespace videorender {
 
-inline constexpr std::size_t particlePointsBodyIssuanceCensusWork=32*sizeof(videowire::geometry::OperationRecord)
-    +sizeof(videowire::geometry::DeferredBodyGeometrySource);
-inline constexpr std::size_t particlePointsBodyCoreOwnerVisits=32;
+// Comparing a source visits each of its operations, so both charges follow the count.
+inline std::size_t particlePointsBodyOperationCount(const videowire::geometry::DeferredBodyGeometrySource& source) {
+    return source.source ? source.source->descriptor().operations.size():0;
+}
+inline constexpr std::size_t particlePointsBodyIssuanceCensusWork(std::size_t operations) {
+    return operations*sizeof(videowire::geometry::OperationRecord)
+        +sizeof(videowire::geometry::DeferredBodyGeometrySource);
+}
 inline constexpr std::size_t particlePointsBodyNativeHeaderVisits=64;
 struct ParticlePointsBodyEnvelope final {
     std::size_t bytes=0, work=0;
@@ -41,7 +46,7 @@ public:
         const auto& value=source.source->descriptor();
         const auto* mesh=std::get_if<GeometryData>(&value.data);
         if (!mesh || mesh->positions.size()>256 || mesh->indices.size()>384 || mesh->vertexIds.size()>256
-            || value.operations.empty() || value.operations.size()>32 || !value.attributes.empty()
+            || value.operations.empty() || !value.attributes.empty()
             || !value.spectrumFields.empty() || !value.scoreFields.empty()
             || source.reference->positions.size()>256 || source.reference->vertexIds.size()>256
             || source.reference->indices.size()>384) return false;
@@ -75,12 +80,16 @@ public:
         }
         // Eight descriptor owners cover decoder/admit copies, its compatibility
         // descriptor, the body factory snapshot/reference and concurrent scratch.
-        // The supported 32-record body schedule visits at most 32*32 shapes and
-        // 32 bounded 256-vertex/384-index mesh or vertex-field intermediates per
-        // pass. Decode, validation, comparison and publication have eight passes.
+        // A body schedule of n records visits at most n*n shapes and n bounded
+        // 256-vertex/384-index mesh or vertex-field intermediates per pass.
+        // Decode, validation, comparison and publication have eight passes.
+        const auto records=value.operations.size();
+        std::size_t census=0,perRecord=0;
+        if (!particlebodygeometrydetail::censusBytes(records,census)
+            || !checkedAdd(records,std::size_t{256u*16u+384u*4u},perRecord)
+            || !checkedMul(records,perRecord,envelope.work) || !checkedMul(envelope.work,8,envelope.work)) return false;
         envelope.bytes=sizeof(ParticlePointsBodySourceAdmission)+sizeof(ParticleParams)
-            +sizeof(ParticleGeometryBinding)+particlebodygeometrydetail::censusLogicalBytes;
-        envelope.work=8u*32u*(32u+256u*16u+384u*4u);
+            +sizeof(ParticleGeometryBinding)+census;
         if (source.reference.get()!=mesh
             && (!addArrayBytes(source.reference->positions.capacity(),sizeof(Vec3),envelope.bytes)
                 || !addArrayBytes(source.reference->vertexIds.capacity(),sizeof(StableId),envelope.bytes)

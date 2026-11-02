@@ -8,40 +8,41 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace arbitgpu::opaquevisibility
 {
 // Renderer-owned acceleration, never a serialized scene authority. Exact range
-// instances share a BLAS; a bounded TLAS holds their current world transforms.
-constexpr std::size_t kMaximumTriangles =
-    HarmonicMIDI::grid::Visual3DScene::kMaxObjects * (HarmonicMIDI::grid::Visual3DScene::kMaxIndices / 3);
-constexpr std::size_t kMaximumBlasNodes = 2 * (HarmonicMIDI::grid::Visual3DScene::kMaxIndices / 3) - 1;
-constexpr std::size_t kMaximumInstances =
-    HarmonicMIDI::grid::Visual3DScene::kMaxObjects * visualnoteinstancing::kMaximumInstances;
-constexpr std::size_t kMaximumTlasNodes = 2 * kMaximumInstances - 1;
+// instances share a BLAS; the TLAS holds their current world transforms. Both are
+// sized from the scene and flattened into one RGBA32F texture of this width. Its
+// height comes from the payload and is checked against the device's reported
+// maximum texture size where the texture is created.
 constexpr std::size_t kTextureWidth = 1024;
-constexpr std::size_t kTextureHeight = 2048;
-constexpr std::size_t kMaximumPayloadTexels =
-    HarmonicMIDI::grid::Visual3DScene::kMaxObjects *
-        (2 * kMaximumBlasNodes + HarmonicMIDI::grid::Visual3DScene::kMaxIndices) +
-    4 * kMaximumInstances + 2 * kMaximumTlasNodes + HarmonicMIDI::grid::Visual3DScene::kMaxObjects + 1;
-static_assert(kMaximumPayloadTexels <= kTextureWidth * kTextureHeight,
-              "Opaque visibility must cover the complete admitted scene and note instance bounds");
+// The payload stores node, leaf and instance indices in float components, which
+// are exact below 2^24. This is the encoding's range, not a scene budget.
+constexpr std::size_t kExactFloatIndexRange = std::size_t(1) << 24;
 using Texel = std::array<float, 4>;
 using Matrix = std::array<float, 16>;
 using Point = std::array<float, 3>;
-// Median splitting reaches at most 14 TLAS and 11 BLAS levels at these bounds.
-constexpr std::size_t kClosestHitStackCapacity = 16;
-static_assert(kMaximumInstances <= (std::size_t(1) << (kClosestHitStackCapacity - 1)) &&
-              HarmonicMIDI::grid::Visual3DScene::kMaxIndices / 3 <=
-                  4 * (std::size_t(1) << (kClosestHitStackCapacity - 1)),
-              "Median-split BLAS/TLAS depths must fit the closest-hit stacks");
-constexpr std::size_t kMaximumClosestHitWork = kMaximumTlasNodes +
-    kMaximumInstances * (kMaximumBlasNodes + HarmonicMIDI::grid::Visual3DScene::kMaxIndices / 3);
-static_assert(kMaximumClosestHitWork < UINT32_MAX, "Closest-hit work must fit the query counter");
+// Median splitting halves the primitive range at each level, so a tree over any
+// indexable range is at most 24 levels deep and each level leaves one entry pending.
+constexpr std::size_t kClosestHitStackCapacity = 32;
+// The range of the query's 32-bit work counter. A frame's allowance comes from
+// its actual topology and saturates here.
+constexpr std::size_t kMaximumClosestHitWork = UINT32_MAX;
+inline bool payloadIndexable(std::size_t texels, std::string& error)
+{
+    if (texels <= kExactFloatIndexRange)
+        return true;
+    error = "Scene query payload has " + std::to_string(texels) + " texels and its float index encoding is exact to "
+        + std::to_string(kExactFloatIndexRange);
+    return false;
+}
 inline std::size_t treeNodes(std::size_t count, std::size_t leafSize)
 {
     return count <= leafSize ? 1 : 1 + treeNodes(count / 2, leafSize) + treeNodes(count - count / 2, leafSize);
@@ -69,6 +70,8 @@ struct Primitive
     Bounds bounds;
     std::array<Point, 3> triangle{};
     std::size_t record = 0;
+    // First of three vertex-normal texels, or 0 when the face normal is the answer.
+    std::size_t normals = 0;
 };
 struct Mesh
 {
@@ -84,14 +87,10 @@ struct Prepared
 {
     AdmissionMode mode = AdmissionMode::opaqueOnly;
     std::size_t objectCount = 0;
-    std::array<Texel, 64> identities{};
+    std::vector<Texel> identities;
     std::vector<Texel> texels;
     std::vector<Mesh> meshes;
-    std::array<int, 64> objectMesh{};
-    Prepared()
-    {
-        objectMesh.fill(-1);
-    }
+    std::vector<int> objectMesh;
 };
 struct Instance
 {
@@ -161,7 +160,8 @@ inline std::size_t tree(std::vector<Texel>& texels, std::vector<Primitive>& prim
                 {
                     const auto& p = primitives[i].triangle[v];
                     texels.push_back({p[0], p[1], p[2], v == 0 && i == begin ? float(end - begin) :
-                        (identities && v == 1 ? float(primitives[i].record) : 0.0f)});
+                        (identities && v == 1 ? float(primitives[i].record)
+                            : v == 2 ? float(primitives[i].normals) : 0.0f)});
                 }
         }
         else
@@ -185,21 +185,45 @@ inline std::size_t tree(std::vector<Texel>& texels, std::vector<Primitive>& prim
     texels[node + 1] = {bounds.high[0], bounds.high[1], bounds.high[2], float(leaf)};
     return node;
 }
-inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene, const std::array<bool, 64>& opaque,
-                    Prepared& output, std::string& error, AdmissionMode mode = AdmissionMode::opaqueOnly)
+// Upper bound of one query table for this scene: seven texels per triangle of each
+// distinct mesh range, one identity per object and eight per instance matrix, rounded
+// up to a whole row. Saturates rather than wraps, so an impossible table fails its charge.
+// Glass receiver normal blocks are not counted. They add three texels per smooth receiver
+// triangle, and the callers charge this figure four times over.
+inline std::uint64_t sceneQueryPayloadTexels(const HarmonicMIDI::grid::Visual3DScene& scene,
+                                             std::uint64_t notes = visualnoteinstancing::kMaximumInstances)
+{
+    std::set<std::array<std::uint32_t, 4>> ranges;
+    std::uint64_t triangles = 0;
+    for (std::size_t o = 0; o < scene.objectCount; ++o)
+    {
+        const auto& object = scene.objects[o];
+        if (ranges.insert({object.firstVertex, object.vertexCount, object.firstIndex, object.indexCount}).second)
+            triangles += (object.indexCount ? object.indexCount : object.vertexCount) / 3;
+    }
+    const auto instances = (std::uint64_t(scene.objectCount) + scene.objectInstanceCount) * (notes + 1);
+    const auto saturated = std::numeric_limits<std::uint64_t>::max() / 16;
+    if (triangles > saturated / 8 || instances > saturated / 16) return saturated;
+    const auto texels = 7 * triangles + scene.objectCount + 8 * instances + 1;
+    return (texels + kTextureWidth - 1) / kTextureWidth * kTextureWidth;
+}
+
+inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene, const std::vector<char>& opaque,
+                    Prepared& output, std::string& error, AdmissionMode mode = AdmissionMode::opaqueOnly,
+                    const std::vector<char>* receiverNormals = nullptr)
 {
     using namespace HarmonicMIDI::grid;
     Prepared candidate;
     candidate.mode = mode;
     candidate.objectCount = scene.objectCount;
     std::map<std::array<std::uint32_t, 4>, int> ranges;
-    std::size_t triangleCount = 0;
-    if (scene.objectCount > 64 || scene.vertexCount > Visual3DScene::kMaxVertices ||
-        scene.indexCount > Visual3DScene::kMaxIndices)
+    if (opaque.size() != scene.objectCount)
     {
-        error = "Opaque visibility scene counts exceed snapshot bounds";
+        error = "Opaque visibility object roster does not match the scene";
         return false;
     }
+    candidate.identities.resize(scene.objectCount);
+    candidate.objectMesh.assign(scene.objectCount, -1);
     for (std::size_t o = 0; o < scene.objectCount; ++o)
     {
         const auto& object = scene.objects[o];
@@ -226,13 +250,8 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene, const std::a
             candidate.objectMesh[o] = found->second;
             continue;
         }
-        triangleCount += count / 3;
-        if (triangleCount > kMaximumTriangles)
-        {
-            error = "Opaque visibility exceeds the admitted scene triangle budget";
-            return false;
-        }
         std::vector<Primitive> triangles;
+        triangles.reserve(count / 3);
         for (std::size_t index = 0; index < count; index += 3)
         {
             Primitive p;
@@ -254,6 +273,34 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene, const std::a
                     }
                 p.bounds.add(p.triangle[v]);
             }
+            // A face whose vertex normals all equal its geometric normal stores none,
+            // so a flat mesh keeps the same texels and the same shading.
+            if (receiverNormals && (*receiverNormals)[o])
+            {
+                std::array<Point, 3> normals{};
+                bool smooth = false;
+                const auto& t = p.triangle;
+                const Point e1{t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]};
+                const Point e2{t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]};
+                const Point face{e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+                const auto faceLength = std::sqrt(face[0] * face[0] + face[1] * face[1] + face[2] * face[2]);
+                for (int v = 0; v < 3; ++v)
+                {
+                    const auto local = object.indexCount ? scene.indices[object.firstIndex + index + v] : index + v;
+                    normals[v] = point(scene.vertices[object.firstVertex + local].normal);
+                    for (int axis = 0; axis < 3; ++axis)
+                        smooth = smooth || !(std::abs(normals[v][axis] - face[axis] / faceLength) <= 1e-5f);
+                }
+                if (smooth)
+                {
+                    // Index 0 means no block, so a block never starts there.
+                    if (candidate.texels.empty())
+                        candidate.texels.push_back({});
+                    p.normals = candidate.texels.size();
+                    for (const auto& normal : normals)
+                        candidate.texels.push_back({normal[0], normal[1], normal[2], 0.0f});
+                }
+            }
             triangles.push_back(p);
         }
         Mesh mesh;
@@ -267,12 +314,8 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene, const std::a
         ranges[key] = id;
         candidate.objectMesh[o] = id;
     }
-    if (candidate.texels.size() + 65 + kMaximumInstances * 4 + kMaximumTlasNodes * 2 >
-        kTextureWidth * kTextureHeight)
-    {
-        error = "Opaque visibility payload exceeds its RGBA32F texture budget";
+    if (!payloadIndexable(candidate.texels.size(), error))
         return false;
-    }
     output = std::move(candidate);
     error.clear();
     return true;
@@ -324,11 +367,6 @@ inline std::vector<Instance> sceneInstances(const HarmonicMIDI::grid::Visual3DSc
 inline bool frame(const Prepared& prepared, const std::vector<Instance>& matrices, Frame& output,
                   std::string& error)
 {
-    if (matrices.size() > kMaximumInstances)
-    {
-        error = "Opaque visibility instance count exceeds budget";
-        return false;
-    }
     Frame candidate;
     candidate.texels = prepared.texels;
     const auto metadata = candidate.texels.size();
@@ -338,8 +376,7 @@ inline bool frame(const Prepared& prepared, const std::vector<Instance>& matrice
     std::size_t queryWork = 0;
     for (std::size_t o = 0; o < matrices.size(); ++o)
     {
-        if (matrices[o].object >= 64 ||
-            (prepared.mode == AdmissionMode::allSurfaces && matrices[o].object >= prepared.objectCount))
+        if (matrices[o].object >= prepared.objectCount)
         {
             error = "Opaque visibility instance object is invalid";
             return false;
@@ -399,9 +436,7 @@ inline bool frame(const Prepared& prepared, const std::vector<Instance>& matrice
     {
         if (prepared.mode == AdmissionMode::allSurfaces)
         {
-            queryWork += treeNodes(instances.size(), 1);
-            if (queryWork == 0 || queryWork > kMaximumClosestHitWork)
-            { error = "Scene closest-hit topology exceeds its work budget"; return false; }
+            queryWork = std::min(queryWork + treeNodes(instances.size(), 1), kMaximumClosestHitWork);
             // Count every instance even when its BLAS range is reused. Split the
             // integer into exact float words; the public control remains unchanged.
             candidate.texels.push_back({float(queryWork & 65535u), float(queryWork >> 16),
@@ -410,11 +445,8 @@ inline bool frame(const Prepared& prepared, const std::vector<Instance>& matrice
         const auto root = tree(candidate.texels, instances, 0, instances.size(), false);
         candidate.control = {float(root), float(candidate.texels.size()), float(kTextureWidth), prepared.mode == AdmissionMode::allSurfaces ? 2.0f : 1.0f};
     }
-    if (candidate.texels.size() > kTextureWidth * kTextureHeight)
-    {
-        error = "Opaque visibility frame exceeds texture budget";
+    if (!payloadIndexable(candidate.texels.size(), error))
         return false;
-    }
     candidate.height =
         std::max(std::size_t(1), (candidate.texels.size() + kTextureWidth - 1) / kTextureWidth);
     candidate.texels.resize(kTextureWidth * candidate.height);
@@ -472,11 +504,6 @@ struct FrameTail
 inline bool frameTail(const Prepared& prepared, const std::vector<Instance>& matrices, FrameTail& output,
                       std::string& error)
 {
-    if (matrices.size() > kMaximumInstances)
-    {
-        error = "Opaque visibility instance count exceeds budget";
-        return false;
-    }
     FrameTail candidate;
     const auto base = prepared.texels.size();
     candidate.begin = base;
@@ -488,8 +515,7 @@ inline bool frameTail(const Prepared& prepared, const std::vector<Instance>& mat
     std::size_t queryWork = 0;
     for (std::size_t o = 0; o < matrices.size(); ++o)
     {
-        if (matrices[o].object >= 64 ||
-            (prepared.mode == AdmissionMode::allSurfaces && matrices[o].object >= prepared.objectCount))
+        if (matrices[o].object >= prepared.objectCount)
         {
             error = "Opaque visibility instance object is invalid";
             return false;
@@ -551,9 +577,7 @@ inline bool frameTail(const Prepared& prepared, const std::vector<Instance>& mat
     {
         if (prepared.mode == AdmissionMode::allSurfaces)
         {
-            queryWork += treeNodes(instances.size(), 1);
-            if (queryWork == 0 || queryWork > kMaximumClosestHitWork)
-            { error = "Scene closest-hit topology exceeds its work budget"; return false; }
+            queryWork = std::min(queryWork + treeNodes(instances.size(), 1), kMaximumClosestHitWork);
             candidate.texels.push_back({float(queryWork & 65535u), float(queryWork >> 16),
                                         float(kClosestHitStackCapacity), 3.0f});
         }
@@ -562,11 +586,8 @@ inline bool frameTail(const Prepared& prepared, const std::vector<Instance>& mat
                              prepared.mode == AdmissionMode::allSurfaces ? 2.0f : 1.0f};
     }
     const auto total = base + candidate.texels.size();
-    if (total > kTextureWidth * kTextureHeight)
-    {
-        error = "Opaque visibility frame exceeds texture budget";
+    if (!payloadIndexable(total, error))
         return false;
-    }
     candidate.height = std::max(std::size_t(1), (total + kTextureWidth - 1) / kTextureWidth);
     output = std::move(candidate);
     error.clear();
@@ -579,7 +600,7 @@ struct ClosestHit
 {
     int status = -1;
     float distance = 0;
-    Point position{}, outwardNormal{};
+    Point position{}, outwardNormal{}, shadingNormal{};
     std::uint32_t objectId = 0, materialId = 0, instanceId = 0, triangleId = 0;
     bool entering = false;
     std::uint32_t work = 0; // One unit per popped node or triangle intersection.
@@ -605,7 +626,7 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
     if (prepared.mode != AdmissionMode::allSurfaces || !finite(origin) || !finite(rayDirection) ||
         !std::isfinite(rayLength) || rayLength<=0 || !std::isfinite(minimum) || !std::isfinite(maximum) ||
         minimum<0 || maximum<minimum || control[3]!=2 || control[2]!=1024 ||
-        !index(control[1], kTextureWidth*kTextureHeight+1) || control[1]>frame.texels.size() ||
+        !index(control[1], kExactFloatIndexRange+1) || control[1]>frame.texels.size() ||
         control[1]>double(frame.height)*kTextureWidth ||
         !index(control[0], std::size_t(control[1])+1)) return hit;
     for (auto& c : rayDirection) c /= rayLength;
@@ -618,7 +639,7 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
     if (!index(allowance[0],65536) || !index(allowance[1],65536) ||
         !index(allowance[2],kClosestHitStackCapacity+1) || allowance[2]<1 || allowance[3]!=3) return refused(-1);
     const auto budget=std::uint32_t(allowance[0])+(std::uint32_t(allowance[1])<<16);
-    if (budget==0 || budget>kMaximumClosestHitWork) return refused(-1);
+    if (budget==0) return refused(-1);
     const auto capacity=std::size_t(allowance[2]);
     auto range = [&](const Texel& low, const Texel& high, std::size_t node, std::size_t limit) {
         return finite(xyz(low)) && finite(xyz(high)) && low[0]<=high[0] && low[1]<=high[1] && low[2]<=high[2] &&
@@ -667,14 +688,14 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
         }
         return 0;
     };
-    std::size_t bestObject=kTextureWidth*kTextureHeight;
+    std::size_t bestObject=kExactFloatIndexRange;
     const int status=walk(root,end,origin,rayDirection,[&](std::size_t node,std::size_t,std::size_t leaf) {
         if (leaf+3>=end) return -1;
         const auto& r0=frame.texels[leaf]; const auto& r1=frame.texels[leaf+1]; const auto& r2=frame.texels[leaf+2];
         const auto& mesh=frame.texels[leaf+3];
         if (!finite(xyz(r0)) || !std::isfinite(r0[3]) || !finite(xyz(r1)) || !std::isfinite(r1[3]) ||
             !finite(xyz(r2)) || !std::isfinite(r2[3]) || !index(mesh[0],end) || !index(mesh[1],node+1) ||
-            mesh[1]<=mesh[0] || !index(mesh[2],end) || !index(mesh[3],kMaximumInstances)) return -1;
+            mesh[1]<=mesh[0] || !index(mesh[2],end) || !index(mesh[3],kExactFloatIndexRange)) return -1;
         const auto& ids=frame.texels[std::size_t(mesh[2])];
         for (float value : ids) if (!index(value,65536)) return -1;
         const auto objectId=std::uint32_t(ids[0])+(std::uint32_t(ids[1])<<16);
@@ -695,7 +716,7 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
                     ++hit.work; const auto offset=tri+t*3;
                     const auto a=xyz(frame.texels[offset]),b=xyz(frame.texels[offset+1]),c=xyz(frame.texels[offset+2]);
                     const auto triangle=frame.texels[offset+1][3];
-                    if (!finite(a) || !finite(b) || !finite(c) || !index(triangle,kMaximumTriangles)) return -1;
+                    if (!finite(a) || !finite(b) || !finite(c) || !index(triangle,kExactFloatIndexRange)) return -1;
                     const auto e1=sub(b,a),e2=sub(c,a),p=cross(localDirection,e2),normal=cross(e1,e2);
                     const float det=dot(e1,p);
                     if (!finite(e1) || !finite(e2) || !finite(p) || !finite(normal) || !std::isfinite(det)) return -1;
@@ -723,6 +744,18 @@ inline ClosestHit closestHitCpu(const Prepared& prepared, const Frame& frame, Po
                     if (!std::isfinite(length) || length<=0) return -1;
                     for (int axis=0;axis<3;++axis) { worldNormal[axis]/=length; hit.position[axis]=origin[axis]+rayDirection[axis]*distance; }
                     hit.status=1; hit.distance=distance; hit.outwardNormal=worldNormal; hit.entering=dot(rayDirection,worldNormal)<0;
+                    hit.shadingNormal=worldNormal;
+                    const auto block=frame.texels[offset+2][3];
+                    if (!index(block,kExactFloatIndexRange)) return -1;
+                    if (block>0) {
+                        if (std::size_t(block)+2>=frame.texels.size()) return -1;
+                        const auto n0=xyz(frame.texels[std::size_t(block)]),n1=xyz(frame.texels[std::size_t(block)+1]),n2=xyz(frame.texels[std::size_t(block)+2]);
+                        const Point blended{n0[0]*(1-u-v)+n1[0]*u+n2[0]*v,n0[1]*(1-u-v)+n1[1]*u+n2[1]*v,n0[2]*(1-u-v)+n1[2]*u+n2[2]*v};
+                        Point world{r0[0]*blended[0]+r1[0]*blended[1]+r2[0]*blended[2],
+                            r0[1]*blended[0]+r1[1]*blended[1]+r2[1]*blended[2],r0[2]*blended[0]+r1[2]*blended[1]+r2[2]*blended[2]};
+                        const float worldLength=std::sqrt(dot(world,world));
+                        if (std::isfinite(worldLength) && worldLength>0) { for (auto& component:world) component/=worldLength; hit.shadingNormal=world; }
+                    }
                     hit.objectId=objectId; hit.materialId=materialId; hit.instanceId=instanceId; hit.triangleId=triangleId; bestObject=objectIndex;
                     if (preferred==0 || candidatePreferred) reach=distance;
                 }
@@ -739,13 +772,13 @@ inline bool prepareScene(const HarmonicMIDI::grid::Visual3DScene& scene,
                          Prepared& output, std::string& error, AdmissionMode mode = AdmissionMode::opaqueOnly,
                          bool sceneReceiverTransport = false,
                          bool sceneReceiverConsumer = false,
-                         NativeFixtureDiffractionConsumer consumer=NativeFixtureDiffractionConsumer::FiniteLobe)
+                         NativeFixtureDiffractionConsumer consumer=NativeFixtureDiffractionConsumer::FiniteLobe,
+                         bool glassReceiverNormals=false)
 {
     using namespace HarmonicMIDI::grid;
     const bool discrete=consumer==NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders;
     if((consumer!=NativeFixtureDiffractionConsumer::FiniteLobe&&!discrete)
-        ||(discrete&&(scene.objectCount>Visual3DScene::kMaxObjects||scene.vertexCount>Visual3DScene::kMaxVertices
-            ||scene.indexCount>Visual3DScene::kMaxIndices||sceneReceiverTransport||mode!=AdmissionMode::allSurfaces||!program
+        ||(discrete&&(sceneReceiverTransport||mode!=AdmissionMode::allSurfaces||!program
             ||program->kind!=NativeFixtureMaterialKind::DiffractionReflective
             ||!validNativeFixtureMaterialPrograms(*program,scene,program->backend,true,consumer))))
     {error="Smooth glass grating query requires exact private discrete material owners";return false;}
@@ -754,14 +787,12 @@ inline bool prepareScene(const HarmonicMIDI::grid::Visual3DScene& scene,
         || program->diffractionLightingAdmission->description().version != 3
         || !validNativeFixtureMaterialPrograms(*program, scene, program->backend, true)))
     { error = "Scene receiver query requires the exact admitted v3 grating"; return false; }
-    if (scene.objectCount > Visual3DScene::kMaxObjects || scene.vertexCount > Visual3DScene::kMaxVertices ||
-        scene.indexCount > Visual3DScene::kMaxIndices || scene.materialCount > Visual3DScene::kMaxMaterials ||
-        (!appearances.empty() && appearances.size() != scene.objectCount))
+    if (!appearances.empty() && appearances.size() != scene.objectCount)
     {
-        error = "Opaque visibility scene or appearance counts are malformed";
+        error = "Opaque visibility appearance count is malformed";
         return false;
     }
-    std::array<bool, 64> opaque{};
+    std::vector<char> opaque(scene.objectCount, 0);
     for (std::size_t o = 0; o < scene.objectCount; ++o)
     {
         const auto& object = scene.objects[o];
@@ -828,7 +859,19 @@ inline bool prepareScene(const HarmonicMIDI::grid::Visual3DScene& scene,
         for (std::size_t v = 0; opaque[o] && v < object.vertexCount; ++v)
             opaque[o] = scene.vertices[object.firstVertex + v].color[3] >= 1.0f;
     }
-    return prepare(scene, opaque, output, error, mode);
+    if (!glassReceiverNormals)
+        return prepare(scene, opaque, output, error, mode);
+    // Only a receiver reads a shading normal. Water and glass refract at their own
+    // evaluated normals, and a 1024 by 1024 sea must not pay for a block per face.
+    std::vector<char> receivers(scene.objectCount, 0);
+    for (std::size_t o = 0; o < scene.objectCount; ++o)
+    {
+        const auto* surface = nativeSurfaceForObject(program, scene.objects[o].id);
+        receivers[o] = !surface || (surface->kind == NativeFixtureMaterialKind::SurfacePbr
+            && surface->parameters.identifiers[1] != static_cast<std::uint32_t>(surfacematerial::TransportMode::ThinInterface)
+            && surface->parameters.identifiers[1] != static_cast<std::uint32_t>(surfacematerial::TransportMode::ClosedVolume));
+    }
+    return prepare(scene, opaque, output, error, mode, &receivers);
 }
 inline bool vertexDeformation(const NativeFixtureSurfaceMaterialProgram* program)
 {
@@ -879,7 +922,7 @@ bool opaqueTriangle(SV3 origin,SV3 direction,SV3 a,SV3 b,SV3 c,float limit) {
 bool opaqueMesh(SV3 origin,SV3 direction,float limit,int root,int end ST_ARGS) {
     int node=root;
     #pragma optionNV(unroll none)
-    for(int visit=0;visit<OPAQUE_MAX_BLAS_NODES;++visit) {
+    for(int visit=0;visit<OPAQUE_WALK_VISITS;++visit) {
         if(node>=end) return false;
         SV4 low=opaqueRead(node ST_PASS),high=opaqueRead(node+1 ST_PASS);
         int escape=int(low.w),leaf=int(high.w)-1;
@@ -906,7 +949,7 @@ float opaqueVisibility(SV3 position,SV3 geometricNormal,SV3 toLight,float limit,
     limit=max(0.0,limit-bias);
     int node=int(control.x),end=int(control.y);
     #pragma optionNV(unroll none)
-    for(int visit=0;visit<OPAQUE_MAX_TLAS_NODES;++visit) {
+    for(int visit=0;visit<OPAQUE_WALK_VISITS;++visit) {
         if(node>=end) return 1.0;
         SV4 low=opaqueRead(node ST_PASS),high=opaqueRead(node+1 ST_PASS);
         int escape=int(low.w),leaf=int(high.w)-1;
@@ -930,6 +973,9 @@ struct SceneClosestHit {
     float distance;
     SV3 position;
     SV3 outwardNormal;
+    // The interpolated vertex normal on a face that stores a normal block, otherwise
+    // exactly outwardNormal. Interface crossings keep using outwardNormal.
+    SV3 shadingNormal;
     uint objectId;
     uint materialId;
     uint instanceId;
@@ -947,7 +993,7 @@ bool sceneRange(SV4 low,SV4 high,int node,int end) {
 }
 SceneClosestHit sceneEmptyHit(int status,float limit) {
     SceneClosestHit hit;
-    hit.status=status;hit.distance=limit;hit.position=SV3(0.0);hit.outwardNormal=SV3(0.0);
+    hit.status=status;hit.distance=limit;hit.position=SV3(0.0);hit.outwardNormal=SV3(0.0);hit.shadingNormal=SV3(0.0);
     hit.objectId=uint(0);hit.materialId=uint(0);hit.instanceId=uint(0);hit.triangleId=uint(0);hit.entering=false;
     return hit;
 }
@@ -962,7 +1008,7 @@ bool sceneBoundsNear(SV3 origin,SV3 direction,SV3 low,SV3 high,float limit SC_OU
     nearDistance=nearT;return true;
 }
 int sceneTriangle(SV3 origin,SV3 direction,SV3 a,SV3 b,SV3 c,
-                  float minimum,float maximum SC_OUT(float,distance) SC_OUT(SV3,normal)) {
+                  float minimum,float maximum SC_OUT(float,distance) SC_OUT(SV3,normal) SC_OUT(float,hitU) SC_OUT(float,hitV)) {
     SV3 e1=b-a,e2=c-a,p=cross(direction,e2);float det=dot(e1,p);
     normal=cross(e1,e2);
     if(!sceneFinite3(e1)||!sceneFinite3(e2)||!sceneFinite3(p)||!sceneFinite3(normal)||!sceneFinite(det)) return -1;
@@ -973,6 +1019,7 @@ int sceneTriangle(SV3 origin,SV3 direction,SV3 a,SV3 b,SV3 c,
     if(!sceneFinite(v)) return -1;if(v<0.0||u+v>1.0) return 0;
     distance=dot(e2,q)/det;
     if(!sceneFinite(distance)) return -1;
+    hitU=u;hitV=v;
     return distance>=minimum&&distance<=maximum?1:0;
 }
 int sceneChildren(SV3 origin,SV3 direction,float limit,int node,int escape SC_STACK_ARGS ST_ARGS) {
@@ -1009,7 +1056,7 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
     if(!sceneFinite3(origin)||!sceneFinite3(rayDirection)||!sceneFinite(rayLength)||rayLength<=0.0||
         !sceneFinite(minimum)||!sceneFinite(maximum)||minimum<0.0||maximum<minimum||
         control.w!=2.0||control.z!=1024.0||!sceneFinite(control.y)||floor(control.y)!=control.y||
-        control.y<0.0||control.y>float(SC_MAX_TEXELS)||control.y>float(SC_TEXELS)||!sceneFinite(control.x)||floor(control.x)!=control.x||
+        control.y<0.0||control.y>float(SC_TEXELS)||!sceneFinite(control.x)||floor(control.x)!=control.x||
         control.x<0.0||control.x>control.y) return hit;
     SV3 direction=rayDirection/rayLength;
     int root=int(control.x),end=int(control.y);
@@ -1021,7 +1068,7 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
         !sceneIndex(allowance.z,SC_STACK_CAPACITY+1)||allowance.z<1.0||allowance.w!=3.0)
         return sceneEmptyHit(-1,maximum);
     uint budget=uint(allowance.x)+uint(allowance.y)*uint(65536),work=uint(0);
-    if(budget==uint(0)||budget>uint(SC_MAX_WORK)) return sceneEmptyHit(-1,maximum);
+    if(budget==uint(0)) return sceneEmptyHit(-1,maximum);
     int capacity=int(allowance.z);
     int nodes[SC_STACK_CAPACITY];int pending=1;nodes[0]=root;
     int bestObject=2147483647;
@@ -1045,7 +1092,7 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
             if(!sceneFinite3(r0.xyz)||!sceneFinite(r0.w)||!sceneFinite3(r1.xyz)||!sceneFinite(r1.w)||
                 !sceneFinite3(r2.xyz)||!sceneFinite(r2.w)||!sceneIndex(mesh.x,end)||
                 !sceneFinite(mesh.y)||floor(mesh.y)!=mesh.y||mesh.y<=mesh.x||mesh.y>float(node)||
-                !sceneIndex(mesh.z,end)||!sceneIndex(mesh.w,SC_MAX_INSTANCES)) return sceneEmptyHit(-1,maximum);
+                !sceneIndex(mesh.z,end)||!sceneIndex(mesh.w,SC_EXACT_INDEX_RANGE)) return sceneEmptyHit(-1,maximum);
             SV4 ids=opaqueRead(int(mesh.z) ST_PASS);
             if(!sceneIndex(ids.x,65536)||!sceneIndex(ids.y,65536)||!sceneIndex(ids.z,65536)||!sceneIndex(ids.w,65536))
                 return sceneEmptyHit(-1,maximum);
@@ -1083,10 +1130,11 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
                         if(work>=budget) return sceneEmptyHit(-2,maximum);
                         ++work;int offset=tri+t*3;
                         SV4 a=opaqueRead(offset ST_PASS),b=opaqueRead(offset+1 ST_PASS),c=opaqueRead(offset+2 ST_PASS);
-                        if(!sceneFinite3(a.xyz)||!sceneFinite3(b.xyz)||!sceneFinite3(c.xyz)||!sceneIndex(b.w,SC_MAX_TRIANGLES))
+                        if(!sceneFinite3(a.xyz)||!sceneFinite3(b.xyz)||!sceneFinite3(c.xyz)||!sceneIndex(b.w,SC_EXACT_INDEX_RANGE)||!sceneIndex(c.w,SC_EXACT_INDEX_RANGE))
                             return sceneEmptyHit(-1,maximum);
                         float distance=0.0;SV3 normal=SV3(0.0);
-                        int triangleStatus=sceneTriangle(localOrigin,localDirection,a.xyz,b.xyz,c.xyz,minimum,reach,distance,normal);
+                        float hitU=0.0,hitV=0.0;
+                        int triangleStatus=sceneTriangle(localOrigin,localDirection,a.xyz,b.xyz,c.xyz,minimum,reach,distance,normal,hitU,hitV);
                         if(triangleStatus<0) return sceneEmptyHit(-1,maximum);
                         if(triangleStatus>0) {
                             uint triangleId=uint(b.w);
@@ -1107,6 +1155,18 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
                                 hit.status=1;hit.distance=distance;hit.position=origin+direction*distance;
                                 hit.outwardNormal=worldNormal/normalLength;hit.entering=dot(direction,hit.outwardNormal)<0.0;
                                 hit.objectId=objectId;hit.materialId=materialId;hit.instanceId=instanceId;hit.triangleId=triangleId;
+                                hit.shadingNormal=hit.outwardNormal;
+                                if(c.w>0.0) {
+                                    int block=int(c.w);
+                                    if(block+2>=end) return sceneEmptyHit(-1,maximum);
+                                    SV3 blended=opaqueRead(block ST_PASS).xyz*(1.0-hitU-hitV)
+                                        +opaqueRead(block+1 ST_PASS).xyz*hitU+opaqueRead(block+2 ST_PASS).xyz*hitV;
+                                    SV3 worldBlended=SV3(r0.x*blended.x+r1.x*blended.y+r2.x*blended.z,
+                                        r0.y*blended.x+r1.y*blended.y+r2.y*blended.z,
+                                        r0.z*blended.x+r1.z*blended.y+r2.z*blended.z);
+                                    float blendedLength=length(worldBlended);
+                                    if(sceneFinite(blendedLength)&&blendedLength>0.0) hit.shadingNormal=worldBlended/blendedLength;
+                                }
                                 bestObject=objectIndex;
                                 if(preferred==uint(0)||candidatePreferred) reach=distance;
                             }
@@ -1128,13 +1188,9 @@ SceneClosestHit sceneClosestHit(SV3 origin,SV3 rayDirection,float minimum,float 
 )shader";
 template<class String> inline String shaderBoundsRecipe()
 {
-    return String("\n#define OPAQUE_MAX_BLAS_NODES ") + surfacesource::number<String>(kMaximumBlasNodes) +
-           "\n#define OPAQUE_MAX_TLAS_NODES " + surfacesource::number<String>(kMaximumTlasNodes) +
-           "\n#define SC_MAX_TEXELS " + surfacesource::number<String>(kTextureWidth * kTextureHeight) +
-           "\n#define SC_MAX_INSTANCES " + surfacesource::number<String>(kMaximumInstances) +
-           "\n#define SC_STACK_CAPACITY " + surfacesource::number<String>(kClosestHitStackCapacity) +
-           "\n#define SC_MAX_WORK " + surfacesource::number<String>(kMaximumClosestHitWork) +
-           "\n#define SC_MAX_TRIANGLES " + surfacesource::number<String>(kMaximumTriangles) + "\n";
+    return String("\n#define OPAQUE_WALK_VISITS ") + surfacesource::number<String>(kExactFloatIndexRange) +
+           "\n#define SC_EXACT_INDEX_RANGE " + surfacesource::number<String>(kExactFloatIndexRange) +
+           "\n#define SC_STACK_CAPACITY " + surfacesource::number<String>(kClosestHitStackCapacity) + "\n";
 }
 // GLSL 4.30 only. Qualify the existing ordered stages in their own functions;
 // a precise caller result would not constrain unqualified callee arithmetic.

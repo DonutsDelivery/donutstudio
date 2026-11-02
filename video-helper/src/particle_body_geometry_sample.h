@@ -264,7 +264,8 @@ inline bool deriveParticleBodyGeometrySampleRecipe(
     if (!body) return refuse("Body geometry sampler requires an immutable source admission");
     auto& r=attempt.recipe;
     r.derivation=body->recipe().census;
-    r.derivationLogicalBytes=particlebodygeometrydetail::censusLogicalBytes;
+    if (!particlebodygeometrydetail::censusBytes(body->ownedDescriptor().operations.size(),r.derivationLogicalBytes))
+        return refuse("Body geometry sampler work overflow");
     // total() visits nine named counters. Factory calls it three times; each
     // sample calls it once here and once inside matchesExactSource(). These are
     // explicit source loops, separate from geometry/field element visits.
@@ -282,7 +283,7 @@ inline bool deriveParticleBodyGeometrySampleRecipe(
     // visiting four parameters beyond the common finite/default-settings checks.
     // Retained Mesh and Position Field also build logical unique-ID sets
     // absent from that recipe.
-    std::array<particlebodygeometrydetail::Shape,32> shapes{};
+    std::vector<particlebodygeometrydetail::Shape> shapes(body->ownedDescriptor().operations.size());
     std::size_t count=0,maxIdentityVertices=0;
     const auto find=[&](StableId id)->const particlebodygeometrydetail::Shape* {
         for (std::size_t i=0;i<count;++i) if (shapes[i].id==id) return &shapes[i];

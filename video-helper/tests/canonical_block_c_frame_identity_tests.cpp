@@ -289,6 +289,59 @@ void testLongScoreResidency()
             "dense packing truncated the source score");
 }
 
+void testScoreDropCounts()
+{
+    const auto scoreOf = [](int notes, int links)
+    {
+        auto score = projectedLoopScore();
+        score->notes.clear();
+        score->links.clear();
+        score->historyBeats = score->lookaheadBeats = 0;
+        for (int index = 0; index < notes; ++index)
+            score->notes.push_back(note(-(index + 1), 0.0f, 60.0f, 220.0f));
+        for (int index = 0; index < links; ++index)
+            score->links.push_back({-1000 - index, -1, -2, 3, 2, 0});
+        return score;
+    };
+    const auto frameOf = [](const std::shared_ptr<arbitmod::Score>& score)
+    {
+        FrameProducer producer;
+        const auto frame = producer.evaluate(key(), score, 0);
+        require(frame != nullptr, "the score-drop fixture did not pack");
+        return frame;
+    };
+
+    const auto fits = frameOf(scoreOf(arbitblockc::kMaxNotes, arbitblockc::kMaxLinks));
+    require(fits->droppedNotes == 0 && fits->droppedLinks == 0,
+            "a score the textures hold counted a drop");
+    require(arbitblockc::scoreDropWarning(fits->droppedNotes, fits->droppedLinks).empty(),
+            "a score the textures hold raised the warning");
+
+    const auto over = frameOf(scoreOf(arbitblockc::kMaxNotes + 3, arbitblockc::kMaxLinks + 5));
+    require(over->droppedNotes == 3 && over->droppedLinks == 5,
+            "notes and links past the textures were not counted");
+    const auto warning = arbitblockc::scoreDropWarning(over->droppedNotes, over->droppedLinks);
+    require(warning.find("3 notes and 5 links") != std::string::npos,
+            "the warning does not name what was left out");
+
+    // A note outside the window is not a drop, and neither is its link.
+    auto windowed = scoreOf(2, 1);
+    windowed->notes[1].startBeat = 5000.0f;
+    const auto outside = frameOf(windowed);
+    require(outside->droppedNotes == 0 && outside->droppedLinks == 0,
+            "a note outside the window counted as a drop");
+
+    // A link that lost an endpoint to the note limit is left out too.
+    auto cut = scoreOf(arbitblockc::kMaxNotes + 1, 0);
+    const int lastId = cut->notes.back().id;
+    cut->links.push_back({-1000, lastId, -1, 3, 2, 0});
+    const auto cutFrame = frameOf(cut);
+    require(cutFrame->droppedNotes == 1 && cutFrame->droppedLinks == 1,
+            "a link cut with its note was not counted");
+    require(arbitblockc::scoreDropWarning(1, 1).find("1 note and 1 link") != std::string::npos,
+            "the warning's singular forms are wrong");
+}
+
 void testDirectNoteInstanceAxes()
 {
     using Axis = visualnoteinstancing::MappingAxis;
@@ -870,6 +923,7 @@ void testReleasedNoteTailKeepsIdentity()
 int main()
 {
     testLongScoreResidency();
+    testScoreDropCounts();
     testNoteIdentityAcrossEvictionLoopSeekAndExport();
     testReleasedNoteTailKeepsIdentity();
     testDirectNoteInstanceAxes();
@@ -982,9 +1036,12 @@ int main()
     require(!visualnoteinstancing::decode(encodedMapping + "0\n", decodedMapping),
             "note appearance transport accepted trailing values");
     auto invalidAppearance = mapping;
-    invalidAppearance.appearanceHigh[3] = 65.0f;
+    invalidAppearance.appearanceHigh[3] = std::numeric_limits<float>::infinity();
     require(visualnoteinstancing::encode(invalidAppearance).empty(),
             "note emission exceeded its bound");
+    invalidAppearance.appearanceHigh[3] = 1.0e30f;
+    require(!visualnoteinstancing::encode(invalidAppearance).empty(),
+            "note emission lost a value a float holds");
     invalidAppearance = mapping;
     invalidAppearance.appearanceLow[0] = std::numeric_limits<float>::quiet_NaN();
     require(visualnoteinstancing::encode(invalidAppearance).empty(),

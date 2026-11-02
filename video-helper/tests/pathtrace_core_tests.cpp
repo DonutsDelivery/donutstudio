@@ -5,6 +5,7 @@
 #include "pathtrace/bvh.h"
 #include "pathtrace/scene_ingest.h"
 #include "pathtrace/thread_pool.h"
+#include "SceneAovOperationContract.h"
 
 #include <algorithm>
 #include <array>
@@ -550,7 +551,7 @@ void ingestTests()
         const std::size_t index = addCube (*scene, 40, translation (0.0f, 0.0f, 40.0f), 0, 1);
         scene->indices[scene->objects[index].firstIndex + 4] = 8;
         const std::size_t broken = addCube (*scene, 41, translation (0.0f, 0.0f, 50.0f), 0, 1);
-        scene->objects[broken].indexCount = static_cast<std::uint32_t> (grid::Visual3DScene::kMaxIndices);
+        scene->objects[broken].indexCount = static_cast<std::uint32_t> (scene->indices.size() + 3);
     }
 
     pt::IngestedScene ingested;
@@ -618,6 +619,32 @@ void ingestTests()
         if (attributes.objectId == 30)
             flipped = flipped && attributes.tangents[0][3] < 0.0f;
     check (flipped, "mirroring flips the bitangent sign");
+
+    // Shade Mesh's flag reaches ingest and the wire; a scene without it keeps its bytes.
+    {
+        auto shadedScene = emptyScene();
+        addCube (*shadedScene, 60, translation (0.0f, 0.0f, 0.0f));
+        const std::size_t shadedObject = addCube (*shadedScene, 61, translation (3.0f, 0.0f, 0.0f));
+        const auto plainBytes = sceneaov::detail::encodeScene (*shadedScene);
+        shadedScene->objects[shadedObject].authoredShading = true;
+        pt::IngestedScene shadedIngest;
+        pt::ingestScene (*shadedScene, shadedIngest);
+        bool plainUnflagged = true, shadedFlagged = true;
+        for (const auto& attributes : shadedIngest.triangles)
+        {
+            plainUnflagged = plainUnflagged && (attributes.objectId != 60 || ! attributes.authoredShading);
+            shadedFlagged = shadedFlagged && (attributes.objectId != 61 || (attributes.authoredShading && attributes.hasShadingNormals));
+        }
+        check (plainUnflagged, "an object without Shade Mesh is not flagged");
+        check (shadedFlagged, "an object with Shade Mesh carries authored shading");
+        const auto shadedBytes = sceneaov::detail::encodeScene (*shadedScene);
+        check (! plainBytes.empty() && shadedBytes.size() == plainBytes.size() + 8 + 4 * shadedScene->objectCount,
+               "the flag adds one extension and leaves other scenes byte-identical");
+        auto decodedScene = emptyScene();
+        check (sceneaov::detail::decodeScene (shadedBytes, *decodedScene)
+                   && decodedScene->objects[shadedObject].authoredShading && ! decodedScene->objects[0].authoredShading,
+               "the flag survives the scene wire");
+    }
 
     // World-matrix overrides replace the authored chain.
     std::vector<pt::Mat4> worlds (scene->objectCount);
@@ -1010,6 +1037,234 @@ void deterministicRenderTests()
     check (single[0] == 0.0f && single[3] == 1.0f, "a corner pixel sees the background");
 }
 
+bool contains (const std::string& text, const std::string& part)
+{
+    return text.find (part) != std::string::npos;
+}
+
+// A scene allocates what it needs. Only a real allocation failure or a size
+// overflow stops it, and either one names the buffer, the counts and the bytes.
+void capacityTests()
+{
+    using grid::Visual3DScene;
+
+    {
+        const auto scene = std::make_unique<Visual3DScene>();
+        check (scene->vertices.size() == Visual3DScene::kInitialVertices
+                   && scene->indices.size() == Visual3DScene::kInitialIndices
+                   && scene->objects.size() == Visual3DScene::kInitialObjects
+                   && scene->materials.size() == Visual3DScene::kInitialMaterials
+                   && scene->lights.size() == Visual3DScene::kInitialLights
+                   && scene->objectInstances.size() == Visual3DScene::kInitialObjectInstances,
+               "a default scene starts at the initial lengths");
+    }
+
+    // A size that overflows 64 bits is a real failure, reported by name.
+    {
+        auto scene = std::make_unique<Visual3DScene>();
+        grid::Visual3DSceneCapacity huge = grid::kVisual3DSceneDefaultCapacity;
+        huge.vertices = ~std::size_t {};
+        const auto overflow = grid::allocateVisual3DSceneBuffers (*scene, huge);
+        check (overflow.code == grid::Visual3DSceneAllocationCode::SizeOverflow
+                   && overflow.cause == grid::Visual3DSceneBuffer::Vertices
+                   && contains (overflow.message, "vertices")
+                   && contains (overflow.message, std::to_string (huge.vertices)),
+               "a capacity whose size overflows names the buffer and its count: " + overflow.message);
+    }
+
+    // No address space holds 4 EiB of vertices, so this is the OS refusing.
+    {
+        auto scene = std::make_unique<Visual3DScene>();
+        grid::Visual3DSceneCapacity impossible = grid::kVisual3DSceneDefaultCapacity;
+        impossible.vertices = (std::size_t { 1 } << 62) / sizeof (grid::SceneVertex);
+        const auto failed = grid::allocateVisual3DSceneBuffers (*scene, impossible);
+        check (failed.code == grid::Visual3DSceneAllocationCode::AllocationFailed
+                   && failed.cause == grid::Visual3DSceneBuffer::Vertices
+                   && failed.causeRecords == impossible.vertices && failed.causeBytes > 0
+                   && ! failed.osMessage.empty()
+                   && contains (failed.message, "vertices")
+                   && contains (failed.message, std::to_string (impossible.vertices))
+                   && contains (failed.message, std::to_string (failed.causeBytes))
+                   && contains (failed.message, failed.osMessage),
+               "a failed allocation reports the buffer, counts, bytes and OS message: " + failed.message);
+        check (scene->vertices.size() == Visual3DScene::kInitialVertices,
+               "a failed vertex allocation keeps the scene's vertices");
+    }
+
+    // A capacity below a live count allocates at least the live count.
+    {
+        auto scene = std::make_unique<Visual3DScene>();
+        scene->objectCount = 2;
+        grid::Visual3DSceneCapacity small = grid::kVisual3DSceneDefaultCapacity;
+        small.objects = 1;
+        const auto kept = grid::allocateVisual3DSceneBuffers (*scene, small);
+        check (kept.allocated() && scene->objects.size() >= 2,
+               "a capacity below a live count keeps the live records");
+    }
+
+    // 1,205,000 traced triangles from 1,015,003 vertices and 3,015,003 indices,
+    // 5,001 objects, 500 materials, 100 lamps, 16 cameras, 32 textures with one
+    // 16384 wide, and 200,000 instances. Every count passes both the old fixed
+    // caps (4,096 / 12,288 / 64 / 32 / 16 / 8 / 128, axis 8,192) and the later
+    // floors (1,000,000 triangles, 1,000 objects, 256 materials, 64 lamps,
+    // 100,000 instances). Red under the old code: allocation refused this size.
+    {
+        constexpr std::size_t kStrips = 5000, kStripTriangles = 201, kInstances = 200000;
+        constexpr std::size_t kMaterials = 500, kLights = 100, kCameras = 16, kTextures = 32;
+        constexpr std::size_t kWideTexels = 16384u * 2u;
+
+        grid::Visual3DSceneCapacity large = grid::kVisual3DSceneDefaultCapacity;
+        large.vertices = 3 + kStrips * (kStripTriangles + 2);
+        large.indices = 3 + kStrips * kStripTriangles * 3;
+        large.objects = kStrips + 1;
+        large.materials = kMaterials;
+        large.textures = kTextures;
+        large.textureTexels = kWideTexels + (kTextures - 1);
+        large.lights = kLights;
+        large.cameras = kCameras;
+        large.objectInstances = kInstances;
+
+        auto scene = std::make_unique<Visual3DScene>();
+        scene->id.value = 1;
+        const auto allocation = grid::allocateVisual3DSceneBuffers (*scene, large);
+        check (allocation.allocated(), "the large scene allocates: " + allocation.message);
+        if (! allocation.allocated())
+            return;
+
+        scene->cameraCount = kCameras;
+        for (std::size_t i = 0; i < kCameras; ++i)
+        {
+            scene->cameras[i].id.value = static_cast<std::uint32_t> (i + 1);
+            scene->cameras[i].transform.translation = { 0.0f, 25.0f, 50.0f };
+        }
+        scene->activeCamera.value = 1;
+
+        scene->textureCount = kTextures;
+        scene->textures[0].id.value = 1;
+        scene->textures[0].width = 16384;
+        scene->textures[0].height = 2;
+        for (std::size_t i = 1; i < kTextures; ++i)
+        {
+            scene->textures[i].id.value = static_cast<std::uint32_t> (i + 1);
+            scene->textures[i].width = 1;
+            scene->textures[i].height = 1;
+            scene->textures[i].firstTexel = kWideTexels + (i - 1);
+        }
+        scene->textureTexelCount = large.textureTexels;
+        scene->textureTexels.resize (scene->textureTexelCount);
+
+        scene->materialCount = kMaterials;
+        for (std::size_t i = 0; i < kMaterials; ++i)
+            scene->materials[i].id.value = static_cast<std::uint32_t> (i + 1);
+        scene->materials[0].baseColorTexture.value = 1;
+
+        scene->lightCount = kLights;
+        for (std::size_t i = 0; i < kLights; ++i)
+        {
+            scene->lights[i].id.value = static_cast<std::uint32_t> (i + 1);
+            scene->lights[i].kind = grid::SceneLightKind::Point;
+            scene->lights[i].transform.translation = { static_cast<float> (i), 5.0f, 0.0f };
+        }
+
+        const auto addStrip = [&scene] (std::uint32_t id, std::uint32_t triangles)
+        {
+            auto& object = scene->objects[scene->objectCount++];
+            object.id.value = id;
+            object.material.value = 1 + (id % kMaterials);
+            object.transform.translation = { 0.0f, static_cast<float> (id) * 0.01f, 0.0f };
+            object.firstVertex = static_cast<std::uint32_t> (scene->vertexCount);
+            object.vertexCount = triangles + 2;
+            object.firstIndex = static_cast<std::uint32_t> (scene->indexCount);
+            object.indexCount = 3 * triangles;
+            for (std::uint32_t v = 0; v < triangles + 2; ++v)
+            {
+                auto& vertex = scene->vertices[scene->vertexCount++];
+                vertex.position = { static_cast<float> (v / 2) * 0.001f, static_cast<float> (v % 2) * 0.001f, 0.0f };
+                vertex.normal = { 0.0f, 0.0f, 1.0f };
+            }
+            for (std::uint32_t t = 0; t < triangles; ++t)
+            {
+                const bool odd = (t % 2) != 0;
+                scene->indices[scene->indexCount++] = t;
+                scene->indices[scene->indexCount++] = odd ? t + 2 : t + 1;
+                scene->indices[scene->indexCount++] = odd ? t + 1 : t + 2;
+            }
+        };
+        addStrip (1, 1);
+        for (std::uint32_t id = 2; id <= kStrips + 1; ++id)
+            addStrip (id, kStripTriangles);
+        // The last strip spans the frame so the render below has a known hit.
+        auto& wall = scene->objects[kStrips];
+        wall.transform.scale = { 1000.0f, 100000.0f, 1.0f };
+        wall.transform.translation = { -50.0f, -25.0f, 0.0f };
+
+        scene->instancedObject.value = 1;
+        scene->objectInstanceCount = kInstances;
+        for (std::size_t i = 0; i < kInstances; ++i)
+            scene->objectInstances[i].translation = { static_cast<float> (i % 1000), static_cast<float> (i / 1000), -1.0f };
+
+        const auto validation = grid::validateVisual3DScene (*scene);
+        check (validation.valid(), "the large scene validates, code "
+                                       + std::to_string (static_cast<int> (validation.code)) + " at record "
+                                       + std::to_string (validation.recordIndex));
+
+        pt::IngestedScene ingested;
+        pt::ingestScene (*scene, ingested);
+        check (ingested.refusal.empty(), "the large scene ingests: " + ingested.refusal);
+        check (ingested.stats.objectsWithGeometry == kStrips + 1 && ingested.stats.instancesExpanded == kInstances
+                   && ingested.triangleCount() == kStrips * kStripTriangles + kInstances,
+               "every triangle and instance of the large scene reaches the path tracer");
+
+        pt::Bvh bvh;
+        bvh.build (ingested.positions);
+        pt::PinholeCamera camera;
+        check (pt::resolveActiveCamera (*scene, 32, 24, camera), "the large scene's camera resolves");
+        pt::ThreadPool pool (4);
+        pt::Accumulator accumulator;
+        accumulator.resize (32, 24);
+        accumulator.reset (7);
+        pt::CancellationToken token;
+        const pt::TileGrid tiles (32, 24, 16);
+        pool.runTiles (tiles, token, [&] (const pt::Tile& tile, unsigned) {
+            for (std::uint32_t y = tile.y0; y < tile.y1; ++y)
+                for (std::uint32_t x = tile.x0; x < tile.x1; ++x)
+                {
+                    const pt::Ray ray = camera.generateRay (static_cast<float> (x) + 0.5f, static_cast<float> (y) + 0.5f);
+                    pt::Hit hit;
+                    pt::Rgb value;
+                    if (bvh.intersect (ray, hit))
+                        value = { 1.0f, 1.0f, 1.0f };
+                    accumulator.addSample (x, y, value);
+                }
+        });
+        const std::vector<float> pixels = accumulator.resolveRgba32f();
+        const std::size_t centre = (12 * 32 + 16) * 4;
+        check (pixels.size() == 32u * 24u * 4u && pixels[centre] > 0.5f,
+               "the large scene renders its wall through the path tracer's BVH at the frame centre");
+
+        const auto encoded = sceneaov::detail::encodeScene (*scene);
+        check (! encoded.empty(), "the AOV wire carries the large scene");
+
+    }
+
+    // A count past its allocated buffer is malformed. Reading it would run off
+    // the buffer, so ingest refuses the scene whole.
+    {
+        auto scene = emptyScene();
+        for (std::uint32_t id = 1; id <= Visual3DScene::kInitialObjects; ++id)
+            addCube (*scene, id, translation (static_cast<float> (id), 0.0f, 0.0f), 0, 1);
+        pt::IngestedScene ingested;
+        pt::ingestScene (*scene, ingested);
+        check (ingested.refusal.empty() && ingested.triangleCount() == 12 * Visual3DScene::kInitialObjects,
+               "a scene at its allocated length ingests unchanged");
+        scene->objectCount = scene->objects.size() + 1;
+        pt::ingestScene (*scene, ingested);
+        check (ingested.triangleCount() == 0 && contains (ingested.refusal, "objects")
+                   && contains (ingested.refusal, std::to_string (scene->objectCount)),
+               "an object count past the buffer is refused by name: " + ingested.refusal);
+    }
+}
+
 } // namespace
 
 int main()
@@ -1022,6 +1277,7 @@ int main()
     threadPoolTests();
     accumulatorTests();
     deterministicRenderTests();
+    capacityTests();
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -71,4 +71,16 @@ inline Extent fitToPresentation (int canvasWidth, int canvasHeight,
     if (h < 1) h = 1;
     return { static_cast<std::uint32_t> (w), static_cast<std::uint32_t> (h) };
 }
+
+// The extent the viewport renders the scene at. A caller that asked for the full
+// canvas (viewport_set_full_canvas_scene) gets it at any panel size or zoom. Otherwise
+// the scene follows the panel.
+inline Extent sceneExtent (int canvasWidth, int canvasHeight,
+                           int presentWidth, int presentHeight,
+                           std::uint32_t zoom, bool fullCanvas)
+{
+    if (fullCanvas && canvasWidth > 0 && canvasHeight > 0)
+        return { static_cast<std::uint32_t> (canvasWidth), static_cast<std::uint32_t> (canvasHeight) };
+    return fitToPresentation (canvasWidth, canvasHeight, presentWidth, presentHeight, zoom);
+}
 } // namespace videohelper::previewextent

@@ -143,8 +143,8 @@ while at >= 0:
     if guard < 0 or at - guard > 120:
         errors.append("viewport.cpp rejected log must sit behind geometryPendingThisFrame")
     at = viewport.find(rejected, at + 1)
-if logs != 2:
-    errors.append("viewport.cpp must have two rejected logs, found " + str(logs))
+if logs != 3:
+    errors.append("viewport.cpp must have three rejected logs, found " + str(logs))
 
 # Other callers keep the blocking default. Only the viewport context sets Preview.
 forbid(exporter, "geometryPrepareUse", "exporter.cpp")

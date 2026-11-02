@@ -283,13 +283,6 @@ void checkImportedMaterialFrameDag()
         invalid = plan; invalid.nodeIds.insert(invalid.nodeIds.end()-1,95); invalid.nodeKinds.insert(invalid.nodeKinds.end()-1,"video.source");
         invalid.operations.insert(invalid.operations.end()-1,{95,"video.source","source-decode",{}});
         invalid.ports.push_back({95,0,1,"out","frame","image","rgba8","sRGB"}); reject(invalid,"imported Frame DAG rejects unused producers");
-        invalid = plan;
-        for (int id = 200; id < 233; ++id) {
-            invalid.nodeIds.insert(invalid.nodeIds.end()-1,id); invalid.nodeKinds.insert(invalid.nodeKinds.end()-1,"video.source");
-            invalid.operations.insert(invalid.operations.end()-1,{id,"video.source","source-decode",{}});
-            invalid.ports.push_back({id,0,1,"out","frame","image","rgba8","sRGB"});
-        }
-        reject(invalid,"imported Frame DAG retains the existing 32-operation admission cap");
         if (mode == 4) {
             invalid = plan;
             auto& payload = std::find_if(invalid.operations.begin(),invalid.operations.end(),[](const auto& op){return op.nodeId == 92;})->payloadXml;
@@ -1306,9 +1299,9 @@ void checkSolidBodyInstancingBound()
     broken->objectInstanceCount=0;
     check(HarmonicMIDI::grid::validateVisual3DScene(*broken).code==Visual3DSceneValidationCode::InvalidObjectInstances,
         "an instanced object with no instances is invalid");
-    broken->objectInstanceCount=HarmonicMIDI::grid::Visual3DScene::kMaxObjectInstances+1;
+    broken->objectInstanceCount=broken->objectInstances.size()+1;
     check(HarmonicMIDI::grid::validateVisual3DScene(*broken).code==Visual3DSceneValidationCode::InvalidObjectInstances,
-        "more than 128 object instances are invalid");
+        "a count past the allocated instances is invalid");
     broken->objectInstanceCount=128; broken->objectInstances[100].scale.y=0;
     check(HarmonicMIDI::grid::validateVisual3DScene(*broken).code==Visual3DSceneValidationCode::InvalidObjectInstances,
         "a zero-scale object instance is invalid");
@@ -3788,8 +3781,6 @@ void checkReactiveParticleGeometryHistory()
         }
         auto body=*audioMesh; body.spectrumFields[0].history.live=true; body.spectrumFields[0].history.enabled=true;
         check(!validateParticleGeometry(body,CarrierKind::geometry3D,error),"historical particles refuse live spectral history");
-        body=*audioMesh; body.operations.resize(33);
-        check(!validateParticleGeometry(body,CarrierKind::geometry3D,error),"reactive geometry preserves the 32-operation cap");
         const auto admitted=admitValue(*audioMesh,meshContract,error);
         check(admitted.has_value(),error.c_str());
         if (admitted) {
@@ -4485,14 +4476,9 @@ void checkParticleScoreImpulse()
     packed.historyProjectSeconds=9.0;
     auto packedKick=packed; packedKick.scoreImpulseGain=kickGain;
     const auto capWindow=particleReplayWindow(packedKick,9.0);
-    const auto noop=[](std::int64_t,double) {};
-    check(visitParticleHistoryEvents(packed,capWindow,noop,0.0) && !visitParticleHistoryEvents(packedKick,capWindow,noop,kickGain),
-          "520 score onsets exceed the shared 512-event cap only with a positive impulse gain");
-    const auto kickCap=particleEventCapDiagnostic(packedKick,capWindow,"generic cap");
-    check(kickCap.find("Score note impulse")!=std::string::npos && kickCap.find("512")!=std::string::npos,
-          "the cap refusal names score note impulses as its cause");
-    check(particleEventCapDiagnostic(packed,capWindow,"generic cap")=="generic cap",
-          "the cap refusal without impulses keeps its generic diagnostic");
+    int kicks=0;
+    visitParticleHistoryEvents(packedKick,capWindow,[&](std::int64_t,double kick) { if (kick>0) ++kicks; },kickGain);
+    check(kicks==520,"520 score onsets in the window give 520 impulse events");
     check(error.empty(), "score impulse replays complete without diagnostics");
 }
 

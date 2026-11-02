@@ -519,7 +519,12 @@ void lightSetTests()
     const auto twice = ignoredCount ({ imageRecord (testAsset()), imageRecord (testAsset()) }, sky);
     check (twice.first == 1 && twice.second, "a second image record is ignored, the first lights");
     const auto hot = ignoredCount ({ imageRecord (testAsset(), 0.0f, 16.0f, { 64.0f, 64.0f, 64.0f }, 1000.0f) }, sky);
-    check (hot.first == 1 && ! hot.second, "an exposure past the raster's radiance bound is ignored, as the raster refuses it");
+    check (hot.first == 0 && hot.second, "a bright exposure lights, with no radiance bound");
+    pt::EnvironmentMap brightest;
+    const float top = std::numeric_limits<float>::max();
+    check (brightest.build (sky, { top, top, top }, 0.0f), "a tint at the largest float builds");
+    const Vec3 past = brightest.radiance ({ 0.0f, 1.0f, 0.0f });
+    check (pt::isFinite (past) && pt::isFinite (brightest.integratedRadiance()), "a texel times a huge tint stays finite");
 }
 
 // ---------------------------------------------------------------- renders
@@ -645,6 +650,75 @@ bool fullyCovered (const pt::RenderScene& scene, const pt::PinholeCamera& camera
 }
 
 // A constant image renders the same picture as the PT-A2 constant environment.
+// Coverage 1 of type 0 at the zenith: every noise value clears the threshold, so opacity
+// is the layer's 0.96 and radiance is the raster's cloud formula with no noise left in it.
+void floatMaxFilmAndSkyTests()
+{
+    const float top = std::numeric_limits<float>::max();
+    pt::Accumulator film;
+    film.resize (2, 1);
+    // The device's float sum of 16 samples at the largest float is infinite.
+    film.addSampleSum (0, 0, { std::numeric_limits<float>::infinity(), top, 1.0f }, 16);
+    film.addSampleSum (0, 0, { top, top, 1.0f }, 16);
+    const pt::Rgb mean = film.mean (0, 0);
+    check (std::isfinite (mean.r) && std::isfinite (mean.g) && std::isfinite (mean.b) && mean.r > 1.0e38f,
+           "a device sum past a float leaves the film finite");
+    film.addSample (1, 0, { top, top, top });
+    film.addSample (1, 0, { top, top, top });
+    check (film.mean (1, 0).r == top, "repeated samples at the largest float keep it");
+
+    grid::SceneLightRecord record;
+    record.kind = grid::SceneLightKind::Environment;
+    record.color = { 1.0f, 1.0f, 1.0f };
+    record.intensity = 1.0f;
+    record.sky.version = 1;
+    record.sky.zenith = { top, top, top };
+    record.sky.horizon = { top, top, top };
+    record.sky.ground = { top, top, top };
+    pt::RenderScene scene;
+    scene.lightRecords = { record };
+    scene.commit();
+    check (scene.lights.hasEnvironment() && scene.lights.stats().zeroPowerLights == 0, "a sky at the largest float stays a light");
+}
+
+void analyticCloudTests()
+{
+    grid::SceneLightRecord record;
+    record.kind = grid::SceneLightKind::Environment;
+    record.color = { 1.0f, 1.0f, 1.0f };
+    record.intensity = 1.0f;
+    record.sky.version = 1;
+    record.sky.zenith = { 0.1f, 0.2f, 0.9f };
+    record.sky.horizon = { 0.5f, 0.6f, 0.7f };
+    record.sky.ground = { 0.01f, 0.02f, 0.03f };
+    record.sky.sunColor = { 1.0f, 0.5f, 0.25f };
+    record.sky.sunIntensity = 8.0f;
+    record.sky.sunElevationDegrees = 12.0f;
+    record.sky.sunRadiusDegrees = 3.0f;
+
+    pt::RenderScene clearScene;
+    clearScene.lightRecords = { record };
+    clearScene.commit();
+    record.sky.cloudCoverage = 1.0f;
+    pt::RenderScene cloudScene;
+    cloudScene.lightRecords = { record };
+    cloudScene.commit();
+
+    const Vec3 up { 0.0f, 1.0f, 0.0f };
+    const Vec3 clear = clearScene.lights.environmentRadiance (up);
+    const float sunCos = std::cos (3.0f * 3.14159265f / 180.0f);
+    const float sunY = std::sin (12.0f * 3.14159265f / 180.0f);
+    const float cloud = 0.96f;
+    const float shade = 1.0f - 0.3f * cloud * cloud;
+    const Vec3 sun = Vec3 { 1.0f, 0.5f, 0.25f } * (8.0f * (1.0f - sunCos) * sunY);
+    const Vec3 lit = (Vec3 { 0.8f, 0.8f, 0.8f } + sun) * shade;
+    check (closeTo (cloudScene.lights.environmentRadiance (up), clear + (lit - clear) * cloud, 1.0e-4f),
+           "a closed sky is the raster's cloud formula at the zenith");
+    const Vec3 down { 0.0f, -1.0f, 0.0f };
+    check (closeTo (cloudScene.lights.environmentRadiance (down), clearScene.lights.environmentRadiance (down), 1.0e-6f),
+           "clouds never show below the horizon");
+}
+
 void constantImageTests()
 {
     const auto render = [] (bool useImage, double& covered, Vec3& background) {
@@ -929,11 +1003,13 @@ void residentStoreTests()
 
 int main()
 {
+    floatMaxFilmAndSkyTests();
     conventionTests();
     distributionTests();
     brightTexelTests();
     orientationTests();
     lightSetTests();
+    analyticCloudTests();
     constantImageTests();
     hdriFurnaceTests();
     misTests();

@@ -13,6 +13,7 @@
 #include "support/generated_surface_scene.h"
 #include "support/smooth_glass_authored_material.h"
 #include "reactive_frame_fixture.h"
+#include "../../shared/Visual3DSceneComposition.h"
 #include "../src/renderer.h"
 #include "../src/viewport_project_generation.h"
 #include "../src/imported_animation_deformation_consumer.h"
@@ -311,6 +312,9 @@ struct FakeExecution
     const HarmonicMIDI::grid::Visual3DScene* admittedScene = nullptr;
     videohelper::modelpayload::ImportedSceneRequest lastRequest;
     std::shared_ptr<FakeFrame> nextFrame = std::make_shared<FakeFrame>();
+    // The native renderers allocate the Color target the request names. A test of
+    // a mismatched attachment clears this and sets the frame itself.
+    bool frameFollowsRequest = true;
     bool succeed = true;
     std::string publishedIdentity;
     int identityRetirements = 0;
@@ -350,6 +354,7 @@ struct FakeExecution
             error = "preview rejected";
             return false;
         }
+        if (frameFollowsRequest) nextFrame->linearColor = request.runtimeInputs.linearColor;
         receipt = { true, nextFrame, 1, request.runtimeInputs.canonicalBlockCFrame,
                     request.runtimeInputs.materialFrameTexture };
         return true;
@@ -371,6 +376,7 @@ struct FakeExecution
             error = "export rejected";
             return false;
         }
+        if (frameFollowsRequest) nextFrame->linearColor = request.runtimeInputs.linearColor;
         receipt = { true, nextFrame, 2, request.runtimeInputs.canonicalBlockCFrame,
                     request.runtimeInputs.materialFrameTexture };
         return true;
@@ -389,6 +395,10 @@ struct FakeLayer
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
     int shaderTransitionFromClipId = 0;
     unsigned texture = 0;
+    // Radiance reaches the compositor as linear colour, so a fake layer owns its
+    // frame as LayerDesc does.
+    std::shared_ptr<const void> nativeTextureOwner;
+    std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> nativeLinearImage;
     std::string nativeTextureBackend;
     std::uintptr_t nativeTextureView = 0;
     arbitgpu::NativeTextureViewDescriptor nativeTextureDescriptor;
@@ -532,7 +542,7 @@ void waterFrameConsumers()
     auto invalid = history; invalid.key.helperGeneration = 0;
     reject(&invalid,project,"composed water invalid history generation refuses atomically");
     currentFrame = waterreplayfixture::frame(history,10.001);
-    reject(&history,10.001,"composed water over-horizon request refuses atomically");
+    check(evaluate(preview,&history,10.001,scene)!=nullptr,"composed water runs past the former 10 second limit");
     currentFrame = waterreplayfixture::frame(history,project);
 
     const auto bytes = decodeLoweredPlanText(request->timelineGeometry->loweredPlan,error);
@@ -609,14 +619,15 @@ void waterFrameConsumers()
             "non-grid wrong packed beat refuses image water before backend preparation");
     }
     currentFrame = waterreplayfixture::frame(history,project);
-    const auto prepares = backend.prepareCalls;
+    auto prepares = backend.prepareCalls;
     check(!capture(*admission,nullptr,project) && backend.prepareCalls==prepares,
         "missing water history refuses before image backend preparation");
     check(!capture(*admission,&invalid,project) && backend.prepareCalls==prepares,
         "invalid water generation refuses before image backend preparation");
     currentFrame = waterreplayfixture::frame(history,10.001);
-    check(!capture(*admission,&history,10.001) && backend.prepareCalls==prepares,
-        "over-horizon water refuses before image backend preparation");
+    check(capture(*admission,&history,10.001) && backend.prepareCalls==prepares+1,
+        "water past the former 10 second limit reaches image backend preparation");
+    prepares = backend.prepareCalls;
     currentFrame = waterreplayfixture::frame(history,project);
     // Every candidate is valid on its own, but belongs to another Block C lifecycle.
     for (const auto member : {&canonicalblockc::FrameKey::projectGeneration,
@@ -1260,10 +1271,8 @@ void testImportedParentIntentTransport()
         std::string("visual.imported-scene.render.v11\n1\n") + expected})
         check(!decodeCanonical(wire, decoded, error) && sameRequest(sentinel, decoded),
             "uppercase, truncated, trailing, nested, leaf and nonroot V23 envelopes refuse transactionally");
-    auto huge = expected;
-    huge.resize(kMaximumV8EncodedBytes + 1, '0');
-    check(!decodeCanonical(huge, decoded, error) && sameRequest(sentinel, decoded),
-        "V23 retains the existing whole-wire ceiling");
+    // A string past the whole-wire bound would need 4 EiB, so the bound is pinned at compile time.
+    static_assert(kMaximumV8EncodedBytes == sceneaov::detail::kMaximumSceneBytes * 2 + kMaximumV7EncodedBytes);
     auto unrelated = leaf; unrelated.importedParentIntent = intent;
     refuses(unrelated, packed(intent, encode(leaf)));
     auto leafWithIntent = leaf; leafWithIntent.importedParentIntent = intent;
@@ -1437,6 +1446,15 @@ visualimportedscenerender::Request importedOverrideRequest()
 // The composed scene the executor builds: the imported object keeps its
 // identity and takes the override's material, and the procedural object moves
 // to its composed half of the identity space.
+void addImportedBaseColorTexture(HarmonicMIDI::grid::Visual3DScene& scene)
+{
+    scene.textureTexels = { HarmonicMIDI::grid::SceneTexelRgba8 {} };
+    scene.textureTexelCount = 1;
+    scene.textureCount = 1;
+    scene.textures[0].id.value = 1;
+    scene.textures[0].width = scene.textures[0].height = 1;
+}
+
 std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> importedOverrideComposedScene(
     const surfacematerialbinding::ImportedSceneMaterialRequest& material)
 {
@@ -1444,6 +1462,7 @@ std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> importedOverrideCompose
     auto scene = std::make_shared<Visual3DScene>(*composedScene());
     scene->objects[0].id = *visualimportedsceneidentity::objectId(0, 0);
     scene->materials[0].id.value = geometrysurfacematerial::materialId(material);
+    addImportedBaseColorTexture(*scene);
     scene->materials[0].baseColorTexture.value = 1;
     scene->objects[0].material = scene->materials[0].id;
     scene->objects[1].id = SceneObjectId{0x80000000u | scene->objects[1].id.value};
@@ -1502,6 +1521,56 @@ void testImportedSurfaceOverrideBesideProceduralPrograms()
         "the imported override binds only its imported object and the procedural program only its target");
 }
 
+// The Render node's mode reaches the executor request for the viewport and for
+// export alike, and Accurate keeps the bytes it had before the mode existed.
+void testRenderModeReachesPreviewAndExport()
+{
+    using namespace HarmonicMIDI::grid;
+    using videohelper::importedscene::NativeImportedSceneRenderUse;
+    using videohelper::importedscene::VisualImportedScenePlanCache;
+    using videohelper::importedscene::VisualImportedScenePreparation;
+    using videohelper::importedscene::prepareVisualImportedSceneLayerAtTime;
+    const auto accurate = importedOverrideRequest();
+    auto fast = accurate;
+    fast.renderMode = visualimportedscenerender::RenderMode::Fast;
+    const auto accurateWire = visualimportedscenerender::encode(accurate);
+    const auto fastWire = visualimportedscenerender::encode(fast);
+    check(!accurateWire.empty() && accurateWire.find(visualimportedscenerender::kCompiledOperationHeaderV29) != 0
+        && fastWire.find(visualimportedscenerender::kCompiledOperationHeaderV29) == 0,
+        "only the Fast request uses the V29 envelope");
+    if (accurateWire.empty() || fastWire.empty()) return;
+    for (const auto mode : {visualimportedscenerender::RenderMode::Accurate, visualimportedscenerender::RenderMode::Fast})
+    {
+        const auto& encoded = mode == visualimportedscenerender::RenderMode::Fast ? fastWire : accurateWire;
+        for (const auto use : {NativeImportedSceneRenderUse::Preview, NativeImportedSceneRenderUse::Export})
+        {
+            auto plan = composedScenePlan();
+            plan.structuralRevision = 31;
+            plan.nodeIds = {6,11};
+            plan.nodeKinds = {videowire::geometry::kRetainedSceneOperation, "visual.3d.render"};
+            plan.operations = {{6,plan.nodeKinds[0],"control-eval",""},
+                {11,plan.nodeKinds[1],"native-gpu",encoded}};
+            plan.edges = {{6,0,11,0}};
+            plan.ports = {{6,0,1,"out","control","scene3D","unspecified","unspecified"},
+                {11,0,1,"in","control","scene3D","unspecified","unspecified"},
+                {11,1,1,"out","frame","image","rgba8","sRGB"}};
+            FakeExecution execution;
+            FakeLayer layer;
+            std::vector<FakeReceipt> receipts;
+            VisualImportedScenePlanCache cache;
+            std::string error;
+            const bool rendered = prepareVisualImportedSceneLayerAtTime({plan},8,640,360,1.25,24,use,
+                &execution,&cache,layer,receipts,error,nullptr,{12,34}) == VisualImportedScenePreparation::rendered;
+            check(rendered, "the executor receives the mode-carrying payload: " + error);
+            const bool previewing = use == NativeImportedSceneRenderUse::Preview;
+            check(rendered && execution.lastRequest.renderMode == mode
+                && execution.previewCalls == (previewing ? 1 : 0) && execution.exportCalls == (previewing ? 0 : 1),
+                std::string(previewing ? "the viewport" : "the exporter") + " reads the node's "
+                + (mode == visualimportedscenerender::RenderMode::Fast ? "Fast" : "Accurate") + " mode");
+        }
+    }
+}
+
 void testImportedSurfaceOverrideReachesCompositionExecutor()
 {
     using namespace HarmonicMIDI::grid;
@@ -1532,6 +1601,37 @@ void testImportedSurfaceOverrideReachesCompositionExecutor()
         const bool conditionOk = prepareVisualImportedSceneLayerAtTime({plan},8,640,360,1.25,24,NativeImportedSceneRenderUse::Preview,
         &execution,&cache,layer,receipts,error,nullptr,{12,34}) == VisualImportedScenePreparation::rendered;
         check(conditionOk, "the executor receives the plugin-shaped imported override: " + error);
+    }
+    {
+        // A leased plan compares once per publication. A changed plan in a new one still compiles.
+        VisualImportedScenePlanCache leased;
+        auto publication = std::make_shared<std::vector<videowire::CompiledVisualLayerPlan>>(1, plan);
+        const auto& held = publication->front();
+        const videohelper::importedscene::ImportedSceneStaticResourceIdentity identity {12, 34, publication};
+        leased.publish(held, identity);
+        const auto* first = leased.resolve(held, error, publication);
+        check(first != nullptr && leased.planCompiles() == 1, "the first frame compiles the plan: " + error);
+        const auto before = leased.planTextComparisons();
+        leased.publish(held, identity);
+        check(leased.resolve(held, error, publication) == first && leased.planTextComparisons() == before
+            && leased.planCompiles() == 1, "later samples in a publication neither compare nor compile");
+        auto nextPublication = std::make_shared<std::vector<videowire::CompiledVisualLayerPlan>>(1, plan);
+        const auto& same = nextPublication->front();
+        const videohelper::importedscene::ImportedSceneStaticResourceIdentity sameIdentity {12, 34, nextPublication};
+        leased.publish(same, sameIdentity);
+        check(leased.resolve(same, error, nextPublication) != nullptr && leased.planTextComparisons() == before + 1
+            && leased.planCompiles() == 1, "an equal plan in a new publication compares once and does not compile");
+        auto changed = plan;
+        ++changed.structuralRevision;
+        auto changedPublication = std::make_shared<std::vector<videowire::CompiledVisualLayerPlan>>(1, changed);
+        const auto& edited = changedPublication->front();
+        const videohelper::importedscene::ImportedSceneStaticResourceIdentity editedIdentity {12, 34, changedPublication};
+        leased.publish(edited, editedIdentity);
+        leased.resolve(edited, error, changedPublication);
+        check(leased.planCompiles() == 2, "a changed plan in a new publication compiles");
+        const auto bare = leased.planTextComparisons();
+        check(leased.resolve(edited, error) != nullptr && leased.planTextComparisons() == bare + 1,
+            "a caller with no publication compares in full");
     }
     const auto& actual = execution.lastRequest;
     check(actual.importedScene && actual.material && actual.surfacePrograms.size() == 1
@@ -1790,10 +1890,10 @@ void testImportedSceneCompositionHandoff()
     mismatched.importedScene = std::make_shared<const visualimportedscenerender::Request>(wrongAsset);
     check(!visualimportedscenerender::valid(mismatched), "composition refuses an animation bound to a different asset fingerprint");
     auto oversized = std::make_shared<Visual3DScene>(*request.sceneSnapshot);
-    oversized->objectCount = Visual3DScene::kMaxObjects + 1;
+    oversized->objectCount = oversized->objects.size() + 1;
     mismatched = request; mismatched.sceneSnapshot = oversized;
     check(!visualimportedscenerender::valid(mismatched) && visualimportedscenerender::encode(mismatched).empty(),
-        "composition refuses scene capacity overflow before import admission");
+        "composition refuses a count past its allocated records");
     auto procedural = request; procedural.importedScene.reset();
     check(visualimportedscenerender::encode(procedural).find(visualimportedscenerender::kCompiledOperationHeaderV8) == 0
         && visualimportedscenerender::encode(renderRequest()).find(visualimportedscenerender::kCompiledOperationHeader) == 0,
@@ -2267,6 +2367,75 @@ void testAuthoredImportedStarterTopologies()
         && compiled.importedSceneRender->diffractionMaterial->spatialFoil && compiled.importedSceneRender->materialField;
         check(conditionOk, "authored holographic card reaches strict execution with its exact foil field and outer output: " + error);
     }
+    // The authored card with its Environment light: port 0 out, no transform, record on the Render request.
+    auto environmentCard = card;
+    {
+        const auto transform = std::find(environmentCard.nodeIds.begin(), environmentCard.nodeIds.end(), 75);
+        const auto transformIndex = static_cast<std::size_t>(transform - environmentCard.nodeIds.begin());
+        environmentCard.nodeIds.erase(transform);
+        environmentCard.nodeKinds.erase(environmentCard.nodeKinds.begin() + transformIndex);
+        environmentCard.operations.erase(environmentCard.operations.begin() + transformIndex);
+    }
+    *std::find(environmentCard.nodeKinds.begin(), environmentCard.nodeKinds.end(), "visual.3d.light.directional")
+        = "visual.3d.light.environment";
+    operation(environmentCard, 76).kind = "visual.3d.light.environment";
+    environmentCard.ports.erase(std::remove_if(environmentCard.ports.begin(), environmentCard.ports.end(), [](const auto& port)
+        { return port.nodeId == 75 || (port.nodeId == 76 && port.direction == "in"); }), environmentCard.ports.end());
+    for (auto& port : environmentCard.ports) if (port.nodeId == 76) port.port = 0;
+    environmentCard.edges.erase(std::remove_if(environmentCard.edges.begin(), environmentCard.edges.end(), [](const auto& edge)
+        { return edge.fromNodeId == 75; }), environmentCard.edges.end());
+    for (auto& edge : environmentCard.edges) if (edge.fromNodeId == 76) edge.fromPort = 0;
+    auto environmentRequest = cardRequest;
+    HarmonicMIDI::grid::SceneLightRecord environmentLight;
+    environmentLight.id.value = 77;
+    environmentLight.kind = HarmonicMIDI::grid::SceneLightKind::Environment;
+    environmentLight.intensity = 1.5f;
+    environmentLight.environmentCameraVisible = false;
+    environmentLight.sky.version = 1;
+    environmentLight.sky.sunAzimuthDegrees = 15;
+    environmentRequest.light = environmentLight;
+    operation(environmentCard, 71).payloadXml = visualimportedscenerender::encode(environmentRequest);
+    {
+        const bool conditionOk = accepted(environmentCard) && compiled.importedSceneRender && compiled.importedSceneRender->light
+            && HarmonicMIDI::grid::scenecomposition::sameLightRecord(*compiled.importedSceneRender->light, environmentLight);
+        check(conditionOk, "card's environment-light typed operation compiles to its authored sky, intensity and camera-visibility record: " + error);
+    }
+    auto hdrCard = environmentCard;
+    auto hdrLight = environmentLight;
+    hdrLight.sky = {};
+    hdrLight.environmentImage = {1, {"saved-hdr", 7, std::string(64, 'a')}, 30, 2};
+    auto hdrRequest = environmentRequest;
+    hdrRequest.light = hdrLight;
+    operation(hdrCard, 71).payloadXml = visualimportedscenerender::encode(hdrRequest);
+    {
+        const bool conditionOk = accepted(hdrCard) && compiled.importedSceneRender && compiled.importedSceneRender->light
+            && HarmonicMIDI::grid::scenecomposition::sameLightRecord(*compiled.importedSceneRender->light, hdrLight);
+        check(conditionOk, "card's environment-light typed operation keeps its HDR image binding identity: " + error);
+    }
+    {
+        // Native preparation resolves the HDR image from the scene it receives.
+        HarmonicMIDI::grid::Visual3DScene source;
+        const auto bound = HarmonicMIDI::grid::scenecomposition::sceneWithEnvironmentImageLight(source, hdrLight);
+        check(bound && bound->lightCount == 1 && HarmonicMIDI::grid::scenecomposition::sameLightRecord(bound->lights[0], hdrLight)
+            && source.lightCount == 0, "imported scene prepared for an HDR request light names that image without changing its source");
+    }
+    invalid = environmentCard;
+    {
+        auto directionalRequest = environmentRequest;
+        directionalRequest.light = light;
+        operation(invalid, 71).payloadXml = visualimportedscenerender::encode(directionalRequest);
+    }
+    reject(invalid, "an environment-light operation cannot own a directional request light");
+    invalid = environmentCard;
+    addBefore(invalid, 72, 75, "visual.3d.transform", "control-eval");
+    invalid.ports.push_back({75, 0, 1, "out", "control", "transform3D", "unspecified", "unspecified"});
+    reject(invalid, "an environment-light schedule refuses a stray transform");
+    invalid = card;
+    {
+        auto environmentOnDirectional = environmentRequest;
+        operation(invalid, 71).payloadXml = visualimportedscenerender::encode(environmentOnDirectional);
+    }
+    reject(invalid, "a directional-light operation cannot own an environment request light");
     invalid = card;
     operation(invalid, 72).kind = "visual.material.diffraction-grating";
     *std::find(invalid.nodeKinds.begin(), invalid.nodeKinds.end(), "visual.material.diffractive-foil")
@@ -2678,14 +2847,14 @@ void testMaterialFramePrerequisite(bool diffraction = false, bool generated = fa
           "legacy imported slot-zero texture remains unchanged without a Frame edge");
 }
 
-videowire::CompiledVisualLayerPlan importedVertexPlan()
+videowire::CompiledVisualLayerPlan importedVertexPlan(bool deformed = true)
 {
-    auto plan = importedScenePlan(true, true);
+    auto plan = importedScenePlan(true, deformed);
     auto render = std::move(plan.operations.back());
     plan.operations.pop_back();
     plan.nodeIds.pop_back();
     plan.nodeKinds.pop_back();
-    auto request = renderRequest(true, true);
+    auto request = renderRequest(true, deformed);
     request.material->vertexModifier = videohelper::test::audioNormalDisplacement();
     const auto& vertex = *request.material->vertexModifier;
     constexpr int material = 83;
@@ -2794,8 +2963,11 @@ void testDiffractionRuntimeParameters()
             if (seconds == 0)
                 check(request.runtimeInputs.diffractionParameters.empty(), "returning to the authored value clears frame-local modulation");
             else
-                check(request.runtimeInputs.diffractionParameters.at("grooveSpacingNanometres") == originalSpacing + 100 * seconds,
+            {
+                const auto changed = request.runtimeInputs.diffractionParameters.find("grooveSpacingNanometres");
+                check(changed != request.runtimeInputs.diffractionParameters.end() && changed->second == originalSpacing + 100 * seconds,
                       "the frame carries only the exact changed material scalar");
+            }
         }
     for (const auto& key : {"visual73/not-a-parameter", "visual73/rmsSlope"})
     {
@@ -3028,6 +3200,30 @@ void testLightOverrideBackendRead()
           "a position offset on a static directional light is refused");
     scene->lights[0].kind = SceneLightKind::Point;
 
+    // S2 follow-up (a): the refusal latch key's validity-only reads. The key gate
+    // calls the same animated-lights ownership helper the build refuses with, so a
+    // same-size ownership mismatch fails the key instead of letting a stale latch
+    // answer with its own error, and the other-lights validity read the key gates
+    // on is the build's read.
+    auto ownedScene = std::make_unique<Visual3DScene>();
+    ownedScene->lightCount = 2;
+    ownedScene->lights[0].id.value = 601;
+    ownedScene->lights[1].id.value = 602;
+    arbitgpu::NativeImportedSceneRuntimeInputs ownedRuntime;
+    using AnimatedLight = std::remove_reference_t<decltype(ownedRuntime.animatedLights[0])>;
+    AnimatedLight animated {};
+    animated.id.value = 601;
+    ownedRuntime.animatedLights.push_back(animated);
+    animated.id.value = 602;
+    ownedRuntime.animatedLights.push_back(animated);
+    std::string keyError;
+    check(arbitgpu::animatedLightsOwnedByScene(*ownedScene, ownedRuntime)
+              && arbitgpu::validNativeImportedLightOverrideTargets(*ownedScene, ownedRuntime, keyError),
+          "the latch key gate keys a scene whose animated lights are owned");
+    ownedRuntime.animatedLights[1].id.value = 699;
+    check(!arbitgpu::animatedLightsOwnedByScene(*ownedScene, ownedRuntime) && keyError.empty(),
+          "a same-size animated-light id mismatch fails the key gate instead of latching");
+
     // With sampled animatedLights, the override applies to the sampled record, which
     // stays authored, and the count follows the sampled list.
     arbitgpu::NativeImportedSceneRuntimeInputs sampledRuntime;
@@ -3074,7 +3270,7 @@ void testDirectionalLightModulation()
                   && point.transform.translation.x == 1000001.0f
                   && point.transform.translation.y == 1.5f
                   && point.transform.translation.z == 3.0f
-                  && point.intensity == 0.0f && point.color.x == 64.0f,
+                  && point.intensity == 0.0f && point.color.x == 99.0f,
               "point light offsets and absolute values clamp to their ranges");
         const std::map<std::string, double> nonfinite { { "visual77/intensity", std::nan("") } };
         check(!evaluateDirectionalOrPointLight(nonfinite, point),
@@ -3115,6 +3311,7 @@ void testDirectionalLightModulation()
     check(authored && authored->lightCount == 1
               && authored->lights[0].kind == SceneLightKind::Directional,
           "the composed plan carries one directional light");
+    if (!authored) return;
     const auto key = "visual" + std::to_string(authored->lights[0].id.value) + "/";
     check(parameters.count(key + "intensity") == 1 && parameters.count(key + "red") == 1
               && parameters.count(key + "rotationY") == 1 && parameters.count(key + "positionX") == 0,
@@ -3149,7 +3346,7 @@ void testDirectionalLightModulation()
     check(render(modulated) == VisualImportedScenePreparation::rendered
               && !arbitgpu::sameNativeImportedLightOverrides(firstOverrides, execution.lastRequest.runtimeInputs.lightOverrides)
               && readLights().size() == 1
-              && readLights()[0].intensity == 1000000.0f
+              && readLights()[0].intensity == 2.0e6f
               && readLights()[0].color.x == 0.0f,
           "out-of-range light values clamp to the node ranges");
 
@@ -3356,6 +3553,11 @@ void testBakedSurfaceConstantModulation()
     visualimportedscenerender::Request request;
     check(visualimportedscenerender::decode(plan.operations.back().payloadXml, request) && request.sceneSnapshot,
           "Surface constant fixture decodes its composed request");
+    // A Surface node names the material of every object it lowers to, so one source
+    // is one scene material, as Visual3DGraphNodes.h lowerObjectMaterial builds it.
+    auto sharedMaterialScene = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*request.sceneSnapshot);
+    sharedMaterialScene->objects[1].material = sharedMaterialScene->objects[0].material;
+    request.sceneSnapshot = sharedMaterialScene;
     std::string error;
     request.surfacePrograms = composedSurfacePrograms(request, error);
     check(request.surfacePrograms.size() == 2,
@@ -3820,7 +4022,8 @@ videowire::CompiledVisualLayerPlan nativeResolverPlan(bool retained,int mode,std
         }
         surfacematerialbinding::ImportedSceneMaterialRequest material;
         material.scene = retained ? request.sceneSnapshot->id : Scene3DId{1}; material.sceneSnapshot = request.sceneSnapshot;
-        material.sceneRevision = material.structuralRevision = material.evaluationRevision = material.programRevision = 9;
+        material.sceneRevision = material.structuralRevision = material.programRevision = 9;
+        material.evaluationRevision = request.evaluationRevision;
         material.binding.targetKind = surfacematerialbinding::BindingTargetKind::ObjectOverride; material.binding.object = {1};
         material.binding.surfaceMaterialRevision = 9; material.version = surfacematerialbinding::kGraphFrameWireVersion;
         material.program = surfacematerialstarterfixture::kPrograms[0].program(); material.program.textureSlotCount = 1;
@@ -3961,6 +4164,8 @@ void testProductionMaterialFrameResolver()
     {
         std::string error;
         auto plan = nativeResolverPlan(retained,mode >= 7 ? (mode == 12 ? 3 : mode == 11 ? 1 : 4) : mode,error);
+        // The builder has already failed its check, and the cases below edit its operations.
+        if (plan.operations.empty()) continue;
         if (mode >= 7 && mode <= 10)
         {
             auto& operation = *std::find_if(plan.operations.begin(),plan.operations.end(),[](const auto& op){return op.nodeId==92;});
@@ -3969,7 +4174,7 @@ void testProductionMaterialFrameResolver()
                 : mode == 9 ? "visual.echo" : "visual.long-exposure";
             payload.mode = mode == 7 ? visualtemporaloperation::Mode::stutter : mode == 8 ? visualtemporaloperation::Mode::feedback
                 : mode == 9 ? visualtemporaloperation::Mode::echo : visualtemporaloperation::Mode::longExposure;
-            payload.historyLength = 3; payload.holdFrames = 3;
+            payload.historyLength = mode == 7 ? 1 : mode == 8 ? 2 : 3; payload.holdFrames = mode == 7 ? 3 : 1;
             payload.decay = mode == 8 ? .9f : 0; payload.zoom = 1;
             operation.kind = kind; operation.payloadXml = visualtemporaloperation::serialize(payload);
             plan.nodeKinds[std::find(plan.nodeIds.begin(),plan.nodeIds.end(),92)-plan.nodeIds.begin()] = kind;
@@ -3989,7 +4194,8 @@ void testProductionMaterialFrameResolver()
             operation.kind = "visual.shader.custom";
             plan.nodeKinds[std::find(plan.nodeIds.begin(),plan.nodeIds.end(),91)-plan.nodeIds.begin()] = operation.kind;
             operation.payloadXml = "<FlatShaderBridge schemaVersion=\"2\" role=\"generator\" language=\"glsl\" source=\""
-                + source + "\" sourceSha256=\"" + videohelper::sha256Text(source) + "\"/>";
+                + source + "\" sourceSha256=\"" + videohelper::sha256Text(source)
+                + "\" catalogPackId=\"\" catalogProgramId=\"\" parameters=\"\"/>";
             operation.runtimeGrantJson = programmableadmission::toJson(grant).dump();
         }
         if (mode == 12)
@@ -4867,13 +5073,122 @@ void testGlassCausticRequestHandoff()
     absent.glassCaustic.reset();
     auto absentPlan = plan;
     absentPlan.operations[1].payloadXml = visualimportedscenerender::encode(absent);
-    execution.nextFrame->linearColor = false;
     {
         const bool conditionOk = prepareVisualImportedSceneLayerAtTime({absentPlan}, 8, 640, 360, 1.25, 24,
         NativeImportedSceneRenderUse::Preview, &execution, &cache, layer, owners, error, nullptr, {12,34})
             == VisualImportedScenePreparation::rendered
-        && !execution.lastRequest.glassCaustic && !execution.lastRequest.runtimeInputs.linearColor;
-        check(conditionOk, "a retained scene without caustic selection preserves the ordinary SDR route: " + error);
+        && !execution.lastRequest.glassCaustic && execution.lastRequest.runtimeInputs.linearColor;
+        check(conditionOk, "a retained scene without caustic selection keeps the linear Color route: " + error);
+    }
+
+    // Path Trace radiance takes the linear route with no caustic on the request, so
+    // the compositor encodes it for the viewport and for an SDR export alike.
+    auto tracedRequest = request;
+    tracedRequest.glassCaustic.reset();
+    tracedRequest.renderEngine = visualimportedscenerender::RenderEngine::PathTrace;
+    auto tracedPlan = plan;
+    tracedPlan.operations[1].payloadXml = visualimportedscenerender::encode(tracedRequest);
+    FakeExecution tracedExecution;
+    tracedExecution.nextFrame->linearColor = true;
+    VisualImportedScenePlanCache tracedCache;
+    for (const auto use : {NativeImportedSceneRenderUse::Preview, NativeImportedSceneRenderUse::Export})
+    {
+        videorender::LayerDesc layer;
+        std::vector<FakeReceipt> owners;
+        const auto result = prepareVisualImportedSceneLayerAtTime({tracedPlan}, 8, 640, 360, 1.25, 24,
+            use, &tracedExecution, &tracedCache, layer, owners, error, nullptr, {12,34});
+        check(result == VisualImportedScenePreparation::rendered
+                  && tracedExecution.lastRequest.runtimeInputs.linearColor
+                  && layer.nativeLinearImage == tracedExecution.nextFrame
+                  && arbitgpu::isLinearSceneColor(layer.nativeTextureDescriptor),
+              "Path Trace reaches the compositor as a linear image: " + error);
+    }
+
+    // Raster and Realtime radiance takes the same route, so a material looks alike
+    // in every engine. A data pass stays on the 8-bit route, with no transfer.
+    for (const auto engine : {visualimportedscenerender::RenderEngine::Raster,
+                              visualimportedscenerender::RenderEngine::Realtime})
+    {
+        auto engineRequest = request;
+        engineRequest.glassCaustic.reset();
+        engineRequest.renderEngine = engine;
+        auto enginePlan = plan;
+        enginePlan.operations[1].payloadXml = visualimportedscenerender::encode(engineRequest);
+        auto dataRequest = engineRequest;
+        dataRequest.imageOutput = renderpassoutput::Output::Motion;
+        auto dataPlan = plan;
+        dataPlan.operations[1].payloadXml = visualimportedscenerender::encode(dataRequest);
+        FakeExecution engineExecution;
+        engineExecution.nextFrame->rawPasses = true;
+        VisualImportedScenePlanCache engineCache;
+        for (const auto use : {NativeImportedSceneRenderUse::Preview, NativeImportedSceneRenderUse::Export})
+        {
+            videorender::LayerDesc colorLayer;
+            std::vector<FakeReceipt> colorOwners;
+            const auto colorResult = prepareVisualImportedSceneLayerAtTime({enginePlan}, 8, 640, 360, 1.25, 24,
+                use, &engineExecution, &engineCache, colorLayer, colorOwners, error, nullptr, {12,34});
+            check(colorResult == VisualImportedScenePreparation::rendered
+                      && engineExecution.lastRequest.runtimeInputs.linearColor
+                      && colorLayer.nativeLinearImage == engineExecution.nextFrame
+                      && arbitgpu::isLinearSceneColor(colorLayer.nativeTextureDescriptor),
+                  "scene radiance reaches the compositor as a linear image: " + error);
+            VisualImportedScenePlanCache dataCache;
+            videorender::LayerDesc dataLayer;
+            std::vector<FakeReceipt> dataOwners;
+            const auto dataResult = prepareVisualImportedSceneLayerAtTime({dataPlan}, 8, 640, 360, 1.25, 24,
+                use, &engineExecution, &dataCache, dataLayer, dataOwners, error, nullptr, {12,34});
+            check(dataResult == VisualImportedScenePreparation::rendered
+                      && !engineExecution.lastRequest.runtimeInputs.linearColor
+                      && !dataLayer.nativeLinearImage
+                      && !arbitgpu::isLinearSceneColor(dataLayer.nativeTextureDescriptor),
+                  "a data pass stays unencoded on the 8-bit route: " + error);
+        }
+    }
+
+    // AgX travels on the layer to the one display conversion. A composite converts
+    // once, a second pass over its output finds nothing linear left, and HDR capture
+    // keeps the scene-linear frame without calling the conversion at all.
+    auto agxRequest = tracedRequest;
+    agxRequest.viewTransform = visualimportedscenerender::ViewTransform::AgX;
+    auto agxPlan = tracedPlan;
+    agxPlan.operations[1].payloadXml = visualimportedscenerender::encode(agxRequest);
+    auto agxDisplay = std::make_shared<FakeFrame>();
+    agxDisplay->image = 91;
+    agxDisplay->view = 92;
+    for (const auto use : {NativeImportedSceneRenderUse::Preview, NativeImportedSceneRenderUse::Export})
+    {
+        videorender::LayerDesc layer;
+        std::vector<FakeReceipt> owners;
+        VisualImportedScenePlanCache agxCache;
+        const auto result = prepareVisualImportedSceneLayerAtTime({agxPlan}, 8, 640, 360, 1.25, 24,
+            use, &tracedExecution, &agxCache, layer, owners, error, nullptr, {12,34});
+        check(result == VisualImportedScenePreparation::rendered
+                  && layer.nativeLinearViewTransform == colortransform::ToneMap::AgX,
+              "the AgX choice reaches the layer on preview and export: " + error);
+        int conversions = 0;
+        colortransform::ToneMap seen = colortransform::ToneMap::None;
+        const auto convert = [&](const auto&, colortransform::ToneMap transform, std::string&)
+            -> std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>
+        {
+            ++conversions;
+            seen = transform;
+            return arbitgpu::declaredSrgbMaterialFrame(agxDisplay);
+        };
+        videorender::SdrNativeImageLayers sdr;
+        std::string routeError;
+        check(sdr.prepare(&layer, 1, false, convert, routeError) && conversions == 1
+                  && seen == colortransform::ToneMap::AgX && !sdr.layers[0].nativeLinearImage
+                  && arbitgpu::materialFrameIsSrgb(sdr.layers[0].nativeTextureDescriptor),
+              "SDR composition runs the view transform and sRGB encode once: " + routeError);
+        videorender::SdrNativeImageLayers again;
+        check(again.prepare(sdr.layers.data(), 1, false, convert, routeError) && conversions == 1
+                  && again.layers.empty(),
+              "an already encoded layer is not encoded again: " + routeError);
+        videorender::SdrNativeImageLayers hdr;
+        check(hdr.prepare(&layer, 1, true, convert, routeError) && conversions == 1
+                  && hdr.layers[0].nativeLinearImage == layer.nativeLinearImage
+                  && arbitgpu::isLinearSceneColor(hdr.layers[0].nativeTextureDescriptor),
+              "HDR capture stays scene-linear with AgX selected: " + routeError);
     }
 }
 
@@ -5022,22 +5337,25 @@ void testImportedSolidComposition()
     auto bodylessBox=p; bodylessBox.bodyShape=2;
     refuse(current,bodylessBox,solids,"an oriented box without static body Geometry refuses before composition");
     auto full=std::make_shared<Visual3DScene>(*current);
-    while (full->objectCount<Visual3DScene::kMaxObjects) {
+    while (full->objectCount<Visual3DScene::kInitialObjects) {
         auto object=full->objects[1]; object.id={static_cast<std::uint32_t>(100+full->objectCount)};
         full->objects[full->objectCount++]=object;
     }
-    refuse(full,p,solids,"remaining object capacity refuses without raising the 64-object cap");
+    const auto grows=[&](std::shared_ptr<const Visual3DScene> candidate,const char* message) {
+        check(bool(appendParticleSolidsToScene(candidate,*request->sceneSnapshot,*request->timelineGeometry,p,solids,90,error)),message);
+    };
+    grows(full,"a scene at the former 64-object cap still takes the solids");
     auto materialFull=std::make_shared<Visual3DScene>(*current);
-    while (materialFull->materialCount<Visual3DScene::kMaxMaterials) {
+    while (materialFull->materialCount<Visual3DScene::kInitialMaterials) {
         auto material=materialFull->materials[0]; material.id={static_cast<std::uint32_t>(100+materialFull->materialCount)};
         materialFull->materials[materialFull->materialCount++]=material;
     }
-    refuse(materialFull,p,solids,"remaining material capacity refuses before native preparation");
-    auto vertexFull=std::make_shared<Visual3DScene>(*current); vertexFull->vertexCount=Visual3DScene::kMaxVertices;
-    refuse(vertexFull,p,solids,"remaining vertex capacity refuses before native preparation");
+    grows(materialFull,"a scene at the former 32-material cap still takes the solids");
+    auto vertexFull=std::make_shared<Visual3DScene>(*current); vertexFull->vertexCount=Visual3DScene::kInitialVertices;
+    grows(vertexFull,"a scene at the former 4096-vertex cap still takes the solids");
     auto indexFull=std::make_shared<Visual3DScene>(*current);
-    while (indexFull->indexCount<Visual3DScene::kMaxIndices) indexFull->indices[indexFull->indexCount++]=0;
-    refuse(indexFull,p,solids,"remaining index capacity refuses before native preparation");
+    while (indexFull->indexCount<Visual3DScene::kInitialIndices) indexFull->indices[indexFull->indexCount++]=0;
+    grows(indexFull,"a scene at the former 12288-index cap still takes the solids");
 
     auto plan=composedScenePlan();
     plan.nodeIds={6,11,90,91,92};
@@ -5315,6 +5633,24 @@ void testImportedSolidComposition()
         "late clip body clock refuses before replacing the prior coupled layer");
 }
 
+// The helper only ever sees the scene as the wire gives it, so production tests
+// admit that scene. The fixture also sets a field outside the active camera range.
+// The wire drops it by design, and that gets its own check here.
+std::optional<timelinefamilyfixture::Source> wireSource(std::optional<timelinefamilyfixture::Source> source)
+{
+    if (!source) return source;
+    const auto bytes = sceneaov::detail::encodeScene(*source->scene);
+    auto scene = std::make_shared<HarmonicMIDI::grid::Visual3DScene>();
+    const bool decoded = sceneaov::detail::decodeScene(bytes,*scene);
+    check(decoded && source->scene->cameras.back().farPlane == 77
+        && scene->cameras.back().farPlane == HarmonicMIDI::grid::SceneCameraRecord{}.farPlane
+        && sceneaov::detail::encodeScene(*scene) == bytes,
+        "the wire drops declared fields outside active ranges and keeps every active byte");
+    if (!decoded) return std::nullopt;
+    source->scene = std::move(scene);
+    return source;
+}
+
 void testTimelineFamilyTransport()
 {
     using namespace videowire::geometry;
@@ -5446,17 +5782,11 @@ void testTimelineFamilyTransport()
     wrong=family; wrong.timelineGeometryFamily.resize(1);
     check(refuseRequest(wrong) && refuseWire(wire(wrong.timelineGeometryFamily,oldV8)),"a one-child family refuses in favor of old V14");
     wrong=family; wrong.timelineGeometryFamily.resize(65,source->bindings[0]);
-    check(refuseRequest(wrong) && refuseWire(wire(wrong.timelineGeometryFamily,oldV8)),"family count above 64 refuses before record allocation");
-    wrong=family; wrong.timelineGeometryFamily[0].loweredPlan.resize(kMaximumTimelineScenePlanBytes+2,'0');
-    check(refuseRequest(wrong) && refuseWire(wire(wrong.timelineGeometryFamily,oldV8)),"oversized child text refuses without replacing output");
-    wrong=family;
-    for (auto& binding : wrong.timelineGeometryFamily) binding.loweredPlan.resize(kMaximumTimelineScenePlanBytes/2+2,'0');
-    check(refuseRequest(wrong) && refuseWire(wire(wrong.timelineGeometryFamily,oldV8)),"aggregate text and decoded byte capacity is checked before any child decode");
+    check(refuseRequest(wrong) && refuseWire(wire(wrong.timelineGeometryFamily,oldV8)),"duplicate family objects refuse");
     check(refuseWire(encoded.substr(0,encoded.size()-1)) && refuseWire(encoded+"extra")
         && refuseWire(wire(source->bindings,encoded)),"truncated, trailing and recursively nested families preserve output");
     // Add real identity Transform Geometry operations to both admitted sources.
-    // Each source is valid on its own. Together their actual 130 operations
-    // exceed the family bound before runtime descriptor allocation.
+    // Each source passes the former 128-operation limit on a child.
     auto crowded=source->bindings;
     PortContract contract; contract.carrier=CarrierKind::geometry3D;
     contract.maxVertices=4096; contract.maxIndices=12288;
@@ -5464,17 +5794,23 @@ void testTimelineFamilyTransport()
         const auto admitted=decodeTimelineScenePlan(crowded[i],error);
         if (!admitted) { check(false,"aggregate fixture retains genuine timeline admission"); return; }
         auto value=admitted->descriptor();
-        while (value.operations.size()<65) {
+        while (value.operations.size()<130) {
             const auto transformed=lowerTransformGeometry(value,20000+i*100+value.operations.size(),Transform{},contract,error);
             if (!transformed) { check(false,"aggregate fixture lowers real identity transforms: "+error); return; }
             value=*transformed;
         }
         const auto final=admitValue(value,contract,error);
-        if (!final) { check(false,"each 65-operation source independently admits: "+error); return; }
+        if (!final) { check(false,"each 130-operation source independently admits: "+error); return; }
         crowded[i].loweredPlan=encodeLoweredPlanText(lowerRuntimePlan(contract,*final));
     }
     wrong=family; wrong.timelineGeometryFamily=crowded;
-    check(refuseRequest(wrong) && refuseWire(wire(crowded,oldV8)),"130 genuine operations refuse the aggregate 128-operation budget");
+    visualimportedscenerender::Request crowdedDecoded;
+    check(visualimportedscenerender::valid(wrong)
+        && visualimportedscenerender::decode(visualimportedscenerender::encode(wrong),crowdedDecoded)
+        && crowdedDecoded.timelineGeometryFamily.size()==2
+        && crowdedDecoded.timelineGeometryFamily[0].loweredPlan==crowded[0].loweredPlan
+        && crowdedDecoded.timelineGeometryFamily[1].loweredPlan==crowded[1].loweredPlan,
+        "two 130-operation children admit past the former 128-operation limit and survive the wire");
     visualimportedscenerender::detail::TimelineFamilyCodecEnvelope envelope;
     check(visualimportedscenerender::detail::timelineFamilyEnvelope(source->bindings,1,composedBytes.size(),envelope)
         && envelope.familyValidationPasses==10 && envelope.planDecodeCalls==20
@@ -5571,7 +5907,7 @@ void testTimelineFamilyProductionDispatch()
     using namespace videohelper::importedscene;
     using namespace videohelper::geometry;
     std::string error;
-    const auto source = timelinefamilyfixture::source(error);
+    const auto source = wireSource(timelinefamilyfixture::source(error));
     {
         const bool conditionOk = bool(source);
         check(conditionOk, "production family has two genuine independent timeline children: " + error);
@@ -5739,7 +6075,7 @@ void testTimelineFamilySolidComposition()
     using namespace videowire::geometry;
     using namespace videorender;
     std::string error;
-    const auto source = timelinefamilyfixture::source(error);
+    const auto source = wireSource(timelinefamilyfixture::source(error));
     {
         const bool conditionOk = bool(source);
         check(conditionOk, "family Solid fixture has two independent animated children: " + error);
@@ -6135,7 +6471,7 @@ void testTimelineFamilyWaterProductionDispatch()
     using namespace videohelper::importedscene;
     using namespace videohelper::geometry;
     std::string error;
-    const auto source = timelinefamilyfixture::source(error,0.5,true);
+    const auto source = wireSource(timelinefamilyfixture::source(error,0.5,true));
     {
         const bool conditionOk = bool(source);
         check(conditionOk, "production Water family has distinct released grids and gains: " + error);
@@ -6223,11 +6559,16 @@ void testTimelineFamilyWaterProductionDispatch()
     frameRefusal(current,staleHistory,dt);
     frameRefusal({},history,dt);
     frameRefusal(current,{},dt);
-    check(geometryCache.familyEvaluationLimits.maxWaterIdentityVisits == 10000000
-        && geometryCache.familyEvaluationLimits.maxWaterRestPositionVisits == 10000000
-        && geometryCache.familyEvaluationLimits.maxWaterMemoCopyElements == 10000000
-        && geometryCache.familyEvaluationLimits.maxWaterColumnDiscoveryVisits == 10000000,
-        "production sets four finite logical pass allowances instead of compatibility-unbounded defaults");
+    constexpr auto unlimitedVisits = std::numeric_limits<std::size_t>::max();
+    constexpr auto unlimitedWork = std::numeric_limits<std::uint64_t>::max();
+    const auto& waterSourceLimits = geometryCache.familyEvaluationLimits.waterSource;
+    check(geometryCache.familyEvaluationLimits.maxWaterIdentityVisits == unlimitedVisits
+        && geometryCache.familyEvaluationLimits.maxWaterRestPositionVisits == unlimitedVisits
+        && geometryCache.familyEvaluationLimits.maxWaterMemoCopyElements == unlimitedVisits
+        && geometryCache.familyEvaluationLimits.maxWaterColumnDiscoveryVisits == unlimitedVisits
+        && std::all_of(waterSourceLimits.work.begin(), waterSourceLimits.work.end(), [] (auto limit) { return limit == unlimitedWork; })
+        && std::all_of(waterSourceLimits.logicalBytes.begin(), waterSourceLimits.logicalBytes.end(), [] (auto limit) { return limit == unlimitedWork; }),
+        "production sets no Water visit, source work or source byte ceiling");
     const std::pair<std::size_t timelineevaluation::Limits::*,std::size_t> shortages[] = {
         {&timelineevaluation::Limits::maxWaterIdentityVisits,99},
         {&timelineevaluation::Limits::maxWaterRestPositionVisits,15},
@@ -6269,7 +6610,7 @@ void testTimelineFamilyWaterProductionDispatch()
         auto coupledRequest = familyProductionRequest(*coupled); coupledRequest.structuralRevision = 10; coupledRequest.evaluationRevision = 18;
         refusal(familyProductionPlan(coupledRequest),"independently owned child frames");
     }
-    const auto audioSource = timelinefamilyfixture::source(error,0.5,true,1,1);
+    const auto audioSource = wireSource(timelinefamilyfixture::source(error,0.5,true,1,1));
     check(bool(audioSource),"second-child failure uses real positive-audio Water lowering");
     if (audioSource)
     {
@@ -6569,6 +6910,7 @@ void testMultiLeafComposition()
         auto composed = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*composedScene());
         // As in importedOverrideComposedScene, each target material owns the
         // imported base color texture its override samples.
+        addImportedBaseColorTexture(*composed);
         composed->materials[0].baseColorTexture.value = 1;
         composed->materials[1].baseColorTexture.value = 1;
         geometrysurfacematerial::ObjectPrograms programs;
@@ -7173,6 +7515,7 @@ int main(int argc, char** argv)
     testImportedSceneCompositionHandoff();
     testImportedSurfaceOverrideBesideProceduralPrograms();
     testImportedSurfaceOverrideReachesCompositionExecutor();
+    testRenderModeReachesPreviewAndExport();
     testImportedSceneCompositionGeneratedIdentities();
     testUnsupportedObjectLocalRefusal();
     testMultiLeafComposition();
@@ -7400,6 +7743,7 @@ int main(int argc, char** argv)
             {
                 const bool conditionOk = prepareVisualImportedSceneLayer({ plan }, 7, 640, 360, use, &native, layer, owners, error)
                 == VisualImportedScenePreparation::rendered && native.lastRequest.runtimeInputs.passComposite
+                && !native.lastRequest.runtimeInputs.linearColor
                 && renderpasscomposite::encode(*native.lastRequest.runtimeInputs.passComposite) == renderpasscomposite::encode(parameters);
                 check(conditionOk, "preview and export forward identical raw-pass composite parameters: " + error);
             }
@@ -7485,7 +7829,8 @@ int main(int argc, char** argv)
                 {
                     const bool conditionOk = prepareVisualImportedSceneLayer({branched}, 7, 640, 360, use,
                     &native, layer, owners, error) == VisualImportedScenePreparation::rendered
-                    && native.lastRequest.runtimeInputs.passProgram.has_value();
+                    && native.lastRequest.runtimeInputs.passProgram.has_value()
+                    && !native.lastRequest.runtimeInputs.linearColor;
                     check(conditionOk, "preview and export carry the same retained branch program: " + error);
                 }
                 if (native.lastRequest.runtimeInputs.passProgram)
@@ -7610,8 +7955,10 @@ int main(int argc, char** argv)
         check(!visualimportedscenerender::decode(prefix + bytes, reopened),
             "imported-light envelopes cannot recurse");
         auto bad = authored;
-        bad.importedLights.intensityMultipliers[1] = 65;
-        check(visualimportedscenerender::encode(bad).empty(), "out-of-bound authored multiplier rejects");
+        bad.importedLights.intensityMultipliers[1] = 1.0e30f;
+        check(!visualimportedscenerender::encode(bad).empty(), "a multiplier past the knob keeps its value");
+        bad.importedLights.intensityMultipliers[1] = std::numeric_limits<float>::infinity();
+        check(visualimportedscenerender::encode(bad).empty(), "a non-finite authored multiplier rejects");
         bad = authored;
         bad.sceneSnapshot = composedScene();
         check(visualimportedscenerender::encode(bad).empty(), "imported definitions cannot attach to an unrelated composed scene");
@@ -7962,6 +8309,51 @@ int main(int argc, char** argv)
               && visualimportedscenerender::sameRequest(exactVertexRequest, decodedVertex)
               && visualimportedscenerender::encode(decodedVertex) == vertexEncoded,
           "the v4 material and vertex request has one canonical exact round trip");
+    // A modifier is as large as its node graph lowers to. This wire is over the 128 KiB
+    // that used to refuse it, with a record count the balanced tree keeps within depth.
+    auto largeVertexRequest = renderRequest(true, true);
+    {
+        using Operation = videowire::VertexModifierOperation;
+        videowire::VertexModifierIr vertex;
+        videowire::VertexModifierStableId nextId = 1000;
+        const auto append = [&vertex, &nextId](Operation operation,
+                                               std::initializer_list<videowire::VertexModifierStableId> inputs,
+                                               std::initializer_list<double> parameters)
+        {
+            const auto schema = videowire::vertexModifierOperationSchema(operation);
+            videowire::VertexModifierRecord record;
+            record.stableId = nextId++;
+            record.operation = operation;
+            record.resultType = schema.resultType;
+            record.inputCount = schema.inputCount;
+            record.parameterCount = schema.parameterCount;
+            std::copy(inputs.begin(), inputs.end(), record.inputs.begin());
+            std::copy(parameters.begin(), parameters.end(), record.parameters.begin());
+            vertex.records.push_back(record);
+            return record.stableId;
+        };
+        const auto position = append(Operation::importedPosition, {}, {});
+        std::vector<videowire::VertexModifierStableId> level;
+        for (int leaf = 0; leaf < 2000; ++leaf)
+            level.push_back(append(Operation::vec3Constant, {}, { 0.0, 0.25, -0.0 }));
+        while (level.size() > 1)
+        {
+            std::vector<videowire::VertexModifierStableId> next;
+            for (std::size_t i = 0; i < level.size(); i += 2)
+                next.push_back(i + 1 == level.size() ? level[i]
+                                                     : append(Operation::vec3Add, { level[i], level[i + 1] }, {}));
+            level = std::move(next);
+        }
+        vertex.rootId = nextId;
+        append(Operation::boundedDisplacementOutput, { position, level.front() }, { 0.5 });
+        largeVertexRequest.material->vertexModifier = std::move(vertex);
+    }
+    const auto largeVertexEncoded = visualimportedscenerender::encode(largeVertexRequest);
+    visualimportedscenerender::Request decodedLargeVertex;
+    check(largeVertexEncoded.size() > visualimportedscenerender::kMaximumV4EncodedBytes
+              && visualimportedscenerender::decode(largeVertexEncoded, decodedLargeVertex)
+              && visualimportedscenerender::sameRequest(largeVertexRequest, decodedLargeVertex),
+          "a vertex modifier above 128 KiB of wire keeps its exact round trip");
     check(decodedVertex.material && decodedVertex.material->vertexModifier
               && decodedVertex.material->vertexModifier->rootId == 103
               && floatBits(static_cast<float>(
@@ -7990,11 +8382,29 @@ int main(int argc, char** argv)
               && decodedForeignOwner.material
               && decodedForeignOwner.material->sceneSnapshot == nullptr,
           "material transport excludes rather than serializes a scene snapshot owner");
-    auto tooManyOperations = exactMaterialRequest;
-    tooManyOperations.material->program.operations.resize(
-        surfacematerial::kMaximumOperations + 1u);
-    check(visualimportedscenerender::encode(tooManyOperations).empty(),
-          "material transport rejects an oversized operation count");
+    videowire::VertexModifierIr deepVertex;
+    deepVertex.rootId = 200000;
+    const auto deepSchema = [](videowire::VertexModifierOperation operation, videowire::VertexModifierStableId id)
+    {
+        const auto schema = videowire::vertexModifierOperationSchema(operation);
+        videowire::VertexModifierRecord record;
+        record.stableId = id; record.operation = operation; record.resultType = schema.resultType;
+        record.inputCount = schema.inputCount; record.parameterCount = schema.parameterCount;
+        return record;
+    };
+    deepVertex.records.push_back(deepSchema(videowire::VertexModifierOperation::importedPosition, 1));
+    deepVertex.records.push_back(deepSchema(videowire::VertexModifierOperation::vec3Constant, 2));
+    for (videowire::VertexModifierStableId id = 3; id <= 200000; ++id)
+    {
+        auto record = deepSchema(id == 200000 ? videowire::VertexModifierOperation::boundedDisplacementOutput
+                                              : videowire::VertexModifierOperation::vec3Add, id);
+        record.inputs[0] = id == 200000 ? 1 : id == 3 ? 2 : id - 1;
+        record.inputs[1] = id == 200000 ? id - 1 : 2;
+        if (id == 200000) record.parameters[0] = 0.5;
+        deepVertex.records.push_back(record);
+    }
+    check(visualimportedscenerender::detail::validVertexModifier(deepVertex),
+          "the transport walks a long vertex chain with an explicit stack");
     auto tooManyTextures = exactMaterialRequest;
     tooManyTextures.material->binding.textures.resize(
         surfacematerialbinding::kMaximumTextureBindings + 1u);
@@ -8086,11 +8496,13 @@ int main(int argc, char** argv)
                     && arbitgpu::isLinearSceneColor(hdrLayer.nativeTextureDescriptor);
                     check(conditionOk, "imported/generated reopened plans retain explicit linear native preview/export color: " + error);
                 }
+                hdrExecution.frameFollowsRequest = false;
                 hdrExecution.nextFrame->linearColor = false;
                 check(prepareVisualImportedSceneLayerAtTime(hdrPlans, hdrPlan.clipId, 640, 360, 0, 24,
                     use, &hdrExecution, &reopened, hdrLayer, owners, error, nullptr, {}, nullptr, true)
                         == VisualImportedScenePreparation::rejected,
                     "HDR scene preparation rejects an SDR attachment from the native executor");
+                hdrExecution.frameFollowsRequest = true;
                 hdrExecution.nextFrame->linearColor = true;
             }
         }
@@ -8157,8 +8569,6 @@ int main(int argc, char** argv)
                 "timeline plan cannot bind the static cube's different mesh");
             wrong = *fixture; wrong.timelineGeometry->loweredPlan[0] = 'g';
             check(!visualimportedscenerender::valid(wrong), "timeline binding rejects malformed plan hex");
-            wrong = *fixture; wrong.timelineGeometry->loweredPlan.assign(videowire::geometry::kMaximumTimelineScenePlanBytes + 1, '0');
-            check(!visualimportedscenerender::valid(wrong), "timeline binding rejects an oversized lowered plan before decoding");
             check(!visualimportedscenerender::decode(encoded + "extra", decoded), "V14 rejects trailing bytes");
             auto shared = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*fixture->sceneSnapshot);
             shared->objects[1].firstVertex = shared->objects[0].firstVertex;
@@ -9028,16 +9438,26 @@ int main(int argc, char** argv)
                              execution.lastRequest.runtimeInputs.vertexSpectrum.end(),
                              [](float value) { return value == 0.0f; }),
               "missing audio keeps the imported vertex graph silent");
-        auto motionVertexPlan = vertexPlan;
-        for (auto& operation : motionVertexPlan.operations)
-            if (operation.kind == visualimportedscenerender::kRenderNodeKind)
-            {
-                visualimportedscenerender::Request motionRequest;
-                check(visualimportedscenerender::decode(operation.payloadXml, motionRequest),
-                    "vertex motion fixture decodes");
-                motionRequest.imageOutput = renderpassoutput::Output::Motion;
-                operation.payloadXml = visualimportedscenerender::encode(motionRequest);
-            }
+        const auto selectMotion = [](videowire::CompiledVisualLayerPlan motionPlan)
+        {
+            for (auto& operation : motionPlan.operations)
+                if (operation.kind == visualimportedscenerender::kRenderNodeKind)
+                {
+                    visualimportedscenerender::Request motionRequest;
+                    check(visualimportedscenerender::decode(operation.payloadXml, motionRequest),
+                        "vertex motion fixture decodes");
+                    motionRequest.imageOutput = renderpassoutput::Output::Motion;
+                    operation.payloadXml = visualimportedscenerender::encode(motionRequest);
+                }
+            return motionPlan;
+        };
+        const auto motionVertexPlan = selectMotion(importedVertexPlan(false));
+        check(prepareVisualImportedSceneLayerAtTime(
+            {selectMotion(vertexPlan)}, 7, 640, 360, 0.5, 60.0, NativeImportedSceneRenderUse::Preview,
+            &execution, &vertexCache, vertexLayer, vertexOwners, error)
+                == VisualImportedScenePreparation::rejected
+              && error.find("prior normals") != std::string::npos,
+              "Motion names the missing prior normals for a Normal-reading program over a skinned pose");
         for (const auto use : {NativeImportedSceneRenderUse::Preview, NativeImportedSceneRenderUse::Export})
             {
                 const bool conditionOk = prepareVisualImportedSceneLayerAtTime(

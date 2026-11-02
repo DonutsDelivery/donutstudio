@@ -117,6 +117,8 @@ struct ViewportInfo
     // clip that plan belongs to. Empty and -1 while frames render.
     std::string planError;
     int planErrorClipId = -1;
+    // Notes and links the latest frame's score left out. The frame still renders.
+    std::string scoreDropWarning;
     // True while the latest frame holds on an imported scene Preview that is still compiling.
     bool importedScenePending = false;
     uint64_t fallbackCount = 0;
@@ -179,6 +181,10 @@ struct ViewportInfo
     // more: that step and its age. rendererError carries the same stall.
     std::string stalledStep;
     double stalledStepMs = 0.0;
+    // A kernel compile, not a stall, accounts for the current step's age.
+    bool kernelCompiling = false;
+    bool kernelCancellable = false;
+    bool kernelBuildStopped = false;
     // How long the last close waited for the render thread to stop, and the
     // step it was in when the close began. A long wait delays the next open,
     // because RPCs run one at a time.
@@ -356,6 +362,8 @@ public:
     std::string setCanvas (int width, int height);
     void setCanvasFrameEnabled (bool enabled) { canvasFrameEnabled_ = enabled; }
     std::string setView (double zoom, double panX, double panY);
+    // Renders the imported 3D scene at the full canvas instead of the panel size.
+    void setFullCanvasScene (bool enabled);
 
     // Project canvas background colour (viewport_set_canvas_background) + the
     // bloom/tonemap post stack (viewport_set_post). Both are FRAME-GLOBAL render
@@ -488,6 +496,7 @@ private:
     int canvasW_ = 0, canvasH_ = 0;
     uint64_t canvasGeneration_ = 0;
     std::atomic<bool> canvasFrameEnabled_ { true };
+    std::atomic<bool> fullCanvasScene_ { false };
     std::atomic<double> viewZoom_ { 1.0 }, viewPanX_ { 0.0 }, viewPanY_ { 0.0 };
 
     // Frame-global render settings mirrored from the export job for preview ==
@@ -511,4 +520,17 @@ private:
     // Realtime interpolation resolution cap (long side, px); see
     // setInterpMaxLongSide. 0 ⇒ engine default 360p clamp.
     std::atomic<int> interpMaxLongSide_ { 0 };
+
+    // The published preview audio mix, mirrored OUTSIDE Impl (which close()
+    // resets) so a close/reopen — device fallback, dock switch, helper replay —
+    // reseeds the new Impl with the mix the plugin already knows is current.
+    // Without the carry the reopened viewport starts empty while the plugin's
+    // baked/ready state says nothing more is owed, and the stopped-spectrum
+    // gates wait for a re-bake that alreadyReady never schedules.
+    void seedImplPreviewMix();
+    mutable std::mutex previewMixCarryMutex_;
+    std::vector<arbitblockb::FeatureFrame> carriedPreviewMixFeats_;
+    std::shared_ptr<const videohelper::AnalysisSources> carriedPreviewSourceFeats_;
+    double carriedPreviewMixSr_ = 0.0;
+    uint64_t carriedPreviewMixGeneration_ = 0;
 };

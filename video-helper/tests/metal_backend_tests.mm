@@ -516,17 +516,6 @@ bool verifyMetalTextFrames()
         const auto refused=arbitgpu::nativeSdfExecutionBackend().render(invalid);
         if(refused.rendered||refused.frame||refused.error.empty())return false;
     }
-    for(const auto extent : {std::array<std::uint32_t,2>{1920,1080},{3840,2160}})
-    {
-        auto full=base; full.width=extent[0]; full.height=extent[1];
-        full.maximumSteps=128; full.output=arbitgpu::NativeSdfOutput::color;
-        const auto started=std::chrono::steady_clock::now();
-        const auto refused=arbitgpu::nativeSdfExecutionBackend().render(full);
-        const auto seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
-        std::printf("Metal SDF text %ux%u admission refusal seconds=%.6f, no rendered timing receipt\n",
-            full.width,full.height,seconds);
-        if(refused.rendered||refused.frame||refused.error!="SDF text evaluation work capacity exceeded")return false;
-    }
     for(unsigned output=0;output<static_cast<unsigned>(arbitgpu::NativeSdfOutput::count);++output)
     {
         auto diagnostic=base; diagnostic.width=diagnostic.height=17;

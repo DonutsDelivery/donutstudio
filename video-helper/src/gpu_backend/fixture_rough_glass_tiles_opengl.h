@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fixture_rough_glass_tiles.h"
+#include "fixture_gpu_test_pacing.h"
 #include "../gl_loader.h"
 #include <new>
 
@@ -12,14 +13,19 @@ bool readOpenGlRoughGlassTileSummaryForFixture(const NativeFixtureSceneFrame&,
 
 namespace roughglasstiles::opengl
 {
-inline bool completeSubmission(const arbitgl::GlFuncs& gl,std::string& error)
+// held, when given, gets how long the wait took, before any test run's yield.
+inline bool completeSubmission(const arbitgl::GlFuncs& gl,std::string& error,std::chrono::nanoseconds* held=nullptr)
 {
+    const auto started=std::chrono::steady_clock::now();
     const auto fence=gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
     if(!fence) {error="OpenGL rough tile completion fence allocation failed";return false;}
     const auto status=gl.ClientWaitSync(fence,GL_SYNC_FLUSH_COMMANDS_BIT,30000000000ull);
     gl.DeleteSync(fence);
     if((status!=GL_ALREADY_SIGNALED&&status!=GL_CONDITION_SATISFIED)||glGetError()!=GL_NO_ERROR)
     {error="OpenGL rough tile submission did not complete successfully";return false;}
+    const std::chrono::nanoseconds elapsed=std::chrono::steady_clock::now()-started;
+    if(held)*held=elapsed;
+    testpacing::afterSubmission(elapsed);
     return true;
 }
 // Native readback of one completed attachment region. Its pixel coordinates

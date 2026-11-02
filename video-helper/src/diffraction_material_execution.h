@@ -15,7 +15,6 @@ namespace diffractionmaterial
 namespace physicalcheckpoint
 {
 inline constexpr float kDirectionTolerance = 1.0e-4f;
-inline constexpr float kMaximumSpectralRadiance = 16.0f;
 inline constexpr float kMaximumSinusoidalPhaseArgument = 4.0f;
 inline constexpr auto kWavelengths = kProductionWavelengthsNanometres;
 
@@ -93,8 +92,7 @@ inline bool validate(const AdmittedDiffractionMaterialIR& material,
     }
     for (const auto radiance : light.radiance)
     {
-        if (!std::isfinite(radiance) || radiance < 0.0f
-            || radiance > kMaximumSpectralRadiance)
+        if (!std::isfinite(radiance) || radiance < 0.0f)
         {
             error = prefix + " incident spectrum is invalid";
             return false;
@@ -129,7 +127,8 @@ inline PhysicalDiffractionGpuParameters makeGpuParameters(
     };
     parameters.control = {
         static_cast<float>(description.spectrum.lastOrder),
-        static_cast<float>(description.microstructure.profile), 0.0f,
+        static_cast<float>(description.microstructure.profile),
+        description.geometry.thirdGrooveFamily ? 1.0f : 0.0f,
         static_cast<float>(description.coating.model)
     };
     parameters.incident = {
@@ -142,7 +141,8 @@ inline PhysicalDiffractionGpuParameters makeGpuParameters(
     };
     parameters.roughness = {
         description.roughness.rmsHeightNanometres,
-        description.roughness.rmsSlope, 0.0f, 0.0f
+        description.roughness.rmsSlope, description.roughness.streakSlope,
+        description.roughness.streakSlope > 0.0f ? description.roughness.streakSpacingUv : 0.0f
     };
     parameters.grooveField = {
         static_cast<float>(description.grooveField.mode),

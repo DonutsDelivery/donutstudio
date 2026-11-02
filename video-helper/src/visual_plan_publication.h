@@ -105,7 +105,7 @@ inline bool makeVisualPlanExecutionSnapshot (
     bool containLayerFailures = false)
 {
     auto candidate = std::make_shared<VisualPlanExecutionSnapshot>(
-        normalizedVisualLayerPlans(plans));
+        normalizedVisualLayerPlans(std::move(plans)));
     if (telemetryOwner != nullptr) candidate->state.setTelemetryOwner(*telemetryOwner);
     candidate->state.containLayerLoweringFailures(containLayerFailures);
     diagnostic.clear();

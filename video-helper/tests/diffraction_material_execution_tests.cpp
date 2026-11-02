@@ -461,6 +461,22 @@ int main()
               && !arbitgpu::nativeFixtureDiffractionBandSchedule(card, 4097, 2160, true, bands),
           "band admission keeps the fixture extent bounds");
 
+    // The native program carries a second axis at 60 degrees and the third family,
+    // and still refuses a parallel axis.
+    const auto hexagonal = admit(makeHexagonalGratingPreset(), error);
+    check(bool(hexagonal), "the hexagonal lattice admits");
+    if (hexagonal)
+    {
+        auto hexagonalParameters = physicalcheckpoint::makeGpuParameters(*hexagonal, light);
+        check(hexagonalParameters.control.z == 1.0f
+                  && arbitgpu::validNativeFixtureDiffractionParameters(hexagonalParameters),
+              "the native program admits the hexagonal lattice");
+        hexagonalParameters.secondaryGeometry.x = hexagonalParameters.geometry.x;
+        hexagonalParameters.secondaryGeometry.y = hexagonalParameters.geometry.y;
+        check(!arbitgpu::validNativeFixtureDiffractionParameters(hexagonalParameters),
+              "the native program refuses parallel lattice axes");
+    }
+
     auto crossedDescription = makeCrossedTwoDimensionalGratingPreset();
     const auto crossed = admit(crossedDescription, error);
     check(crossed
@@ -615,10 +631,19 @@ int main()
               && error == "physical diffraction test incident spectrum is invalid",
           "nonfinite incident spectra fail before command submission");
     invalidLight = light;
-    invalidLight.radiance[3] = physicalcheckpoint::kMaximumSpectralRadiance + 1.0f;
+    invalidLight.radiance[3] = std::numeric_limits<float>::infinity();
     check(!physicalcheckpoint::validate(*admitted, invalidLight, "test", error)
               && error == "physical diffraction test incident spectrum is invalid",
-          "incident spectra above the hard bound fail before command submission");
+          "infinite incident spectra fail before command submission");
+    invalidLight = light;
+    invalidLight.radiance[3] = -1.0f;
+    check(!physicalcheckpoint::validate(*admitted, invalidLight, "test", error)
+              && error == "physical diffraction test incident spectrum is invalid",
+          "negative incident spectra fail before command submission");
+    auto brightLight = light;
+    brightLight.radiance.fill(24.0f);
+    check(physicalcheckpoint::validate(*admitted, brightLight, "test", error),
+          "the Diffraction Orb's 24 W/(m^2 sr nm), above the removed 16 bound, validates");
 
     const std::array<float, 4> color { 0.2f, 0.1f, 0.4f, 1.0f };
     const std::array<float, 4> energy { 1.0f, 0.8f, 0.3f, 0.2f };

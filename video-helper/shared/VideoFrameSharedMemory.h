@@ -105,6 +105,8 @@ public:
         if (mapping_ == nullptr) return false;
         base_ = MapViewOfFile (mapping_, FILE_MAP_ALL_ACCESS, 0, 0, size_);
         if (base_ == nullptr) { close(); return false; }
+        // The name may reopen a section left by a crashed run.
+        std::memset (base_, 0, size_);
 #else
         const std::string posixName = "/" + name;
         shm_unlink (posixName.c_str()); // stale region from a crashed run
@@ -114,8 +116,9 @@ public:
         base_ = mmap (nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         if (base_ == MAP_FAILED) { base_ = nullptr; close(); return false; }
         owner_ = true;
+        // ftruncate of a new object reads as zeros and commits no pages, so a slot
+        // sized for the largest frame costs only the pixels actually written.
 #endif
-        std::memset (base_, 0, size_);
         auto* h = header();
         h->magic = kMagic;
         h->version = kVersion;

@@ -208,7 +208,7 @@ inline bool check(arbitgpu::NativeFixtureSceneBackend& backend,Visual3DScene aut
         for(std::size_t i=0;i<receipt.size();++i) if(retained[i].bytes!=receipt[i].bytes)
         {error="GL rough water later frame overwrote a retained receipt owner";return false;}
         for(unsigned pass=1;pass<=7;++pass) {
-            auto aovInputs=inputs;aovInputs.imageOutput=static_cast<renderpassoutput::Output>(pass);
+            auto aovInputs=inputs;aovInputs.linearColor=false;aovInputs.imageOutput=static_cast<renderpassoutput::Output>(pass);
             const auto aov=backend.render(snapshot,preparation.resources,extent,extent,aovInputs);
             if(!aov.rendered||!aov.frame||!aov.stats.roughGlassReceiptComplete)
             {error="GL rough water AOV bypassed or refused complete rough energy admission: "+aov.error;return false;}

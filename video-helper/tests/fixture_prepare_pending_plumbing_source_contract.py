@@ -140,7 +140,7 @@ ordered(animated, [
 ], "animated composition preview pending order")
 require(animated, "camera/light composition export render returned pending", "animated composition export refusal")
 ordered(animated, [
-    "sceneRenderer_.renderPreview(scene_, material",
+    "sceneRenderer_.renderPreview(drawnScene, material",
     "if (sceneFrame.pending)",
     "renderPending = true;",
 ], "animated single-leaf preview pending order")

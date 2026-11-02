@@ -3,6 +3,7 @@
 #include "geometry_core_backend.h"
 #include "glb_geometry_core_adapter.h"
 #include "sdf_visual_plan_execution.h"
+#include "support/import_change_pixel_checks.h"
 #include "support/native_scene_orientation_fixture.h"
 #include "support/sdf_display_oracle.h"
 #include "support/typed_scene_pass_product_checks.h"
@@ -628,20 +629,24 @@ bool run(const arbitgl::GlFuncs& gl, std::string& error)
 
 int main(int argc, char** argv)
 {
-    if (argc != 1 && (argc != 3 || std::string(argv[1]) != "--typed-scene-passes"))
-    { std::cerr << "Usage: arbit-native-scene-orientation-gl-tests [--typed-scene-passes fixtures.json]\n"; return 1; }
+    const bool importChangesOnly = argc == 2 && std::string(argv[1]) == "--import-changes";
+    if (argc != 1 && !importChangesOnly && (argc != 3 || std::string(argv[1]) != "--typed-scene-passes"))
+    { std::cerr << "Usage: arbit-native-scene-orientation-gl-tests [--import-changes | --typed-scene-passes fixtures.json]\n"; return 1; }
     if (!glfwInit()) { std::cerr << "SKIP: no native GL display\n"; return 77; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4); glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE); glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     auto* window = glfwCreateWindow(64, 36, "Native scene orientation", nullptr, nullptr);
     if (!window) { glfwTerminate(); std::cerr << "SKIP: no native GL 4.3 context\n"; return 77; }
     glfwMakeContextCurrent(window);
+    std::cout << "GL renderer: " << reinterpret_cast<const char*>(glGetString(GL_RENDERER)) << '\n';
     arbitgl::GlFuncs gl;
     std::string error;
     const bool passed = arbitgl::loadGlFunctions(gl, error)
-        && (argc == 3 ? typedscenepasstests::run(argv[2], gl, error) : run(gl, error));
+        && (argc == 3 ? typedscenepasstests::run(argv[2], gl, error)
+            : (importChangesOnly || run(gl, error)) && importchangepixels::run(error));
     if (!passed) std::cerr << "FAIL: native scene orientation: " << error << '\n';
     else std::cout << (argc == 3 ? "PASS: typed scene graph -> native preparation -> SDR compositor preview/export\n"
+                                : importChangesOnly ? "PASS: import changes reach native frame pixels\n"
                                 : "PASS: native scene/Frame/Geometry Core/SDF preview and export orientation\n");
     arbitgpu::invalidateNativeSdfExecutionContext(reinterpret_cast<std::uintptr_t>(window));
     glfwDestroyWindow(window); glfwTerminate();

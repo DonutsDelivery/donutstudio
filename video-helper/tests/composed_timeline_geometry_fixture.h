@@ -241,7 +241,9 @@ bool verifyNativeDirectionalSurfaceWave(arbitgpu::NativeFixtureSceneBackend& bac
     if (control==4) settings.phaseRadians=1.3;
     if (control==5) settings.loopPeriod=8;
     auto variant=composedTimelineGeometryFixture(error,&settings);
-    auto scene=variant ? evaluateComposedTimelineGeometry(runtime,previewOwner,*variant->timelineGeometry,
+    // Each control is a different plan, and one owner holds one plan.
+    auto controlOwner=previewOwner; controlOwner.planGeneration+=1+control;
+    auto scene=variant ? evaluateComposedTimelineGeometry(runtime,controlOwner,*variant->timelineGeometry,
         variant->sceneSnapshot,0.5,error) : nullptr;
     if (!scene || !verifyDirectionalWaveGeometry(*scene,*variant->sceneSnapshot,settings,0.5,error)) return false;
     const auto rendered=render(scene);

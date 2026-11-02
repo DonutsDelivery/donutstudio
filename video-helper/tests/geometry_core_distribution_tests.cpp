@@ -224,10 +224,11 @@ void densityTransportVersionAndRoundTrip() {
   const auto bytes = encodeRuntimeValue(*admitted);
   check(bytes.size() > 5 && bytes[4] == kPointDensityTransportVersion && bytes[5] == 0,
         "a density distribution is written at transport version 18");
-  check(kPointDensityTransportVersion == kTransportVersion
+  check(kPointDensityTransportVersion < kShadeTransportVersion
+            && kShadeTransportVersion == kTransportVersion
+            && kSubdivisionTransportVersion == kTransportVersion
             && kPointDensityTransportVersion > kCullTransportVersion,
-        "the density version is the current transport version and follows the cull version");
-  auto reopened = decodeRuntimeValue(bytes, pointsContract(), {}, {}, error);
+        "the density version follows the cull version and precedes shade and subdivision at the current transport version");  auto reopened = decodeRuntimeValue(bytes, pointsContract(), {}, {}, error);
   check(reopened.has_value() && encodeRuntimeValue(*reopened) == bytes,
         "a version 18 density distribution roundtrips");
 

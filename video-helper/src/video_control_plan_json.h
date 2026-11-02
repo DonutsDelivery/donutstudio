@@ -74,9 +74,9 @@ inline bool parsePlanJson(const nlohmann::json& value, videocontrol::Plan& desti
             plan.signalWindow.sampleRate = window.value("sampleRate", 0);
             plan.signalWindow.fps = window.value("fps", 0.0);
             plan.signalWindow.frameCount = window.value("frameCount", 0);
-            if (!plan.signalWindow.valid() || value.dump().size() > kMaxSignalPlanBytes)
+            if (!plan.signalWindow.valid())
             {
-                error = "video Signal window identity or 2 MiB plan capacity is invalid";
+                error = "video Signal window identity is invalid";
                 return false;
             }
         }

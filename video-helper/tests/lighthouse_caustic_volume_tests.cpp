@@ -9,6 +9,7 @@
 
 #include "support/glass_caustic_oracle.h"
 #include "../src/gpu_backend/fixture_glass_caustics_opengl.h"
+#include "../src/gpu_backend/fixture_rough_glass_tiles.h"
 #include "../src/gpu_backend/fixture_smooth_glass.h"
 #include "../src/gpu_backend/metal_glass_caustic_consumer.h"
 #include <algorithm>
@@ -388,9 +389,16 @@ void pairedShaderText()
                   && paired.find("return glassSingleTransport(camera,entry,complete,status GX_PASS);") != std::string::npos,
               name + " paired entry points fall back to the released bodies without a partner");
         check(paired.find("for(int visit=0;visit<48;++visit)") != std::string::npos
-                  && paired.find("if(depth>=GLASS_INTERFACE_DEPTH) {status=GLASS_SMOOTH_STATUS_DEPTH;") != std::string::npos
+                  && paired.find("if(depth>=GLASS_INTERFACE_DEPTH) {trapped=true;continue;}") != std::string::npos
+                  && paired.find("GLASS_SMOOTH_STATUS_DEPTH") == std::string::npos
                   && paired.find("if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;") != std::string::npos,
-              name + " the released walks keep their depth and pending refusals; the paired walk has its 48 visit loop");
+              name + " a released walk ends at the depth limit and keeps its pending refusal; the paired walk has its 48 visit loop");
+        // A rough path at the depth limit ends: tail in the single-scatter walk, absorbed in V2.
+        check(occurrences(paired, spell("if(depth>=GLASS_INTERFACE_DEPTH) {tail[channel]+=power;continue;}")) == 0
+                  && occurrences(paired, spell("if(depth>=GLASS_INTERFACE_DEPTH) {masked[channel]+=power;continue;}")) == 2
+                  && occurrences(paired, spell("if(tail[channel]>GLASS_ROUGH_UNRESOLVED)")) == 2
+                  && paired.find("GLASS_ROUGH_STATUS_DEPTH") == std::string::npos,
+              name + " both rough walks end at the depth limit with the power in the receipt");
         // A non-finite final radiance carries a status, not UNCLASSIFIED.
         const auto walkAt = paired.find(spell("vec3 glassPairWalk("));
         const auto walkEnd = paired.find(spell("vec3 thinInterfaceTransport("), walkAt);
@@ -479,7 +487,8 @@ void pairedShaderText()
               + " extra stages; one more declares the fragment uniform within StageBudget::pairedVolume");
 }
 
-// The real lighthouse-and-ocean starter, rebuilt from its authored values:
+// The real Lighthouse Glass Caustics starter (visual.lighthouse-glass-caustics),
+// rebuilt from its authored values:
 // object order water, tower, lantern, glass, rock (ids 101 to 105), a 12 by 12
 // water grid at 0.7 spacing laid flat with evaluated wave normals, three cubes at
 // the starter's sizes and translations, the starter's sphere lens with its scale,
@@ -609,9 +618,10 @@ bool starterIcosphere(Visual3DScene& scene, std::size_t o, float radius, float s
     operation.parameters = {radius, subdivisions, 0, 0};
     geometry::GeometryData mesh;
     std::string error;
-    if (!geometry::materializeMeshGenerator(operation, mesh, Visual3DScene::kMaxVertices, Visual3DScene::kMaxIndices, error)
-        || scene.vertexCount + mesh.positions.size() > Visual3DScene::kMaxVertices
-        || scene.indexCount + mesh.indices.size() > Visual3DScene::kMaxIndices)
+    HarmonicMIDI::grid::Visual3DSceneGrowth growth;
+    if (!geometry::materializeMeshGenerator(operation, mesh, geometry::kMaximumVertices, geometry::kMaximumIndices, error)
+        || (growth.vertices = mesh.positions.size(), growth.indices = mesh.indices.size(),
+            !HarmonicMIDI::grid::growVisual3DScene(scene, growth, error)))
     { check(false, "icosphere generator: " + error); return false; }
     auto& object = scene.objects[o];
     object.firstVertex = std::uint32_t(scene.vertexCount);
@@ -643,9 +653,10 @@ bool starterSphere(Visual3DScene& scene, std::size_t o)
     operation.parameters = {radius, 10, 6, 0};
     geometry::GeometryData mesh;
     std::string error;
-    if (!geometry::materializeMeshGenerator(operation, mesh, Visual3DScene::kMaxVertices, Visual3DScene::kMaxIndices, error)
-        || scene.vertexCount + mesh.positions.size() > Visual3DScene::kMaxVertices
-        || scene.indexCount + mesh.indices.size() > Visual3DScene::kMaxIndices)
+    HarmonicMIDI::grid::Visual3DSceneGrowth growth;
+    if (!geometry::materializeMeshGenerator(operation, mesh, geometry::kMaximumVertices, geometry::kMaximumIndices, error)
+        || (growth.vertices = mesh.positions.size(), growth.indices = mesh.indices.size(),
+            !HarmonicMIDI::grid::growVisual3DScene(scene, growth, error)))
     { check(false, "sphere generator: " + error); return false; }
     auto& object = scene.objects[o];
     object.firstVertex = std::uint32_t(scene.vertexCount);
@@ -1559,25 +1570,144 @@ void trappedCameraPixels()
           "a frame with 16 trapped pixels is admitted and counts them: " + error);
     // A hard refusal still refuses next to trapped pixels.
     error.clear();
-    check(!sg::completeFrame(frameWith(16, sg::negativeHalfBits(int(sg::SmoothTransportStatus::InterfaceDepth))), error)
-              && error.find("interface depth budget exhausted; 1 pixel") != std::string::npos,
-          "an interface-depth pixel still refuses beside trapped pixels: " + error);
+    check(!sg::completeFrame(frameWith(16, sg::negativeHalfBits(int(sg::SmoothTransportStatus::PendingBranches))), error)
+              && error.find("pending branch budget exhausted; 1 pixel") != std::string::npos,
+          "a pending-branch pixel still refuses beside trapped pixels: " + error);
 
-    // (b) Systemic trapping refuses: 0.5% of 230400 drawn pixels is 1152.
+    // (b) Trapped pixels never refuse the frame, however many there are.
     error.clear();
-    check(sg::completeFrame(frameWith(1100, 0), error), "1100 trapped of 230400 drawn pixels is admitted: " + error);
+    check(sg::completeFrame(frameWith(72047, 0), error, &trappedPixels) && trappedPixels == 72047,
+          "72047 trapped of 230400 drawn pixels is admitted: " + error);
     error.clear();
-    check(!sg::completeFrame(frameWith(1200, 0), error)
-              && error.find("Closed glass ray transport did not produce a complete finite result (bounce budget exhausted; 1200 trapped pixels")
-                     == 0
-              && error.find("first at texel x=0 y=0") != std::string::npos,
-          "1200 trapped of 230400 drawn pixels refuses the frame: " + error);
-    // At 3840x2160 the absolute cap bites first.
-    const std::uint64_t uhd = 3840ull * 2160ull;
-    check(sg::admitTrappedCameraPixels(16, uhd) && sg::admitTrappedCameraPixels(4096, uhd)
-              && !sg::admitTrappedCameraPixels(4097, uhd) && !sg::admitTrappedCameraPixels(1, 100)
-              && sg::admitTrappedCameraPixels(0, 0),
-          "the trapped cap is 4096 pixels and 0.5% of drawn pixels");
+    check(sg::completeFrame(frameWith(std::size_t(width) * height, 0), error, &trappedPixels)
+              && trappedPixels == std::uint64_t(width) * height,
+          "a frame of only trapped pixels is admitted: " + error);
+}
+
+// Absorbed power closes the receipt only when it is really there, and never hides
+// unresolved power.
+void roughAbsorbedReceipt()
+{
+    std::string error;
+    sg::RoughEnergyReceipt receipt;
+    receipt.terminal.fill(0.85);
+    receipt.absorbed.fill(0.15);
+    check(sg::completeRoughEnergy(receipt, error), "absorbed power closes the receipt: " + error);
+    receipt.terminal.fill(0.80);
+    check(!sg::completeRoughEnergy(receipt, error) && error.find("nonconserving") != std::string::npos,
+          "a dropped path term refuses with absorbed reporting on: " + error);
+    receipt.terminal.fill(0.84);
+    receipt.tail.fill(0.01);
+    check(!sg::completeRoughEnergy(receipt, error) && error.find("unresolved-power") != std::string::npos,
+          "unresolved power past 0.0001 refuses beside absorbed power: " + error);
+
+    check(sg::selectedCameraFailure(-7.0f) == sg::roughTransportDiagnostic(sg::RoughTransportStatus::RayVisits)
+              && sg::selectedCameraFailure(0.0f).find("work reserve") != std::string::npos,
+          "a selected camera refusal names the walk's status");
+
+    constexpr std::uint32_t width = 3;
+    float unresolved = 0.0f;
+    sg::Prepared prepared;
+    prepared.enabled = true;
+    prepared.roughness = 0.28f;
+    prepared.transport = surfacematerial::TransportMode::ClosedVolume;
+    prepared.roughConsumer.backend = arbitgpu::NativeFixtureMaterialBackend::OpenGl;
+    prepared.roughConsumer.shader = prepared.roughConsumer.float32Receipt = prepared.roughConsumer.readback = true;
+    prepared.roughConsumer.version = sg::kMultipleScatterVersion;
+    prepared.roughConsumer.selectedComputeV2 = true;
+    prepared.object.value = 7;
+    prepared.material.value = 9;
+    const auto frame = [&](float terminal, float absorbed, float nextAbsorbed, arbitgpu::NativeFixtureSceneStats& stats) {
+        arbitgpu::NativeRawPassPixels t {arbitgpu::NativeTexturePixelFormat::Rgba32Float, width, 1, std::vector<std::uint8_t>(width * 16)};
+        auto m = t, r = t;
+        arbitgpu::NativeRawPassPixels objects {arbitgpu::NativeTexturePixelFormat::R32Uint, width, 1, std::vector<std::uint8_t>(width * 4)};
+        auto materials = objects;
+        for (std::uint32_t pixel = 0; pixel < width; ++pixel)
+        {
+            const float power = pixel == 0 ? absorbed : pixel == 1 ? nextAbsorbed : 0.0f;
+            const float out = pixel == 0 ? terminal : 1.0f - power;
+            const bool multiple = prepared.roughConsumer.version == sg::kMultipleScatterVersion;
+            const float status = multiple ? float(sg::kMultipleScatterCameraComplete) : 1.0f;
+            const std::array<float, 4> term {out - unresolved, out - unresolved, out - unresolved, status};
+            const std::array<float, 4> mask {power, power, power, 3.0f};
+            const std::array<float, 4> tail {unresolved, unresolved, unresolved, multiple ? 3.0f : status};
+            std::memcpy(t.bytes.data() + pixel * 16, term.data(), 16);
+            std::memcpy(m.bytes.data() + pixel * 16, mask.data(), 16);
+            std::memcpy(r.bytes.data() + pixel * 16, tail.data(), 16);
+            std::memcpy(objects.bytes.data() + pixel * 4, &prepared.object.value, 4);
+            std::memcpy(materials.bytes.data() + pixel * 4, &prepared.material.value, 4);
+        }
+        return sg::completeRoughFrame(prepared, width, 1, t, m, r, objects, materials, stats, error);
+    };
+    arbitgpu::NativeFixtureSceneStats stats;
+    check(frame(0.75f, 0.25f, 0.00005f, stats), "a V2 frame with absorbed power publishes: " + error);
+    check(std::abs(stats.roughGlassAbsorbedTotalPower - 3.0 * (0.25 + 0.00005)) < 1e-5
+              && std::abs(stats.roughGlassMaximumAbsorbedPower - 0.25) < 1e-6
+              && stats.roughGlassAbsorbedPixelsOverLimit == 1
+              && stats.roughGlassMaximumUnresolvedPower == 0,
+          "the frame receipt reports absorbed total, maximum and pixels over 0.0001, none of it unresolved");
+    arbitgpu::NativeFixtureSceneStats dropped;
+    check(!frame(0.70f, 0.25f, 0.0f, dropped) && error.find("nonconserving") != std::string::npos
+              && dropped.roughGlassAbsorbedTotalPower == 0,
+          "a V2 frame with a dropped path term refuses and reports nothing: " + error);
+
+    prepared.roughConsumer.version = sg::kSingleScatterCameraVersion;
+    prepared.roughConsumer.selectedComputeV2 = false;
+    arbitgpu::NativeFixtureSceneStats single;
+    check(frame(0.75f, 0.25f, 0.00005f, single), "a V1 frame with absorbed power publishes: " + error);
+    check(std::abs(single.roughGlassAbsorbedTotalPower - 3.0 * (0.25 + 0.00005)) < 1e-5
+              && single.roughGlassAbsorbedPixelsOverLimit == 1 && single.roughGlassMaximumUnresolvedPower == 0,
+          "a V1 frame reports absorbed power the same way, none of it unresolved");
+    arbitgpu::NativeFixtureSceneStats singleDropped;
+    check(!frame(0.70f, 0.25f, 0.0f, singleDropped) && error.find("nonconserving") != std::string::npos,
+          "a V1 frame with a dropped path term refuses: " + error);
+    unresolved = 0.01f;
+    arbitgpu::NativeFixtureSceneStats singleMasked;
+    check(!frame(0.76f, 0.24f, 0.0f, singleMasked) && error.find("unresolved-power") != std::string::npos,
+          "V1 masked power in the tail still refuses past 0.0001: " + error);
+}
+// The multiple-scatter tile holds 136 pixels, so 1080p needs more than 8192 jobs.
+void roughTileJobCount()
+{
+    namespace tiles = arbitgpu::roughglasstiles;
+    SceneObjectId water;
+    SceneMaterialId waterMaterial;
+    auto f = lighthouse(water, waterMaterial);
+    sg::Prepared prepared;
+    prepared.enabled = true;
+    prepared.roughness = 0.28f;
+    prepared.transport = surfacematerial::TransportMode::ClosedVolume;
+    prepared.roughConsumer.backend = arbitgpu::NativeFixtureMaterialBackend::OpenGl;
+    prepared.roughConsumer.shader = prepared.roughConsumer.float32Receipt = prepared.roughConsumer.readback = true;
+    prepared.roughConsumer.version = sg::kMultipleScatterVersion;
+    prepared.roughConsumer.selectedComputeV2 = true;
+    prepared.sourceScene = f.scene;
+    prepared.sourceMaterial = f.program;
+    tiles::FrameKey key;
+    key.scene = prepared.sourceScene;
+    key.program = prepared.sourceMaterial;
+    arbitgpu::NativeFixtureSceneRuntimeInputs inputs;
+    inputs.linearColor = true;
+    key.runtime = std::make_shared<const arbitgpu::NativeFixtureSceneRuntimeInputs>(inputs);
+    key.owner = std::make_shared<const int>(31);
+    key.camera = *arbitgpu::findFixtureActiveCamera(*key.scene);
+    key.sceneRevision = key.program->sceneRevision;
+    key.rendererGeneration = 1;
+    for (const auto extent : {std::array<std::uint32_t, 2>{1920, 1080}, {3840, 2160}})
+    {
+        key.width = extent[0];
+        key.height = extent[1];
+        std::string error;
+        std::shared_ptr<const tiles::Schedule> plan;
+        const bool admitted = tiles::Schedule::admit(prepared, key, false, plan, error);
+        check(admitted, "a multiple-scatter frame admits its whole tile schedule: " + error);
+        if (!admitted) continue;
+        std::uint64_t pixels = 0;
+        for (const auto& tile : plan->tiles())
+            pixels += tile.pixels();
+        check(plan->tiles().size() > 8192 && plan->maximumTilePixels() <= 136 && pixels == plan->pixels(),
+              "the frame's tiles cover it, more than 8192 of them, at most 136 pixels each");
+    }
 }
 } // namespace
 
@@ -1597,6 +1727,8 @@ int main()
     starterCameraOnly();
     starterIcosphereLens();
     trappedCameraPixels();
+    roughAbsorbedReceipt();
+    roughTileJobCount();
     std::printf("lighthouse caustic volume: %d/%d checks passed\n", checks - failures, checks);
     return failures == 0 ? 0 : 1;
 }

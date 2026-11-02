@@ -1,5 +1,6 @@
 #pragma once
 
+#include "published_plan_memo.h"
 #include "imported_animated_scene_payload_execution.h"
 #include "glb_native_render_seam.h"
 #include "model_payload_transport.h"
@@ -59,6 +60,11 @@ struct ImportedSceneRequest final
     std::uint64_t helperGeneration = 0;
     int clipId = 0;
     std::string staticPayloadIdentity;
+    // A leased plan's text, used in place of a copy in staticPayloadIdentity.
+    const std::string* publishedPayloadIdentity = nullptr;
+    std::shared_ptr<const void> publishedPayloadOwner;
+    const std::string& payloadIdentity() const noexcept
+    { return publishedPayloadIdentity ? *publishedPayloadIdentity : staticPayloadIdentity; }
     std::optional<surfacematerialbinding::ImportedSceneMaterialRequest> material;
     geometrysurfacematerial::ObjectPrograms surfacePrograms;
     std::optional<diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest>
@@ -71,10 +77,18 @@ struct ImportedSceneRequest final
     // vertex order. Motion history then survives the per-frame snapshot and
     // retains vertex positions so the next frame can project them.
     bool deformedSceneMotion = false;
-    // The 3D Render node's engine (V27 wire). These sit in the padding before
-    // the next member, so the request's charge bytes are unchanged.
+    // The 3D Render node's engine (V27/V28 wire) and the Path Trace preview
+    // accumulation target.
     visualimportedscenerender::RenderEngine renderEngine = visualimportedscenerender::RenderEngine::Raster;
+    // The same node's quality mode. Preview and export both read it from this
+    // request; no consumer branches on it yet.
+    visualimportedscenerender::RenderMode renderMode = visualimportedscenerender::RenderMode::Accurate;
+    // The same node's Path Trace denoise switch (V30 wire).
+    bool pathTraceDenoise = false;
     std::uint16_t pathTraceExportSamples = visualimportedscenerender::kDefaultPathTraceExportSamples;
+    std::uint16_t pathTracePreviewSamples = visualimportedscenerender::kDefaultPathTracePreviewSamples;
+    // No padding is left in this run, so this one grows the request charge by 8 bytes.
+    std::uint16_t pathTraceMaxBounces = visualimportedscenerender::kDefaultPathTraceMaxBounces;
     // Vertices whose positions that history keeps. Zero keeps every vertex.
     // Appended solid bodies past it take Motion from their own prior transforms.
     std::size_t retainedMotionVertexCount = 0;
@@ -88,6 +102,36 @@ struct ImportedSceneRequest final
 // before multi-leaf compositions.
 inline constexpr std::size_t kImportedSceneRequestChargeBytes =
     sizeof(ImportedSceneRequest) - sizeof(std::vector<ImportedSceneLeafRequest>);
+
+// renderMode sits between renderEngine and the sample counts, where it replaces
+// padding instead of adding to it. This mirror of that run keeps the insertion
+// from moving kImportedSceneRequestChargeBytes.
+namespace render_mode_layout
+{
+struct TailBeforeMode final
+{
+    bool deformedSceneMotion; visualimportedscenerender::RenderEngine engine;
+    std::uint16_t exportSamples; std::uint16_t previewSamples; std::size_t retainedMotionVertexCount;
+};
+struct TailWithMode final
+{
+    bool deformedSceneMotion; visualimportedscenerender::RenderEngine engine;
+    visualimportedscenerender::RenderMode mode;
+    std::uint16_t exportSamples; std::uint16_t previewSamples; std::size_t retainedMotionVertexCount;
+};
+static_assert(sizeof(TailWithMode) == sizeof(TailBeforeMode)
+        && alignof(TailWithMode) == alignof(TailBeforeMode),
+    "renderMode must not grow ImportedSceneRequest");
+struct TailWithDenoise final
+{
+    bool deformedSceneMotion; visualimportedscenerender::RenderEngine engine;
+    visualimportedscenerender::RenderMode mode; bool denoise;
+    std::uint16_t exportSamples; std::uint16_t previewSamples; std::size_t retainedMotionVertexCount;
+};
+static_assert(sizeof(TailWithDenoise) == sizeof(TailBeforeMode)
+        && alignof(TailWithDenoise) == alignof(TailBeforeMode),
+    "pathTraceDenoise must not grow ImportedSceneRequest");
+} // namespace render_mode_layout
 
 // Opaque source-presentation bookkeeping. Only the existing payload executor
 // issues or retires it. It grants no native capability or historical validity.
@@ -214,7 +258,9 @@ public:
     void publishStaticPayload(int clipId,
                               std::uint64_t projectGeneration,
                               std::uint64_t helperGeneration,
-                              const std::string& exactPayloadIdentity) noexcept;
+                              const std::string& exactPayloadIdentity,
+                              const std::shared_ptr<const void>& planPublication = {}) noexcept;
+    std::uint64_t staticPayloadScans() const noexcept { return staticPayloadScans_; }
 
     // Fixed-size presentation bookkeeping only. Historical native receipts
     // remain valid, but cannot be adopted again after source publication retires.
@@ -258,7 +304,15 @@ private:
         // admission.scene holds the composed result. A new procedural
         // snapshot recomposes from it without a second decode or admission.
         std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> importedScene;
+        // Static leaves 1+ of a multi-leaf Scene Compose, in leaf order.
+        std::vector<visualmodelassetpayload::PayloadPtr> additionalPayloads;
+        std::vector<std::optional<std::size_t>> additionalSceneIndices;
+        std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>> additionalScenes;
+        // The HDR image request.light named when this owner's scene was prepared.
+        std::optional<visualenvironmentimage::Identity> environmentImage;
         std::string exactPayloadIdentity;
+        // The last composed operation that passed its checks on this owner's scene.
+        std::shared_ptr<const visualimportedscenerender::Request> verifiedOperation;
         std::optional<visualimportedscenerender::GlassCausticSelection> glassCaustic;
         std::uint64_t lastUse = 0;
         std::array<arbitgpu::NativeSceneMotionHistory, 2> motion;
@@ -282,6 +336,9 @@ private:
     std::unique_ptr<ImportedAnimatedScenePayloadExecution> deformationExecution_;
     using StaticOwnerKey = int;
     std::map<StaticOwnerKey, StaticOwner> staticOwners_;
+    // One memo per clip: the payload text each clip last matched against its owner.
+    std::map<int, PublishedPlanMemo> publishedPayloads_;
+    std::uint64_t staticPayloadScans_ = 0;
     std::uint64_t projectGeneration_ = 0;
     std::uint64_t helperGeneration_ = 0;
     std::uint64_t useSerial_ = 0;

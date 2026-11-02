@@ -57,8 +57,10 @@ struct NativeDeformationCompositionLeafSample final
 class NativeDeformationCompositionOwner final
 {
 public:
-    static constexpr std::size_t kMaximumLogicalBytes = 8 * 1024 * 1024;
-    static constexpr std::size_t kMaximumLogicalWork = 4096ull * 1024 * 1024;
+    // Counter ranges for checked arithmetic, not a scene ceiling. Callers scale
+    // them by small factors, so they stay well below the top of size_t.
+    static constexpr std::size_t kMaximumLogicalBytes = std::size_t(1) << 56;
+    static constexpr std::size_t kMaximumLogicalWork = std::size_t(1) << 56;
     const auto& scene() const noexcept { return composed_; }
     std::uint64_t revision() const noexcept { return revision_; }
     std::uint64_t evaluationRevision() const noexcept { return evaluationRevision_; }

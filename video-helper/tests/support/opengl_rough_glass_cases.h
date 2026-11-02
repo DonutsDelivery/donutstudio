@@ -98,8 +98,8 @@ inline bool malformed(const arbitgpu::smoothglass::Prepared& prepared,
             case 3: write(receipt[0], covered, 0, .5f); break;
             case 4:
                 write(receipt[0], covered, 0, .99f);
-                write(receipt[1], covered, 0, .01f);
-                write(receipt[2], covered, 0, 0); break;
+                write(receipt[1], covered, 0, 0);
+                write(receipt[2], covered, 0, .01f); break;
             case 5: write(receipt[0], covered, 3, 0); break;
             case 6: write(receipt[1], covered, 3, 1.5f); break;
             case 7:
@@ -175,7 +175,10 @@ inline bool run(arbitgpu::NativeFixtureSceneBackend& backend, std::string& error
             || stats.roughGlassReceiptBytes != extent*extent*48
             || stats.roughGlassMaximumEnergyResidual > .00002
             || stats.roughGlassMaximumUnresolvedPower > .0001)
-        { error = "GL native rough frame omitted its complete power/resource receipt"; return false; }
+        { error = "GL native rough frame omitted its complete power/resource receipt: complete=" + std::to_string(stats.roughGlassReceiptComplete)
+            + " covered=" + std::to_string(stats.roughGlassCoveredPixels) + " bytes=" + std::to_string(stats.roughGlassReceiptBytes)
+            + " residual=" + std::to_string(stats.roughGlassMaximumEnergyResidual) + " unresolved=" + std::to_string(stats.roughGlassMaximumUnresolvedPower);
+          return false; }
         std::array<arbitgpu::NativeRawPassPixels,3> receipt, exportReceipt;
         arbitgpu::NativeRawPassPixels objects, materials, exportObjects, exportMaterials, color, exportColor, normal;
         if (!arbitgpu::readOpenGlRoughGlassReceiptForFixture(*preview.nativeFrame,receipt,objects,materials,error)

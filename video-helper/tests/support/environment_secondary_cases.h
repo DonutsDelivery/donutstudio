@@ -177,8 +177,14 @@ inline bool admissionCases(const std::shared_ptr<const Visual3DScene>& scene,
     if(!smoothglass::prepare(scene,material,{},transport,error)) return false;
     arbitgpu::environmentimage::Prepared environment;
     const auto reject=[&](bool accepted,const char* failure) {if(accepted)error=failure;return !accepted;};
-    if(!reject(arbitgpu::environmentimage::prepare(*scene,material.get(),environment,error),"Default HDR transmission admission changed")
-        ||!reject(arbitgpu::environmentimage::prepare(*scene,material.get(),environment,error,arbitgpu::environmentimage::SecondaryRayConsumer::SmoothTransport),
+    // Realtime prepares no glass walk, so its glass arrives here with no consumer. The
+    // scope releases the budget lease before the admissions below.
+    {
+        arbitgpu::environmentimage::Prepared withoutConsumer;
+        if(!arbitgpu::environmentimage::prepare(*scene,material.get(),withoutConsumer,error)||!withoutConsumer.resident)
+        {error="HDR glass without a secondary consumer was refused: "+error;return false;}
+    }
+    if(!reject(arbitgpu::environmentimage::prepare(*scene,material.get(),environment,error,arbitgpu::environmentimage::SecondaryRayConsumer::SmoothTransport),
             "HDR secondary transport admitted without owned geometry")) return false;
     auto replacement=std::make_shared<const Visual3DScene>(*scene);
     if(!reject(arbitgpu::environmentimage::prepare(*replacement,material.get(),environment,error,

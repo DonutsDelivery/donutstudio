@@ -91,8 +91,8 @@ def main() -> int:
     require("surfacematerialstarterfixture::kPrograms" in test
             and generated.count("visual.material.") == 5
             and len(oracle["materials"]) == 5
-            and oracle["schema"] == 4
-            and "kSchemaVersion = 4" in oracle_loader,
+            and oracle["schema"] == 5
+            and "kSchemaVersion = 5" in oracle_loader,
             "physical target must consume the one generated five-program table")
     require("14695981039346656037ull" in oracle_loader
             and "surface_material_starter_oracle_cross_language" in cmake,

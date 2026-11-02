@@ -136,7 +136,7 @@ inline bool calculateGratingCellCoverageBounds(const GratingCellTransportBinding
     const auto& parent=*boundary.sourceCells->incidentBinding;const auto& frame=parent.frame;
     if(!frame.triangles.size()||frame.triangles.size()>opaquevisibility::kMaximumClosestHitWork
         ||boundary.bounds.maximumRecords>kMaximumEntrySamples*8*kMaximumBranchVisits
-        ||boundary.bounds.maximumRecords>parent.bounds.maximumIncidents||!boundary.bounds.maximumInterfaces||boundary.bounds.maximumInterfaces>kMaximumInterfaces)
+        ||boundary.bounds.maximumRecords>parent.bounds.maximumIncidents||!boundary.bounds.maximumInterfaces||boundary.bounds.maximumInterfaces>kMaximumAncestryInterfaces)
         return refuse("Cell coverage retained triangle or interface extent is invalid");
     GratingCellCoverageBounds bounds;bounds.maximumLeaves=maximumLeaves;
     const auto leaves=boundary.bounds.maximumRecords*maximumLeaves;
@@ -498,7 +498,7 @@ inline bool calculateGratingBoundaryBoundsV2(const GratingCellTransportBinding& 
     // two. Euler plus 2E>=3V-3 and E=V+R-1 gives E<=3R.
     bounds.seams=3*regions;
     bounds.transitions=paths*(bounds.interfaces+1);bounds.adjacent=3*frame.triangles.size();
-    if(!bounds.interfaces||bounds.interfaces>kMaximumInterfaces||frame.triangles.empty()||bounds.adjacent>3*opaquevisibility::kMaximumClosestHitWork
+    if(!bounds.interfaces||bounds.interfaces>kMaximumAncestryInterfaces||frame.triangles.empty()||bounds.adjacent>3*opaquevisibility::kMaximumClosestHitWork
         ||frame.work.size()>kMaximumEntrySamples*8||paths>kMaximumBranchVisits)return refuse();
     const auto vertices=regions*kGratingBoundaryVerticesV2;
     // Work includes partition SAT/normalization, retained topology lookup and

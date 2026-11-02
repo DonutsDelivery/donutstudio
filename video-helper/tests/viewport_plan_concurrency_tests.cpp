@@ -123,6 +123,40 @@ int main()
           && exportAdmission.telemetry().snapshot().failedLowerings == 1,
           "export admission refuses over-capacity plans before installing partial state");
 
+    {
+        // A describe reads what admission accounted instead of decoding the plan again.
+        auto accounted = planFor(3, 5);
+        videowire::VisualPlanResourceUsage expected;
+        std::string accountingError;
+        check(videowire::accountVisualPlanResources(accounted, 640, 360, expected, accountingError),
+              "the fixture plan accounts");
+        accounted.descriptorCount = expected.descriptors;
+        accounted.operationCount = expected.operations;
+        accounted.sceneRecordCount = expected.sceneRecords;
+        accounted.frameOutputCount = expected.frameOutputs;
+        accounted.peakLiveFrameCount = expected.peakLiveFrames;
+        accounted.allocatedFrameSlotCount = expected.frameSlots;
+        std::shared_ptr<videowire::VisualPlanExecutionSnapshot> admitted;
+        videowire::VisualPlanTelemetry admittedTelemetry;
+        const bool made = videowire::makeVisualPlanExecutionSnapshot(
+            { accounted, planFor(4, 1) }, admitted, diagnostic, &admittedTelemetry, 640, 360);
+        check(made, "an accounted plan admits");
+        if (! made) std::fprintf(stderr, "%s\n", diagnostic.c_str());
+        if (made)
+        {
+            const auto* usage = admitted->state.admittedResources(3, 5, 640, 360);
+            check(usage != nullptr && usage->allocatedFrameBytes == expected.allocatedFrameBytes
+                  && usage->descriptors == expected.descriptors && usage->frameSlots == expected.frameSlots,
+                  "admission keeps the accounted usage for a describe");
+            check(admitted->state.admittedResources(3, 6, 640, 360) == nullptr
+                  && admitted->state.admittedResources(3, 5, 1280, 720) == nullptr
+                  && admitted->state.admittedResources(9, 5, 640, 360) == nullptr,
+                  "another revision, canvas or clip has no admitted usage");
+            check(admitted->state.admittedResources(4, 1, 640, 360) == nullptr,
+                  "a plan admission did not account has no admitted usage");
+        }
+    }
+
     std::shared_ptr<videowire::VisualPlanExecutionSnapshot> normalized;
     videowire::VisualPlanTelemetry normalizedTelemetry;
     const bool normalizedMade = videowire::makeVisualPlanExecutionSnapshot(

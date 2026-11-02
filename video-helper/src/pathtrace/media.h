@@ -25,6 +25,7 @@
 // intern/cycles/kernel/integrator/volume_stack.h for stack entry and exit by
 // shader, and the priority rule of the nested dielectric paper above.
 
+#include "devices/device_annotations.h"
 #include "bsdf.h"
 #include "spectrum.h"
 
@@ -40,11 +41,11 @@ class MediumStack
 public:
     static constexpr int kCapacity = 8;
 
-    bool empty() const noexcept { return count_ == 0; }
-    int size() const noexcept { return count_; }
+    PT_SHARED_FN bool empty() const noexcept { return count_ == 0; }
+    PT_SHARED_FN int size() const noexcept { return count_; }
 
     // The medium the path is in, or null outside every medium (index 1).
-    const Material* active() const noexcept
+    PT_SHARED_FN const Material* active() const noexcept
     {
         const Material* best = nullptr;
         for (int i = 0; i < count_; ++i)
@@ -56,7 +57,7 @@ public:
         return best;
     }
 
-    bool contains (const Material* material) const noexcept
+    PT_SHARED_FN bool contains (const Material* material) const noexcept
     {
         for (int i = 0; i < count_; ++i)
             if (entries_[static_cast<std::size_t> (i)] == material)
@@ -66,7 +67,7 @@ public:
 
     // False (and no change) when the stack is full; a later exit through
     // that medium is then an unbalanced exit.
-    bool push (const Material* material) noexcept
+    PT_SHARED_FN bool push (const Material* material) noexcept
     {
         if (material == nullptr || count_ >= kCapacity)
             return false;
@@ -76,7 +77,7 @@ public:
     }
 
     // Removes the latest entry of material. False when there is none.
-    bool remove (const Material* material) noexcept
+    PT_SHARED_FN bool remove (const Material* material) noexcept
     {
         for (int i = count_ - 1; i >= 0; --i)
         {
@@ -111,7 +112,7 @@ struct BoundaryCrossing
 
 // frontFace: the ray arrives on the geometric front face, so it enters the
 // material when it crosses.
-inline BoundaryCrossing classifyBoundary (const MediumStack& stack, const Material* material, bool frontFace) noexcept
+PT_SHARED_FN BoundaryCrossing classifyBoundary (const MediumStack& stack, const Material* material, bool frontFace) noexcept
 {
     BoundaryCrossing crossing;
     const Material* owner = stack.active();
@@ -147,7 +148,7 @@ inline BoundaryCrossing classifyBoundary (const MediumStack& stack, const Materi
 }
 
 // Updates the stack for a transmission through the boundary (real or false).
-inline void applyCrossing (MediumStack& stack, const Material* material, const BoundaryCrossing& crossing) noexcept
+PT_SHARED_FN void applyCrossing (MediumStack& stack, const Material* material, const BoundaryCrossing& crossing) noexcept
 {
     if (crossing.entering)
         stack.push (material);
@@ -156,13 +157,13 @@ inline void applyCrossing (MediumStack& stack, const Material* material, const B
 }
 
 // Index of a medium at a wavelength; 1 outside every medium.
-inline float mediumIor (const Material* medium, float nm, bool spectral) noexcept
+PT_SHARED_FN float mediumIor (const Material* medium, float nm, bool spectral) noexcept
 {
     return medium != nullptr ? materialIorAt (*medium, nm, spectral) : 1.0f;
 }
 
 // Far index over near index per channel, for buildMaterialBsdf.
-inline DielectricSetup dielectricSetupFor (const BoundaryCrossing& crossing, const Wavelengths& wavelengths) noexcept
+PT_SHARED_FN DielectricSetup dielectricSetupFor (const BoundaryCrossing& crossing, const Wavelengths& wavelengths) noexcept
 {
     DielectricSetup setup;
     for (std::size_t c = 0; c < setup.eta.size(); ++c)
@@ -178,7 +179,7 @@ inline DielectricSetup dielectricSetupFor (const BoundaryCrossing& crossing, con
 // Beer-Lambert transmittance over distance through absorption sigma. A
 // channel without absorption passes everything, even over an infinite
 // distance.
-inline Spectrum beerLambert (const Spectrum& sigma, float distance) noexcept
+PT_SHARED_FN Spectrum beerLambert (const Spectrum& sigma, float distance) noexcept
 {
     Spectrum t = Spectrum::constant (1.0f);
     for (int c = 0; c < kSpectrumChannels; ++c)

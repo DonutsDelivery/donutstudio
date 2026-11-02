@@ -36,7 +36,6 @@ struct ParticleHistorySource
 
 inline constexpr std::int64_t kParticleReplayTicksPerSecond = 28224000;
 inline constexpr std::int64_t kParticleReplayStepTicks = 235200;
-inline constexpr int kParticleReplayMaxEvents = 512;
 
 inline std::array<float*, visualsimulation::parameters.size()> particleAutomationFields(ParticleParams& p)
 {
@@ -97,26 +96,23 @@ inline float particleScoreAttractorX(float midiNote)
     return std::clamp((midiNote - 36.0f) / 60.0f, 0.0f, 1.0f) * 0.8f + 0.1f;
 }
 
-// Bound work by actual events inside this replay window, not the total number
-// of authored notes in the project. Over-cap histories fail before GPU work.
+// Work follows the actual events inside this replay window, not the total number
+// of authored notes in the project.
 // visit(tick, event) receives window-relative ticks. Adapter weights use the
 // birth track rule, trackId == spawnTrack, so a filtered-out note adds no
 // boundary. A weighted onset exactly at the window start (relative tick 0) is
 // still visited: bodies born there take the step-0 kick and credit, as the audio
 // path does for an onset on reset. A note already sounding at the window start
-// reports only its attractor, at tick 0. The same 512-event cap covers all of it.
+// reports only its attractor, at tick 0.
 template <typename Visitor>
-bool visitParticleScoreEvents(const ParticleParams& p, ParticleReplayWindow window, Visitor visit,
+void visitParticleScoreEvents(const ParticleParams& p, ParticleReplayWindow window, Visitor visit,
                               double kickGain, double emissionGain, double attractorGain)
 {
-    int count = 0;
     const auto add = [&](std::int64_t tick, const ParticleScoreEvent& event, bool weightedAtStart)
     {
         tick -= window.start;
-        if (tick < 0 || tick >= window.age || (tick == 0 && !weightedAtStart)) return true;
-        if (++count > kParticleReplayMaxEvents) return false;
+        if (tick < 0 || tick >= window.age || (tick == 0 && !weightedAtStart)) return;
         visit(tick, event);
-        return true;
     };
     const bool adapters = kickGain > 0 || emissionGain > 0 || attractorGain > 0;
     if (p.geometryCount == 0 || adapters)
@@ -144,12 +140,11 @@ bool visitParticleScoreEvents(const ParticleParams& p, ParticleReplayWindow wind
                 sounding.attractor = onset.attractor;
                 sounding.attractorX = onset.attractorX;
                 sounding.attractorEnd = onset.attractorEnd;
-                if (!add(window.start, sounding, true)) return false;
+                add(window.start, sounding, true);
             }
-            if ((p.geometryCount == 0 || weighted) && !add(startTick, onset, weighted))
-                return false;
+            if (p.geometryCount == 0 || weighted) add(startTick, onset, weighted);
             if (p.geometryCount == 0 || (weighted && onset.attractor > 0))
-                if (!add(endTick, ParticleScoreEvent {}, false)) return false;
+                add(endTick, ParticleScoreEvent {}, false);
         }
     if (p.history->hasAudio())
     {
@@ -159,19 +154,17 @@ bool visitParticleScoreEvents(const ParticleParams& p, ParticleReplayWindow wind
         auto next = std::lower_bound(frames.begin(), frames.end(), firstSample,
             [](const auto& value, double sample) { return value.sampleIndex < sample; });
         for (; next != frames.end() && next->sampleIndex <= finalSample; ++next)
-            if (next->onset > 0 && next->onsetAge == 0
-                && !add(std::llround(double(next->sampleIndex) / p.history->audioSampleRate * kParticleReplayTicksPerSecond), ParticleScoreEvent {}, false))
-                return false;
+            if (next->onset > 0 && next->onsetAge == 0)
+                add(std::llround(double(next->sampleIndex) / p.history->audioSampleRate * kParticleReplayTicksPerSecond), ParticleScoreEvent {}, false);
     }
-    return true;
 }
 
 // Kick-only view of the same visit. The visitor receives the kick weight in
 // place of the whole event, so callers that never read adapters keep their shape.
 template <typename Visitor>
-bool visitParticleHistoryEvents(const ParticleParams& p, ParticleReplayWindow window, Visitor visit, double kickGain)
+void visitParticleHistoryEvents(const ParticleParams& p, ParticleReplayWindow window, Visitor visit, double kickGain)
 {
-    return visitParticleScoreEvents(p, window,
+    visitParticleScoreEvents(p, window,
         [&visit](std::int64_t tick, const ParticleScoreEvent& event) { visit(tick, event.kick); },
         kickGain, 0.0, 0.0);
 }
@@ -224,17 +217,7 @@ inline bool particleScoreAdaptersActive(const ParticleParams& p)
     return p.scoreImpulseGain > 0 || p.scoreEmitGain > 0 || p.scoreAttractGain > 0;
 }
 
-// Called after the event visit has refused. Score adapters are named only when
-// the same window fits the cap without them, so the cause is never guessed.
-inline std::string particleEventCapDiagnostic(const ParticleParams& p, ParticleReplayWindow window, const char* generic)
-{
-    if (particleScoreAdaptersActive(p)
-        && visitParticleScoreEvents(p, window, [](std::int64_t, const ParticleScoreEvent&) {}, 0.0, 0.0, 0.0))
-        return "Score note impulses, emission credit or attractors push historical particle replay past 512 note/audio events in its bounded replay window; shorten the lifetime or set Score note impulse, Score emission credit and Score attractor to 0";
-    return generic;
-}
-
-inline bool particleHistoryReady(const ParticleParams& params, std::string& error, double clipSeconds = 0)
+inline bool particleHistoryReady(const ParticleParams& params, std::string& error, double = 0)
 {
     if (!params.historicalReplay) return true;
     if (!params.history || !params.history->score)
@@ -247,17 +230,6 @@ inline bool particleHistoryReady(const ParticleParams& params, std::string& erro
         key.frame = 0; key.fps = kParticleReplayTicksPerSecond; key.beat = 0;
         if (!canonicalblockc::FrameProducer::admissible(key, params.history->score, 0))
         { error = "Historical particles require an admitted canonical score"; return false; }
-    }
-    if (std::isfinite(clipSeconds) && clipSeconds >= params.resetTime)
-    {
-        const auto window = particleReplayWindow(params, clipSeconds);
-        if (!visitParticleScoreEvents(params, window, [](std::int64_t, const ParticleScoreEvent&) {},
-            params.scoreImpulseGain, params.scoreEmitGain, params.scoreAttractGain))
-        {
-            error = particleEventCapDiagnostic(params, window,
-                "Historical particle replay exceeds 512 note/audio events in its bounded replay window; shorten the lifetime");
-            return false;
-        }
     }
     return true;
 }

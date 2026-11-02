@@ -56,7 +56,8 @@ inline bool isSetter (const std::string& method)
     static const std::set<std::string> setters = {
         "viewport_set_clkfps", "viewport_set_target_fps", "viewport_set_interp_max_dim",
         "viewport_set_bounds", "viewport_set_fullscreen", "viewport_set_canvas",
-        "viewport_set_view", "viewport_set_canvas_frame_enabled",
+        "viewport_set_view", "viewport_set_full_canvas_scene",
+        "viewport_set_canvas_frame_enabled",
         "viewport_set_canvas_background", "viewport_set_post",
         "viewport_set_inspection", "viewport_set_inspection_presentation",
         "viewport_set_score", "viewport_set_beat_timeline",
@@ -70,7 +71,7 @@ inline bool isSetter (const std::string& method)
 inline bool bumpsItself (const std::string& method)
 {
     return method == "viewport_set_canvas" || method == "viewport_set_canvas_background"
-        || method == "viewport_set_visible";
+        || method == "viewport_set_visible" || method == "viewport_set_full_canvas_scene";
 }
 
 // What the guard does when a handler returns.

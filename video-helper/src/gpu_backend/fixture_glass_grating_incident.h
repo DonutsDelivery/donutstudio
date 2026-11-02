@@ -78,7 +78,7 @@ inline std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> compileDiscret
     if(!HarmonicMIDI::grid::validateVisual3DScene(scene).valid())return refuse("Discrete grating compiler scene is invalid");
     const auto* object=HarmonicMIDI::grid::visual3d_detail::findById(scene.objects,scene.objectCount,admitted.object());
     if(admitted.scene()!=scene.id||!object||!object->indexCount
-        ||object->indexCount%3||object->indexCount/3>kMaximumNativeDiffractionTriangles||admitted.spatialFoil())
+        ||object->indexCount%3||admitted.spatialFoil())
         return refuse("Discrete grating compiler requires exact bounded authored scene geometry");
     Point firstNormal{},firstTangent{},firstPosition{};
     for(std::size_t triangle=0;triangle<object->indexCount/3;++triangle) {
@@ -117,7 +117,7 @@ inline bool calculateGratingIncidentBounds(const Frame& frame,std::size_t triang
     if(frame.work.empty()||frame.work.size()>kMaximumEntrySamples*8||!frame.bounds.maximumDeposits
         ||frame.bounds.maximumDeposits>frame.work.size()*kMaximumBranchVisits||frame.bounds.queryWork>kMaximumQueryWork
         ||frame.bounds.deposition.depositionWork>kMaximumDepositionWork
-        ||frame.bounds.transientBytes>renderpassoutput::kMaximumTotalBytes||!triangles||triangles>kMaximumNativeDiffractionTriangles
+        ||frame.bounds.transientBytes>renderpassoutput::kMaximumTotalBytes||!triangles
         ||!std::isfinite(frame.query.control[0])||frame.query.control[0]<1
         ||frame.query.control[0]>=frame.query.texels.size()||std::floor(frame.query.control[0])!=frame.query.control[0])
     {error="Glass to grating staging bounds are incomplete";return false;}
@@ -231,8 +231,8 @@ inline bool prepareGratingIncidentBinding(const Prepared& prepared,const Frame& 
         }
         appendGratingWitness(witness,candidate->witnessTexels);candidate->triangles.push_back(witness);
     }
-    if(candidate->triangles.empty()||candidate->triangles.size()>kMaximumNativeDiffractionTriangles)
-        return refuse("Glass to grating target triangle coverage exceeds its existing bound");
+    if(candidate->triangles.empty())
+        return refuse("Glass to grating target has no triangles");
     if(!calculateGratingIncidentBounds(frame,candidate->triangles.size(),candidate->bounds,error))return false;
     const auto programBytes=sizeof(NativeFixtureSurfaceMaterialProgram)+gratingOwner->bindingDigest.size()+gratingOwner->programIdentity.size()
         +sizeof(diffractionmaterial::AdmittedDiffractionMaterialIR)+material->structuralDigest().size()
@@ -592,11 +592,11 @@ inline bool prepareDirectGratingIrradianceCohort(
     std::shared_ptr<const DirectGratingIrradianceCohort>& output,std::string& error)
 {
     const auto refuse=[&](const char* message){error=message;return false;};
-    if(sources.empty()||sources.size()>HarmonicMIDI::grid::Visual3DScene::kMaxLights
+    if(sources.empty()
         ||!sources.front()||inputs.empty()||inputs.size()>kMaximumEntrySamples
         ||otherOwnedBytes>renderpassoutput::kMaximumTotalBytes||otherWork>kMaximumQueryWork)
         return refuse("Directional cohort source or endpoint count is unsupported");
-    std::array<HarmonicMIDI::grid::SceneLightId,HarmonicMIDI::grid::Visual3DScene::kMaxLights> roster{};
+    std::vector<HarmonicMIDI::grid::SceneLightId> roster;
     std::size_t count=0;if(!directionalSourceRoster(sources.front()->prepared,roster,count,error))return false;
     if(count!=sources.size())return refuse("Directional cohort omits or adds an admitted scene D8 source");
     DirectGratingIrradianceCohortBounds bounds;bounds.bytes=otherOwnedBytes;bounds.combinedWork=otherWork;
@@ -790,7 +790,7 @@ inline bool accumulateDirectGratingIrradianceCohort(const std::shared_ptr<const 
         ||expected.completedFence!=expected.submissionSerial
         ||expected.frameIdentity.capacity()>2*cohort->identity().size())
         return refuse("Directional cohort has no complete common native frame inspector");
-    std::array<const NativeDirectGratingIrradianceBinding*,HarmonicMIDI::grid::Visual3DScene::kMaxLights> seen{};
+    std::vector<const NativeDirectGratingIrradianceBinding*> seen(readbacks.size(),nullptr);
     for(std::size_t i=0;i<readbacks.size();++i) {
         const auto* batch=native->directSourceBatch(i);const auto& source=*cohort->sources()[i];const auto& receipt=readbacks[i];
         if(!batch||std::find(seen.begin(),seen.begin()+i,batch)!=seen.begin()+i)
@@ -1152,7 +1152,7 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
             const Point origin{visit.originMinimum[0],visit.originMinimum[1],visit.originMinimum[2]};
             const Point direction{visit.directionFraction[0],visit.directionFraction[1],visit.directionFraction[2]};
             const auto fraction=visit.directionFraction[3];
-            if(visit.visit!=v||visit.interfaces>kMaximumInterfaces||!finite(origin)||!unit(direction)
+            if(visit.visit!=v||visit.interfaces>kMaximumAncestryInterfaces||!finite(origin)||!unit(direction)
                 ||visit.originMinimum[3]!=kRayMinimum||!std::isfinite(fraction)||fraction<=0||fraction>1.0002f
                 ||glassCameraTraceFloatBits(visit.ior)!=glassCameraTraceFloatBits(band.ior)||hit.work>perQuery
                 ||hit.status<-1||hit.status>1||std::uint32_t(visit.disposition)>4||!std::isfinite(hit.distance)
@@ -1170,7 +1170,7 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
                 if(visit.parent>=v||(visit.token!=1&&visit.token!=65))return refuse("Camera trace ancestry has no preceding native parent");
                 const auto& parent=band.visits[visit.parent];const bool reflected=visit.token==1;const unsigned child=reflected?0:1;
                 auto ancestry=parent.ancestry;
-                if(parent.disposition!=GlassCameraTraceDisposition::Interface||parent.interfaces>=kMaximumInterfaces||children[visit.parent][child])
+                if(parent.disposition!=GlassCameraTraceDisposition::Interface||parent.interfaces>=kMaximumAncestryInterfaces||children[visit.parent][child])
                     return refuse("Camera trace branch repeats or crosses a terminal parent");
                 ancestry[parent.interfaces]=std::uint8_t(visit.token);children[visit.parent][child]=true;
                 const auto expectedFraction=reflected?parent.reflectedFraction:parent.transmittedFraction;
@@ -1209,7 +1209,7 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
                 ||hit.entering!=(dot(direction,hit.outwardNormal)<0))return refuse("Camera trace hit differs from its owning primitive or query ray");
             if(visit.disposition==GlassCameraTraceDisposition::Interface) {
                 Point normal=hit.outwardNormal;if(visit.inside)for(auto& value:normal)value=-value;
-                if(!triangle->glass||visit.inside==hit.entering||visit.interfaces>=kMaximumInterfaces
+                if(!triangle->glass||visit.inside==hit.entering||visit.interfaces>=kMaximumAncestryInterfaces
                     ||!sameGlassCameraTraceFloats(normal,visit.orientedNormal)||dot(direction,normal)>=0
                     ||!std::isfinite(visit.reflection)||visit.reflection<0||visit.reflection>1
                     ||!unit(visit.reflected)||(!visit.tir&&!unit(visit.transmitted))
@@ -1314,7 +1314,7 @@ inline bool validateGratingIncident(const GratingIncidentBinding& binding,const 
         ||!expected.submissionSerial||!expected.rasterGeneration||!expected.queryGeneration
         ||!expected.scratchGeneration||expected.completedFence!=expected.submissionSerial
         ||event.version!=kGratingIncidentVersion||!event.complete||event.work>=binding.frame.work.size()
-        ||event.band!=binding.frame.work[event.work].band||!event.interfaces||event.interfaces>kMaximumInterfaces
+        ||event.band!=binding.frame.work[event.work].band||!event.interfaces||event.interfaces>kMaximumAncestryInterfaces
         ||event.orderCount>kGratingOrdersPerIncident||!finite(event.origin)||!finite(event.direction)
         ||std::abs(dot(event.direction,event.direction)-1)>1e-4f||!std::isfinite(event.fraction)
         ||event.fraction<=0||event.fraction>1||!nearPower(event.power,binding.frame.work[event.work].incidentPower*event.fraction)
@@ -1457,14 +1457,14 @@ inline bool calculateGratingCameraBounds(const GratingIncidentBinding& binding,G
     output=candidate;error.clear();return true;
 }
 // Native vectors have binary32 unit-length admission. Normalize only that
-// rounding when entering the binary64 optical authority, preserving direction.
-inline bool gratingCameraUnitDirection(Point native,std::array<double,3>& output)
+// rounding when entering the optical authority, preserving direction.
+inline bool gratingCameraUnitDirection(Point native,std::array<float,3>& output)
 {
     if(!finite(native))return false;
     const double squared=double(native[0])*native[0]+double(native[1])*native[1]+double(native[2])*native[2];
     if(!std::isfinite(squared)||std::abs(squared-1)>1e-4)return false;
-    std::array<double,3> result{};
-    for(unsigned a=0;a<3;++a)result[a]=native[a]/std::sqrt(squared);
+    std::array<float,3> result{};
+    for(unsigned a=0;a<3;++a)result[a]=float(native[a]/std::sqrt(squared));
     output=result;return true;
 }
 inline bool gratingCameraOpticalFrame(Point tangent,Point bitangent,Point normal,
@@ -1474,7 +1474,7 @@ inline bool gratingCameraOpticalFrame(Point tangent,Point bitangent,Point normal
     if(!gratingCameraUnitDirection(tangent,result.tangent)
         ||!gratingCameraUnitDirection(bitangent,result.bitangent)
         ||!gratingCameraUnitDirection(normal,result.normal))return false;
-    double projection=0,squared=0;
+    float projection=0,squared=0;
     for(unsigned a=0;a<3;++a)projection+=result.tangent[a]*result.normal[a];
     for(unsigned a=0;a<3;++a) {
         result.tangent[a]-=projection*result.normal[a];squared+=result.tangent[a]*result.tangent[a]; }
@@ -1483,9 +1483,9 @@ inline bool gratingCameraOpticalFrame(Point tangent,Point bitangent,Point normal
     result.bitangent={result.normal[1]*result.tangent[2]-result.normal[2]*result.tangent[1],
         result.normal[2]*result.tangent[0]-result.normal[0]*result.tangent[2],
         result.normal[0]*result.tangent[1]-result.normal[1]*result.tangent[0]};
-    const auto withinNative=[](Point original,const std::array<double,3>& corrected) {
+    const auto withinNative=[](Point original,const std::array<float,3>& corrected) {
         double distance=0;
-        for(unsigned a=0;a<3;++a)distance+=(corrected[a]-original[a])*(corrected[a]-original[a]);
+        for(unsigned a=0;a<3;++a)distance+=double(corrected[a]-original[a])*(corrected[a]-original[a]);
         return distance<=double(2e-4f)*double(2e-4f); };
     // The existing retained native frame comparison uses this vector-distance
     // bound. Mirrored or materially nonorthogonal axes cannot be repaired here.
@@ -1533,7 +1533,7 @@ inline bool validateGratingCameraReadback(const GratingIncidentBinding& binding,
             return refuse("Grating camera incident has no exact metric receiving-area witness");
         const double irradiance=double(event.power)/receiving.area;
         diffractionmaterial::DiffractionLocalFrame local;
-        std::array<double,3> incident;
+        std::array<float,3> incident;
         if(!gratingCameraOpticalFrame(event.tangent,event.bitangent,event.normal,local)
             ||!gratingCameraUnitDirection(advance({},event.direction,-1),incident))
             return refuse("Grating camera native incident axes exceed optical conversion precision");
@@ -1642,8 +1642,11 @@ inline bool decodeGratingDepositExtension(const Texel& extension,const Texel& re
     if(reserved!=Texel{}||extension[3]!=0)return false;
     if(extension==Texel{}){output.gratingVersion=0;output.gratingIncident=UINT32_MAX;output.gratingOrder=0;return true;}
     std::uint32_t incident=0,order=0;
+    // A grating child keeps 32-byte ancestry. Both callers decode interfaces
+    // first: GL decodeGratingDeposit (fixture_glass_caustics_opengl.h) and
+    // Metal decodeCoupledDeposit (metal_glass_caustic_consumer.h).
     if(extension[0]!=kGratingIncidentVersion||!exactReceiptInteger(extension[1],kMaximumEntrySamples*8*kMaximumBranchVisits,incident)
-        ||!exactReceiptInteger(extension[2],2,order))return false;
+        ||!exactReceiptInteger(extension[2],2,order)||output.interfaces>kMaximumAncestryInterfaces)return false;
     output.gratingVersion=kGratingIncidentVersion;output.gratingIncident=incident;output.gratingOrder=int(order)-1;return true;
 }
 // Coupled smooth children carry exact binary interface ancestry in the
@@ -1742,9 +1745,10 @@ struct DirectGratingTerminalBand
 {
     std::uint32_t source=0,endpoint=0,band=0,witness=0;
     diffractionmaterial::DiffractionLocalFrame frame;
-    std::array<double,3> toSource{};
-    std::array<double,2> uv{};
-    double wavelengthNanometres=0,incidentIrradiance=0;
+    std::array<float,3> toSource{};
+    std::array<float,2> uv{};
+    float wavelengthNanometres=0;
+    double incidentIrradiance=0;
     double substrateReflectedPower=0,resolvedReflectedPower=0,unresolvedReflectedPower=0; // Dimensionless shares.
     double substrateReflectedIrradiance=0,resolvedReflectedIrradiance=0,unresolvedReflectedIrradiance=0,absorbedIrradiance=0;
     std::size_t firstOrder=0,orderCount=0;
@@ -1879,9 +1883,10 @@ inline bool evaluateDirectGratingTerminalOrders(const std::shared_ptr<const Dire
         result=e*share;return std::isfinite(share)&&share>=0&&std::isfinite(result)&&result>=0
             &&(!(e>0&&share>0)||result>0);
     };
+    // The authority's powers are binary32, so these sums close to its rounding.
     const auto conserved=[](double a,double b) {
         return std::isfinite(a)&&std::isfinite(b)&&a>=0&&b>=0
-            &&std::abs(a-b)<=2e-10*std::max(a,b);
+            &&std::abs(a-b)<=double(diffractionmaterial::ordercore::distributionConsistencyTolerance)*std::max(a,b);
     };
     for(std::size_t s=0;s<sources.size();++s)for(std::size_t e=0;e<cohort->inputs().size();++e) {
         const auto& binding=*cohort->sources()[s];const auto& sample=sources[s].samples[e];

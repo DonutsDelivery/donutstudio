@@ -1,6 +1,7 @@
 // Tests for the CPU path tracer refraction slice (Plan 3, PT-D): hero
 // wavelength spectral transport, Cauchy dispersion, nested dielectrics, thin
-// sheets, Beer-Lambert absorption and sized lights with MIS.
+// sheets, Beer-Lambert absorption, sized lights with MIS, and the caustics
+// that light tracing carries through glass and gratings.
 
 #include "pathtrace/accumulator.h"
 #include "pathtrace/bsdf.h"
@@ -12,6 +13,8 @@
 #include "pathtrace/scene_ingest.h"
 #include "pathtrace/spectrum.h"
 #include "pathtrace/thread_pool.h"
+#include "diffraction_material_admission.h"
+#include "DiffractionMaterialPresets.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +23,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <utility>
@@ -249,6 +253,7 @@ struct Image
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::vector<Vec3> pixels;
+    std::vector<Vec3> caustic;  // the light-path share of pixels
     pt::RenderStats stats {};
 
     Vec3 at (std::uint32_t x, std::uint32_t y) const { return pixels[static_cast<std::size_t> (y) * width + x]; }
@@ -269,6 +274,8 @@ Image render (const pt::RenderScene& scene, const pt::PinholeCamera& camera, con
         {
             const pt::Rgb v = tracer.accumulator().mean (x, y);
             image.pixels.push_back ({ v.r, v.g, v.b });
+            const pt::Rgb c = tracer.accumulator().splatMean (x, y);
+            image.caustic.push_back ({ c.r, c.g, c.b });
         }
     return image;
 }
@@ -1512,11 +1519,1710 @@ void nonFiniteTests()
     }
 }
 
+// ---------------------------------------------------------------- caustics
+
+// Camera at position looking at target.
+pt::PinholeCamera lookAt (Vec3 position, Vec3 target, float tanHalfFov, std::uint32_t width, std::uint32_t height)
+{
+    return makeCamera (position, fromZTo (pt::normalizeOrZero (position - target)), tanHalfFov, width, height);
+}
+
+// Triangle cross-section in the xy plane, extruded over z in +-halfDepth.
+// Use appendMesh with outwardFrom inside it.
+Mesh prism (const std::array<Vec3, 3>& section, float halfDepth)
+{
+    Mesh mesh;
+    for (const float z : { -halfDepth, halfDepth })
+        for (const Vec3 p : section)
+            mesh.vertices.push_back ({ p.x, p.y, z });
+    mesh.indices = { 0, 1, 2, 3, 4, 5 };
+    for (std::uint32_t a = 0; a < 3; ++a)
+    {
+        const std::uint32_t b = (a + 1) % 3;
+        mesh.indices.insert (mesh.indices.end(), { a, b, b + 3, a, b + 3, a + 3 });
+    }
+    return mesh;
+}
+
+// Torus around the vertical axis through centre. The winding puts every
+// front face outward: cross(d/dv, d/du) is the outward normal.
+Mesh torus (Vec3 centre, float major, float minor, std::uint32_t segments, std::uint32_t sides)
+{
+    Mesh mesh;
+    for (std::uint32_t i = 0; i < segments; ++i)
+    {
+        const float u = 2.0f * pt::kPi * static_cast<float> (i) / static_cast<float> (segments);
+        for (std::uint32_t j = 0; j < sides; ++j)
+        {
+            const float v = 2.0f * pt::kPi * static_cast<float> (j) / static_cast<float> (sides);
+            const float ring = major + minor * std::cos (v);
+            mesh.vertices.push_back (centre + Vec3 { ring * std::cos (u), minor * std::sin (v), ring * std::sin (u) });
+        }
+    }
+    const auto at = [segments, sides] (std::uint32_t i, std::uint32_t j) { return (i % segments) * sides + j % sides; };
+    for (std::uint32_t i = 0; i < segments; ++i)
+        for (std::uint32_t j = 0; j < sides; ++j)
+        {
+            mesh.indices.insert (mesh.indices.end(), { at (i, j), at (i, j + 1), at (i + 1, j) });
+            mesh.indices.insert (mesh.indices.end(), { at (i, j + 1), at (i + 1, j + 1), at (i + 1, j) });
+        }
+    return mesh;
+}
+
+// Floor point seen at pixel (x, y): the centre ray's first hit, when that
+// is one of the scene's first floorTriangles triangles.
+bool floorPoint (const pt::RenderScene& scene, const pt::PinholeCamera& camera, std::uint32_t x, std::uint32_t y,
+                 std::uint32_t floorTriangles, Vec3& point)
+{
+    const pt::Ray ray = camera.generateRay (static_cast<float> (x) + 0.5f, static_cast<float> (y) + 0.5f);
+    pt::Hit hit;
+    if (! scene.bvh.intersect (ray, hit) || hit.triangle >= floorTriangles)
+        return false;
+    point = ray.origin + ray.direction * hit.t;
+    return true;
+}
+
+// Mean grey value of values over the pixels that see the floor inside
+// x0 < x < x1, z0 < z < z1.
+double floorMean (const pt::RenderScene& scene, const pt::PinholeCamera& camera, const std::vector<Vec3>& values,
+                  std::uint32_t floorTriangles, float x0, float x1, float z0, float z1, int& count)
+{
+    double sum = 0.0;
+    count = 0;
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            Vec3 p;
+            if (! floorPoint (scene, camera, x, y, floorTriangles, p) || ! (p.x > x0 && p.x < x1 && p.z > z0 && p.z < z1))
+                continue;
+            sum += meanOf (values[static_cast<std::size_t> (y) * camera.width + x]);
+            ++count;
+        }
+    return sum / std::max (1, count);
+}
+
+// Light-path share of the whole image.
+double causticShare (const Image& image)
+{
+    double splats = 0.0;
+    double total = 0.0;
+    for (std::size_t i = 0; i < image.pixels.size(); ++i)
+    {
+        splats += meanOf (image.caustic[i]);
+        total += meanOf (image.pixels[i]);
+    }
+    return total > 0.0 ? splats / total : 0.0;
+}
+
+const char* const kLightTypeNames[] { "directional", "point", "spot", "environment", "triangle", "rect", "disk" };
+
+// One emitter's splats are all recorded under its type.
+bool splatsOnlyFrom (const pt::RenderStats& stats, pt::LightType type)
+{
+    const auto index = static_cast<std::size_t> (type);
+    return stats.causticSplats > 0 && stats.causticSplatsByLight[index] == stats.causticSplats;
+}
+
+// A floating glass slab under a sun straight overhead. The floor under it is
+// lit only through two interfaces, which camera paths cannot connect to a
+// delta light, so light tracing carries all of it. Every order of internal
+// reflection exits straight down, so the floor receives the slab's
+// transmittance (1 - R) / (1 + R) of the open floor's irradiance, with
+// R = 0.04 at n = 1.5: 0.923.
+void slabCausticTests()
+{
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.5f, 0.5f, 0.5f }), clearGlass (1.5f) };
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 2.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -2.0f }), 0);
+    const Vec3 centre { 0.0f, 1.1f, 0.0f };
+    appendMesh (scene, box ({ -0.5f, 1.0f, -0.5f }, { 0.5f, 1.2f, 0.5f }), 1, &centre);
+    scene.lightRecords = { directionalRecord ({ 0.0f, 1.0f, 0.0f }, 1.0f) };
+    scene.commit();
+    // Below the slab, so the camera sees the floor under it directly. tanHalfFov is
+    // vertical, so this is a horizontal half angle of tan 0.6.
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.8f, 2.5f }, { 0.0f, 0.0f, 0.0f }, 0.4f, 48, 32);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    settings.spectral = pt::SpectralMode::Off;
+    const Image image = render (scene, camera, settings, 64, 11);
+    int underCount = 0;
+    int litCount = 0;
+    const double under = floorMean (scene, camera, image.pixels, 2, -0.35f, 0.35f, -0.35f, 0.35f, underCount);
+    const double underSplats = floorMean (scene, camera, image.caustic, 2, -0.35f, 0.35f, -0.35f, 0.35f, underCount);
+    const double lit = floorMean (scene, camera, image.pixels, 2, 0.8f, 1.6f, -0.35f, 0.35f, litCount);
+    const double litSplats = floorMean (scene, camera, image.caustic, 2, 0.8f, 1.6f, -0.35f, 0.35f, litCount);
+    check (underCount >= 20 && litCount >= 20,
+           "the camera sees the floor under and beside the slab: " + std::to_string (underCount) + ", "
+               + std::to_string (litCount) + " pixels");
+    check (image.stats.nonFiniteSamples == 0 && splatsOnlyFrom (image.stats, pt::LightType::Directional),
+           "slab caustic splats are finite and recorded as directional");
+    check (closeRelative (lit, 0.5 / pt::kPi, 0.03), "the open floor shows the sun's diffuse radiance: " + describe (lit));
+    // About 1800 light paths cross the measured patch, a 2.4% standard
+    // error on 0.923. A camera path counting the same light again would put
+    // the ratio near 1.9, and a missing caustic near 0.
+    check (under > 0.84 * lit && under < 1.0 * lit,
+           "the floor under the slab receives its transmittance: " + describe (under / lit) + " of the open floor");
+    check (underSplats > 0.95 * under, "light paths carry the light under the slab: " + describe (underSplats) + " of "
+                                           + describe (under));
+    check (litSplats < 1.0e-3 * lit, "light paths add nothing to the open floor: " + describe (litSplats));
+
+    settings.causticLightPaths = false;
+    const Image off = render (scene, camera, settings, 16, 11);
+    const double dark = floorMean (scene, camera, off.pixels, 2, -0.35f, 0.35f, -0.35f, 0.35f, underCount);
+    // Camera paths still bring what the slab mirrors down from the open floor: floor,
+    // slab, floor, sun. A Monte Carlo of that path gives 0.0052 of the open floor with a
+    // standard error of 0.0022 over these 34 pixels at 16 samples. Four of those errors
+    // above it is 0.014. The missing caustic itself would be 0.92.
+    check (off.stats.lightPaths == 0 && off.stats.causticSplats == 0 && dark < 0.015 * lit,
+           "without light paths the floor under the slab is dark: " + describe (dark));
+}
+
+// A glass ring over a floor, once per emitter type. The ring's shadow
+// carries the light it refracts, so the light-path share of the image is
+// near the ring's share of the floor's light, about the transmitted 0.85 of
+// the intercepted flux: about 10% under the point and disk lights above
+// it, 4% under the sun and 3% under the uniform sky, whose flux the ring
+// intercepts over half its 4.7 m^2 surface against 29 m^2 of visible floor.
+// 0.005 stays six times below the smallest.
+void ringCausticTests()
+{
+    const Vec3 ringCentre { 0.0f, 1.0f, 0.0f };
+    const Mesh ring = torus (ringCentre, 0.6f, 0.2f, 48, 16);
+    bool outward = true;
+    for (std::size_t i = 0; i + 2 < ring.indices.size(); i += 3)
+    {
+        const Vec3 p0 = ring.vertices[ring.indices[i]];
+        const Vec3 c = (p0 + ring.vertices[ring.indices[i + 1]] + ring.vertices[ring.indices[i + 2]]) * (1.0f / 3.0f);
+        const Vec3 n = pt::cross (ring.vertices[ring.indices[i + 1]] - p0, ring.vertices[ring.indices[i + 2]] - p0);
+        const Vec3 radial = pt::normalizeOrZero (Vec3 { c.x - ringCentre.x, 0.0f, c.z - ringCentre.z });
+        const Vec3 tube = ringCentre + radial * 0.6f;
+        outward = outward && pt::dot (n, c - tube) > 0.0f;
+    }
+    check (outward, "the ring's faces point out of its tube");
+
+    pt::RenderScene base;
+    base.materials = { diffuse ({ 0.8f, 0.8f, 0.8f }), clearGlass (1.5f) };
+    appendMesh (base, quad ({ 0.0f, 0.0f, 0.0f }, { 3.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -3.0f }), 0);
+    appendMesh (base, ring, 1);
+    const pt::PinholeCamera camera = makeCamera ({ 0.0f, 3.0f, 0.0f }, kDown, 0.9f, 32, 32);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    settings.spectral = pt::SpectralMode::Off;
+
+    pt::AreaLightRecord disk;
+    disk.shape = pt::AreaLightShape::Disk;
+    disk.position = { 0.2f, 3.5f, 0.0f };
+    disk.rotation = kDown;
+    disk.sizeX = 0.6f;
+    disk.sizeY = 0.6f;
+    disk.intensity = 4.0f;
+    for (const pt::LightType type : { pt::LightType::Point, pt::LightType::Directional, pt::LightType::Environment,
+                                      pt::LightType::Disk })
+    {
+        pt::RenderScene scene = base;
+        if (type == pt::LightType::Point)
+            scene.lightRecords = { pointRecord ({ 0.3f, 3.5f, 0.2f }, 8.0f) };
+        else if (type == pt::LightType::Directional)
+            scene.lightRecords = { directionalRecord ({ 0.2f, 1.0f, 0.1f }, 1.0f) };
+        else if (type == pt::LightType::Environment)
+            scene.lightRecords = { environmentRecord (0.5f) };
+        else
+            scene.areaLights = { disk };
+        scene.commit();
+        const std::string name = kLightTypeNames[static_cast<std::size_t> (type)];
+        check (scene.anyMediumBoundary && scene.lights.size() == 1, name + ": one light over a glass ring");
+        const Image image = render (scene, camera, settings, 32, 5);
+        const double share = causticShare (image);
+        bool finite = true;
+        for (const Vec3 p : image.pixels)
+            finite = finite && pt::isFinite (p);
+        check (image.stats.nonFiniteSamples == 0 && finite, name + ": the ring renders finite pixels");
+        check (image.stats.lightPaths == 32u * 32u * 32u, name + ": one light path per camera sample");
+        check (splatsOnlyFrom (image.stats, type),
+               name + ": the ring's caustic splats are recorded under the " + name + " light: "
+                   + std::to_string (image.stats.causticSplats));
+        check (share > 0.005 && share < 0.5, name + ": the ring's caustic carries " + describe (share) + " of the image");
+    }
+}
+
+// Dispersion across two interfaces: a 30 degree wedge under a sun straight
+// overhead. Light enters the tilted top and leaves through the flat bottom
+// bent toward +x, blue more than red, so the caustic's blue centroid lies
+// past its red one on the floor 1 m below. Snell's law at 450 and 650 nm
+// predicts the separation. The RGB channels overlap in wavelength, but their
+// negative lobes push the centroids apart again, to about the prediction.
+void dispersionCausticTests()
+{
+    const float cauchyB = 0.05f;
+    const float alpha = 30.0f * static_cast<float> (kDegree);
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.8f, 0.8f, 0.8f }), clearGlass (1.5f, cauchyB) };
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 2.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -2.0f }), 0);
+    const std::array<Vec3, 3> section { { { -0.5f, 1.0f, 0.0f }, { 0.5f, 1.0f, 0.0f },
+                                          { 0.5f, 1.0f + std::tan (alpha), 0.0f } } };
+    const Vec3 inside { 0.17f, 1.19f, 0.0f };
+    appendMesh (scene, prism (section, 1.0f), 1, &inside);
+    scene.lightRecords = { directionalRecord ({ 0.0f, 1.0f, 0.0f }, 1.0f) };
+    scene.commit();
+    check (scene.anyDispersive, "the wedge is dispersive");
+
+    const auto floorShift = [&] (float nm) {
+        const float n = pt::cauchyIor (1.5f, cauchyB, nm);
+        Vec3 inGlass;
+        Vec3 out;
+        if (! refractDirection ({ 0.0f, -1.0f, 0.0f }, { -std::sin (alpha), std::cos (alpha), 0.0f }, n, inGlass)
+            || ! refractDirection (inGlass, { 0.0f, 1.0f, 0.0f }, 1.0 / n, out))
+            return 0.0;
+        return static_cast<double> (out.x) / static_cast<double> (-out.y);
+    };
+    const double predicted = floorShift (450.0f) - floorShift (650.0f);
+    check (predicted > 0.05, "Snell's law spreads 450 and 650 nm by " + describe (predicted) + " m on the floor");
+
+    const pt::PinholeCamera camera = lookAt ({ 0.3f, 0.9f, 2.5f }, { 0.3f, 0.0f, -0.2f }, 0.5f, 64, 40);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    const Image image = render (scene, camera, settings, 32, 13);
+    check (image.stats.spectral && image.stats.nonFiniteSamples == 0, "the wedge renders spectrally and finite");
+    check (splatsOnlyFrom (image.stats, pt::LightType::Directional), "the wedge's caustic is recorded as directional");
+    double red = 0.0, redX = 0.0, blue = 0.0, blueX = 0.0;
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            Vec3 p;
+            if (! floorPoint (scene, camera, x, y, 2, p) || ! (p.x > -0.6f && p.x < 1.2f && std::fabs (p.z) < 0.9f))
+                continue;
+            const Vec3 c = image.caustic[static_cast<std::size_t> (y) * camera.width + x];
+            red += c.x;
+            redX += static_cast<double> (c.x) * p.x;
+            blue += c.z;
+            blueX += static_cast<double> (c.z) * p.x;
+        }
+    check (red > 0.0 && blue > 0.0, "the wedge's caustic reaches the floor: " + describe (red) + ", " + describe (blue));
+    const double separation = blue > 0.0 && red > 0.0 ? blueX / blue - redX / red : 0.0;
+    check (separation > 0.2 * predicted && separation < 1.2 * predicted,
+           "the caustic's blue lands past its red by " + describe (separation) + " m of " + describe (predicted));
+
+    // The caster splits white light but adds no colour, so the caustic's total
+    // stays white, while its two sides differ. Counting only the positive part
+    // of each wavelength's colour makes the red total 1.48 / 1.12 = 1.32 times
+    // the green and washes the sides out.
+    std::array<double, 3> total { 0.0, 0.0, 0.0 };
+    std::array<double, 3> nearSide { 0.0, 0.0, 0.0 };
+    std::array<double, 3> farSide { 0.0, 0.0, 0.0 };
+    const double middle = 0.5 * (blueX / blue + redX / red);
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            Vec3 p;
+            if (! floorPoint (scene, camera, x, y, 2, p) || ! (p.x > -0.6f && p.x < 1.2f && std::fabs (p.z) < 0.9f))
+                continue;
+            const Vec3 c = image.caustic[static_cast<std::size_t> (y) * camera.width + x];
+            auto& side = p.x < middle ? nearSide : farSide;
+            const std::array<double, 3> channels { c.x, c.y, c.z };
+            for (std::size_t k = 0; k < 3; ++k)
+            {
+                total[k] += channels[k];
+                side[k] += channels[k];
+            }
+        }
+    check (closeRelative (total[0], total[1], 0.15) && closeRelative (total[2], total[1], 0.15),
+           "the dispersive caustic's total stays white: " + describe (total[0]) + ", " + describe (total[1]) + ", "
+               + describe (total[2]));
+    const double nearRatio = nearSide[0] / std::max (std::fabs (nearSide[2]), 1.0e-9);
+    const double farRatio = farSide[0] / std::max (std::fabs (farSide[2]), 1.0e-9);
+    // The 8 cm split on a beam about 1 m wide moves 4% of each band across the
+    // middle: about 0.54 / 0.46 = 1.17 and its inverse.
+    check (nearRatio > 1.05 && farRatio < 0.95,
+           "the caustic is red on its near side and blue on its far side: red over blue "
+               + describe (nearRatio) + ", " + describe (farRatio));
+}
+
+// Light leaving after total internal reflection: a 45-45-90 prism turns a
+// horizontal sun straight down. It enters and leaves at normal incidence and
+// reflects totally at the hypotenuse (45 degrees past the 41.8 critical
+// angle), so the floor under it receives (1 - R)^2 = 0.9216 of the sun. The
+// sun grazes the floor itself, so nothing else lights it.
+void tirCausticTests()
+{
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.8f, 0.8f, 0.8f }), clearGlass (1.5f) };
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 2.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -2.0f }), 0);
+    const std::array<Vec3, 3> section { { { 0.5f, 1.5f, 0.0f }, { 0.5f, 2.5f, 0.0f }, { -0.5f, 1.5f, 0.0f } } };
+    const Vec3 inside { 0.17f, 1.83f, 0.0f };
+    appendMesh (scene, prism (section, 1.0f), 1, &inside);
+    scene.lightRecords = { directionalRecord ({ 1.0f, 0.0f, 0.0f }, 1.0f) };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 1.2f, 3.0f }, { 0.0f, 0.0f, 0.0f }, 0.5f, 48, 32);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    settings.spectral = pt::SpectralMode::Off;
+    const double expected = 0.9216 * 0.8 / pt::kPi;
+
+    // About 3600 light paths cross the measured patch: a 1.7% standard error.
+    const Image image = render (scene, camera, settings, 64, 17);
+    int count = 0;
+    const double patch = floorMean (scene, camera, image.pixels, 2, -0.35f, 0.35f, -0.8f, 0.8f, count);
+    check (count >= 20, "the camera sees the floor under the prism: " + std::to_string (count) + " pixels");
+    check (image.stats.nonFiniteSamples == 0 && splatsOnlyFrom (image.stats, pt::LightType::Directional),
+           "the prism's caustic is finite and recorded as directional");
+    check (patch > 0.9 * expected && patch < 1.08 * expected,
+           "light leaving after total internal reflection lights the floor: " + describe (patch) + " vs "
+               + describe (expected));
+
+    settings.causticLightPaths = false;
+    const Image off = render (scene, camera, settings, 16, 17);
+    const double dark = floorMean (scene, camera, off.pixels, 2, -0.35f, 0.35f, -0.8f, 0.8f, count);
+    check (dark < 1.0e-3 * expected, "without light paths the floor under the prism is dark: " + describe (dark));
+}
+
+// A grooved disc: a fan of triangles whose radial first edges give the
+// grating its groove frame, bound to the aluminium grating. Under a point
+// light its orders reflect onto a wall behind it. The disc intercepts about
+// 0.2 sr of the light against about 1.2 sr for the wall, so the reflected
+// orders give the wall over 10% of its light; 0.005 is a twentieth of that.
+void gratingCausticTests()
+{
+    std::string error;
+    const auto admitted = diffractionmaterial::admit (diffractionmaterial::makeAluminiumBinaryGratingPreset(), error);
+    check (admitted.has_value(), "the aluminium binary grating preset admits: " + error);
+    if (! admitted)
+        return;
+
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.8f, 0.8f, 0.8f }), diffuse ({ 0.2f, 0.2f, 0.2f }) };
+    appendMesh (scene, quad ({ 0.0f, 1.5f, -1.5f }, { 2.0f, 0.0f, 0.0f }, { 0.0f, 1.5f, 0.0f }), 0);
+    Mesh disc;
+    const Vec3 discCentre { 0.0f, 0.05f, 0.0f };
+    disc.vertices.push_back (discCentre);
+    constexpr std::uint32_t kSegments = 48;
+    for (std::uint32_t k = 0; k < kSegments; ++k)
+    {
+        const float phi = 2.0f * pt::kPi * static_cast<float> (k) / static_cast<float> (kSegments);
+        disc.vertices.push_back (discCentre + Vec3 { 0.5f * std::cos (phi), 0.0f, 0.5f * std::sin (phi) });
+    }
+    // (centre, next, this) faces up.
+    for (std::uint32_t k = 0; k < kSegments; ++k)
+        disc.indices.insert (disc.indices.end(), { 0u, 1 + (k + 1) % kSegments, 1 + k });
+    appendMesh (scene, disc, 1);
+    scene.gratingMaterials = { std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR> (*admitted) };
+    scene.gratings = { { 1u, scene.gratingMaterials[0]->description() } };
+    scene.lightRecords = { pointRecord ({ 0.0f, 1.5f, 1.0f }, 8.0f) };
+    scene.commit();
+    check (! scene.anyMediumBoundary, "light tracing runs for the grating alone");
+
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 1.5f, 3.0f }, { 0.0f, 1.5f, -1.5f }, 0.6f, 48, 32);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    const Image image = render (scene, camera, settings, 32, 19);
+    const double share = causticShare (image);
+    check (image.stats.spectral && image.stats.nonFiniteSamples == 0, "the grooved disc renders spectrally and finite");
+    check (splatsOnlyFrom (image.stats, pt::LightType::Point),
+           "the grooved disc's orders splat as point light: " + std::to_string (image.stats.causticSplats));
+    check (share > 0.005 && share < 0.5, "the grooved disc's orders carry " + describe (share) + " of the image");
+
+    settings.causticLightPaths = false;
+    const Image off = render (scene, camera, settings, 8, 19);
+    check (off.stats.lightPaths == 0 && causticShare (off) == 0.0, "the setting turns grating light paths off");
+}
+
+// A rough grating faces the camera with a small lamp behind the camera, in a black room.
+// Sigma = 2 x 0.02 = 0.04 rad, and the lamp subtends 0.15 / 4 = 0.0375 rad on a side.
+// Without a light sample an order reaches the lamp by chance, in about 0.0014 / 0.01 of
+// its samples (lamp solid angle against 2 pi sigma^2), so a pixel in the arm averages few
+// large hits. Noise is the RMS difference of two seeds; its standard error sets the mean's
+// tolerance. A light sample needs more than half the noise gone to count; the true gain
+// is far larger, so 0.5 does not sit near the result.
+void gratingOrderLightSamplingTests()
+{
+    std::string error;
+    auto description = diffractionmaterial::makeAluminiumBinaryGratingPreset();
+    description.roughness.rmsSlope = 0.02f;
+    const auto admitted = diffractionmaterial::admit (description, error);
+    check (admitted.has_value(), "the rough grating admits: " + error);
+    if (! admitted)
+        return;
+
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.0f, 0.0f, 0.0f }), lamp (200.0f) };
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 1.5f, 0.0f, 0.0f }, { 0.0f, 1.5f, 0.0f }), 0);
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 4.0f }, { 0.0f, 0.075f, 0.0f }, { 0.075f, 0.0f, 0.0f }), 1);
+    scene.gratingMaterials = { std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR> (*admitted) };
+    scene.gratings = { { 0u, scene.gratingMaterials[0]->description() } };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.0f, 2.0f }, { 0.0f, 0.0f, 0.0f }, 0.9f, 48, 48);
+
+    const auto rendered = [&] (pt::LightStrategy strategy, std::uint64_t generation) {
+        pt::IntegratorSettings settings;
+        settings.maxDepth = 4;
+        settings.causticLightPaths = false;
+        settings.strategy = strategy;
+        return render (scene, camera, settings, 64, generation);
+    };
+    const auto meanOfImage = [] (const Image& image) {
+        double total = 0.0;
+        for (const Vec3 pixel : image.pixels)
+            total += meanOf (pixel);
+        return total / static_cast<double> (image.pixels.size());
+    };
+    const auto noiseBetween = [] (const Image& a, const Image& b) {
+        double total = 0.0;
+        for (std::size_t i = 0; i < a.pixels.size(); ++i)
+        {
+            const double difference = meanOf (a.pixels[i]) - meanOf (b.pixels[i]);
+            total += difference * difference;
+        }
+        return std::sqrt (total / static_cast<double> (a.pixels.size()));
+    };
+    const Image chance1 = rendered (pt::LightStrategy::BsdfOnly, 31);
+    const Image chance2 = rendered (pt::LightStrategy::BsdfOnly, 32);
+    const Image sampled1 = rendered (pt::LightStrategy::MultipleImportance, 31);
+    const Image sampled2 = rendered (pt::LightStrategy::MultipleImportance, 32);
+    const Image lightOnly = rendered (pt::LightStrategy::LightOnly, 31);
+    check (sampled1.stats.nonFiniteSamples == 0 && chance1.stats.nonFiniteSamples == 0, "a lit grating stays finite");
+
+    const double chanceNoise = noiseBetween (chance1, chance2);
+    const double sampledNoise = noiseBetween (sampled1, sampled2);
+    check (meanOfImage (sampled1) > 0.0, "the grating shows the lamp");
+    check (sampledNoise < 0.5 * chanceNoise,
+           "a light sample through the orders cuts the noise: " + describe (sampledNoise) + " from " + describe (chanceNoise));
+
+    // Means over 2304 pixels: the image's standard error is the per-pixel difference over
+    // sqrt (2 x 2304), and 4 of them leaves room for a true fluctuation only.
+    const double tolerance = 4.0 * chanceNoise / std::sqrt (2.0 * 2304.0);
+    const double chanceMean = 0.5 * (meanOfImage (chance1) + meanOfImage (chance2));
+    check (std::abs (meanOfImage (sampled1) - chanceMean) < tolerance,
+           "MIS keeps the mean: " + describe (meanOfImage (sampled1)) + " against " + describe (chanceMean));
+    check (std::abs (meanOfImage (lightOnly) - chanceMean) < tolerance,
+           "light sampling alone keeps the mean: " + describe (meanOfImage (lightOnly)) + " against " + describe (chanceMean));
+
+    // Energy: under a uniform environment of radiance 1 the grating returns its reflected
+    // power and no more, by either estimator, and an aluminium surface returns under 1.
+    pt::RenderScene furnace;
+    furnace.materials = { diffuse ({ 0.0f, 0.0f, 0.0f }) };
+    appendMesh (furnace, quad ({ 0.0f, 0.0f, 0.0f }, { 1.5f, 0.0f, 0.0f }, { 0.0f, 1.5f, 0.0f }), 0);
+    furnace.gratingMaterials = scene.gratingMaterials;
+    furnace.gratings = { { 0u, furnace.gratingMaterials[0]->description() } };
+    furnace.lightRecords = { environmentRecord (1.0f) };
+    furnace.commit();
+    const pt::PinholeCamera inside = lookAt ({ 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f }, 0.5f, 16, 16);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 2;
+    settings.causticLightPaths = false;
+    settings.environmentVisibleToCamera = false;
+    settings.strategy = pt::LightStrategy::BsdfOnly;
+    const double scattered = meanOfImage (render (furnace, inside, settings, 256, 33));
+    settings.strategy = pt::LightStrategy::MultipleImportance;
+    const double weighted = meanOfImage (render (furnace, inside, settings, 256, 33));
+    check (scattered > 0.3 && scattered < 1.0 && weighted < 1.0,
+           "the grating's furnace stays under 1: " + describe (scattered) + " and " + describe (weighted));
+    check (std::abs (weighted - scattered) < 0.01,
+           "the furnace is the same with a light sample: " + describe (weighted) + " against " + describe (scattered));
+}
+
+// A pressed disc has no roughness, so its orders and mirror are deltas and its pit scatter is
+// the only lobe a light sample can serve. A small lamp away from every order lights the scatter
+// alone. The same rule as above: same mean as scatter sampling, with more than half the noise gone.
+void pitScatterLightSamplingTests()
+{
+    std::string error;
+    auto description = diffractionmaterial::makeAluminiumBinaryGratingPreset();
+    description.geometry.grooveSpacingNanometres = 1600.0f;
+    description.microstructure.grooveDepthNanometres = 124.1f;
+    description.microstructure.dutyCycle = 0.3125f;
+    description.pitStatistics = diffractionmaterial::PitStatistics::PressedDisc;
+    description.roughness.rmsSlope = 0.0f;
+    description.spectrum.lastOrder = 3;
+    const auto admitted = diffractionmaterial::admit (description, error);
+    check (admitted.has_value(), "the pressed disc admits: " + error);
+    if (! admitted)
+        return;
+
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.0f, 0.0f, 0.0f }), lamp (200.0f) };
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 1.5f, 0.0f, 0.0f }, { 0.0f, 1.5f, 0.0f }), 0);
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 4.0f }, { 0.0f, 0.075f, 0.0f }, { 0.075f, 0.0f, 0.0f }), 1);
+    scene.gratingMaterials = { std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR> (*admitted) };
+    scene.gratings = { { 0u, scene.gratingMaterials[0]->description() } };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.0f, 2.0f }, { 0.0f, 0.0f, 0.0f }, 0.9f, 48, 48);
+
+    const auto rendered = [&] (pt::LightStrategy strategy, std::uint64_t generation) {
+        pt::IntegratorSettings settings;
+        settings.maxDepth = 4;
+        settings.causticLightPaths = false;
+        settings.strategy = strategy;
+        return render (scene, camera, settings, 64, generation);
+    };
+    const auto meanOfImage = [] (const Image& image) {
+        double total = 0.0;
+        for (const Vec3 pixel : image.pixels)
+            total += meanOf (pixel);
+        return total / static_cast<double> (image.pixels.size());
+    };
+    // The light sample covers pit scatter only. At slope 0 the mirror and the orders are
+    // deltas that hit the lamp by chance of wavelength, in either strategy. So measure where
+    // none of them can reach it: the lamp's offset from the mirror direction, in direction
+    // cosines, clears the mirror and stays under the first order's 380 / 1600 nm whatever the
+    // groove axis. The margin 0.055 is the lamp's half diagonal at 4 units, 0.027, plus half
+    // a pixel, 0.028.
+    std::vector<std::size_t> scatterOnly;
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            const pt::Ray ray = camera.generateRay (static_cast<float> (x) + 0.5f, static_cast<float> (y) + 0.5f);
+            const Vec3 p = ray.origin + ray.direction * (-ray.origin.z / ray.direction.z);
+            const float radius = std::sqrt (p.x * p.x + p.y * p.y);
+            const float offset = radius * (1.0f / std::sqrt (radius * radius + 4.0f) + 1.0f / std::sqrt (radius * radius + 16.0f));
+            if (offset > 0.055f && offset < 380.0f / 1600.0f - 0.055f)
+                scatterOnly.push_back (static_cast<std::size_t> (y) * camera.width + x);
+        }
+    check (scatterOnly.size() >= 20, "pit scatter alone reaches the lamp over enough pixels: " + std::to_string (scatterOnly.size()));
+    const auto noiseBetween = [&scatterOnly] (const Image& a, const Image& b) {
+        double total = 0.0;
+        for (const std::size_t i : scatterOnly)
+        {
+            const double difference = meanOf (a.pixels[i]) - meanOf (b.pixels[i]);
+            total += difference * difference;
+        }
+        return std::sqrt (total / static_cast<double> (std::max<std::size_t> (scatterOnly.size(), 1)));
+    };
+    const Image chance1 = rendered (pt::LightStrategy::BsdfOnly, 41);
+    const Image chance2 = rendered (pt::LightStrategy::BsdfOnly, 42);
+    const Image sampled1 = rendered (pt::LightStrategy::MultipleImportance, 41);
+    const Image sampled2 = rendered (pt::LightStrategy::MultipleImportance, 42);
+    check (sampled1.stats.nonFiniteSamples == 0 && chance1.stats.nonFiniteSamples == 0, "a lit pressed disc stays finite");
+
+    const double chanceNoise = noiseBetween (chance1, chance2);
+    const double sampledNoise = noiseBetween (sampled1, sampled2);
+    check (meanOfImage (sampled1) > 0.0, "the pit scatter shows the lamp");
+    check (sampledNoise < 0.5 * chanceNoise,
+           "a light sample through the pit scatter cuts the noise: " + describe (sampledNoise) + " from " + describe (chanceNoise));
+    const double tolerance = 4.0 * chanceNoise / std::sqrt (2.0 * static_cast<double> (std::max<std::size_t> (scatterOnly.size(), 1)));
+    const auto meanOfScatter = [&scatterOnly] (const Image& image) {
+        double total = 0.0;
+        for (const std::size_t i : scatterOnly)
+            total += meanOf (image.pixels[i]);
+        return total / static_cast<double> (std::max<std::size_t> (scatterOnly.size(), 1));
+    };
+    const double chanceMean = 0.5 * (meanOfScatter (chance1) + meanOfScatter (chance2));
+    check (std::abs (meanOfScatter (sampled1) - chanceMean) < tolerance,
+           "MIS keeps the pit scatter's mean: " + describe (meanOfScatter (sampled1)) + " against " + describe (chanceMean));
+}
+
+// Roughness across one groove family stretches a lamp's mirror image into a line along
+// that family's axis. At slope 0.15 the line's sigma is 0.3 rad against 0.04 across it, so
+// its second moment must beat the other axis's by far more than the 3 asked here, and
+// light sampling must keep the mean the scatter sampling gets on its own.
+void gratingAcrossGrooveRoughnessTests()
+{
+    std::string error;
+    auto description = diffractionmaterial::makeAluminiumBinaryGratingPreset();
+    description.roughness.rmsSlope = 0.02f;
+    description.roughness.acrossGrooveSlope = 0.15f;
+    const auto admitted = diffractionmaterial::admit (description, error);
+    check (admitted.has_value(), "the grating with roughness across its grooves admits: " + error);
+    if (! admitted)
+        return;
+
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.0f, 0.0f, 0.0f }), lamp (200.0f) };
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 1.5f, 0.0f, 0.0f }, { 0.0f, 1.5f, 0.0f }), 0);
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 4.0f }, { 0.0f, 0.075f, 0.0f }, { 0.075f, 0.0f, 0.0f }), 1);
+    scene.gratingMaterials = { std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR> (*admitted) };
+    scene.gratings = { { 0u, scene.gratingMaterials[0]->description() } };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.0f, 2.0f }, { 0.0f, 0.0f, 0.0f }, 0.9f, 48, 48);
+    const auto rendered = [&] (pt::LightStrategy strategy, std::uint64_t generation) {
+        pt::IntegratorSettings settings;
+        settings.maxDepth = 4;
+        settings.causticLightPaths = false;
+        settings.strategy = strategy;
+        return render (scene, camera, settings, 64, generation);
+    };
+    const Image sampled = rendered (pt::LightStrategy::MultipleImportance, 41);
+    const Image chance1 = rendered (pt::LightStrategy::BsdfOnly, 41);
+    const Image chance2 = rendered (pt::LightStrategy::BsdfOnly, 42);
+    double total = 0.0, momentX = 0.0, momentY = 0.0, noise = 0.0, chanceMean = 0.0;
+    for (std::uint32_t y = 0; y < 48; ++y)
+        for (std::uint32_t x = 0; x < 48; ++x)
+        {
+            const double v = meanOf (sampled.at (x, y));
+            const double a = meanOf (chance1.at (x, y)), b = meanOf (chance2.at (x, y));
+            total += v;
+            momentX += v * (x - 23.5) * (x - 23.5);
+            momentY += v * (y - 23.5) * (y - 23.5);
+            noise += (a - b) * (a - b);
+            chanceMean += 0.5 * (a + b);
+        }
+    check (total > 0.0 && sampled.stats.nonFiniteSamples == 0, "the rough grating shows the lamp, finite");
+    const double longer = std::max (momentX, momentY), shorter = std::min (momentX, momentY);
+    check (longer > 3.0 * shorter, "the lamp's image is a line: moments " + describe (longer) + " and " + describe (shorter));
+    const double tolerance = 4.0 * std::sqrt (noise / 2304.0) / std::sqrt (2.0 * 2304.0);
+    check (std::abs (total - chanceMean) / 2304.0 < tolerance,
+           "the light sample keeps the line's mean: " + describe (total / 2304.0) + " against " + describe (chanceMean / 2304.0));
+}
+
+// ---------------------------------------------------------------- authored normals
+
+// Appends one triangle whose stored vertex normals are the given ones.
+void appendShadedTriangle (pt::RenderScene& scene, std::array<Vec3, 3> positions, std::array<Vec3, 3> normals, bool authored,
+                           std::uint32_t material = 0)
+{
+    pt::TriangleAttributes attributes;
+    attributes.materialIndex = material;
+    attributes.geometricNormal = pt::normalizeOrZero (pt::cross (positions[1] - positions[0], positions[2] - positions[0]));
+    attributes.shadingNormals = normals;
+    attributes.hasShadingNormals = true;
+    attributes.authoredShading = authored;
+    for (const Vec3 p : positions)
+    {
+        scene.geometry.positions.push_back (p);
+        scene.geometry.bounds.grow (p);
+    }
+    scene.geometry.triangles.push_back (attributes);
+}
+
+// An eight sided prism along y, lit from 70 degrees off the camera, with radial
+// vertex normals: the coarse mesh shaded smooth.
+// The same disc under a clear body, as the Grooved Disc starter has it. A shadow ray stops at the
+// body's top, so the lamp is reached only through the refracted line planarExitTo solves. One
+// flat top: same mean as scattering alone, with more than half the noise gone. Past a second slab
+// the line is blocked, and an arched top often has none: both keep to scattering, same mean.
+void pitScatterThroughFlatTopTests()
+{
+    std::string error;
+    auto description = diffractionmaterial::makeAluminiumBinaryGratingPreset();
+    description.geometry.grooveSpacingNanometres = 1600.0f;
+    description.microstructure.grooveDepthNanometres = 124.1f;
+    description.microstructure.dutyCycle = 0.3125f;
+    description.pitStatistics = diffractionmaterial::PitStatistics::PressedDisc;
+    description.roughness.rmsSlope = 0.0f;
+    description.spectrum.lastOrder = 3;
+    const auto admitted = diffractionmaterial::admit (description, error);
+    check (admitted.has_value(), "the pressed disc admits: " + error);
+    if (! admitted)
+        return;
+
+    enum class Top { flat, secondSlab, arched };
+    const auto sceneWith = [&] (Top top) {
+        pt::RenderScene scene;
+        scene.materials = { diffuse ({ 0.0f, 0.0f, 0.0f }), lamp (200.0f), clearGlass (1.5f) };
+        appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 1.5f, 0.0f, 0.0f }, { 0.0f, 1.5f, 0.0f }), 0);
+        appendMesh (scene, quad ({ 0.0f, 0.0f, 4.0f }, { 0.0f, 0.075f, 0.0f }, { 0.075f, 0.0f, 0.0f }), 1);
+        if (top == Top::arched)
+        {
+            // Flat-shaded strips along an arc, narrower than the body is deep, so the line to a
+            // lamp often leaves the strip the straight line met.
+            const auto archHeight = [] (float x) { return 0.05f + 0.25f * (1.0f - x * x / 4.0f); };
+            for (int strip = -20; strip < 20; ++strip)
+            {
+                const float x0 = 0.1f * static_cast<float> (strip);
+                const float x1 = x0 + 0.1f;
+                const Vec3 centre { 0.5f * (x0 + x1), 0.0f, 0.5f * (archHeight (x0) + archHeight (x1)) };
+                appendMesh (scene, quad (centre, { 0.05f, 0.0f, 0.5f * (archHeight (x1) - archHeight (x0)) }, { 0.0f, 2.0f, 0.0f }), 2);
+            }
+        }
+        else
+            appendMesh (scene, box ({ -2.0f, -2.0f, -0.02f }, { 2.0f, 2.0f, 0.05f }), 2);
+        if (top == Top::secondSlab)
+            appendMesh (scene, box ({ -2.0f, -2.0f, 0.2f }, { 2.0f, 2.0f, 0.25f }), 2);
+        scene.gratingMaterials = { std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR> (*admitted) };
+        scene.gratings = { { 0u, scene.gratingMaterials[0]->description() } };
+        scene.commit();
+        return scene;
+    };
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.0f, 2.0f }, { 0.0f, 0.0f, 0.0f }, 0.9f, 48, 48);
+    std::vector<std::size_t> scatterOnly;
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            const pt::Ray ray = camera.generateRay (static_cast<float> (x) + 0.5f, static_cast<float> (y) + 0.5f);
+            const Vec3 p = ray.origin + ray.direction * (-ray.origin.z / ray.direction.z);
+            const float radius = std::sqrt (p.x * p.x + p.y * p.y);
+            const float offset = radius * (1.0f / std::sqrt (radius * radius + 4.0f) + 1.0f / std::sqrt (radius * radius + 16.0f));
+            if (offset > 0.055f && offset < 380.0f / 1600.0f - 0.055f)
+                scatterOnly.push_back (static_cast<std::size_t> (y) * camera.width + x);
+        }
+    const auto rendered = [&] (const pt::RenderScene& scene, pt::LightStrategy strategy, std::uint64_t generation) {
+        pt::IntegratorSettings settings;
+        settings.causticLightPaths = false;
+        settings.strategy = strategy;
+        return render (scene, camera, settings, 16, generation);
+    };
+    const auto meanOver = [&scatterOnly] (const Image& image) {
+        double total = 0.0;
+        for (const std::size_t i : scatterOnly)
+            total += meanOf (image.pixels[i]);
+        return total / static_cast<double> (std::max<std::size_t> (scatterOnly.size(), 1));
+    };
+    const auto noiseBetween = [&scatterOnly] (const Image& a, const Image& b) {
+        double total = 0.0;
+        for (const std::size_t i : scatterOnly)
+        {
+            const double difference = meanOf (a.pixels[i]) - meanOf (b.pixels[i]);
+            total += difference * difference;
+        }
+        return std::sqrt (total / static_cast<double> (std::max<std::size_t> (scatterOnly.size(), 1)));
+    };
+    // 16 samples seldom hit so small a lamp by chance: a single pair of frames can show no hit at
+    // all, which reads as no noise. So 20 pairs, 16 samples each, and the mean over all 40.
+    const Top tops[] = { Top::flat, Top::secondSlab, Top::arched };
+    const char* names[] = { "a flat top", "a second slab", "an arched top" };
+    for (int t = 0; t < 3; ++t)
+    {
+        const pt::RenderScene scene = sceneWith (tops[t]);
+        const std::string name = names[t];
+        double chanceNoise = 0.0, sampledNoise = 0.0;
+        std::vector<double> difference;
+        bool finite = true;
+        for (std::uint64_t pair = 0; pair < 20; ++pair)
+        {
+            const Image chance1 = rendered (scene, pt::LightStrategy::BsdfOnly, 100 + 2 * pair);
+            const Image chance2 = rendered (scene, pt::LightStrategy::BsdfOnly, 101 + 2 * pair);
+            const Image sampled1 = rendered (scene, pt::LightStrategy::MultipleImportance, 100 + 2 * pair);
+            const Image sampled2 = rendered (scene, pt::LightStrategy::MultipleImportance, 101 + 2 * pair);
+            finite = finite && sampled1.stats.nonFiniteSamples == 0 && sampled2.stats.nonFiniteSamples == 0;
+            const double chanceBetween = noiseBetween (chance1, chance2);
+            const double sampledBetween = noiseBetween (sampled1, sampled2);
+            chanceNoise += chanceBetween * chanceBetween / 20.0;
+            sampledNoise += sampledBetween * sampledBetween / 20.0;
+            difference.push_back (meanOver (sampled1) - meanOver (chance1));
+            difference.push_back (meanOver (sampled2) - meanOver (chance2));
+        }
+        chanceNoise = std::sqrt (chanceNoise);
+        sampledNoise = std::sqrt (sampledNoise);
+        double shift = 0.0, spread = 0.0;
+        for (const double d : difference)
+            shift += d / static_cast<double> (difference.size());
+        for (const double d : difference)
+            spread += (d - shift) * (d - shift) / static_cast<double> (difference.size() - 1);
+        const double standardError = std::sqrt (spread / static_cast<double> (difference.size()));
+        std::cout << name << ": noise " << chanceNoise << " to " << sampledNoise << ", mean shift " << shift << " +- " << standardError << "\n";
+        check (finite, name + " stays finite");
+        check (std::abs (shift) <= 4.0 * standardError, name + " keeps the mean: shift " + describe (shift) + " against " + describe (standardError));
+        if (tops[t] == Top::flat)
+            check (sampledNoise < 0.5 * chanceNoise,
+                   "a light sample through the flat top cuts the noise: " + describe (sampledNoise) + " from " + describe (chanceNoise));
+    }
+}
+
+// A diffuse plate under a clear body, as a pressed disc's hub is, lit only through both faces.
+// The light sample must keep the mean of scattering alone.
+void lightSampleThroughSlabTests()
+{
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.0f, 2.0f }, { 0.0f, 0.0f, 0.0f }, 0.9f, 48, 48);
+    struct Case { const char* name; pt::Material body; float top; Vec3 lamp; bool blocker; bool cutsNoise; };
+    pt::Material tinted = clearGlass (1.5f);
+    tinted.baseColor = { 0.6f, 0.8f, 0.9f };
+    const Case cases[] = {
+        { "a thin body", clearGlass (1.5f), 0.1f, { 0.0f, 0.0f, 4.0f }, false, true },
+        { "a thick body", clearGlass (1.5f), 0.8f, { 0.0f, 0.0f, 4.0f }, false, true },
+        { "an oblique lamp", clearGlass (1.5f), 0.4f, { 3.0f, 0.0f, 2.0f }, false, true },
+        { "a tinted body", tinted, 0.4f, { 0.0f, 0.0f, 4.0f }, false, true },
+        { "a dispersive body", clearGlass (1.5f, 0.02f), 0.4f, { 0.0f, 0.0f, 4.0f }, false, true },
+        { "a sheet inside the body", clearGlass (1.5f), 0.4f, { 0.0f, 0.0f, 4.0f }, true, false },
+    };
+    for (const Case& c : cases)
+    {
+        pt::RenderScene scene;
+        scene.materials = { diffuse ({ 0.5f, 0.5f, 0.5f }), lamp (40.0f), c.body };
+        appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 2.0f, 0.0f, 0.0f }, { 0.0f, 2.0f, 0.0f }), 0);
+        appendMesh (scene, quad (c.lamp, { 0.0f, 0.3f, 0.0f }, { 0.3f, 0.0f, 0.0f }), 1);
+        const Vec3 bodyCentre { 0.0f, 0.0f, 0.5f * (0.05f + c.top) };
+        appendMesh (scene, box ({ -6.0f, -6.0f, 0.05f }, { 6.0f, 6.0f, c.top }), 2, &bodyCentre);
+        if (c.blocker)
+            appendMesh (scene, quad ({ 0.5f, 0.0f, 0.5f * (0.05f + c.top) }, { 0.5f, 0.0f, 0.0f }, { 0.0f, 2.0f, 0.0f }), 0);
+        scene.commit();
+        const auto rendered = [&] (pt::LightStrategy strategy, std::uint64_t generation) {
+            pt::IntegratorSettings settings;
+            settings.causticLightPaths = false;
+            settings.strategy = strategy;
+            return render (scene, camera, settings, 16, generation);
+        };
+        const auto meanOver = [] (const Image& image) {
+            double total = 0.0;
+            for (const auto& pixel : image.pixels)
+                total += meanOf (pixel);
+            return total / static_cast<double> (image.pixels.size());
+        };
+        const auto noiseBetween = [] (const Image& a, const Image& b) {
+            double total = 0.0;
+            for (std::size_t i = 0; i < a.pixels.size(); ++i)
+            {
+                const double difference = meanOf (a.pixels[i]) - meanOf (b.pixels[i]);
+                total += difference * difference;
+            }
+            return std::sqrt (total / static_cast<double> (a.pixels.size()));
+        };
+        double chanceNoise = 0.0, sampledNoise = 0.0;
+        std::vector<double> difference;
+        bool finite = true;
+        for (std::uint64_t pair = 0; pair < 20; ++pair)
+        {
+            const Image chance1 = rendered (pt::LightStrategy::BsdfOnly, 100 + 2 * pair);
+            const Image chance2 = rendered (pt::LightStrategy::BsdfOnly, 101 + 2 * pair);
+            const Image sampled1 = rendered (pt::LightStrategy::MultipleImportance, 100 + 2 * pair);
+            const Image sampled2 = rendered (pt::LightStrategy::MultipleImportance, 101 + 2 * pair);
+            finite = finite && sampled1.stats.nonFiniteSamples == 0 && sampled2.stats.nonFiniteSamples == 0;
+            const double chanceBetween = noiseBetween (chance1, chance2);
+            const double sampledBetween = noiseBetween (sampled1, sampled2);
+            chanceNoise += chanceBetween * chanceBetween / 20.0;
+            sampledNoise += sampledBetween * sampledBetween / 20.0;
+            difference.push_back (meanOver (sampled1) - meanOver (chance1));
+            difference.push_back (meanOver (sampled2) - meanOver (chance2));
+        }
+        chanceNoise = std::sqrt (chanceNoise);
+        sampledNoise = std::sqrt (sampledNoise);
+        double shift = 0.0, spread = 0.0;
+        for (const double d : difference)
+            shift += d / static_cast<double> (difference.size());
+        for (const double d : difference)
+            spread += (d - shift) * (d - shift) / static_cast<double> (difference.size() - 1);
+        const double standardError = std::sqrt (spread / static_cast<double> (difference.size()));
+        const std::string name = c.name;
+        std::cout << name << ": noise " << chanceNoise << " to " << sampledNoise << ", mean shift " << shift << " +- " << standardError << "\n";
+        check (finite, name + " stays finite");
+        check (std::abs (shift) <= 4.0 * standardError, name + " keeps the mean: shift " + describe (shift) + " against " + describe (standardError));
+        if (c.cutsNoise)
+            check (sampledNoise < 0.5 * chanceNoise, name + ": the light sample cuts the noise: " + describe (sampledNoise) + " from " + describe (chanceNoise));
+    }
+}
+
+Image renderCoarsePrism (bool authored)
+{
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.8f, 0.8f, 0.8f }) };
+    const auto radial = [] (std::uint32_t k) {
+        const float angle = static_cast<float> (k) * pt::kPi * 0.25f;
+        return Vec3 { std::sin (angle), 0.0f, std::cos (angle) };
+    };
+    const Vec3 up { 0.0f, 4.0f, 0.0f };
+    for (std::uint32_t k = 0; k < 8; ++k)
+    {
+        const Vec3 n0 = radial (k), n1 = radial (k + 1);
+        appendShadedTriangle (scene, { n0 - up, n1 - up, n1 + up }, { n0, n1, n1 }, authored);
+        appendShadedTriangle (scene, { n0 - up, n1 + up, n0 + up }, { n0, n1, n0 }, authored);
+    }
+    const float light = 70.0f * pt::kPi / 180.0f;
+    scene.lightRecords = { directionalRecord ({ std::sin (light), 0.0f, std::cos (light) }, 1.0f) };
+    pt::LightShape disk;
+    disk.angularRadius = 0.001f;
+    scene.lightShapes = { disk };
+    scene.commit();
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 2;
+    // tanHalfFov is vertical. Over the film's aspect of 24 this is 1.5 units either side
+    // at distance 20, 0.03125 per pixel, so the prism spans pixels 16 to 80.
+    return render (scene, makeCamera ({ 0.0f, 0.0f, 20.0f }, pt::Quat {}, 0.075f / 24.0f, 96, 4), settings, 16);
+}
+
+// Measurable form of "no faceted shadow edge": along a centre scanline, away from
+// the silhouettes, no two pixels two apart differ by more than 25% of the peak
+// radiance. The span keeps a step straddling a pixel in one measure. The facet-normal terminator of the same mesh jumps by cos 70 of peak,
+// about 34%, and stops about ten pixels earlier.
+void coarseMeshTerminatorTests()
+{
+    const Image authored = renderCoarsePrism (true);
+    const Image facet = renderCoarsePrism (false);
+    const auto measure = [] (const Image& image, float& peak, float& jump, int& lit) {
+        peak = jump = 0.0f;
+        lit = 0;
+        for (std::uint32_t x = 20; x < 76; ++x)
+        {
+            const float value = image.at (x, 2).x;
+            peak = std::max (peak, value);
+            lit += value > 0.0f ? 1 : 0;
+            if (x > 21)
+                jump = std::max (jump, std::fabs (value - image.at (x - 2, 2).x));
+        }
+    };
+    float peak = 0.0f, jump = 0.0f, facetPeak = 0.0f, facetJump = 0.0f;
+    int lit = 0, facetLit = 0;
+    measure (authored, peak, jump, lit);
+    measure (facet, facetPeak, facetJump, facetLit);
+    check (peak > 0.0f && facetPeak > 0.0f, "the coarse prism is lit");
+    check (jump <= 0.25f * peak, "authored normals leave no faceted shadow edge on a coarse mesh");
+    check (facetJump > 0.25f * facetPeak, "the facet-normal terminator is the step the measure detects");
+    check (lit >= facetLit + 5, "the terminator follows the normals past the facet edge");
+    check (authored.stats.nonFiniteSamples == 0, "the coarse prism renders finite samples");
+}
+
+// A camera ray refracts by the stored normal: only a sun on the refracted direction
+// of the tilted normal is seen through the sheet, and it shows only with that normal.
+// A light path has to reach what a camera path shades through a shading normal.
+// At a receiver: the slab's floor again, every vertex normal tilted the same way off
+// the facet. The open floor is f |toLight.ns| from a camera path, and the patch under
+// the slab must stay at the slab's 0.923 of it. Reading the importance through ns gave
+// (toCamera.ns / toCamera.ng) / (toLight.ns / toLight.ng), about 2.6 times too much here.
+void shadingNormalReceiverSplatTests()
+{
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.5f, 0.5f, 0.5f }), clearGlass (1.5f) };
+    const Vec3 tilted = pt::normalizeOrZero ({ 0.0f, 1.0f, 0.5f });
+    const Vec3 a { -2.0f, 0.0f, -2.0f }, b { -2.0f, 0.0f, 2.0f }, c { 2.0f, 0.0f, 2.0f }, d { 2.0f, 0.0f, -2.0f };
+    appendShadedTriangle (scene, { a, b, c }, { tilted, tilted, tilted }, false);
+    appendShadedTriangle (scene, { a, c, d }, { tilted, tilted, tilted }, false);
+    const Vec3 centre { 0.0f, 1.1f, 0.0f };
+    appendMesh (scene, box ({ -0.5f, 1.0f, -0.5f }, { 0.5f, 1.2f, 0.5f }), 1, &centre);
+    scene.lightRecords = { directionalRecord ({ 0.0f, 1.0f, 0.0f }, 1.0f) };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.8f, 2.5f }, { 0.0f, 0.0f, 0.0f }, 0.4f, 48, 32);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    settings.spectral = pt::SpectralMode::Off;
+    const Image image = render (scene, camera, settings, 64, 11);
+    int count = 0;
+    const double under = floorMean (scene, camera, image.pixels, 2, -0.35f, 0.35f, -0.35f, 0.35f, count);
+    const double lit = floorMean (scene, camera, image.pixels, 2, 0.8f, 1.6f, -0.35f, 0.35f, count);
+    check (closeRelative (lit, 0.5 / pt::kPi * tilted.y, 0.03), "a tilted normal shades the open floor: " + describe (lit));
+    check (under > 0.84 * lit && under < 1.0 * lit,
+           "a tilted receiver takes the slab's light as a camera path would: " + describe (under / lit) + " of the open floor");
+}
+
+// At a delta vertex: a glass floor under a sun straight overhead, flat, with a vertex normal
+// tilted 25 degrees, mirrors the sun onto a wall the sun itself runs parallel to. A camera
+// path from the wall reads Fresnel * sun off this glass at the 50 degree mirror direction, so
+// the wall shows f * F * |out.wall|. Without the factor |out.ng| / |toLight.ng| the wall is
+// 1 / 0.643 too bright.
+void shadingNormalDeltaSplatTests()
+{
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.5f, 0.5f, 0.5f }), clearGlass (1.5f) };
+    appendMesh (scene, quad ({ 0.0f, 1.7f, 2.0f }, { 0.0f, 2.0f, 0.0f }, { 3.0f, 0.0f, 0.0f }), 0);
+    const float tilt = 25.0f * pt::kPi / 180.0f;
+    const Vec3 tilted { 0.0f, std::cos (tilt), std::sin (tilt) };
+    const Vec3 a { -2.0f, 0.0f, -1.0f }, b { -2.0f, 0.0f, 1.0f }, c { 2.0f, 0.0f, 1.0f }, d { 2.0f, 0.0f, -1.0f };
+    appendShadedTriangle (scene, { a, b, c }, { tilted, tilted, tilted }, false, 1);
+    appendShadedTriangle (scene, { a, c, d }, { tilted, tilted, tilted }, false, 1);
+    scene.lightRecords = { directionalRecord ({ 0.0f, 1.0f, 0.0f }, 1.0f) };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 1.7f, -1.5f }, { 0.0f, 1.7f, 2.0f }, 0.5f, 48, 32);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 4;
+    settings.spectral = pt::SpectralMode::Off;
+    const Image image = render (scene, camera, settings, 128, 11);
+    // The mirrored band lands on the wall from y 0.84 to 2.52.
+    double sum = 0.0;
+    int count = 0;
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            Vec3 p;
+            if (floorPoint (scene, camera, x, y, 2, p) && p.y > 1.2f && p.y < 2.2f && std::fabs (p.x) < 1.0f)
+            {
+                sum += meanOf (image.pixels[static_cast<std::size_t> (y) * camera.width + x]);
+                ++count;
+            }
+        }
+    const double expected = 0.5 / pt::kPi * pt::fresnelDielectric (std::cos (tilt), 1.5f) * std::sin (2.0f * tilt);
+    check (count >= 20, "the camera sees the mirrored band: " + std::to_string (count) + " pixels");
+    check (closeRelative (sum / std::max (1, count), expected, 0.2),
+           "a delta vertex with a tilted normal splats what a camera path reads: " + describe (sum / std::max (1, count))
+               + " against " + describe (expected));
+}
+
+void authoredRefractionTests()
+{
+    const float tilt = 20.0f * pt::kPi / 180.0f;
+    const Vec3 tilted { std::sin (tilt), 0.0f, std::cos (tilt) };
+    const Vec3 facing { 0.0f, 0.0f, 1.0f };
+    Vec3 sun;
+    check (refractDirection ({ 0.0f, 0.0f, -1.0f }, tilted, 1.5, sun), "the tilted normal refracts");
+    const auto seen = [&sun] (Vec3 normal, bool authored) {
+        pt::RenderScene scene;
+        scene.materials = { clearGlass (1.5f) };
+        const Vec3 a { -2.0f, -2.0f, 0.0f }, b { 2.0f, -2.0f, 0.0f }, c { 2.0f, 2.0f, 0.0f }, d { -2.0f, 2.0f, 0.0f };
+        appendShadedTriangle (scene, { a, b, c }, { normal, normal, normal }, authored);
+        appendShadedTriangle (scene, { a, c, d }, { normal, normal, normal }, authored);
+        scene.lightRecords = { directionalRecord (sun, 1.0f) };
+        pt::LightShape disk;
+        disk.angularRadius = 0.03f;
+        scene.lightShapes = { disk };
+        scene.commit();
+        pt::IntegratorSettings settings;
+        settings.maxDepth = 4;
+        const Image image = render (scene, makeCamera ({ 0.0f, 0.0f, 5.0f }, pt::Quat {}, 0.02f, 8, 8), settings, 32);
+        return image.at (4, 4).x;
+    };
+    check (seen (tilted, true) > 0.0f, "refraction follows the authored normal");
+    check (seen (facing, true) == 0.0f, "a facing normal does not bend the ray to the sun");
+}
+
+// ---------------------------------------------------------------- ring fringes
+
+// Normal of a tube side at angle v around the tube. Flat keeps the side's own
+// normal, the Smooth by Angle split the Glass Ring starter had at 7.5 degrees.
+float tubeShadingAngle (float v, float sideAngle, bool flat, std::uint32_t side)
+{
+    return flat ? (static_cast<float> (side) + 0.5f) * sideAngle : v;
+}
+
+// The Glass Ring starter's 96 x 24 tube about the y axis, major 0.5, minor 0.1.
+// Normals blend along the hoop. Across the tube they blend or stay flat per side.
+void appendShadedRing (pt::RenderScene& scene, std::uint32_t material, bool flatSides)
+{
+    constexpr std::uint32_t segments = 96, sides = 24;
+    constexpr float major = 0.5f, minor = 0.1f;
+    const float segmentAngle = 2.0f * pt::kPi / static_cast<float> (segments);
+    const float sideAngle = 2.0f * pt::kPi / static_cast<float> (sides);
+    const auto point = [&] (float u, float v) {
+        const float r = major + minor * std::cos (v);
+        return Vec3 { r * std::cos (u), minor * std::sin (v), r * std::sin (u) };
+    };
+    const auto normal = [&] (float u, float v) {
+        return Vec3 { std::cos (v) * std::cos (u), std::sin (v), std::cos (v) * std::sin (u) };
+    };
+    for (std::uint32_t i = 0; i < segments; ++i)
+        for (std::uint32_t j = 0; j < sides; ++j)
+        {
+            const float u0 = static_cast<float> (i) * segmentAngle, u1 = u0 + segmentAngle;
+            const float v0 = static_cast<float> (j) * sideAngle, v1 = v0 + sideAngle;
+            const float n0 = tubeShadingAngle (v0, sideAngle, flatSides, j);
+            const float n1 = tubeShadingAngle (v1, sideAngle, flatSides, j);
+            appendShadedTriangle (scene, { point (u0, v0), point (u0, v1), point (u1, v0) },
+                                  { normal (u0, n0), normal (u0, n1), normal (u1, n0) }, true, material);
+            appendShadedTriangle (scene, { point (u0, v1), point (u1, v1), point (u1, v0) },
+                                  { normal (u0, n1), normal (u1, n1), normal (u1, n0) }, true, material);
+        }
+}
+
+// A straight 24 sided tube of radius 0.1 along x through the origin.
+void appendShadedTube (pt::RenderScene& scene, std::uint32_t material, float halfLength, bool flatSides)
+{
+    constexpr std::uint32_t sides = 24;
+    const float sideAngle = 2.0f * pt::kPi / static_cast<float> (sides);
+    const auto normal = [] (float v) { return Vec3 { 0.0f, std::cos (v), std::sin (v) }; };
+    const Vec3 end { halfLength, 0.0f, 0.0f };
+    for (std::uint32_t j = 0; j < sides; ++j)
+    {
+        const float v0 = static_cast<float> (j) * sideAngle, v1 = v0 + sideAngle;
+        const float n0 = tubeShadingAngle (v0, sideAngle, flatSides, j);
+        const float n1 = tubeShadingAngle (v1, sideAngle, flatSides, j);
+        const Vec3 p0 = normal (v0) * 0.1f, p1 = normal (v1) * 0.1f;
+        appendShadedTriangle (scene, { p0 - end, p1 - end, p0 + end }, { normal (n0), normal (n1), normal (n0) }, true, material);
+        appendShadedTriangle (scene, { p0 + end, p1 - end, p1 + end }, { normal (n0), normal (n1), normal (n1) }, true, material);
+    }
+}
+
+// Width in pixels of the widest coherent spectral band on the ring's far arc,
+// seen at the given film scale. 346 pixels per unit is the old starter's 1080p
+// frame at fov 52 and distance 3.2. The only light is a bright disc 1 below
+// the ring, seen only through the glass, so the tube images the disc's round edge
+// as a band that follows the hoop.
+//
+// The metric. Pixels fall into one pixel wide rings around the hoop's centre and
+// 12 sectors along the arc. A band is a ring where at least 10 consecutive sectors
+// have (red - blue) / (red + green + blue) of one sign and above minimumChroma, with that
+// ratio taken over the sector's summed light and only where the mean pixel sum is
+// over 0.15, 5% of the disc's white. An isolated chromatic pixel cannot
+// pass: it moves one sector's sum by little, and speckle has no shared sign. This
+// is the reference's structure: saturated bands that run on along the rim.
+int coherentRingBandWidth (float cauchyB, std::uint64_t generation, float pixelsPerUnit = 346.0f,
+                           double minimumChroma = 0.2)
+{
+    constexpr float cameraHeight = 3.2f;
+    constexpr std::uint32_t width = 220, height = 120;
+    constexpr int sectors = 12, rings = 80;
+    pt::RenderScene scene;
+    scene.materials = { clearGlass (1.5f, cauchyB), lamp (1.0f) };
+    appendShadedRing (scene, 0, false);
+    Mesh disc;
+    disc.vertices.push_back ({ 0.0f, -1.0f, 0.0f });
+    constexpr std::uint32_t discEdges = 256;
+    for (std::uint32_t k = 0; k < discEdges; ++k)
+    {
+        const float a = 2.0f * pt::kPi * static_cast<float> (k) / static_cast<float> (discEdges);
+        disc.vertices.push_back ({ 0.2f * std::cos (a), -1.0f, 0.2f * std::sin (a) });
+    }
+    for (std::uint32_t k = 0; k < discEdges; ++k)
+        disc.indices.insert (disc.indices.end(), { 0u, 1 + (k + 1) % discEdges, 1 + k });
+    appendMesh (scene, disc, 1);
+    scene.commit();
+
+    const float tanHalfFov = 0.5f * static_cast<float> (height) / (pixelsPerUnit * cameraHeight);
+    const pt::PinholeCamera camera = makeCamera ({ 0.0f, cameraHeight, -0.5f }, kDown, tanHalfFov, width, height);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    settings.causticLightPaths = false;
+    const Image image = render (scene, camera, settings, 32, generation);
+    check (image.stats.spectral && image.stats.nonFiniteSamples == 0, "the ring fringe fixture renders spectrally and finite");
+
+    constexpr float arc = 24.0f * pt::kPi / 180.0f;
+    std::vector<std::array<double, 3>> sums (static_cast<std::size_t> (sectors * rings), { 0.0, 0.0, 0.0 });
+    std::vector<int> counts (sums.size(), 0);
+    for (std::uint32_t y = 0; y < height; ++y)
+        for (std::uint32_t x = 0; x < width; ++x)
+        {
+            // Image up is -z, away from the hoop's centre here.
+            const float worldX = (static_cast<float> (x) + 0.5f - 0.5f * width) / pixelsPerUnit;
+            const float worldZ = -0.5f - (0.5f * height - static_cast<float> (y) - 0.5f) / pixelsPerUnit;
+            const float angle = std::atan2 (worldX, -worldZ);
+            const float radius = std::sqrt (worldX * worldX + worldZ * worldZ);
+            const int ring = static_cast<int> (std::floor ((radius - 0.4f) * pixelsPerUnit));
+            const int sector = static_cast<int> (std::floor ((angle + arc) / (2.0f * arc) * sectors));
+            if (ring < 0 || ring >= rings || sector < 0 || sector >= sectors)
+                continue;
+            const Vec3 p = image.at (x, y);
+            const auto cell = static_cast<std::size_t> (ring * sectors + sector);
+            ++counts[cell];
+            auto& sum = sums[cell];
+            sum[0] += p.x;
+            sum[1] += p.y;
+            sum[2] += p.z;
+        }
+
+    int band = 0;
+    for (int ring = 0; ring < rings; ++ring)
+    {
+        int longest = 0, run = 0, runSign = 0;
+        for (int sector = 0; sector < sectors; ++sector)
+        {
+            const auto cell = static_cast<std::size_t> (ring * sectors + sector);
+            const auto& sum = sums[cell];
+            const double total = sum[0] + sum[1] + sum[2];
+            const double chroma = total > 0.15 * counts[cell] && total > 0.0 ? (sum[0] - sum[2]) / total : 0.0;
+            const int sign = chroma > minimumChroma ? 1 : chroma < -minimumChroma ? -1 : 0;
+            run = sign != 0 && sign == runSign ? run + 1 : (sign != 0 ? 1 : 0);
+            runSign = sign;
+            longest = std::max (longest, run);
+        }
+        band += longest >= 10 ? 1 : 0;
+    }
+    return band;
+}
+
+// A cross-section model of this fixture with the CIE tables gives 3 rings above
+// 0.2 at B = 0.02 and none at 0.004, whose peak ratio is about 0.12. That model
+// leaves out the hoop's curve. The camera sits over the far arc, so a sector at 24
+// degrees sees the tube's top 0.06 shifted by 0.2 * 0.06 / 3.2, 1.3 pixels, against
+// the arc's centre, and 10 sectors must share a ring. So B = 0.02, the starter's value
+// until it became 0.15, holds a band about a pixel wide. ringStarterFrameBandTests
+// covers the wide band at 0.15.
+void ringFringeCoherenceTests()
+{
+    const int starter = coherentRingBandWidth (0.02f, 31);
+    const int previous = coherentRingBandWidth (0.004f, 31);
+    check (starter >= 1, "B = 0.02 forms a coherent band " + std::to_string (starter) + " pixels wide");
+    check (previous <= 1, "the old Cauchy B forms no band over a pixel wide: " + std::to_string (previous));
+}
+
+// The fixture at the starter's own film scales on the 804 x 452 live film, the
+// frame that stayed grey: 143 pixels per unit at the old camera distance of 3.2,
+// 241 at the authored 1.9. Saturated means a ratio above 0.5. The cross-section
+// model with the CIE tables gives 0 such pixels for B = 0.02 at 143, the frame the
+// old test passed beside, and 6 for B = 0.15 at 241. The wide margin below is for
+// the hoop's curve, which that model leaves out.
+void ringStarterFrameBandTests()
+{
+    const int oldFrame = coherentRingBandWidth (0.02f, 43, 143.0f, 0.5);
+    const int newFrame = coherentRingBandWidth (0.15f, 43, 241.0f, 0.5);
+    check (oldFrame <= 1, "the old starter's frame has no saturated band: " + std::to_string (oldFrame));
+    check (newFrame >= 3, "the authored starter's frame has a saturated band " + std::to_string (newFrame) + " pixels wide");
+}
+
+// Dispersion above any old cap reaches the walk at the authored strength. The
+// path tracer capped B at 0.05 and n at 3 after the admission stopped doing so.
+void strongDispersionReachesEvalTests()
+{
+    const pt::Material strong = clearGlass (1.5f, 0.15f);
+    check (pt::materialCauchyB (strong) == 0.15f, "B = 0.15 renders as authored: " + describe (pt::materialCauchyB (strong)));
+    check (std::fabs (pt::materialIorAt (strong, 400.0f, true) - 2.003f) < 1.0e-3f,
+           "B = 0.15 gives n = 2.003 at 400 nm: " + describe (pt::materialIorAt (strong, 400.0f, true)));
+    const pt::Material extreme = clearGlass (1.5f, 0.6f);
+    const float n400 = pt::materialIorAt (extreme, 400.0f, true);
+    check (std::fabs (n400 - 3.512f) < 1.0e-2f, "n has no upper cap: " + describe (n400));
+
+    // The eta of the lobe the walk refracts with: a ray at 45 degrees into n = 3.512
+    // bends to asin (sin 45 / 3.512) = 11.6 degrees. The old eta cap of 3 gave 13.6.
+    pt::Wavelengths wl = pt::sampleHeroWavelengths ((400.0f - pt::kWavelengthMinNm) / pt::kWavelengthSpanNm);
+    pt::MediumStack media;
+    const pt::BoundaryCrossing in = pt::classifyBoundary (media, &extreme, true);
+    const pt::DielectricSetup entry = pt::dielectricSetupFor (in, wl);
+    pt::SpectralBsdf bsdf;
+    const Vec3 normal { 0.0f, 0.0f, 1.0f };
+    const Vec3 incoming { std::sqrt (0.5f), 0.0f, std::sqrt (0.5f) };
+    pt::buildMaterialBsdf (extreme, normal, normal, incoming, wl, entry, bsdf);
+    pt::SpectralBsdfSample through;
+    const bool refracted = bsdf.sample (incoming, 0.9f, { 0.5f, 0.5f }, through);
+    check (refracted && (through.flags & pt::kBsdfTransmission) != 0, "the strong glass refracts");
+    const float degrees = std::asin (std::sqrt (through.wi.x * through.wi.x + through.wi.y * through.wi.y)) * 180.0f / pt::kPi;
+    check (std::fabs (degrees - 11.6f) < 0.3f, "the walk refracts with the uncapped eta: " + describe (degrees));
+}
+
+// Blue's and red's RMS spread across a straight tube's caustic on a floor 0.17
+// below its axis, the Glass Ring starter's lowest point. The summed spread is
+// immune to the per-pixel colour noise of a light path's four wavelengths, as long
+// as the sum stays signed: splats are signed, and dropping a pixel's negative part
+// would keep that noise.
+double causticBlueOverRedSpread (float cauchyB, std::uint64_t generation)
+{
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.8f, 0.8f, 0.8f }), clearGlass (1.5f, cauchyB) };
+    appendMesh (scene, quad ({ 0.0f, -0.17f, 0.0f }, { 0.75f, 0.0f, 0.0f }, { 0.0f, 0.0f, -0.75f }), 0);
+    appendShadedTube (scene, 1, 0.75f, false);
+    scene.lightRecords = { directionalRecord ({ 0.0f, 1.0f, 0.0f }, 1.0f) };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.15f, 2.0f }, { 0.0f, -0.17f, 0.0f }, 0.04f, 128, 96);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    const Image image = render (scene, camera, settings, 128, generation);
+    check (image.stats.spectral && image.stats.causticSplats > 0, "the tube's caustic is spectral and reaches the camera");
+    double red = 0.0, redZ2 = 0.0, blue = 0.0, blueZ2 = 0.0;
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            Vec3 p;
+            if (! floorPoint (scene, camera, x, y, 2, p) || std::fabs (p.z) > 0.35f)
+                continue;
+            const Vec3 c = image.caustic[static_cast<std::size_t> (y) * camera.width + x];
+            const double z2 = static_cast<double> (p.z) * p.z;
+            red += c.x;
+            redZ2 += static_cast<double> (c.x) * z2;
+            blue += c.z;
+            blueZ2 += static_cast<double> (c.z) * z2;
+        }
+    check (red > 0.0 && blue > 0.0, "the tube's caustic lands on the floor in red and blue");
+    return red > 0.0 && blue > 0.0 ? std::sqrt ((blueZ2 / blue) / (redZ2 / red)) : 0.0;
+}
+
+// Signed (red - blue) / sum of the tube's caustic over floor bands 0.02 wide,
+// out to 0.1 from its line. Index 0 is the core. Only splats count, so this is
+// the colour light paths deposit. Each cell sums many splats of all wavelengths,
+// so a neutral deposit would stay near 0 whatever the per-pixel colour noise.
+std::vector<double> causticBandChroma (float cauchyB, std::uint64_t generation)
+{
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ 0.8f, 0.8f, 0.8f }), clearGlass (1.5f, cauchyB) };
+    appendMesh (scene, quad ({ 0.0f, -0.17f, 0.0f }, { 0.75f, 0.0f, 0.0f }, { 0.0f, 0.0f, -0.75f }), 0);
+    appendShadedTube (scene, 1, 0.75f, false);
+    scene.lightRecords = { directionalRecord ({ 0.0f, 1.0f, 0.0f }, 1.0f) };
+    scene.commit();
+    const pt::PinholeCamera camera = lookAt ({ 0.0f, 0.15f, 2.0f }, { 0.0f, -0.17f, 0.0f }, 0.04f, 128, 96);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    const Image image = render (scene, camera, settings, 128, generation);
+    std::vector<std::array<double, 3>> bands (5, { 0.0, 0.0, 0.0 });
+    for (std::uint32_t y = 0; y < camera.height; ++y)
+        for (std::uint32_t x = 0; x < camera.width; ++x)
+        {
+            Vec3 p;
+            if (! floorPoint (scene, camera, x, y, 2, p))
+                continue;
+            const auto band = static_cast<std::size_t> (std::fabs (p.z) / 0.02f);
+            if (band >= bands.size())
+                continue;
+            const Vec3 c = image.caustic[static_cast<std::size_t> (y) * camera.width + x];
+            bands[band][0] += c.x;
+            bands[band][1] += c.y;
+            bands[band][2] += c.z;
+        }
+    std::vector<double> chroma;
+    for (const auto& band : bands)
+    {
+        const double total = band[0] + band[1] + band[2];
+        check (total > 0.0, "the tube's caustic reaches every floor band");
+        chroma.push_back (total > 0.0 ? (band[0] - band[2]) / total : 0.0);
+    }
+    return chroma;
+}
+
+// Red focuses on this floor and blue crosses over before it, so a coloured
+// deposit has a red core and a blue halo. The cross-section model with the CIE
+// tables gives +0.25 core and -0.20 to -0.31 halo at B = 0.15, and +0.04 and -0.05
+// at 0.02, the white caustic of the frame.
+void causticSplatColourTests()
+{
+    const std::vector<double> strong = causticBandChroma (0.15f, 47);
+    const std::vector<double> weak = causticBandChroma (0.02f, 47);
+    check (strong[0] > 0.12, "B = 0.15 deposits a red caustic core: " + describe (strong[0]));
+    for (std::size_t band = 1; band < strong.size(); ++band)
+        check (strong[band] < -0.1, "B = 0.15 deposits a blue caustic halo: " + describe (strong[band]));
+    check (std::fabs (weak[0]) < 0.12, "B = 0.02 leaves the caustic core near white: " + describe (weak[0]));
+}
+
+// Blue focuses nearer than red, so past the focus it spreads wider. The same
+// cross-section model gives 1.09 at B = 0.02 and 1.04 at 0.004, summed with the
+// signed colour weights over this floor window.
+void ringCausticColourTests()
+{
+    const double starter = causticBlueOverRedSpread (0.02f, 37);
+    const double previous = causticBlueOverRedSpread (0.004f, 37);
+    check (starter > 1.06, "the starter's caustic separates blue from red by a spread ratio of " + describe (starter));
+    check (previous < 1.06, "the old Cauchy B leaves the caustic near white, a spread ratio of " + describe (previous));
+}
+
+// The Glass Ring starter's tube as it stands: the circle in the XY plane, centre
+// at y 0.6. appendShadedRing's mesh turned 90 degrees about x, so winding holds.
+void appendStandingRing (pt::RenderScene& scene, std::uint32_t material)
+{
+    constexpr std::uint32_t segments = 96, sides = 24;
+    constexpr float major = 0.5f, minor = 0.1f, centreY = 0.6f;
+    const float segmentAngle = 2.0f * pt::kPi / static_cast<float> (segments);
+    const float sideAngle = 2.0f * pt::kPi / static_cast<float> (sides);
+    const auto normal = [] (float u, float v) {
+        return Vec3 { std::cos (v) * std::cos (u), std::cos (v) * std::sin (u), -std::sin (v) };
+    };
+    const auto point = [&] (float u, float v) {
+        const float r = major + minor * std::cos (v);
+        return Vec3 { r * std::cos (u), centreY + r * std::sin (u), -minor * std::sin (v) };
+    };
+    for (std::uint32_t i = 0; i < segments; ++i)
+        for (std::uint32_t j = 0; j < sides; ++j)
+        {
+            const float u0 = static_cast<float> (i) * segmentAngle, u1 = u0 + segmentAngle;
+            const float v0 = static_cast<float> (j) * sideAngle, v1 = v0 + sideAngle;
+            appendShadedTriangle (scene, { point (u0, v0), point (u0, v1), point (u1, v0) },
+                                  { normal (u0, v0), normal (u0, v1), normal (u1, v0) }, true, material);
+            appendShadedTriangle (scene, { point (u0, v1), point (u1, v1), point (u1, v0) },
+                                  { normal (u0, v1), normal (u1, v1), normal (u1, v0) }, true, material);
+        }
+}
+
+// Authored light of the Glass Ring starter.
+struct RingFloorLight
+{
+    Vec3 toLight;
+    float keyIntensity = 0.0f;
+    float floorAlbedo = 0.0f;
+    float skyRadiance = 0.0f;
+};
+
+struct RingFloorResult
+{
+    double diffuseFace = 0.0;
+    double predictedFace = 0.0;
+    double renderedFace = 0.0;
+    double causticOverFace = 0.0;
+    double causticChroma = 0.0;
+    double brightestStripChannel = 0.0;
+};
+
+double rec709Luminance (Vec3 c)
+{
+    return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+}
+
+// Mirrors the starter at full scale: ring and B 0.15 glass, floor plate, key colour,
+// camera position and fov, hidden sky. The one stand-in is a constant sky: art_studio's
+// cosine-weighted upper-hemisphere luminance of 0.86, times 0.05. The starter now binds a
+// brighter colour HDR (0.605 * 0.5 = 0.30), which this model doesn't follow. The old light
+// keeps the bare 0.86.
+// GraphInstrumentTests pins the same authored values on the starter itself.
+RingFloorResult renderRingFloor (const RingFloorLight& light, std::uint64_t generation)
+{
+    const float skyRadiance = light.skyRadiance;
+    const Vec3 keyColour { 1.0f, 0.9f, 0.75f };
+    const Vec3 cameraPosition { 0.0f, 0.95f, 1.9f };
+    pt::RenderScene scene;
+    scene.materials = { diffuse ({ light.floorAlbedo, light.floorAlbedo, light.floorAlbedo }), clearGlass (1.5f, 0.15f) };
+    appendMesh (scene, quad ({ 0.0f, 0.0f, 0.0f }, { 1.7f, 0.0f, 0.0f }, { 0.0f, 0.0f, -1.3f }), 0);
+    appendStandingRing (scene, 1);
+    grid::SceneLightRecord key = directionalRecord (light.toLight, light.keyIntensity);
+    key.color = { keyColour.x, keyColour.y, keyColour.z };
+    scene.lightRecords = { key, environmentRecord (skyRadiance) };
+    scene.commit();
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    settings.environmentVisibleToCamera = false;
+
+    // Face from open floor beyond the ring's shadow, in the starter's own framing.
+    const pt::PinholeCamera wide = lookAt (cameraPosition, { 0.0f, 0.67f, 0.0f }, std::tan (26.0f * pt::kPi / 180.0f), 96, 54);
+    const Image wideImage = render (scene, wide, settings, 32, generation);
+    check (wideImage.stats.nonFiniteSamples == 0, "the ring floor stays finite");
+    std::vector<Vec3> wideLuminance;
+    for (const Vec3 c : wideImage.pixels)
+    {
+        const auto y = static_cast<float> (rec709Luminance (c));
+        wideLuminance.push_back ({ y, y, y });
+    }
+    int openPixels = 0;
+    RingFloorResult result;
+    result.renderedFace = floorMean (scene, wide, wideLuminance, 2, 0.9f, 1.4f, 0.0f, 0.4f, openPixels);
+    check (openPixels >= 20, "the open floor is in frame, pixels " + describe (static_cast<double> (openPixels)));
+    const Vec3 toLight = pt::normalizeOrZero (light.toLight);
+    result.diffuseFace = light.floorAlbedo * (light.keyIntensity * toLight.y * rec709Luminance (keyColour) / pt::kPi + skyRadiance);
+    // The floor is an opaque dielectric, so it also has a specular lobe with F0 0.04 at
+    // roughness 1, whatever its albedo. Over the open pixels, through the renderer's own
+    // BSDF: the key's value, plus the sky over the lobes' directional albedo.
+    double predicted = 0.0;
+    int predictedPixels = 0;
+    for (std::uint32_t y = 0; y < wide.height; ++y)
+        for (std::uint32_t x = 0; x < wide.width; ++x)
+        {
+            Vec3 p;
+            if (! floorPoint (scene, wide, x, y, 2, p) || ! (p.x > 0.9f && p.x < 1.4f && p.z > 0.0f && p.z < 0.4f))
+                continue;
+            const Vec3 wo = pt::normalizeOrZero (wide.position - p);
+            const Vec3 up { 0.0f, 1.0f, 0.0f };
+            pt::Bsdf floorBsdf;
+            pt::buildMaterialBsdf (scene.materials[0], up, up, wo, true, floorBsdf);
+            float scale = 0.0f, bias = 0.0f;
+            pt::ggxAlbedoScaleBias (wo.y, 1.0f, scale, bias);
+            const float specular = 0.04f * scale + bias;
+            const double directional = light.floorAlbedo * (1.0f - specular) + specular;
+            predicted += light.keyIntensity * rec709Luminance (keyColour) * meanOf (floorBsdf.eval (wo, toLight).value)
+                       + skyRadiance * directional;
+            ++predictedPixels;
+        }
+    result.predictedFace = predicted / std::max (1, predictedPixels);
+
+    // Same camera position with a narrow lens, so the same sight lines resolve the
+    // strip. Floor strips 0.02 deep, 0.16 wide, under the ring's foot.
+    constexpr float nearZ = -0.15f, stripDepth = 0.02f;
+    constexpr std::size_t strips = 22;
+    const pt::PinholeCamera narrow = lookAt (cameraPosition, { 0.0f, 0.0f, 0.05f }, 0.07f, 256, 128);
+    const Image image = render (scene, narrow, settings, 96, generation + 1);
+    std::array<std::array<double, 6>, strips> sums {};
+    std::array<int, strips> counts {};
+    for (std::uint32_t y = 0; y < narrow.height; ++y)
+        for (std::uint32_t x = 0; x < narrow.width; ++x)
+        {
+            Vec3 p;
+            if (! floorPoint (scene, narrow, x, y, 2, p) || std::fabs (p.x) >= 0.08f || p.z < nearZ)
+                continue;
+            const auto strip = static_cast<std::size_t> ((p.z - nearZ) / stripDepth);
+            if (strip >= strips)
+                continue;
+            const std::size_t index = static_cast<std::size_t> (y) * narrow.width + x;
+            sums[strip][0] += rec709Luminance (image.pixels[index]);
+            sums[strip][1] += image.caustic[index].x;
+            sums[strip][2] += image.caustic[index].z;
+            sums[strip][3] += image.pixels[index].x;
+            sums[strip][4] += image.pixels[index].y;
+            sums[strip][5] += image.pixels[index].z;
+            ++counts[strip];
+        }
+    double brightest = 0.0;
+    for (std::size_t strip = 0; strip < strips; ++strip)
+    {
+        if (counts[strip] < 40 || sums[strip][0] / counts[strip] <= brightest)
+            continue;
+        brightest = sums[strip][0] / counts[strip];
+        result.causticChroma = (sums[strip][1] - sums[strip][2]) / std::max (sums[strip][1] + sums[strip][2], 1.0e-9);
+        // The largest channel of the strip's mean. A mean of each pixel's largest channel
+        // would count the colour noise of four wavelengths as brightness.
+        result.brightestStripChannel = std::max ({ sums[strip][3], sums[strip][4], sums[strip][5] }) / counts[strip];
+    }
+    result.causticOverFace = brightest / std::max (result.renderedFace, 1.0e-9);
+    return result;
+}
+
+// The r2-acceptance floor was a uniform dark grey with no caustic in it. Arithmetic:
+// old face 0.03 * (3.5 * 0.574 * 0.911 / pi + 0.86) = 0.043, sRGB 59. New
+// 0.03 * (10 * 0.866 * 0.911 / pi + 0.043) = 0.077. Both count the albedo only; the
+// floor's specular lobe takes the rendered faces to 0.075 and 0.117. The Monte Carlo ring
+// model gave the strip 1.07x the face at the old light and 2.31x with chroma +0.43 at the
+// -102 key, with the ring 0.07 clear of the floor. With the ring at contact the same kind
+// of model gives 1.63x at the old light and 6.5x at the -120 key, so the old light does
+// leave a strip now, a quarter of the new one's. Its chroma threshold is still unmeasured.
+void ringCausticFloorTests()
+{
+    const RingFloorResult before = renderRingFloor ({ { -0.346f, 0.574f, 0.742f }, 3.5f, 0.03f, 0.86f }, 53);
+    const RingFloorResult after = renderRingFloor ({ { 0.0f, 0.866f, -0.5f }, 10.0f, 0.03f, 0.043f }, 55);
+    check (before.diffuseFace < 0.09, "the old light underexposes the floor, face " + describe (before.diffuseFace));
+    check (after.diffuseFace > 0.06 && after.diffuseFace < 0.09,
+           "the floor's diffuse face lands in 0.06 to 0.09 linear: " + describe (after.diffuseFace));
+    check (std::fabs (after.renderedFace - after.predictedFace) < 0.15 * after.predictedFace,
+           "the rendered face " + describe (after.renderedFace) + " matches the prediction " + describe (after.predictedFace));
+    check (after.brightestStripChannel < 1.0, "the caustic stays under display white: " + describe (after.brightestStripChannel));
+    check (before.causticOverFace < 2.0, "the old light leaves only a faint caustic, ratio " + describe (before.causticOverFace));
+    check (after.causticOverFace > 1.6, "the caustic strip stands above the floor, ratio " + describe (after.causticOverFace));
+    check (after.causticChroma > 0.12, "the caustic strip keeps its red core: " + describe (after.causticChroma));
+}
+
+// A sine across 32 rows of a coarse environment, seen through a tube. Rows are
+// 5.6 degrees, so a nearest lookup or a flat tube side would show as steps.
+pt::EnvironmentPixels bandedEnvironment()
+{
+    constexpr std::uint32_t width = 16, height = 32;
+    std::vector<float> rgb;
+    for (std::uint32_t y = 0; y < height; ++y)
+        for (std::uint32_t x = 0; x < width; ++x)
+        {
+            const float value = 0.5f + 0.4f * std::sin (2.0f * pt::kPi * static_cast<float> (y) / 16.0f);
+            rgb.insert (rgb.end(), { value, value, value });
+        }
+    return pt::copyEnvironmentPixels (width, height, rgb.data(), { "ring-refraction-test", 1, std::string (64, 'b') });
+}
+
+// Largest second difference of the tube's mean brightness down the image,
+// away from its rims, over the brightness range seen there. Each row averages
+// many columns, so what is left is the profile across the tube.
+double refractedBlockiness (bool flatSides, std::uint64_t generation)
+{
+    pt::RenderScene scene;
+    scene.materials = { clearGlass (1.5f) };
+    appendShadedTube (scene, 0, 3.0f, flatSides);
+    grid::SceneLightRecord light;
+    light.kind = grid::SceneLightKind::Environment;
+    light.color = { 1.0f, 1.0f, 1.0f };
+    light.intensity = 1.0f;
+    light.environmentImage.version = 1;
+    scene.environmentImage = bandedEnvironment();
+    light.environmentImage.asset = scene.environmentImage.asset;
+    scene.lightRecords = { light };
+    scene.commit();
+    constexpr std::uint32_t width = 96, height = 56;
+    constexpr float pixelsPerUnit = 346.0f, distance = 3.2f;
+    const float tanHalfFov = 0.5f * static_cast<float> (height) / (pixelsPerUnit * distance);
+    const pt::PinholeCamera camera = makeCamera ({ 0.0f, 0.0f, distance }, pt::Quat {}, tanHalfFov, width, height);
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    settings.spectral = pt::SpectralMode::Off;
+    settings.causticLightPaths = false;
+    const Image image = render (scene, camera, settings, 32, generation);
+    std::vector<double> profile;
+    for (std::uint32_t y = 8; y < height - 8; ++y)
+    {
+        double sum = 0.0;
+        for (std::uint32_t x = 0; x < width; ++x)
+            sum += image.at (x, y).y;
+        profile.push_back (sum / width);
+    }
+    const auto [low, high] = std::minmax_element (profile.begin(), profile.end());
+    double worst = 0.0;
+    for (std::size_t i = 1; i + 1 < profile.size(); ++i)
+        worst = std::max (worst, std::fabs (profile[i + 1] - 2.0 * profile[i] + profile[i - 1]));
+    return worst / std::max (*high - *low, 1.0e-9);
+}
+
+// The lookup itself is bilinear: across one texel of a stripe image at any
+// non-integer offset the radiance moves in equal steps, with no jump a nearest
+// lookup or a coarse block would make. Then the rendered form: through a
+// smooth tube the banded environment stays smooth, and the flat sided tube of
+// the same mesh shows the steps that were the starter's rectangular patches.
+void refractionSmoothnessTests()
+{
+    constexpr std::uint32_t width = 16, height = 8;
+    std::vector<float> stripes;
+    for (std::uint32_t y = 0; y < height; ++y)
+        for (std::uint32_t x = 0; x < width; ++x)
+        {
+            const float value = x % 2 == 0 ? 0.0f : 1.0f;
+            stripes.insert (stripes.end(), { value, value, value });
+        }
+    pt::EnvironmentMap map;
+    check (map.build (pt::copyEnvironmentPixels (width, height, stripes.data(), { "ring-stripes-test", 1, std::string (64, 'c') }),
+                      { 1.0f, 1.0f, 1.0f }, 0.0f),
+           "the stripe environment builds");
+    double largestStep = 0.0;
+    constexpr int stepsPerTexel = 7;
+    float previous = map.radiance (map.uvToDirection ({ 0.25f, 0.53f })).y;
+    for (int k = 1; k <= 4 * stepsPerTexel; ++k)
+    {
+        const float u = 0.25f + static_cast<float> (k) / (static_cast<float> (stepsPerTexel) * width);
+        const float value = map.radiance (map.uvToDirection ({ u, 0.53f })).y;
+        largestStep = std::max (largestStep, static_cast<double> (std::fabs (value - previous)));
+        previous = value;
+    }
+    check (largestStep < 1.1 / stepsPerTexel, "the environment lookup is bilinear, largest step " + describe (largestStep));
+
+    const double smooth = refractedBlockiness (false, 41);
+    const double flat = refractedBlockiness (true, 41);
+    check (smooth < 0.05, "a smooth tube refracts the banded environment smoothly: " + describe (smooth));
+    check (flat > 0.08, "the flat sided tube shows the steps the measure detects: " + describe (flat));
+}
+
+void causticTests()
+{
+    slabCausticTests();
+    ringCausticTests();
+    dispersionCausticTests();
+    tirCausticTests();
+    gratingCausticTests();
+    gratingOrderLightSamplingTests();
+    gratingAcrossGrooveRoughnessTests();
+    pitScatterLightSamplingTests();
+    pitScatterThroughFlatTopTests();
+    lightSampleThroughSlabTests();
+}
+
 } // namespace
+
+// What the R2 glass ring's fringes and caustic depend on: the Cauchy spread,
+// the colour of one wavelength, four wavelengths in every dispersive sample,
+// signed splats, and a receiver spectrum with no steps in it.
+void spectralQualityTests()
+{
+    // B = 0.004 um^2, the ring's value: n(450) - n(650) = B (1/0.45^2 - 1/0.65^2).
+    const double spread = static_cast<double> (pt::cauchyIor (1.5f, 0.004f, 450.0f))
+                        - static_cast<double> (pt::cauchyIor (1.5f, 0.004f, 650.0f));
+    check (closeRelative (spread, 0.01028, 0.01), "Cauchy B 0.004 spreads the index by " + describe (spread));
+
+    // All four channels on one wavelength: the conversion is 400 w(lambda).
+    pt::Wavelengths pure;
+    pure.spectral = true;
+    pure.nm.fill (515.0f);
+    const Vec3 green = pt::channelsToRgb (pt::Spectrum::constant (1.0f), pure);
+    const Vec3 expected = pt::rgbMatchingWeightAt (515.0f) * 400.0f;
+    check (closeRelative (green.y, expected.y, 1.0e-3) && green.y > 3.0f && green.x < -1.5f,
+           "515 nm converts to a saturated green with negative red: " + describe (green.x) + ", " + describe (green.y));
+
+    // A dispersive pane under a white sky. Every direction sees radiance 1, so
+    // a sample's colour is only its wavelengths' weights: one wavelength swings
+    // red by a standard deviation of 3, four rotated ones by 0.32.
+    pt::RenderScene pane;
+    pane.materials = { clearGlass (1.5f, 0.02f) };
+    const Vec3 paneCentre { 0.0f, 0.0f, 0.0f };
+    appendMesh (pane, box ({ -1.0f, -1.0f, -0.1f }, { 1.0f, 1.0f, 0.1f }), 0, &paneCentre);
+    pane.lightRecords = { environmentRecord (1.0f) };
+    pane.commit();
+    pt::IntegratorSettings settings;
+    settings.maxDepth = 8;
+    pt::Ray ray;
+    ray.origin = { 0.05f, 0.03f, 2.0f };
+    ray.direction = pt::normalizeOrZero (Vec3 { 0.1f, 0.05f, -1.0f });
+    double mean = 0.0;
+    double square = 0.0;
+    const int samples = 512;
+    for (int i = 0; i < samples; ++i)
+    {
+        const pt::PathSampler sampler (0, static_cast<std::uint32_t> (i), 7, settings.pattern);
+        pt::PathCounters counters;
+        Vec3 radiance;
+        check (pt::tracePath (pane, settings, ray, sampler, counters, radiance), "the pane's path is finite");
+        mean += radiance.x;
+        square += static_cast<double> (radiance.x) * static_cast<double> (radiance.x);
+    }
+    mean /= samples;
+    const double deviation = std::sqrt (std::max (0.0, square / samples - mean * mean));
+    check (closeRelative (mean, 1.0, 0.05), "a white sky through the pane stays white: red " + describe (mean));
+    check (deviation < 1.0, "one dispersive sample holds several wavelengths: red deviates by " + describe (deviation));
+
+    // Splats keep their sign and their size. A single wavelength's peak at
+    // 1080p, about 10^7, is well inside the range.
+    pt::Accumulator film;
+    film.resize (1, 1);
+    film.addSplat (0, 0, { -1.5f, 2.0f, 1.0e7f });
+    film.addSplat (0, 0, { 0.5f, 0.0f, 0.0f });
+    film.addLightPath();
+    const pt::Rgb splat = film.splatMean (0, 0);
+    check (closeRelative (splat.r, -1.0, 1.0e-5) && closeRelative (splat.g, 2.0, 1.0e-5)
+               && closeRelative (splat.b, 1.0e7, 1.0e-5),
+           "splats sum signed and unclipped: " + describe (splat.r) + ", " + describe (splat.b));
+
+    // Not the source of the R2 contours: the receiver's spectrum is continuous,
+    // so its reflectance has no steps a caustic could show. The contours come
+    // from the ring's 96 x 24 mesh. Light refracted through facets and C0
+    // normals lands with a density that ripples at the mesh spacing, and
+    // tracing that mesh with no sampler at all shows the ripple falling about
+    // fourfold at 384 x 96.
+    double largestStep = 0.0;
+    Vec3 previous = pt::rgbBasisAt (380.0f);
+    for (int nm = 381; nm <= 780; ++nm)
+    {
+        const Vec3 b = pt::rgbBasisAt (static_cast<float> (nm));
+        largestStep = std::max (largestStep, static_cast<double> (std::max (std::fabs (b.x - previous.x),
+                                                  std::max (std::fabs (b.y - previous.y), std::fabs (b.z - previous.z)))));
+        previous = b;
+    }
+    check (largestStep < 0.05, "the receiver spectrum moves at most " + describe (largestStep) + " per nm");
+}
 
 int main()
 {
     spectrumTests();
+    spectralQualityTests();
     prismLobeTests();
     prismImageTest();
     dispersiveFurnaceTests();
@@ -1527,6 +3233,18 @@ int main()
     beerLambertTests();
     areaLightTests();
     nonFiniteTests();
+    causticTests();
+    coarseMeshTerminatorTests();
+    authoredRefractionTests();
+    shadingNormalReceiverSplatTests();
+    shadingNormalDeltaSplatTests();
+    ringFringeCoherenceTests();
+    ringStarterFrameBandTests();
+    strongDispersionReachesEvalTests();
+    ringCausticColourTests();
+    causticSplatColourTests();
+    ringCausticFloorTests();
+    refractionSmoothnessTests();
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

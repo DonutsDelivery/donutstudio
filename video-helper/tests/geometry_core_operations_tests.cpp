@@ -1,6 +1,8 @@
 #include "../../shared/GeometryCore.h"
 #include "../../shared/GeometryCoreTransport.h"
+#include "../../shared/SdfSurfaceOperationContract.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -41,6 +43,22 @@ PortContract meshContract() {
   contract.maxVertices = 64;
   contract.maxIndices = 256;
   contract.maxAttributes = 32;
+  return contract;
+}
+
+// A contract at the format bounds, for the generator tests that run past the old
+// node limits. The caps here are the 32-bit index limits, so only the format stops a count.
+PortContract contractFor(CarrierKind carrier) {
+  PortContract contract;
+  contract.carrier = carrier;
+  contract.overflow = OverflowPolicy::reject;
+  contract.maxVertices = kMaximumVertices;
+  contract.maxIndices = kMaximumIndices;
+  contract.maxPoints = kMaximumPoints;
+  contract.maxCurvePoints = kMaximumCurvePoints;
+  contract.maxSplines = kMaximumSplines;
+  contract.maxInstances = kMaximumInstances;
+  contract.maxAttributes = kMaximumAttributes;
   return contract;
 }
 
@@ -286,7 +304,154 @@ void recomputedNormalsAreTheNormalizedFaceSums() {
   check(normalized, "Set Normal with the default toggle makes the recomputed normals unit length");
 }
 
+// Counts past the old node limits build the exact mesh, and only a count that
+// 32-bit indices can't address stops, before anything is allocated.
+void meshGeneratorCountsStopOnlyAtTheirFormat() {
+  const auto contract = contractFor(CarrierKind::geometry3D);
+  std::string error;
+  struct Fixture { OperationCode code; std::array<float, 4> parameters; std::size_t vertices, indices; };
+  for (const auto &fixture : std::array<Fixture, 4>{{
+      {OperationCode::sphere, {1, 128, 64, 0}, 8066, 48384},
+      {OperationCode::icosphere, {1, 9, 0, 0}, 2621442, 15728640},
+      {OperationCode::cylinder, {1, 2, 1024, 0}, 4098, 12288},
+      {OperationCode::cylinder, {1, 2, 1024, 0.5f}, 8192, 24576}}}) {
+    const auto value = lowerMeshGenerator(501, 501, 1, fixture.code, fixture.parameters, contract, error);
+    check(value.has_value(), "a mesh generator lowers past the old node limits");
+    if (!value) continue;
+    const auto &mesh = std::get<GeometryData>(value->data);
+    check(mesh.positions.size() == fixture.vertices && mesh.indices.size() == fixture.indices
+              && *std::max_element(mesh.indices.begin(), mesh.indices.end()) == fixture.vertices - 1,
+          "a large generated mesh has its exact topology and every index in range");
+  }
+  for (const auto &fixture : std::array<Fixture, 6>{{
+      {OperationCode::sphere, {1, 65536, 65537, 0}, 0, 0},
+      {OperationCode::sphere, {1, 4294967040.0f, 4294967040.0f, 0}, 0, 0},
+      {OperationCode::sphere, {1, 4294967296.0f, 2, 0}, 0, 0},
+      {OperationCode::icosphere, {1, 4294967040.0f, 0, 0}, 0, 0},
+      {OperationCode::cylinder, {1, 2, 1073741824.0f, 0}, 0, 0},
+      {OperationCode::cylinder, {1, 2, 536870912.0f, 0.5f}, 0, 0}}})
+    check(!lowerMeshGenerator(501, 501, 1, fixture.code, fixture.parameters, contract, error),
+          "a count past the 32-bit vertex index refuses before allocation");
+  check(!lowerGrid(601, 601, 1, 65536, 65537, 1, contract, error),
+        "a grid past the 32-bit vertex index refuses before allocation");
+  const auto curves = contractFor(CarrierKind::curves3D);
+  const auto circle = lowerCurveCircle(602, 602, 1, 65537, 1, curves, error);
+  const auto line = lowerCurveLine(603, 603, 1, 2049, 1, curves, error);
+  check(circle && std::get<CurvesData>(circle->data).points.size() == 65537
+            && line && std::get<CurvesData>(line->data).points.size() == 2049,
+        "curve generators lower past the old node limits");
+  const auto solid = lowerMeshGenerator(604, 604, 1, OperationCode::cube, {1, 1, 1, 0}, contract, error);
+  const auto scattered = lowerPointDistribution(*solid, 605, OperationCode::pointsOnFaces, 1024, 0,
+                                                contractFor(CarrierKind::points3D), error);
+  check(scattered && std::get<PointsData>(scattered->data).points.size() == 1024,
+        "point distribution lowers past the old node limit");
+}
+
 } // namespace
+
+// The grid stopped at 64 cells per axis until the limit came off. 72 must mesh, finer than 64,
+// on the sphere's surface, without any other budget refusing it.
+void sdfGridAboveTheOldLimitMeshes() {
+  namespace surface = videowire::sdfsurface;
+  const auto mesh = [](std::uint32_t cells, surface::Mesh& out, std::string& error) {
+    surface::Request request;
+    request.cells = {cells, cells, cells};
+    videowire::SdfRecord sphere;
+    sphere.stableId = 9007199254740001ull;
+    sphere.operation = videowire::SdfOperation::sphere;
+    sphere.parameterCount = 1;
+    sphere.parameters[0] = 1.013;
+    request.geometry.rootId = sphere.stableId;
+    request.geometry.records = {sphere};
+    return surface::materialize(request, 9700, 16777216, 100663296, out, error);
+  };
+  surface::Mesh old, finer;
+  std::string error;
+  check(mesh(64, old, error), error.c_str());
+  check(mesh(72, finer, error), error.c_str());
+  check(finer.indices.size() > old.indices.size(), "72 cells mesh finer than 64");
+  check(!finer.positions.empty(), "72 cells produce vertices");
+  for (const auto& position : finer.positions) {
+    const auto radius = std::sqrt(double(position[0]) * position[0] + double(position[1]) * position[1]
+                                  + double(position[2]) * position[2]);
+    if (std::fabs(radius - 1.013) > 0.011) {
+      check(false, "a 72 cell vertex lies on the sphere");
+      break;
+    }
+  }
+}
+
+// Depth bounds real recursion and reports its refusal; the record count is only the wire's.
+void sdfRecordsAndDepthLimits() {
+  namespace surface = videowire::sdfsurface;
+  std::uint64_t nextId = 9007199254000000ull;
+  const auto sphere = [&](std::size_t index) {
+    videowire::SdfRecord record;
+    record.stableId = nextId++;
+    record.operation = videowire::SdfOperation::sphere;
+    record.parameterCount = 1;
+    record.parameters[0] = 1.013f + float(index) * 1.0e-4f;
+    return record;
+  };
+  const auto join = [&](std::uint64_t a, std::uint64_t b) {
+    videowire::SdfRecord record;
+    record.stableId = nextId++;
+    record.operation = videowire::SdfOperation::unionOp;
+    record.inputCount = 2;
+    record.inputs[0] = a;
+    record.inputs[1] = b;
+    return record;
+  };
+  const auto chain = [&](std::size_t depth) {
+    surface::Request request;
+    request.cells = {8, 8, 8};
+    auto root = sphere(0);
+    request.geometry.records.push_back(root);
+    for (std::size_t level = 1; level < depth; ++level) {
+      const auto side = sphere(level);
+      const auto next = join(root.stableId, side.stableId);
+      request.geometry.records.push_back(side);
+      request.geometry.records.push_back(next);
+      root = next;
+    }
+    request.geometry.rootId = root.stableId;
+    return request;
+  };
+  surface::Budget budget;
+  std::string error;
+  check(surface::inspect(chain(64), budget, error), error.c_str());
+  error.clear();
+  check(!surface::inspect(chain(65), budget, error), "depth 65 is refused");
+  check(error.find("depth") != std::string::npos, "the depth refusal names depth");
+
+  surface::Request wide;
+  wide.cells = {8, 8, 8};
+  std::vector<std::uint64_t> level;
+  for (std::size_t index = 0; index < 300; ++index) {
+    const auto leaf = sphere(index);
+    wide.geometry.records.push_back(leaf);
+    level.push_back(leaf.stableId);
+  }
+  while (level.size() > 1) {
+    std::vector<std::uint64_t> next;
+    for (std::size_t index = 0; index < level.size(); index += 2) {
+      if (index + 1 == level.size()) {
+        next.push_back(level[index]);
+        continue;
+      }
+      const auto parent = join(level[index], level[index + 1]);
+      wide.geometry.records.push_back(parent);
+      next.push_back(parent.stableId);
+    }
+    level = std::move(next);
+  }
+  wide.geometry.rootId = level.front();
+  check(wide.geometry.records.size() > 256, "the wide shape has more than the old 256 records");
+  surface::Mesh mesh;
+  error.clear();
+  check(surface::materialize(wide, 9701, 16777216, 100663296, mesh, error), error.c_str());
+  check(!mesh.indices.empty(), "the wide shape meshes");
+}
 
 int main() {
   transformMovesTheUnitCubeExactly();
@@ -296,6 +461,9 @@ int main() {
   joinAppendsTheSecondMeshWithOffsetIndices();
   displacementMovesEachVertexByTheScaledField();
   recomputedNormalsAreTheNormalizedFaceSums();
+  meshGeneratorCountsStopOnlyAtTheirFormat();
+  sdfGridAboveTheOldLimitMeshes();
+  sdfRecordsAndDepthLimits();
   if (failures != 0) {
     std::fprintf(stderr, "%d geometry operation check(s) failed\n", failures);
     return 1;

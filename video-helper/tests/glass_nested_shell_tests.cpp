@@ -9,12 +9,15 @@
 // rules. They need no GPU.
 
 #include "../src/gpu_backend/fixture_smooth_glass.h"
+#include "../src/gpu_backend/fixture_glass_overdraw_probe.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -135,13 +138,19 @@ void receiverBox(Visual3DScene& scene, std::uint32_t id, std::uint32_t material,
 }
 
 // An opaque quad over x0..x1 and z0..z1, facing up, with its height a linear
-// function of x: y0 at x0 and y1 at x1.
+// function of x: y0 at x0 and y1 at x1. Every vertex carries the quad's flat
+// geometric normal, which admission requires of a receiver, so a tilted quad
+// reaches the interpenetration test instead of failing on its normals.
 void opaqueQuad(Visual3DScene& scene, std::uint32_t id, std::uint32_t material, float x0, float x1, float z0, float z1,
                 float y0, float y1)
 {
     const auto o = beginObject(scene, id, material);
-    const auto a = vertex(scene, o, {x0, y0, z0}), b = vertex(scene, o, {x0, y0, z1});
-    const auto c = vertex(scene, o, {x1, y1, z1}), d = vertex(scene, o, {x1, y1, z0});
+    // cross(b - a, c - a) with b - a = (0, 0, dz) and c - a = (dx, dy, dz).
+    const double dx = double(x1) - x0, dy = double(y1) - y0, dz = double(z1) - z0;
+    const double nx = -dz * dy, ny = dz * dx, length = std::sqrt(nx * nx + ny * ny);
+    const SceneVec3 n {float(nx / length), float(ny / length), 0};
+    const auto a = vertex(scene, o, {x0, y0, z0}, n), b = vertex(scene, o, {x0, y0, z1}, n);
+    const auto c = vertex(scene, o, {x1, y1, z1}, n), d = vertex(scene, o, {x1, y1, z0}, n);
     triangle(scene, a, b, c);
     triangle(scene, a, c, d);
     endObject(scene, o);
@@ -610,7 +619,7 @@ void touchingAndInterpenetrating()
                   && cubeBottom(first.normal, first.entering),
               "the contact chain " + label + " ends on the cube's bottom face after 6 visits: end "
                   + std::to_string(int(first.end)) + ", " + std::to_string(first.visits) + " visits");
-        // Preview caps a walk at 12 visits, an export pair walk at 48.
+        // Preview caps a walk at kPreviewCameraVisits visits, an export pair walk at 48.
         for (const int cap : {int(sg::kPreviewCameraVisits), 48})
         {
             std::string trapped;
@@ -823,6 +832,57 @@ void shellRefusals()
 }
 
 // (e) The single-shell case is unchanged.
+// A closed glass sphere of 12000 triangles, past the old 2048 volume and 8192
+// scene counts: 100 segments and 61 rings make 2*100*60 triangles, with one
+// vertex at each pole, so it is one closed manifold shell.
+void largeClosedGlassVolume()
+{
+    constexpr std::uint32_t segments = 100, rings = 61;
+    constexpr double kPi = 3.14159265358979323846;
+    const auto owned = newScene();
+    auto& scene = *owned;
+    Visual3DSceneGrowth growth;
+    growth.vertices = 2 + segments * (rings - 1) + 24;
+    growth.indices = 3 * 2 * std::size_t(segments) * (rings - 1) + 36;
+    std::string error;
+    const bool grown = growVisual3DScene(scene, growth, error);
+    check(grown, "the 12000-triangle scene allocates: " + error);
+    if (!grown) return;
+    const auto o = beginObject(scene, kGlassId, kGlassMaterial);
+    const auto north = vertex(scene, o, {0, 1, 0});
+    std::vector<std::uint32_t> band;
+    for (std::uint32_t k = 1; k < rings; ++k)
+        for (std::uint32_t j = 0; j < segments; ++j)
+        {
+            const double theta = kPi * k / rings, phi = 2 * kPi * j / segments;
+            band.push_back(vertex(scene, o, {float(std::sin(theta) * std::cos(phi)), float(std::cos(theta)),
+                                             float(std::sin(theta) * std::sin(phi))}));
+        }
+    const auto south = vertex(scene, o, {0, -1, 0});
+    const auto at = [&](std::uint32_t k, std::uint32_t j) { return band[(k - 1) * segments + j % segments]; };
+    for (std::uint32_t j = 0; j < segments; ++j)
+    {
+        triangle(scene, north, at(1, j + 1), at(1, j));
+        triangle(scene, south, at(rings - 1, j), at(rings - 1, j + 1));
+        for (std::uint32_t k = 1; k + 1 < rings; ++k)
+        {
+            triangle(scene, at(k, j), at(k, j + 1), at(k + 1, j + 1));
+            triangle(scene, at(k, j), at(k + 1, j + 1), at(k + 1, j));
+        }
+    }
+    endObject(scene, o);
+    check(scene.objects[o].indexCount / 3 == 12000, "the test sphere has 12000 triangles");
+    receiverBox(scene, kFloor, 20, {-3, -1.5f, -3}, {3, -1.01f, 3});
+    const auto admitted = admit(scene);
+    check(admitted.ok && admitted.prepared.enabled
+              && admitted.prepared.transport == surfacematerial::TransportMode::ClosedVolume,
+          "a closed glass sphere of 12000 triangles is admitted: " + admitted.error);
+    if (!admitted.ok) return;
+    const auto camera = walk(admitted, {0.05f, 0.03f, 5}, {0, 0, -1}, true);
+    check(camera.status == 0 && std::abs(total(camera) - 1) < 1e-9 && camera.environment > 0.9,
+          "a ray through the 12000-triangle sphere conserves power and transmits to the environment");
+}
+
 void singleShell()
 {
     {
@@ -838,7 +898,10 @@ void singleShell()
         if (admitted.ok)
         {
             const auto camera = walk(admitted, {0.05f, 0.03f, 5}, {0, 0, -1}, true);
-            check(camera.status == 0 && camera.terminals.empty() && std::abs(camera.environment - 1) < 1e-9,
+            // The walk moves any branch under 1e-5 to unresolved, and at normal
+            // incidence (R = 0.04) that drops about 2.5e-6 of the power.
+            check(camera.status == 0 && camera.terminals.empty() && std::abs(total(camera) - 1) < 1e-9
+                      && camera.environment > 1 - 1e-5,
                   "the axial ray through the solid cube leaves to the environment");
         }
     }
@@ -859,14 +922,273 @@ void singleShell()
 }
 } // namespace
 
+// The closed-glass overdraw probe (ARBIT_GL_GLASS_OVERDRAW_PROBE=1) is GPU-only, so this
+// pins its GL-free half: the switch, the walk-mode tags, the per-object merge across
+// bands, the walk and per-mode totals, the factors, the times and the exact log line.
+void overdrawProbeLine()
+{
+    namespace go = arbitgpu::glassoverdraw;
+    check(go::enabledValue("1") && !go::enabledValue("0") && !go::enabledValue(nullptr)
+        && !go::enabledValue(""), "overdraw probe turns on only for 1");
+    // Same test as the shader: exactly 2 is the water walk, anything else above 0.5 the
+    // volume walk, the rest ordinary lighting.
+    check(go::walkMode(0.0f) == go::kOrdinary && go::walkMode(0.4f) == go::kOrdinary
+        && go::walkMode(1.0f) == go::kVolume && go::walkMode(2.0f) == go::kWater
+        && go::walkMode(3.0f) == go::kVolume, "overdraw probe walk mode follows uGlassTransport.x");
+    check(std::string(go::walkTag(go::kWater)) == "water" && std::string(go::walkTag(go::kVolume)) == "volume"
+        && std::string(go::walkTag(go::kOrdinary)) == "obj", "overdraw probe walk tags");
+    go::FrameCounts counts;
+    counts.width = 672; counts.height = 378; counts.bands = 2; counts.covered = 1000;
+    // Two bands draw the water, the dome and an ordinary object. Each object keeps one entry.
+    go::accumulate(counts, 0x3004u, go::kWater, 600, 500, 1500000);
+    go::accumulate(counts, kGlassId, go::kVolume, 900, 400, 2000000);
+    go::accumulate(counts, 0x3005u, go::kOrdinary, 100, 100, 250000);
+    go::accumulate(counts, 0x3004u, go::kWater, 300, 200, 1000000);
+    go::accumulate(counts, kGlassId, go::kVolume, 700, 300, 1250000);
+    // The coverage pass looks entries up as ordinary. That must not drop a walk tag.
+    go::entryFor(counts, 0x3004u, go::kOrdinary).visible = 600;
+    go::entryFor(counts, kGlassId, go::kOrdinary).visible = 400;
+    go::entryFor(counts, 0x3005u, go::kOrdinary).visible = 50;
+    check(counts.objects.size() == 3 && counts.objects[0].object == 0x3004u
+        && counts.objects[0].invocations == 900 && counts.objects[0].nanoseconds == 2500000
+        && counts.objects[1].samplesPassed == 700 && counts.objects[0].mode == go::kWater
+        && counts.objects[1].mode == go::kVolume && counts.objects[2].mode == go::kOrdinary,
+        "overdraw probe merges an object's draws across bands in first-draw order");
+    const auto walk = go::walkTotals(counts), water = go::modeTotals(counts, go::kWater),
+        volume = go::modeTotals(counts, go::kVolume);
+    check(go::totalInvocations(counts) == 2600 && walk.invocations == 2500 && walk.visible == 1000
+        && walk.nanoseconds == 5750000 && water.invocations == 900 && water.visible == 600
+        && volume.invocations == 1600 && volume.visible == 400 && volume.nanoseconds == 3250000,
+        "overdraw probe totals the walk objects and each walk mode");
+    check(go::factor(go::totalInvocations(counts), counts.covered) == 2.6,
+        "overdraw factor is invocations over covered pixels");
+    check(go::factor(walk.invocations, walk.visible) == 2.5,
+        "walk factor is walk invocations over visible walk pixels");
+    check(go::factor(300, 1000) == 0.3, "an overdraw factor below one is not clamped");
+    check(go::factor(5, 0) == 0.0, "overdraw factor is zero when nothing is covered");
+    check(go::formatLine(counts) == "[gl] glass overdraw: invocations=2600 covered=1000 factor=2.600 "
+        "walk-invocations=2500 walk-visible=1000 walk-factor=2.500 walk-ms=5.75 "
+        "water-invocations=900 water-visible=600 water-ms=2.50 "
+        "volume-invocations=1600 volume-visible=400 volume-ms=3.25 "
+        "per-object=[water12292:900/700/600:ms=2.50,volume12291:1600/700/400:ms=3.25,"
+        "obj12293:100/100/50:ms=0.25] frame=672x378 bands=2\n",
+        "overdraw probe log line format");
+    check(go::shouldLog(1) && !go::shouldLog(2) && !go::shouldLog(30) && go::shouldLog(31)
+        && !go::shouldLog(0), "overdraw probe logs the first and every 30th measured frame");
+}
+
+// ARBIT_GL_GLASS_PREVIEW_VISITS: only a whole number from 1 to 64 sets the Fast
+// Preview walk cap, and the cap reaches the Preview text's define.
+void previewVisitsOverride()
+{
+    for (const char* ignored : { (const char*) nullptr, "", "0", "65", "-3", "+8", "8x", " 8", "8 ", "1.5", "abc", "99999999999" })
+        check(!sg::parsePreviewCameraVisitsOverride(ignored).has_value(),
+              std::string("preview visits text is ignored: ") + (ignored ? ignored : "(unset)"));
+    const std::pair<const char*, std::uint32_t> accepted[] { {"1", 1u}, {"12", 12u}, {"24", 24u}, {"64", 64u} };
+    for (const auto& [text, value] : accepted)
+    {
+        const auto parsed = sg::parsePreviewCameraVisitsOverride(text);
+        check(parsed && *parsed == value, std::string("preview visits text parses: ") + text);
+    }
+    const std::string anchor = "        for(int visit=0;visit<64;++visit) {\n";
+    const std::string text = "    for(int channel=0;channel<3;++channel) {\n        float wavelength=channel==0?0.6563:channel==1?0.5461:0.4358;\n"
+        "        float ior=max(1.0,uSurfaceCoating.y+uGlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));\n"
+        "        // backs: where retry 3 looks (seamSpawnBack), -direction for the seed.\n"
+        "        vec3 origins[16],directions[16],backs[16];float weights[16];int depths[16];bool media[16];int seams[16];\n" + anchor
+        + "if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}"
+        + "if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}"
+        + "radiance[channel]+=weight*glassEnvironment(direction GX_PASS)[channel];continue;"
+        + "radiance[channel]+=weight*receiver[channel];continue;";
+    const auto standard = sg::previewCameraTransportShader(text);
+    const auto overridden = sg::previewCameraTransportShader(text, 24);
+    check(standard.find("#define GLASS_PREVIEW_VISITS 6\n") != std::string::npos, "the default Preview cap stays 6");
+    check(overridden.find("#define GLASS_PREVIEW_VISITS 24\n") != std::string::npos
+              && overridden.find("#define GLASS_PREVIEW_VISITS 6") == std::string::npos,
+          "an override cap replaces the Preview define");
+    // A walk of v visits from s seeds holds at most s + v branches, so Preview
+    // sizes its arrays to that and never past the 16 Export slots.
+    check(standard.find("#define GLASS_PREVIEW_PENDING 7\n#define GLASS_PREVIEW_PAIR_PENDING 8\n") != std::string::npos,
+          "6 visits size the single walk to 7 slots and the paired walk to 8");
+    check(overridden.find("#define GLASS_PREVIEW_PENDING 16\n#define GLASS_PREVIEW_PAIR_PENDING 16\n") != std::string::npos,
+          "a cap past 14 visits keeps all 16 slots");
+    check(sg::previewCameraTransportShader(text, 1).find("#define GLASS_PREVIEW_PENDING 2\n#define GLASS_PREVIEW_PAIR_PENDING 3\n")
+              != std::string::npos, "one visit sizes the walks to 2 and 3 slots");
+    std::string oneCheck = text;
+    oneCheck.erase(oneCheck.find("if(pending>=16) {"), std::char_traits<char>::length("if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}"));
+    check(sg::previewCameraTransportShader(oneCheck).empty(), "a single walk without both slot checks builds no Preview text");
+    for (const bool paired : { false, true })
+    {
+        const auto exported = sg::transportShader(false, true, false, paired);
+        const auto preview = sg::previewCameraTransportShader(exported);
+        const std::string exportArrays = "vec3 origins[16],directions[16],backs[16];float weights[16];int depths[16];bool media[16];int seams[16];";
+        const auto count = [] (const std::string& haystack, const std::string& needle)
+        {
+            std::size_t found = 0;
+            for (auto at = haystack.find(needle); at != std::string::npos; at = haystack.find(needle, at + needle.size())) ++found;
+            return found;
+        };
+        check(!preview.empty() && count(exported, exportArrays) == (paired ? 2u : 1u) && count(preview, exportArrays) == 0
+                  && count(exported, "if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}") == 2
+                  && count(preview, "if(pending>=GLASS_PREVIEW_PENDING) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}") == 2
+                  && preview.find("int seams[GLASS_PREVIEW_PENDING];") != std::string::npos
+                  && exported.find("GLASS_PREVIEW") == std::string::npos,
+              std::string("the Preview walks use the compact slots and Export keeps 16: ") + (paired ? "paired" : "single"));
+        if (paired)
+            check(preview.find("int seams[GLASS_PREVIEW_PAIR_PENDING];") != std::string::npos
+                      && preview.find("if(pending>=GLASS_PREVIEW_PAIR_PENDING) {") != std::string::npos
+                      && preview.find("for(int slot=1;slot<GLASS_PREVIEW_PAIR_PENDING;++slot)") != std::string::npos
+                      && exported.find("for(int slot=1;slot<16;++slot)") != std::string::npos,
+                  "the paired walk spills at its compact slot count in Preview and at 16 in Export");
+    }
+    // The Preview query text hands BVH children back by value; the shared query
+    // text, which Accurate and Export compile, keeps the inout stack.
+    const auto query = sg::queryShader(false);
+    const auto previewQuery = sg::previewQueryShader(query);
+    check(!previewQuery.empty() && previewQuery != query
+              && previewQuery.find("SC_STACK_ARGS ST_ARGS) {") == std::string::npos
+              && previewQuery.find("out int pushFirst,out int pushSecond ST_ARGS) {") != std::string::npos
+              && previewQuery.find("if(pushed>0) nodes[pending++]=pushFirst;") != std::string::npos
+              && previewQuery.find("if(pushed>1) meshNodes[meshPending++]=pushSecond;") != std::string::npos
+              && previewQuery.find(",nodes,pending,capacity ST_PASS)") == std::string::npos
+              && query.find("int glassSceneChildren(SV3 origin,SV3 direction,float limit,int node,int escape SC_STACK_ARGS ST_ARGS) {")
+                     != std::string::npos
+              && query.find("escape,nodes,pending,capacity ST_PASS);") != std::string::npos
+              && query.find("pushFirst") == std::string::npos,
+          "only the Preview query text drops the inout BVH stack");
+    check(sg::previewQueryShader("vec3 unrelated();").empty(), "a query text without the anchors builds no Preview query");
+}
+
+// A scene whose glass is all roughness 0 compiles the GL fixture program from the
+// smooth-only transport text. That text has no rough walk definitions and keeps
+// every smooth walk byte for byte. The full text keeps the rough walks.
+void smoothOnlyTransportText()
+{
+    const auto count = [] (const std::string& haystack, const std::string& needle)
+    {
+        std::size_t found = 0;
+        for (auto at = haystack.find(needle); at != std::string::npos; at = haystack.find(needle, at + needle.size())) ++found;
+        return found;
+    };
+    const auto body = [] (const std::string& text, const std::string& signature)
+    {
+        const auto at = text.find(signature);
+        if (at == std::string::npos) return std::string();
+        const auto close = text.find("\n}\n", at);
+        return close == std::string::npos ? std::string() : text.substr(at, close + 3 - at);
+    };
+    const char* rough[] { "vec3 glassRoughNormal(", "float glassRoughG1(", "void glassRoughInterface(",
+        "vec3 glassDirectSpecular(", "vec3 roughThinInterfaceTransport(", "vec3 roughGlassTransport(",
+        "uint glassMsChildHistory(", "uint glassMsEntryKey(", "uint glassMsSeed(", "float glassMsRandom(",
+        "float glassMsLambda(", "float glassMsEscape(", "vec3 glassMsNormal(",
+        "int glassMsWalk(", "vec3 roughGlassTransportV2(", "uint glassCameraPixelKey(", "vec3 roughCameraTransport(" };
+    for (const bool paired : { false, true })
+        for (const bool preview : { false, true })
+        {
+            const std::string variant = std::string(paired ? "paired" : "single") + (preview ? " Preview" : " export");
+            auto full = sg::transportShader(false, true, false, paired);
+            if (preview) full = sg::previewCameraTransportShader(full);
+            const auto smooth = sg::smoothOnlyCameraTransportShader(full);
+            check(!full.empty() && !smooth.empty() && smooth.size() < full.size(),
+                  "the smooth-only transport text is built and shorter: " + variant);
+            for (const char* definition : rough)
+                check(count(full, definition) == 1 && count(smooth, definition) == 0,
+                      "only the full transport text defines " + std::string(definition) + " " + variant);
+            std::vector<std::string> kept { "float glassFresnel(", "vec3 glassEnvironment(", "vec3 glassReceiver(",
+                "vec3 thinInterfaceReceiver(", "int glassRoughReason(", "bool thinEntryOwned(" };
+            if (paired)
+                for (const char* name : { "vec3 thinSingleInterfaceTransport(", "vec3 glassSingleTransport(",
+                         "vec3 glassPairWalk(", "vec3 glassPairLeftover(" })
+                    kept.emplace_back(name);
+            kept.emplace_back("vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool complete,out int status GX_ARGS) {");
+            kept.emplace_back("vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_ARGS) {");
+            for (const auto& signature : kept)
+            {
+                const auto before = body(full, signature);
+                check(!before.empty() && before == body(smooth, signature),
+                      "the smooth-only text keeps " + signature + " byte for byte: " + variant);
+            }
+        }
+    const auto once = sg::smoothOnlyCameraTransportShader(sg::transportShader(false, true));
+    check(sg::smoothOnlyCameraTransportShader(once).empty(), "a text without the rough anchors builds no smooth-only text");
+    check(sg::smoothOnlyCameraTransportShader("vec3 unrelated();").empty(), "an unrelated text builds no smooth-only text");
+
+    const auto program = [] (std::uint32_t mode, float roughness)
+    {
+        auto p = std::make_shared<Program>();
+        p->parameters.identifiers[1] = mode;
+        p->parameters.emissionRoughness = {0, 0, 0, roughness};
+        return p;
+    };
+    const auto closed = std::uint32_t(surfacematerial::TransportMode::ClosedVolume);
+    const auto thin = std::uint32_t(surfacematerial::TransportMode::ThinInterface);
+    check(!sg::smoothOnlyCameraGlass(nullptr), "no program is not smooth-only glass");
+    check(!sg::smoothOnlyCameraGlass(program(0, 0).get()), "a scene without glass is not smooth-only glass");
+    check(sg::smoothOnlyCameraGlass(program(closed, 0).get()), "smooth closed glass is smooth-only glass");
+    check(!sg::smoothOnlyCameraGlass(program(closed, .05f).get()), "rough closed glass keeps the rough text");
+    check(!sg::smoothOnlyCameraGlass(program(closed, std::nanf("")).get()), "NaN roughness keeps the rough text");
+    auto root = program(0, 1);
+    root->objectPrograms.push_back(program(thin, 0));
+    root->objectPrograms.push_back(program(closed, 0));
+    check(sg::smoothOnlyCameraGlass(root.get()), "smooth water beside smooth closed glass is smooth-only glass");
+    root->objectPrograms.push_back(program(closed, .35f));
+    check(!sg::smoothOnlyCameraGlass(root.get()), "one rough glass child keeps the rough text");
+}
+
+// The lighthouse roof is a smooth sphere the water reflects. A receiver's camera
+// walk hit carries its interpolated normal, the crossing keeps the face normal,
+// and a flat receiver stores no normals, so its query and its shading stay as they were.
+void smoothReceiverNormals()
+{
+    const auto scene = [](bool smooth) {
+        const auto owned = newScene();
+        addGlass(*owned, Glass::Solid);
+        receiverBox(*owned, kFloor, 20, {-3, -1.5f, -3}, {3, -1.01f, 3});
+        if (smooth)
+            for (std::size_t v = 0; v < owned->vertexCount; ++v)
+                if (auto& vertex = owned->vertices[v]; vertex.normal.y == 1 && vertex.position.y == -1.01f && vertex.position.x > 0)
+                    vertex.normal = {0.6f, 0.8f, 0};
+        return admit(*owned);
+    };
+    const auto down = [](const auto& admitted) {
+        return ov::closestHitCpu(admitted.prepared.query, admitted.frame, {2.5f, 0, 2.5f}, {0, -1, 0}, 0.0f, 3.402823e38f);
+    };
+    const auto flat = scene(false);
+    check(flat.ok && ! flat.prepared.smoothReceiverNormals, "a flat receiver is admitted without normals: " + flat.error);
+    if (flat.ok)
+    {
+        const auto hit = down(flat);
+        check(hit.status == 1 && hit.objectId == kFloor && hit.shadingNormal == hit.outwardNormal,
+              "a flat receiver shades with exactly its face normal");
+    }
+    const auto smooth = scene(true);
+    check(smooth.ok && smooth.prepared.smoothReceiverNormals, "a smooth receiver is admitted: " + smooth.error);
+    if (smooth.ok)
+    {
+        const auto hit = down(smooth);
+        const auto length = std::sqrt(hit.shadingNormal[0] * hit.shadingNormal[0]
+            + hit.shadingNormal[1] * hit.shadingNormal[1] + hit.shadingNormal[2] * hit.shadingNormal[2]);
+        check(hit.status == 1 && hit.objectId == kFloor && hit.shadingNormal[0] > 0 && std::abs(length - 1) < 1e-5f,
+              "a smooth receiver's hit interpolates its vertex normals");
+        check(hit.outwardNormal[0] == 0 && hit.outwardNormal[1] == 1 && hit.outwardNormal[2] == 0,
+              "the same hit keeps its face normal for crossings");
+        check(smooth.prepared.query.texels.size() > flat.prepared.query.texels.size(),
+              "only the smooth receiver's faces add normal blocks");
+    }
+}
+
 int main()
 {
+    smoothOnlyTransportText();
+    smoothReceiverNormals();
+    previewVisitsOverride();
     hollowDomeAdmitted();
     cavityCube();
     touchingAndInterpenetrating();
     grazingAndCoplanar();
     shellRefusals();
     singleShell();
+    largeClosedGlassVolume();
+    overdrawProbeLine();
     std::printf("glass nested shell: %d/%d checks passed\n", checks - failures, checks);
     return failures == 0 ? 0 : 1;
 }

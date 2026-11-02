@@ -14,14 +14,17 @@
 #include "stabilization.h"
 #include "software_h264_encoder.h"
 #include "capture_device.h"
+#include "block_c_packer.h"
 #include "exporter.h"
+#include "pathtrace_fixture_engine.h"
 
 #include "composite_probe_contract.h"
 #include "composite_render_diagnostic.h"
-#include "bounded_line.h"
+#include "request_line.h"
 #include "compositor_ownership.h"
 #include "render_thread.h"
 #include "render_snapshot_json.h"
+#include "visual_plan_payload_restore.h"
 #include "score_json_parser.h"
 #include "harmony_signals_json.h"
 #include "model_payload_transport.h"
@@ -29,6 +32,7 @@
 #include "glb_geometry_core_adapter.h"
 #include "imported_geometry_execution.h"
 #include "imported_scene_payload_execution.h"
+#include "path_trace_stats_reply.h"
 #include "imported_animated_scene_payload_execution.h"
 #if ARBIT_HAVE_VIEWPORT
 #include "viewport.h"
@@ -54,13 +58,16 @@ namespace arbitselftest { using RifeBackend = arbitrife::RifeEngineNcnn; }
 namespace arbitselftest { using RifeBackend = arbitrife::RifeEngine; }
 #endif
 
+#include <new>
+#include <stdexcept>
+#include <chrono>
 #include <algorithm>
 
 #include <nlohmann/json.hpp>
 #include "video_control_plan_json.h"
 
+#include <cerrno>
 #include <cstdio>
-#include <iostream>
 
 #if defined(__APPLE__)
 #include <poll.h>
@@ -93,14 +100,35 @@ using json = nlohmann::json;
 
 namespace
 {
+double diagnosticMilliseconds (std::chrono::steady_clock::time_point from,
+                               std::chrono::steady_clock::time_point to)
+{
+    return std::chrono::duration<double, std::milli> (to - from).count();
+}
+
 std::map<uint32_t, std::unique_ptr<MediaContext>> g_media;
 uint32_t g_nextMediaId = 1;
 compositeartifact::Store g_compositeArtifacts;
 videoshm::Region g_shm;
 uint32_t g_nextSlot = 0;
 std::filesystem::path g_trustedMatteCacheRoot;
+visualplanpayloaddelta::Store g_visualPlanPayloads;
 std::filesystem::path g_trustedDepthCacheRoot;
 videohelper::modelpayload::Store g_modelPayloads;
+
+// An export that runs out of memory fails its job instead of ending the helper.
+std::string runExportNamingAllocationFailure (const ExportJob& job, std::string& usedEncoder,
+                                              bool& glCompositing, std::string& interpolationBackend,
+                                              ExportProgress* progress)
+{
+    try
+    {
+        return runExport (job, usedEncoder, glCompositing, interpolationBackend,
+                          progress, &g_modelPayloads);
+    }
+    catch (const std::bad_alloc&) { return "Export could not allocate memory"; }
+    catch (const std::length_error&) { return "Export could not allocate memory"; }
+}
 videohelper::modelpayload::ImportedScenePayloadExecution g_importedScenePayloadExecution(
     g_modelPayloads, arbitgpu::nativeFixtureSceneBackend());
 videohelper::modelpayload::ImportedAnimatedScenePayloadExecution
@@ -1210,6 +1238,8 @@ void handleExportAsync (const json& idVal, const json& params)
     g_export.progress.frame.store (0);
     g_export.progress.totalFrames.store (0);
     g_export.progress.encodeFps.store (0.0);
+    g_export.progress.droppedNotesPeak.store (0);
+    g_export.progress.droppedLinksPeak.store (0);
     g_export.progress.phase.store (1);
     g_export.progress.abort.store (false);
     g_export.progress.visualTelemetry.resetSession();
@@ -1234,14 +1264,17 @@ void handleExportAsync (const json& idVal, const json& params)
 #if ARBIT_HAVE_VIEWPORT
         ViewportInterpSuspendGuard interpGuard; // restores on scope exit (exception-safe)
 #endif
-        const std::string error = runExport (*job, usedEncoder, glCompositing,
-                                             interpolationBackend,
-                                             &g_export.progress, &g_modelPayloads);
+        const std::string error = runExportNamingAllocationFailure (*job, usedEncoder, glCompositing,
+                                                                    interpolationBackend,
+                                                                    &g_export.progress);
         json result;
         if (error.empty())
             result = { { "outPath", job->outPath }, { "encoder", usedEncoder },
                        { "glCompositing", glCompositing },
-                       { "interpolationBackend", interpolationBackend } };
+                       { "interpolationBackend", interpolationBackend },
+                       { "scoreDropWarning", arbitblockc::scoreDropWarning (
+                             g_export.progress.droppedNotesPeak.load(),
+                             g_export.progress.droppedLinksPeak.load()) } };
 #if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
         if (error.empty() && (! job->luaScript.empty() || ! job->jsScript.empty()))
             result["testScriptLimitsAtOperation"] = {
@@ -1405,9 +1438,9 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
 #if ARBIT_HAVE_VIEWPORT
         g_viewport.setInterpolationSuspended (true);   // free the GPU for the cache build
 #endif
-        std::string error = runExport (*job, usedEncoder, glCompositing,
-                                       interpolationBackend,
-                                       &g_renderCache.progress, &g_modelPayloads);
+        std::string error = runExportNamingAllocationFailure (*job, usedEncoder, glCompositing,
+                                                              interpolationBackend,
+                                                              &g_renderCache.progress);
 #if ARBIT_HAVE_VIEWPORT
         g_viewport.setInterpolationSuspended (false);
 #endif
@@ -1654,7 +1687,7 @@ json handle (const std::string& method, const json& params, std::string& error)
         if (!geometry) return {};
         videowire::geometry::PortContract contract;
         contract.carrier=videowire::geometry::CarrierKind::geometry3D;
-        contract.maxVertices=4096; contract.maxIndices=12288;
+        contract.maxVertices=videowire::geometry::kMaximumVertices; contract.maxIndices=videowire::geometry::kMaximumIndices;
         contract.maxAttributes=videowire::geometry::kMaximumAttributes;
         contract=videowire::geometry::withAttributeContract(std::move(contract),geometry->descriptor());
         return json{{"geometry",videowire::geometry::encodeLoweredPlanText(
@@ -2326,6 +2359,7 @@ json handle (const std::string& method, const json& params, std::string& error)
             return {};
         videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::snapshotAdmitted);
         CompositeFrameResult frame;
+        videorender::fixture3d::clearPathTraceExportStats();
         error = renderCompositeFrame (job, timelineSec, frame, &g_modelPayloads);
         if (! error.empty()) return {};
         frame.harmonicProbe.scoreObjectPresent = params.contains("score") && params["score"].is_object();
@@ -2386,6 +2420,10 @@ json handle (const std::string& method, const json& params, std::string& error)
                 { "cpuMs", job.scriptCpuMs }, { "memoryMiB", job.scriptMemoryMiB } } }
 #endif
         };
+        videorender::fixture3d::appendPathTraceStats (
+            result, videorender::fixture3d::lastPathTraceStats (videorender::fixture3d::RenderUse::Export));
+        videorender::fixture3d::appendRealtimeStats (
+            result, videorender::fixture3d::lastRealtimeStats (videorender::fixture3d::RenderUse::Export));
         if (params.value("artifact", false))
         {
             if (frame.width != compositeartifact::width || frame.height != compositeartifact::height)
@@ -2682,6 +2720,12 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "ok", true } };
     }
 
+    if (method == "viewport_set_full_canvas_scene")
+    {
+        g_viewport.setFullCanvasScene (params.value ("enabled", false));
+        return json { { "ok", true } };
+    }
+
     if (method == "viewport_set_canvas_frame_enabled")
     {
         g_viewport.setCanvasFrameEnabled (params.value ("enabled", true));
@@ -2745,6 +2789,7 @@ json handle (const std::string& method, const json& params, std::string& error)
     if (method == "viewport_set_timeline")
     {
         if(!admitProgrammableJob(params,error)) return {};
+        const auto snapshotStarted = std::chrono::steady_clock::now();
         videowire::ResolvedVisualSnapshot snapshot;
         if (! videowire::parseSnapshotJson (params, resolveShaderSource, snapshot, error))
         {
@@ -2753,6 +2798,7 @@ json handle (const std::string& method, const json& params, std::string& error)
                               params.value ("structuralRevision", uint64_t { 0 })));
             return {};
         }
+        const auto snapshotParsed = std::chrono::steady_clock::now();
         if (! videowire::validateSnapshotResources (
                 snapshot,
                 [] (const std::string& path) { return std::filesystem::exists (path); },
@@ -2781,8 +2827,14 @@ json handle (const std::string& method, const json& params, std::string& error)
             g_testDeferredSnapshot = std::move (snapshot);
             return json { { "deferred", true } };
         }
+        const auto snapshotValidated = std::chrono::steady_clock::now();
         std::string installError;
-        if (! g_viewport.installSnapshot (std::move (snapshot), &installError))
+        const bool installed = g_viewport.installSnapshot (std::move (snapshot), &installError);
+        std::fprintf (stderr, "[diagnostic] viewport_set_timeline phases snapshotMs=%.1f validateMs=%.1f installMs=%.1f\n",
+                      diagnosticMilliseconds (snapshotStarted, snapshotParsed),
+                      diagnosticMilliseconds (snapshotParsed, snapshotValidated),
+                      diagnosticMilliseconds (snapshotValidated, std::chrono::steady_clock::now()));
+        if (! installed)
         {
             error = installError.empty() ? "snapshot installation failed" : installError;
             return {};
@@ -3262,10 +3314,24 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "ok", true } };
     }
 
+    if (method == "renderer_preparation")
+    {
+        const std::string action = params.value ("action", std::string());
+        if (action == "cancel")
+            return json { { "applied", videorender::fixture3d::pathtracefixture::cancelDeviceBuild() } };
+        if (action == "start")
+        {
+            videorender::fixture3d::pathtracefixture::startDeviceBuildAgain();
+            return json { { "applied", true } };
+        }
+        error = "renderer_preparation: action must be cancel or start";
+        return {};
+    }
+
     if (method == "viewport_info" || method == "get_av_offset")
     {
         const auto vi = g_viewport.info();
-        return json {
+        json reply {
             { "open", vi.open }, { "width", vi.width }, { "height", vi.height },
             { "measuredFps", vi.measuredFps }, { "avOffsetSec", vi.avOffsetSec },
             { "interpolationActive", vi.interpolationActive },
@@ -3284,6 +3350,8 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "rendererError", vi.rendererError },
             { "planError", vi.planError },
             { "planErrorClipId", vi.planErrorClipId },
+            { "scoreDropWarning", vi.scoreDropWarning },
+            { "roughV1RanAsV2", videorender::fixture3d::roughV1RanAsV2Recently() },
             { "importedScenePending", vi.importedScenePending },
             { "fallbackCount", vi.fallbackCount },
             { "framesPresented", vi.framesPresented },
@@ -3323,6 +3391,9 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "lastSlowScopeMs", vi.lastSlowScopeMs },
             { "stalledStep", vi.stalledStep },
             { "stalledStepMs", vi.stalledStepMs },
+            { "kernelCompiling", vi.kernelCompiling },
+            { "kernelCancellable", vi.kernelCancellable },
+            { "kernelBuildStopped", vi.kernelBuildStopped },
             { "lastCloseWaitStep", vi.lastCloseWaitStep },
             { "lastCloseWaitMs", vi.lastCloseWaitMs },
             { "canvasWidth", vi.canvasWidth },
@@ -3347,6 +3418,11 @@ json handle (const std::string& method, const json& params, std::string& error)
                 { "maxComputeWorkGroupInvocations", vi.gpuCaps.maxComputeWorkGroupInvocations },
             } },
         };
+        videorender::fixture3d::appendPathTraceStats (
+            reply, videorender::fixture3d::lastPathTraceStats (videorender::fixture3d::RenderUse::Preview));
+        videorender::fixture3d::appendRealtimeStats (
+            reply, videorender::fixture3d::lastRealtimeStats (videorender::fixture3d::RenderUse::Preview));
+        return reply;
     }
 
     // ---- Video scopes (PROTOCOL.md §Scopes) — viewport-only diagnostics
@@ -3376,6 +3452,7 @@ json handle (const std::string& method, const json& params, std::string& error)
     if (method == "shutdown")
     {
         g_compositeArtifacts.clear();
+        videorender::fixture3d::pathtracefixture::stopDeviceBuildAtExit();
         // Abort + join any in-flight export/proxy/render-cache job so
         // std::exit doesn't tear down a joinable std::thread (terminate) or
         // leave a half-written file.
@@ -3527,7 +3604,9 @@ int main (int argc, char** argv)
         if (lineSize == 0) return;
         g_compositeArtifacts.prune();
 
+        const auto requestStarted = std::chrono::steady_clock::now();
         json req = json::parse (lineData, lineData + lineSize, nullptr, false);
+        const auto requestParsed = std::chrono::steady_clock::now();
         if (req.is_discarded())
         {
             replyError (json(), "parse error");
@@ -3536,7 +3615,17 @@ int main (int argc, char** argv)
 
         const json idVal = req.value ("id", json());
         const std::string method = req.value ("method", "");
-        const json params = req.contains ("params") ? req["params"] : json::object();
+        // A timeline request can run to hundreds of megabytes. Move it, don't copy it.
+        json params = req.contains ("params") ? std::move (req["params"]) : json::object();
+        if (method == "viewport_set_timeline")
+        {
+            std::string payloadError;
+            if (! restoreVisualPlanPayloads (params, g_visualPlanPayloads, payloadError))
+            {
+                replyError (idVal, payloadError);
+                return;
+            }
+        }
 
 #if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
         if (method == "test_private_startup_diagnostics")
@@ -3579,7 +3668,23 @@ int main (int argc, char** argv)
             diagnosticRequested, diagnosticRpcId);
         videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::request);
         std::string error;
-        json result = handle (method, params, error);
+        json result;
+        try
+        {
+            result = handle (method, params, error);
+        }
+        catch (const std::bad_alloc&)
+        {
+            error = "Helper could not allocate memory for " + method;
+        }
+        catch (const std::length_error&)
+        {
+            error = "Helper could not allocate memory for " + method;
+        }
+        if (method == "viewport_set_timeline")
+            std::fprintf (stderr, "[diagnostic] viewport_set_timeline request bytes=%zu parseMs=%.1f handleMs=%.1f\n",
+                          lineSize, diagnosticMilliseconds (requestStarted, requestParsed),
+                          diagnosticMilliseconds (requestParsed, std::chrono::steady_clock::now()));
         videohelper::compositediagnostic::emit(error.empty()
             ? videohelper::compositediagnostic::Phase::requestSucceeded
             : videohelper::compositediagnostic::Phase::requestFailed);
@@ -3589,19 +3694,13 @@ int main (int argc, char** argv)
             reply (idVal, result);
     };
 
-    constexpr size_t kMaxStdinLineBytes = 16u * 1024u * 1024u;
-    auto readBoundedLine = [&] (std::vector<char>& destination)
+    // The request has no id to answer yet. The host fails its pending requests on this reply.
+    const auto refuseUnallocatedRequest = [] (size_t bytes)
     {
-        const auto result = videohelper::readBoundedLine (
-            std::cin, destination, kMaxStdinLineBytes);
-        if (result == videohelper::BoundedLineResult::oversized)
-        {
-            replyError (nullptr, "request line exceeds 16 MiB cap");
-            return false;
-        }
-        return result == videohelper::BoundedLineResult::line;
+        replyError (nullptr, "could not allocate " + std::to_string (bytes) + " bytes for a helper request line");
     };
-    std::vector<char> line;
+    videorender::fixture3d::pathtracefixture::prepareDeviceAtStartup();
+    videohelper::RequestLineAssembler<> requestLines;
 #if defined(__APPLE__) && ARBIT_HAVE_VIEWPORT
     // Keep AppKit event routing on the process main thread while stdin remains
     // responsive. Read the raw descriptor directly: std::cin is buffered and
@@ -3609,8 +3708,7 @@ int main (int argc, char** argv)
     // poll(STDIN_FILENO) watching an empty pipe while a complete request line
     // sits unread in the stream buffer, stalling the loop until EOF.
     {
-        std::string pending;
-        char chunk[4096];
+        char chunk[65536];
         while (true)
         {
             g_viewport.processWindowEvents();
@@ -3623,27 +3721,32 @@ int main (int argc, char** argv)
             const ssize_t n = ::read (STDIN_FILENO, chunk, sizeof (chunk));
             if (n <= 0)
                 break;
-            pending.append (chunk, static_cast<size_t> (n));
-            if (pending.size() > kMaxStdinLineBytes)
-            {
-                replyError (nullptr, "request line exceeds 16 MiB cap");
-                break;
-            }
-            size_t newlinePos = 0;
-            while ((newlinePos = pending.find ('\n')) != std::string::npos)
-            {
-                const std::string oneLine = pending.substr (0, newlinePos);
-                pending.erase (0, newlinePos + 1);
-                if (! oneLine.empty())
-                    processRequest (oneLine.data(), oneLine.size());
-            }
+            requestLines.feed (chunk, static_cast<size_t> (n), processRequest, refuseUnallocatedRequest);
         }
     }
 #else
-    while (readBoundedLine (line))
-        if (! line.empty()) processRequest (line.data(), line.size());
+    // A plan carries its geometry as text, so one request can be hundreds of MiB.
+    // Reading the descriptor in chunks keeps that from costing a stream call per byte.
+    {
+        static char chunk[65536];
+        while (true)
+        {
+#if defined(_WIN32)
+            const int n = ::_read (0, chunk, static_cast<unsigned int> (sizeof (chunk)));
+#else
+            const ssize_t n = ::read (STDIN_FILENO, chunk, sizeof (chunk));
+            if (n < 0 && errno == EINTR)
+                continue;
 #endif
+            if (n <= 0)
+                break;
+            requestLines.feed (chunk, static_cast<size_t> (n), processRequest, refuseUnallocatedRequest);
+        }
+    }
+#endif
+    requestLines.close (processRequest, refuseUnallocatedRequest);
 
+    videorender::fixture3d::pathtracefixture::stopDeviceBuildAtExit();
     // stdin closed (Arbit quit/killed us politely): stop any running export,
     // proxy or render-cache job before static teardown destroys the joinable
     // workers.

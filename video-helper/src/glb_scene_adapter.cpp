@@ -19,15 +19,6 @@ namespace
 {
 using namespace HarmonicMIDI::grid;
 
-static_assert(GlbLimits {}.maxPrimitives
-                  < visualimportedsceneidentity::kObjectPrimitiveStride,
-              "GLB primitive indices must fit the stable object identity stride");
-static_assert((GlbLimits {}.maxNodes - 1)
-                  * visualimportedsceneidentity::kObjectPrimitiveStride
-                  + GlbLimits {}.maxPrimitives
-              <= std::numeric_limits<std::uint32_t>::max(),
-              "admitted GLB node and primitive indices must fit SceneObjectId");
-
 bool fail(std::string& error, const std::string& message)
 {
     error = message;
@@ -275,8 +266,6 @@ bool collectSelectedNodes(const GlbStaticMeshDocument& asset,
 {
     if (asset.selectedScene >= asset.scenes.size())
         return fail(error, "selected GLB scene index is out of range");
-    if (asset.nodes.size() > GlbLimits {}.maxNodes)
-        return fail(error, "GLB node count exceeds the adapter bound");
 
     selected.assign(asset.nodes.size(), 0);
     std::vector<std::uint8_t> state(asset.nodes.size(), 0);
@@ -296,8 +285,6 @@ bool collectSelectedNodes(const GlbStaticMeshDocument& asset,
             auto& frame = stack.back();
             if (state[frame.node] == 0)
             {
-                if (frame.depth > GlbLimits {}.maxNodeDepth)
-                    return fail(error, "selected GLB scene hierarchy exceeds the adapter depth bound");
                 state[frame.node] = 1;
                 selected[frame.node] = 1;
             }
@@ -339,9 +326,6 @@ bool copyMaterials(const GlbStaticMeshDocument& asset,
                    Visual3DScene& scene,
                    std::string& error)
 {
-    if (asset.materials.size() > scene.materials.size())
-        return fail(error, "GLB material count exceeds Visual3DScene capacity");
-
     std::vector<SceneTextureId> adaptedTextureIds(asset.textures.size());
     const auto copyTexture = [&] (const GlbTextureInfo& info) -> bool
     {
@@ -352,8 +336,10 @@ bool copyMaterials(const GlbStaticMeshDocument& asset,
             return fail(error, "GLB material texture requires unsupported TEXCOORD set");
         if (adaptedTextureIds[textureIndex].isValid())
             return true;
-        if (scene.textureCount >= Visual3DScene::kMaxTextures)
-            return fail(error, "GLB material textures exceed Visual3DScene capacity");
+        Visual3DSceneGrowth textureGrowth;
+        textureGrowth.textures = 1;
+        if (!growVisual3DScene(scene, textureGrowth, error))
+            return false;
 
         const auto& sourceTexture = asset.textures[textureIndex];
         if (sourceTexture.source >= asset.images.size())
@@ -366,15 +352,11 @@ bool copyMaterials(const GlbStaticMeshDocument& asset,
         std::size_t texelCount = 0;
         std::size_t expectedBytes = 0;
         if (sourceImage.width == 0 || sourceImage.height == 0
-            || sourceImage.width > Visual3DScene::kMaxTextureDimension
-            || sourceImage.height > Visual3DScene::kMaxTextureDimension
             || !checkedMultiply(static_cast<std::size_t>(sourceImage.width),
                                 static_cast<std::size_t>(sourceImage.height), texelCount)
             || !checkedMultiply(texelCount, 4u, expectedBytes)
             || expectedBytes != sourceImage.decodedRgba8.size())
-            return fail(error, "GLB decoded image texels are malformed or exceed Visual3DScene dimensions");
-        if (texelCount > Visual3DScene::kMaxTextureTexels - scene.textureTexelCount)
-            return fail(error, "GLB decoded image texels exceed Visual3DScene capacity");
+            return fail(error, "GLB decoded image texels are malformed");
 
         SceneTextureRecord texture;
         texture.id = SceneTextureId {static_cast<std::uint32_t>(textureIndex + 1)};
@@ -432,6 +414,10 @@ bool copyMaterials(const GlbStaticMeshDocument& asset,
                 return false;
     }
 
+    Visual3DSceneGrowth materialGrowth;
+    materialGrowth.materials = asset.materials.size();
+    if (!growVisual3DScene(scene, materialGrowth, error))
+        return false;
     for (std::size_t index = 0; index < asset.materials.size(); ++index)
     {
         const auto& source = asset.materials[index];
@@ -498,10 +484,12 @@ bool copyPrimitive(const GlbPrimitiveRecord& primitive,
         return fail(error, "GLB COLOR_0 cardinality does not match POSITION");
     if (primitive.indices.empty() || primitive.indices.size() % 3 != 0)
         return fail(error, "GLB primitive topology is not a non-empty triangle list");
-    if (!appendFits(scene.vertexCount, vertexCount, scene.vertices.size()))
-        return fail(error, "GLB vertex data exceeds Visual3DScene capacity");
-    if (!appendFits(scene.indexCount, primitive.indices.size(), scene.indices.size()))
-        return fail(error, "GLB index data exceeds Visual3DScene capacity");
+    // Object records store 32-bit ranges, so a larger sum cannot be represented.
+    if (!appendFits(scene.vertexCount, vertexCount, std::numeric_limits<std::uint32_t>::max())
+        || !appendFits(scene.indexCount, primitive.indices.size(), std::numeric_limits<std::uint32_t>::max()))
+        return fail(error, "GLB primitive overflows 32-bit scene ranges: " + std::to_string(scene.vertexCount)
+            + " + " + std::to_string(vertexCount) + " vertices, " + std::to_string(scene.indexCount)
+            + " + " + std::to_string(primitive.indices.size()) + " indices");
     if (primitive.generatedFlatNormals)
     {
         if (primitive.normalAccessor || primitive.tangentAccessor
@@ -514,8 +502,12 @@ bool copyPrimitive(const GlbPrimitiveRecord& primitive,
             if (primitive.indices[index] != index)
                 return fail(error, "generated flat GLB normals require sequential triangle indices");
     }
-    if (scene.objectCount == scene.objects.size())
-        return fail(error, "GLB primitive count exceeds Visual3DScene object capacity");
+    Visual3DSceneGrowth primitiveGrowth;
+    primitiveGrowth.vertices = vertexCount;
+    primitiveGrowth.indices = primitive.indices.size();
+    primitiveGrowth.objects = 1;
+    if (!growVisual3DScene(scene, primitiveGrowth, error))
+        return false;
 
     const auto identity = visualimportedsceneidentity::objectId(nodeIndex, primitiveIndex);
     if (!identity)
@@ -564,7 +556,6 @@ bool copyPrimitive(const GlbPrimitiveRecord& primitive,
 std::shared_ptr<const Visual3DScene> composeImportedVisual3DScene(
     const Visual3DScene& procedural, const Visual3DScene& imported, std::string& error)
 {
-    static_assert(GlbLimits{}.maxNodes <= 32768, "Imported object IDs must remain outside the procedural namespace");
     if (!validateVisual3DScene(procedural).valid() || !validateVisual3DScene(imported).valid())
     { fail(error, "Scene Compose requires valid procedural and imported scene owners"); return {}; }
     for (std::size_t index = 0; index < imported.materialCount; ++index)
@@ -625,7 +616,6 @@ static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
     if (!collectSelectedNodes(asset, selected, error))
         return nullptr;
 
-    // Keep the fixed-capacity scene off the video helper's limited thread stack.
     auto scene = std::make_unique<Visual3DScene>();
     const auto sceneIdentity = visualimportedsceneidentity::sceneId(asset.selectedScene);
     if (!sceneIdentity)
@@ -653,11 +643,10 @@ static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
     {
         if (retainedObjectNodes[nodeIndex] == 0)
             continue;
-        if (scene->objectCount == scene->objects.size())
-        {
-            fail(error, "GLB node hierarchy exceeds Visual3DScene object capacity");
+        Visual3DSceneGrowth nodeGrowth;
+        nodeGrowth.objects = 1;
+        if (!growVisual3DScene(*scene, nodeGrowth, error))
             return nullptr;
-        }
         const auto identity = visualimportedsceneidentity::nodeTransformObjectId(nodeIndex);
         if (!identity)
         {
@@ -732,11 +721,10 @@ static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
                 fail(error, "selected GLB node camera reference is out of range");
                 return nullptr;
             }
-            if (scene->cameraCount == scene->cameras.size())
-            {
-                fail(error, "GLB camera instances exceed Visual3DScene capacity");
+            Visual3DSceneGrowth cameraGrowth;
+            cameraGrowth.cameras = 1;
+            if (!growVisual3DScene(*scene, cameraGrowth, error))
                 return nullptr;
-            }
             const auto& source = asset.cameras[*node.camera];
             if (source.type != GlbCameraType::Perspective || !source.farPlane)
             {
@@ -767,11 +755,10 @@ static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
                 fail(error, "selected GLB node light reference is out of range");
                 return nullptr;
             }
-            if (scene->lightCount == scene->lights.size())
-            {
-                fail(error, "GLB light instances exceed Visual3DScene capacity");
+            Visual3DSceneGrowth lightGrowth;
+            lightGrowth.lights = 1;
+            if (!growVisual3DScene(*scene, lightGrowth, error))
                 return nullptr;
-            }
             const auto& source = asset.lights[*node.light];
             auto& target = scene->lights[scene->lightCount++];
             target.id = SceneLightId {static_cast<std::uint32_t>(nodeIndex + 1)};

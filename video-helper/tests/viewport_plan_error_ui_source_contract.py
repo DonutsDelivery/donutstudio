@@ -103,7 +103,7 @@ require(window, "void applyRenderRejection(VideoViewportComponent* vp, int clipI
         "VideoEditorWindow.h declaration")
 
 # Viewport banner: painted on every rung with the HUD, and independent of the HUD toggle.
-require(component, "void setFrameNotice (const juce::String& reason)", "VideoViewportComponent.h")
+require(component, "void setFrameNotice (const juce::String& reason, FrameNoticeKind kind", "VideoViewportComponent.h")
 paint = region(component, "void paintHud (juce::Graphics& g)", "void paintFrameNotice", "VideoViewportComponent.h paintHud")
 ordered(paint, ["paintFrameNotice (g);", "paintMetricsHud (g);"], "VideoViewportComponent.h paintHud")
 gl = region(component, "void drawHudGL (int fbW, int fbH, double scale)", "juce::createOpenGLGraphicsContext",
@@ -160,8 +160,33 @@ ordered(click, ["showPlacementRefusal({});", "onPlace(*package);"], "module brow
 require(graph_h, "void selectedRowsChanged(int) override\n    {\n        placementRefusal.clear();",
         "module browser selection clears the refusal")
 
+# A kernel compile says so; only the helper's judgeStep verdict moves it out of the stall report.
+require(viewport, "if (verdict == kernelcompile::StepVerdict::Stalled)", "viewport.cpp keeps the stall report")
+require(viewport, "vi.kernelCompiling = verdict == kernelcompile::StepVerdict::Compiling;", "viewport.cpp names the compile")
+require(banner, "g.setColour (compiling ? ColorPalette::textPrimary : noticeColour);", "the compile heading reads against the panel")
+require(banner, "g.fillRect (getLocalBounds());", "the compile dims the old frame")
+require(main_cpp, '{ "kernelCompiling", vi.kernelCompiling }', "viewport_info carries the compile")
+require((root / "src/pathtrace/devices/device_optix_host.cpp").read_text(),
+        "compiling.emplace();", "the OptiX device marks a wait on its compile")
+require(viewport, "previewWaiting().load()", "a preview holding its frame shows the compile")
+require(viewport, "previewStopped().load()", "a cancelled compile reaches the notice")
+require(content, 'o->getProperty("kernelBuildStopped")', "the notice says the preview is waiting")
+require(banner, "g.drawText (buttonText, buttonBounds", "the notice paints its own button: no child shows on the zero-copy rung")
+require((root / "src/pathtrace/devices/device_optix_host.cpp").read_text(), "if (gate.stopped())",
+        "a preview after Cancel waits instead of trying the device")
+ordered(content, ('rendererError.isEmpty()\n            && static_cast<bool>(o->getProperty("kernelCompiling"))',
+                  "FrameNoticeKind::compilingKernel"), "a rendererError or rejection outranks the compile notice")
+require(banner, 'TRANS ("Preparing the renderer for this graphics driver")', "the banner names the compile")
+
+require(main_cpp, '{ "scoreDropWarning", vi.scoreDropWarning }', "viewport_info carries the score warning")
+ordered(content, ('o->getProperty("scoreDropWarning")', "FrameNoticeKind::scoreLeftOut"), "the score warning takes the banner")
+require(banner, 'TRANS ("Part of the score is left out")', "the banner names the score warning")
+
 # Every new string is registered for translation.
-for text in ("This frame is not rendering", "Not rendering",
+for text in ("This frame is not rendering", "Not rendering", "Preparing the renderer for this graphics driver",
+             "Part of the score is left out", "The renderer isn't ready", "Start again",
+             "You cancelled preparing it, so the preview is waiting. Start again when you want the preview.",
+             "This happens once per update and can take a few minutes. You can keep working.",
              "Select a video layer first, then place the module.", "The module could not be placed."):
     if text not in strings:
         errors.append("tools/i18n/strings.json missing " + repr(text))

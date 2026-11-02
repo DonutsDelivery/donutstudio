@@ -66,6 +66,7 @@ video chases.
 | `viewport_close` | — | Destroys the window and decoders. |
 | `viewport_set_bounds` | `x, y, width, height` | Applied on the next render tick. |
 | `viewport_set_fullscreen` | `fullscreen` | Primary monitor. |
+| `viewport_set_full_canvas_scene` | `enabled` | `true` renders the imported 3D scene and its Path Trace film at the full canvas instead of the panel size. Default `false`. Accepted while closed; survives viewport close and reopen. |
 | `viewport_set_canvas` | `width, height` | §Project canvas & view transform below. Accepted while closed (applies to the next open); survives close/reopen. |
 | `viewport_set_view` | `zoom, panX, panY` | Replaces the viewport-only view transform in one update. Use this for interactive pan/zoom so stale pointer events do not queue behind rendered frames. |
 
@@ -102,6 +103,13 @@ canvasHeight, viewZoom, viewPanX, viewPanY`; `graph_describe` mirrors them
 under a top-level `canvas` object.
 
 ## Timeline
+
+A `visualLayerPlans` operation in `viewport_set_timeline` may carry a large payload by reference.
+`payloadId` beside `payloadXml` asks the helper to hold that text. `payloadDelta: {id, baseId, size,
+pieces}` replaces `payloadXml`: each piece is a string, or `[offset, length]` into the held base.
+The helper rebuilds the exact text before any other handling and holds only the ids the latest request
+named. An unknown base refuses the request with `visual plan payload base is not held`, and the app
+sends the whole text. Export and every other request always carry `payloadXml`.
 
 `viewport_set_timeline {structuralRevision, matteContentRevision, segments: [{sourceKind?, sourcePath,
 clipId, isAdjustment?, inSec, outSec, rate, displayStartSec, clockStartSec?, clockDurationSec?, matteAssetId?,
@@ -673,8 +681,9 @@ port layout drift and Signal fan-in are rejected with per-sink diagnostics.
 Existing saved topology and unrelated Control-only sinks remain intact.
 
 Preparation is cached off the audio callback. Limits are a 60-second video
-timeline, 8,000,000 sample-node evaluations, 32,768 scalar frame values and 2 MiB
-of Control-plan JSON. The helper's complete request-line limit remains 16 MiB.
+timeline, 8,000,000 sample-node evaluations and 32,768 scalar frame values.
+Control-plan JSON has no size limit of its own. A helper request line can be
+any length.
 A full minute at 30 fps with one clock and one reducer fits these limits.
 Capacity failure rejects all Signal-dependent closures as complete routes;
 it never truncates columns or substitutes zero. Graph snapshot/revision,

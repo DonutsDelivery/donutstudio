@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace
@@ -25,6 +26,8 @@ using namespace diffractionmaterial;
 constexpr double pi = 3.141592653589793238462643383279502884;
 constexpr double gratingSpacingNanometres = 1000.0;
 constexpr double angleToleranceDegrees = 0.1;
+// What a value from the float authority can round by against a double reference.
+constexpr double kFloatTolerance = 16.0 * std::numeric_limits<float>::epsilon();
 // Orders whose |sin(to)| lies this close to 1 sit on the grazing boundary and
 // are not asserted in either direction.
 constexpr double grazingMargin = 1.0e-9;
@@ -72,7 +75,7 @@ void runCase(double incidentDegrees, const std::string& label)
     const double incidentRadians = incidentDegrees * pi / 180.0;
     const double sinIncident = std::sin(incidentRadians);
     const double cosIncident = std::cos(incidentRadians);
-    const std::array<double, 3> incident { sinIncident, 0.0, cosIncident };
+    const std::array<float, 3> incident { static_cast<float>(sinIncident), 0.0f, static_cast<float>(cosIncident) };
 
     std::cout << "case " << label << " theta_i_deg " << incidentDegrees
               << " d_nm " << gratingSpacingNanometres << '\n';
@@ -82,7 +85,7 @@ void runCase(double incidentDegrees, const std::string& label)
     {
         const double wavelength = wavelengthNanometres;
         DiffractionOrderDistribution distribution;
-        check(evaluateDiffractionOrders(*material, wavelength, frame, incident,
+        check(evaluateDiffractionOrders(*material, wavelengthNanometres, frame, incident,
                                         { 0.5, 0.5 }, distribution, error),
               label + " evaluates: " + error);
         if (distribution.orderCount == 0)
@@ -120,13 +123,13 @@ void runCase(double incidentDegrees, const std::string& label)
             const double errorDegrees = measured - predicted;
             check(std::abs(errorDegrees) <= angleToleranceDegrees,
                   label + " angle within 0.1 degrees");
-            check(std::abs(gratingSpacingNanometres * (order.direction[0] - sinIncident)
-                           - primary * wavelength) <= 1.0e-6,
+            check(std::abs(gratingSpacingNanometres * (order.direction[0] + sinIncident)
+                           - primary * wavelength) <= gratingSpacingNanometres * kFloatTolerance,
                   label + " grating equation holds in nanometres");
             if (primary == 0)
-                check(std::abs(order.direction[0] + sinIncident) <= 1.0e-9
-                          && std::abs(order.direction[1]) <= 1.0e-12
-                          && std::abs(order.direction[2] - cosIncident) <= 1.0e-9,
+                check(std::abs(order.direction[0] + sinIncident) <= kFloatTolerance
+                          && std::abs(order.direction[1]) <= kFloatTolerance
+                          && std::abs(order.direction[2] - cosIncident) <= kFloatTolerance,
                       label + " order zero is the mirror direction");
             std::cout << wavelength << ' ' << primary << ' ' << predicted << ' '
                       << measured << ' ' << errorDegrees << '\n';

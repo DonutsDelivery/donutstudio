@@ -23,7 +23,7 @@ class MetalStaticGlbSourceContractTests(unittest.TestCase):
     def test_rich_scene_admission_and_exact_receipt_identity(self):
         for token in (
             "validateVisual3DScene (*scene).valid()",
-            "scene->cameraCount > Visual3DScene::kMaxCameras",
+            "scene->cameraCount == 0",
             "scene->activeCamera",
             "resources->rendererGeneration = nextMetalRendererGeneration()",
             "frame->rendererGeneration_ = resources->rendererGeneration",

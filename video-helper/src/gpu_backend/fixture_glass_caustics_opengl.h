@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fixture_glass_caustics.h"
+#include "fixture_preview_budget.h"
 #include "fixture_glass_grating_incident.h"
 #include "fixture_glass_grating_cell_transport.h"
 #include "fixture_glass_grating_cell_coverage.h"
@@ -10,7 +11,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace arbitgpu
 {
@@ -84,12 +89,19 @@ struct OpenGlCausticRenderPlan
     glasscaustics::SchedulingDescription scheduling;
     bool hostReceipt=true,stageFences=true,bandFences=true,reuseSpectrum=false;
 };
-inline OpenGlCausticRenderPlan openGlCausticRenderPlan(OpenGlCausticRenderUse use,std::uint32_t width,std::uint32_t height)
+// exportSchedule is the Accurate render mode (previewbudget::exportBudgets). Its Preview
+// keeps the export entry schedule, so the caustic it resolves is the export caustic, and
+// still never waits or reads back: the fences, receipt and reuse below stay Preview's.
+inline OpenGlCausticRenderPlan openGlCausticRenderPlan(OpenGlCausticRenderUse use,std::uint32_t width,std::uint32_t height,
+    bool exportSchedule=false)
 {
     OpenGlCausticRenderPlan plan;
-    if(use!=OpenGlCausticRenderUse::Preview)return plan;
+    // Tier K S4: a Fast export (Preview budget) takes the Preview plan's
+    // reductions; the Export draw under Export budgets - the default path -
+    // takes this default plan exactly as before.
+    if(use!=OpenGlCausticRenderUse::Preview && previewbudget::exportBudgets())return plan;
     const auto pixels=std::uint64_t(width)*height;
-    plan.scheduling.entrySubdivisions=kPreviewCausticEntrySubdivisions;
+    if(!exportSchedule)plan.scheduling.entrySubdivisions=kPreviewCausticEntrySubdivisions;
     plan.hostReceipt=false;plan.stageFences=false;
     plan.bandFences=pixels>kPreviewCausticUnfencedPixels;plan.reuseSpectrum=pixels<=kPreviewCausticReusePixels;
     return plan;
@@ -114,6 +126,170 @@ struct OpenGlCausticDeviceLimits
     std::uint64_t maximumInvocations=0,maximumLocalSizeX=0,storageBindings=0,computeStorageBlocks=0;
     std::uint64_t maximumWorkGroupsY=0,maximumLocalSizeY=0;
 };
+inline bool operator==(const OpenGlCausticDeviceLimits& a,const OpenGlCausticDeviceLimits& b)
+{
+    return a.maximumStorageBlockBytes==b.maximumStorageBlockBytes&&a.maximumWorkGroupsX==b.maximumWorkGroupsX
+        &&a.maximumTextureSize==b.maximumTextureSize&&a.maximumInvocations==b.maximumInvocations
+        &&a.maximumLocalSizeX==b.maximumLocalSizeX&&a.storageBindings==b.storageBindings
+        &&a.computeStorageBlocks==b.computeStorageBlocks&&a.maximumWorkGroupsY==b.maximumWorkGroupsY
+        &&a.maximumLocalSizeY==b.maximumLocalSizeY;
+}
+inline bool operator!=(const OpenGlCausticDeviceLimits& a,const OpenGlCausticDeviceLimits& b){return !(a==b);}
+// Test only. ARBIT_TEST_GL_CAUSTIC_LIMIT_SCALE scales the size limits a caustic frame is
+// checked against, so a candidate on a large GPU can force a limit refusal. The value is a
+// number in (0,1). Text that is not a number, zero, a negative value, NaN, or 1 or more is
+// ignored. Ignored means no override: the queried limits stay as GL reported them.
+inline std::optional<double> parseOpenGlCausticLimitScale(const char* text)
+{
+    if(!text||!*text)return std::nullopt;
+    char* end=nullptr;const double value=std::strtod(text,&end);
+    if(end==text||*end!='\0'||!std::isfinite(value)||value<=0||value>=1)return std::nullopt;
+    return value;
+}
+// The limits with every size a demand is compared against scaled down: the storage block
+// bytes, the X and Y work group counts and the texture size. Capability counts (bindings,
+// blocks, invocations, local sizes) keep their values, so the refusal names a size. A
+// nonzero limit stays at least 1, and a scale outside (0,1) returns the limits unchanged.
+inline OpenGlCausticDeviceLimits scaleOpenGlCausticDeviceLimits(OpenGlCausticDeviceLimits limits,double scale)
+{
+    if(!(scale>0&&scale<1))return limits;
+    const auto scaled=[scale](std::uint64_t value)
+    {return value?std::max<std::uint64_t>(1,std::uint64_t(double(value)*scale)):value;};
+    limits.maximumStorageBlockBytes=scaled(limits.maximumStorageBlockBytes);
+    limits.maximumWorkGroupsX=scaled(limits.maximumWorkGroupsX);
+    limits.maximumWorkGroupsY=scaled(limits.maximumWorkGroupsY);
+    limits.maximumTextureSize=scaled(limits.maximumTextureSize);
+    return limits;
+}
+// An Accurate Preview caustic over a GL limit is refused, as its export would be; it is
+// never reduced or dropped. The viewport asks for the frame again every tick, so the
+// refusal is latched: a frame with the same key returns the same named error before the
+// CPU caustic prepare, the schedule build or any GPU work. The key holds every input the
+// schedule and the limit checks read: the scene content fingerprint, prepared resources,
+// light, glass, policy, schedule, extent, mode and GL limits, and from the runtime inputs
+// the evaluated camera (its schedule identity), the evaluated source light record and the
+// object instance transforms. Time is not in the key: the schedule reads it only through
+// those three, so a still frame of an animated scene keeps its latch, and a frame whose
+// camera, light or objects moved retries. A frame whose runtime inputs cannot be keyed
+// is never latched.
+// The scene enters the key as a content fingerprint, not as the snapshot address: the
+// viewport alternates between live Visual3DScene snapshot objects across ticks, so an
+// address key can never match the next frame (verify81: every held-key miss named scene
+// and nothing else). The fingerprint covers the scene content the schedule and its limit
+// checks read. Motion-only previous-frame arrays and the texture texel values are
+// excluded on purpose: neither changes the storage demand a limit refusal names, so a
+// latch that ignores them still refuses the same frame. The scene's light records are
+// excluded for the same reason: the source light enters the key as its evaluated record
+// (below), and no other light can change the storage demand a limit refusal names.
+// verify83 named the lights array as the only segment that churns per tick in the
+// lighthouse starter, so including it would keep every animated scene unlatched while
+// nothing the refusal depends on moves. The content splits into named segment hashes so
+// a held-key miss can print which family moved (verify82: the fingerprint alternated
+// every tick and no segment was named).
+inline std::uint64_t causticFnvFold(std::uint64_t hash,const void* data,std::size_t bytes)
+{
+    const auto* p=static_cast<const unsigned char*>(data);
+    for(std::size_t i=0;i<bytes;++i){hash^=p[i];hash*=1099511628211ull;}
+    return hash;
+}
+struct OpenGlCausticSceneSegments
+{
+    std::uint64_t scalars=0,vertices=0,indices=0,objects=0,materials=0,textures=0,cameras=0,instances=0;
+};
+inline OpenGlCausticSceneSegments causticSceneContentSegments(const HarmonicMIDI::grid::Visual3DScene& scene)
+{
+    constexpr std::uint64_t kOffset=14695981039346656037ull;
+    OpenGlCausticSceneSegments out;
+    out.scalars=causticFnvFold(kOffset,&scene.schemaVersion,sizeof(scene.schemaVersion));
+    out.scalars=causticFnvFold(out.scalars,&scene.id,sizeof(scene.id));
+    out.scalars=causticFnvFold(out.scalars,&scene.activeCamera,sizeof(scene.activeCamera));
+    out.scalars=causticFnvFold(out.scalars,&scene.ambientColor,sizeof(scene.ambientColor));
+    out.scalars=causticFnvFold(out.scalars,&scene.instancedObject,sizeof(scene.instancedObject));
+    const auto counts=std::array<std::size_t,9>{scene.vertexCount,scene.indexCount,scene.objectCount,
+        scene.materialCount,scene.textureCount,scene.textureTexelCount,scene.lightCount,
+        scene.cameraCount,scene.objectInstanceCount};
+    out.scalars=causticFnvFold(out.scalars,counts.data(),counts.size()*sizeof(counts[0]));
+    out.vertices=causticFnvFold(kOffset,scene.vertices.data(),scene.vertexCount*sizeof(scene.vertices[0]));
+    out.indices=causticFnvFold(kOffset,scene.indices.data(),scene.indexCount*sizeof(scene.indices[0]));
+    out.objects=causticFnvFold(kOffset,scene.objects.data(),scene.objectCount*sizeof(scene.objects[0]));
+    out.materials=causticFnvFold(kOffset,scene.materials.data(),scene.materialCount*sizeof(scene.materials[0]));
+    out.textures=causticFnvFold(kOffset,scene.textures.data(),scene.textureCount*sizeof(scene.textures[0]));
+    out.cameras=causticFnvFold(kOffset,scene.cameras.data(),scene.cameraCount*sizeof(scene.cameras[0]));
+    out.instances=causticFnvFold(kOffset,scene.objectInstances.data(),scene.objectInstanceCount*sizeof(scene.objectInstances[0]));
+    return out;
+}
+inline std::uint64_t causticSceneFingerprintOf(const OpenGlCausticSceneSegments& segments)
+{
+    const std::array<std::uint64_t,8> parts={segments.scalars,segments.vertices,segments.indices,
+        segments.objects,segments.materials,segments.textures,segments.cameras,segments.instances};
+    return causticFnvFold(14695981039346656037ull,parts.data(),parts.size()*sizeof(parts[0]));
+}
+inline std::uint64_t causticSceneContentFingerprint(const HarmonicMIDI::grid::Visual3DScene& scene)
+{return causticSceneFingerprintOf(causticSceneContentSegments(scene));}
+struct OpenGlCausticRefusalKey
+{
+    std::uint64_t sceneContent=0;
+    std::uintptr_t resources=0,context=0;std::uint64_t rendererGeneration=0;
+    std::uint32_t source=0,glassObject=0,glassMaterial=0,multipleScatter=0;
+    std::string policy;
+    glasscaustics::SchedulingDescription scheduling;
+    std::uint32_t width=0,height=0;
+    bool exportBudgets=false;
+    OpenGlCausticDeviceLimits limits;
+    // Runtime inputs, as the schedule build evaluates them.
+    std::string cameraIdentity;
+    HarmonicMIDI::grid::SceneLightRecord light{};
+    std::vector<opaquevisibility::Instance> instances;
+};
+// The source record fields a caustic schedule reads. Sky and environment image belong to
+// other light kinds; a caustic source is a directional spectral source.
+inline bool sameCausticRefusalLight(const HarmonicMIDI::grid::SceneLightRecord& a,const HarmonicMIDI::grid::SceneLightRecord& b)
+{
+    const auto bits=[](const auto& x,const auto& y){return std::memcmp(&x,&y,sizeof(x))==0;};
+    return a.id==b.id&&a.kind==b.kind&&bits(a.transform.translation,b.transform.translation)
+        &&bits(a.transform.rotation,b.transform.rotation)&&bits(a.transform.scale,b.transform.scale)
+        &&bits(a.color,b.color)&&bits(a.intensity,b.intensity)&&bits(a.range,b.range)
+        &&bits(a.innerConeAngle,b.innerConeAngle)&&bits(a.outerConeAngle,b.outerConeAngle)
+        &&sameSpectralSource(a.spectralSource,b.spectralSource);
+}
+inline bool sameCausticRefusalInstances(const std::vector<opaquevisibility::Instance>& a,
+    const std::vector<opaquevisibility::Instance>& b)
+{
+    return a.size()==b.size()&&std::equal(a.begin(),a.end(),b.begin(),[](const auto& x,const auto& y) {
+        return x.object==y.object&&std::memcmp(x.world.data(),y.world.data(),sizeof(x.world))==0;});
+}
+inline bool operator==(const OpenGlCausticRefusalKey& a,const OpenGlCausticRefusalKey& b)
+{
+    return a.sceneContent==b.sceneContent&&a.resources==b.resources&&a.context==b.context&&a.rendererGeneration==b.rendererGeneration
+        &&a.source==b.source&&a.glassObject==b.glassObject&&a.glassMaterial==b.glassMaterial
+        &&a.multipleScatter==b.multipleScatter&&a.policy==b.policy&&a.scheduling.version==b.scheduling.version
+        &&a.scheduling.entrySubdivisions==b.scheduling.entrySubdivisions&&a.width==b.width&&a.height==b.height
+        &&a.exportBudgets==b.exportBudgets&&a.limits==b.limits&&a.cameraIdentity==b.cameraIdentity
+        &&sameCausticRefusalLight(a.light,b.light)&&sameCausticRefusalInstances(a.instances,b.instances);
+}
+inline bool operator!=(const OpenGlCausticRefusalKey& a,const OpenGlCausticRefusalKey& b){return !(a==b);}
+struct OpenGlCausticRefusalLatch
+{
+    bool latched=false;
+    OpenGlCausticRefusalKey key;
+    std::string error;
+    // The latched error for this key, or null. A different key clears the latch, so the
+    // frame retries in full.
+    const std::string* find(const OpenGlCausticRefusalKey& candidate)
+    {
+        if(latched&&key==candidate)return &error;
+        clear();return nullptr;
+    }
+    void latch(OpenGlCausticRefusalKey candidate,std::string reason)
+    {latched=true;key=std::move(candidate);error=std::move(reason);}
+    void clear(){latched=false;key={};error.clear();}
+};
+// The refusal an Accurate Preview shows. It names the limit and the way out.
+inline std::string openGlAccurateCausticRefusal(const std::string& reason)
+{
+    return reason+". Accurate Preview matches export, so it does not reduce the caustic;"
+        " switch Render Mode to Fast to preview this scene";
+}
 // The storage, dispatch and texture sizes of one caustic frame. bytes[5] holds keyCount
 // keys: the deposition key count, or the splat key count once a frame splats.
 struct OpenGlCausticStorageDemand
@@ -357,6 +533,14 @@ enum class OpenGlCausticProgramReadiness : std::uint8_t { Ready, Pending, Failed
 // multipleScatter and rough select the query variant the render will schedule.
 OpenGlCausticProgramReadiness prepareOpenGlGlassCausticPrograms(bool multipleScatter,bool rough,
     NativeFixturePrepareUse use,std::string& error);
+// The viewport's readiness seam: true once when every submitted, still-unadopted
+// caustic program set reads complete, so the idle gate can wake for exactly one
+// adopting frame instead of spending its wake-frame cap first on a slow link.
+// Report-only -- the next acquire still finishes and publishes the set -- and it
+// follows the acquire's extension rule. Needs a current context on the caller's
+// thread; false without one, with nothing in flight, or once the completion has
+// already been reported for the set in flight.
+bool takeOpenGlCausticProgramCompletion();
 // Backend-private native route used by the scene-linear Color dispatcher. A Preview
 // frame whose caustic exceeds the GL limits renders reduced or without the caustic, and
 // degradation receives the reason. Empty means the caustic rendered as planned.
@@ -760,7 +944,7 @@ void cameraTraceBranches(int invocation,vec3 origin,vec3 direction,float minimum
             valid=sceneTriangle>=0;
             if(valid)valid=length(hit.outwardNormal-sceneTriangles[sceneTriangle+3].xyz)<=2e-4;
             if(valid&&hit.objectId==glassObject) {
-                if(branch.interfaces>=uint(CAUSTIC_MAX_INTERFACES)) {valid=false;reasons=4u;}
+                if(branch.interfaces>=uint(CAUSTIC_MAX_ANCESTRY_INTERFACES)) {valid=false;reasons=4u;}
                 else {
                     valid=hit.materialId==glassMaterial&&cameraTraceInterface(branch.direction,branch.inside,hit,ior,
                         visit.normal,visit.transmitted,visit.reflected,visit.fresnel,visit.tir);
@@ -1313,13 +1497,13 @@ inline bool decodeGratingIncident(const Texel* p,NativeGratingIncident& output)
     if(p[17][2]!=0||p[17][3]!=0||p[22][1]!=1)return false;
     std::uint32_t low=0,high=0,entering=0;
     if(!causticWord(p[0][0],kMaximumEntrySamples*8-1,result.work)||!causticWord(p[0][1],7,result.band)
-        ||!causticWord(p[0][2],kMaximumInterfaces,result.interfaces)
+        ||!causticWord(p[0][2],kMaximumAncestryInterfaces,result.interfaces)
         ||!causticWord(p[0][3],kGratingOrdersPerIncident,result.orderCount)
         ||!causticId(p[1][0],p[1][1],low)||!causticId(p[1][2],p[1][3],high)
         ||!causticId(p[13][0],p[13][1],result.hit.objectId)||!causticId(p[13][2],p[13][3],result.hit.materialId)
         // Glass schedules admit one instance per authored scene object.
-        ||!causticWord(p[14][0],HarmonicMIDI::grid::Visual3DScene::kMaxObjects-1,result.hit.instanceId)
-        ||!causticWord(p[14][1],kMaximumNativeDiffractionTriangles,result.hit.triangleId)
+        ||!causticWord(p[14][0],std::uint32_t(opaquevisibility::kExactFloatIndexRange-1),result.hit.instanceId)
+        ||!causticWord(p[14][1],std::uint32_t(opaquevisibility::kExactFloatIndexRange-1),result.hit.triangleId)
         ||!causticId(p[14][2],p[14][3],result.hit.work)||!causticWord(p[15][3],1,entering)
         ||!causticWord(p[22][0],kGratingIncidentVersion,result.version)||result.version!=kGratingIncidentVersion)return false;
     result.reflectionHistory=low|(std::uint64_t(high)<<32);

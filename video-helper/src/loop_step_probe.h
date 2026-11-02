@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 namespace loopstep {
 
@@ -93,7 +94,7 @@ public:
             sink_->enterNs->store (previousEnterNs_, std::memory_order_relaxed);
         }
         const std::int64_t elapsedNs = toNs (end) - toNs (start_);
-        if (elapsedNs >= kReportNs)
+        if (elapsedNs >= reportNs())
         {
             std::fprintf (stderr, "[viewport] step %s took %lld ms\n", label_,
                           static_cast<long long> (elapsedNs / 1000000));
@@ -105,6 +106,29 @@ public:
     Scope& operator= (const Scope&) = delete;
 
     static constexpr std::int64_t kReportNs = 200000000; // 200 ms
+
+    // ARBIT_LOOP_STEP_MS overrides the report threshold for a diagnostic run;
+    // the release default stays kReportNs. The value is read once, and the
+    // first read names the threshold in the log so a run's receipt says which
+    // line set it.
+    static std::int64_t reportNs() noexcept
+    {
+        static const std::int64_t value = []
+        {
+            std::int64_t result = kReportNs;
+            if (const char* text = std::getenv ("ARBIT_LOOP_STEP_MS"))
+            {
+                const auto ms = std::strtoll (text, nullptr, 10);
+                if (ms > 0 && ms <= 60000)
+                    result = ms * 1000000;
+            }
+            if (result != kReportNs)
+                std::fprintf (stderr, "[viewport] loop step report=%lld ms\n",
+                              static_cast<long long> (result / 1000000));
+            return result;
+        }();
+        return value;
+    }
 
 private:
 

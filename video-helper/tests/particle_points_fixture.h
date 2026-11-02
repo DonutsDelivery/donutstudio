@@ -379,19 +379,22 @@ inline bool verifyParticlePointsBodyAuthority(std::string& error)
         return fail("Paired source admitted a substituted source revision");
     ParticlePointsBodyEnvelope issuance;
     if (!ParticlePointsBodySourceAdmission::issuanceEnvelope(compiled,payload,body,issuance)) return fail("Fixture source schedule missing");
+    static_assert(particlePointsBodyIssuanceCensusWork(40)-particlePointsBodyIssuanceCensusWork(32)
+        ==8*sizeof(videowire::geometry::OperationRecord),"Census work follows the operation count above 32");
+    const auto censusWork=particlePointsBodyIssuanceCensusWork(particlePointsBodyOperationCount(compiled));
     const auto shortCaller=makeParticleBodyCallerLedger({sizeof(ParticleBodyCallerLedger)+sizeof(ParticleBodyCallerLease)+issuance.bytes-1,
-        (issuance.work+particlePointsBodyIssuanceCensusWork)*2},error);
+        (issuance.work+censusWork)*2},error);
     if (!shortCaller || videowire::admitParticlePointsBodySource(payload,body,compiled,shortCaller,error)
-        || shortCaller->usage().work!=issuance.work+particlePointsBodyIssuanceCensusWork || shortCaller->usage().logicalBytes!=sizeof(ParticleBodyCallerLedger))
+        || shortCaller->usage().work!=issuance.work+censusWork || shortCaller->usage().logicalBytes!=sizeof(ParticleBodyCallerLedger))
         return fail("One-byte-short source refusal must precede decode and preserve attempted work");
     if (videowire::admitParticlePointsBodySource(payload,body,compiled,shortCaller,error)
-        || shortCaller->usage().work!=(issuance.work+particlePointsBodyIssuanceCensusWork)*2
+        || shortCaller->usage().work!=(issuance.work+censusWork)*2
         || videowire::admitParticlePointsBodySource(payload,body,compiled,shortCaller,error))
         return fail("Repeated source shortages must exhaust the persistent caller work epoch");
     const auto shortWork=makeParticleBodyCallerLedger({256u*1024u*1024u,
-        issuance.work+particlePointsBodyIssuanceCensusWork-1},error);
+        issuance.work+censusWork-1},error);
     if (!shortWork || videowire::admitParticlePointsBodySource(payload,body,compiled,shortWork,error)
-        || shortWork->usage().work!=issuance.work+particlePointsBodyIssuanceCensusWork-1
+        || shortWork->usage().work!=issuance.work+censusWork-1
         || shortWork->usage().logicalBytes!=sizeof(ParticleBodyCallerLedger))
         return fail("One-work-unit-short source admission must exhaust before decode");
     const auto request=particlePointsBodyRequestFixture(source,.5,error);
@@ -1100,6 +1103,7 @@ inline bool verifyParticleBodyRetainedResourceOracles(std::string& error)
 
     ParticleBodyGeometryScalarCensus scalar;
     scalar.operationCount=prepared->descriptor().operations.size();
+    scalar.operations.resize(scalar.operationCount);
     const auto& terminal=std::get<GeometryData>(prepared->descriptor().data);
     scalar.terminalVertices=terminal.positions.size(); scalar.terminalIndices=terminal.indices.size();
     scalar.terminalId=prepared->descriptor().stableId;
@@ -1143,9 +1147,15 @@ inline bool verifyParticleBodyRetainedResourceOracles(std::string& error)
         || capacity.records[0].importedAnimation!=oldToken->descriptor().operations[0].retainedMesh->importedAnimation.capacity()
         || ParticleBodyGeometryAdmission::instantiateScalarCost(*prepared,affine,capacity,numerical,refusal))
         return fail("Capacity census did not observe exact containers or reject source substitution");
-    auto excess=scalar; excess.operationCount=33;
+    auto excess=scalar; ParticleBodyGeometryScalarOperation extraTransform;
+    extraTransform.code=OperationCode::transformTRS; extraTransform.emptyPayloads=true; extraTransform.fields=5;
+    excess.operations.resize(40,extraTransform); excess.operationCount=40;
+    if (!ParticleBodyGeometryAdmission::deriveScalarCost(excess,3,ParticleBodyGeometryProxy::sphere,numerical,refusal)
+        || numerical.operationCount!=40)
+        return fail("Scalar factory census refused more than 32 records");
+    excess.operationCount=41;
     if (ParticleBodyGeometryAdmission::deriveScalarCost(excess,3,ParticleBodyGeometryProxy::sphere,numerical,refusal))
-        return fail("Scalar factory census accepted more than 32 records");
+        return fail("Scalar factory census accepted a count beyond its records");
     excess=scalar; excess.operations[0].retainedVertices=std::numeric_limits<std::size_t>::max();
     if (ParticleBodyGeometryAdmission::deriveScalarCost(excess,3,ParticleBodyGeometryProxy::sphere,numerical,refusal))
         return fail("Scalar factory census accepted hostile retained cardinalities");
@@ -1276,26 +1286,19 @@ inline bool verifyParticleBodyOwnedCapacityResetOracles(std::string& error)
         capacity.attributes=std::numeric_limits<std::size_t>::max();
         capacity.spectrumFields=std::numeric_limits<std::size_t>::max();
         capacity.scoreFields=std::numeric_limits<std::size_t>::max();
-        for (auto& record:capacity.records) {
-            record.attributeName=std::numeric_limits<std::size_t>::max();
-            record.retained=true;
-            record.positions=std::numeric_limits<std::size_t>::max();
-            record.identities=std::numeric_limits<std::size_t>::max();
-            record.indices=std::numeric_limits<std::size_t>::max();
-            record.attributes=std::numeric_limits<std::size_t>::max();
-            record.importedAnimation=std::numeric_limits<std::size_t>::max();
-        }
+        ParticleBodyGeometryOwnedCapacityRecord poisoned;
+        poisoned.attributeName=std::numeric_limits<std::size_t>::max();
+        poisoned.retained=true;
+        poisoned.positions=std::numeric_limits<std::size_t>::max();
+        poisoned.identities=std::numeric_limits<std::size_t>::max();
+        poisoned.indices=std::numeric_limits<std::size_t>::max();
+        poisoned.attributes=std::numeric_limits<std::size_t>::max();
+        poisoned.importedAnimation=std::numeric_limits<std::size_t>::max();
+        capacity.records.assign(64,poisoned);
     };
-    const auto zeroRecord=[](const ParticleBodyGeometryOwnedCapacityRecord& record) {
-        return record.attributeName==0 && !record.retained && record.positions==0
-            && record.identities==0 && record.indices==0 && record.attributes==0 && record.importedAnimation==0;
-    };
-    if (particlebodycapacityreset::globalStores.size()!=11 || particlebodycapacityreset::recordStores.size()!=7
-        || particlebodycapacityreset::recordLoopVisits!=capacity.records.size()
-        || particlebodycapacityreset::scalarStores!=235
-        || particlebodycapacityreset::directNativeByteSlots!=sizeof(capacity.observedSource)
-            +(10+6*capacity.records.size())*sizeof(std::size_t)+capacity.records.size()*sizeof(bool))
-        return fail("Capacity reset metadata does not describe exact native field stores and loop visits");
+
+    if (particlebodycapacityreset::globalStores.size()!=11 || particlebodycapacityreset::recordStores.size()!=7)
+        return fail("Capacity reset metadata does not describe exact native field stores");
     poison();
     ParticleBodyGeometryCostRefusal refusal=ParticleBodyGeometryCostRefusal::sourceMismatch;
     if (!ParticleBodyGeometryAdmission::observeOwnedCapacities(*source,capacity,refusal)
@@ -1309,12 +1312,10 @@ inline bool verifyParticleBodyOwnedCapacityResetOracles(std::string& error)
         || capacity.attributes!=value.attributes.capacity() || capacity.spectrumFields!=value.spectrumFields.capacity()
         || capacity.scoreFields!=value.scoreFields.capacity())
         return fail("Capacity reset changed genuine source identity, cardinalities or global capacities");
+    if (capacity.records.size()!=value.operations.size())
+        return fail("Capacity census did not hold exactly one record per operation");
     for (std::size_t i=0;i<capacity.records.size();++i) {
         const auto& record=capacity.records[i];
-        if (i>=value.operations.size()) {
-            if (!zeroRecord(record)) return fail("Unused capacity record retained poison after successful observation");
-            continue;
-        }
         const auto& op=value.operations[i];
         if (record.attributeName!=op.field.attributeName.capacity() || record.retained!=bool(op.retainedMesh))
             return fail("Observed operation name capacity or retained presence changed");
@@ -1342,8 +1343,7 @@ inline bool verifyParticleBodyOwnedCapacityResetOracles(std::string& error)
         || capacity.positions || capacity.identities || capacity.indices || capacity.operations
         || capacity.attributes || capacity.spectrumFields || capacity.scoreFields)
         return fail("Early genuine-source refusal did not clear every global capacity field");
-    for (const auto& record:capacity.records)
-        if (!zeroRecord(record)) return fail("Early genuine-source refusal did not clear all 32 capacity records");
+    if (!capacity.records.empty()) return fail("Early genuine-source refusal did not clear the capacity records");
     return true;
 }
 
@@ -1397,6 +1397,7 @@ inline bool verifyParticleBodyOwnerNativeProofOracles(std::string& error)
         const auto& value=token->descriptor(); const auto& terminal=std::get<GeometryData>(value.data);
         ParticleBodyGeometryScalarCensus census;
         census.operationCount=value.operations.size(); census.terminalId=value.stableId;
+        census.operations.resize(census.operationCount);
         census.terminalVertices=terminal.positions.size(); census.terminalIndices=terminal.indices.size();
         for (std::size_t i=0;i<value.operations.size();++i) {
             const auto& op=value.operations[i]; auto& record=census.operations[i];
@@ -1429,11 +1430,11 @@ inline bool verifyParticleBodyOwnerNativeProofOracles(std::string& error)
             for (const auto term : {sizeof(ParticleBodyGeometryAdmission),numerical.nativeDataBytes,sizeof(AdmittedValue),
                     sizeof(ValueDescriptor),sizeof(ValueDescriptor),sizeof(OperationRecord),sizeof(OperationRecord),
                     sizeof(OperationRecord),std::size_t{1},std::size_t{1},std::size_t{1},sizeof(GeometryData),
-                    sizeof(std::array<particlebodygeometrydetail::Shape,32>)})
+                    numerical.censusLogicalBytes})
                 if (!checkedAdd(floor,term,floor)) return fail("Owner proof fixture native floor overflowed");
             if (numerical.factoryAttemptLogicalBytes<floor || numerical.retainedSourceCoefficient!=1
                 || numerical.factorySourceCoefficient!=2 || numerical.nativeBodyBytes!=sizeof(ParticleBodyGeometryAdmission)
-                || numerical.censusLogicalBytes!=sizeof(std::array<particlebodygeometrydetail::Shape,32>))
+                || numerical.censusLogicalBytes!=particlebodygeometrydetail::censusLogicalBytes+value.operations.size()*sizeof(particlebodygeometrydetail::Shape))
                 return fail("Owner proof floor or unchanged source/native coefficients disagree with genuine cost facts");
             // Existing empty objects are supplied explicitly on these two paths.
             // The third path reaches the actual omitted/default argument. These
@@ -1593,7 +1594,7 @@ inline bool verifyParticleBodyMinimumNativeProofOracles(std::string& error)
                 std::size_t envelope=recipe.retainedLogicalBytes;
                 if (recipe.sourceLogicalBytes!=sourceBytes || recipe.descriptorCopyLogicalBytes!=descriptorBytes
                     || recipe.retainedSourceSnapshotLogicalBytes!=retainedBytes || recipe.sampleLogicalBytes!=sampleBytes
-                    || recipe.censusLogicalBytes!=particlebodygeometrydetail::censusLogicalBytes
+                    || recipe.censusLogicalBytes!=particlebodygeometrydetail::censusLogicalBytes+token->descriptor().operations.size()*sizeof(particlebodygeometrydetail::Shape)
                     || recipe.census.operationRecords!=1 || recipe.census.shapeProbes!=1
                     || recipe.referenceValidation.positionElements!=vertices || recipe.referenceValidation.identityElements!=vertices
                     || recipe.referenceValidation.indexElements!=indices || recipe.referenceNormalization.positionElements!=2*vertices

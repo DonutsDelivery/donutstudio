@@ -14,6 +14,7 @@
 #include "imported_material_frame_resolver.h"
 #include "loop_step_probe.h"
 #include "preview_render_extent.h"
+#include "published_plan_memo.h"
 
 #include <algorithm>
 #include <array>
@@ -55,6 +56,11 @@ template <typename Layer>
 struct HasImportedParentPresentation<Layer, std::void_t<
     decltype(std::declval<Layer>().importedParentPresentation)>> : std::true_type {};
 
+template <typename Layer, typename = void>
+struct HasImportedViewTransform : std::false_type {};
+template <typename Layer>
+struct HasImportedViewTransform<Layer, std::void_t<
+    decltype(std::declval<Layer>().nativeLinearViewTransform)>> : std::true_type {};
 template <typename Layer, typename = void>
 struct HasImportedLinearImage : std::false_type {};
 template <typename Layer>
@@ -102,19 +108,22 @@ struct AnalyticSkyRuntimeParameter
     double minimum;
     double maximum;
 };
+inline constexpr float kMaximumLightValue=std::numeric_limits<float>::max();
 inline auto analyticSkyRuntimeParameters(HarmonicMIDI::grid::SceneLightRecord& light)
 {
     auto& s=light.sky;
-    return std::array<AnalyticSkyRuntimeParameter,21> {{
-        {"red",&light.color.x,0,64},{"green",&light.color.y,0,64},{"blue",&light.color.z,0,64},
-        {"intensity",&light.intensity,0,1000000},
-        {"skyZenithRed",&s.zenith.x,0,64},{"skyZenithGreen",&s.zenith.y,0,64},{"skyZenithBlue",&s.zenith.z,0,64},
-        {"skyHorizonRed",&s.horizon.x,0,64},{"skyHorizonGreen",&s.horizon.y,0,64},{"skyHorizonBlue",&s.horizon.z,0,64},
-        {"skyGroundRed",&s.ground.x,0,64},{"skyGroundGreen",&s.ground.y,0,64},{"skyGroundBlue",&s.ground.z,0,64},
-        {"sunRed",&s.sunColor.x,0,64},{"sunGreen",&s.sunColor.y,0,64},{"sunBlue",&s.sunColor.z,0,64},
-        {"sunIntensity",&s.sunIntensity,0,64},{"sunAzimuthDegrees",&s.sunAzimuthDegrees,-360,360},
+    return std::array<AnalyticSkyRuntimeParameter,25> {{
+        {"red",&light.color.x,0,kMaximumLightValue},{"green",&light.color.y,0,kMaximumLightValue},{"blue",&light.color.z,0,kMaximumLightValue},
+        {"intensity",&light.intensity,0,kMaximumLightValue},
+        {"skyZenithRed",&s.zenith.x,0,kMaximumLightValue},{"skyZenithGreen",&s.zenith.y,0,kMaximumLightValue},{"skyZenithBlue",&s.zenith.z,0,kMaximumLightValue},
+        {"skyHorizonRed",&s.horizon.x,0,kMaximumLightValue},{"skyHorizonGreen",&s.horizon.y,0,kMaximumLightValue},{"skyHorizonBlue",&s.horizon.z,0,kMaximumLightValue},
+        {"skyGroundRed",&s.ground.x,0,kMaximumLightValue},{"skyGroundGreen",&s.ground.y,0,kMaximumLightValue},{"skyGroundBlue",&s.ground.z,0,kMaximumLightValue},
+        {"sunRed",&s.sunColor.x,0,kMaximumLightValue},{"sunGreen",&s.sunColor.y,0,kMaximumLightValue},{"sunBlue",&s.sunColor.z,0,kMaximumLightValue},
+        {"sunIntensity",&s.sunIntensity,0,kMaximumLightValue},{"sunAzimuthDegrees",&s.sunAzimuthDegrees,-360,360},
         {"sunElevationDegrees",&s.sunElevationDegrees,-90,90},{"sunRadiusDegrees",&s.sunRadiusDegrees,.25,30},
-        {"skyOrientationDegrees",&s.orientationDegrees,-360,360}
+        {"skyOrientationDegrees",&s.orientationDegrees,-360,360},
+        {"cloudCoverage",&s.cloudCoverage,0,1},{"cloudType",&s.cloudType,0,1},
+        {"cloudDrift",&s.cloudDrift,-1000000,1000000},{"cloudHeadingDegrees",&s.cloudHeadingDegrees,-360,360}
     }};
 }
 inline bool authoredAnalyticSkyLight(const videowire::CompiledVisualLayerPlan& plan,
@@ -129,8 +138,8 @@ inline bool authoredAnalyticSkyLight(const videowire::CompiledVisualLayerPlan& p
 inline auto environmentImageRuntimeParameters(HarmonicMIDI::grid::SceneLightRecord& light)
 {
     return std::array<AnalyticSkyRuntimeParameter,6>{{
-        {"red",&light.color.x,0,64},{"green",&light.color.y,0,64},{"blue",&light.color.z,0,64},
-        {"intensity",&light.intensity,0,1000000},
+        {"red",&light.color.x,0,kMaximumLightValue},{"green",&light.color.y,0,kMaximumLightValue},{"blue",&light.color.z,0,kMaximumLightValue},
+        {"intensity",&light.intensity,0,kMaximumLightValue},
         {"environmentOrientationDegrees",&light.environmentImage.orientationDegrees,-360,360},
         {"environmentExposureStops",&light.environmentImage.exposureStops,-16,16}}};
 }
@@ -218,10 +227,10 @@ inline bool evaluateDirectionalOrPointLight(const std::map<std::string, double>&
         field = offset ? field + clamped : clamped;
         return true;
     };
-    if (!apply("red", light.color.x, 0.0, 64.0, false)
-        || !apply("green", light.color.y, 0.0, 64.0, false)
-        || !apply("blue", light.color.z, 0.0, 64.0, false)
-        || !apply("intensity", light.intensity, 0.0, 1000000.0, false))
+    if (!apply("red", light.color.x, 0.0, kMaximumLightValue, false)
+        || !apply("green", light.color.y, 0.0, kMaximumLightValue, false)
+        || !apply("blue", light.color.z, 0.0, kMaximumLightValue, false)
+        || !apply("intensity", light.intensity, 0.0, kMaximumLightValue, false))
         return false;
     if (light.kind == HarmonicMIDI::grid::SceneLightKind::Point)
         return apply("positionX", light.transform.translation.x, -1000000.0, 1000000.0, true)
@@ -299,10 +308,10 @@ inline bool directionalOrPointOverride(const std::map<std::string, double>& para
     };
     SceneVec3 color {};
     float intensity = base.intensity;
-    if (!absolute("red", 0.0, 64.0, base.color.x, color.x)
-        || !absolute("green", 0.0, 64.0, base.color.y, color.y)
-        || !absolute("blue", 0.0, 64.0, base.color.z, color.z)
-        || !absolute("intensity", 0.0, 1000000.0, base.intensity, intensity))
+    if (!absolute("red", 0.0, kMaximumLightValue, base.color.x, color.x)
+        || !absolute("green", 0.0, kMaximumLightValue, base.color.y, color.y)
+        || !absolute("blue", 0.0, kMaximumLightValue, base.color.z, color.z)
+        || !absolute("intensity", 0.0, kMaximumLightValue, base.intensity, intensity))
         return false;
     out.hasColor = color.x != base.color.x || color.y != base.color.y || color.z != base.color.z;
     out.color = color;
@@ -342,16 +351,11 @@ inline bool directionalOrPointOverride(const std::map<std::string, double>& para
 }
 
 inline void seedImportedSceneRuntimeParameters(
-    const std::vector<videowire::CompiledVisualLayerPlan>& plans,
-    int clipId,
+    const videowire::CompiledVisualLayerPlan& plan,
+    const videowire::VisualLayerExecution& compiled,
     std::map<std::string, double>& parameters)
 {
-    const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
-    if (plan == nullptr) return;
-    videowire::VisualLayerExecution compiled;
-    std::string error;
-    if (!videowire::compileVisualLayerExecution(*plan, compiled, error)
-        || !compiled.importedSceneRender)
+    if (!compiled.importedSceneRender)
         return;
     const auto seedSky=[&](HarmonicMIDI::grid::SceneLightRecord light) {
         if (light.environmentImage.version)
@@ -360,7 +364,7 @@ inline void seedImportedSceneRuntimeParameters(
             for (auto field:environmentImageRuntimeParameters(light)) parameters.emplace(prefix+field.name,*field.value);
         }
         seedDirectionalOrPointLight(light,parameters);
-        if (!authoredAnalyticSkyLight(*plan,light)) return;
+        if (!authoredAnalyticSkyLight(plan,light)) return;
         const auto prefix="visual"+std::to_string(light.id.value)+"/";
         for (auto field:analyticSkyRuntimeParameters(light)) parameters.emplace(prefix+field.name,*field.value);
     };
@@ -410,7 +414,7 @@ inline void seedImportedSceneRuntimeParameters(
     parameters.emplace(renderPrefix + "objectScale", 1.0);
     parameters.emplace(renderPrefix + "emissionGain", 1.0);
     if (compiled.importedSceneRender->diffractionMaterial)
-        for (const auto& operation : plan->operations)
+        for (const auto& operation : plan.operations)
             if (operation.kind == "visual.material.diffraction-grating"
                 || operation.kind == "visual.material.diffractive-foil")
             {
@@ -419,23 +423,41 @@ inline void seedImportedSceneRuntimeParameters(
                         *compiled.importedSceneRender->diffractionMaterial))
                     parameters.emplace(prefix + name, value);
             }
-    bakedtarget::seed(*plan, compiled, parameters);
+    bakedtarget::seed(plan, compiled, parameters);
+}
+
+// Lowers the plan, which decodes its whole payload. Anything holding an admitted execution
+// passes it to the overload above, above all the render loop, which seeds every frame.
+inline void seedImportedSceneRuntimeParameters(
+    const std::vector<videowire::CompiledVisualLayerPlan>& plans,
+    int clipId,
+    std::map<std::string, double>& parameters)
+{
+    const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
+    if (plan == nullptr) return;
+    videowire::VisualLayerExecution compiled;
+    std::string error;
+    if (videowire::compileVisualLayerExecution(*plan, compiled, error))
+        seedImportedSceneRuntimeParameters(*plan, compiled, parameters);
 }
 
 struct ImportedSceneStaticResourceIdentity final
 {
     std::uint64_t projectGeneration = 0;
     std::uint64_t helperGeneration = 0;
+    // The frame's publication lease, when the caller holds one. See PublishedPlanMemo.
+    std::shared_ptr<const void> planPublication {};
 };
 
-inline std::string exactImportedScenePayloadIdentity(
+inline const std::string& exactImportedScenePayloadIdentity(
     const videowire::CompiledVisualLayerPlan& plan)
 {
+    static const std::string none;
     for (const auto& operation : plan.operations)
         if (operation.kind == visualimportedscenerender::kRenderNodeKind
             || (operation.kind == typedscenepass::kNodeKind && videowire::hasTypedScenePass(plan)))
             return operation.payloadXml;
-    return {};
+    return none;
 }
 
 enum class VisualImportedScenePreparation : std::uint8_t
@@ -513,16 +535,17 @@ public:
         projectGeneration_ = identity.projectGeneration;
         helperGeneration_ = identity.helperGeneration;
         const auto found = entries_.find(plan.clipId);
-        if (found != entries_.end() && !sameCompiledVisualPlan(found->second.plan, plan))
+        if (found != entries_.end() && !samePlan(found->second, plan, identity.planPublication))
             entries_.erase(found);
     }
 
     const videowire::VisualLayerExecution* resolve(
         const videowire::CompiledVisualLayerPlan& plan,
-        std::string& error)
+        std::string& error,
+        const std::shared_ptr<const void>& planPublication = {})
     {
         auto found = entries_.find(plan.clipId);
-        if (found != entries_.end() && sameCompiledVisualPlan(found->second.plan, plan))
+        if (found != entries_.end() && samePlan(found->second, plan, planPublication))
         {
             found->second.lastUse = ++useSerial_;
             return &found->second.execution;
@@ -531,25 +554,25 @@ public:
         videowire::VisualLayerExecution compiled;
         if (!videowire::compileVisualLayerExecution(plan, compiled, error))
             return nullptr;
-
-        if (entries_.size() >= kMaximumEntries)
-        {
-            auto victim = entries_.begin();
-            for (auto candidate = std::next(victim); candidate != entries_.end(); ++candidate)
-                if (candidate->second.lastUse < victim->second.lastUse
-                    || (candidate->second.lastUse == victim->second.lastUse
-                        && candidate->first < victim->first))
-                    victim = candidate;
-            entries_.erase(victim);
-            found = entries_.end();
-        }
-        Entry replacement { plan, std::move(compiled), ++useSerial_, {} };
-        if (found == entries_.end())
-            found = entries_.emplace(plan.clipId, std::move(replacement)).first;
-        else
-            found->second = std::move(replacement);
-        return &found->second.execution;
+        ++planCompiles_;
+        auto& stored = store(plan, std::move(compiled));
+        stored.verified.remember(planPublication, &plan);
+        return &stored.execution;
     }
+
+    // Takes what admission already lowered from this exact plan, so the first frame after an
+    // install does not lower the payload again. A later resolve finds it.
+    void adopt(const videowire::CompiledVisualLayerPlan& plan,
+               const videowire::VisualLayerExecution& admitted,
+               const std::shared_ptr<const void>& planPublication = {})
+    {
+        const auto found = entries_.find(plan.clipId);
+        if (found == entries_.end() || !samePlan(found->second, plan, planPublication))
+            store(plan, admitted).verified.remember(planPublication, &plan);
+    }
+
+    std::uint64_t planTextComparisons() const noexcept { return planTextComparisons_; }
+    std::uint64_t planCompiles() const noexcept { return planCompiles_; }
 
     // Baked-value derivations for the clip's current compiled plan. A replaced
     // or evicted plan drops its slot with the entry.
@@ -580,13 +603,46 @@ private:
         videowire::VisualLayerExecution execution;
         std::uint64_t lastUse = 0;
         bakedtarget::Slot baked {};
+        PublishedPlanMemo verified {};
     };
     static constexpr std::size_t kMaximumEntries = 16;
+    // A sea's plan text is 276 MB and each frame asks about it three times.
+    bool samePlan(Entry& entry, const videowire::CompiledVisualLayerPlan& plan,
+                  const std::shared_ptr<const void>& planPublication) noexcept
+    {
+        if (entry.verified.holds(planPublication, &plan)) return true;
+        ++planTextComparisons_;
+        if (!sameCompiledVisualPlan(entry.plan, plan)) return false;
+        entry.verified.remember(planPublication, &plan);
+        return true;
+    }
+    Entry& store(const videowire::CompiledVisualLayerPlan& plan, videowire::VisualLayerExecution execution)
+    {
+        auto found = entries_.find(plan.clipId);
+        if (found == entries_.end() && entries_.size() >= kMaximumEntries)
+        {
+            auto victim = entries_.begin();
+            for (auto candidate = std::next(victim); candidate != entries_.end(); ++candidate)
+                if (candidate->second.lastUse < victim->second.lastUse
+                    || (candidate->second.lastUse == victim->second.lastUse
+                        && candidate->first < victim->first))
+                    victim = candidate;
+            entries_.erase(victim);
+        }
+        Entry replacement { plan, std::move(execution), ++useSerial_, {}, {} };
+        if (found == entries_.end())
+            found = entries_.emplace(plan.clipId, std::move(replacement)).first;
+        else
+            found->second = std::move(replacement);
+        return found->second;
+    }
     std::map<int, Entry> entries_;
     std::map<int, bakedtarget::RevisionFloor> revisionFloors_;
     std::uint64_t projectGeneration_ = 0;
     std::uint64_t helperGeneration_ = 0;
     std::uint64_t useSerial_ = 0;
+    std::uint64_t planTextComparisons_ = 0;
+    std::uint64_t planCompiles_ = 0;
 };
 
 inline double importedTimelineEvaluationSeconds(double sourceSeconds,
@@ -720,13 +776,18 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     };
     if (plan == nullptr) return VisualImportedScenePreparation::notApplicable;
 
-    const auto exactPayloadIdentity = exactImportedScenePayloadIdentity(*plan);
+    const auto& exactPayloadIdentity = exactImportedScenePayloadIdentity(*plan);
     if (execution != nullptr)
     {
         loopstep::Scope publishStaticScope ("advance:imported-scene:static-publish");
-        execution->publishStaticPayload(clipId, staticIdentity.projectGeneration,
-                                        staticIdentity.helperGeneration,
-                                        exactPayloadIdentity);
+        if constexpr (std::is_same_v<Execution,modelpayload::ImportedScenePayloadExecution>)
+            execution->publishStaticPayload(clipId, staticIdentity.projectGeneration,
+                                            staticIdentity.helperGeneration,
+                                            exactPayloadIdentity, staticIdentity.planPublication);
+        else
+            execution->publishStaticPayload(clipId, staticIdentity.projectGeneration,
+                                            staticIdentity.helperGeneration,
+                                            exactPayloadIdentity);
     }
     if constexpr (std::is_same_v<Execution,modelpayload::ImportedScenePayloadExecution>)
         if (execution && !execution->parentPublicationReady())
@@ -742,7 +803,7 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     const videowire::VisualLayerExecution* compiled = nullptr;
     {
         loopstep::Scope resolveScope ("advance:imported-scene:resolve-compile");
-        compiled = planCache->resolve(*plan, error);
+        compiled = planCache->resolve(*plan, error, staticIdentity.planPublication);
     }
     if (compiled == nullptr)
         return VisualImportedScenePreparation::rejected;
@@ -793,6 +854,22 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         linearColor = true;
     }
 
+    // Radiance from every engine is linear. The 8-bit route takes bytes as already
+    // encoded for display, so radiance on it shows too dark, and frame layers add
+    // linear light into the same image. The linear route lets the compositor encode
+    // once. Pass programs and pass composites own their output transform and may
+    // select a data pass, so outside Path Trace they stay on the 8-bit route.
+    if ((compiled->importedSceneRender->imageOutput == renderpassoutput::Output::Color
+            || compiled->importedSceneRender->imageOutput == renderpassoutput::Output::Emission)
+        && !compiled->particleParameters.solidMotionView
+        && (compiled->importedSceneRender->renderEngine == visualimportedscenerender::RenderEngine::PathTrace
+            || (!compiled->passComposite && !compiled->passProgram)))
+    {
+        if constexpr (!HasImportedTextureOwner<Layer>::value || !HasImportedLinearImage<Layer>::value)
+            return reject("Scene radiance requires a compositor layer with an owned linear native texture");
+        linearColor = true;
+    }
+
     if constexpr (!HasImportedParentInspector<Execution>::value)
         if (compiled->importedSceneRender->importedParentIntent)
             return reject("Imported Scene Compose parenting requires its native parent binding owner and receipt");
@@ -814,7 +891,11 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     request.deformation = importedSource.deformation;
     // The engine belongs to the outer render request; composed leaves are Raster.
     request.renderEngine = compiled->importedSceneRender->renderEngine;
+    request.renderMode = compiled->importedSceneRender->renderMode;
     request.pathTraceExportSamples = compiled->importedSceneRender->pathTraceExportSamples;
+    request.pathTracePreviewSamples = compiled->importedSceneRender->pathTracePreviewSamples;
+    request.pathTraceDenoise = compiled->importedSceneRender->pathTraceDenoise;
+    request.pathTraceMaxBounces = compiled->importedSceneRender->pathTraceMaxBounces;
     request.runtimeInputs.imageOutput = compiled->importedSceneRender->imageOutput;
     request.runtimeInputs.linearColor = linearColor;
     if (linearColor && request.runtimeInputs.imageOutput != renderpassoutput::Output::Color
@@ -843,7 +924,14 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     request.projectGeneration = staticIdentity.projectGeneration;
     request.helperGeneration = staticIdentity.helperGeneration;
     request.clipId = clipId;
-    request.staticPayloadIdentity = exactPayloadIdentity;
+    // The publication keeps the text alive, so a leased plan is not copied per sample.
+    if (staticIdentity.planPublication)
+    {
+        request.publishedPayloadIdentity = &exactPayloadIdentity;
+        request.publishedPayloadOwner = staticIdentity.planPublication;
+    }
+    else
+        request.staticPayloadIdentity = exactPayloadIdentity;
     if (compiled->noteInstanceMapping)
     {
         if (!canonicalBlockCFrame)
@@ -964,12 +1052,12 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             value("cameraRotateY", 0.0, -360.0, 360.0),
             value("cameraRotateZ", 0.0, -360.0, 360.0)
         };
-        // Values in (0, 1) round up to the lowest lowered field of view. Zero or
-        // negative values keep the authored field of view.
+        // Positive values under the narrowest lens round up to it. Zero or negative
+        // values keep the authored field of view.
         const auto fieldOfView = value("cameraFovDegrees", 0.0, 0.0, 179.0);
         request.runtimeInputs.cameraVerticalFovDegrees = fieldOfView > 0.0f
-            ? std::max(fieldOfView, 1.0f) : 0.0f;
-        request.runtimeInputs.emissionGain = value("emissionGain", 1.0, 0.0, 64.0);
+            ? std::max(fieldOfView, HarmonicMIDI::grid::kMinimumCameraVerticalFovDegrees) : 0.0f;
+        request.runtimeInputs.emissionGain = value("emissionGain", 1.0, 0.0, kMaximumLightValue);
     }
     if (!importedanimation::importedAnimationFrameIdentity(
             sourceSeconds, framesPerSecond, request.frame, error))
@@ -1244,7 +1332,7 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             waterHistory = inputLayer.particleHistory.get();
         request.sceneSnapshot = geometry::evaluateComposedTimelineGeometry(cache.runtime, owner,
             *compiled->importedSceneRender->timelineGeometry, request.sceneSnapshot, frameSeconds, error,
-            waterHistory, projectSeconds, canonicalBlockCFrame, preparedCoupledWater.get());
+            waterHistory, projectSeconds, canonicalBlockCFrame, preparedCoupledWater.get(), staticIdentity.planPublication);
         if (!request.sceneSnapshot) return VisualImportedScenePreparation::rejected;
         if (request.material && !request.importedScene) request.material->sceneSnapshot = request.sceneSnapshot;
         for (auto& program : request.surfacePrograms)
@@ -1253,6 +1341,23 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         // depends on water history and coupled bodies, so the payload keeps the
         // evaluated positions instead of evaluating the prior frame again.
         request.deformedSceneMotion = true;
+    }
+    if (!compiled->importedSceneRender->harmonicLinks.empty())
+    {
+        if (solidOverlay)
+            return reject("Harmonic Link Geometry cannot share a scene with Solid 3D bodies yet");
+        // The link count follows the score, so this frame's mesh can differ in
+        // size from the last. No prior positions line up, and links draw no motion.
+        auto linked = std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*request.sceneSnapshot);
+        for (const auto& binding : compiled->importedSceneRender->harmonicLinks)
+            if (!harmonicgeometry::replaceSceneMesh(binding, canonicalBlockCFrame, width, height, *linked, error))
+                return VisualImportedScenePreparation::rejected;
+        if (!HarmonicMIDI::grid::validateVisual3DScene(*linked).valid())
+            return reject("Harmonic Link Geometry produced an invalid retained scene");
+        request.sceneSnapshot = std::move(linked);
+        if (request.material && !request.importedScene) request.material->sceneSnapshot = request.sceneSnapshot;
+        for (auto& program : request.surfacePrograms)
+            program.program.material.sceneSnapshot = request.sceneSnapshot;
     }
     if (solidOverlay)
     {
@@ -1534,6 +1639,10 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         {
             layer.nativeTextureOwner = frame;
             layer.nativeLinearImage = frame;
+            if constexpr (HasImportedViewTransform<Layer>::value)
+                layer.nativeLinearViewTransform =
+                    compiled->importedSceneRender->viewTransform == visualimportedscenerender::ViewTransform::AgX
+                        ? colortransform::ToneMap::AgX : colortransform::ToneMap::None;
         }
     layer.depthTexture = backend == "opengl" ? static_cast<unsigned>(nativeDepthView) : 0;
     layer.nativeDepthTextureBackend = backend;

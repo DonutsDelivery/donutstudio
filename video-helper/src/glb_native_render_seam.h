@@ -3,6 +3,7 @@
 #include "fixture_scene_renderer.h"
 #include "glb_scene_adapter.h"
 #include "imported_light_evaluation.h"
+#include "timeline_scene_evaluation_inputs.h"
 #include "../../shared/SurfaceMaterialBindingContract.h"
 
 #include <algorithm>
@@ -159,10 +160,6 @@ struct GlbColdAdmissionProbe final
 class GlbNativeRenderSeam
 {
 public:
-    static constexpr std::size_t kMaxSourceBytes = 16u * 1024u * 1024u;
-    static constexpr std::size_t kMaxJsonBytes = 1u * 1024u * 1024u;
-    static constexpr std::size_t kMaxBinBytes = kMaxSourceBytes - kMaxJsonBytes;
-
     // Structural node storage for the selected standard library, excluding
     // allocator bookkeeping. Zero means that library boundary is unaccounted.
     static std::size_t lightDefinitionNodeBytes() noexcept;
@@ -237,7 +234,9 @@ public:
         const geometrysurfacematerial::ObjectPrograms& programs,
         const videowire::geometry::RuntimeFieldEvaluation& evaluation, std::string& error,
         const diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest* diffraction = nullptr,
-        const visualimportedscenerender::GlassCausticSelection* caustic = nullptr);
+        const visualimportedscenerender::GlassCausticSelection* caustic = nullptr,
+        const geometry::TimelineSceneEvaluationInputs* materialInputs = nullptr);
+    std::uint64_t surfaceMaterialAdmissions() const noexcept { return surfaceMaterialAdmissions_; }
 
     bool publishDiffractionMaterial (
         const GlbNativeSceneAdmission& admission,
@@ -274,6 +273,32 @@ public:
         renderer_.selectEngine (selection);
     }
 
+    // Carries the fixture renderer's prepared static resources from the seam of a
+    // preview owner that is being replaced to its replacement. An animated
+    // imported scene takes a new snapshot every frame, so without this every frame
+    // cold-prepares and the resident water refit plan never gets a second frame to
+    // be made in.
+    videorender::fixture3d::FixtureSceneRenderer::CachedResources takeRendererCache ()
+    {
+        return renderer_.releaseCache ();
+    }
+    void giveRendererCache (videorender::fixture3d::FixtureSceneRenderer::CachedResources cache)
+    {
+        renderer_.adoptCache (std::move (cache));
+    }
+
+    // Carries the path tracer across the same replacement. The tracer holds
+    // the preview accumulation; without this the animated scene's per-frame
+    // owner swap hands every frame a fresh engine that restarts at one sample.
+    std::shared_ptr<videorender::fixture3d::SceneRenderEngine> takePathTraceEngine ()
+    {
+        return renderer_.releasePathTraceEngine ();
+    }
+    void givePathTraceEngine (std::shared_ptr<videorender::fixture3d::SceneRenderEngine> engine)
+    {
+        renderer_.adoptPathTraceEngine (std::move (engine));
+    }
+
 private:
     bool render (const GlbNativeSceneAdmission& admission,
                  videorender::fixture3d::RenderDimensions dimensions,
@@ -288,6 +313,14 @@ private:
     std::shared_ptr<const videorender::fixture3d::AdmittedSurfaceMaterialBinding>
         lastGoodMaterial_;
     std::string lastSurfaceProgramsIdentity_;
+    std::shared_ptr<const visualimportedscenerender::Request> lastIdentityRequest_;
+    std::string lastIdentityDigest_;
+    // What the last publication evaluated its Fields from. Field evaluation reads only the time
+    // and frame these name, so equal inputs on an unchanged request make the same material.
+    std::optional<geometry::TimelineSceneEvaluationInputs> publishedMaterialInputs_;
+    std::weak_ptr<const videorender::fixture3d::AdmittedSurfaceMaterialBinding> publishedMaterial_;
+    std::weak_ptr<const videorender::fixture3d::AdmittedDiffractionMaterialBinding> publishedDiffraction_;
+    std::uint64_t surfaceMaterialAdmissions_ = 0;
     std::shared_ptr<const videorender::fixture3d::AdmittedDiffractionMaterialBinding>
         lastGoodDiffractionMaterial_;
     std::uint64_t lastGoodMaterialRevision_ = 0;

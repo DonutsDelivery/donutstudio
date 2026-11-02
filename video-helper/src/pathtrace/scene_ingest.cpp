@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <utility>
+#include <vector>
 
 // Behavioural reference for flattening object instances into one world-space
 // triangle set: intern/cycles/bvh/build.cpp (Blender Cycles). Matrix and camera
@@ -21,16 +23,38 @@ using HarmonicMIDI::grid::Visual3DScene;
 
 Vec3 toVec3 (const SceneVec3& v) noexcept { return { v.x, v.y, v.z }; }
 
-template <typename Record, std::size_t N, typename Id>
-std::size_t indexOfId (const std::array<Record, N>& records, std::size_t count, Id id) noexcept
+// Returns records.size() when no live record has the id.
+template <typename Records, typename Id>
+std::size_t indexOfId (const Records& records, std::size_t count, Id id) noexcept
 {
+    const std::size_t none = records.size();
     if (! id.isValid())
-        return N;
-    count = std::min (count, N);
+        return none;
+    count = std::min (count, none);
     for (std::size_t i = 0; i < count; ++i)
         if (records[i].id == id)
             return i;
-    return N;
+    return none;
+}
+
+// Names the first live count that its allocated buffer cannot hold. Ingest
+// refuses such a scene whole rather than drop the records past the buffer.
+std::string capacityRefusal (const Visual3DScene& scene)
+{
+    const struct { const char* name; std::size_t count; std::size_t allocated; } buffers[] {
+        { "vertices", scene.vertexCount, scene.vertices.size() },
+        { "indices", scene.indexCount, scene.indices.size() },
+        { "objects", scene.objectCount, scene.objects.size() },
+        { "materials", scene.materialCount, scene.materials.size() },
+        { "cameras", scene.cameraCount, scene.cameras.size() },
+        { "object instances", scene.objectInstanceCount, scene.objectInstances.size() },
+    };
+    for (const auto& buffer : buffers)
+        if (buffer.count > buffer.allocated)
+            return std::string ("3D scene refused by path-trace ingest: it counts ")
+                + std::to_string (buffer.count) + " " + buffer.name + " but allocates "
+                + std::to_string (buffer.allocated) + ".";
+    return {};
 }
 
 bool usableNormal (Vec3 n) noexcept
@@ -38,12 +62,82 @@ bool usableNormal (Vec3 n) noexcept
     return isFinite (n) && dot (n, n) > 0.0f;
 }
 
+// One dP/du per object vertex, in world space, with the handedness the grating
+// frame requires, so a polar cap's seam wedge, whose u steps back, agrees with its
+// neighbours. A vertex takes both from its constant-v edges, which measure dP/du
+// at that radius. Each edge counts once per side of the vertex however the quads
+// split into triangles, so the sum is the circle's tangent and not tilted toward
+// the wedge holding more triangles. The longest wins, which leaves out the seam
+// edge's shrunken value. A vertex with no such edge uses its triangles.
+std::vector<Vec3> smoothGrooveTangents (const Visual3DScene& scene, const SceneObjectRecord& object, const Mat4& world, bool mirrored)
+{
+    const std::size_t count = object.vertexCount;
+    std::vector<Vec3> directions (count), edgeDirections (count);
+    std::vector<float> edgeLengths (count, 0.0f), triangleLengths (count, 0.0f);
+    for (std::size_t tri = 0; tri + 3 <= object.indexCount; tri += 3)
+    {
+        std::array<std::uint32_t, 3> local { scene.indices[object.firstIndex + tri],
+                                             scene.indices[object.firstIndex + tri + 1],
+                                             scene.indices[object.firstIndex + tri + 2] };
+        if (local[0] >= count || local[1] >= count || local[2] >= count)
+            continue;
+        if (mirrored)
+            std::swap (local[1], local[2]);
+        std::array<Vec3, 3> p {};
+        std::array<Vec2, 3> uv {};
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            const auto& vertex = scene.vertices[object.firstVertex + local[k]];
+            p[k] = transformPoint (world, toVec3 (vertex.position));
+            uv[k] = { vertex.uv.x, vertex.uv.y };
+        }
+        const Vec3 edge1 = p[1] - p[0], edge2 = p[2] - p[0];
+        const float du1 = uv[1].x - uv[0].x, dv1 = uv[1].y - uv[0].y;
+        const float du2 = uv[2].x - uv[0].x, dv2 = uv[2].y - uv[0].y;
+        const double area = static_cast<double> (du1) * dv2 - static_cast<double> (du2) * dv1;
+        const Vec3 normal = normalizeOrZero (cross (edge1, edge2));
+        if (! (std::abs (area) > 1.0e-14) || ! usableNormal (normal))
+            continue;
+        const float inverse = static_cast<float> (1.0 / area);
+        Vec3 tangent = (edge1 * dv2 - edge2 * dv1) * inverse;
+        const Vec3 bitangent = (edge2 * du1 - edge1 * du2) * inverse;
+        const float size = length (tangent);
+        if (! std::isfinite (size) || ! (size > 0.0f))
+            continue;
+        if (dot (bitangent, cross (normal, tangent)) < 0.0f)
+            tangent = tangent * -1.0f;
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            directions[local[k]] = directions[local[k]] + tangent * (1.0f / size);
+            triangleLengths[local[k]] = std::max (triangleLengths[local[k]], size);
+            const std::size_t next = (k + 1) % 3;
+            const float du = std::abs (uv[next].x - uv[k].x), dv = std::abs (uv[next].y - uv[k].y);
+            if (du > 1.0e-6f && dv <= 1.0e-6f)
+            {
+                const float edgeSize = length (p[next] - p[k]) / du;
+                edgeLengths[local[k]] = std::max (edgeLengths[local[k]], edgeSize);
+                edgeLengths[local[next]] = std::max (edgeLengths[local[next]], edgeSize);
+                edgeDirections[local[k]] = edgeDirections[local[k]] + tangent * (1.0f / size);
+                edgeDirections[local[next]] = edgeDirections[local[next]] + tangent * (1.0f / size);
+            }
+        }
+    }
+    for (std::size_t v = 0; v < count; ++v)
+    {
+        const bool onEdge = edgeLengths[v] > 0.0f;
+        const Vec3 sum = onEdge ? edgeDirections[v] : directions[v];
+        // Around a cap's hub the unit directions cancel to rounding noise.
+        directions[v] = length (sum) > 1.0e-3f ? normalizeOrZero (sum) * (onEdge ? edgeLengths[v] : triangleLengths[v]) : Vec3 {};
+    }
+    return directions;
+}
+
 void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Mat4& world,
                    std::uint32_t instanceIndex, IngestedScene& out)
 {
     const SceneObjectRecord& object = scene.objects[objectIndex];
-    const std::size_t sceneVertices = std::min (scene.vertexCount, Visual3DScene::kMaxVertices);
-    const std::size_t sceneIndices = std::min (scene.indexCount, Visual3DScene::kMaxIndices);
+    const std::size_t sceneVertices = scene.vertexCount;
+    const std::size_t sceneIndices = scene.indexCount;
     const std::size_t firstVertex = object.firstVertex;
     const std::size_t vertexCount = object.vertexCount;
     const std::size_t firstIndex = object.firstIndex;
@@ -55,11 +149,12 @@ void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Ma
     }
 
     const std::size_t materialSlot = indexOfId (scene.materials, scene.materialCount, object.material);
-    const bool hasMaterial = materialSlot < Visual3DScene::kMaxMaterials;
+    const bool hasMaterial = materialSlot < scene.materials.size();
     const float determinant = determinant3x3 (world);
     const bool mirrored = determinant < 0.0f;
     const NormalMatrix normals = normalMatrixOf (world);
     const float tangentSign = mirrored ? -1.0f : 1.0f;
+    const std::vector<Vec3> grooveTangents = smoothGrooveTangents (scene, object, world, mirrored);
 
     for (std::size_t tri = 0; tri + 3 <= indexCount; tri += 3)
     {
@@ -113,8 +208,10 @@ void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Ma
                 world, { vertex.tangent[0], vertex.tangent[1], vertex.tangent[2] }));
             const float w = vertex.tangent[3] < 0.0f ? -1.0f : 1.0f;
             attributes.tangents[k] = { t.x, t.y, t.z, w * tangentSign };
+            attributes.grooveTangents[k] = grooveTangents[local[k]];
         }
         attributes.hasShadingNormals = allNormals;
+        attributes.authoredShading = allNormals && object.authoredShading;
         if (! allNormals)
             attributes.shadingNormals = { ng, ng, ng };
 
@@ -135,6 +232,7 @@ void IngestedScene::clear() noexcept
     triangles.clear();
     bounds = {};
     stats = {};
+    refusal.clear();
 }
 
 Mat4 transformMatrix (const SceneTransform3D& transform) noexcept
@@ -152,7 +250,7 @@ Mat4 transformMatrix (const SceneTransform3D& transform) noexcept
 
 Mat4 objectWorldMatrix (const Visual3DScene& scene, std::size_t objectIndex) noexcept
 {
-    const std::size_t objectCount = std::min (scene.objectCount, Visual3DScene::kMaxObjects);
+    const std::size_t objectCount = std::min (scene.objectCount, scene.objects.size());
     if (objectIndex >= objectCount)
         return {};
     const SceneObjectRecord& object = scene.objects[objectIndex];
@@ -172,9 +270,12 @@ Mat4 objectWorldMatrix (const Visual3DScene& scene, std::size_t objectIndex) noe
 void ingestScene (const Visual3DScene& scene, IngestedScene& out, const IngestOptions& options)
 {
     out.clear();
-    const std::size_t objectCount = std::min (scene.objectCount, Visual3DScene::kMaxObjects);
+    out.refusal = capacityRefusal (scene);
+    if (! out.refusal.empty())
+        return;
+    const std::size_t objectCount = scene.objectCount;
     const bool overrides = options.objectWorlds != nullptr && options.objectWorldCount == scene.objectCount;
-    const std::size_t instanceCount = std::min (scene.objectInstanceCount, Visual3DScene::kMaxObjectInstances);
+    const std::size_t instanceCount = scene.objectInstanceCount;
     for (std::size_t objectIndex = 0; objectIndex < objectCount; ++objectIndex)
     {
         const SceneObjectRecord& object = scene.objects[objectIndex];
@@ -194,33 +295,6 @@ void ingestScene (const Visual3DScene& scene, IngestedScene& out, const IngestOp
         }
         appendObject (scene, objectIndex, world, kNoInstance, out);
     }
-}
-
-Ray PinholeCamera::generateRay (float pixelX, float pixelY) const noexcept
-{
-    const float ndcX = 2.0f * pixelX / static_cast<float> (width) - 1.0f;
-    const float ndcY = 1.0f - 2.0f * pixelY / static_cast<float> (height);
-    const Vec3 local { ndcX * tanHalfFov * aspect, ndcY * tanHalfFov, -1.0f };
-    const float localLength = length (local);
-    Ray ray;
-    ray.origin = position;
-    ray.direction = rotate (rotation, local) * (1.0f / localLength);
-    ray.tMin = nearPlane * localLength;
-    ray.tMax = farPlane * localLength;
-    return ray;
-}
-
-bool PinholeCamera::project (Vec3 world, float& pixelX, float& pixelY, float& viewDepth) const noexcept
-{
-    const Vec3 view = rotate (conjugate (rotation), world - position);
-    viewDepth = -view.z;
-    if (! (viewDepth > 0.0f))
-        return false;
-    const float ndcX = view.x / (tanHalfFov * aspect * viewDepth);
-    const float ndcY = view.y / (tanHalfFov * viewDepth);
-    pixelX = (ndcX + 1.0f) * 0.5f * static_cast<float> (width);
-    pixelY = (1.0f - ndcY) * 0.5f * static_cast<float> (height);
-    return std::isfinite (pixelX) && std::isfinite (pixelY);
 }
 
 bool makePinholeCamera (const SceneCameraRecord& record, std::uint32_t width, std::uint32_t height,
@@ -250,7 +324,7 @@ bool resolveActiveCamera (const Visual3DScene& scene, std::uint32_t width, std::
                           PinholeCamera& camera) noexcept
 {
     const std::size_t slot = indexOfId (scene.cameras, scene.cameraCount, scene.activeCamera);
-    if (slot >= std::min (scene.cameraCount, Visual3DScene::kMaxCameras))
+    if (slot >= std::min (scene.cameraCount, scene.cameras.size()))
         return false;
     return makePinholeCamera (scene.cameras[slot], width, height, camera);
 }

@@ -78,7 +78,7 @@ inline std::optional<videowire::geometry::AdmittedValue> adaptGlbObjectsToGeomet
   OperationRecord operation{valueId,OperationCode::retainedMesh,sourceId,valueId,{}};
   operation.retainedMesh=std::move(retained); value.operations.push_back(std::move(operation));
   PortContract contract; contract.carrier=CarrierKind::geometry3D;
-  contract.maxVertices=4096; contract.maxIndices=12288; contract.maxAttributes=kMaximumAttributes;
+  contract.maxVertices=kMaximumVertices; contract.maxIndices=kMaximumIndices; contract.maxAttributes=kMaximumAttributes;
   contract=withAttributeContract(contract,value);
   return admitValue(std::move(value),contract,{},error);
 }
@@ -119,14 +119,13 @@ inline std::optional<videowire::geometry::AdmittedValue> adaptGlbMeshToGeometryC
   auto& mesh=retained->geometry;
   for (const auto& primitive : asset.meshes[meshIndex].primitives) {
     const auto count=primitive.positions.size()/3, base=mesh.positions.size();
-    if (primitive.positions.size()%3!=0 || count==0 || count>4096-base
+    if (primitive.positions.size()%3!=0 || count==0 || count>kMaximumVertices-base
         || primitive.indices.empty() || primitive.indices.size()%3!=0
-        || primitive.indices.size()>12288-mesh.indices.size()
         || (!primitive.normals.empty() && primitive.normals.size()!=count*3)
         || (!primitive.texCoords0.empty() && primitive.texCoords0.size()!=count*2)
         || (!primitive.colors0.empty() && primitive.colors0.size()!=count*4)
         || (primitive.material && *primitive.material>=asset.materials.size())) {
-      error="Imported mesh exceeds 4096 vertices or 12288 indices, or has incomplete attributes";
+      error="Imported mesh has no triangles, more vertices than 32-bit indices address, or incomplete attributes";
       return std::nullopt;
     }
     if (primitive.generatedFlatNormals) {
@@ -195,7 +194,7 @@ inline std::optional<videowire::geometry::AdmittedValue> adaptGlbMeshToGeometryC
   OperationRecord operation{valueId,OperationCode::retainedMesh,sourceId,valueId,{}};
   operation.retainedMesh=std::move(retained); value.operations.push_back(std::move(operation));
   PortContract contract; contract.carrier=CarrierKind::geometry3D;
-  contract.maxVertices=4096; contract.maxIndices=12288; contract.maxAttributes=kMaximumAttributes;
+  contract.maxVertices=kMaximumVertices; contract.maxIndices=kMaximumIndices; contract.maxAttributes=kMaximumAttributes;
   contract=withAttributeContract(std::move(contract),value);
   return admitValue(std::move(value),contract,{},error);
 }

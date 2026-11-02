@@ -80,8 +80,8 @@ inline bool validOutput (arbitgpu::NativeSdfOutput output) noexcept
 inline bool admitNativeSdfTextWork (const videowire::SdfIr& geometry,
     NativeSdfRenderDimensions dimensions, NativeSdfRenderControls controls,
     arbitgpu::NativeSdfWorkReceipt& receipt, std::string& error,
-    std::uint64_t maximumRecordVisits = 100000000,
-    std::uint64_t maximumSegmentVisits = 100000000)
+    std::uint64_t maximumRecordVisits = std::numeric_limits<std::uint64_t>::max(),
+    std::uint64_t maximumSegmentVisits = std::numeric_limits<std::uint64_t>::max())
 {
     receipt = {};
     error.clear();
@@ -129,8 +129,8 @@ inline bool admitNativeSdfTextWork (const videowire::SdfIr& geometry,
 // resources; callers cannot supply their own lower work receipt.
 inline bool admitNativeSdfTextWork (const arbitgpu::NativeSdfDrawRequest& request,
     arbitgpu::NativeSdfWorkReceipt& receipt, std::string& error,
-    std::uint64_t maximumRecordVisits = 100000000,
-    std::uint64_t maximumSegmentVisits = 100000000)
+    std::uint64_t maximumRecordVisits = std::numeric_limits<std::uint64_t>::max(),
+    std::uint64_t maximumSegmentVisits = std::numeric_limits<std::uint64_t>::max())
 {
     NativeSdfRenderControls controls;
     controls.maximumSteps = request.maximumSteps;
@@ -232,9 +232,9 @@ inline bool nativeSdfRayWorkPlan (const arbitgpu::NativeSdfDrawRequest& request,
 // attachment. Caller-provided receipts and BVH average visits cannot reduce it.
 inline bool admitNativeSdfStagedTextWork (const arbitgpu::NativeSdfDrawRequest& request,
     arbitgpu::NativeSdfWorkReceipt& receipt, std::string& error,
-    std::uint64_t maximumRecordVisits = 100000000,
-    std::uint64_t maximumSegmentVisits = 100000000,
-    std::uint64_t maximumIndexNodeVisits = 100000000)
+    std::uint64_t maximumRecordVisits = std::numeric_limits<std::uint64_t>::max(),
+    std::uint64_t maximumSegmentVisits = std::numeric_limits<std::uint64_t>::max(),
+    std::uint64_t maximumIndexNodeVisits = std::numeric_limits<std::uint64_t>::max())
 {
     receipt = {};
     error.clear();

@@ -88,7 +88,8 @@ public:
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseDecodedHdrFrameForDisplay(
         const DecodedHdrFrame& frame, std::string& error);
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseLinearImageForDisplay(
-        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error);
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame,
+        colortransform::ToneMap viewTransform, std::string& error);
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseShaderFrame(
         const LayerDesc& layer, std::string& error);
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseTemporalFrame(

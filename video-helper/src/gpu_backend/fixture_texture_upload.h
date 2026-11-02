@@ -19,11 +19,8 @@ using HarmonicMIDI::grid::SceneTexelRgba8;
 using HarmonicMIDI::grid::Visual3DScene;
 static_assert (sizeof (SceneTexelRgba8) == 4, "fixture mip accounting requires RGBA8 texels");
 
-inline constexpr std::size_t kMaximumSourceTexels = Visual3DScene::kMaxTextureTexels;
-inline constexpr std::size_t kMaximumMipLevels = 16;
-// Retained RGBA8 texel payload, including every mip, role copy and fallback.
-// Native driver bookkeeping and alignment are not observable through this seam.
-inline constexpr std::size_t kMaximumTextureBytes = 16u * 1024u * 1024u;
+// A full chain over any extent an int can hold has at most 31 levels.
+inline constexpr std::size_t kMipLevelSlots = 32;
 
 struct Minification
 {
@@ -55,7 +52,7 @@ struct MipLevel
 
 struct MipLayout
 {
-    std::array<MipLevel, kMaximumMipLevels> levels {};
+    std::array<MipLevel, kMipLevelSlots> levels {};
     std::size_t levelCount = 0, bytes = 0;
 };
 
@@ -69,7 +66,8 @@ inline bool mipLayout (std::uint32_t width, std::uint32_t height,
         || width > maximumExtent || height > maximumExtent
         || width > static_cast<std::uint32_t> (std::numeric_limits<int>::max())
         || height > static_cast<std::uint32_t> (std::numeric_limits<int>::max())
-        || static_cast<std::uint64_t> (width) * height > kMaximumSourceTexels)
+        || static_cast<std::uint64_t> (width) * height
+            > std::numeric_limits<std::size_t>::max() / sizeof (SceneTexelRgba8))
         return false;
 
     MipLayout candidate;
@@ -77,7 +75,7 @@ inline bool mipLayout (std::uint32_t width, std::uint32_t height,
     {
         if (candidate.levelCount == candidate.levels.size()) return false;
         const auto bytes = static_cast<std::size_t> (width) * height * sizeof (SceneTexelRgba8);
-        if (bytes > kMaximumTextureBytes - candidate.bytes) return false;
+        if (bytes > std::numeric_limits<std::size_t>::max() - candidate.bytes) return false;
         candidate.levels[candidate.levelCount++] = { width, height, candidate.bytes, bytes };
         candidate.bytes += bytes;
         if (! sampling.mipmapped || (width == 1 && height == 1)) break;
@@ -88,34 +86,35 @@ inline bool mipLayout (std::uint32_t width, std::uint32_t height,
     return true;
 }
 
-inline bool accountBytes (const MipLayout& layout, std::size_t copies,
-                          std::size_t budget, std::size_t& total) noexcept
+// Retained RGBA8 texel payload, including every mip, role copy and fallback.
+// Native driver bookkeeping and alignment are not observable through this seam.
+inline bool accountBytes (const MipLayout& layout, std::size_t copies, std::size_t& total) noexcept
 {
-    if (layout.levelCount == 0 || layout.levelCount > kMaximumMipLevels
+    if (layout.levelCount == 0 || layout.levelCount > kMipLevelSlots
         || layout.bytes == 0 || copies == 0 || copies > 2
-        || budget == 0 || budget > kMaximumTextureBytes || total > budget
-        || layout.bytes > (budget - total) / copies)
+        || layout.bytes > (std::numeric_limits<std::size_t>::max() - total) / copies)
         return false;
     total += layout.bytes * copies;
     return true;
 }
 
-using SceneMipLayouts = std::array<MipLayout, Visual3DScene::kMaxTextures>;
+using SceneMipLayouts = std::vector<MipLayout>;
 
 // Run before any fixture GPU allocation. Aliased image ranges still consume a
 // separate upload per texture record and are charged for each retained copy.
 inline bool sceneMipLayouts (const Visual3DScene& scene, std::size_t copies,
-                             std::uint32_t maximumExtent, std::size_t budget,
+                             std::uint32_t maximumExtent,
                              std::size_t& textureBytes, SceneMipLayouts& result) noexcept
 {
-    result = {};
+    result.clear();
     if (scene.textureCount > scene.textures.size()
         || scene.textureTexelCount > scene.textureTexels.size()
-        || scene.textureTexelCount > kMaximumSourceTexels
-        || maximumExtent == 0 || copies == 0 || copies > 2
-        || budget == 0 || budget > kMaximumTextureBytes || textureBytes > budget)
+        || maximumExtent == 0 || copies == 0 || copies > 2)
         return false;
     SceneMipLayouts candidate;
+    try { candidate.resize (scene.textureCount); }
+    catch (const std::bad_alloc&) { return false; }
+    catch (const std::length_error&) { return false; }
     auto total = textureBytes;
     const auto validWrap = [] (std::uint32_t value)
     {
@@ -131,10 +130,10 @@ inline bool sceneMipLayouts (const Visual3DScene& scene, std::size_t copies,
             || source.firstTexel > scene.textureTexelCount
             || candidate[index].levels[0].bytes / sizeof (SceneTexelRgba8)
                 > scene.textureTexelCount - source.firstTexel
-            || ! accountBytes (candidate[index], copies, budget, total))
+            || ! accountBytes (candidate[index], copies, total))
             return false;
     }
-    result = candidate;
+    result = std::move (candidate);
     textureBytes = total;
     return true;
 }

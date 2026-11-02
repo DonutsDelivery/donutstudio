@@ -1,3 +1,4 @@
+#include "metal_fixed_bindings.h"
 #include "fixture_analytic_sky.h"
 #include "fixture_environment_image.h"
 #include "gpu_residency_ledger.h"
@@ -683,9 +684,9 @@ struct MetalFixtureRenderScratch final
     FixtureUniforms uniforms {};
     FixtureUniforms frameUniforms {};
     FixtureUniforms gratingUniforms {};
-    std::array<MetalFixtureInstanceGpuRecord, HarmonicMIDI::grid::Visual3DScene::kMaxObjectInstances> objectRecords {};
-    std::array<std::pair<float, std::size_t>, HarmonicMIDI::grid::Visual3DScene::kMaxObjectInstances> order {};
-    std::array<MetalFixtureInstanceGpuRecord, HarmonicMIDI::grid::Visual3DScene::kMaxObjects> instanceRecords {};
+    std::array<MetalFixtureInstanceGpuRecord, ::metalbinding::kObjectInstances> objectRecords {};
+    std::array<std::pair<float, std::size_t>, ::metalbinding::kObjectInstances> order {};
+    std::array<MetalFixtureInstanceGpuRecord, ::metalbinding::kObjects> instanceRecords {};
 };
 
 struct SceneAovUniforms
@@ -2482,7 +2483,7 @@ static_assert (sizeof (SdfGpuRecord) == 48, "Metal SDF record layout changed");
 
 struct alignas(16) SdfUniforms
 {
-    SdfGpuRecord records[arbitgpu::kNativeSdfMaximumRecords];
+    SdfGpuRecord records[arbitgpu::kMetalSdfMaximumRecords];
     float raymarch[4];
     std::uint32_t quality[4];
     std::uint32_t program[4];
@@ -3478,7 +3479,8 @@ float besselJ(int order, float argument) {
     const int magnitude = order < 0 ? -order : order;
     const float halfArgument = 0.5f * argument;
     float term = 1.0f;
-    for (int factor = 1; factor <= 8; ++factor)
+    // The third-family convolution reaches order 12.
+    for (int factor = 1; factor <= 12; ++factor)
         if (factor <= magnitude)
             term *= halfArgument / float(factor);
     float sum = term;
@@ -3486,39 +3488,64 @@ float besselJ(int order, float argument) {
         term *= -(halfArgument * halfArgument)
               / (float(seriesIndex) * float(magnitude + seriesIndex));
         sum += term;
+        // Past the peak; no later term can round into the float sum.
+        if (abs(term) <= 2.98e-8f * abs(sum))
+            break;
     }
     return sum;
 }
 
-float profileEfficiency(int profile, int signedOrder, float duty,
-                        float phase, float2 terracePhase) {
+float2 profileAmplitude(int profile, int signedOrder, float duty,
+                      float phase, float2 terracePhase) {
     if (profile == profileBinaryRectangular) {
-        if (signedOrder == 0) {
-            const float2 amplitude = float2(1.0f - duty, 0.0f) + duty * terracePhase;
-            return dot(amplitude, amplitude);
-        }
-        const float order = float(signedOrder);
-        const float aperture = sin(pi * order * duty) / (pi * order);
-        const float rotation = -pi * order * duty;
-        const float2 amplitude = aperture * complexMultiply(
-            terracePhase - float2(1.0f, 0.0f),
-            float2(cos(rotation), sin(rotation)));
-        return dot(amplitude, amplitude);
+        if (signedOrder == 0)
+            return float2(1.0f - duty, 0.0f) + duty * terracePhase;
+        float order = float(signedOrder);
+        // Measured from the groove centre, so the three families of a lattice
+        // share a centre of symmetry.
+        return sin(pi * order * duty) / (pi * order)
+            * (terracePhase - float2(1.0f, 0.0f));
     }
     if (profile == profileSinusoidal) {
-        const float amplitude = besselJ(signedOrder, 0.5f * phase);
-        return amplitude * amplitude;
+        // exp(i b cos x) = sum i^m J_m(b) exp(i m x).
+        int magnitude = signedOrder < 0 ? -signedOrder : signedOrder;
+        float bessel = besselJ(magnitude, 0.5f * phase);
+        int quarterTurns = magnitude - 4 * (magnitude / 4);
+        return quarterTurns == 0 ? float2(bessel, 0.0f)
+            : quarterTurns == 1 ? float2(0.0f, bessel)
+            : quarterTurns == 2 ? float2(-bessel, 0.0f) : float2(0.0f, -bessel);
     }
     if (profile == profileBlazedSawtooth) {
-        const float orderFrequency = -2.0f * pi * float(signedOrder);
-        const float2 ramp = complexExponentialIntegral(
-            phase / duty + orderFrequency, 0.0f, duty);
-        const float2 land = complexExponentialIntegral(orderFrequency, duty, 1.0f);
-        const float2 amplitude = ramp + land;
-        return dot(amplitude, amplitude);
+        float orderFrequency = -2.0f * pi * float(signedOrder);
+        return complexExponentialIntegral(phase / duty + orderFrequency, 0.0, duty)
+            + complexExponentialIntegral(orderFrequency, duty, 1.0f);
     }
-    return 0.0f;
+    return float2(0.0f);
 }
+
+float latticeEfficiency(int profile, int primary, int secondary,
+                        bool crossed, bool thirdFamily, float duty,
+                        float phase, float2 terracePhase) {
+    float2 first = profileAmplitude(profile, primary, duty, phase, terracePhase);
+    if (!crossed)
+        return dot(first, first);
+    if (!thirdFamily) {
+        float2 second = profileAmplitude(profile, secondary, duty, phase, terracePhase);
+        return dot(first, first) * dot(second, second);
+    }
+    // The third family's reciprocal vector is g1/d1 - g2/d2, so its order r
+    // lands on (m + r, n - r) and the amplitudes convolve. Radius 4 matches
+    // kThirdFamilyConvolutionRadius.
+    float2 sum = float2(0.0f);
+    for (int r = -4; r <= 4; ++r)
+        sum += complexMultiply(
+            complexMultiply(
+                profileAmplitude(profile, primary - r, duty, phase, terracePhase),
+                profileAmplitude(profile, secondary + r, duty, phase, terracePhase)),
+            profileAmplitude(profile, r, duty, phase, terracePhase));
+    return dot(sum, sum);
+}
+
 
 float diffractionOrderContribution(int primaryOrder,
                                    int secondaryOrder,
@@ -3532,6 +3559,9 @@ float diffractionOrderContribution(int primaryOrder,
                                    float4 localGeometry,
                                    float4 localSecondaryGeometry,
                                    constant Uniforms& u) {
+    // Slope 0 is a delta lobe, which a sampled light direction never meets.
+    if (sigma <= 0.0f)
+        return 0.0f;
     const int firstOrder = int(round(u.diffractionMicrostructure.w));
     const int lastOrder = int(u.diffractionControl.x + 0.5f);
     const int primaryMagnitude = primaryOrder < 0 ? -primaryOrder : primaryOrder;
@@ -3564,11 +3594,7 @@ float diffractionOrderContribution(int primaryOrder,
     const float phase = 2.0f * pi * u.diffractionGeometry.w
         * (incident.z + expectedOutgoingCosine) / wavelength;
     const float2 terracePhase = float2(cos(phase), sin(phase));
-    float efficiency = coherentFactor * profileEfficiency(
-        profile, primaryOrder, duty, phase, terracePhase);
-    if (crossedTwoDimensional)
-        efficiency *= profileEfficiency(
-            profile, secondaryOrder, duty, phase, terracePhase);
+    float efficiency = coherentFactor * latticeEfficiency(profile, primaryOrder, secondaryOrder, crossedTwoDimensional, u.diffractionControl.z > 0.5f, duty, phase, terracePhase);
     efficiency *= expectedOutgoingCosine / incident.z;
     return efficiency * lobe;
 }
@@ -3630,7 +3656,7 @@ float3 integrateDiffractionEnvironment(float3 outgoing, float3 tangent,
     int lastOrder = int(u.diffractionControl.x + 0.5f);
     int profile = int(u.diffractionControl.y + 0.5f);
     float duty = u.diffractionMicrostructure.x;
-    float sigma = max(2.0f * u.diffractionRoughness.y, 1.0e-4f);
+    float sigma = 2.0f * u.diffractionRoughness.y;
     float3 xyz = float3(0.0f);
     float whiteY = 0.0f;
     for (int wavelengthIndex = 0; wavelengthIndex < 8; ++wavelengthIndex) {
@@ -3659,8 +3685,7 @@ float3 integrateDiffractionEnvironment(float3 outgoing, float3 tangent,
                 float z = sqrt(max(0.0f, 1.0f - dot(xy, xy)));
                 float phase = 2.0f * pi * geometry.w * (outgoing.z + z) / wavelength;
                 float2 terrace = float2(cos(phase), sin(phase));
-                float efficiency = profileEfficiency(profile, primary, duty, phase, terrace);
-                if (crossed) efficiency *= profileEfficiency(profile, secondary, duty, phase, terrace);
+                float efficiency = latticeEfficiency(profile, primary, secondary, crossed, u.diffractionControl.z > 0.5f, duty, phase, terrace);
                 if (primary != 0 || secondary != 0) efficiency *= z / outgoing.z;
                 float height = 2.0f * pi * u.diffractionRoughness.x * (outgoing.z + z) / wavelength;
                 efficiency *= exp(-height * height);
@@ -3690,8 +3715,40 @@ float3 integrateDiffractionEnvironment(float3 outgoing, float3 tangent,
                 0.0557f * xyz.x - 0.2040f * xyz.y + 1.0570f * xyz.z);
 }
 
+// Brushed relief, the same field as Path Trace's brushedRelief (integrator_body.inl):
+// three octaves of streaks across v, turning the normal towards dP/dv.
+float streakCellHash(int cell, uint salt) {
+    uint x = uint(cell) * 2654435761u + salt * 40503u;
+    x ^= x >> 15u;
+    x *= 2246822519u;
+    x ^= x >> 13u;
+    x *= 3266489917u;
+    x ^= x >> 16u;
+    return float(x) / 4294967296.0f;
+}
+float streakCell(int k, float u, uint salt) {
+    float rate = 3.0f + floor(4.0f * streakCellHash(k, salt + 1u));
+    float along = 0.55f + 0.45f * sin(6.2831853f * (u * rate + streakCellHash(k, salt + 2u)));
+    return (2.0f * streakCellHash(k, salt) - 1.0f) * along;
+}
+float streakOctave(float2 uv, float spacing, uint salt) {
+    float position = uv.y / spacing;
+    float cell = floor(position);
+    float f = position - cell;
+    float s = f * f * (3.0f - 2.0f * f);
+    int k = int(cell);
+    return streakCell(k, uv.x, salt) * (1.0f - s) + streakCell(k + 1, uv.x, salt) * s;
+}
+float3 brushedReliefNormal(float3 normal, float3 tangent, float2 uv, float3 toView, float4 roughness) {
+    if (roughness.z <= 0.0f) return normal;
+    float relief = (streakOctave(uv, roughness.w, 1u) + 0.7f * streakOctave(uv, roughness.w * 0.5f, 11u)
+        + 0.5f * streakOctave(uv, roughness.w * 0.25f, 23u)) / 0.435f;
+    float3 tilted = normalize(normal + roughness.z * relief * cross(normal, tangent));
+    return dot(tilted, toView) > 1.0e-4f ? tilted : normal;
+}
+
 float3 evaluateDiffraction(VertexOut in, constant Uniforms& u) {
-    const float3 normal = normalize(in.worldNormal);
+    float3 normal = normalize(in.worldNormal);
     const float3 dpdx = dfdx(in.worldPosition);
     const float3 dpdy = dfdy(in.worldPosition);
     const float2 duvdx = dfdx(in.uv);
@@ -3700,6 +3757,8 @@ float3 evaluateDiffraction(VertexOut in, constant Uniforms& u) {
     if (abs(determinant) <= 1.0e-8f)
         return float3(0.0f);
     float3 tangent = normalize((dpdx * duvdy.y - dpdy * duvdx.y) / determinant);
+    const float3 toViewWorld = normalize(u.cameraTranslation.xyz - in.worldPosition);
+    normal = brushedReliefNormal(normal, tangent, in.uv, toViewWorld, u.diffractionRoughness);
     tangent = normalize(tangent - normal * dot(normal, tangent));
     float3 bitangent = normalize(cross(normal, tangent));
     if (dot(bitangent, (-dpdx * duvdy.x + dpdy * duvdx.x) / determinant) < 0.0f)
@@ -3707,7 +3766,6 @@ float3 evaluateDiffraction(VertexOut in, constant Uniforms& u) {
 
     const float3 toLightWorld = normalize(rotateQuaternion(
         u.lightRotations[0], float3(0.0f, 0.0f, 1.0f)));
-    const float3 toViewWorld = normalize(u.cameraTranslation.xyz - in.worldPosition);
     float3 incident = u.diffractionIncidentDirectionAndIntensity.xyz;
     const float3 outgoing = float3(dot(toViewWorld, tangent),
                                   dot(toViewWorld, bitangent),
@@ -4127,11 +4185,13 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
             const uint kind = u.lightKinds[lightIndex].x;
             if (kind == 2u) {
                 if (u.sky[0].w>0.5f) {
-                    if (transmission==0.0f && u.materialKind.z==0u && alpha>=1.0f)
+                    // A transmissive surface keeps its sky reflection, or nothing but a few
+                    // percent of ambient draws. The light it transmits leaves the diffuse term.
+                    if (transmission>0.0f || (u.materialKind.z==0u && alpha>=1.0f))
                         skyBase+=u.sky[0].w>1.5f
-                            ? environmentImageBase(in.baseColor*baseTexel.rgb,metallic,roughness,dielectric,
+                            ? environmentImageBase(in.baseColor*baseTexel.rgb*(1.0f-transmission),metallic,roughness,dielectric,
                                 normal,toView,u.sky[0],u.sky[1],environmentTexture)
-                            : analyticSkyBase(in.baseColor*baseTexel.rgb,metallic,roughness,dielectric,
+                            : analyticSkyBase(in.baseColor*baseTexel.rgb*(1.0f-transmission),metallic,roughness,dielectric,
                                 normal,toView,u.sky[0],u.sky[1],u.sky[2],u.sky[3],u.sky[4]);
                 } else lighting += u.lightColors[lightIndex].rgb * u.lightColors[lightIndex].a;
                 continue;
@@ -4257,7 +4317,7 @@ float spectralGratingBsdf(int band, float3 incident, float3 outgoing, float2 uv,
     const int lastOrder = int(u.diffractionControl.x + 0.5f);
     const bool crossedTwoDimensional
         = int(u.diffractionSecondaryGeometry.w + 0.5f) == 2;
-    const float sigma = max(2.0f * u.diffractionRoughness.y, 1.0e-4f);
+    const float sigma = 2.0f * u.diffractionRoughness.y;
     float4 localGeometry = u.diffractionGeometry;
     float4 localSecondaryGeometry = u.diffractionSecondaryGeometry;
     if (u.diffractionSpatialCounts.x > 0u) {
@@ -4302,14 +4362,14 @@ float spectralGratingBsdf(int band, float3 incident, float3 outgoing, float2 uv,
             const float z = sqrt(max(0.0f, 1.0f - square));
             const float phase = 2.0f * pi * localGeometry.w * (incident.z + z) / wavelength;
             const float2 terrace = float2(cos(phase), sin(phase));
-            float efficiency = profileEfficiency(profile, primary, duty, phase, terrace);
-            if (crossedTwoDimensional)
-                efficiency *= profileEfficiency(profile, secondary, duty, phase, terrace);
+            float efficiency = latticeEfficiency(profile, primary, secondary, crossedTwoDimensional, u.diffractionControl.z > 0.5f, duty, phase, terrace);
             const float height = 2.0f * pi * u.diffractionRoughness.x * (incident.z + z) / wavelength;
             efficiency *= exp(-height * height) * z / incident.z;
             const float2 delta = outgoing.xy - centre;
-            radiance += efficiency * exp(-dot(delta, delta) / (2.0f * sigma * sigma))
-                / (2.0f * pi * sigma * sigma);
+            // Slope 0 is a delta lobe, which a sampled light direction never meets.
+            if (sigma > 0.0f)
+                radiance += efficiency * exp(-dot(delta, delta) / (2.0f * sigma * sigma))
+                    / (2.0f * pi * sigma * sigma);
             efficiencySum += efficiency;
         }
     }
@@ -4340,16 +4400,22 @@ bool spectralHitValid(SpectralQueryClosestHit hit,float minimum,float maximum) {
 }
 // A nearer admitted object blocks the path. Matching endpoints retain exact
 // object, material, instance and triangle ids from the authored sample table.
-bool spectralEndpoint(SpectralQueryClosestHit hit, float distance, float4 ids,
-                      float4 metadata, float3 normal, thread bool& complete) {
-    if (hit.status != 1) { complete=false; return false; }
-    if (hit.distance < distance-1.0e-5f) return false;
-    if (hit.objectId != spectralId(ids.xy) || hit.materialId != spectralId(ids.zw)
-        || hit.instanceId != uint(metadata.x) || hit.triangleId != uint(metadata.y)
-        || abs(hit.distance-distance) > 1.0e-5f || dot(hit.outwardNormal,normal) < 1.0f-1.0e-5f) {
-        complete=false; return false;
-    }
-    return true;
+// A ray in the endpoint triangle's plane can miss it or clip a neighbour by
+// rounding. Its cosine weight is nearly zero, so it counts as unseen.
+float spectralEndpointTolerance(float3 normal, float3 direction) {
+    return 1.0e-5f/max(abs(dot(normal,direction)),0.01f);
+}
+bool spectralEndpointMatches(SpectralQueryClosestHit hit, float distance, uint object, uint material,
+                             uint instance, uint triangle, float3 normal, float3 direction, thread bool& complete) {
+    const bool grazing=abs(dot(normal,direction))<0.01f;
+    if (hit.status != 1) { complete=grazing; return false; }
+    const bool same=hit.objectId==object && hit.materialId==material
+        && hit.instanceId==instance && hit.triangleId==triangle;
+    const float allowed=spectralEndpointTolerance(normal,direction);
+    if (hit.distance < distance-(same?allowed:1.0e-5f)) { complete=true; return false; }
+    const bool matched=same && abs(hit.distance-distance)<=allowed && dot(hit.outwardNormal,normal)>=1.0f-1.0e-5f;
+    complete=matched||grazing;
+    return matched;
 }
 float spectralScatterWeight(float2 uv,constant Uniforms& u) {
     float coverage=u.diffractionSpatialCounts.y==0u ? 1.0f : as_type<float>(u.diffractionPathKindAndBounce.w);
@@ -4368,13 +4434,12 @@ float spectralScatterWeight(float2 uv,constant Uniforms& u) {
 float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Uniforms& u,
                          texture2d<float> query,texture2d<float> table,device atomic_uint* diagnostic) {
     if (!all(isfinite(u.spectralSampleControl))
-        || u.spectralSampleControl.x<1.0f || u.spectralSampleControl.x>32.0f
-        || u.spectralSampleControl.y<1.0f || u.spectralSampleControl.y>32.0f
+        || u.spectralSampleControl.x<1.0f || u.spectralSampleControl.y<1.0f
         || floor(u.spectralSampleControl.x)!=u.spectralSampleControl.x
         || floor(u.spectralSampleControl.y)!=u.spectralSampleControl.y
         || table.get_width()!=512u) return spectralFailure(diagnostic);
     int receivers=int(u.spectralSampleControl.x),gratings=int(u.spectralSampleControl.y);
-    if (receivers<1 || gratings<1 || receivers>32 || gratings>32
+    if (receivers<1 || gratings<1
         || u.spectralSampleControl.z!=8.0f || u.spectralSampleControl.w!=1.0f
         || (receivers+gratings)*8>int(table.get_width()*table.get_height())) return spectralFailure(diagnostic);
     uint object=spectralId(in.rawIdentifiers.zw),material=spectralId(in.rawIdentifiers.xy);
@@ -4408,6 +4473,7 @@ float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Unifo
         float det=ux.x*uy.y-ux.y*uy.x;
         if (!isfinite(det) || abs(det)<=1.0e-8f) return spectralFailure(diagnostic);
         tangent=normalize((dx*uy.y-dy*ux.y)/det);
+        normal=brushedReliefNormal(normal,tangent,in.uv,normalize(u.cameraTranslation.xyz-in.worldPosition),u.diffractionRoughness);
         tangent=normalize(tangent-normal*dot(normal,tangent));
         bitangent=normalize(cross(normal,tangent));
         if (dot(bitangent,(-dx*uy.x+dy*ux.x)/det)<0.0f) bitangent=-bitangent;
@@ -4435,20 +4501,19 @@ float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Unifo
         if (!isfinite(distance) || distance<=2.0f*minimum || distance+minimum>maximum
             || !all(isfinite(sampleNormal)) || !isfinite(sample.w) || sample.w<=0.0f) return spectralFailure(diagnostic);
         float3 direction=delta/distance;
-        SpectralQueryClosestHit forward=spectralQuerySceneClosestHit(in.worldPosition,direction,minimum,distance+minimum,u.spectralQueryControl,query);
-        SpectralQueryClosestHit backward=spectralQuerySceneClosestHit(sample.xyz,-direction,minimum,distance+minimum,u.spectralQueryControl,query);
+        const float forwardLimit=min(maximum,distance+spectralEndpointTolerance(sampleNormal,direction));
+        const float backwardLimit=min(maximum,distance+spectralEndpointTolerance(normal,direction));
+        SpectralQueryClosestHit forward=spectralQuerySceneClosestHit(in.worldPosition,direction,minimum,forwardLimit,u.spectralQueryControl,query);
+        SpectralQueryClosestHit backward=spectralQuerySceneClosestHit(sample.xyz,-direction,minimum,backwardLimit,u.spectralQueryControl,query);
         SpectralQueryClosestHit illumination=spectralQuerySceneClosestHit(sample.xyz,light,minimum,maximum,u.spectralQueryControl,query);
-        if (!spectralHitValid(forward,minimum,distance+minimum) || !spectralHitValid(backward,minimum,distance+minimum)
+        if (!spectralHitValid(forward,minimum,forwardLimit) || !spectralHitValid(backward,minimum,backwardLimit)
             || !spectralHitValid(illumination,minimum,maximum)) return spectralFailure(diagnostic);
         bool complete=true;
-        bool visible=spectralEndpoint(forward,distance,ids,metadata,sampleNormal,complete);
-        if (!complete || backward.status!=1) return spectralFailure(diagnostic);
-        if (backward.distance>=distance-minimum) {
-            if (backward.objectId!=object || backward.materialId!=material
-                || backward.instanceId!=in.spectralInstance || backward.triangleId!=triangle
-                || abs(backward.distance-distance)>minimum
-                || dot(backward.outwardNormal,normal)<1.0f-1.0e-5f) return spectralFailure(diagnostic);
-        } else visible=false;
+        bool visible=spectralEndpointMatches(forward,distance,spectralId(ids.xy),spectralId(ids.zw),
+            uint(metadata.x),uint(metadata.y),sampleNormal,direction,complete);
+        if (!complete) return spectralFailure(diagnostic);
+        visible=spectralEndpointMatches(backward,distance,object,material,in.spectralInstance,triangle,normal,direction,complete)&&visible;
+        if (!complete) return spectralFailure(diagnostic);
         float ownCosine=max(dot(normal,direction),0.0f),sampleCosine=max(dot(sampleNormal,-direction),0.0f);
         float sampleLight=illumination.status==0 ? max(dot(sampleNormal,light),0.0f) : 0.0f;
         if (!visible || ownCosine==0.0f || sampleCosine==0.0f || sampleLight==0.0f) continue;
@@ -5897,6 +5962,16 @@ public:
                 ? "Metal native SDF program admission failed" : std::move (programError);
             return result;
         }
+        if (compiledProgram->records().size() > kMetalSdfMaximumRecords)
+        {
+            result.error = "Metal native SDF uniform table holds 64 records";
+            return result;
+        }
+        if (compiledProgram->expandedEvaluationSteps() > kMetalSdfMaximumEvaluationSteps)
+        {
+            result.error = "Metal native SDF interpreter runs 256 expanded records per query";
+            return result;
+        }
         const auto cpuBytes = compiledProgram->storageBytes();
         if ((request.geometryCacheBytes != 0 && request.geometryCacheBytes < cpuBytes)
             || request.geometryCacheBytes > renderpassoutput::kMaximumTotalBytes)
@@ -6402,7 +6477,7 @@ private:
             NativeSdfOutput::softShadow)] = true;
         result.supportedOutputs[static_cast<std::size_t> (
             NativeSdfOutput::edgeDistance)] = true;
-        result.maxOperations = kNativeSdfMaximumRecords;
+        result.maxOperations = kMetalSdfMaximumRecords;
         result.maxDepth = kNativeSdfMaximumDepth;
         result.maxExtent = static_cast<std::uint32_t> (
             std::min (nativeLimits.max_image_size_2d, 4096));
@@ -6472,7 +6547,7 @@ kernel void selectedTransport(constant Uniforms& u [[buffer(0)]],device const Se
     uint volume=uint(u.glassTransport.z)|(uint(u.glassTransport.w)<<16u);
     if(selection.state.x==1 && selection.ids.x==volume) {
         GlassClosestHit first;first.status=selection.state.x;first.distance=selection.position.w;
-        first.position=selection.position.xyz;first.outwardNormal=selection.normal.xyz;first.entering=selection.normal.w==1.0f;
+        first.position=selection.position.xyz;first.outwardNormal=selection.normal.xyz;first.shadingNormal=selection.normal.xyz;first.entering=selection.normal.w==1.0f;
         first.objectId=selection.ids.x;first.materialId=selection.ids.y;first.instanceId=selection.ids.z;first.triangleId=selection.ids.w;
         float3 terminal,masked,tail;int status,queries,events;
         atomic_fetch_add_explicit(executed+index*4+1,1u,memory_order_relaxed);
@@ -6647,7 +6722,7 @@ bool metalSelectedRoughRange(const std::vector<MetalSelectedRoughCamera::Selecti
     using namespace arbitgpu;
     end=begin;
     if(completedWork>smoothglass::kMaximumCameraMicroWork) {
-        error="Metal selected camera whole-frame executed work exceeds its bound";return false;
+        error="Metal selected camera tile executed work exceeds its bound";return false;
     }
     const auto reserve=(smoothglass::kMaximumCameraMicroWork-completedWork)/smoothglass::kMaximumCameraPixelMicroWork;
     std::uint64_t starts=0;
@@ -6657,7 +6732,7 @@ bool metalSelectedRoughRange(const std::vector<MetalSelectedRoughCamera::Selecti
         starts+=glass?1u:0u;++end;
     }
     if(end==begin) {
-        error="Metal selected camera whole-frame work reserve exhausted before transport";return false;
+        error="Metal selected camera tile work reserve exhausted before transport";return false;
     }
     return true;
 }
@@ -6745,7 +6820,7 @@ bool dispatchMetalSelectedRoughCamera(MetalFixtureSceneFrame& frame,const arbitg
                 ||work.events>smoothglass::kMaximumCameraMicroEvents
                 ||(glass&&(result.color[3]!=smoothglass::kMultipleScatterCameraComplete||work.queries!=result.masked[3]||work.events!=result.tail[3]))
                 ||(!glass&&(work.queries!=1||work.events!=0))) {
-                error="Metal selected camera native invocation did not complete within its work reserve";return false;
+                error="Metal "+smoothglass::selectedCameraFailure(glass?result.color[3]:0.0f);return false;
             }
             const auto charge=std::uint64_t(work.events)*smoothglass::kCameraMicroWorkPerEvent;
             if(charge>smoothglass::kMaximumCameraMicroWork-completedWork) {
@@ -8108,17 +8183,17 @@ public:
             videowire::geometry::CarrierKind::geometry3D))
             | (1u << static_cast<unsigned> (
                 videowire::geometry::CarrierKind::instances3D));
-        capabilities.maxVertices = HarmonicMIDI::grid::Visual3DScene::kMaxVertices;
-        capabilities.maxIndices = HarmonicMIDI::grid::Visual3DScene::kMaxIndices;
+        capabilities.maxVertices = videowire::geometry::kMaximumVertices;
+        capabilities.maxIndices = videowire::geometry::kMaximumIndices;
         capabilities.maxPoints = 1;
         capabilities.maxCurvePoints = 1;
         capabilities.maxSplines = 1;
-        capabilities.maxInstances = HarmonicMIDI::grid::Visual3DScene::kMaxObjects;
-        capabilities.maxFieldElements = HarmonicMIDI::grid::Visual3DScene::kMaxVertices;
+        capabilities.maxInstances = videowire::geometry::kMaximumInstances;
+        capabilities.maxFieldElements = videowire::geometry::kMaximumFieldElements;
         capabilities.maxAttributes = videowire::geometry::kMaximumAttributes;
         capabilities.maxOperations = videowire::geometry::kMaximumOperations;
         capabilities.maxDispatches = videowire::geometry::kMaximumDispatches;
-        capabilities.maxBufferBytes = 64u * 1024u * 1024u;
+        capabilities.maxBufferBytes = videowire::geometry::kMaximumBufferBytes;
         return capabilities;
     }
 
@@ -8177,14 +8252,15 @@ public:
         const auto materialProgram = snapshotNativeSurfaceProgram(requestedMaterialProgram);
         if (scene == nullptr || ! validateVisual3DScene (*scene).valid()
             || scene->objectCount == 0 || scene->materialCount == 0
-            || scene->lightCount > Visual3DScene::kMaxLights
-            || scene->cameraCount == 0 || scene->cameraCount > Visual3DScene::kMaxCameras
+            || scene->cameraCount == 0
             || visual3d_detail::findById (scene->cameras, scene->cameraCount,
                                           scene->activeCamera) == nullptr)
         {
             result.error = "Metal fixture preparation requires a bounded renderable scene";
             return result;
         }
+        if (! ::metalbinding::sceneIsBound (*scene, result.error))
+            return result;
         const auto& sceneMaterial = scene->materials[0];
         const auto& firstObject = scene->objects[0];
         if (frameAttributes && (!geometryAdmission
@@ -8307,8 +8383,8 @@ public:
                 return result;
             if (scene == nullptr || ! validateVisual3DScene (*scene).valid()
                 || scene->objectCount == 0 || scene->materialCount == 0
-                || scene->lightCount > Visual3DScene::kMaxLights
-                || scene->cameraCount == 0 || scene->cameraCount > Visual3DScene::kMaxCameras
+                || scene->lightCount > ::metalbinding::kLights
+                || scene->cameraCount == 0 || scene->cameraCount > ::metalbinding::kCameras
                 || visual3d_detail::findById (scene->cameras, scene->cameraCount,
                                               scene->activeCamera) == nullptr)
             {
@@ -8329,8 +8405,8 @@ public:
                 result.error = "Metal fixture preparation requires an exact bounded material binding";
                 return result;
             }
-            static_assert (fixturetexture::kMaximumMipLevels <= SG_MAX_MIPMAPS,
-                           "fixture mip layout exceeds Sokol image data capacity");
+            // The Metal guard holds texture axes to 8192, fourteen levels, inside SG_MAX_MIPMAPS.
+            static_assert (::metalbinding::kTextureDimension <= (std::size_t(1) << 15) && SG_MAX_MIPMAPS >= 16);
             const auto maximumTextureExtent = sg_query_limits().max_image_size_2d;
             const auto linearFormat = sg_query_pixelformat (SG_PIXELFORMAT_RGBA8);
             const auto colorFormat = sg_query_pixelformat (SG_PIXELFORMAT_SRGB8A8);
@@ -8371,13 +8447,11 @@ public:
             }
             std::size_t textureBytes = 0;
             fixturetexture::SceneMipLayouts textureLayouts;
-            if (! fixturetexture::accountBytes (fallbackLayout, 1,
-                    fixturetexture::kMaximumTextureBytes, textureBytes)
+            if (! fixturetexture::accountBytes (fallbackLayout, 1, textureBytes)
                 || ! fixturetexture::sceneMipLayouts (*scene, 2,
-                    static_cast<std::uint32_t> (maximumTextureExtent),
-                    fixturetexture::kMaximumTextureBytes, textureBytes, textureLayouts))
+                    static_cast<std::uint32_t> (maximumTextureExtent), textureBytes, textureLayouts))
             {
-                result.error = "Metal fixture texture bounds, sampler settings or allocation budget are invalid";
+                result.error = "Metal fixture texture bounds or sampler settings are invalid, or their host allocation failed";
                 return result;
             }
             auto resources = std::make_shared<MetalFixtureSceneResources>();
@@ -8431,7 +8505,7 @@ public:
 
             sg_buffer_desc instanceDesc = {};
             instanceDesc.size = (scene->instancedObject.isValid()
-                    ? Visual3DScene::kMaxObjectInstances : Visual3DScene::kMaxObjects)
+                    ? ::metalbinding::kObjectInstances : ::metalbinding::kObjects)
                 * sizeof (MetalFixtureInstanceGpuRecord);
             instanceDesc.usage.vertex_buffer = true;
             instanceDesc.usage.dynamic_update = true;
@@ -8538,8 +8612,6 @@ public:
                     resources->smoothGlass.enabled ? &resources->smoothGlass : nullptr)) return fail(result.error);
             if (environment.resident)
             {
-                if (std::any_of(resources->instanceAppearances.begin(),resources->instanceAppearances.end(),
-                    [](const auto& a){return a.color[3]<1;})) return fail("HDR environment requires opaque instance appearance");
                 const auto& metadata=environment.resident->image.metadata;
                 if (metadata.width>static_cast<std::uint32_t>(maximumTextureExtent)
                     || metadata.height>static_cast<std::uint32_t>(maximumTextureExtent))
@@ -8548,6 +8620,9 @@ public:
                 sg_image_desc desc={}; desc.width=metadata.width; desc.height=metadata.height;
                 desc.pixel_format=SG_PIXELFORMAT_RGBA32F; desc.usage.immutable=true;
                 desc.data.mip_levels[0]={environment.texels.data(),environment.texels.size()*sizeof(environment.texels[0])};
+                desc.num_mipmaps=int(environment.mips.size())+1;
+                for (std::size_t mip=0;mip<environment.mips.size();++mip)
+                    desc.data.mip_levels[mip+1]={environment.mips[mip].data(),environment.mips[mip].size()*sizeof(environment.mips[mip][0])};
                 desc.label="arbit-metal-linear-hdr-environment";
                 resources->environmentTexture=sg_make_image(&desc);
                 if (!resourceValid(sg_query_image_state(resources->environmentTexture)))
@@ -8556,6 +8631,7 @@ public:
                 resources->environmentView=sg_make_view(&view);
                 if (!resourceValid(sg_query_view_state(resources->environmentView))) return fail("HDR environment native Metal view failed");
                 std::vector<std::array<float,4>>().swap(environment.texels);
+                environment.mips.clear();
             }
             if (!opaquevisibility::prepareScene(*scene,materialProgram.get(),resources->instanceAppearances,
                     resources->opaqueVisibility,result.error,opaquevisibility::AdmissionMode::opaqueOnly,
@@ -9315,7 +9391,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                         &&charge(query.meshes.capacity(),sizeof(opaquevisibility::Mesh));
                 };
                 if(!charge(resources->permanentBytes,1)
-                    ||!charge(Visual3DScene::kMaxObjects,sizeof(MetalFixtureInstanceGpuRecord)*SG_NUM_INFLIGHT_FRAMES)
+                    ||!charge(::metalbinding::kObjects,sizeof(MetalFixtureInstanceGpuRecord)*SG_NUM_INFLIGHT_FRAMES)
                     ||!charge(opaqueBudget.texels.capacity(),sizeof(opaquevisibility::Texel)*3)
                     ||!charge(glassBudget.texels.capacity(),sizeof(opaquevisibility::Texel)*3)
                     ||!queryHost(resources->opaqueVisibility)||!queryHost(resources->smoothGlass.query)
@@ -9686,8 +9762,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 std::copy (pbr.emissionRoughness.begin(), pbr.emissionRoughness.begin() + 3,
                            uniforms.emissive);
             }
-            for (std::size_t channel = 0; channel < 3; ++channel)
-                uniforms.emissive[channel] *= runtimeInputs.emissionGain;
+            arbitgpu::analyticsky::clipRasterRadiance (uniforms.emissive, runtimeInputs.emissionGain);
             std::string lightTargetError;
             if (!validNativeImportedLightOverrideTargets (*scene, runtimeInputs, lightTargetError))
                 return fail (lightTargetError);
@@ -9695,12 +9770,19 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 : effectiveNativeLightCount (*scene, runtimeInputs);
             storeVec3 (uniforms.ambient, scene->ambientColor,
                        static_cast<float> (lightCount));
+            arbitgpu::analyticsky::clipRasterRadiance (uniforms.ambient);
+            // A camera-hidden environment still lights and reflects; only the backdrop is skipped.
+            // The skipped pixels are opaque black, as Path Trace sees no world on a camera ray.
+            bool skyCameraVisible = true;
             for (std::size_t lightIndex = 0; lightIndex < lightCount; ++lightIndex)
             {
                 // Overrides apply here, once, to the record each light index reads.
                 const auto light = effectiveNativeLightRecord (*scene, runtimeInputs, lightIndex);
+                if (light.kind == SceneLightKind::Environment && !light.environmentCameraVisible)
+                    skyCameraVisible = false;
                 storeQuaternion (uniforms.lightRotations[lightIndex], light.transform.rotation);
                 storeVec3 (uniforms.lightColors[lightIndex], light.color, light.intensity);
+                arbitgpu::analyticsky::clipRasterLight (uniforms.lightColors[lightIndex]);
                 storeVec3 (uniforms.lightPositions[lightIndex], light.transform.translation,
                            light.range);
                 uniforms.lightCones[lightIndex][0] = std::cos (light.innerConeAngle);
@@ -9805,8 +9887,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                         resources->diagnosticInstanceIdentityColors ? 1.0f : 0.0f };
                     instanceRecords[index].color=resources->instanceAppearances[index].color;
                     instanceRecords[index].emission=resources->instanceAppearances[index].emission;
-                    for (std::size_t channel=0;channel<3;++channel)
-                        instanceRecords[index].emission[channel]*=runtimeInputs.emissionGain;
+                    arbitgpu::analyticsky::clipRasterRadiance(instanceRecords[index].emission.data(),runtimeInputs.emissionGain);
                 }
                 const sg_range instanceRange = { instanceRecords.data(),
                     scene->objectCount * sizeof (MetalFixtureInstanceGpuRecord) };
@@ -9878,9 +9959,9 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             frame->glassImageCharge = arbitgpu::residency::ResidencyCharge (
                 arbitgpu::residency::BackingClass::fixtureScene, metalImageBytes (glassImage));
             std::copy(glassFrame.control.begin(),glassFrame.control.end(),uniforms.glassControl);
-            uniforms.glassReceivers=resources->smoothGlass.receivers;
-            uniforms.glassEmission=resources->smoothGlass.emission;
-            for (auto& emission : uniforms.glassEmission) for (std::size_t channel=0; channel<3; ++channel) emission[channel]*=runtimeInputs.emissionGain;
+            std::copy_n(resources->smoothGlass.receivers.begin(),std::min(resources->smoothGlass.receivers.size(),uniforms.glassReceivers.size()),uniforms.glassReceivers.begin());
+            std::copy_n(resources->smoothGlass.emission.begin(),std::min(resources->smoothGlass.emission.size(),uniforms.glassEmission.size()),uniforms.glassEmission.begin());
+            for (auto& emission : uniforms.glassEmission) arbitgpu::analyticsky::clipRasterRadiance(emission.data(),runtimeInputs.emissionGain);
             result.stats.smoothGlassTransportApplied=resources->smoothGlass.enabled;
             result.stats.smoothGlassQueryBytes=resources->smoothGlass.enabled ? glassFrame.texels.size()*sizeof(opaquevisibility::Texel) : 0;
 
@@ -9948,6 +10029,11 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                     smoothglass::displayEncode(10.0f / 255.0f), smoothglass::displayEncode(18.0f / 255.0f), 1.0f };
             if (runtimeInputs.imageOutput != renderpassoutput::Output::Color || runtimeInputs.passComposite)
                 pass.action.colors[0].clear_value = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const bool cameraHiddenBackdrop = !skyCameraVisible
+                && runtimeInputs.imageOutput == renderpassoutput::Output::Color
+                && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage);
+            if (cameraHiddenBackdrop)
+                pass.action.colors[0].clear_value = { 0.0f, 0.0f, 0.0f, 1.0f };
             if (runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage)
             {
                 const auto clear = renderpasscomposite::inspectionClear(*runtimeInputs.passComposite);
@@ -10005,7 +10091,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             bindings.views[7] = resources->environmentView.id ? resources->environmentView : frame->opaqueView;
             bindings.views[8] = frame->spectralQueryView.id ? frame->spectralQueryView : frame->opaqueView;
             bindings.views[9] = frame->spectralSampleView.id ? frame->spectralSampleView : frame->opaqueView;
-            if (uniforms.sky[0][3]>0.5f && !diffractionDraw
+            if (uniforms.sky[0][3]>0.5f && skyCameraVisible && !diffractionDraw
                 && runtimeInputs.imageOutput==renderpassoutput::Output::Color
                 && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage))
             {
@@ -10036,6 +10122,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                 if (diffractionDraw) {
                     uniforms.passProgram.control = {0.0f, 0.0f, 1.0f, 0.0f};
                     storeVec3(uniforms.ambient, scene->ambientColor, static_cast<float>(lightCount));
+                    arbitgpu::analyticsky::clipRasterRadiance(uniforms.ambient);
                 }
 
                 const auto textureSlot = [&] (SceneTextureId id, bool srgb)
@@ -10160,8 +10247,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                             if (appearance.metallic>=0) uniforms.materialParams[0]=appearance.metallic;
                             if (appearance.roughness>=0) uniforms.materialParams[1]=appearance.roughness;
                         }
-                        for (std::size_t channel = 0; channel < 3; ++channel)
-                            uniforms.emissive[channel] *= runtimeInputs.emissionGain;
+                        arbitgpu::analyticsky::clipRasterRadiance (uniforms.emissive, runtimeInputs.emissionGain);
                     }
                     std::array<SceneTextureId, 5> textureIds {
                         drawMaterial != nullptr ? drawMaterial->baseColorTexture : SceneTextureId {},
@@ -10447,7 +10533,7 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
             if(selectedRough) {
                 if(!tile || roughDraws.size()!=1) return fail("Metal selected camera requires one exact volume draw owner");
                 if(!frame->selectedRough && !prepareMetalSelectedRoughCamera(*frame,result.error)) return fail(result.error);
-                if(!dispatchMetalSelectedRoughCamera(*frame,*tile,roughDraws.front().uniforms,tileCompletion.aggregate().microWork,result.error)
+                if(!dispatchMetalSelectedRoughCamera(*frame,*tile,roughDraws.front().uniforms,0,result.error)
                     ||!resolveMetalSelectedRoughCamera(*frame,*tile,roughDraws.front().uniforms,result.error))return fail(result.error);
             }
             if (roughReceiptBytes && !selectedRough) {
@@ -10670,7 +10756,7 @@ public:
         NativeDeformationPreparation result;
         if (source->compositionOwner && !source->compositionOwner->matches(*source))
         { result.error = "native Metal composition batch has a foreign owner"; return result; }
-        if (source->draws.size() > HarmonicMIDI::grid::Visual3DScene::kMaxObjects)
+        if (source->draws.size() > ::metalbinding::kObjects)
         { result.error = "native Metal deformation draw capacity exceeded"; return result; }
         MetalFixtureSceneBackend fixtureBackend;
         const auto fixture = fixtureBackend.prepare(source->scene, materialProgram);
@@ -12098,11 +12184,10 @@ bool metalSelectedRoughBudgetGuardForFixture(const std::shared_ptr<const NativeF
     const auto begin=std::size_t(first-state.selections.begin());std::size_t end=begin;
     std::string refused;
     const auto ceiling=smoothglass::kMaximumCameraMicroWork,cost=smoothglass::kMaximumCameraPixelMicroWork;
-    // Less than one worst-case invocation left, including a subsequent tile
-    // after the whole frame reaches its ceiling, must refuse before dispatch.
+    // Less than one worst-case invocation left in a tile must refuse before dispatch.
     for(const auto completed:{ceiling-cost+1,ceiling,ceiling+1}) {
         if(metalSelectedRoughRange(state.selections,volume,begin,completed,end,refused)||end!=begin
-            ||refused.find("Metal selected camera whole-frame")!=0) {
+            ||refused.find("Metal selected camera tile")!=0) {
             error="Metal selected budget admitted transport without its full remaining work reserve";return false;
         }
     }
@@ -12295,7 +12380,7 @@ static bool stageMetalGlassGratingFrameBound(const std::shared_ptr<const NativeF
     if(!metalRasterCaptureBudget(*resources,schedule,runtime,1,rasterDraws,rasterCaptureBudget,error))return false;
     // Re-admission/binding copies retain fixed Scene arrays and owned texture
     // payloads. Reserve their bounded copies before native allocation.
-    const auto scenePayload=sizeof(Visual3DScene)+Visual3DScene::kMaxTextureTexels*sizeof(SceneTexelRgba8);
+    const auto scenePayload=sizeof(Visual3DScene)+::metalbinding::kTextureTexels*sizeof(SceneTexelRgba8);
     std::uint64_t host=rasterCaptureBudget.host+8*scenePayload+128*1024+sizeof(MetalFixtureSceneResources)+sizeof(MetalFixtureSceneFrame)
         +sizeof(MetalCausticState)+sizeof(NativeFixtureSceneRuntimeInputs)+scene.objectCount*(sizeof(FixtureUniforms)+sizeof(sg_bindings))
         +(resources->opaqueVisibility.texels.capacity()+4*resources->smoothGlass.query.texels.capacity())*16
@@ -14163,7 +14248,7 @@ static bool metalDirectCohortStageBytes(const MetalFixtureSceneFrame& frame,
     const auto& resources=*frame.staticResources;const auto& state=*frame.caustic;const auto& schedule=state.schedule;
     const auto& binding=*state.cameraBinding;const auto& scene=*resources.snapshot;
     if(!inspectMetalRasterCaptureUnlocked(frame,error))return false;
-    const auto scenePayload=sizeof(Visual3DScene)+Visual3DScene::kMaxTextureTexels*sizeof(HarmonicMIDI::grid::SceneTexelRgba8);
+    const auto scenePayload=sizeof(Visual3DScene)+::metalbinding::kTextureTexels*sizeof(HarmonicMIDI::grid::SceneTexelRgba8);
     const auto paddedQuery=std::uint64_t(opaquevisibility::kTextureWidth)*schedule.query.height*16;
     std::uint64_t host=state.rasterCapture->hostReservation+8*scenePayload+128*1024+sizeof(MetalFixtureSceneResources)+sizeof(MetalFixtureSceneFrame)
         +sizeof(MetalCausticState)+sizeof(NativeFixtureSceneRuntimeInputs)+scene.objectCount*(sizeof(FixtureUniforms)+sizeof(sg_bindings))
@@ -14876,7 +14961,7 @@ static bool metalCameraCoverageCosts(const MetalFixtureSceneFrame& frame,
     // Fixed setup is finite even without a Pixel. The existing submission
     // journal bounds admitted begins. Repeated diagnostics use actual counters
     // on their immutable batch and the existing raster manifest receipt.
-    constexpr auto passes=32ull*(kMaximumEntrySamples+1)*(HarmonicMIDI::grid::Visual3DScene::kMaxLights+1);
+    constexpr auto passes=32ull*(kMaximumEntrySamples+1)*(::metalbinding::kLights+1);
     if(!mul(renderpassoutput::kMaximumTotalBytes/4,passes,w[7])
         ||!mul(t,frozen.query.texels.size(),w[9])||!mul(w[9],32,w[9])
         ||!add(w[7],w[9])||!add(w[7],16*metalCameraCoverageSourceLimit/4)
@@ -15053,7 +15138,7 @@ static bool metalCameraRangeCosts(const MetalFixtureSceneFrame& frame,
     std::uint64_t data=0,extra=0;
     if(!mul(p,kCameraRangeRequestWords+kCameraRangeResultWords,data)||!mul(data,4*32,extra)||!add(w[7],extra)
         ||!mul(data,4*8,extra)||!add(w[8],extra))return false;
-    constexpr auto phases=32ull*(glasscaustics::kMaximumEntrySamples+1)*(HarmonicMIDI::grid::Visual3DScene::kMaxLights+1);
+    constexpr auto phases=32ull*(glasscaustics::kMaximumEntrySamples+1)*(::metalbinding::kLights+1);
     if(!mul(renderpassoutput::kMaximumTotalBytes/4,phases,w[9])||!mul(w[9],8,w[9])
         ||!mul(frozen.triangles.size(),frozen.query.texels.size(),extra)||!mul(extra,32*8,extra)||!add(w[9],extra)
         ||!mul(w[9],64,extra)||!add(w[6],extra)||!add(w[5],w[9]))return false;
@@ -15285,7 +15370,7 @@ static bool metalFiniteSourceCosts(const MetalFixtureSceneFrame& frame,std::arra
     // A later inspector receives the same host envelope BEFORE those calls.
     if(!metalCameraCoverageFixedByteCosts(w[11],w[12])||!mul(w[11],8,w[11])||!mul(w[12],8,w[12])
         ||!mul(wire,32*4,extra)||!add(w[11],extra)||!mul(wire,8*4,extra)||!add(w[12],extra))return false;
-    constexpr auto phases=32ull*(glasscaustics::kMaximumEntrySamples+1)*(HarmonicMIDI::grid::Visual3DScene::kMaxLights+1);
+    constexpr auto phases=32ull*(glasscaustics::kMaximumEntrySamples+1)*(::metalbinding::kLights+1);
     if(!mul(renderpassoutput::kMaximumTotalBytes/4,phases,w[9])||!mul(w[9],8,w[9])
         ||!mul(t,frozen.query.texels.size(),extra)||!mul(extra,32*8,extra)||!add(w[9],extra)
         ||!add(w[6],w[9])||!mul(w[9],64,extra)||!add(w[7],extra)||!add(w[7],w[8]))return false;
@@ -15770,7 +15855,7 @@ static bool metalCameraCoverageFixedByteCosts(std::uint64_t& copies,std::uint64_
     // opaque compiler/driver storage is outside this application byte journal.
     constexpr std::uint64_t sourceConstructionSteps=128;
     constexpr std::uint64_t setupBytePhases=256ull*(glasscaustics::kMaximumEntrySamples+1)
-        *(HarmonicMIDI::grid::Visual3DScene::kMaxLights+1);
+        *(::metalbinding::kLights+1);
     constexpr std::uint64_t sourcePhases=4;
     std::uint64_t sourceCopies=0,sourceTransfers=0,setup=0,localCopies=0;
     if(!mul(renderpassoutput::kMaximumTotalBytes,setupBytePhases,setup)
@@ -16356,7 +16441,7 @@ static bool metalFiniteReceiverCosts(const MetalFixtureSceneFrame& frame,std::ar
     // owner cover query, BVH, historical archive, material, trace and ledger
     // comparisons. The 2048x2048 identifier scan is separate from word moves.
     constexpr std::uint64_t cap=glasscaustics::kMaximumEntrySamples;
-    constexpr std::uint64_t lights=HarmonicMIDI::grid::Visual3DScene::kMaxLights;
+    constexpr std::uint64_t lights=::metalbinding::kLights;
     std::uint64_t extra=0;
     if(!mul(renderpassoutput::kMaximumTotalBytes/4,32*(cap+1)*(lights+1),w[9])
         ||!mul(t,frozen.query.texels.size(),extra)||!mul(extra,256,extra)||!add(w[9],extra)
@@ -17790,14 +17875,14 @@ constexpr std::array<MTLPixelFormat,9> completeBaseNativeFormats{MTLPixelFormatR
 static std::uint64_t completeBaseQueryLimit(const MetalFixtureSceneFrame& f) {
     using namespace surfacesource;const auto& prepared=f.staticResources->opaqueVisibility;
     const auto count=f.caustic->schedule.instances.size();
-    if(count>opaquevisibility::kMaximumInstances)throw std::length_error("Complete base opaque instance census exceeds released bound");
+    if(count>::metalbinding::kQueryInstances)throw std::length_error("Complete base opaque instance census exceeds released bound");
     // Four inverse-matrix texels per instance, at most2n-1 two-texel TLAS
     // nodes, and one all-surfaces work record. The prepared BLAS and optional
     // identities precede that tail. Padding occupies complete1024-texel rows.
     auto texels=add(prepared.texels.size(),prepared.mode==opaquevisibility::AdmissionMode::allSurfaces?prepared.identities.size():0);
     texels=add(texels,add(multiply(8,count),1));
     texels=multiply(add(texels,opaquevisibility::kTextureWidth-1)/opaquevisibility::kTextureWidth,opaquevisibility::kTextureWidth);
-    if(texels>opaquevisibility::kTextureWidth*opaquevisibility::kTextureHeight)throw std::length_error("Complete base opaque padded census exceeds released bound");
+    if(texels>::metalbinding::kQueryTexels)throw std::length_error("Complete base opaque padded census exceeds released bound");
     return multiply(texels,sizeof(opaquevisibility::Texel));
 }
 static bool completeBaseBudget(std::uint64_t nativeAttachments,std::uint64_t rings,std::uint64_t geometry,
@@ -17917,7 +18002,8 @@ static bool completeBaseUniforms(const MetalFixtureSceneFrame& f,const MetalPriv
     std::memcpy(&u.materialKind[3],&material->alphaCutoff,sizeof(float));
     u.passProgram.control={0,0,1,0};u.imageOutput[0]=float(renderpassoutput::Output::Color);
     u.ambient[3]=1;storeQuaternion(u.lightRotations[0],light.transform.rotation);
-    storeVec3(u.lightColors[0],light.color,light.intensity);storeVec3(u.lightPositions[0],light.transform.translation,light.range);
+    storeVec3(u.lightColors[0],light.color,light.intensity);arbitgpu::analyticsky::clipRasterLight(u.lightColors[0]);
+    storeVec3(u.lightPositions[0],light.transform.translation,light.range);
     u.lightCones[0][0]=std::cos(light.innerConeAngle);u.lightCones[0][1]=std::cos(light.outerConeAngle);
     u.lightKinds[0][0]=std::uint32_t(light.kind);
     for(std::size_t i=0;i<scene.objectCount;++i){const auto& o=scene.objects[i];
@@ -21979,6 +22065,9 @@ struct MetalDrawShapeParams
     // colorB is the end colour; color is the start colour.
     float colorB[4];
     float gradient[4];
+    // Canvas in the pass's buffer UV: minU, minV, maxU, maxV. RawUV spans the whole
+    // buffer, so the shape and the gradient are mapped through it, as on OpenGL.
+    float canvasRect[4];
 };
 
 enum MetalFxValue
@@ -22023,7 +22112,7 @@ static_assert (sizeof (MetalUvEffectParams) == 32, "Metal UV effect uniforms cha
 static_assert (sizeof (MetalFeedbackParams) == 16, "Metal feedback uniforms changed");
 static_assert (sizeof (MetalPostParams) == 16, "Metal post uniforms changed");
 static_assert (sizeof (MetalCanvasParams) == 32, "Metal canvas uniforms changed");
-static_assert (sizeof (MetalDrawShapeParams) == 96, "Metal draw-shape uniforms changed");
+static_assert (sizeof (MetalDrawShapeParams) == 112, "Metal draw-shape uniforms changed");
 static_assert (sizeof (MetalEffectParams) == 208, "Metal effect uniforms changed");
 
 const char* kMetalLayerVertex = R"metal(
@@ -22440,6 +22529,31 @@ float3 encodeTransfer(float3 value, int transfer, float outputReferenceWhite)
     return select(a * log(12.0f * value - b) + c,
                   sqrt(3.0f * value), low);
 }
+// AgX. shared/AgxViewTransform.h has the sources and the scalar twin.
+static float3 agxViewTransform(float3 radiance)
+{
+    const float3x3 toRec2020(float3(0.6274039f, 0.0690973f, 0.0163914f),
+                             float3(0.3292830f, 0.9195404f, 0.0880133f),
+                             float3(0.0433131f, 0.0113623f, 0.8955953f));
+    const float3x3 fromRec2020(float3(1.6604910f, -0.1245505f, -0.0181507f),
+                               float3(-0.5876411f, 1.1328999f, -0.1005789f),
+                               float3(-0.0728499f, -0.0083494f, 1.1187296f));
+    const float3x3 inset(float3(0.856627153315983f, 0.137318972929847f, 0.11189821299995f),
+                         float3(0.0951212405381588f, 0.761241990602591f, 0.0767994186031903f),
+                         float3(0.0482516061458583f, 0.101439036467562f, 0.811302368396859f));
+    const float3x3 outset(float3(1.1271005818144368f, -0.1413297634984383f, -0.14132976349843826f),
+                          float3(-0.11060664309660323f, 1.157823702216272f, -0.11060664309660294f),
+                          float3(-0.016493938717834573f, -0.016493938717834257f, 1.2519364065950405f));
+    const float minimumEv = -12.47393f;
+    const float maximumEv = 4.026069f;
+    float3 x = inset * (toRec2020 * radiance);
+    x = clamp((log2(max(x, float3(1.0e-10f))) - minimumEv) / (maximumEv - minimumEv), 0.0f, 1.0f);
+    const float3 x2 = x * x;
+    const float3 x4 = x2 * x2;
+    x = 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 - 6.868f * x2 * x
+        + 0.4298f * x2 + 0.1191f * x - 0.00232f;
+    return clamp(fromRec2020 * pow(max(outset * x, float3(0.0f)), float3(2.2f)), 0.0f, 1.0f);
+}
 fragment float4 _main(In in [[stage_in]], constant Params& p [[buffer(0)]],
                       texture2d<float> image [[texture(0)]],
                       sampler imageSampler [[sampler(0)]])
@@ -22467,6 +22581,7 @@ fragment float4 _main(In in [[stage_in]], constant Params& p [[buffer(0)]],
         absoluteNits *= y > 0.0f ? mappedY / y : 0.0f;
     }
     working = absoluteNits / p.luminance.z;
+    if (p.rendering.x == 2) working = agxViewTransform(working);
     const float3 outputLinear = (p.workingToOutput * float4(working, 1.0f)).rgb;
     float3 outputEncoded = encodeTransfer(outputLinear, p.options.y, p.luminance.z);
     if (p.options.w == 1) alpha = 1.0f;
@@ -23090,7 +23205,7 @@ const char* kMetalDrawShapeFragment = R"metal(
 #include <metal_stdlib>
 using namespace metal;
 struct In { float4 position [[position]]; float2 uv [[user(locn0)]]; };
-struct ShapeParams { float4 rect; float4 rectB; float4 color; int4 operation; float4 colorB; float4 gradient; };
+struct ShapeParams { float4 rect; float4 rectB; float4 color; int4 operation; float4 colorB; float4 gradient; float4 canvasRect; };
 bool shapeContains(float2 uv, float4 rect)
 {
     float2 halfSize = max(abs(rect.zw) * 0.5f, float2(0.0f));
@@ -23106,15 +23221,22 @@ bool shapeContains(float2 uv, float4 rect)
 }
 fragment float4 _main(In in [[stage_in]], constant ShapeParams& p [[buffer(0)]])
 {
+    // The uv the compositor hands us spans the whole buffer; the shape and the
+    // gradient are authored against the canvas, exactly as the export reads them.
+    // Outside the canvas the export has no pixels at all.
+    float2 canvasSpan = max(p.canvasRect.zw - p.canvasRect.xy, float2(1e-6f));
+    float2 uv = (in.uv - p.canvasRect.xy) / canvasSpan;
+    if (any(uv < float2(0.0f)) || any(uv > float2(1.0f)))
+        discard_fragment();
     if (p.gradient.x > 0.5f)
     {
         // Same ramp as the OpenGL compositor and the synthesised Gradient
         // generator: 0 degrees runs left to right, positive angles turn down.
-        float t = clamp(dot(in.uv - float2(0.5f), p.gradient.yz) + 0.5f, 0.0f, 1.0f);
+        float t = clamp(dot(uv - float2(0.5f), p.gradient.yz) + 0.5f, 0.0f, 1.0f);
         return mix(p.color, p.colorB, t);
     }
-    bool insideA = shapeContains(in.uv, p.rect);
-    bool insideB = p.operation.x == 0 ? false : shapeContains(in.uv, p.rectB);
+    bool insideA = shapeContains(uv, p.rect);
+    bool insideB = p.operation.x == 0 ? false : shapeContains(uv, p.rectB);
     bool inside = p.operation.x == 1 ? (insideA || insideB)
                 : p.operation.x == 2 ? (insideA && insideB)
                 : p.operation.x == 3 ? (insideA && !insideB)
@@ -24261,7 +24383,8 @@ struct MetalFrameRenderer::Impl
     }
 
     std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> leaseLinearImageForDisplay(
-        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& failure)
+        const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame,
+        colortransform::ToneMap viewTransform, std::string& failure)
     {
         failure.clear();
         if (!frame || !programsReady) { failure = "Linear image conversion requires a native Metal frame"; return {}; }
@@ -24288,7 +24411,7 @@ struct MetalFrameRenderer::Impl
             || storage.sample_count != 1 || storage.pixel_format != SG_PIXELFORMAT_RGBA16F)
         { failure = "Linear image storage does not match its native descriptor"; return {}; }
         colortransform::AdmissionFailure admissionFailure;
-        const auto admitted = nativeLinearImageToSrgb({descriptor.width, descriptor.height}, admissionFailure);
+        const auto admitted = nativeLinearImageToSrgb({descriptor.width, descriptor.height}, viewTransform, admissionFailure);
         if (!admitted)
         { failure = "Linear image display transform was rejected: " + std::string(colortransform::token(admissionFailure)); return {}; }
         Target target;
@@ -24306,6 +24429,7 @@ struct MetalFrameRenderer::Impl
         params.options[0] = static_cast<int>(transform.input.transfer);
         params.options[1] = static_cast<int>(transform.output.transfer);
         params.options[2] = params.options[3] = static_cast<int>(colortransform::AlphaMode::Straight);
+        params.rendering[0] = static_cast<int>(transform.toneMap);
         params.rendering[1] = 1;
         sg_pass pass = {}; pass.attachments.colors[0] = target.attachment;
         pass.action.colors[0].load_action = SG_LOADACTION_DONTCARE;
@@ -25296,10 +25420,11 @@ std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::lea
 }
 
 std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::leaseLinearImageForDisplay(
-    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame, std::string& error)
+    const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& frame,
+    colortransform::ToneMap viewTransform, std::string& error)
 {
     std::lock_guard<std::mutex> lock(sokolMutex());
-    return impl_->leaseLinearImageForDisplay(frame, error);
+    return impl_->leaseLinearImageForDisplay(frame, viewTransform, error);
 }
 
 std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> MetalFrameRenderer::leaseTemporalFrame(
@@ -25557,7 +25682,7 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
     impl_->lastCompositeLinearScene = false;
     impl_->error.clear();
     if (!displayInputs.prepare(layers, numLayers, impl_->hdrImageCapture,
-            [&](const auto& frame, auto& error) { return impl_->leaseLinearImageForDisplay(frame, error); }, impl_->error))
+            [&](const auto& frame, auto viewTransform, auto& error) { return impl_->leaseLinearImageForDisplay(frame, viewTransform, error); }, impl_->error))
         return 0;
     if (impl_->sceneTraceSeqHint != 0 && !displayInputs.layers.empty())
     {
@@ -26484,6 +26609,27 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
             if (layer.drawShape)
             {
                 const auto drawShapeStarted = std::chrono::steady_clock::now();
+                // The canvas in this pass's buffer UV, from the same view the layer
+                // transforms use. RawUV alone spans the whole buffer, so without it
+                // the shape stretched to the buffer height and the gradient filled the
+                // letterbox beside the canvas.
+                const int shapeDisplayW = impl_->presentWidth > 0 ? impl_->presentWidth : impl_->width;
+                const int shapeDisplayH = impl_->presentHeight > 0 ? impl_->presentHeight : impl_->height;
+                const float shapeOutAspect = shapeDisplayH > 0
+                    ? static_cast<float> (shapeDisplayW) / shapeDisplayH : 1.0f;
+                float shapeCanvasZx = impl_->zoom, shapeCanvasZy = impl_->zoom;
+                if (impl_->canvasWidth > 0 && impl_->canvasHeight > 0)
+                {
+                    const float shapeCanvasAspect = static_cast<float> (impl_->canvasWidth)
+                                                   / impl_->canvasHeight;
+                    if (shapeCanvasAspect > shapeOutAspect) shapeCanvasZy *= shapeOutAspect / shapeCanvasAspect;
+                    else                                    shapeCanvasZx *= shapeCanvasAspect / shapeOutAspect;
+                }
+                const float shapeCanvasRect[4] = {
+                    (impl_->panX - shapeCanvasZx + 1.0f) * 0.5f,
+                    (impl_->panY - shapeCanvasZy + 1.0f) * 0.5f,
+                    (impl_->panX + shapeCanvasZx + 1.0f) * 0.5f,
+                    (impl_->panY + shapeCanvasZy + 1.0f) * 0.5f };
                 sg_pass shapePass = {};
                 shapePass.attachments.colors[0] = impl_->layerTarget.attachment;
                 shapePass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
@@ -26512,7 +26658,9 @@ unsigned MetalFrameRenderer::renderComposite (const arbitgl::GlFuncs* gl,
                       std::clamp(layer.drawGradientB, 0.0f, 1.0f),
                       std::clamp(layer.drawGradientA, 0.0f, 1.0f) },
                     { layer.drawShapeGradient ? 1.0f : 0.0f,
-                      layer.drawGradientCos, layer.drawGradientSin, 0.0f } };
+                      layer.drawGradientCos, layer.drawGradientSin, 0.0f },
+                    { shapeCanvasRect[0], shapeCanvasRect[1],
+                      shapeCanvasRect[2], shapeCanvasRect[3] } };
                 const sg_range shapeRange = { &shape, sizeof (shape) };
                 sg_apply_uniforms (0, &shapeRange);
                 sg_draw (0, 3, 1);

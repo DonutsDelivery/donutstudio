@@ -445,11 +445,18 @@ int main()
     check(!evaluate(*admitted, invalid, failure)
               && failure == EvaluationFailure::InvalidSpectrum,
           "nonfinite incident spectra fail closed");
-    invalid = {};
-    invalid.incidentSpectrum[4] = 17.0;
-    check(!evaluate(*admitted, invalid, failure)
-              && failure == EvaluationFailure::InvalidSpectrum,
-          "incident radiance above the hard bound fails closed");
+    // Incident energy is linear in radiance, so 24 W/(m^2 sr nm), above the removed
+    // 16 bound, carries exactly twice the incident energy of 12.
+    EvaluationInput dimSource;
+    dimSource.incidentSpectrum.fill(12.0);
+    EvaluationInput brightSource;
+    brightSource.incidentSpectrum.fill(24.0);
+    const auto dimEvaluation = evaluate(*admitted, dimSource, failure);
+    const auto brightEvaluation = evaluate(*admitted, brightSource, failure);
+    check(dimEvaluation && brightEvaluation
+              && near(brightEvaluation->incidentEnergy, 2.0 * dimEvaluation->incidentEnergy,
+                      1.0e-8 * dimEvaluation->incidentEnergy),
+          "incident radiance above the removed bound renders as authored");
 
     const auto spatialFoil = makeDiffractionReferenceScene(
         ReferenceSceneKind::SpatialFoil);

@@ -89,6 +89,7 @@ def generate() -> bytes:
     vdoth = sum(view[i] * half[i] for i in range(3))
     rows = []
     samples = bytearray()
+    display_samples = bytearray()
     for index, material in enumerate(MATERIALS, start=1):
         identifier, base, metallic, emission, roughness, normal_slot, opacity, transmission, ior, clearcoat, texture_slot = material
         dielectric = ((ior - 1.0) / (ior + 1.0)) ** 2
@@ -114,11 +115,16 @@ def generate() -> bytes:
                         + (AMBIENT[i] + LIGHT_COLOR[i] * LIGHT_INTENSITY * ndotl) * coat
                         + emission[i]) / max(coverage, 0.000001) for i in range(3))
         alpha = opacity * coverage
+        # The product's Color route is RGBA16F, which does not clamp a source before
+        # blending, and the compositor applies the sRGB transfer once to the result.
+        scene_linear = linear
         if opacity < 1.0 or transmission > 0.0:
             background = (7 / 255, 10 / 255, 18 / 255)
+            scene_linear = tuple(linear[i] * alpha + background[i] * (1.0 - alpha) for i in range(3))
             linear = tuple(min(max(linear[i], 0.0), 1.0) * alpha
                            + background[i] * (1.0 - alpha) for i in range(3))
         rgba = [*(unorm8(channel) for channel in linear), 255]
+        display = [*(unorm8(srgb(min(max(channel, 0.0), 1.0))) for channel in scene_linear), 255]
         wrong_transfer = [*(unorm8(srgb(min(max(channel, 0.0), 1.0))) for channel in linear), 255]
         # Reversing the authored normal removes direct base and direct coat
         # light. Ambient and emission remain, including glass alpha blending.
@@ -135,14 +141,16 @@ def generate() -> bytes:
             "pbrParameterBlock": pbr,
             "rejectedWrongShadingRgba8": [[0, 0, 0, unorm8(opacity)], wrong_transfer, wrong_normal_rgba],
             "directionalLitCenterRgba8": rgba,
+            "displayEncodedCenterRgba8": display,
         })
         samples.extend(rgba)
+        display_samples.extend(display)
     document = {
         "materials": rows,
         "provenance": {
             "constants": "Independent authored constants, separate from production module and generated-program tables",
             "independence": "This Python binary64 model computes JSON pixels without reading native output or production starter definitions.",
-            "model": "Quaternion-rotated fixture normal and directional light; center view +Z at 65x65; direct GGX/Smith/Schlick base with Lambert energy partner; existing ambient metallic/roughness weights, thin transmission coverage and constant coat layering; emission, straight-alpha blending and linear RGBA8 quantization",
+            "model": "Quaternion-rotated fixture normal and directional light; center view +Z at 65x65; direct GGX/Smith/Schlick base with Lambert energy partner; existing ambient metallic/roughness weights, thin transmission coverage and constant coat layering; emission, straight-alpha blending and linear RGBA8 quantization. displayEncodedCenterRgba8 is that same radiance blended without the 8-bit source clamp, then clamped and encoded once with the IEC 61966-2-1 sRGB transfer, as the compositor encodes the RGBA16F Color route",
             "fixture": {
                 "extent": [65, 65],
                 "samplePixelXy": [32, 32],
@@ -161,10 +169,12 @@ def generate() -> bytes:
                 "lightIntensity": LIGHT_INTENSITY,
             },
         },
+        "displayRgba8Fnv1a64": fnv1a64(display_samples),
+        "displayRgba8Sha256": hashlib.sha256(display_samples).hexdigest(),
         "sampledRgba8Fnv1a64": fnv1a64(samples),
         "sampledRgba8Sha256": hashlib.sha256(samples).hexdigest(),
-        "schema": 4,
-        "truthBoundary": "The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, transmission, IOR and clearcoat. Direct base reflection uses view-dependent GGX with Schlick Fresnel from normal-incidence IOR F0. Ambient and constant environment retain the existing approximation; coat is a constant legacy layer and transmission is thin alpha coverage. This does not establish reflective environments, full clearcoat, volumetric refraction, screen-space distortion, absorption or multilayer path tracing.",
+        "schema": 5,
+        "truthBoundary": "directionalLitCenterRgba8 pins unencoded radiance bytes on the 8-bit target, which the product now uses only for data passes and pass programs; an encoded byte there would be encoded twice on display. displayEncodedCenterRgba8 pins what a viewer sees. The independent CPU model covers the exact constant PBR block and one directional-lit center sample per starter, including metallic, roughness, emission, opacity, transmission, IOR and clearcoat. Direct base reflection uses view-dependent GGX with Schlick Fresnel from normal-incidence IOR F0. Ambient and constant environment retain the existing approximation; coat is a constant legacy layer and transmission is thin alpha coverage. This does not establish reflective environments, full clearcoat, volumetric refraction, screen-space distortion, absorption or multilayer path tracing.",
     }
     return (json.dumps(document, indent=2) + "\n").encode()
 

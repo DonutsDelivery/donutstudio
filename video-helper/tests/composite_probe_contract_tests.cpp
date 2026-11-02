@@ -1,16 +1,35 @@
 #include "../src/composite_probe_contract.h"
 #include "../src/composite_render_diagnostic.h"
-#include "../src/bounded_line.h"
+#include "../src/request_line.h"
 #include "../src/compositor_ownership.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <new>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace
 {
+template <typename T>
+struct FailsAboveLimitAllocator
+{
+    using value_type = T;
+    FailsAboveLimitAllocator() = default;
+    template <typename U> FailsAboveLimitAllocator (const FailsAboveLimitAllocator<U>&) {}
+    T* allocate (std::size_t count)
+    {
+        if (count > 4096) throw std::bad_alloc();
+        return std::allocator<T>().allocate (count);
+    }
+    void deallocate (T* pointer, std::size_t count) { std::allocator<T>().deallocate (pointer, count); }
+    template <typename U> bool operator== (const FailsAboveLimitAllocator<U>&) const { return true; }
+    template <typename U> bool operator!= (const FailsAboveLimitAllocator<U>&) const { return false; }
+};
+
 int checks = 0;
 int failures = 0;
 void check (bool condition, const char* message)
@@ -222,24 +241,52 @@ int main()
         const auto released = create("first");
         check(store.release("first", released, error), "explicit release succeeds");
         check(!store.read("first", released, 0, bytes, done, error), "released handle is invalid");
-        check(store.create("first", std::vector<uint8_t>(16), [] { return true; }, error).empty(),
-              "incorrect raw byte count is rejected");
+        check(store.create("first", {}, [] { return true; }, error).empty(), "an empty artifact is rejected");
+        check(store.create("first", std::vector<uint8_t>(maxBytes + 1), [] { return true; }, error).empty(),
+              "an artifact over the 4K byte count is rejected");
+        const auto encoded = store.create("first", std::vector<uint8_t>(chunkBytes + 16, 7), [] { return true; }, error);
+        check(!encoded.empty(), "an encoded frame shorter than 4K raw is accepted");
+        check(store.read("first", encoded, 0, bytes, done, error) && bytes.size() == chunkBytes && !done,
+              "a short artifact's first chunk is whole");
+        check(store.read("first", encoded, chunkBytes, bytes, done, error) && bytes.size() == 16 && done,
+              "a short artifact ends at its own length");
     }
 
-    std::vector<char> line;
-    std::istringstream exact (std::string (64, 'x') + "\n");
-    check (videohelper::readBoundedLine (exact, line, 64) == videohelper::BoundedLineResult::line
-               && line.size() == 64, "exact-limit helper request is accepted");
-    std::istringstream oversized (std::string (65, 'x'));
-    check (videohelper::readBoundedLine (oversized, line, 64) == videohelper::BoundedLineResult::oversized
-               && line.empty(), "newline-free oversized helper request is rejected at the cap");
-    std::istringstream partial ("partial");
-    check (videohelper::readBoundedLine (partial, line, 64) == videohelper::BoundedLineResult::line
-               && std::string (line.begin(), line.end()) == "partial",
-           "bounded parser preserves a final partial line at EOF");
-    std::istringstream empty;
-    check (videohelper::readBoundedLine (empty, line, 64) == videohelper::BoundedLineResult::end,
-           "clean EOF is distinguished from a partial line");
+    {
+        std::vector<std::string> lines;
+        std::vector<size_t> failures;
+        const auto onLine = [&] (const char* data, size_t size) { lines.emplace_back (data, size); };
+        const auto onFailure = [&] (size_t bytes) { failures.push_back (bytes); };
+
+        // 22:16 on 30 Oct 2026: the R1 plan overran a 16 MiB line limit and the helper
+        // left its read loop with exit code 0. A larger line now arrives whole, and the
+        // request after it still runs.
+        const size_t largeBytes = 64u * 1024u * 1024u;
+        const std::string large (largeBytes, 'x');
+        videohelper::RequestLineAssembler<> assembler;
+        for (size_t offset = 0; offset < large.size(); offset += 4096)
+            assembler.feed (large.data() + offset, std::min<size_t> (4096, large.size() - offset), onLine, onFailure);
+        assembler.feed ("\nnext\n\npart", 11, onLine, onFailure);
+        check (lines.size() == 2 && lines[0].size() == largeBytes && lines[1] == "next" && failures.empty(),
+               "a request line above the former 16 MiB limit arrives whole and the next line follows it");
+        assembler.close (onLine, onFailure);
+        check (lines.size() == 3 && lines[2] == "part", "a final line without a newline is delivered at close");
+        assembler.close (onLine, onFailure);
+        check (lines.size() == 3 && failures.empty(), "closing with nothing buffered delivers no line");
+
+        // Only a real allocation failure stops a line, and the stream stays usable.
+        lines.clear();
+        videohelper::RequestLineAssembler<std::vector<char, FailsAboveLimitAllocator<char>>> limited;
+        limited.feed ("short\n", 6, onLine, onFailure);
+        const std::string tooLarge (4196, 'y');
+        limited.feed (tooLarge.data(), 10, onLine, onFailure);
+        limited.feed (tooLarge.data() + 10, tooLarge.size() - 10, onLine, onFailure);
+        limited.feed ("\nafter\n", 7, onLine, onFailure);
+        check (lines.size() == 2 && lines[0] == "short" && lines[1] == "after",
+               "the request after a failed allocation still runs");
+        check (failures.size() == 1 && failures[0] == tooLarge.size(),
+               "an allocation failure reports the full length of the line it could not store");
+    }
 
     videohelper::CompositorOwnershipGate gate;
     auto exportLease = gate.tryClaim(videohelper::CompositorOwnershipGate::Owner::exportJob);

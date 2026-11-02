@@ -42,11 +42,6 @@ static SidecarProcessManager::Config configFor(const juce::File& helper,
     config.maxRestartAttempts = 0;
     config.requestTimeoutMs = 2000;
     config.terminateOnRequestTimeout = true;
-#if defined(__linux__)
-    config.requiresResourceLimits = true;
-    config.maxAddressSpaceBytes = uint64_t { 4 } * 1024u * 1024u * 1024u;
-    config.maxCpuSeconds = 60;
-#endif
     return config;
 }
 
@@ -267,44 +262,6 @@ static void proveAuthorityRollover()
     assert(std::all_of(wipeProbe.begin(), wipeProbe.end(), [] (uint8_t byte) { return byte == 0; }));
 }
 
-#if defined(__linux__)
-static void proveMeasuredResourceLimit(SidecarProcessManager& manager, const char* mode)
-{
-    SidecarProcessManager::Config config;
-    config.binaryPath = juce::File(RESOURCE_LIMIT_FIXTURE);
-    config.args.add(mode);
-    config.healthCheckIntervalMs = 0;
-    config.maxRestartAttempts = 0;
-    config.requiresResourceLimits = true;
-    if (std::strcmp(mode, "memory") == 0)
-        config.maxAddressSpaceBytes = uint64_t { 64 } * 1024u * 1024u;
-    else
-        config.maxCpuSeconds = 1;
-
-    assert(manager.launch(config));
-    juce::String error;
-    const auto prepared = manager.sendRequestSync("prepare", juce::var(), 2000, error);
-    assert(error.isEmpty());
-    const pid_t leader = manager.getOwnedProcessId();
-    const pid_t descendant = static_cast<pid_t>((int)prepared.getProperty("descendantPid", 0));
-    assert(leader > 0 && descendant > 0 && getpgid(leader) == leader
-           && getpgid(descendant) == leader);
-
-    const auto started = std::chrono::steady_clock::now();
-    error.clear();
-    manager.sendRequestSync("exhaust", juce::var(), 5000, error);
-    assert(error.containsIgnoreCase("process exited"));
-    assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(6));
-    assert(!manager.isRunning() && manager.getOwnedProcessId() == -1);
-    for (int i = 0; i < 100 && (kill(descendant, 0) == 0 || errno != ESRCH); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    assert(kill(descendant, 0) != 0 && errno == ESRCH);
-    const auto reason = manager.getLastTerminationReason();
-    assert(reason.length() < 160);
-    assert(reason.containsIgnoreCase(mode));
-}
-#endif
-
 int main (int argc, char** argv)
 {
     juce::MessageManager::getInstance();
@@ -332,16 +289,6 @@ int main (int argc, char** argv)
 #else
     programmableruntime::SessionSecret secretA {};
     std::copy_n(config.inheritedPrivateBytes.begin(), secretA.size(), secretA.begin());
-#if ! defined(__linux__)
-    // A platform without kernel-backed resource limits must reject a worker
-    // that requires them. Then exercise the remaining production lifecycle
-    // with that unsupported capability explicitly not requested.
-    config.requiresResourceLimits = true;
-    assert(!manager.launch(config));
-    assert(config.inheritedPrivateBytes.empty());
-    assert(!manager.isRunning());
-    config = configFor(helper, matte, 0x5a, 11);
-#endif
     assert(manager.launch(config));
     assert(config.inheritedPrivateBytes.empty());
     assert(manager.getConfig().inheritedPrivateBytes.empty());
@@ -422,15 +369,10 @@ int main (int argc, char** argv)
     assert(manager.getOwnedProcessId() == -1);
 
 #if defined(__linux__)
-    // These are measured over-budget workloads under limits installed by the
-    // production fork path. No resource-limit signal is injected.
-    proveMeasuredResourceLimit(manager, "memory");
-    proveMeasuredResourceLimit(manager, "cpu");
-
-    // Resource-failed sessions cannot authorize a replacement helper. Only a
-    // grant projected from the replacement's fresh session is accepted.
-    auto postLimit = configFor(helper, matte, 0x79, 19);
-    assert(manager.launch(postLimit));
+    // A grant from the earlier session cannot authorize a replacement helper.
+    // Only a grant projected from the replacement's fresh session is accepted.
+    auto replacement = configFor(helper, matte, 0x79, 19);
+    assert(manager.launch(replacement));
     error.clear(); result = manager.sendRequestSync("viewport_set_script", makeScriptParams(freshGrant), 2000, error);
     assert(error.containsIgnoreCase("session") || error.containsIgnoreCase("authentication"));
     programmableruntime::SessionSecret secretC {}; secretC.fill(0x79);

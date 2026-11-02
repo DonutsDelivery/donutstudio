@@ -405,6 +405,8 @@ void rpcPolicyTests()
     check (bumpsItself ("viewport_set_canvas") && bumpsItself ("viewport_set_canvas_background")
            && bumpsItself ("viewport_set_visible") && ! bumpsItself ("viewport_set_view"),
            "policy: Viewport bumps itself only for the canvas pair and visibility");
+    check (isSetter ("viewport_set_full_canvas_scene") && bumpsItself ("viewport_set_full_canvas_scene"),
+           "policy: the full canvas request wakes the viewport only on a real change");
 
     const auto exempt = decide ("ping", false, false);
     check (! exempt.bump && ! exempt.remember && ! exempt.forget,
@@ -549,6 +551,31 @@ void previewExtentTests()
           && zoomBucket(2.0) == 2 && zoomBucket(3.0) == 4 && zoomBucket(32.0) == 32
           && zoomBucket(1000.0) == 32 && zoomBucket(std::numeric_limits<double>::quiet_NaN()) == 1,
           "zoom buckets are powers of two from 1 to 32");
+
+    // A full canvas request gives the canvas at any panel size or zoom.
+    using videohelper::previewextent::sceneExtent;
+    check(sceneExtent(1920, 1080, 804, 452, 1, true) == Extent { 1920, 1080 },
+          "a full canvas request renders 1080p in the 804x452 dock");
+    check(sceneExtent(3840, 2160, 424, 240, 1, true) == Extent { 3840, 2160 },
+          "a full canvas request renders 4K in a small dock");
+    check(sceneExtent(1920, 1080, 0, 0, 1, true) == Extent { 1920, 1080 }
+          && sceneExtent(1920, 1080, 3840, 2160, 4, true) == Extent { 1920, 1080 },
+          "a full canvas request ignores the framebuffer and the zoom");
+    check(! sceneExtent(0, 1080, 804, 452, 1, true).valid(), "a zero canvas still gives no extent");
+    // With no request the extent is exactly the panel fit.
+    check(sceneExtent(1920, 1080, 804, 452, 1, false) == Extent { 804, 452 },
+          "with no request 1080p in the 804x452 dock stays at 804x452");
+    {
+        const int cases[][4] = { { 3840, 2160, 424, 240 }, { 3840, 2160, 800, 240 }, { 1080, 1920, 424, 240 },
+                                 { 640, 360, 1920, 1080 }, { 3840, 2160, 0, 0 }, { 3840, 2160, 40, 20 },
+                                 { 48, 27, 20, 10 }, { 0, 2160, 424, 240 }, { 1920, 1080, 777, 431 } };
+        bool same = true;
+        for (const auto& c : cases)
+            for (const std::uint32_t zoom : { 0u, 1u, 2u, 4u, 32u })
+                same = same && sceneExtent(c[0], c[1], c[2], c[3], zoom, false)
+                                   == fitToPresentation(c[0], c[1], c[2], c[3], zoom);
+        check(same, "with no request every panel, canvas and zoom matches fitToPresentation");
+    }
 
     // The telemetry keeps the last completed extent and forgets it on reset.
     videowire::VisualPlanTelemetry telemetry;

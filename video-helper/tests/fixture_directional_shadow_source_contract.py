@@ -38,9 +38,9 @@ def require(text, needle, message):
 
 
 # Light loop: the directional light is kind 0 with a per-draw rotation, so its ray direction
-# follows the current uLightRotations value on every frame.
-require(flat, "vec3 toLight = kind == 0 ? rotateQ(uLightRotations[lightIndex], vec3(0.0, 0.0, 1.0)) : baseSurfaceUnit(delta);",
-        "the light loop must derive a directional toLight from the per-draw uLightRotations")
+# follows the current scene table light rotation on every frame.
+require(flat, "vec3 toLight = kind == 0 ? rotateQ(fixtureLightRotation(lightIndex), vec3(0.0, 0.0, 1.0)) : baseSurfaceUnit(delta);",
+        "the light loop must derive a directional toLight from the scene table light rotation")
 
 # The visibility term is gated by the opaque alpha and transmission conditions, then uses the
 # unbounded ray for directional lights and the receiver distance for the others. The receiver

@@ -1,8 +1,12 @@
 #include "support/diffraction_native_transport_fixture.h"
 #include "support/diffraction_reference_oracle.h"
 #include "../../shared/DiffractionMaterialPresets.h"
+#include "../src/gpu_backend/fixture_diffraction_bands.h"
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace
@@ -88,8 +92,22 @@ void refusals()
     input=fixture.input;input.receiver.parameterMaterial=999;reject(input,dt::Failure::IdentityMismatch,"wrong parameter/material identity refuses");
     input=fixture.input;input.receiver.programRevision=2;reject(input,dt::Failure::RevisionMismatch,"stale program revision refuses");
     input=fixture.input;input.receiver.reflectance.reset();reject(input,dt::Failure::MissingReflectance,"missing authored rho refuses without RGB inference");
-    for(double invalid:{-1.0,17.0,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()})
+    for(double invalid:{-1.0,std::numeric_limits<double>::infinity(),std::numeric_limits<double>::quiet_NaN()})
     {input=fixture.input;input.source.radiance[3]=invalid;reject(input,dt::Failure::InvalidSpectrum,"invalid independent source radiance refuses");}
+    {
+        // Power is radiance times geometry, so 24 W/(m^2 sr nm), above the removed 16
+        // bound, delivers 24 times the receiver power of 1 W/(m^2 sr nm) in each band.
+        auto unitSource=fixture.input,brightSource=fixture.input;
+        unitSource.source.radiance.fill(1.0);brightSource.source.radiance.fill(24.0);
+        dt::Failure failure;
+        const auto unit=dt::evaluate(unitSource,[&](const dt::Ray& ray){return fixture.query(ray);},failure);
+        const auto bright=dt::evaluate(brightSource,[&](const dt::Ray& ray){return fixture.query(ray);},failure);
+        check(bool(unit)&&bool(bright),"source radiance above the removed bound evaluates");
+        if(unit&&bright)for(unsigned band=0;band<8;++band)
+            check(near(bright->receiverIncidentPower[band],24.0*unit->receiverIncidentPower[band],1e-9)
+                &&near(bright->arrivingPower[band],24.0*unit->arrivingPower[band],1e-9),
+                "source radiance above the removed bound scales power as authored");
+    }
     for(float invalid:{-1.0f,1.01f,std::numeric_limits<float>::quiet_NaN()})
     {input=fixture.input;input.receiver.reflectance->coefficients[5]=invalid;reject(input,dt::Failure::InvalidSpectrum,"invalid receiver rho refuses");}
     input=fixture.input;input.receiver.opacity=.5;reject(input,dt::Failure::UnsupportedReceiver,"transparent receiver refuses");
@@ -197,6 +215,20 @@ void nativeTableAdmission()
     check(selected.supportsAuthoredSpectralReceiverTransport()
         && arbitgpu::validNativeFixtureMaterialPrograms(f.program,*f.scene,f.program.backend,
             selected.supportsAuthoredSpectralReceiverTransport()),"an exact selected backend capability permits mixed v3 envelope admission only");
+    // The Diffraction Orb authors 24. Mixed admission refused a path intensity above
+    // 16 while lowering and the transport already carried it, so no frame could render.
+    for(const double radiance:{24.0,double(diffractionmaterial::kSpectralRadianceControlMaximum)})
+    {
+        auto bright=tt::nativeFixture(false,0,0,radiance);nt::Prepared brightPrepared;
+        check(bright.program.diffractionPaths[0].incidentDirectionAndIntensity.w==float(radiance)
+            && bright.program.diffractionPaths[0].material.spectral[0].y==1.0f
+            && arbitgpu::validNativeFixtureMaterialPrograms(bright.program,*bright.scene,bright.program.backend,
+                selected.supportsAuthoredSpectralReceiverTransport()),"mixed admission carries authored source radiance above the removed bound");
+        check(nt::prepareScene(*bright.scene,bright.program,1,brightPrepared,error),"native transport prepares authored source radiance above the removed bound");
+        auto staleIntensity=bright.program;staleIntensity.diffractionPaths[0].incidentDirectionAndIntensity.w=8.0f;
+        check(!arbitgpu::validNativeFixtureMaterialPrograms(staleIntensity,*bright.scene,staleIntensity.backend,
+                selected.supportsAuthoredSpectralReceiverTransport()),"a path intensity that differs from the admitted lighting still refuses");
+    }
     ov::Prepared opaque;
     check(!ov::prepareScene(*f.scene,&f.program,{},opaque,error),"default opaque-shadow preparation keeps v3 grating guarded");
     check(ov::prepareScene(*f.scene,&f.program,{},opaque,error,ov::AdmissionMode::opaqueOnly,false,true)
@@ -235,6 +267,71 @@ void nativeTableAdmission()
     std::vector<float> readback(16,0);check(nt::validateWholeOutput(readback,2,2,error),"complete finite native diagnostic readback admits");
     readback[5]=std::numeric_limits<float>::quiet_NaN();
     check(!nt::validateWholeOutput(readback,2,2,error),"one invalid-query diagnostic refuses the whole output");
+    // A refusal must name the branch that fired: the GLSL payload carries the
+    // reason id in quiet-NaN bits 10..17 and the readback counts it.
+    readback[5]=std::nextafter(0.0f,1.0f);
+    { const std::uint32_t bits=0x7fc00000u|(3u<<10u);std::memcpy(&readback[5],&bits,sizeof(float)); }
+    check(!nt::validateWholeOutput(readback,2,2,error)
+        && error.find("sample segment query incomplete: 1")!=std::string::npos,
+        "the whole-output refusal names the tagged branch and its pixel count");
+    readback[9]=std::nextafter(0.0f,1.0f);
+    { const std::uint32_t bits=0x7fc00000u|(3u<<10u);std::memcpy(&readback[9],&bits,sizeof(float)); }
+    { const std::uint32_t bits=0x7fc00000u|(7u<<10u);std::memcpy(&readback[13],&bits,sizeof(float)); }
+    check(!nt::validateWholeOutput(readback,2,2,error)
+        && error.find("sample segment query incomplete: 2")!=std::string::npos
+        && error.find("invalid BSDF efficiency sum: 1")!=std::string::npos,
+        "the whole-output refusal counts every tagged branch in the frame");
+    // Infinity and overrange pixels carry no payload, but a refusal that must
+    // name its cause still counts them and reports the worst magnitude.
+    readback[5]=std::numeric_limits<float>::infinity();
+    readback[9]=surfacematerial::kMaximumLinearColorComponent*4.0f;
+    readback[13]=std::numeric_limits<float>::quiet_NaN();
+    check(!nt::validateWholeOutput(readback,2,2,error)
+        && error.find("infinite: 1")!=std::string::npos
+        && error.find("overrange: 1")!=std::string::npos
+        && error.find("unattributed: 1")!=std::string::npos,
+        "the whole-output refusal counts infinite, overrange and unattributed pixels");
+    // The disc frame's real silhouette NaN (all mantissa bits set -- what the
+    // GPU produces when a zero-length tangent normalizes at an edge pixel) is
+    // not a named refusal: the shader guard bounds it to zero contribution
+    // instead of killing the frame. The seven tagged branch payloads remain
+    // refusals the frame must honor.
+    // The branch-probe tags name a nonfinite sky or base-shading result, so a
+    // probe rerun attributes the pixels to the branch that produced them.
+    auto taggedFloat=[](std::uint32_t bits){ float value=0.0f;
+        std::memcpy(&value,&bits,sizeof(value)); return value; };
+    std::vector<float> skyProbe(16,0.0f);
+    { skyProbe[0]=taggedFloat(0x7fc00000u|(8u<<10u)); std::string probeError;
+      check(!nt::validateWholeOutput(skyProbe,2,2,probeError)
+          && probeError.find("sky output nonfinite: 1")!=std::string::npos,
+          "a tagged sky-branch pixel is counted under its branch name"); }
+    std::vector<float> baseProbe(16,0.0f);
+    { baseProbe[0]=taggedFloat(0x7fc00000u|(9u<<10u)); std::string probeError;
+      check(!nt::validateWholeOutput(baseProbe,2,2,probeError)
+          && probeError.find("base surface output nonfinite: 1")!=std::string::npos,
+          "a tagged base-branch pixel is counted under its branch name"); }
+    { std::vector<float> probe(16,0.0f); std::string probeError;
+      probe[0]=taggedFloat(0x7fc00000u|(10u<<10u));
+      check(!nt::validateWholeOutput(probe,2,2,probeError)
+          && probeError.find("resolve output nonfinite: 1")!=std::string::npos,
+          "a tagged resolve pixel is counted under its name"); }
+    { std::vector<float> probe(16,0.0f); std::string probeError;
+      probe[0]=taggedFloat(0x7fc00000u|(11u<<10u));
+      check(!nt::validateWholeOutput(probe,2,2,probeError)
+          && probeError.find("pre-resolve accumulation nonfinite: 1")!=std::string::npos,
+          "a tagged pre-resolve pixel is counted under its name"); }
+    { std::vector<float> probe(16,0.0f); std::string probeError;
+      probe[0]=taggedFloat(0x7fc00000u|(12u<<10u));
+      check(!nt::validateWholeOutput(probe,2,2,probeError)
+          && probeError.find("receiver output nonfinite: 1")!=std::string::npos,
+          "a tagged receiver pixel is counted under its name"); }
+    check(!nt::diagnosticPayloadIsNamedRefusal(0x7fffffffu),
+        "an arithmetic silhouette NaN is not a named refusal");
+    check(!nt::diagnosticPayloadIsNamedRefusal(0x7fc00000u),
+        "the released unattributed payload is not a named refusal");
+    for(std::uint32_t reason=1;reason<=7;++reason)
+        check(nt::diagnosticPayloadIsNamedRefusal(0x7fc00000u|(reason<<10u)),
+            "a tagged branch payload is a named refusal the frame honors");
     readback.resize(15);check(!nt::validateWholeOutput(readback,2,2,error),"truncated diagnostic readback refuses all AOV publication");
     check(!arbitgpu::validNativeFixtureDiffractionProgram(f.program,f.program.backend,f.program.object),
           "native v3 rendering stays refused until a backend explicitly consumes its table");
@@ -352,15 +449,84 @@ void nativeTableAdmission()
     nt::Prepared shortPrepared;
     check(nt::prepareScene(*shortRange.scene,shortRange.program,1,shortPrepared,error)
         && !nt::buildFrame(shortPrepared,tt::nativeInstances(shortRange),128,128,discarded,error),"finite trace range cannot truncate an actual reciprocal endpoint");
-    check(arbitgpu::nativeFixtureDiffractionQueryWorkWithinBudget(1920,1080,32,32,16),"1080p maximum sample table has an explicit admitted small-topology query budget");
-    check(!arbitgpu::nativeFixtureDiffractionQueryWorkWithinBudget(3840,2160,32,32,16),"4K maximum sample table exceeds its explicit query budget");
-    check(arbitgpu::nativeFixtureDiffractionQueryWorkWithinBudget(3840,2160,8,8,16),"4K smaller exact table remains eligible within the explicit query budget");
+    std::uint64_t queries=0;
+    check(arbitgpu::nativeFixtureDiffractionFrameQueries(3840,2160,3840,3840,16,queries)
+        && queries==std::uint64_t(3840)*2160*(1+3*3840)+3840+2*std::uint64_t(3840)*3840,
+        "4K frame query count follows the actual round orb sample tables");
+    check(!arbitgpu::nativeFixtureDiffractionFrameQueries(3840,2160,std::numeric_limits<std::size_t>::max(),8,16,queries),
+        "a query count that does not fit 64 bits is the only frame work refusal");
+}
+
+// Replaces the grating quad, the fixture's last object, with a UV sphere wound
+// outward like the starter's GeometrySphere: segments*2+segments*(rings-2)*2 triangles.
+tt::Fixture nativeSphereFixture(unsigned segments,unsigned rings,float radius,std::array<float,3> center)
+{
+    auto f=tt::nativeFixture();
+    auto& scene=*f.scene;
+    HarmonicMIDI::grid::Visual3DSceneGrowth growth;
+    growth.vertices=std::size_t(segments+1)*(rings+1);growth.indices=std::size_t(segments)*(rings-1)*6;
+    std::string growthError;
+    check(HarmonicMIDI::grid::growVisual3DScene(scene,growth,growthError),"scene grows for the sphere mesh");
+    auto& object=scene.objects[scene.objectCount-1];
+    scene.vertexCount=object.firstVertex;scene.indexCount=object.firstIndex;
+    constexpr float pi=3.14159265358979f;
+    for(unsigned ring=0;ring<=rings;++ring)for(unsigned segment=0;segment<=segments;++segment)
+    {
+        const float polar=pi*float(ring)/float(rings),azimuth=2*pi*float(segment)/float(segments);
+        const float x=std::sin(polar)*std::cos(azimuth),y=std::cos(polar),z=std::sin(polar)*std::sin(azimuth);
+        auto& v=scene.vertices[scene.vertexCount++];
+        v.position={center[0]+radius*x,center[1]+radius*y,center[2]+radius*z};v.color={1,1,1,1};
+        v.uv={float(segment)/float(segments),float(ring)/float(rings)};
+    }
+    const auto at=[&](unsigned ring,unsigned segment){return ring*(segments+1)+segment;};
+    const auto triangle=[&](std::uint32_t a,std::uint32_t b,std::uint32_t c)
+    {scene.indices[scene.indexCount++]=a;scene.indices[scene.indexCount++]=b;scene.indices[scene.indexCount++]=c;};
+    for(unsigned ring=0;ring<rings;++ring)for(unsigned segment=0;segment<segments;++segment)
+    {
+        if(ring!=0)triangle(at(ring,segment),at(ring,segment+1),at(ring+1,segment));
+        if(ring+1!=rings)triangle(at(ring,segment+1),at(ring+1,segment+1),at(ring+1,segment));
+    }
+    object.vertexCount=scene.vertexCount-object.firstVertex;object.indexCount=scene.indexCount-object.firstIndex;
+    return f;
+}
+
+void largeGratingAdmission()
+{
+    namespace nt=arbitgpu::diffractiontransportnative;
+    check(nt::endpointTolerance(nt::kRayMinimumDistance,1.f,1.f)==nt::kRayMinimumDistance,
+        "a short endpoint keeps the ray minimum as its tolerance");
+    check(nt::endpointTolerance(nt::kRayMinimumDistance,30.f,1.f)>=8*(std::nextafter(30.f,31.f)-30.f),
+        "a 30 m endpoint tolerance covers the rounding of a ray that long");
+    struct Case {const char* name;unsigned segments,rings;std::size_t triangles;};
+    // diffraction-stress-ball is the named stress object, 4,032 triangles.
+    for(const Case c:{Case{"round diffraction orb",32,16,960},Case{"diffraction-stress-ball",64,32,4032}})
+    {
+        std::string error;auto f=nativeSphereFixture(c.segments,c.rings,.25f,{0.f,0.f,1.f});
+        nt::Prepared prepared;nt::Frame frame;
+        const bool admitted=nt::prepareScene(*f.scene,f.program,1,prepared,error);
+        check(admitted,c.name);
+        if(!admitted){std::printf("%s prepare: %s\n",c.name,error.c_str());continue;}
+        const bool built=nt::buildFrame(prepared,tt::nativeInstances(f),1920,1080,frame,error);
+        check(built,c.name);
+        if(!built){std::printf("%s frame: %s\n",c.name,error.c_str());continue;}
+        check(frame.sampleControl[0]==8 && frame.sampleControl[1]==float(c.triangles*4),"grating table sizes from the actual sphere triangles");
+        check(nt::validateQueries(prepared,frame,error),"sphere endpoints validate, including its grazing triangles");
+        check(frame.texels.size()==frame.height*nt::kTextureWidth
+            && frame.texels.size()>=(8+c.triangles*4)*std::size_t(frame.sampleControl[2]),"sample table texture grows with the sphere");
+        arbitgpu::NativeFixtureDiffractionBands bands;
+        check(arbitgpu::nativeFixtureDiffractionBandSchedule(f.program,1920,1080,false,bands),"large receiver frame schedules bands");
+        std::uint64_t perPixel=0;
+        check(arbitgpu::nativeFixtureDiffractionPixelQueries(8,c.triangles*4,perPixel),"per pixel queries fit");
+        arbitgpu::nativeFixtureDiffractionSplitBandsByQueries(bands,perPixel);
+        std::uint32_t rows=0;for(std::uint32_t b=0;b<bands.bandCount;++b)rows+=arbitgpu::nativeFixtureDiffractionBandRows(bands,b);
+        check(bands.bandCount>1 && rows==1080,"query split covers every row exactly once");
+    }
 }
 
 }
 int main()
 {
-    geometryAndVisibility();refusals();gratingResponse();nativeTableAdmission();
+    geometryAndVisibility();refusals();gratingResponse();nativeTableAdmission();largeGratingAdmission();
     std::printf("diffraction triangle transport: %d/%d checks passed\n",checks-failures,checks);
     return failures?EXIT_FAILURE:EXIT_SUCCESS;
 }

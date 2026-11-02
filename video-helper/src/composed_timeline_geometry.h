@@ -1,6 +1,8 @@
 #pragma once
 
+#include "timeline_scene_evaluation_inputs.h"
 #include <atomic>
+#include <cstring>
 
 #include "geometry_core_admission.h"
 #include "water_surface_replay.h"
@@ -35,7 +37,8 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
     const videorender::ParticleHistorySource* waterHistory = nullptr,
     double projectSeconds = std::numeric_limits<double>::quiet_NaN(),
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalFrame = {},
-    const videorender::WaterCoupledFrame* coupledWater = nullptr) {
+    const videorender::WaterCoupledFrame* coupledWater = nullptr,
+    const std::shared_ptr<const void>& planPublication = {}) {
   if (!authored) {
     error = "Timeline Scene3D requires an authored scene";
     return {};
@@ -52,18 +55,33 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
     error = "Coupled Timeline Scene3D requires the completed frame at its exact project-zero time";
     return {};
   }
-  const auto value = videowire::geometry::decodeTimelineScenePlan(binding, error);
-  if (!value || !videowire::geometry::validTimelineSceneBinding(binding, *authored, *value, error)) {
-    if (error.empty()) error = "Timeline Scene3D binding does not match its authored mesh";
-    return {};
+  // The first frame of an authored scene checks the whole plan and mesh. Later frames
+  // only change time, and on this mesh those checks cost several seconds each.
+  auto admitted = runtime.reuseVerifiedTimelinePlan(owner, binding, authored, planPublication);
+  const bool verified = admitted.has_value();
+  // A converging preview asks for the same frame once per sample. The result is a function of
+  // these inputs and is never written after it is published, so the same inputs get the same
+  // snapshot, and the static owner, its seam and its digest all survive to the next sample.
+  // Coupled water reads a per-frame body solve that these inputs do not name.
+  const auto inputs = timelineSceneEvaluationInputs(seconds, projectSeconds, waterHistory != nullptr,
+      canonicalFrame ? &canonicalFrame->key : nullptr);
+  if (verified && !coupledWater)
+    if (auto held = runtime.reuseEvaluatedTimelineScene(owner, inputs)) return held;
+  if (!verified) {
+    const auto value = videowire::geometry::decodeTimelineScenePlan(binding, error);
+    if (!value || !videowire::geometry::validTimelineSceneBinding(binding, *authored, *value, error)) {
+      if (error.empty()) error = "Timeline Scene3D binding does not match its authored mesh";
+      return {};
+    }
+    const auto bytes = videowire::geometry::decodeLoweredPlanText(binding.loweredPlan, error);
+    if (!bytes || !runtime.reconcileGeneration(owner.projectGeneration, owner.helperGeneration,
+            owner.deviceGeneration, error)) return {};
+    auto fresh = owner.use == PlanUse::preview
+        ? runtime.admitPreview(owner, *bytes, {}, {}, error)
+        : runtime.admitExport(owner, *bytes, {}, {}, error);
+    if (!fresh) return {};
+    admitted.emplace(std::move(*fresh));
   }
-  const auto bytes = videowire::geometry::decodeLoweredPlanText(binding.loweredPlan, error);
-  if (!bytes || !runtime.reconcileGeneration(owner.projectGeneration, owner.helperGeneration,
-          owner.deviceGeneration, error)) return {};
-  const auto admitted = owner.use == PlanUse::preview
-      ? runtime.admitPreview(owner, *bytes, {}, {}, error)
-      : runtime.admitExport(owner, *bytes, {}, {}, error);
-  if (!admitted) return {};
   struct OwnedScene final {
     HarmonicMIDI::grid::Visual3DScene scene;
     std::shared_ptr<const std::uint8_t> lease;
@@ -73,8 +91,11 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
   result->lease = admitted->ownerLease;
   auto evaluation = videorender::waterSurfaceFrameEvaluation(waterHistory, projectSeconds, seconds, std::move(canonicalFrame), coupledWater);
   if (!videowire::geometry::replaceTimelineSceneMesh(binding,
-          admitted->plan->value(), seconds, result->scene, error, &evaluation)) return {};
-  return std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>(result, &result->scene);
+          admitted->plan->value(), seconds, result->scene, error, &evaluation, verified)) return {};
+  if (!verified) runtime.markTimelinePlanVerified(owner, binding, authored);
+  std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluated(result, &result->scene);
+  runtime.rememberEvaluatedTimelineScene(owner, inputs, coupledWater ? nullptr : evaluated);
+  return evaluated;
 }
 } // namespace videohelper::geometry
 
@@ -128,17 +149,17 @@ inline bool add(std::size_t count,std::size_t passes,std::size_t& out) noexcept 
 
 // Only sizes, operation tags, IDs and grid/count parameters are read here.
 // No decoder, mesh copy, validator or replay runs during this schedule census.
-// The table is fixed stack storage and each lookup scans only prior records.
+// The table holds one record per operation and each lookup scans only prior records.
 inline bool childSchedule(const TimelineSceneChildAdmission& child,Envelope& out,
     std::size_t& peakReplay,std::string& error,bool allowCoupled=false) {
   struct Count final { StableId id=0; std::size_t vertices=0,indices=0,fields=0; };
-  std::array<Count,128> counts{};
   const auto& value=child.plan().value().descriptor();
   const auto operations=value.operations.size();
-  if (operations==0 || operations>counts.size() || !value.attributes.empty()
+  if (operations==0 || !value.attributes.empty()
       || !value.spectrumFields.empty() || !value.scoreFields.empty()) {
     error="Timeline family evaluation has no incremental attribute/reactive-source schedule"; return false;
   }
+  std::vector<Count> counts(operations);
   std::size_t used=0,geometryBytes=0,fieldBytes=0,edges=0,meshScratch=0;
   std::size_t geometryOutputs=0,largestVertices=0,displacements=0;
   if (!checkedAdd(out.preflightCountInitializations,counts.size(),out.preflightCountInitializations)) return false;
@@ -192,7 +213,7 @@ inline bool childSchedule(const TimelineSceneChildAdmission& child,Envelope& out
           || !add(count.fields,3*4,out.fieldComponentVisits)) return false;
     } else if (op.code==OperationCode::fieldConstant || op.code==OperationCode::constantVectorField) {
       const auto n=op.code==OperationCode::fieldConstant ? op.field.values[4] : double(op.parameters[3]);
-      if (!std::isfinite(n) || n<1 || n>Scene::kMaxVertices || std::floor(n)!=n) return false;
+      if (!std::isfinite(n) || n<1 || std::floor(n)!=n) return false;
       count.fields=static_cast<std::size_t>(n);
       if (!add(count.fields,3,out.fieldInitializations)
           || (op.code==OperationCode::fieldConstant && !add(4,3,out.fieldComponentVisits))) return false;
@@ -226,8 +247,6 @@ inline bool childSchedule(const TimelineSceneChildAdmission& child,Envelope& out
       error="Timeline family evaluation has no incremental schedule for operation "
           +std::to_string(static_cast<unsigned>(op.code)); return false;
     }
-    if (count.vertices>Scene::kMaxVertices || count.indices>Scene::kMaxIndices
-        || count.fields>Scene::kMaxVertices) return false;
     if (op.inputStableId && op.inputStableId!=op.outputStableId && op.code!=OperationCode::grid)
       if (!checkedAdd(edges,1,edges)) return false;
     if (op.secondaryInputStableId && !checkedAdd(edges,1,edges)) return false;
@@ -360,55 +379,55 @@ inline bool sameWaterOperation(const OperationRecord& a,const OperationRecord& b
 }
 
 inline bool scheduleWork(const Envelope& e,std::size_t& total) {
-  if (!checkedAdd(total,e.waterIdentityVisits,total)) return false;
-  if (!checkedAdd(total,e.waterHeightCopies,total)) return false;
-  if (!checkedAdd(total,e.waterHeightValidationVisits,total)) return false;
-  if (!checkedAdd(total,e.waterRestPositionVisits,total)) return false;
-  if (!checkedAdd(total,e.waterMemoCopyElements,total)) return false;
-  if (!checkedAdd(total,e.waterColumnDiscoveryVisits,total)) return false;
-  if (!checkedAdd(total,e.preflightChildVisits,total)) return false;
-  if (!checkedAdd(total,e.preflightOperationVisits,total)) return false;
-  if (!checkedAdd(total,e.cardinalityLookupVisits,total)) return false;
-  if (!checkedAdd(total,e.preflightCountInitializations,total)) return false;
-  if (!checkedAdd(total,e.preflightLightVisits,total)) return false;
-  if (!checkedAdd(total,e.bindingCopyRecords,total)) return false;
-  if (!checkedAdd(total,e.bindingCopyBytes,total)) return false;
-  if (!checkedAdd(total,e.sceneCopyRecords,total)) return false;
-  if (!checkedAdd(total,e.sceneCopyStringBytes,total)) return false;
-  if (!checkedAdd(total,e.ownerTransferRecords,total)) return false;
-  if (!checkedAdd(total,e.timeAnchorWrites,total)) return false;
-  if (!checkedAdd(total,e.receiptTransfers,total)) return false;
-  if (!checkedAdd(total,e.sceneValidationCalls,total)) return false;
-  if (!checkedAdd(total,e.sceneRecordVisits,total)) return false;
-  if (!checkedAdd(total,e.sceneStringByteVisits,total)) return false;
-  if (!checkedAdd(total,e.hierarchyLookupVisits,total)) return false;
-  if (!checkedAdd(total,e.hierarchyDepthIterations,total)) return false;
-  if (!checkedAdd(total,e.matrixConstructions,total)) return false;
-  if (!checkedAdd(total,e.matrixMultiplyTerms,total)) return false;
-  if (!checkedAdd(total,e.matrixElementVisits,total)) return false;
-  if (!checkedAdd(total,e.matrixPostcheckIterations,total)) return false;
-  if (!checkedAdd(total,e.lightChannelVisits,total)) return false;
-  if (!checkedAdd(total,e.vertexChannelVisits,total)) return false;
-  if (!checkedAdd(total,e.rangeComparisons,total)) return false;
-  if (!checkedAdd(total,e.topologyComparisons,total)) return false;
-  if (!checkedAdd(total,e.replayOperationVisits,total)) return false;
-  if (!checkedAdd(total,e.replayOperationScans,total)) return false;
-  if (!checkedAdd(total,e.replayInputVisits,total)) return false;
-  if (!checkedAdd(total,e.replayDependencyVisits,total)) return false;
-  if (!checkedAdd(total,e.replayOutputVisits,total)) return false;
-  if (!checkedAdd(total,e.replayParameterVisits,total)) return false;
-  if (!checkedAdd(total,e.gridVertexVisits,total)) return false;
-  if (!checkedAdd(total,e.gridCellVisits,total)) return false;
-  if (!checkedAdd(total,e.fieldInitializations,total)) return false;
-  if (!checkedAdd(total,e.fieldElementVisits,total)) return false;
-  if (!checkedAdd(total,e.fieldComponentVisits,total)) return false;
-  if (!checkedAdd(total,e.meshCopyElements,total)) return false;
-  if (!checkedAdd(total,e.displacementVisits,total)) return false;
-  if (!checkedAdd(total,e.appendVertexVisits,total)) return false;
-  if (!checkedAdd(total,e.appendIndexVisits,total)) return false;
-  if (!checkedAdd(total,e.appendTriangleVisits,total)) return false;
-  if (!checkedAdd(total,e.appendNormalVisits,total)) return false;
-  if (!checkedAdd(total,e.replacementVertexVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.waterIdentityVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.waterHeightCopies,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.waterHeightValidationVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.waterRestPositionVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.waterMemoCopyElements,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.waterColumnDiscoveryVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.preflightChildVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.preflightOperationVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.cardinalityLookupVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.preflightCountInitializations,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.preflightLightVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.bindingCopyRecords,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.bindingCopyBytes,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.sceneCopyRecords,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.sceneCopyStringBytes,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.ownerTransferRecords,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.timeAnchorWrites,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.receiptTransfers,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.sceneValidationCalls,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.sceneRecordVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.sceneStringByteVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.hierarchyLookupVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.hierarchyDepthIterations,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.matrixConstructions,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.matrixMultiplyTerms,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.matrixElementVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.matrixPostcheckIterations,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.lightChannelVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.vertexChannelVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.rangeComparisons,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.topologyComparisons,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.replayOperationVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.replayOperationScans,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.replayInputVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.replayDependencyVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.replayOutputVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.replayParameterVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.gridVertexVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.gridCellVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.fieldInitializations,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.fieldElementVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.fieldComponentVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.meshCopyElements,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.displacementVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.appendVertexVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.appendIndexVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.appendTriangleVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.appendNormalVisits,total)) return false;
+  if (!timelinefamily::visitAdd(total,e.replacementVertexVisits,total)) return false;
   return true;
 }
 
@@ -416,51 +435,54 @@ inline bool sceneSchedule(const Scene& scene,std::size_t children,Envelope& out,
     std::size_t& sceneBytes,std::string& error) {
   const auto O=scene.objectCount,M=scene.materialCount,T=scene.textureCount;
   const auto L=scene.lightCount,C=scene.cameraCount,V=scene.vertexCount;
-  std::size_t calls=0,depths=0,multiplies=0,lookups=0,records=0,strings=0;
-  if (!checkedMul(children,2,calls) || !checkedMul(O,O+1,depths)
-      || !checkedMul(O,O,multiplies) || !checkedAdd(depths,multiplies,lookups)
-      || !checkedMul(lookups,O,lookups)
-      || !checkedMul(calls,lookups,out.hierarchyLookupVisits)
-      || !checkedAdd(depths,multiplies,out.hierarchyDepthIterations)
-      || !checkedMul(calls,out.hierarchyDepthIterations,out.hierarchyDepthIterations)
-      || !checkedAdd(O,multiplies,out.matrixConstructions)
-      || !checkedMul(calls,out.matrixConstructions,out.matrixConstructions)
-      || !checkedMul(calls,multiplies,out.matrixMultiplyTerms)
-      || !checkedMul(out.matrixMultiplyTerms,64,out.matrixMultiplyTerms)
-      || !add(out.matrixConstructions,32,out.matrixElementVisits)
-      || !add(out.matrixMultiplyTerms,3,out.matrixElementVisits)
-      || !add(calls,O*30,out.matrixElementVisits)
-      || !add(calls,multiplies*32,out.matrixElementVisits)
-      || !add(calls,O*6,out.matrixPostcheckIterations)) goto overflow;
+  std::size_t calls=0,depths=0,multiplies=0,lookups=0,records=0,strings=0,terms=0;
+  // These count visits, not bytes. They saturate as the admission family's do:
+  // a huge scene's cubic estimate stays at the top of size_t and refuses nothing.
+  if (!timelinefamily::visitMul(children,2,calls) || !timelinefamily::visitMul(O,O+1,depths)
+      || !timelinefamily::visitMul(O,O,multiplies) || !timelinefamily::visitAdd(depths,multiplies,lookups)
+      || !timelinefamily::visitMul(lookups,O,lookups)
+      || !timelinefamily::visitMul(calls,lookups,out.hierarchyLookupVisits)
+      || !timelinefamily::visitAdd(depths,multiplies,out.hierarchyDepthIterations)
+      || !timelinefamily::visitMul(calls,out.hierarchyDepthIterations,out.hierarchyDepthIterations)
+      || !timelinefamily::visitAdd(O,multiplies,out.matrixConstructions)
+      || !timelinefamily::visitMul(calls,out.matrixConstructions,out.matrixConstructions)
+      || !timelinefamily::visitMul(calls,multiplies,out.matrixMultiplyTerms)
+      || !timelinefamily::visitMul(out.matrixMultiplyTerms,64,out.matrixMultiplyTerms)
+      || !timelinefamily::visitAddMul(out.matrixConstructions,32,out.matrixElementVisits)
+      || !timelinefamily::visitAddMul(out.matrixMultiplyTerms,3,out.matrixElementVisits)
+      || !timelinefamily::visitAddMul(calls,O*30,out.matrixElementVisits)
+      || !timelinefamily::visitMul(multiplies,32,terms)
+      || !timelinefamily::visitAddMul(calls,terms,out.matrixElementVisits)
+      || !timelinefamily::visitAddMul(calls,O*6,out.matrixPostcheckIterations)) goto overflow;
   out.sceneValidationCalls=calls;
-  for (const auto n : {O,M,T,L,C}) if (n && !add(n,n-1,records)) goto overflow;
+  for (const auto n : {O,M,T,L,C}) if (n && !timelinefamily::visitAddMul(n,n-1,records)) goto overflow;
   records/=2; // Exact duplicateIdAt earlier-record visits.
-  if (!checkedAdd(records,lookups,records) || !add(O,O+M+scene.indexCount,records)
-      || !add(M,5*T,records) || !checkedAdd(records,C,records)
-      || !checkedAdd(records,T+M+2*O+V+2*L+C,records)
-      || !checkedMul(calls,records,out.sceneRecordVisits)
-      || !add(calls,L*(3+3*diffractionmaterial::kMaximumSpectralSamples),out.lightChannelVisits)
-      || !add(calls,V*8,out.vertexChannelVisits)
-      || !add(children,O,out.rangeComparisons)
+  if (!timelinefamily::visitAdd(records,lookups,records) || !timelinefamily::visitAddMul(O,O+M+scene.indexCount,records)
+      || !timelinefamily::visitAddMul(M,5*T,records) || !timelinefamily::visitAdd(records,C,records)
+      || !timelinefamily::visitAdd(records,T+M+2*O+V+2*L+C,records)
+      || !timelinefamily::visitMul(calls,records,out.sceneRecordVisits)
+      || !timelinefamily::visitAddMul(calls,L*(3+3*diffractionmaterial::kMaximumSpectralSamples),out.lightChannelVisits)
+      || !timelinefamily::visitAddMul(calls,V*8,out.vertexChannelVisits)
+      || !timelinefamily::visitAddMul(children,O,out.rangeComparisons)
       // valid binding plus replacement perform three object and two material
       // lookups, then the baseline equality walks vertices and local indices.
-      || !add(children,3*O+2*M,out.sceneRecordVisits)) goto overflow;
+      || !timelinefamily::visitAddMul(children,3*O+2*M,out.sceneRecordVisits)) goto overflow;
   out.preflightLightVisits=scene.lights.size();
   for (const auto& light : scene.lights) {
     if (!checkedAdd(strings,light.environmentImage.asset.id.size(),strings)
         || !checkedAdd(strings,light.environmentImage.asset.contentSha256.size(),strings)) goto overflow;
   }
-  if (!checkedMul(calls,strings,out.sceneStringByteVisits)) goto overflow;
+  timelinefamily::visitMul(calls,strings,out.sceneStringByteVisits);
   sceneBytes=sizeof(Scene);
   if (!add(scene.textureTexels.size(),sizeof(HarmonicMIDI::grid::SceneTexelRgba8),sceneBytes)
       || !checkedAdd(sceneBytes,strings,sceneBytes)
-      || !add(Scene::kMaxLights,2,sceneBytes)) goto overflow;
+      || !add(scene.lights.size(),2,sceneBytes)) goto overflow;
   // One result default construction and full assignment. Each child creates
   // a baseline and evaluated scene, both default-constructed fixed arrays.
   records=scene.vertices.size()+scene.indices.size()+scene.objects.size()+scene.materials.size()
       +scene.textures.size()+scene.lights.size()+scene.cameras.size();
-  if (!add(records,2+2*children,out.sceneCopyRecords)
-      || !checkedAdd(out.sceneCopyRecords,scene.textureTexels.size(),out.sceneCopyRecords)) goto overflow;
+  timelinefamily::visitAddMul(records,2+2*children,out.sceneCopyRecords);
+  timelinefamily::visitAdd(out.sceneCopyRecords,scene.textureTexels.size(),out.sceneCopyRecords);
   out.sceneCopyStringBytes=strings;
   error.clear(); return true;
 overflow:
@@ -532,10 +554,10 @@ public:
       Envelope* destination; Envelope& envelope; const decltype(envelope.water.work)& attempts;
       ~Receipt() { if (destination) { envelope.attemptedWaterWork=attempts; *destination=envelope; } }
     } report{receipt,envelope,attemptedWaterWork_};
-    std::array<WaterChild,Scene::kMaxObjects> waterChildren{};
-    if (family->children().empty() || family->children().size()>waterChildren.size()) {
-      error="Timeline family Water child schedule exceeds the admitted object capacity"; return {};
+    if (family->children().empty()) {
+      error="Timeline family Water child schedule has no children"; return {};
     }
+    std::vector<WaterChild> waterChildren(family->children().size());
     std::size_t childIndex=0;
     envelope.preflightChildVisits=family->children().size();
     envelope.bindingCopyRecords=family->children().size();
@@ -631,7 +653,7 @@ public:
         || !videowire::geometry::checkedAdd(peakReplay,sizeof(Scene),envelope.scratchBytes)
         || !videowire::geometry::checkedAdd(envelope.scratchBytes,bindingsBytes,envelope.scratchBytes)
         || !videowire::geometry::checkedAdd(envelope.scratchBytes,waterScratch,envelope.scratchBytes)
-        || !videowire::geometry::checkedAdd(envelope.scratchBytes,sizeof(waterChildren),envelope.scratchBytes)
+        || !videowire::geometry::checkedAdd(envelope.scratchBytes,waterChildren.size()*sizeof(WaterChild),envelope.scratchBytes)
         || !videowire::geometry::checkedAdd(envelope.scratchBytes,sizeof(videowire::geometry::RuntimeFieldEvaluation),envelope.scratchBytes)
         || !videowire::geometry::checkedAdd(envelope.retainedBytes,envelope.waterHeightBytes,envelope.retainedBytes)
         || !add(envelope.waterChildren,sizeof(WaterSample),envelope.retainedBytes)) {
@@ -735,15 +757,19 @@ public:
         || !parameters.history->score || !frame || !parameters.geometryBinding || !parameters.geometryBinding->mesh
         || !std::isfinite(sourceSeconds) || sourceSeconds<0 || sourceSeconds>10 || sourceSeconds!=bodySeconds
         || sourceSeconds!=projectSeconds || parameters.historyProjectSeconds!=projectSeconds
-        || !std::isfinite(aspect) || aspect<=0 || family->children().size()<2
-        || family->children().size()>Scene::kMaxObjects) {
+        || !std::isfinite(aspect) || aspect<=0 || family->children().size()<2) {
       error="Coupled family requires exact admitted ownership, one Water child, authored siblings and equal finite clocks"; return {};
     }
     std::lock_guard<std::mutex> lock(mutex_);
     auto caller=videorender::particleBodyRenderThreadCaller(error);
     if (!caller || !caller->onCallerThread()) return {};
     // Fixed prospective metadata envelope precedes all child schedule scans.
-    if (!caller->charge(sizeof(Scene)+Scene::kMaxObjects*128*128*8)) {
+    std::size_t censusBytes=0;
+    if (!checkedMul(family->scene().objects.size(),128*128*8,censusBytes)
+        || !checkedAdd(censusBytes,sizeof(Scene),censusBytes)) {
+      error="Coupled family schedule census size overflows for "+std::to_string(family->scene().objects.size())+" objects"; return {};
+    }
+    if (!caller->charge(censusBytes)) {
       error="Coupled family permanent schedule census admission is short"; return {};
     }
     Envelope e; std::size_t sceneBytes=0,peakReplay=0,bindingsBytes=0,familyWork=0;
@@ -818,10 +844,8 @@ public:
     // inspector envelopes. This prerequisite publishes the family and pair;
     // production append/native association is still a separate owner handoff.
     const auto& anchor=family->scene();
-    if (parameters.count<1 || parameters.count>63 || std::size_t(parameters.count)>Scene::kMaxObjects-anchor.objectCount
-        || anchor.materialCount>=Scene::kMaxMaterials || anchor.vertexCount>Scene::kMaxVertices-6
-        || anchor.indexCount>Scene::kMaxIndices-24) {
-      error="Coupled family sphere append exceeds the current authored scene capacities"; return {};
+    if (parameters.count<1) {
+      error="Coupled family sphere append needs at least one body"; return {};
     }
     const auto* ancestor=&child.object();
     for (std::size_t depth=0;ancestor && depth<anchor.objectCount;++depth) {
@@ -841,7 +865,7 @@ public:
     const auto finalVisits=2*finalObjects*finalObjects*finalObjects+400*finalObjects*finalObjects
         +finalObjects*(anchor.indexCount+24+anchor.materialCount+1+finalObjects+64)+sizeof(Scene);
     if (!add(finalVisits,12,appendWork)
-        || !add(std::size_t(parameters.count),Scene::kMaxObjects*Scene::kMaxObjects,appendWork)
+        || !add(std::size_t(parameters.count),finalObjects*finalObjects,appendWork)
         || !checkedAdd(appendWork,6+24+water.rest->positions.size()+water.rest->indices.size(),appendWork)) return {};
     coupledwaterbudget::Recipe recipe;
     if (!coupledwaterbudget::complete(parameters,*water.operation,*water.rest,water.grid,frame,projectSeconds,

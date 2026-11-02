@@ -16,6 +16,8 @@
 namespace
 {
 constexpr double pi = 3.141592653589793238462643383279502884;
+// What a value from the float authority can round by against a double reference.
+constexpr double kFloatTolerance = 16.0 * std::numeric_limits<float>::epsilon();
 constexpr std::size_t phaseSamples = 65536;
 constexpr std::size_t crossedAxisSamples = 1024;
 constexpr std::uint32_t samplingTrials = 1048576;
@@ -32,9 +34,15 @@ void check(bool condition, const std::string& message)
     }
 }
 
-double dot(const std::array<double, 3>& a, const std::array<double, 3>& b)
+template <typename A, typename B>
+double dot(const std::array<A, 3>& a, const std::array<B, 3>& b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+std::array<float, 3> narrow(const std::array<double, 3>& v)
+{
+    return { static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]) };
 }
 
 std::array<double, 3> normalized(std::array<double, 3> v)
@@ -246,7 +254,8 @@ void runCase(diffractionmaterial::Description description, double wavelength,
     if (!admitted)
         return;
     DiffractionOrderDistribution production;
-    check(evaluateDiffractionOrders(*admitted, wavelength, frame, incident, uv,
+    check(evaluateDiffractionOrders(*admitted, static_cast<float>(wavelength), frame, narrow(incident),
+                                    { static_cast<float>(uv[0]), static_cast<float>(uv[1]) },
                                     production, error),
           std::string(label) + " evaluates: " + error);
     if (production.orderCount == 0)
@@ -266,8 +275,10 @@ void runCase(diffractionmaterial::Description description, double wavelength,
         const auto& actual = production.orders[index];
         check(actual.primary == expected.primary && actual.secondary == expected.secondary,
               std::string(label) + " order identity agrees");
-        const double directionDot = std::clamp(dot(actual.direction, expected.direction), -1.0, 1.0);
-        check(std::acos(directionDot) <= 1.0e-6,
+        double directionGap = 0.0;
+        for (std::size_t a = 0; a < 3; ++a)
+            directionGap = std::max(directionGap, std::abs(actual.direction[a] - expected.direction[a]));
+        check(directionGap <= kFloatTolerance,
               std::string(label) + " independently built world direction agrees");
         const double powerError = std::abs(actual.reflectedPower - expected.power);
         const double relativeTolerance = description.geometry.lattice
@@ -299,11 +310,11 @@ void runCase(diffractionmaterial::Description description, double wavelength,
     }
     check(asymmetricPropagation || production.orderCount == 1,
           std::string(label) + " has a positive or sole propagating order");
-    check(std::abs(probabilitySum - 1.0) <= 2.0e-12,
+    check(std::abs(probabilitySum - 1.0) <= ordercore::probabilityTolerance,
           std::string(label) + " probabilities normalize");
     check(std::abs(production.resolvedReflectedPower + production.unresolvedReflectedPower
                    - production.substrateReflectedPower)
-              <= 1.0e-10 * std::max(1.0, production.substrateReflectedPower),
+              <= ordercore::distributionConsistencyTolerance * std::max(1.0, static_cast<double>(production.substrateReflectedPower)),
           std::string(label) + " reflected energy ledger closes");
 
     std::vector<std::uint32_t> counts(production.orderCount, 0u);
@@ -333,55 +344,315 @@ void runCase(diffractionmaterial::Description description, double wavelength,
           std::string(label) + " sampled energy tolerance");
 }
 
+// Each wavelength and view offset the disc can reach, through the two calls the
+// integrator makes. A uniform sky returns resolved plus unresolved power, whichever
+// order is drawn, so a refused sample shows as that wavelength's loss.
+// Offsets past 0.8 are the steep views where the scalar orders sum above the metal's
+// reflectance; they must still return exactly that reflectance.
+void perWavelengthFurnaceTests()
+{
+    using namespace diffractionmaterial;
+    const DiffractionLocalFrame frame { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
+    for (const float depth : { 30.0f, 70.0f, 100.0f })
+    {
+        auto description = makeAluminiumBinaryGratingPreset();
+        description.geometry.directionUv = { 1.0f, 0.0f };
+        description.geometry.grooveSpacingNanometres = 1400.0f;
+        description.microstructure.dutyCycle = 0.5f;
+        description.microstructure.grooveDepthNanometres = depth;
+        std::string error;
+        const auto admitted = admit(description, error);
+        check(admitted.has_value(), "the furnace grating admits: " + error);
+        if (!admitted)
+            continue;
+        int refused = 0, wrongEnergy = 0;
+        for (int nanometres = 380; nanometres <= 780; nanometres += 5)
+            for (int percent = 0; percent <= 98; percent += 2)
+            {
+                const double offset = percent / 100.0;
+                const auto incident = narrow({ -offset, 0.0, std::sqrt(1.0 - offset * offset) });
+                DiffractionOrderDistribution distribution;
+                if (!evaluateDiffractionOrders(*admitted, nanometres, frame, incident, { 0.5, 0.5 },
+                                               distribution, error))
+                {
+                    ++refused;
+                    continue;
+                }
+                double returned = distribution.unresolvedReflectedPower;
+                for (std::uint32_t trial = 0; trial < 64; ++trial)
+                {
+                    DiffractionOrderSample sample;
+                    if (!sampleDiffractionOrder(distribution, lowDiscrepancySample(trial), sample, error))
+                        ++refused;
+                    else
+                        returned += sample.throughput / 64.0;
+                }
+                if (std::abs(returned - distribution.substrateReflectedPower) > 1.0e-2)
+                    ++wrongEnergy;
+            }
+        check(refused == 0, "every wavelength and offset evaluates and samples, refused "
+                                + std::to_string(refused) + " at depth " + std::to_string(depth));
+        check(wrongEnergy == 0, "every wavelength returns the metal's reflectance, wrong at "
+                                    + std::to_string(wrongEnergy) + " points at depth " + std::to_string(depth));
+    }
+}
+
+// The measured table reaches the path's wavelength, and a material without it stays constant.
+void measuredAluminiumTests()
+{
+    using namespace diffractionmaterial;
+    const DiffractionLocalFrame frame { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
+    auto description = makeAluminiumBinaryGratingPreset();
+    description.geometry.directionUv = { 1.0f, 0.0f };
+    description.geometry.grooveSpacingNanometres = 1400.0f;
+    std::string error;
+    const auto constant = admit(description, error);
+    check(constant.has_value(), "the constant grating admits: " + error);
+    description.substrateData = SubstrateData::AluminiumMcPeak2015;
+    const auto measured = admit(description, error);
+    check(measured.has_value(), "the measured grating admits: " + error);
+    if (!constant || !measured)
+        return;
+    check(constant->structuralDigest() != measured->structuralDigest(),
+          "the table is part of the material's identity");
+    const std::array<float, 3> incident { 0.0f, 0.0f, 1.0f };
+    const auto power = [&](const auto& material, double nanometres)
+    {
+        DiffractionOrderDistribution distribution;
+        check(evaluateDiffractionOrders(material, nanometres, frame, incident, { 0.5, 0.5 }, distribution, error),
+              "the evaluator takes " + std::to_string(nanometres) + " nm: " + error);
+        return distribution.substrateReflectedPower;
+    };
+    // Normal-incidence Fresnel from the source file's own rows at these wavelengths.
+    for (const auto& row : std::array<std::array<double, 2>, 4> {
+             { { 380.0, 0.9245 }, { 550.0, 0.9157 }, { 700.0, 0.8951 }, { 780.0, 0.8692 } } })
+        check(std::abs(power(*measured, row[0]) - row[1]) < 5.0e-4,
+              "measured reflectance at " + std::to_string(row[0]) + " nm");
+    // 545 lies between table rows; the source's 5 nm row there gives 0.9160.
+    check(std::abs(power(*measured, 545.0) - 0.9160) < 5.0e-4, "the table interpolates between rows");
+    check(power(*measured, 380.0) > power(*measured, 780.0) + 0.05, "the metal falls toward the near infrared");
+    check(power(*constant, 380.0) == power(*constant, 780.0), "constants stay flat across wavelength");
+    description.substrateData = static_cast<SubstrateData>(2);
+    check(!admit(description, error).has_value(), "unknown substrate data is refused");
+}
+
+// Orders in a medium: the grating's step is lambda / (n d), and n sin(theta) is the same as
+// in air, so Snell at the top surface returns the air grating's directions.
+void orderMediumTests()
+{
+    using namespace diffractionmaterial;
+    const DiffractionLocalFrame frame { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
+    auto description = makeAluminiumBinaryGratingPreset();
+    description.geometry.directionUv = { 1.0f, 0.0f };
+    description.geometry.grooveSpacingNanometres = 1400.0f;
+    description.microstructure.grooveDepthNanometres = 70.0f;
+    description.substrateData = SubstrateData::AluminiumMcPeak2015;
+    description.orderMedium = OrderMedium::SurroundingMedium;
+    description.spectrum.lastOrder = 3;
+    std::string error;
+    const auto admitted = admit(description, error);
+    check(admitted.has_value(), "a grating in a medium admits: " + error);
+    if (!admitted)
+        return;
+    const std::array<float, 3> incident { 0.0f, 0.0f, 1.0f };
+    constexpr double index = 1.5893;
+    DiffractionOrderDistribution air, inside;
+    check(evaluateDiffractionOrders(*admitted, 550.0, frame, incident, { 0.5, 0.5 }, air, error), error);
+    check(evaluateDiffractionOrders(*admitted, 550.0, frame, incident, { 0.5, 0.5 }, inside, error, index), error);
+    const auto orderOf = [](const DiffractionOrderDistribution& distribution, int order) -> const DiffractionOrder*
+    {
+        for (std::size_t at = 0; at < distribution.orderCount; ++at)
+            if (distribution.orders[at].primary == order)
+                return &distribution.orders[at];
+        return nullptr;
+    };
+    const auto* airOne = orderOf(air, 1);
+    const auto* insideOne = orderOf(inside, 1);
+    check(airOne != nullptr && insideOne != nullptr, "order 1 propagates on both sides");
+    if (airOne != nullptr && insideOne != nullptr)
+    {
+        check(std::abs(std::abs(airOne->direction[0]) - 550.0 / 1400.0) < kFloatTolerance, "in air sin(theta) is lambda / d");
+        check(std::abs(std::abs(insideOne->direction[0]) * index - 550.0 / 1400.0) < kFloatTolerance,
+              "in the medium n sin(theta) is lambda / d, so it leaves at the air grating's angle");
+    }
+    // Order 3 at 550 nm: sin(theta) 1.18 in air, so absent, and 0.74 inside, so present.
+    check(orderOf(air, 3) == nullptr && orderOf(inside, 3) != nullptr, "the medium admits an order air cannot carry");
+    // Metal against the medium: |(n - m) / (n + m)|^2 with m = 0.7894 + 5.8519i.
+    check(std::abs(inside.substrateReflectedPower - 0.874) < 1.0e-3, "the metal reflects less against plastic");
+    // Binary depth 70 at normal incidence: phase 4 pi 70 n / lambda = 2.54 rad,
+    // so order 0 is cos^2(1.27) = 0.087 of the metal, against 0.486 in air.
+    const auto* airZero = orderOf(air, 0);
+    const auto* insideZero = orderOf(inside, 0);
+    check(airZero != nullptr && insideZero != nullptr, "order 0 exists on both sides");
+    if (airZero != nullptr && insideZero != nullptr)
+    {
+        check(std::abs(insideZero->reflectedPower / inside.substrateReflectedPower - 0.0873) < 2.0e-3,
+              "the groove's optical depth is n times its depth");
+        check(std::abs(airZero->reflectedPower / air.substrateReflectedPower - 0.4857) < 2.0e-3,
+              "in air the groove's depth is its own");
+    }
+    check(!evaluateDiffractionOrders(*admitted, 550.0, frame, incident, { 0.5, 0.5 }, inside, error, 0.9),
+          "an index below 1 is refused");
+    DiffractionOrderDistribution untouched;
+    const auto plain = [&] { auto copy = description; copy.orderMedium = OrderMedium::Air; return admit(copy, error); }();
+    check(plain.has_value() && plain->structuralDigest() != admitted->structuralDigest(),
+          "the medium is part of the material's identity");
+    check(plain.has_value() && evaluateDiffractionOrders(*plain, 550.0, frame, incident, { 0.5, 0.5 }, untouched, error)
+              && untouched.substrateReflectedPower == air.substrateReflectedPower,
+          "with index 1 the evaluator computes what air always did");
+    auto unknown = description;
+    unknown.orderMedium = static_cast<OrderMedium>(2);
+    check(!admit(unknown, error).has_value(), "an unknown order medium is refused");
+}
+
+void pressedDiscPitTests()
+{
+    using namespace diffractionmaterial;
+    const DiffractionLocalFrame frame { { 1.0, 0.0, 0.0 }, { 0.0, 1.0, 0.0 }, { 0.0, 0.0, 1.0 } };
+    auto description = makeAluminiumBinaryGratingPreset();
+    description.geometry.directionUv = { 1.0f, 0.0f };
+    description.geometry.grooveSpacingNanometres = 1600.0f;
+    description.microstructure.grooveDepthNanometres = 124.1f;
+    description.microstructure.dutyCycle = 0.3125f;
+    description.substrateData = SubstrateData::AluminiumMcPeak2015;
+    description.orderMedium = OrderMedium::SurroundingMedium;
+    description.pitStatistics = PitStatistics::PressedDisc;
+    description.spectrum.lastOrder = 3;
+    std::string error;
+    const auto admitted = admit(description, error);
+    check(admitted.has_value(), "a pressed disc track admits: " + error);
+    if (!admitted)
+        return;
+    const std::array<float, 3> incident { 0.0f, 0.0f, 1.0f };
+    constexpr double index = 1.5893;
+    DiffractionOrderDistribution pits;
+    check(evaluateDiffractionOrders(*admitted, 550.0, frame, incident, { 0.5, 0.5 }, pits, error, index), error);
+    const auto share = [](const DiffractionOrderDistribution& distribution, int order)
+    {
+        for (std::size_t at = 0; at < distribution.orderCount; ++at)
+            if (distribution.orders[at].primary == order)
+                return distribution.orders[at].reflectedPower / distribution.substrateReflectedPower;
+        return -1.0f;
+    };
+    // 550 nm, n 1.5893, depth 124.1: phase 4 pi 124.1 n / 550 = 4.506 rad at order 0, and
+    // qW = 0.15625. Orders past 0 add their cosine, in the phase and as the power's factor.
+    check(std::abs(share(pits, 0) - 0.6824) < 1.0e-3, "order 0 is |1 + (e^(i phase) - 1) q W|^2");
+    check(std::abs(share(pits, 1) - 0.04296) < 1.0e-3, "order 1 follows the pit width's sinc");
+    check(std::abs(share(pits, -1) - 0.04296) < 1.0e-3, "order -1 mirrors order 1 at normal incidence");
+    check(std::abs(share(pits, 2) - 0.01379) < 1.0e-3, "order 2 is not zero, as a pit is not half the pitch");
+    check(std::abs(share(pits, 3) - 0.00027) < 1.0e-3, "order 3 is near the sinc's zero at m W = 1");
+    // W q (1 - q) |e^(i phase) - 1|^2 = 0.3125 x 0.25 x 2.41 = 0.188 of the metal forms no
+    // order, so at least that much stays out of the resolved power.
+    const double unresolved = 1.0 - pits.resolvedReflectedPower / pits.substrateReflectedPower;
+    check(std::abs(unresolved - 0.2036) < 2.0e-3 && unresolved > 0.188, "the pits' noise forms no order");
+    check(std::abs(pits.pitScatterPower / pits.substrateReflectedPower - 0.1882) < 1.0e-3, "that noise is the pit scatter");
+    // The track orders and the pit scatter are one budget, so the lobe's power is not
+    // counted twice. The orders past 20000 hold about 5e-6.
+    for (const auto [nanometres, n] : { std::pair<double, double> { 450.0, 1.6074 }, { 550.0, index }, { 650.0, 1.5792 } })
+    {
+        DiffractionOrderDistribution at;
+        check(evaluateDiffractionOrders(*admitted, nanometres, frame, incident, { 0.5, 0.5 }, at, error, n), error);
+        const float phase = static_cast<float>(4.0 * 3.14159265358979323846 * 124.1 * n / nanometres);
+        // W q (1 - q) |e^(i phase) - 1|^2, by Parseval.
+        const double sine = std::sin(0.5 * phase);
+        const double parseval = 0.3125 * sine * sine;
+        double total = parseval;
+        for (int order = -20000; order <= 20000; ++order)
+            total += ordercore::pressedDiscEfficiency(order, 0.3125f, phase);
+        check(std::abs(total - 1.0) < 1.0e-4, "orders plus pit scatter are the metal's power at " + std::to_string(nanometres) + " nm, " + std::to_string(total));
+        // Each resolved order's phase uses its own outgoing cosine, which moves its power
+        // off the normal-incidence figure, and orders past lastOrder stay unresolved. Where
+        // the first outweighs the second, as at 450 nm, the scatter is what is left: 0.00032.
+        const double scatter = at.pitScatterPower / at.substrateReflectedPower;
+        double gained = 0.0, listed = 0.0;
+        for (std::size_t i = 0; i < at.orderCount; ++i)
+        {
+            const float normal = ordercore::pressedDiscEfficiency(at.orders[i].primary, 0.3125f, phase);
+            gained += at.orders[i].reflectedPower / at.substrateReflectedPower - normal;
+            listed += normal;
+        }
+        const double shortfall = std::max(0.0, gained - (total - parseval - listed));
+        check(std::abs(scatter - (parseval - shortfall)) < 1.0e-5, "the compiled pit scatter is that term less the orders' gain at " + std::to_string(nanometres) + " nm, " + std::to_string(scatter));
+        check(nanometres != 450.0 || std::abs(shortfall - 0.00032) < 1.0e-5, "450 nm gives up the derived 0.00032, " + std::to_string(shortfall));
+        check(at.resolvedReflectedPower + at.pitScatterPower <= at.substrateReflectedPower * 1.000001f, "orders and pit scatter stay inside the metal's power");
+    }
+    // lambda / n / w = 550 / 1.5893 / 500, and lambda / n / (pi 1354).
+    check(std::abs(pits.pitAcrossWidth - 0.6921) < 1.0e-3, "across tracks it spreads by the pit's width");
+    check(std::abs(pits.pitAlongWidth - 0.08135) < 1.0e-4, "along tracks it spreads by the mean run");
+    check(std::abs(std::abs(pits.pitAcrossAxis[0]) - 1.0) < 1.0e-6 && std::abs(pits.pitAlongAxis[1] - pits.pitAcrossAxis[0]) < 1.0e-6,
+          "the scatter's axes are the track's axes");
+    auto stripes = description;
+    stripes.pitStatistics = PitStatistics::None;
+    const auto plain = admit(stripes, error);
+    DiffractionOrderDistribution continuous;
+    check(plain.has_value() && plain->structuralDigest() != admitted->structuralDigest(),
+          "pit statistics are part of the material's identity");
+    // A continuous groove of the same shape: 1 - 4 W (1 - W) sin^2(phase / 2) = 0.483.
+    check(plain.has_value()
+              && evaluateDiffractionOrders(*plain, 550.0, frame, incident, { 0.5, 0.5 }, continuous, error, index)
+              && std::abs(share(continuous, 0) - 0.483) < 2.0e-3,
+          "without pit statistics the groove computes what it always did");
+    check(continuous.pitScatterPower == 0.0, "without pit statistics nothing scatters");
+    auto crossed = makeCrossedTwoDimensionalGratingPreset();
+    crossed.pitStatistics = PitStatistics::PressedDisc;
+    check(!admit(crossed, error).has_value(), "pit statistics refuse a crossed lattice");
+    auto sinusoidal = description;
+    sinusoidal.microstructure.profile = GrooveProfile::Sinusoidal;
+    check(!admit(sinusoidal, error).has_value(), "pit statistics refuse a non-binary profile");
+    auto unknown = description;
+    unknown.pitStatistics = static_cast<PitStatistics>(2);
+    check(!admit(unknown, error).has_value(), "unknown pit statistics are refused");
+}
+
 void boundaryAndMalformedTests()
 {
     using namespace diffractionmaterial;
     DiffractionOrderDistribution valid;
     valid.orderCount = 5;
     valid.resolvedReflectedPower = 10.0;
-    const std::array<double, 5> probabilities { 0.2, 0.0, 0.3, 0.5, 0.0 };
+    const std::array<float, 5> probabilities { 0.2f, 0.0f, 0.3f, 0.5f, 0.0f };
     for (std::size_t index = 0; index < valid.orderCount; ++index)
     {
         valid.orders[index].direction = { 0.0, 0.0, 1.0 };
         valid.orders[index].selectionProbability = probabilities[index];
-        valid.orders[index].reflectedPower = 10.0 * probabilities[index];
+        valid.orders[index].reflectedPower = 10.0f * probabilities[index];
         valid.orders[index].angularStandardDeviationRadians = 0.01;
     }
     std::string error;
     DiffractionOrderSample sample;
-    const auto owns = [&] (double u, std::size_t index, const char* label)
+    const auto owns = [&] (float u, std::size_t index, const char* label)
     {
         check(sampleDiffractionOrder(valid, u, sample, error) && sample.orderIndex == index,
               label);
     };
     owns(0.0, 0, "u=0 belongs to the first positive bin");
-    owns(std::nextafter(0.2, 0.0), 0, "value below first boundary stays in first bin");
-    owns(0.2, 2, "exact first boundary skips zero-probability interior bin");
-    owns(std::nextafter(0.2, 1.0), 2, "value above first boundary enters next positive bin");
-    owns(std::nextafter(0.5, 0.0), 2, "value below second boundary stays in middle bin");
-    owns(0.5, 3, "exact second boundary belongs to following bin");
-    owns(std::nextafter(0.5, 1.0), 3, "value above second boundary stays in following bin");
-    owns(std::nextafter(1.0, 0.0), 3, "largest unit sample skips trailing zero bin");
+    owns(std::nextafter(0.2f, 0.0f), 0, "value below first boundary stays in first bin");
+    owns(0.2f, 2, "exact first boundary skips zero-probability interior bin");
+    owns(std::nextafter(0.2f, 1.0f), 2, "value above first boundary enters next positive bin");
+    owns(std::nextafter(0.5f, 0.0f), 2, "value below second boundary stays in middle bin");
+    owns(0.5f, 3, "exact second boundary belongs to following bin");
+    owns(std::nextafter(0.5f, 1.0f), 3, "value above second boundary stays in following bin");
+    owns(std::nextafter(1.0f, 0.0f), 3, "largest unit sample skips trailing zero bin");
 
-    for (const double residual : { -0.5e-12, 0.5e-12 })
+    for (const float residual : { -0.5f * ordercore::probabilityTolerance, 0.5f * ordercore::probabilityTolerance })
     {
         auto rounded = valid;
         rounded.orders[3].selectionProbability += residual;
         rounded.orders[3].reflectedPower += residual * rounded.resolvedReflectedPower;
-        check(sampleDiffractionOrder(rounded, std::nextafter(1.0, 0.0), sample, error)
+        check(sampleDiffractionOrder(rounded, std::nextafter(1.0f, 0.0f), sample, error)
                   && sample.orderIndex == 3
-                  && sample.pdf == 0.5
+                  && std::abs(sample.pdf - 0.5f) <= std::numeric_limits<float>::epsilon()
                   && sample.order.selectionProbability == sample.pdf
                   && sample.order.reflectedPower
                       == sample.pdf * rounded.resolvedReflectedPower,
-              residual < 0.0
+              residual < 0.0f
                   ? "low tolerance edge closes canonically at one"
                   : "high tolerance edge closes canonically at one");
     }
 
-    const double nan = std::numeric_limits<double>::quiet_NaN();
-    const double inf = std::numeric_limits<double>::infinity();
-    const double huge = std::numeric_limits<double>::max();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const float huge = std::numeric_limits<float>::max();
     struct MalformedCase
     {
         const char* label;
@@ -396,7 +667,7 @@ void boundaryAndMalformedTests()
         { "per-order power and PMF mismatch rejected", [] (auto& d) { d.orders[2].reflectedPower += 0.01; } },
         { "tiny positive power in interior zero bin rejected", [] (auto& d) { d.orders[1].reflectedPower = 1.0e-15; d.orders[3].reflectedPower -= 1.0e-15; } },
         { "tiny positive power in trailing zero bin rejected", [] (auto& d) { d.orders[4].reflectedPower = 1.0e-15; d.orders[3].reflectedPower -= 1.0e-15; } },
-        { "compensated positive-bin mismatch rejected", [] (auto& d) { d.orders[0].reflectedPower += 2.0e-9; d.orders[3].reflectedPower -= 2.0e-9; } },
+        { "compensated positive-bin mismatch rejected", [] (auto& d) { d.orders[0].reflectedPower += 1.0e-3f; d.orders[3].reflectedPower -= 1.0e-3f; } },
         { "resolved-power mismatch rejected", [] (auto& d) { d.resolvedReflectedPower = 11.0; } },
         { "NaN direction rejected", [=] (auto& d) { d.orders[4].direction[0] = nan; } },
         { "non-unit trailing direction rejected", [] (auto& d) { d.orders[4].direction = { 0.0, 0.0, 2.0 }; } },
@@ -477,7 +748,7 @@ void discreteCameraPixelTests()
     const auto flatMaterial = admit(description, error);
     check(bool(flatMaterial), "flat discrete reflective IR admits"); if (!flatMaterial) return;
     const DiffractionLocalFrame frame;
-    const std::array<double,3> normal{0,0,1};
+    const std::array<float,3> normal{0,0,1};
     const DiffractionCameraIncident irradiance{DiffractionIncidentMeasure::SurfaceSpectralIrradiance, 2};
     const DiffractionCameraPixel whole{frame, pi/2, 1,1,0,0};
     DiffractionCameraPixelIntegral flat;
@@ -488,9 +759,9 @@ void discreteCameraPixelTests()
     const double reflection = interfacePower({1,0},
         {description.substrate.refractiveIndex,description.substrate.extinctionCoefficient});
     check(std::abs(flat.solidAngleSteradians-exactAngle)<1.e-12
-        &&std::abs(flat.meanSpectralRadiance-2*reflection/exactAngle)<1.e-12
-        &&std::abs(flat.pixelReflectedIrradiance-2*reflection)<1.e-12
-        &&std::abs(flat.unresolvedReflectedIrradiance)<1.e-12,
+        &&std::abs(flat.meanSpectralRadiance-2*reflection/exactAngle)<kFloatTolerance
+        &&std::abs(flat.pixelReflectedIrradiance-2*reflection)<kFloatTolerance
+        &&std::abs(flat.unresolvedReflectedIrradiance)<kFloatTolerance,
         "analytic flat limit has exact solid angle, cosine-normalized radiance and reflection");
     unsigned owners = 0;
     double angleSum = 0, integralSum = 0;
@@ -512,7 +783,7 @@ void discreteCameraPixelTests()
     DiffractionCameraPixelIntegral tilted;
     const double incidenceCosine=std::sqrt(.96);
     check(integrateDiscreteDiffractionCameraPixel(*flatMaterial,3,frame,{.2,0,incidenceCosine},irradiance,whole,tilted,error)
-        &&std::abs(tilted.meanSpectralRadiance*exactAngle-2*reflection/incidenceCosine)<1.e-12,
+        &&std::abs(tilted.meanSpectralRadiance*exactAngle-2*reflection/incidenceCosine)<kFloatTolerance,
         "surface irradiance already includes incident cosine and is divided only by exact outgoing cosine");
     description.microstructure.dutyCycle=patternedDuty;
     description.microstructure.grooveDepthNanometres=.9f;
@@ -525,9 +796,9 @@ void discreteCameraPixelTests()
     const double phase=2*pi*description.microstructure.grooveDepthNanometres*(1+exitCosine)/wavelength;
     const double signedPower=reflection*4*std::pow(std::sin(phase/2),2)
         *std::pow(std::sin(pi*description.microstructure.dutyCycle)/pi,2)*exitCosine;
-    check(std::abs(coarse.orders[0].reflectedIrradiance-2*signedPower)<1.e-12
-        &&std::abs(coarse.orders[2].reflectedIrradiance-2*signedPower)<1.e-12
-        &&std::abs(coarse.orders[0].integratedRadiance-2*signedPower/exitCosine)<1.e-12,
+    check(std::abs(coarse.orders[0].reflectedIrradiance-2*signedPower)<kFloatTolerance
+        &&std::abs(coarse.orders[2].reflectedIrradiance-2*signedPower)<kFloatTolerance
+        &&std::abs(coarse.orders[0].integratedRadiance-2*signedPower/exitCosine)<kFloatTolerance,
         "analytical binary profile and projected outgoing cosine determine the finite delta coefficient");
     DiffractionOrderDistribution original;
     check(evaluateDiffractionOrders(*material,description.spectrum.wavelengthsNanometres[3],frame,normal,{0,0},original,error),
@@ -551,10 +822,10 @@ void discreteCameraPixelTests()
         }
     }
     check(counts==std::array<unsigned,3>{1,1,1}&&coarse.orders[0].reflectedIrradiance>0
-        &&coarse.orders[2].reflectedIrradiance>0&&std::abs(partition-coarse.resolvedReflectedIrradiance)<1.e-12
-        &&std::abs(partition+coarse.unresolvedReflectedIrradiance+coarse.absorbedIrradiance-irradiance.value)<1.e-12
+        &&coarse.orders[2].reflectedIrradiance>0&&std::abs(partition-coarse.resolvedReflectedIrradiance)<kFloatTolerance
+        &&std::abs(partition+coarse.unresolvedReflectedIrradiance+coarse.absorbedIrradiance-irradiance.value)<kFloatTolerance
         &&std::abs(solidAngle-exactAngle)<1.e-12
-        &&std::abs(radianceIntegral-coarse.meanSpectralRadiance*exactAngle)<1.e-12,
+        &&std::abs(radianceIntegral-coarse.meanSpectralRadiance*exactAngle)<kFloatTolerance,
         "nontrivial signed-order angular partition preserves reflected/absorbed/unresolved energy once");
     DiffractionCameraPixelIntegral doubled, dark, away;
     auto twice=irradiance;twice.value*=2;
@@ -616,18 +887,114 @@ void discreteCameraPixelTests()
             "private delta camera authority refuses other physical models without changing their finite-lobe admission");
     }
 }
+// A second axis at 60 degrees gives first orders along six directions 60 degrees
+// apart, each a tangent step of wavelength / period, at normal incidence.
+void hexagonalOrderDirectionsTest(const diffractionmaterial::Description& material)
+{
+    using namespace diffractionmaterial;
+    std::string error;
+    const auto admitted = admit(material, error);
+    check(admitted.has_value(), "sixty degree lattice admits");
+    if (!admitted)
+        return;
+    const double wavelength = 460.0;
+    const double step = wavelength / material.geometry.grooveSpacingNanometres;
+    const DiffractionLocalFrame frame;
+    DiffractionOrderDistribution distribution;
+    check(evaluateDiffractionOrders(*admitted, wavelength, frame, { 0.0, 0.0, 1.0 }, { 0.5, 0.5 },
+                                    distribution, error),
+          "sixty degree lattice evaluates");
+    const std::array<std::array<int, 2>, 6> arms {{ { 1, 0 }, { 0, 1 }, { -1, 1 },
+                                                     { -1, 0 }, { 0, -1 }, { 1, -1 } }};
+    for (std::size_t arm = 0; arm < arms.size(); ++arm)
+    {
+        const auto found = std::find_if(distribution.orders.begin(),
+            distribution.orders.begin() + static_cast<std::ptrdiff_t>(distribution.orderCount),
+            [&] (const DiffractionOrder& order)
+            { return order.primary == arms[arm][0] && order.secondary == arms[arm][1]; });
+        check(found != distribution.orders.begin() + static_cast<std::ptrdiff_t>(distribution.orderCount),
+              "sixty degree lattice has each arm's order");
+        if (found == distribution.orders.begin() + static_cast<std::ptrdiff_t>(distribution.orderCount))
+            continue;
+        const double angle = static_cast<double>(arm) * 60.0 * pi / 180.0;
+        check(std::abs(found->direction[0] - step * std::cos(angle)) < 1.0e-5
+                  && std::abs(found->direction[1] - step * std::sin(angle)) < 1.0e-5,
+              "sixty degree lattice arm points along its sixth of the circle");
+    }
+}
+
+// With all three families on, the first orders carry equal power on all six arms
+// and match the Fourier coefficient of the three-family surface, integrated numerically.
+void hexagonalOrderPowerTest(diffractionmaterial::GrooveProfile profile, double depth,
+                             const char* name)
+{
+    using namespace diffractionmaterial;
+    auto material = makeHexagonalGratingPreset();
+    material.roughness = {};
+    material.microstructure.profile = profile;
+    material.microstructure.grooveDepthNanometres = static_cast<float>(depth);
+    material.microstructure.dutyCycle = 0.5f;
+    std::string error;
+    const auto admitted = admit(material, error);
+    check(admitted.has_value(), std::string(name) + " three-family lattice admits: " + error);
+    if (!admitted)
+        return;
+    const double wavelength = 540.0;
+    const auto height = [&] (double u, double phase)
+    {
+        if (profile == GrooveProfile::Sinusoidal)
+            return 0.5 * phase * std::cos(2.0 * pi * u);
+        return std::abs(u - std::floor(u + 0.5)) < 0.25 ? phase : 0.0;
+    };
+    DiffractionOrderDistribution distribution;
+    check(evaluateDiffractionOrders(*admitted, wavelength, DiffractionLocalFrame {}, { 0.0, 0.0, 1.0 },
+                                    { 0.5, 0.5 }, distribution, error),
+          std::string(name) + " three-family lattice evaluates");
+    double firstArm = -1.0;
+    constexpr std::size_t samples = 512;
+    for (std::size_t index = 0; index < distribution.orderCount; ++index)
+    {
+        const auto& order = distribution.orders[index];
+        const double z = order.direction[2];
+        const double phase = 2.0 * pi * depth * (1.0 + z) / wavelength;
+        std::complex<double> sum {};
+        for (std::size_t yIndex = 0; yIndex < samples; ++yIndex)
+            for (std::size_t xIndex = 0; xIndex < samples; ++xIndex)
+            {
+                const double x = (static_cast<double>(xIndex) + 0.5) / samples;
+                const double y = (static_cast<double>(yIndex) + 0.5) / samples;
+                sum += std::polar(1.0, height(x, phase) + height(y, phase) + height(x - y, phase)
+                    - 2.0 * pi * (order.primary * x + order.secondary * y));
+            }
+        sum /= static_cast<double>(samples * samples);
+        const double expected = distribution.substrateReflectedPower * std::norm(sum)
+            * (order.primary != 0 || order.secondary != 0 ? z : 1.0);
+        check(std::abs(order.reflectedPower - expected) < 0.004,
+              std::string(name) + " three-family order power matches the surface integral");
+        const bool arm = (order.primary == 0 || order.secondary == 0
+                          || order.primary == -order.secondary)
+            && (order.primary != 0 || order.secondary != 0);
+        if (!arm)
+            continue;
+        if (firstArm < 0.0)
+            firstArm = order.reflectedPower;
+        check(std::abs(order.reflectedPower - firstArm) < 1.0e-5,
+              std::string(name) + " three-family arms carry equal power");
+    }
+    check(firstArm > 0.0, std::string(name) + " three-family arms carry power");
+}
 } // namespace
 
 int main()
 {
     using namespace diffractionmaterial;
     const DiffractionLocalFrame identity;
-    const std::array<double, 3> normal { 0.0, 0.0, 1.0 };
+    const std::array<float, 3> normal { 0.0f, 0.0f, 1.0f };
 
     auto binary = makeAluminiumBinaryGratingPreset();
     binary.spectrum.lastOrder = 2;
     binary.roughness = { 3.0f, 0.08f };
-    runCase(binary, 540.0, identity, normal, { 0.5, 0.5 }, "binary 1D normal");
+    runCase(binary, 540.0, identity, { 0.0, 0.0, 1.0 }, { 0.5, 0.5 }, "binary 1D normal");
 
     const double c = std::sqrt(0.5);
     const DiffractionLocalFrame rotatedFrame {
@@ -666,6 +1033,17 @@ int main()
     runCase(crossed, 460.0, rotatedFrame, obliqueWorld, { 0.72, 0.81 },
             "crossed oblique rotated radial varying periods");
 
+    auto hexagonal = makeCrossedTwoDimensionalGratingPreset();
+    hexagonal.spectrum.lastOrder = 1;
+    hexagonal.geometry.directionUv = { 1.0f, 0.0f };
+    hexagonal.geometry.secondaryDirectionUv = { 0.5f, 0.8660254f };
+    hexagonal.geometry.secondaryGrooveSpacingNanometres = hexagonal.geometry.grooveSpacingNanometres;
+    runCase(hexagonal, 460.0, rotatedFrame, obliqueWorld, { 0.5, 0.5 },
+            "crossed at sixty degrees");
+    hexagonalOrderDirectionsTest(hexagonal);
+    hexagonalOrderPowerTest(GrooveProfile::BinaryRectangular, 120.0, "binary");
+    hexagonalOrderPowerTest(GrooveProfile::Sinusoidal, 120.0, "sinusoidal");
+
     std::string error;
     const auto admitted = admit(binary, error);
     DiffractionOrderDistribution distribution;
@@ -685,6 +1063,10 @@ int main()
           "nonfinite material coordinate fails closed");
 
     discreteCameraPixelTests();
+    perWavelengthFurnaceTests();
+    measuredAluminiumTests();
+    orderMediumTests();
+    pressedDiscPitTests();
     boundaryAndMalformedTests();
     crossedIntegrationConvergenceTest();
     std::cout << checks << " checks, " << failures << " failures\n";
