@@ -732,7 +732,7 @@ int main()
                 && error == "native surface material admission does not match the exact scene snapshot"
                 && !refused.nativeFrame && roughBackend.preparations == 0,
                 "a rough glass owner cannot bind an equal-value scene copy or leave previous Color visible");
-            runtime.glassCaustic->policy.maximumVisits = 65;
+            runtime.glassCaustic->policy.maximumVisits = 16777216u;
             refused = materialPreview;
             check(!roughRenderer.renderExport(roughScene, roughBinding, {}, runtime,
                     {32,32}, kNativeGpuCapability, refused, error)
@@ -827,7 +827,7 @@ int main()
             inputs.glassCaustic->glassMaterial = {9999};
             refuse("a mismatched caustic material refuses before native work");
             inputs.glassCaustic = selection;
-            inputs.glassCaustic->policy.maximumVisits = 65;
+            inputs.glassCaustic->policy.maximumVisits = 16777216u;
             refuse("an out-of-budget caustic branch policy refuses before native work");
             inputs.glassCaustic = selection;
             inputs.linearColor = false;
@@ -932,10 +932,9 @@ int main()
     }
     auto unsupportedVertex = vertexRequest;
     unsupportedVertex.vertexModifier->records[2].operation = videowire::VertexModifierOperation::controlParameter;
-    check(!admitSurfaceMaterialBinding(materialScene, unsupportedVertex,
-              videohelper::materialprogram::BackendTarget::Metal, error)
-          && error.find("control banks") != std::string::npos,
-          "unavailable vertex control banks reject before native preparation");
+    check(admitSurfaceMaterialBinding(materialScene, unsupportedVertex,
+              videohelper::materialprogram::BackendTarget::Metal, error) != nullptr,
+          ("a vertex control read admits before native preparation: " + error).c_str());
     unsupportedVertex = vertexRequest;
     auto& noise = unsupportedVertex.vertexModifier->records[2];
     noise.operation = videowire::VertexModifierOperation::scalarNoise3d;
@@ -943,10 +942,9 @@ int main()
     noise.inputs[0] = 1;
     noise.parameterCount = 2;
     noise.parameters[0] = 1.0;
-    check(!admitSurfaceMaterialBinding(materialScene, unsupportedVertex,
-              videohelper::materialprogram::BackendTarget::Metal, error)
-          && error.find("noise") != std::string::npos,
-          "unavailable vertex noise rejects before native preparation");
+    check(admitSurfaceMaterialBinding(materialScene, unsupportedVertex,
+              videohelper::materialprogram::BackendTarget::Metal, error) != nullptr,
+          ("vertex noise admits for native preparation: " + error).c_str());
     unsupportedVertex = vertexRequest;
     auto& remap = unsupportedVertex.vertexModifier->records[3];
     remap.operation = videowire::VertexModifierOperation::scalarRemap;

@@ -180,7 +180,7 @@ bool nativeCases(arbitgpu::NativeFixtureSceneBackend& backend,
     if (preview.renderPreview(dimmed, material, {}, runtime, {32,32}, renderer::kNativeGpuCapability, changed, error)
         || changed.nativeFrame)
         return fail("stale rough material owner published an earlier whole frame");
-    runtime.glassCaustic->policy.maximumVisits = 65;
+    runtime.glassCaustic->policy.maximumVisits = 16777216u;
     changed = a;
     if (exporter.renderExport(snapshot, material, {}, runtime, {32,32}, renderer::kNativeGpuCapability, changed, error)
         || changed.nativeFrame)

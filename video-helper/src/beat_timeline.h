@@ -111,6 +111,14 @@ public:
         return seconds;
     }
 
+    // The project time a delay of some beats before `seconds` lands on, through
+    // tempo changes. Negative when the delay reaches before beat zero.
+    double secondsBeforeBeats(double seconds, double beats) const noexcept
+    {
+        const double beat = secondsToBeat(seconds) - beats;
+        return beat < 0.0 ? -1.0 : beatToSeconds(beat);
+    }
+
     double secondsToBeat(double seconds) const noexcept
     {
         if (! std::isfinite(seconds) || seconds <= 0.0)

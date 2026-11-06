@@ -601,9 +601,18 @@ blend modes and leading-edge transitions. The viewport is driven by live
 state plus a **baked automation timeline**. Both feed identical `LayerDesc`s.
 
 **Codecs / containers.** `codec`: `h264` | `h265` | `vp9` | `prores`.
-h264/h265 try hardware first under `encoder: "auto"` (`h264_nvenc` /
-`hevc_nvenc`, `*_videotoolbox` on macOS) and fall back to software
-(`libx264` / `libx265`) when the hw encoder is missing or fails to open.
+h264/h265 try hardware first under `encoder: "auto"`: NVENC then VA-API on
+Linux, NVENC then AMF on Windows, VideoToolbox on macOS. They fall back to
+software (`libx264` / `libx265`) when the hw encoder is missing or fails to
+open. `encoder` also takes `"nvenc"`, `"vaapi"`, `"amf"` or `"videotoolbox"`,
+which get that encoder or an error naming why. NVENC takes each frame from
+the GL composite through CUDA-GL interop, and VideoToolbox from the IOSurface
+the Metal compositor renders into, with no CPU readback. VA-API and AMF take
+an upload. The result adds `encoderBackend`, `frameRoute` (`cuda-gl`,
+`iosurface`, `vaapi-upload`, `amf-upload`, `nvenc-upload`,
+`videotoolbox-upload` or `cpu`), `framesOnGpu`, `encoderFallback` (every
+fallback by name, empty when none) and `encoderRoute`, the one-line form the
+export dialog shows.
 vp9 is always `libvpx-vp9`; prores is always `prores_ks` (profile 3 =
 ProRes 422 HQ, `yuv422p10le`) and **requires a `.mov` outPath** — mp4/mkv
 muxers have no ProRes tag, so the helper rejects other extensions up front.

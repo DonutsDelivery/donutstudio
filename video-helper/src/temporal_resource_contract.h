@@ -66,7 +66,7 @@ static_assert(! ResourceContract::authorizesGraphCycles);
 struct ResourceLimits
 {
     uint32_t maximumImageDimension = 8192;
-    uint32_t maximumHistoryLength = 256;
+    uint32_t maximumHistoryLength = std::numeric_limits<uint32_t>::max();
     uint64_t maximumHistoryBytes = 512ull * 1024ull * 1024ull;
     uint64_t maximumTransientBytes = 256ull * 1024ull * 1024ull;
 };

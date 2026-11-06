@@ -71,7 +71,9 @@ require(particle_fixture, "prepareGeometryInstances(scene,material,admission,dia
 
 # Geometry Core: the prepare takes the use, pending returns before render, and only
 # Preview defers. A pending from a blocking prepare stays an error.
-require(core_header, "arbitgpu::NativeFixturePrepareUse prepareUse = arbitgpu::NativeFixturePrepareUse::Blocking);",
+# prepareUse is no longer the last parameter: runtime parameters and the motion
+# record follow it, and it keeps its Blocking default.
+require(core_header, "arbitgpu::NativeFixturePrepareUse prepareUse = arbitgpu::NativeFixturePrepareUse::Blocking,",
         "geometry_core_backend.h executeNativeGeometry")
 require(core_header, "std::uint64_t geometryCorePreviewPendingResultsOnThisThread() noexcept;",
         "geometry_core_backend.h accessor")
@@ -103,7 +105,7 @@ ordered(executor, [
     "displaced.push_back(retained.owners.extract(victim));",
     "const auto pendingBefore=videohelper::geometry::geometryCorePreviewPendingResultsOnThisThread();",
     "auto execution = videohelper::geometry::executeNativeGeometry(",
-    "{},{},evaluationContext->geometryPrepareUse);",
+    "{},{},evaluationContext->geometryPrepareUse,runtimeParameters,",
     "const bool previewDeferred=",
     "retained.owners.erase(owner);",
     "if(previewDeferred)",

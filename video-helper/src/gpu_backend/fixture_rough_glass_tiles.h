@@ -407,12 +407,14 @@ private:
 };
 // The backend supplies the complete resident attachment stride and all other
 // retained bytes, including any tile depth/identity staging targets. This is
-// admission, not proof that resources were allocated.
+// admission, not proof that resources were allocated. The total only has to
+// stay representable; each texture and buffer meets the device's own limit
+// where it is created.
 inline bool admitMemory(const Schedule& schedule,std::uint64_t fullFrameBytesPerPixel,
                         std::uint64_t additionalResidentBytes,FrameMemoryAdmission& admission,std::string& error)
 {
     FrameMemoryAdmissionRequest request;
-    request.byteBudget=renderpassoutput::kMaximumTotalBytes;
+    request.byteBudget=std::numeric_limits<std::uint64_t>::max();
     request.classes[request.classCount++]={schedule.key().width,schedule.key().height,fullFrameBytesPerPixel,1};
     request.classes[request.classCount++]={schedule.maximumTilePixels(),1,
         smoothglass::kRoughReceiptBytesPerPixel+kTileReadbackBytesPerPixel,1};

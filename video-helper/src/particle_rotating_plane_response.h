@@ -36,14 +36,20 @@ struct ResponseCost {
             +12*C::compare(n)+12*C::shift(n)+4*C::convert(n)+28+2*guard(n):C::unavailable;
     }
     // Contract W(n,V,T,P) for one body interval: every exact phase once, each
-    // triangle once, and 4P+14 plane guards including remainder's two.
+    // triangle once, and 4P+14 plane guards including remainder's two. Any
+    // point count is charged; only a cost past the uint64 range is unavailable.
     static constexpr std::uint64_t interval(unsigned n,std::uint64_t vertices,std::uint64_t triangles,
                                             std::uint64_t points)
     {
         using C=rotatingexact::Cost;
-        if (!Cost::supported(n) || vertices>256 || triangles>128 || points>64) return C::unavailable;
-        return Cost::first(n,unsigned(vertices),unsigned(triangles))+Cost::face(n)+triangles*Cost::triangle(n)
-            +rate(n)+remainder(n)+(4*points+12)*guard(n);
+        if (!Cost::supported(n) || vertices>std::numeric_limits<unsigned>::max()
+            || triangles>std::numeric_limits<unsigned>::max()/3) return C::unavailable;
+        const auto base=Cost::first(n,unsigned(vertices),unsigned(triangles))+Cost::face(n)+triangles*Cost::triangle(n)
+            +rate(n)+remainder(n);
+        const auto each=guard(n),maximum=std::numeric_limits<std::uint64_t>::max();
+        if (points>(maximum/each-12)/4) return C::unavailable;
+        const auto guards=(4*points+12)*each;
+        return guards>=maximum-base ? C::unavailable : base+guards;
     }
 };
 
@@ -86,8 +92,8 @@ inline bool response(const Input& input,const Mesh& mesh,const ResponseInput& st
     };
     if (outputOverlaps(&input,sizeof(input)) || outputOverlaps(&state,sizeof(state))
         || outputOverlaps(&mesh,sizeof(mesh))
-        || (mesh.vertices<=256 && outputOverlaps(mesh.positions,3*mesh.vertices*sizeof(float)))
-        || (mesh.triangles<=128 && outputOverlaps(mesh.indices,3*mesh.triangles*sizeof(std::uint32_t)))) return false;
+        || outputOverlaps(mesh.positions,3*std::size_t(mesh.vertices)*sizeof(float))
+        || outputOverlaps(mesh.indices,3*std::size_t(mesh.triangles)*sizeof(std::uint32_t))) return false;
     Result geometry;
     if (!certificate(input,mesh,n,workspace,budget,geometry)) return false;
     if (geometry.kind!=Kind::impact) {

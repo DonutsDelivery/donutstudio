@@ -304,9 +304,19 @@ class StaticLocalObjectWorldSourceContractTests(unittest.TestCase):
         self.assertLess(
             self.animated.index("arbitgpu::nativeImportedObjectWorldsExactCover(*scene_, *worlds)"), publish)
         self.assertLess(publish, self.animated.index("runtimeInputs.previousMotion.reset();"))
-        self.assertIn("const auto correction = NativeSceneAnimationCompositionFrame::multiply(", self.animated)
+        # Each moved node's correction is its animated world times its offset times
+        # the inverse world. Nested corrections compose outer first, so an inner
+        # correction conjugated by the outer one reduces to outer times inner.
+        self.assertIn("correction.matrix = NativeSceneAnimationCompositionFrame::multiply(\n"
+                      "                NativeSceneAnimationCompositionFrame::multiply(*movedWorld, "
+                      "NativeSceneAnimationCompositionFrame::compose(offset)),\n"
+                      "                inverseMoved);", self.animated)
+        self.assertLess(self.animated.index("[](const auto& a, const auto& b) { return a.depth < b.depth; }"),
+                        self.animated.index("for (const auto& correction : corrections)"))
+        self.assertIn("applied = any ? NativeSceneAnimationCompositionFrame::multiply(applied, correction.matrix)"
+                      " : correction.matrix;", self.animated)
         self.assertIn(
-            "NativeSceneAnimationCompositionFrame::multiply(correction, authored) : authored",
+            "NativeSceneAnimationCompositionFrame::multiply(applied, authored) : authored",
             self.animated)
         for message in ANIMATED_FRAME_REFUSALS:
             self.assertIn(message, self.animated)

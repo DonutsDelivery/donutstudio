@@ -2,6 +2,7 @@
 #include "support/diffraction_reference_oracle.h"
 #include "../../shared/DiffractionMaterialPresets.h"
 #include "../src/gpu_backend/fixture_diffraction_bands.h"
+#include "../src/gpu_backend/realtime_diffraction_gather.h"
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -123,8 +124,6 @@ void refusals()
     input=fixture.input;input.source.traceMaximumDistance=1;reject(input,dt::Failure::InvalidBounds,"finite trace maximum cannot truncate receiver/grating connection");
     input=fixture.input;input.queryBudget=2;reject(input,dt::Failure::BudgetExhausted,"query budget exhaustion refuses entire result after partial work");
     input=fixture.input;input.subdivisions=17;reject(input,dt::Failure::BudgetExhausted,"oversized quadrature refuses");
-    input=fixture.input;input.receiverTriangles.resize(64,input.receiverTriangles[0]);input.gratingTriangles.resize(64,input.gratingTriangles[0]);
-    reject(input,dt::Failure::BudgetExhausted,"finite pair-work cap refuses before visibility work");
     for(int kind=0;kind<5;++kind)
     {
         dt::Failure failure;
@@ -429,7 +428,8 @@ void nativeTableAdmission()
     }
     auto wrongMaterial=frame;wrongMaterial.query.texels[metadata+1][2]=201;
     check(!nt::validateQueries(prepared,wrongMaterial,error),"mutated endpoint material identity refuses the whole query frame");
-    auto wrongInstance=frame;wrongInstance.query.texels[metadata+64+4+3][3]=0;
+    // Past the one identity texel per object, instance 0 takes four texels; instance 1's mesh row carries its index in w.
+    auto wrongInstance=frame;wrongInstance.query.texels[metadata+prepared.query.identities.size()+4+3][3]=0;
     check(!nt::validateQueries(prepared,wrongInstance,error),"mutated endpoint instance identity refuses the whole query frame");
     auto wrongTriangle=frame;
     const auto& mesh=prepared.query.meshes[std::size_t(prepared.query.objectMesh[1])];
@@ -476,6 +476,7 @@ tt::Fixture nativeSphereFixture(unsigned segments,unsigned rings,float radius,st
         const float x=std::sin(polar)*std::cos(azimuth),y=std::cos(polar),z=std::sin(polar)*std::sin(azimuth);
         auto& v=scene.vertices[scene.vertexCount++];
         v.position={center[0]+radius*x,center[1]+radius*y,center[2]+radius*z};v.color={1,1,1,1};
+        v.normal={x,y,z};
         v.uv={float(segment)/float(segments),float(ring)/float(rings)};
     }
     const auto at=[&](unsigned ring,unsigned segment){return ring*(segments+1)+segment;};
@@ -498,10 +499,13 @@ void largeGratingAdmission()
     check(nt::endpointTolerance(nt::kRayMinimumDistance,30.f,1.f)>=8*(std::nextafter(30.f,31.f)-30.f),
         "a 30 m endpoint tolerance covers the rounding of a ray that long");
     struct Case {const char* name;unsigned segments,rings;std::size_t triangles;};
-    // diffraction-stress-ball is the named stress object, 4,032 triangles.
-    for(const Case c:{Case{"round diffraction orb",32,16,960},Case{"diffraction-stress-ball",64,32,4032}})
+    // A UV sphere has two triangles per quad and one per quad at each pole ring:
+    // segments * (2 * rings - 2). The stress ball, 64 x 32, is 3,968 triangles.
+    for(const Case c:{Case{"round diffraction orb",32,16,960},Case{"diffraction-stress-ball",64,32,3968}})
     {
         std::string error;auto f=nativeSphereFixture(c.segments,c.rings,.25f,{0.f,0.f,1.f});
+        check(c.triangles==std::size_t(c.segments)*(2*c.rings-2)
+            && f.scene->objects[f.scene->objectCount-1].indexCount==c.triangles*3,"each sphere case has the UV sphere's triangle count");
         nt::Prepared prepared;nt::Frame frame;
         const bool admitted=nt::prepareScene(*f.scene,f.program,1,prepared,error);
         check(admitted,c.name);
@@ -520,13 +524,53 @@ void largeGratingAdmission()
         arbitgpu::nativeFixtureDiffractionSplitBandsByQueries(bands,perPixel);
         std::uint32_t rows=0;for(std::uint32_t b=0;b<bands.bandCount;++b)rows+=arbitgpu::nativeFixtureDiffractionBandRows(bands,b);
         check(bands.bandCount>1 && rows==1080,"query split covers every row exactly once");
+        // Realtime budgets its bands by the rows a pixel gathers, every floor(sqrt(n))th.
+        arbitgpu::NativeFixtureDiffractionBands gathered;
+        check(arbitgpu::nativeFixtureDiffractionBandSchedule(f.program,1920,1080,false,gathered),"Realtime frame schedules bands");
+        std::uint64_t gatheredPerPixel=0;
+        check(arbitgpu::nativeFixtureDiffractionPixelQueries(arbitgpu::nativeFixtureRealtimeDiffractionGatherRows(8),
+            arbitgpu::nativeFixtureRealtimeDiffractionGatherRows(c.triangles*4),gatheredPerPixel),"gathered queries fit");
+        arbitgpu::nativeFixtureDiffractionSplitBandsByQueries(gathered,gatheredPerPixel);
+        std::uint32_t gatheredRows=0;for(std::uint32_t b=0;b<gathered.bandCount;++b)gatheredRows+=arbitgpu::nativeFixtureDiffractionBandRows(gathered,b);
+        check(gatheredRows==1080 && gathered.bandHeight>=bands.bandHeight
+            && (bands.bandHeight==1080 || gathered.bandCount<bands.bandCount),"gathered rows give fewer, taller bands over every row");
     }
+    using arbitgpu::nativeFixtureRealtimeDiffractionGatherRows;
+    check(nativeFixtureRealtimeDiffractionGatherRows(0)==0 && nativeFixtureRealtimeDiffractionGatherRows(1)==1
+        && nativeFixtureRealtimeDiffractionGatherRows(3)==3 && nativeFixtureRealtimeDiffractionGatherRows(4)==2
+        && nativeFixtureRealtimeDiffractionGatherRows(2500)==50 && nativeFixtureRealtimeDiffractionGatherRows(2501)==51
+        && nativeFixtureRealtimeDiffractionGatherRows(2600)==52,"a Realtime pixel gathers every floor(sqrt(n))th row");
 }
 
 }
+// Realtime's reduced-resolution gather keeps at most kGatherPixels whatever the output.
+void gatherScale()
+{
+    namespace g=arbitgpu::realtimediffractiongather;
+    check(g::scale(1920,1080)==3&&g::extent(1920,3)==640&&g::extent(1080,3)==360,"1920x1080 gathers at 640x360");
+    check(g::scale(480,270)==1&&g::scale(640,360)==1,"frames of kGatherPixels or fewer gather at full resolution");
+    for(const auto size:std::array<std::array<std::uint32_t,2>,4>{{{3840,2160},{1281,721},{7680,4320},{641,1}}}){
+        const auto s=g::scale(size[0],size[1]);
+        check(std::uint64_t(g::extent(size[0],s))*g::extent(size[1],s)<=g::kGatherPixels
+            &&(s==1||std::uint64_t(g::extent(size[0],s-1))*g::extent(size[1],s-1)>g::kGatherPixels),
+            "the gather scale is the smallest that fits kGatherPixels");
+    }
+    check(g::extent(1921,3)==641&&g::extent(5,1)==5&&g::extent(5,0)==5,"gather extents round up");
+    // 1920x1080 at 400 queries a pixel: 21-row frame bands; the 640-wide gather target
+    // takes 65-row bands, and the full pass 198-row bands.
+    arbitgpu::NativeFixtureDiffractionBands frame{1920,1080,1080,1,0,0,0};
+    const auto split=[](arbitgpu::NativeFixtureDiffractionBands b,std::uint64_t q){arbitgpu::nativeFixtureDiffractionSplitBandsByQueries(b,q);return b;};
+    const auto gatherBands=g::gatherPassBands(frame,400,3), fullBands=g::fullPassBands(frame,400,3);
+    check(split(frame,400).bandHeight==21&&gatherBands.width==640&&gatherBands.height==360&&gatherBands.bandHeight==65
+        &&gatherBands.bandCount==6&&fullBands.width==1920&&fullBands.bandHeight==198&&fullBands.bandCount==6,
+        "each gather round bands by its own work");
+    check(g::gatherPassBands(frame,0,3).bandCount==1&&g::gatherPassBands(frame,0,3).bandHeight==360,
+        "a gather pass with no queries draws in one band");
+}
+
 int main()
 {
-    geometryAndVisibility();refusals();gratingResponse();nativeTableAdmission();largeGratingAdmission();
+    geometryAndVisibility();refusals();gratingResponse();nativeTableAdmission();largeGratingAdmission();gatherScale();
     std::printf("diffraction triangle transport: %d/%d checks passed\n",checks-failures,checks);
     return failures?EXIT_FAILURE:EXIT_SUCCESS;
 }

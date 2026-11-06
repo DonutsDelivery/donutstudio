@@ -47,12 +47,14 @@
 // Nothing here touches a GPU. The helper uploads the bytes (cpu_scene_frame.h).
 
 #include "integrator.h"
+#include "render_outputs.h"
 #include "thread_pool.h"
 #include "../../../shared/Visual3DScene.h"
 
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,12 +82,26 @@ struct EngineSceneSetup
     // (PrepareOptions). Empty keeps the delta lights.
     std::vector<LightShape> lightShapes;
     std::vector<AreaLightRecord> areaLights;
+    // Motion blur (IngestOptions): the shutter in frames from the current one,
+    // closed when shutterClose <= shutterOpen, and the scene one frame earlier.
+    // previousObjectWorlds is empty or lists every object like objectWorlds;
+    // previousInstances is empty or lists every instance; previousPositions
+    // is empty or a prefix of the scene vertices.
+    float shutterOpen = 0.0f;
+    float shutterClose = 0.0f;
+    std::vector<Mat4> previousObjectWorlds;
+    std::vector<HarmonicMIDI::grid::SceneTransform3D> previousInstances;
+    std::shared_ptr<const std::vector<HarmonicMIDI::grid::SceneVec3>> previousPositions;
 };
 
 // Everything that, when it changes, restarts accumulation.
 struct EngineView
 {
     HarmonicMIDI::grid::SceneCameraRecord camera {};
+    // The camera one frame earlier, with its runtime offsets applied
+    // (arbitgpu::priorRuntimeCamera). The Motion output and motion blur over
+    // the setup's shutter both read it. Empty: the camera holds still.
+    std::optional<HarmonicMIDI::grid::SceneCameraRecord> previousCamera {};
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     float timeSeconds = 0.0f;
@@ -126,7 +142,22 @@ struct EngineImage
     EngineColor color = EngineColor::DisplayRgba8;
     std::vector<std::uint8_t> colorBytes;  // tight rows, bottom row first
     std::vector<float> depth;              // width * height, bottom row first
+    // The denoiser's guides (Plan 3, Denoising), three floats per pixel, bottom row
+    // first: the mean first-hit albedo and the normalized mean world-space normal.
+    // Zeros where the centre ray and every sample missed.
+    std::vector<float> albedo;
+    std::vector<float> normal;
     std::vector<EngineFrameLayer> frameLayers;  // by ObjectFrameBinding::layer
+    // Render outputs (render_outputs.h), bottom row first, in the raster's raw
+    // pass formats: RGBA16F half bits for normal and emission, R8 mask, R32UI
+    // ids and RG16F motion. They come from the centre ray, so the denoiser never
+    // touches them.
+    std::vector<std::uint16_t> normalPass;
+    std::vector<std::uint16_t> emissionPass;
+    std::vector<std::uint8_t> maskPass;
+    std::vector<std::uint32_t> materialIdPass;
+    std::vector<std::uint32_t> objectIdPass;
+    std::vector<std::uint16_t> motionPass;
     std::uint64_t generation = 0;          // accumulation this image belongs to
     std::uint32_t samplesPerPixel = 0;     // accumulated in this generation
     bool restarted = false;                // this call started a new generation
@@ -217,6 +248,15 @@ public:
 
     // Thread safe. Stops the pass in flight; the next preview restarts.
     void cancel() noexcept { cancel_.cancel(); }
+    // The next preview passes stop once generation moves past captured, the value
+    // read with the inputs they render (render_input_generation.h). Null watches
+    // nothing. Exports never watch: they render a snapshot to the end.
+    void watchInputs (const std::atomic<std::uint64_t>* generation, std::uint64_t captured) noexcept
+    {
+        cancel_.watch (generation, captured);
+    }
+    // The last preview pass stopped because its inputs were edited.
+    bool lastPassObsolete() const noexcept { return lastPassObsolete_; }
     // Every pass renders on this device from now on (PathTracer::setDevicePass).
     // While ready says false, a preview of a scene the device can draw returns pending
     // without touching its film or sample stream. An export doesn't ask: its pass waits
@@ -255,7 +295,13 @@ private:
     std::function<bool()> deviceReady_;
     bool prepare (const EngineSceneSetup& setup, const EngineView& view, PinholeCamera& camera,
                   bool& rebuilt, std::string& error);
-    void traceDepth (const PinholeCamera& camera);
+    // prepare, timed as SceneLower and CpuBvhBuild.
+    bool timedPrepare (const EngineSceneSetup& setup, const EngineView& view, PinholeCamera& camera,
+                       bool& rebuilt, FramePhaseTimes& phases, std::string& error);
+    // The centre ray's depth and render outputs. setup is this call's, not the
+    // cached one: a snapshot equal in what the tracer ingests can still carry
+    // other previous transforms, which only Motion reads.
+    void traceDepth (const PinholeCamera& camera, const EngineView& view, const EngineSceneSetup& setup);
     void resolve (EngineColor color, EngineImage& image) const;
     // Folds the accumulator's frame into the history, or seeds the history from it.
     void updatePlaybackHistory (bool blend);
@@ -265,11 +311,14 @@ private:
     RenderScene scene_;
     bool sceneValid_ = false;
     bool skyVisible_ = false;
+    // What camera misses show when the world is hidden from the camera.
+    HarmonicMIDI::grid::SceneCameraBackground cameraBackground_ {};
     EngineSceneSetup cachedSetup_;
     std::uint64_t sceneBuilds_ = 0;
 
     bool previewValid_ = false;
-    std::uint32_t previewMaxDepth_ = 0;
+    // The light-path settings the live accumulation was drawn with.
+    IntegratorSettings previewLightPaths_ {};
     std::uint64_t previewGeneration_ = kExportGeneration;
     EngineView previewView_ {};
     std::uint32_t previewSamples_ = 0;
@@ -279,6 +328,7 @@ private:
     EngineRenderMode renderMode_ = EngineRenderMode::Converging;
     std::vector<float> depth_;        // top row first, as traced
     std::vector<std::uint8_t> covered_;  // centre ray hit, top row first
+    std::vector<FirstHitOutput> outputs_;  // top row first, as traced
 
     // The temporal history, all film-sized and top row first. It survives only
     // between playback frames with one camera and one film size.
@@ -289,6 +339,7 @@ private:
     bool historyValid_ = false;
     // The image on screen is history_, not the accumulator's mean.
     bool historyShown_ = false;
+    bool lastPassObsolete_ = false;
 };
 
 // Exact comparisons the cache uses. Floats compare by bit pattern.

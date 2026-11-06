@@ -4,6 +4,12 @@
 #include "particle_history.h"
 #include "particle_geometry.h"
 #include "particle_solid_state.h"
+#include <utility>
+
+#include <set>
+#include <map>
+#include <mutex>
+#include <utility>
 
 namespace videorender
 {
@@ -11,7 +17,7 @@ namespace videorender
 // emitter is first admitted, or after a replay reset. Note end and window end
 // bound its life. These times describe the same bodies drawn by the Image path.
 struct ParticlePointReplayTimes {
-    std::array<double,kParticleSolidMaxBodies> birthSeconds {}, lifetimeSeconds {};
+    ParticleSizedList<double> birthSeconds, lifetimeSeconds;
     double sampleSeconds = 0;
 };
 
@@ -40,9 +46,10 @@ public:
                 error_="Dynamic body replay requires its admitted stable caller context";
                 prepared_=false; failed_=true; error=error_; return false;
             }
-            scratch=context->caller->reserve(callerScratchLogicalBytes(),callerPrepareWork());
-            retained=scratch ? context->caller->reserve(ParticleBodyReplayReceipt::retainedLogicalBytes(),callerReceiptWork()):nullptr;
-            const auto outputBytes=callerOutputLogicalBytes(needSolidState,needPointTimes);
+            const auto bodies=particleBodyCapacity(parameters);
+            scratch=context->caller->reserve(callerScratchLogicalBytes(bodies,particleAnchorCount(parameters)),callerPrepareWork());
+            retained=scratch ? context->caller->reserve(ParticleBodyReplayReceipt::retainedLogicalBytes(),callerReceiptWork(bodies)):nullptr;
+            const auto outputBytes=callerOutputLogicalBytes(needSolidState,needPointTimes,bodies);
             publication=retained ? context->caller->reserve(outputBytes,outputBytes):nullptr;
             if (!scratch || !retained || !publication) {
                 error_="Dynamic body replay prospective caller admission is short";
@@ -63,38 +70,66 @@ public:
         error=error_; return prepared_;
     }
 
-    static constexpr std::size_t callerScratchLogicalBytes() noexcept
+    // The replay sizes its body lists from Count, at least one body.
+    static constexpr std::size_t particleBodyCapacity(const ParticleParams& parameters) noexcept
+    { return static_cast<std::size_t>(std::max(parameters.count,1)); }
+    // Heap bytes per body in the scratch: working bodies, births and
+    // lifetimes, the result, one rotation capture and guard, the per-interval
+    // forces and changed-axis flags, a previous-bodies copy, and the published
+    // Solid bodies and replay times.
+    static constexpr std::size_t callerScratchBytesPerBody() noexcept
+    {
+        return 2*sizeof(ParticleRigidBody)+2*sizeof(double)+sizeof(std::array<float,4>)
+            +sizeof(SolidRotationCapture)+8+sizeof(std::array<float,3>)+sizeof(char)
+            +sizeof(ParticleRigidBody)+2*sizeof(double);
+    }
+    // Heap bytes per body in one publication: bodies, Solid bodies, times.
+    static constexpr std::size_t callerOutputBytesPerBody(bool solid,bool times) noexcept
+    { return sizeof(std::array<float,4>)+(solid ? sizeof(ParticleRigidBody):0)+(times ? 2*sizeof(double):0); }
+    // Each of the three Params copies holds its emitter anchors, identities
+    // and depths on the heap.
+    static constexpr std::size_t particleAnchorCount(const ParticleParams& parameters) noexcept
+    { return static_cast<std::size_t>(std::max(parameters.geometryCount,0)); }
+    static constexpr std::size_t callerAnchorBytes(std::size_t anchors) noexcept
+    { return 3*anchors*(sizeof(std::array<float,4>)+sizeof(std::uint64_t)+sizeof(std::array<float,2>)); }
+    static constexpr std::size_t callerScratchLogicalBytes(std::size_t bodies,std::size_t anchors) noexcept
     {
         // State includes request/working Params, bodies, collider, boundary array,
         // producer and publication scratch. Extra locals and old/candidate
         // canonical frames coexist during history and wrapper publication.
         return sizeof(ParticleBodyReplayState)+3*sizeof(ParticleParams)
             +sizeof(ParticleBodyState)+sizeof(ParticleSolidState)+sizeof(ParticlePointReplayTimes)
-            +3*sizeof(canonicalblockc::CanonicalBlockCFrame);
+            +3*sizeof(canonicalblockc::CanonicalBlockCFrame)+bodies*callerScratchBytesPerBody()+callerAnchorBytes(anchors);
     }
     static constexpr std::size_t callerPrepareWork() noexcept
     { return 2*sizeof(ParticleBodyReplayState)+3*sizeof(ParticleParams); }
-    static constexpr std::size_t callerReceiptWork() noexcept
-    { return 2*(sizeof(ParticleBodyReplayReceipt)+sizeof(ParticleBodyState)+sizeof(ParticleSolidState)); }
+    static constexpr std::size_t callerReceiptWork(std::size_t bodies) noexcept
+    {
+        return 2*(sizeof(ParticleBodyReplayReceipt)+sizeof(ParticleBodyState)+sizeof(ParticleSolidState)
+            +bodies*(sizeof(std::array<float,4>)+sizeof(ParticleRigidBody)));
+    }
     static constexpr std::size_t callerScheduleCopyWork(std::size_t boundaries) noexcept
     {
         // sampleHistory is called at the initial tick, each interval start and
         // the terminal tick. An initial tick may be read twice but sampled once.
         return (boundaries+1)*sizeof(ParticleParams);
     }
-    // Each interval may write all 128 captures 8,192, reset 1,024 guard bytes and
-    // write the 16-byte descriptor and 8-byte generation. Each capacity body adds
-    // 27,768 workspace bytes plus 32 view construction and 32 retirement bytes.
+    // Each interval may write every body's 64-byte capture, reset its 8-byte
+    // guard and write the 16-byte descriptor and 8-byte generation. Each body
+    // adds 27,768 workspace bytes plus 32 view construction and 32 retirement bytes.
     static constexpr std::size_t callerRotatingCopyWork(std::size_t steps,std::size_t bodies) noexcept
-    { return steps*(9240+bodies*27832); }
-    static constexpr std::size_t callerOutputLogicalBytes(bool solid,bool times) noexcept
-    { return sizeof(ParticleBodyState)+(solid ? sizeof(ParticleSolidState):0)+(times ? sizeof(ParticlePointReplayTimes):0); }
+    { return steps*(24+bodies*(72+27832)); }
+    static constexpr std::size_t callerOutputLogicalBytes(bool solid,bool times,std::size_t bodies) noexcept
+    {
+        return sizeof(ParticleBodyState)+(solid ? sizeof(ParticleSolidState):0)+(times ? sizeof(ParticlePointReplayTimes):0)
+            +bodies*callerOutputBytesPerBody(solid,times);
+    }
     // The fresh synchronous wrapper keeps all three reservations through
     // receipt issuance and publication. Each reserve adds its own lease header.
-    static constexpr std::size_t callerFreshPeakLogicalBytes(bool solid,bool times) noexcept
+    static constexpr std::size_t callerFreshPeakLogicalBytes(bool solid,bool times,std::size_t bodies,std::size_t anchors) noexcept
     {
-        return callerScratchLogicalBytes()+ParticleBodyReplayReceipt::retainedLogicalBytes()
-            +callerOutputLogicalBytes(solid,times)+3*sizeof(ParticleBodyCallerLease);
+        return callerScratchLogicalBytes(bodies,anchors)+ParticleBodyReplayReceipt::retainedLogicalBytes()
+            +callerOutputLogicalBytes(solid,times,bodies)+3*sizeof(ParticleBodyCallerLease);
     }
     bool prepared() const { return prepared_; }
     bool complete() const { return prepared_ && !failed_ && completed_; }
@@ -158,7 +193,7 @@ public:
         // its own lease instead of refreshing storage on the next publication.
         std::shared_ptr<const ParticleBodyCallerLease> outputLease;
         if (dynamicBody) {
-            const auto bytes=callerOutputLogicalBytes(solidState!=nullptr,pointTimes!=nullptr);
+            const auto bytes=callerOutputLogicalBytes(solidState!=nullptr,pointTimes!=nullptr,static_cast<std::size_t>(capacity));
             outputLease=callerOutput_ ? std::move(callerOutput_):callerScratch_->ledger->reserve(bytes,bytes);
             if (!outputLease) { error="Dynamic body publication prospective caller admission is short"; return false; }
         }
@@ -185,17 +220,18 @@ private:
     ParticleReplayWindow window;
     std::int64_t ageTicks=0, startTicks=0, lastOnset=-1, intervalStart_=0, intervalEnd_=0;
     SolidVector boxHalf {};
-    std::array<Body,kParticleSolidMaxBodies> bodies {};
-    std::array<Link,arbitblockc::kMaxLinks> links {};
+    ParticleSizedList<Body> bodies;
+    // One spring per score link between live bodies, sized by the frame.
+    std::vector<Link> links;
     int count=0, linkCount=0, capacity=0, boundaryCount=0, steps=0, step=0;
-    std::array<double,kParticleSolidMaxBodies> births {}, lifetimes {};
+    ParticleSizedList<double> births, lifetimes;
     canonicalblockc::FrameProducer historicalProducer;
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> historicalFrame;
     ParticleHistoryAudio historicalAudio;
     ParticleGeometryFrame geometryFrame;
     SolidTriangleWorkBudget triangleWork;
-    // Inline rotating-plane storage, 9,272 + 27,768 bytes, so the sizeof-based
-    // caller scratch and prepare work include it once. rotatingLimbs is the
+    // Rotating-plane storage: the ledger's 56 inline bytes plus 72 heap bytes
+    // per body, and the 27,768-byte workspace; the caller scratch charges both. rotatingLimbs is the
     // preflight-admitted exact width, or zero when the class is unavailable,
     // which includes every replay without an authenticated caller lease.
     SolidRotationLedger rotations;
@@ -296,7 +332,18 @@ private:
             if (diagnostic) *diagnostic="Oriented box requires static body geometry with three nonzero dimensions";
             return false;
         }
-        capacity = std::clamp(p.count, 1, particleMaxBodies(p.simulationSpace));
+        capacity = std::max(p.count, 1);
+        // Size every per-body list once, so the heap holds exactly the
+        // charged bytes and no interval allocates body storage.
+        try {
+            bodies.resize(static_cast<std::size_t>(capacity));
+            births.resize(static_cast<std::size_t>(capacity)); lifetimes.resize(static_cast<std::size_t>(capacity));
+            result.resize(static_cast<std::size_t>(capacity));
+            rotations.size(static_cast<std::size_t>(capacity));
+        } catch (const std::bad_alloc&) {
+            if (diagnostic) *diagnostic="Particle replay could not allocate "+std::to_string(capacity)+" bodies";
+            return false;
+        }
         mass = std::clamp(p.bodyMass, 0.01f, 100.0f);
         sourceSeconds = p.historicalReplay ? double(startTicks)/ticksPerSecond : p.resetTime;
         replayEndSeconds = sourceSeconds + duration;
@@ -368,7 +415,7 @@ private:
         if (solid && geometryFrame.meshIdentity
             && !preflightWork.preflight(static_cast<std::uint64_t>(steps),capacity,
                 geometryFrame.meshVertexCount,geometryFrame.meshTriangleCount,geometryFrame.pointCount,p.bodyShape==2 ? 96:1)) {
-            if (diagnostic) *diagnostic="Triangle surface replay exceeds 100M worst-case checked work units; reduce replay work";
+            if (diagnostic) *diagnostic="Triangle surface replay work does not fit its checked work limit";
             return false;
         }
         // Admit the rotating box class before any step: the largest exact width
@@ -399,12 +446,12 @@ private:
         const auto previous = bodies;
         const int previousCount = count;
         const auto previousBirths = births, previousLifetimes = lifetimes;
-        count = 0; linkCount = 0;
-        std::array<int, arbitblockc::kMaxNotes> rows {};
+        count = 0; linkCount = 0; links.clear();
+        std::vector<int> rows(frame != nullptr ? static_cast<std::size_t>(std::max(frame->noteRows(), 0)) : 0u);
         int rowCount = 0;
         if (frame != nullptr)
         {
-            for (int row = 0; row < std::clamp(frame->noteRows(), 0, arbitblockc::kMaxNotes); ++row)
+            for (int row = 0; row < std::max(frame->noteRows(), 0); ++row)
             {
                 const auto at = static_cast<std::size_t>(row * 16);
                 const auto& values = frame->noteTextureValues;
@@ -424,7 +471,7 @@ private:
             n = n * (n * n * 15731U + 789221U) + 1376312589U;
             return float(n & 0x7fffffffU) / float(0x7fffffff);
         };
-        const int sources = p.geometryCount > 0 ? std::clamp(p.geometryCount, 0, 64) : rowCount;
+        const int sources = p.geometryCount > 0 ? p.geometryCount : rowCount;
         for (int index = 0; index < std::min(capacity, sources); ++index)
         {
             const int row = p.geometryCount > 0 ? -1 : rows[static_cast<std::size_t>(index)];
@@ -488,8 +535,8 @@ private:
         }
         if (frame != nullptr && p.geometryCount == 0 && p.linkSpring > 0)
         {
-            std::array<int, arbitblockc::kMaxLinks> order {};
-            const int rowsInLinks = std::clamp(frame->linkRows(), 0, arbitblockc::kMaxLinks);
+            const int rowsInLinks = std::max(frame->linkRows(), 0);
+            std::vector<int> order(static_cast<std::size_t>(rowsInLinks));
             for (int i = 0; i < rowsInLinks; ++i) order[static_cast<std::size_t>(i)] = i;
             std::sort(order.begin(), order.begin() + rowsInLinks, [frame](int a, int b)
             { return frame->linkIdentities[static_cast<std::size_t>(a)] < frame->linkIdentities[static_cast<std::size_t>(b)]; });
@@ -510,10 +557,11 @@ private:
                 const float ratio = std::clamp(std::max(values[at + 2] / values[at + 3], values[at + 3] / values[at + 2]), 1.0f, 8.0f);
                 const auto& ba = bodies[static_cast<std::size_t>(a)];
                 const auto& bb = bodies[static_cast<std::size_t>(b)];
-                links[static_cast<std::size_t>(linkCount++)] = { a, b,
+                ++linkCount;
+                links.push_back({ a, b,
                     std::max(0.001f, (solid ? std::hypot(std::hypot(bb.tx-ba.tx,bb.ty-ba.ty),bb.tz-ba.tz)
                         : std::hypot(bb.tx-ba.tx,bb.ty-ba.ty)) * p.linkRestScale),
-                    1 + p.linkRatioInfluence * (ratio - 1) };
+                    1 + p.linkRatioInfluence * (ratio - 1) });
             }
         }
     }
@@ -600,7 +648,7 @@ private:
             for (int i=0;i<scoreEventCount;++i)
                 if (scoreEvents[static_cast<std::size_t>(i)].tick==tick-startTicks)
                     credit+=scoreEvents[static_cast<std::size_t>(i)].event.emission;
-            emissionBudget=std::min(64.0,emissionBudget+credit);
+            emissionBudget=std::min(double(capacity),emissionBudget+credit);
         }
         updateInputs(historicalFrame.get(), historicalAudio.rms, preserve);
         return true;
@@ -687,12 +735,12 @@ private:
             const float length=std::hypot(std::hypot(dx,dy),dz);
             if (length > 0) kickDirection={dx/length,dy/length,dz/length};
         }
-        emissionBudget=std::min(64.0,emissionBudget+std::max(0.0,double(p.emissionRate))*dt);
+        emissionBudget=std::min(double(capacity),emissionBudget+std::max(0.0,double(p.emissionRate))*dt);
         if (rotatingLimbs) rotations.begin(p.historicalReplay ? startTicks+boundaries[static_cast<std::size_t>(step)]:step,
             p.historicalReplay ? startTicks+boundaries[static_cast<std::size_t>(step+1)]:step+1);
         const auto previousGeometry=geometryFrame;
         const auto previousBodies=bodies;
-        std::array<std::array<float, 3>, kParticleSolidMaxBodies> forces {};
+        ParticleSizedList<std::array<float, 3>> forces(static_cast<std::size_t>(count));
         for (int index = 0; index < linkCount && p.linkConstraint == 0; ++index)
         {
             const auto& link = links[static_cast<std::size_t>(index)];
@@ -747,7 +795,9 @@ private:
         const auto geometryContact = [&](Body& body, const Body& previous, int index)
         {
             const auto& edge=geometryFrame.segments[static_cast<std::size_t>(index)];
-            const auto& old=previousGeometry.segments[static_cast<std::size_t>(index)];
+            // A segment the previous frame did not have has not moved yet.
+            const auto& old=static_cast<std::size_t>(index)<previousGeometry.segments.size()
+                ? std::as_const(previousGeometry).segments[static_cast<std::size_t>(index)] : edge;
             const float ex=edge[2]-edge[0],ey=edge[3]-edge[1],length2=ex*ex+ey*ey;
             const float t=length2>1.0e-12f ? std::clamp(((body.x-edge[0])*ex+(body.y-edge[1])*ey)/length2,0.0f,1.0f) : 0;
             const float cx=edge[0]+t*ex,cy=edge[1]+t*ey;
@@ -812,7 +862,7 @@ private:
         // if no positional link or body-pair operation can move it before its
         // pass-zero certificate. Otherwise, or when no exact width was admitted,
         // refuse the whole step here, before any of those operations runs.
-        std::array<bool,kParticleSolidMaxBodies> changedAxis {};
+        ParticleSizedList<char> changedAxis(static_cast<std::size_t>(count));
         bool rotatingStep=false;
         if (solid && p.bodyShape==2 && (geometryFrame.meshIdentity || previousGeometry.meshIdentity))
             for (int i=0;i<count;++i) {
@@ -933,19 +983,134 @@ inline std::unique_ptr<ParticleBodyReplayState> makeParticleBodyReplayState(std:
     catch (const std::bad_alloc&) { error="Particle body replay state allocation failed"; return nullptr; }
 }
 
+// Checkpoints for a coupled replay that reaches past its body window. Bodies live
+// for the particle lifetime; after that only the water keeps stepping, and its
+// state at a completed step does not depend on the requested end time. A late,
+// exported or sought frame resumes from the latest checkpoint at or before it, so
+// its cost is at most one checkpoint interval whatever the project position.
+// Each checkpoint holds the grid's heights and velocities, so the store grows with
+// the scene's vertex count and the simulated length, with no fixed ceiling.
+class WaterCoupledCheckpointStore final
+{
+public:
+    static constexpr std::int64_t kIntervalSteps=kParticleReplayTicksPerSecond/kParticleReplayStepTicks;
+
+    struct Entry final
+    {
+        ParticleParams parameters;   // scalar controls and the shared sources they name
+        bool pointTimes=false;
+        ParticleBodyState bodies {};
+        ParticleSolidState solids;
+        ParticlePointReplayTimes times;
+        std::map<std::int64_t,WaterSurfaceReplayState::Checkpoint> water;
+    };
+
+    // A plan, score, source or control change replaces the clip node's entry.
+    static bool sameSimulation(const ParticleParams& a,const ParticleParams& b)
+    {
+        const auto sameBinding=[](const ParticleGeometryBinding* x,const ParticleGeometryBinding* y) {
+            return x==y || (x && y && x->mesh==y->mesh && x->emitters==y->emitters && x->attractors==y->attractors
+                && x->points==y->points && x->body==y->body && x->bodySource==y->bodySource
+                && x->scale==y->scale && x->centerX==y->centerX && x->centerY==y->centerY
+                && x->centerZ==y->centerZ && x->projection==y->projection && x->meshFamily.empty() && y->meshFamily.empty());
+        };
+        const auto sameHistory=[](const ParticleHistorySource* x,const ParticleHistorySource* y) {
+            if (x==y) return true;
+            if (!x || !y) return false;
+            const auto& k=x->key; const auto& l=y->key;
+            return x->score==y->score && x->audioFrames==y->audioFrames && x->audioSampleRate==y->audioSampleRate
+                && k.carrierVersion==l.carrierVersion && k.projectGeneration==l.projectGeneration
+                && k.sourceGeneration==l.sourceGeneration && k.helperGeneration==l.helperGeneration
+                && k.backendGeneration==l.backendGeneration && k.deviceGeneration==l.deviceGeneration
+                && k.scoreGeneration==l.scoreGeneration && k.beatMapGeneration==l.beatMapGeneration;
+        };
+        auto x=a,y=b;
+        const auto fx=particleAutomationFields(x),fy=particleAutomationFields(y);
+        for (std::size_t i=0;i<fx.size();++i) if (*fx[i]!=*fy[i]) return false;
+        return sameHistory(a.history.get(),b.history.get()) && sameBinding(a.geometryBinding.get(),b.geometryBinding.get())
+            && a.count==b.count && a.spawnTrack==b.spawnTrack && a.seed==b.seed && a.size==b.size
+            && a.lifetime==b.lifetime && a.motionMode==b.motionMode && a.collisionMode==b.collisionMode
+            && a.bodyShape==b.bodyShape && a.linkConstraint==b.linkConstraint && a.resetMode==b.resetMode
+            && a.simulationSpace==b.simulationSpace && a.spawnZ==b.spawnZ
+            && a.orientationDegrees==b.orientationDegrees && a.angularVelocity==b.angularVelocity
+            && a.historyClipId==b.historyClipId && a.historyNodeId==b.historyNodeId
+            && a.historicalReplay==b.historicalReplay && a.geometryRevision==b.geometryRevision
+            && a.colliderThickness==b.colliderThickness && a.scoreImpulseGain==b.scoreImpulseGain
+            && a.scoreEmitGain==b.scoreEmitGain && a.scoreAttractGain==b.scoreAttractGain
+            && a.geometryCount==b.geometryCount && a.geometryAnchors==b.geometryAnchors
+            && a.geometryIdentities==b.geometryIdentities && a.geometryDepths==b.geometryDepths;
+    }
+
+    // Copies the latest checkpoint at or before step for this simulation.
+    bool find(const ParticleParams& parameters,bool pointTimes,std::int64_t step,Entry& found,
+              WaterSurfaceReplayState::Checkpoint& checkpoint)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto at=entries_.find({parameters.historyClipId,parameters.historyNodeId});
+        if (at==entries_.end() || at->second.pointTimes!=pointTimes || !sameSimulation(at->second.parameters,parameters))
+            return false;
+        auto latest=at->second.water.upper_bound(step);
+        if (latest==at->second.water.begin()) return false;
+        --latest;
+        found.bodies=at->second.bodies; found.solids=at->second.solids; found.times=at->second.times;
+        checkpoint=latest->second; ++resumes_;
+        return true;
+    }
+
+    // Starts a clip node's entry with its completed body window.
+    void begin(const ParticleParams& parameters,bool pointTimes,const ParticleBodyState& bodies,
+               const ParticleSolidState& solids,const ParticlePointReplayTimes& times)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& entry=entries_[{parameters.historyClipId,parameters.historyNodeId}];
+        if (entry.pointTimes==pointTimes && sameSimulation(entry.parameters,parameters) && !entry.water.empty()) return;
+        entry=Entry{};
+        entry.parameters=parameters; entry.parameters.preparedBodies.reset(); entry.parameters.preparedSolids.reset();
+        entry.parameters.preparedBodyReplay.reset(); entry.parameters.preparedImportedSolids.reset();
+        entry.parameters.preparedSolidMotion.reset(); entry.parameters.bodyReplayContext.reset();
+        entry.pointTimes=pointTimes; entry.bodies=bodies; entry.solids=solids; entry.times=times;
+    }
+
+    void record(const ParticleParams& parameters,bool pointTimes,const WaterSurfaceReplayState& wave)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto at=entries_.find({parameters.historyClipId,parameters.historyNodeId});
+        if (at==entries_.end() || at->second.pointTimes!=pointTimes || !sameSimulation(at->second.parameters,parameters))
+            return;
+        const auto step=wave.completedTicks()/kParticleReplayStepTicks;
+        if (at->second.water.count(step)) return;
+        at->second.water.emplace(step,wave.checkpoint()); ++recorded_;
+    }
+
+    std::size_t resumes() const { std::lock_guard<std::mutex> lock(mutex_); return resumes_; }
+    std::size_t recorded() const { std::lock_guard<std::mutex> lock(mutex_); return recorded_; }
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::pair<int,int>,Entry> entries_;
+    std::size_t resumes_=0, recorded_=0;
+};
+
+inline WaterCoupledCheckpointStore& waterCoupledCheckpoints()
+{
+    static WaterCoupledCheckpointStore store;
+    return store;
+}
+
 // The water height solver retains local XY and moves vertices along local Z.
 // Contact momentum in that coordinate is conserved using each vertex's lumped
 // mass: authored mass per simulation-space area times its triangle area share.
 inline bool replayWaterCoupledBodies(const ParticleParams& input, double clipSeconds, float aspect,
     const canonicalblockc::CanonicalBlockCFrame* frame, ParticleBodyState& output,
     ParticleSolidState& solids, ParticlePointReplayTimes* pointTimes, std::string& error,
-    std::vector<double>* waterVelocity = nullptr, WaterCoupledFrame* waterFrame = nullptr)
+    std::vector<double>* waterVelocity = nullptr, WaterCoupledFrame* waterFrame = nullptr,
+    WaterCoupledCheckpointStore* checkpoints = &waterCoupledCheckpoints())
 {
     using namespace videowire::geometry;
     const auto refuse=[&](const char* reason) { error=reason; return false; };
     if (!input.geometryBinding || !input.geometryBinding->mesh || !input.geometryBinding->meshFamily.empty() || !input.history
         || input.motionMode!=2 || !input.historicalReplay || input.simulationSpace!=1
-        || input.bodyShape!=0 || input.resetMode!=1 || input.geometryBinding->points || input.count<1 || input.count>63
+        || input.bodyShape!=0 || input.resetMode!=1 || input.geometryBinding->points || input.count<1
         || !std::isfinite(input.historyProjectSeconds) || input.historyProjectSeconds!=clipSeconds
         || !particleHistoryReady(input,error,clipSeconds))
         return refuse("Water body coupling requires one exact water mesh and project-zero Solid 3D sphere history");
@@ -964,17 +1129,43 @@ inline bool replayWaterCoupledBodies(const ParticleParams& input, double clipSec
     if (!(expected==frame->key))
         return refuse("Water body coupling history does not match the current canonical frame");
     const auto& descriptor=*input.geometryBinding->mesh;
-    const auto& operations=descriptor.operations;
-    const auto water=std::find_if(operations.begin(),operations.end(),[](const auto& op)
+    const auto& authoredOperations=descriptor.operations;
+    const auto water=std::find_if(authoredOperations.begin(),authoredOperations.end(),[](const auto& op)
         { return op.code==OperationCode::fieldWaterHeight; });
-    if (water==operations.end() || water->field.values[4]<=0
-        || std::count_if(operations.begin(),operations.end(),[](const auto& op)
+    if (water==authoredOperations.end() || water->field.values[4]<=0
+        || std::count_if(authoredOperations.begin(),authoredOperations.end(),[](const auto& op)
             { return op.code==OperationCode::fieldWaterHeight; })!=1
-        || operations.end()-water!=3 || operations.back().code!=OperationCode::vectorDisplacement
-        || operations.back().outputStableId!=descriptor.stableId || operations.back().parameters[0]!=1
-        || !descriptor.spectrumFields.empty() || !descriptor.scoreFields.empty())
+        || authoredOperations.end()-water<3 || !descriptor.scoreFields.empty())
         return refuse("Water body coupling requires the exact terminal Water Surface Simulation mesh");
-    for (auto at=operations.begin();at!=water;++at)
+    // Bodies collide with the simulated surface. Audio spectrum operations after the
+    // Water displacement move only the drawn mesh, which the family composes from the
+    // same frame hook, so the solver replays the plan up to that displacement.
+    const auto tail=water+3;
+    const bool spectrumTail=std::all_of(tail,authoredOperations.end(),[](const auto& op) {
+        return op.code==OperationCode::audioDeformer || op.code==OperationCode::fieldAudioSpectrum
+            || op.code==OperationCode::vectorDisplacement || op.code==OperationCode::fieldComposeVector
+            || op.code==OperationCode::fieldTimeline || op.code==OperationCode::fieldVectorMeasure
+            || op.code==OperationCode::fieldConstant || op.code==OperationCode::constantVectorField;
+    });
+    if (tail==authoredOperations.end() ? !descriptor.spectrumFields.empty()
+            : (descriptor.spectrumFields.empty() || !spectrumTail
+               || std::any_of(descriptor.spectrumFields.begin(),descriptor.spectrumFields.end(),[](const auto& b) {
+                    return b.target!=spectrum::Target::geometryDeformation && b.target!=spectrum::Target::vertexDisplacement; })
+               || authoredOperations.back().outputStableId!=descriptor.stableId))
+        return refuse("Water body coupling requires the exact terminal Water Surface Simulation mesh");
+    ValueDescriptor surface;
+    if (tail!=authoredOperations.end()) {
+        surface.carrier=descriptor.carrier; surface.sourceStableId=descriptor.sourceStableId;
+        surface.sourceRevision=descriptor.sourceRevision; surface.data=descriptor.data;
+        surface.operations.assign(authoredOperations.begin(),tail);
+        surface.stableId=surface.operations.back().outputStableId;
+        surface.dispatchCount=surface.operations.size();
+    }
+    const auto& operations=tail==authoredOperations.end() ? authoredOperations : surface.operations;
+    if (operations.back().code!=OperationCode::vectorDisplacement || operations.back().parameters[0]!=1
+        || operations.back().outputStableId!=(tail==authoredOperations.end() ? descriptor.stableId : surface.stableId))
+        return refuse("Water body coupling requires the exact terminal Water Surface Simulation mesh");
+    for (auto at=authoredOperations.begin();at!=water;++at)
         if (at->code==OperationCode::fieldTimeline || at->code==OperationCode::fieldScoreSample || at->code==OperationCode::fieldAudioSpectrum || (at->retainedMesh && !at->retainedMesh->importedAnimation.empty()))
             return refuse("Water body coupling requires a static retained rest grid");
     GeometryData rest;
@@ -989,11 +1180,12 @@ inline bool replayWaterCoupledBodies(const ParticleParams& input, double clipSec
         rest=mesh; grid=requestedGrid; heights.assign(mesh.positions.size(),0); return true;
     };
     MaterializedInstancePlan restReplay;
-    const auto* terminal=replayGeometryMesh(descriptor,restReplay,error,&evaluation);
-    if (!terminal || requests!=1 || !equal(*terminal,rest)
-        || grid.columns!=grid.rows || (grid.columns!=8 && grid.columns!=9)
-        || rest.positions.size()>256 || rest.indices.size()>384)
-        return refuse("Water body coupling requires one unchanged 8 by 8 or 9 by 9 rest grid within the 128 triangle bound");
+    const auto* terminal=replayGeometryMesh(tail==authoredOperations.end() ? descriptor : surface,
+        restReplay,error,&evaluation);
+    // Any grid validateWaterSurfaceGrid admits couples; the mass and impulse
+    // arrays below size from the rest mesh.
+    if (!terminal || requests!=1 || !equal(*terminal,rest) || grid.columns<2 || grid.rows<2)
+        return refuse("Water body coupling requires one unchanged regular rest grid");
     WaterSurfaceReplayState wave;
     if (!wave.prepare(*input.history,*water,rest,grid,input.historyProjectSeconds,error)) return false;
     const auto scale=double(input.geometryBinding->scale);
@@ -1017,20 +1209,54 @@ inline bool replayWaterCoupledBodies(const ParticleParams& input, double clipSec
         return refuse("Water body coupling requires a finite zero reset time");
     parameters.resetTime=0;
     const auto window=particleReplayWindow(parameters,clipSeconds);
-    if (window.start!=0 || window.age!=wave.requestedTicks())
+    if (window.start!=0 || window.age>wave.requestedTicks())
         return refuse("Water body coupling requires an uncycled project-zero particle replay window");
+    // Past the body window the bodies keep their final state and the water runs on.
+    const bool waterOutlivesBodies=window.age<wave.requestedTicks();
+    const bool wantTimes=pointTimes!=nullptr;
     std::int64_t waterStart=0;
     std::uint64_t viewIdentity=1;
     auto previousHeight=wave.height();
     const auto view=[&]() { return ParticlePriorWaterGeometryView{*water,rest,grid,previousHeight,waterStart,
         waterStart+kParticleReplayStepTicks,viewIdentity,&wave.height()}; };
+    // Water alone from the body window's end, then the final collider at the request.
+    const auto finishWater=[&](ParticleBodyState staged,ParticleSolidState stagedSolids,
+                               const ParticlePointReplayTimes& stagedTimes) {
+        while (!wave.complete()) {
+            if (!wave.advance(error)) return false;
+            if (checkpoints && wave.completedTicks()>=window.age
+                && wave.completedTicks()/kParticleReplayStepTicks%WaterCoupledCheckpointStore::kIntervalSteps==0)
+                checkpoints->record(parameters,wantTimes,wave);
+        }
+        previousHeight=wave.height(); waterStart=wave.completedTicks();
+        viewIdentity=2*std::uint64_t(wave.stepCount())+3;
+        auto finalView=view();
+        if (!sampleParticleGeometry(parameters,wave.requestedTicks(),stagedSolids.colliders,error,&finalView)) return false;
+        if (waterVelocity) *waterVelocity=wave.velocity();
+        if (waterFrame) *waterFrame=WaterCoupledFrame{*water,rest,grid,input.historyProjectSeconds,wave.height()};
+        output=std::move(staged); solids=std::move(stagedSolids);
+        if (pointTimes) *pointTimes=stagedTimes;
+        error.clear(); return true;
+    };
+    if (waterOutlivesBodies && checkpoints) {
+        WaterCoupledCheckpointStore::Entry saved;
+        WaterSurfaceReplayState::Checkpoint checkpoint;
+        if (checkpoints->find(parameters,wantTimes,wave.stepCount(),saved,checkpoint)) {
+            if (!wave.resume(checkpoint,error)) return false;
+            return finishWater(saved.bodies,std::move(saved.solids),saved.times);
+        }
+    }
     auto initial=view();
     auto ownedBodies=makeParticleBodyReplayState(error);
     if (!ownedBodies) return false;
     auto& bodies=*ownedBodies;
     if (!bodies.prepare(parameters,clipSeconds,aspect,frame,error,true,pointTimes!=nullptr,&initial)) return false;
     std::vector<double> impulses(rest.positions.size(),0);
-    std::array<std::pair<std::int64_t,std::uint64_t>,63> contactBodies {};
+    // One momentum contact per body in each fixed interval, sized from Count.
+    std::vector<std::pair<std::int64_t,std::uint64_t>> contactBodies;
+    try { contactBodies.resize(static_cast<std::size_t>(parameters.count)); }
+    catch (const std::bad_alloc&) { return refuse("Water contact list could not allocate one entry per body"); }
+    std::set<std::pair<std::int64_t,std::uint64_t>> contactSeen;
     std::size_t contacts=0;
     bodies.waterMeshIdentity=descriptor.stableId;
     bodies.waterContact=[&](const auto& contact,const auto& mesh,std::string& diagnostic) {
@@ -1040,7 +1266,7 @@ inline bool replayWaterCoupledBodies(const ParticleParams& input, double clipSec
             diagnostic="Water contact exceeds its bounded exact mesh request"; return false;
         }
         const auto identity=std::make_pair(contact.bodyIdentity,contact.bodyGeometryIdentity);
-        if (std::find(contactBodies.begin(),contactBodies.begin()+contacts,identity)!=contactBodies.begin()+contacts) {
+        if (!contactSeen.insert(identity).second) {
             diagnostic="Water coupling supports one momentum contact per body in each fixed interval"; return false;
         }
         contactBodies[contacts++]=identity;
@@ -1084,15 +1310,25 @@ inline bool replayWaterCoupledBodies(const ParticleParams& input, double clipSec
             if (!wave.applyBodyVelocity(impulses,error)) return false;
             std::fill(impulses.begin(),impulses.end(),0);
             if (end==waterStart+kParticleReplayStepTicks) {
-                waterStart=end; intervalPrepared=false; contacts=0; ++viewIdentity;
+                waterStart=end; intervalPrepared=false; contacts=0; contactSeen.clear(); ++viewIdentity;
             }
         }
     }
-    if (!wave.complete()) return refuse("Water and body replay did not complete together");
+    if (!waterOutlivesBodies && !wave.complete()) return refuse("Water and body replay did not complete together");
     ParticleBodyState staged;
     ParticleSolidState stagedSolids;
     ParticlePointReplayTimes stagedTimes;
     if (!bodies.publish(staged,error,&stagedSolids,pointTimes ? &stagedTimes:nullptr)) return false;
+    if (waterOutlivesBodies) {
+        // A request ending inside the body window's last water step holds that step
+        // back during the final body interval, so only a replay whose water already
+        // passed the window's end matches every later request.
+        if (checkpoints && wave.completedTicks()>=window.age) {
+            checkpoints->begin(parameters,wantTimes,staged,stagedSolids,stagedTimes);
+            checkpoints->record(parameters,wantTimes,wave);
+        }
+        return finishWater(std::move(staged),std::move(stagedSolids),stagedTimes);
+    }
     // Re-sample the final collider from the same completed wave state, rather
     // than publishing the frozen prior-interval collider used by the body step.
     previousHeight=wave.height();
@@ -1167,16 +1403,6 @@ inline ParticleBodyState replayParticleBodies(
     return result;
 }
 
-// Planar shaders read a fixed 64-entry body array. Planar replay never fills
-// more than kParticlePlanarMaxBodies entries.
-inline std::array<std::array<float, 4>, kParticlePlanarMaxBodies> planarParticleBodies(
-    const ParticleBodyState& bodies) noexcept
-{
-    std::array<std::array<float, 4>, kParticlePlanarMaxBodies> planar {};
-    std::copy_n(bodies.begin(), planar.size(), planar.begin());
-    return planar;
-}
-
 inline bool replayParticlePoints(const ParticleParams& input, double clipSeconds, float aspect,
     const canonicalblockc::CanonicalBlockCFrame* frame,
     videowire::geometry::StableId outputId, const videowire::geometry::DeferredPointsSource& binding,
@@ -1186,10 +1412,9 @@ inline bool replayParticlePoints(const ParticleParams& input, double clipSeconds
     error.clear();
     if (!validStableId(outputId) || !validStableId(binding.sourceStableId) || binding.sourceRevision==0
         || input.motionMode!=2 || !input.historicalReplay || input.count<1
-        || input.count>particleMaxBodies(input.simulationSpace)
         || binding.capacity!=static_cast<std::size_t>(input.count) || !std::isfinite(clipSeconds)
         || !std::isfinite(aspect) || aspect<=0 || !particleHistoryReady(input,error,clipSeconds)) {
-        if (error.empty()) error="Points3D requires Coupled bodies with owned project history and at most 64 planar or 128 Solid 3D bodies";
+        if (error.empty()) error="Points3D requires Coupled bodies with owned project history";
         return false;
     }
     ParticleSolidState state;

@@ -30,7 +30,9 @@ constexpr std::uint32_t kNoTriangle = 0xffffffffu;
 
 // A ray covers origin + t * direction for tMin < t < tMax. The direction need
 // not be unit length; t is in units of the direction. ignoreTriangle skips one
-// triangle, usually the one a secondary ray starts on.
+// triangle, usually the one a secondary ray starts on. time is the ray's
+// moment in the shutter, 0 at the open and 1 at the close keys, where moving
+// triangles are placed (CPU motion BVH and the OptiX motion GAS alike).
 struct Ray
 {
     Vec3 origin {};
@@ -38,16 +40,20 @@ struct Ray
     float tMin = 0.0f;
     float tMax = std::numeric_limits<float>::infinity();
     std::uint32_t ignoreTriangle = kNoTriangle;
+    float time = 0.0f;
 };
 
 // Barycentrics: the hit point is (1 - u - v) * p0 + u * p1 + v * p2.
 // triangle is the caller's index into the triangle list given to build().
+// time copies the ray's shutter time, so the hit point can be rebuilt from
+// the triangle's vertices at that moment.
 struct Hit
 {
     float t = std::numeric_limits<float>::infinity();
     float u = 0.0f;
     float v = 0.0f;
     std::uint32_t triangle = kNoTriangle;
+    float time = 0.0f;
 
     PT_SHARED_FN bool valid() const noexcept { return triangle != kNoTriangle; }
 };
@@ -66,13 +72,31 @@ struct PreparedRay
     float shearZ = 1.0f;
 };
 
-// False when the origin or direction is not finite or the direction is zero.
-bool prepareRay (const Ray& ray, PreparedRay& prepared) noexcept;
+// prepareRay and intersectTriangle, the ray setup and the watertight triangle
+// test, are in bvh_traversal.h, which every device compiles.
 
-// Watertight test of one triangle against tMin < t < tMax. Both faces hit.
-// On a hit, writes t, u and v (triangle is left unchanged).
-bool intersectTriangle (const PreparedRay& ray, Vec3 p0, Vec3 p1, Vec3 p2,
-                        float tMin, float tMax, Hit& hit) noexcept;
+// Linear vertex motion: the vertex at shutter time `time` between its open and
+// close positions. Rigid transforms interpolated elementwise move every vertex
+// along this line, so the lerp is exact for them.
+PT_SHARED_FN Vec3 motionLerp (Vec3 open, Vec3 close, float time) noexcept
+{
+    return open + (close - open) * time;
+}
+
+// Bounds of one triangle over the whole shutter: the union of its open and
+// close triangles, which contains every in-between triangle because each
+// vertex moves on a straight line.
+inline Bounds motionTriangleBounds (const Vec3* open, const Vec3* close) noexcept
+{
+    Bounds b;
+    for (int k = 0; k < 3; ++k)
+    {
+        b.grow (open[k]);
+        if (close != nullptr)
+            b.grow (close[k]);
+    }
+    return b;
+}
 
 // Moves a surface point off its triangle along n, the geometric normal facing
 // the side the new ray leaves from. The step grows with |p|, so it stays a few
@@ -108,6 +132,8 @@ PT_SHARED_FN Vec3 spawnRayOrigin (Vec3 p, Vec3 ng, Vec3 dir) noexcept
     return offsetRayOrigin (p, dot (ng, dir) < 0.0f ? -ng : ng);
 }
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 // 32 bytes. An interior node (count == 0) has children at firstOrLeft and
 // firstOrLeft + 1. A leaf (count > 0) owns ordered triangles
 // [firstOrLeft, firstOrLeft + count).
@@ -119,6 +145,20 @@ struct BvhNode
     std::uint32_t count;
 };
 static_assert (sizeof (BvhNode) == 32, "BvhNode must stay 32 bytes");
+
+// A built Bvh's arrays, on the host or copied to a device. Leaf order: the
+// ordered triangle i has vertices orderedPositions[3i..3i+2] and the caller's
+// index triangleIndices[i]. bvh_traversal.h traverses it, placing a moving
+// triangle's vertices at ray.time between orderedPositions and orderedClose.
+struct BvhView
+{
+    const BvhNode* nodes = nullptr;
+    std::size_t nodeCount = 0;
+    const Vec3* orderedPositions = nullptr;
+    const std::uint32_t* triangleIndices = nullptr;
+    // Close-of-shutter vertices in leaf order, or null for a static build.
+    const Vec3* orderedClose = nullptr;
+};
 
 struct BvhBuildOptions
 {
@@ -147,7 +187,13 @@ public:
     // replaces any earlier hierarchy. Triangles keep their caller indices.
     void build (const std::vector<Vec3>& positions, const BvhBuildOptions& options = {});
     void build (const Vec3* positions, std::size_t triangleCount, const BvhBuildOptions& options = {});
+    // Motion build: open and close hold three vertices per triangle at shutter
+    // open and close. Node bounds cover the whole sweep and the leaf test
+    // places each vertex at ray.time. close == nullptr is a static build.
+    void buildMotion (const Vec3* open, const Vec3* close, std::size_t triangleCount,
+                      const BvhBuildOptions& options = {});
     void clear() noexcept;
+    bool hasMotion() const noexcept { return ! orderedClose_.empty(); }
 
     // Closest hit in (ray.tMin, ray.tMax). Leaves hit unchanged on a miss.
     bool intersect (const Ray& ray, Hit& hit) const noexcept;
@@ -156,6 +202,15 @@ public:
 
     std::size_t triangleCount() const noexcept { return triangleIndices_.size(); }
     const std::vector<BvhNode>& nodes() const noexcept { return nodes_; }
+    // The arrays a device copies; a GPU device uploads each and traverses the copy.
+    BvhView view() const noexcept
+    {
+        return { nodes_.data(), nodes_.size(), orderedPositions_.data(), triangleIndices_.data(),
+                 orderedClose_.empty() ? nullptr : orderedClose_.data() };
+    }
+    const std::vector<Vec3>& orderedPositions() const noexcept { return orderedPositions_; }
+    const std::vector<Vec3>& orderedClose() const noexcept { return orderedClose_; }
+    const std::vector<std::uint32_t>& triangleIndices() const noexcept { return triangleIndices_; }
     Bounds bounds() const noexcept;
     const BvhStats& stats() const noexcept { return stats_; }
 
@@ -163,8 +218,16 @@ private:
     std::vector<BvhNode> nodes_;
     // Leaf order. orderedPositions_ holds three vertices per ordered triangle.
     std::vector<Vec3> orderedPositions_;
+    // Close-of-shutter vertices in the same order; empty without motion.
+    std::vector<Vec3> orderedClose_;
     std::vector<std::uint32_t> triangleIndices_;
     BvhStats stats_ {};
 };
+#endif
 
 } // namespace videohelper::pathtrace
+
+// Metal traces against its own acceleration structure.
+#if ! defined(PATHTRACE_DEVICE_METAL)
+#include "bvh_traversal.h"
+#endif

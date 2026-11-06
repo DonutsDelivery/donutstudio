@@ -27,6 +27,7 @@ typedef unsigned long long CUdeviceptr;
 #include <dlfcn.h>
 #endif
 
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -75,6 +76,10 @@ struct CudaApi
     int (*cuMemcpyHtoD) (CUdeviceptr, const void*, std::size_t) = nullptr;
     int (*cuMemcpyDtoH) (void*, CUdeviceptr, std::size_t) = nullptr;
     int (*cuMemsetD8) (CUdeviceptr, unsigned char, std::size_t) = nullptr;
+    int (*cuMemcpyDtoD) (CUdeviceptr, CUdeviceptr, std::size_t) = nullptr;
+    int (*cuCtxSetLimit) (int, std::size_t) = nullptr;
+    // Optional: a driver without it leaves the memory readout empty.
+    int (*cuMemGetInfo) (std::size_t*, std::size_t*) = nullptr;
 
     bool load (std::string& error)
     {
@@ -105,6 +110,9 @@ struct CudaApi
         bind (cuMemcpyHtoD, "cuMemcpyHtoD_v2");
         bind (cuMemcpyDtoH, "cuMemcpyDtoH_v2");
         bind (cuMemsetD8, "cuMemsetD8_v2");
+        bind (cuMemcpyDtoD, "cuMemcpyDtoD_v2");
+        bind (cuCtxSetLimit, "cuCtxSetLimit");
+        cuMemGetInfo = reinterpret_cast<decltype (cuMemGetInfo)> (find ("cuMemGetInfo_v2"));
         return error.empty();
     }
 };
@@ -112,6 +120,22 @@ struct CudaApi
 struct EmptyRecord
 {
     alignas (OPTIX_SBT_RECORD_ALIGNMENT) char header[OPTIX_SBT_RECORD_HEADER_SIZE] {};
+};
+
+// The OptiX AI denoiser (Plan 3, Denoising), one per model kind, on the shared
+// context. Each keeps its state, scratch and images for the last frame size.
+// Outside OptixRenderer: its inline static array needs the type complete.
+struct DenoiserSlot
+{
+    OptixDenoiser denoiser = nullptr;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    OptixDenoiserSizes sizes {};
+    std::vector<CUdeviceptr> memory;
+    CUdeviceptr state = 0, scratch = 0, color = 0, albedo = 0, normal = 0, output = 0, flow = 0;
+    CUdeviceptr guides[2] {};
+    int currentGuide = 0;
+    bool hasPrevious = false;
 };
 
 class OptixRenderer
@@ -136,6 +160,7 @@ public:
 
     bool render (PathTracer::DevicePass& pass)
     {
+        const auto waitStart = PhaseClock::now();
         if (deviceLost())
         {
             pass.error = "OptiX device: the GPU context was lost earlier in this session";
@@ -157,6 +182,7 @@ public:
                 return false;
         }
         const std::lock_guard<std::mutex> lock (deviceLock_);
+        pass.stats.phases.set (FramePhase::PipelineWait, millisecondsSince (waitStart));
         if (deviceLost())
         {
             pass.error = "OptiX device: the GPU context was lost earlier in this session";
@@ -287,7 +313,7 @@ private:
         return check (result, "compiling the kernel", error);
     }
 
-    bool cuda (int result, const char* what, std::string& error) const
+    static bool cuda (int result, const char* what, std::string& error)
     {
         if (result == 0)
             return true;
@@ -297,7 +323,7 @@ private:
         return false;
     }
 
-    bool check (OptixResult result, const char* what, std::string& error) const
+    static bool check (OptixResult result, const char* what, std::string& error)
     {
         if (result == OPTIX_SUCCESS)
             return true;
@@ -311,7 +337,7 @@ private:
 
     // Every OptiX and CUDA call needs the context current on the calling thread,
     // and render threads change.
-    bool enter (std::string& error) { return cuda (cu_.cuCtxSetCurrent (cudaContext_), "making the CUDA context current", error); }
+    static bool enter (std::string& error) { return cuda (cu_.cuCtxSetCurrent (cudaContext_), "making the CUDA context current", error); }
 
     // pipeline_ is published last, so a set pipeline_ means the whole setup finished.
     // A setup that fails releases all it made, and the next engine's try starts from
@@ -373,6 +399,9 @@ private:
         pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
         pipelineOptions.pipelineLaunchParamsVariableName = "params";
         pipelineOptions.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
+        // Motion blur: a moving scene's GAS has two motion keys (shutter open and
+        // close) and rays carry their time. A still GAS traces the same in this pipeline.
+        pipelineOptions.usesMotionBlur = 1;
         std::string ptx;
         for (std::size_t chunk = 0; chunk < kArbitOptixKernelPtxChunks; ++chunk)
             ptx += kArbitOptixKernelPtx[chunk];
@@ -433,6 +462,7 @@ private:
                      "computing the stack sizes", error)
             || ! check (optixPipelineSetStackSize (pipeline, fromTraversal, fromState, continuation, 1), "setting the stack size", error))
             return false;
+        stackBytesPerThread_ = continuation;
 
         EmptyRecord raygen, misses[2], hits[2];
         if (! check (optixSbtRecordPackHeader (groups_[0], &raygen), "packing an SBT record", error)
@@ -462,6 +492,43 @@ private:
             return false;
         pipeline_ = pipeline;
         return true;
+    }
+
+    // A launch holds the pipeline's stack in local memory for every thread the GPU
+    // can run at once: 46 KB a thread, 3.1 GB on an RTX 4070 (measured). Left to
+    // itself the driver grows the context's local memory at the first launch, and
+    // when the GPU has less free than that it does not refuse the launch: the GPU
+    // faults (Xid 13, SKEDCHECK05_LOCAL_MEMORY_TOTAL_SIZE) and the context is lost,
+    // CUDA error 719 at the next copy. A stack limit of the same size makes the driver
+    // reserve the memory before the launch, and a GPU without room says so with an
+    // out-of-memory code that leaves the context usable for a later pass
+    // (pathtrace_optix_preview_sequence_tests.cpp, ARBIT_OPTIX_SEQUENCE_LEAVE_MIB).
+    // The first launch does it rather than the build, which runs at helper startup
+    // and would hold the memory for a session that never traces.
+    static bool reserveStack (std::string& error)
+    {
+        if (stackReserved_)
+            return true;
+        const unsigned int bytesPerThread = stackBytesPerThread_;
+        std::size_t freeBefore = 0, freeAfter = 0, total = 0;
+        if (cu_.cuMemGetInfo != nullptr)
+            cu_.cuMemGetInfo (&freeBefore, &total);
+        const int result = cu_.cuCtxSetLimit (0x00 /* CU_LIMIT_STACK_SIZE */, bytesPerThread);
+        if (cu_.cuMemGetInfo != nullptr)
+            cu_.cuMemGetInfo (&freeAfter, &total);
+        std::fprintf (stderr, "[pt] optix stack %u bytes per thread, reserved %zu MiB (free %zu MiB before, %zu MiB after, result %d)\n",
+                      bytesPerThread, freeBefore > freeAfter ? (freeBefore - freeAfter) >> 20 : 0, freeBefore >> 20, freeAfter >> 20, result);
+        if (result == 0)
+        {
+            stackReserved_ = true;
+            return true;
+        }
+        if (cudaErrorLosesDevice (result))
+            noteDeviceLost();
+        error = "OptiX device: reserving " + std::to_string (static_cast<unsigned long long> (bytesPerThread))
+              + " bytes of path stack per GPU thread failed with CUDA error " + std::to_string (result)
+              + (result == 2 ? ": the GPU has too little free memory; close other GPU apps" : "");
+        return false;
     }
 
     bool uploadBytes (const void* data, std::size_t size, std::vector<CUdeviceptr>& owner, CUdeviceptr& address, std::string& error)
@@ -511,8 +578,15 @@ private:
     bool ensureScene (const PathTracer::DevicePass& pass, std::string& error)
     {
         const std::uint64_t build = sceneBuild_();
+        auto& phases = pass.stats.phases;
         if (haveScene_ && build == sceneUploaded_ && &pass.scene == sceneAddress_)
+        {
+            phases.set (FramePhase::Upload, 0.0);
+            phases.set (FramePhase::AccelBuild, 0.0);
+            phases.accelBuild = "reused";
             return true;
+        }
+        const auto uploadStart = PhaseClock::now();
         freeScene();
         haveScene_ = false;
         const RenderScene& scene = pass.scene;
@@ -520,12 +594,22 @@ private:
         if (! uploadView (BufferView<Vec3> { scene.geometry.positions.data(), scene.geometry.positions.size() }, view_.positions, error)
             || ! uploadView (BufferView<TriangleAttributes> { scene.geometry.triangles.data(), scene.geometry.triangles.size() }, view_.triangles, error)
             || ! uploadView (BufferView<Material> { scene.materials.data(), scene.materials.size() }, view_.materials, error)
-            || ! uploadView (BufferView<GratingBinding> { scene.gratings.data(), scene.gratings.size() }, view_.gratings, error))
+            || ! uploadView (BufferView<GratingBinding> { scene.gratings.data(), scene.gratings.size() }, view_.gratings, error)
+            || ! uploadView (BufferView<Vec3> { scene.geometry.motionOpen.data(), scene.geometry.motionOpen.size() }, view_.motionOpen, error)
+            || ! uploadView (BufferView<Vec3> { scene.geometry.motionClose.data(), scene.geometry.motionClose.size() }, view_.motionClose, error))
             return false;
         CUdeviceptr fallback = 0;
         if (! uploadBytes (&scene.fallbackMaterial, sizeof (Material), scene_, fallback, error))
             return false;
         view_.fallbackMaterial = reinterpret_cast<const Material*> (fallback);
+        if (scene.hasWorldVolume)
+        {
+            CUdeviceptr world = 0;
+            if (! uploadBytes (&scene.worldVolume, sizeof (Material), scene_, world, error))
+                return false;
+            view_.worldMedium = reinterpret_cast<const Material*> (world);
+            view_.worldVolumeRadius = scene.worldVolumeExtent;
+        }
 
         // The light set's own buffers first, then the view that points at them.
         bool uploaded = true;
@@ -543,9 +627,20 @@ private:
         view_.anyThinSheet = scene.anyThinSheet;
         view_.anyDispersive = scene.anyDispersive;
         view_.anyMediumBoundary = scene.anyMediumBoundary;
+        view_.anyVolume = scene.anyVolume;
+        view_.anyHiddenObjects = scene.anyHiddenObjects;
         view_.boundsCentre = scene.boundsCentre;
         view_.boundsRadius = scene.boundsRadius;
-        if (! buildAccel (scene, error))
+        // cuMemcpyHtoD from pageable memory returns once the bytes are staged, so the
+        // last copies may still be in flight; the build below queues behind them.
+        phases.set (FramePhase::Upload, millisecondsSince (uploadStart));
+        const auto accelStart = PhaseClock::now();
+        const bool accelBuilt = buildAccel (scene, error);
+        // optixAccelBuild only queues the build on the default stream. Its GPU time
+        // finishes inside the first launch's parameter copy, so traceMs carries it.
+        phases.set (FramePhase::AccelBuild, millisecondsSince (accelStart));
+        phases.accelBuild = "build";
+        if (! accelBuilt)
             return false;
         haveScene_ = true;
         sceneUploaded_ = build;
@@ -559,19 +654,34 @@ private:
         const auto vertexCount = static_cast<unsigned int> (scene.geometry.positions.size());
         if (vertexCount == 0)
             return true;  // a scene of lights alone: rays miss a null handle
-        CUdeviceptr vertices = reinterpret_cast<CUdeviceptr> (view_.positions.data);
+        // A moving scene builds a motion GAS from its shutter-open and shutter-close
+        // vertices. Ingest has already expanded instances and deformations into
+        // world-space triangles, so two linear keys move every vertex exactly as
+        // the CPU BVH does: rigid objects, instances and deforming meshes alike.
+        const bool moving = ! view_.motionOpen.empty();
+        CUdeviceptr vertices[2] {
+            reinterpret_cast<CUdeviceptr> (moving ? view_.motionOpen.data : view_.positions.data),
+            reinterpret_cast<CUdeviceptr> (moving ? view_.motionClose.data : view_.positions.data) };
         const std::uint32_t flags = OPTIX_GEOMETRY_FLAG_NONE;  // keeps any-hit, which honours Ray::ignoreTriangle
         OptixBuildInput input {};
         input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
         input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
         input.triangleArray.vertexStrideInBytes = sizeof (Vec3);
         input.triangleArray.numVertices = vertexCount;
-        input.triangleArray.vertexBuffers = &vertices;
+        input.triangleArray.vertexBuffers = vertices;
         input.triangleArray.flags = &flags;
         input.triangleArray.numSbtRecords = 1;
         OptixAccelBuildOptions options {};
         options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
         options.operation = OPTIX_BUILD_OPERATION_BUILD;
+        if (moving)
+        {
+            // Ray time runs 0 at shutter open to 1 at close, as Ray::time.
+            options.motionOptions.numKeys = 2;
+            options.motionOptions.flags = OPTIX_MOTION_FLAG_NONE;
+            options.motionOptions.timeBegin = 0.0f;
+            options.motionOptions.timeEnd = 1.0f;
+        }
         OptixAccelBufferSizes sizes {};
         if (! check (optixAccelComputeMemoryUsage (context_, &options, &input, 1, &sizes), "sizing the acceleration structure", error))
             return false;
@@ -596,9 +706,9 @@ private:
         film_.clear();
         filmWidth_ = filmHeight_ = 0;
         const std::size_t bytes = static_cast<std::size_t> (width) * height * sizeof (optix::FilmPixel);
-        for (CUdeviceptr* address : { &pixels_, &splats_, &lightPaths_, &totals_, &paramsAddress_ })
+        for (CUdeviceptr* address : { &pixels_, &splats_, &guideAlbedo_, &guideNormal_, &lightPaths_, &totals_, &paramsAddress_ })
         {
-            const std::size_t size = address == &pixels_ || address == &splats_ ? bytes
+            const std::size_t size = address == &pixels_ || address == &splats_ || address == &guideAlbedo_ || address == &guideNormal_ ? bytes
                                    : address == &lightPaths_ ? sizeof (unsigned long long)
                                    : address == &totals_ ? sizeof (optix::LaunchTotals) : sizeof (optix::LaunchParams);
             if (! cuda (cu_.cuMemAlloc (address, size), "allocating the film", error))
@@ -615,13 +725,16 @@ private:
         std::string& error = pass.error;
         const std::uint32_t width = pass.film.width();
         const std::uint32_t height = pass.film.height();
-        if (! ensureFilm (width, height, error))
+        const auto traceStart = PhaseClock::now();
+        if (! reserveStack (error) || ! ensureFilm (width, height, error))
             return false;
         const std::size_t pixelBytes = static_cast<std::size_t> (width) * height * sizeof (optix::FilmPixel);
         const unsigned long long noPaths = 0;
         const optix::LaunchTotals noTotals {};
         if (! cuda (cu_.cuMemsetD8 (pixels_, 0, pixelBytes), "clearing the film", error)
             || ! cuda (cu_.cuMemsetD8 (splats_, 0, pixelBytes), "clearing the film", error)
+            || ! cuda (cu_.cuMemsetD8 (guideAlbedo_, 0, pixelBytes), "clearing the film", error)
+            || ! cuda (cu_.cuMemsetD8 (guideNormal_, 0, pixelBytes), "clearing the film", error)
             || ! cuda (cu_.cuMemcpyHtoD (lightPaths_, &noPaths, sizeof (noPaths)), "clearing the film", error)
             || ! cuda (cu_.cuMemcpyHtoD (totals_, &noTotals, sizeof (noTotals)), "clearing the film", error))
             return false;
@@ -631,7 +744,8 @@ private:
         params.settings = pass.settings;
         params.camera = pass.camera;
         params.film = { reinterpret_cast<optix::FilmPixel*> (pixels_), reinterpret_cast<optix::FilmPixel*> (splats_),
-                        reinterpret_cast<unsigned long long*> (lightPaths_), width };
+                        reinterpret_cast<unsigned long long*> (lightPaths_),
+                        reinterpret_cast<optix::FilmPixel*> (guideAlbedo_), reinterpret_cast<optix::FilmPixel*> (guideNormal_), width };
         params.totals = reinterpret_cast<optix::LaunchTotals*> (totals_);
         params.tables = tables_;
         params.samples = 1;
@@ -651,18 +765,207 @@ private:
                 return false;
             ++launched;
         }
-        return launched == 0 || readBack (pass, pixelBytes);
+        // Each parameter copy waits for the launch before it, so this covers every
+        // sample but the last one's GPU work, which finishes inside the readback.
+        pass.stats.phases.set (FramePhase::Trace, millisecondsSince (traceStart));
+        if (launched == 0)
+        {
+            pass.stats.phases.set (FramePhase::Readback, 0.0);
+            return true;
+        }
+        const auto readbackStart = PhaseClock::now();
+        const bool read = readBack (pass, pixelBytes);
+        pass.stats.phases.set (FramePhase::Readback, millisecondsSince (readbackStart));
+        return read;
     }
 
+public:
+    // The OptiX AI denoiser, which the denoiser choice runs on any device's image.
+    static std::string denoiserProblem()
+    {
+        const std::lock_guard<std::mutex> lock (deviceLock_);
+        if (deviceLost())
+            return "the GPU context was lost earlier in this session";
+        if (context_ == nullptr || pipeline_ == nullptr)
+            return "the OptiX device has not started in this session";
+        return {};
+    }
+
+private:
+    static void freeDenoiserImages (DenoiserSlot& slot)
+    {
+        for (const CUdeviceptr address : slot.memory)
+            cu_.cuMemFree (address);
+        slot.memory.clear();
+        slot.width = slot.height = 0;
+        slot.hasPrevious = false;
+    }
+
+    static bool denoiserAllocate (DenoiserSlot& slot, CUdeviceptr& address, std::size_t bytes, std::string& error)
+    {
+        if (! cuda (cu_.cuMemAlloc (&address, bytes), "allocating the denoiser's memory", error))
+            return false;
+        slot.memory.push_back (address);
+        return true;
+    }
+
+    static bool ensureDenoiser (DenoiserSlot& slot, bool temporal, std::uint32_t width, std::uint32_t height, std::string& error)
+    {
+        if (slot.denoiser == nullptr)
+        {
+            OptixDenoiserOptions options {};
+            options.guideAlbedo = 1;
+            options.guideNormal = 1;
+            options.denoiseAlpha = OPTIX_DENOISER_ALPHA_MODE_COPY;
+            // TEMPORAL_AOV is the SDK 9 name of OPTIX_DENOISER_MODEL_KIND_TEMPORAL, which maps to it.
+            if (! check (optixDenoiserCreate (context_, temporal ? OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV
+                                                                         : OPTIX_DENOISER_MODEL_KIND_AOV,
+                                                      &options, &slot.denoiser), "creating the AI denoiser", error))
+                return false;
+        }
+        if (slot.width == width && slot.height == height)
+            return true;
+        freeDenoiserImages (slot);
+        if (! check (optixDenoiserComputeMemoryResources (slot.denoiser, width, height, &slot.sizes),
+                             "sizing the AI denoiser", error))
+            return false;
+        const std::size_t pixels = static_cast<std::size_t> (width) * height;
+        const std::size_t image = pixels * 3 * sizeof (float);
+        if (! denoiserAllocate (slot, slot.state, slot.sizes.stateSizeInBytes, error)
+            || ! denoiserAllocate (slot, slot.scratch, slot.sizes.withoutOverlapScratchSizeInBytes, error)
+            || ! denoiserAllocate (slot, slot.color, image, error)
+            || ! denoiserAllocate (slot, slot.albedo, image, error)
+            || ! denoiserAllocate (slot, slot.normal, image, error)
+            || ! denoiserAllocate (slot, slot.output, image, error))
+        {
+            freeDenoiserImages (slot);
+            return false;
+        }
+        if (temporal)
+        {
+            const std::size_t guide = pixels * slot.sizes.internalGuideLayerPixelSizeInBytes;
+            if (! denoiserAllocate (slot, slot.flow, pixels * 2 * sizeof (float), error)
+                || ! denoiserAllocate (slot, slot.guides[0], guide, error)
+                || ! denoiserAllocate (slot, slot.guides[1], guide, error))
+            {
+                freeDenoiserImages (slot);
+                return false;
+            }
+        }
+        if (! check (optixDenoiserSetup (slot.denoiser, nullptr, width, height, slot.state, slot.sizes.stateSizeInBytes,
+                                                 slot.scratch, slot.sizes.withoutOverlapScratchSizeInBytes),
+                             "setting up the AI denoiser", error))
+        {
+            freeDenoiserImages (slot);
+            return false;
+        }
+        slot.width = width;
+        slot.height = height;
+        return true;
+    }
+
+public:
+    static bool denoise (const OptixDenoiseImage& frame, std::string& error)
+    {
+        const std::lock_guard<std::mutex> lock (deviceLock_);
+        if (deviceLost())
+        {
+            error = "OptiX AI denoiser: the GPU context was lost earlier in this session";
+            return false;
+        }
+        if (context_ == nullptr || pipeline_ == nullptr)
+        {
+            error = "OptiX AI denoiser: the OptiX device has not started in this session";
+            return false;
+        }
+        if (frame.width == 0 || frame.height == 0 || frame.color == nullptr || frame.albedo == nullptr
+            || frame.normal == nullptr || frame.output == nullptr || (frame.temporal && frame.flow == nullptr))
+        {
+            error = "OptiX AI denoiser: the frame is incomplete";
+            return false;
+        }
+        if (! enter (error))
+            return false;
+        DenoiserSlot& slot = denoisers_[frame.temporal ? 1 : 0];
+        if (! ensureDenoiser (slot, frame.temporal, frame.width, frame.height, error))
+            return false;
+        const std::size_t pixels = static_cast<std::size_t> (frame.width) * frame.height;
+        const std::size_t bytes = pixels * 3 * sizeof (float);
+        if (! cuda (cu_.cuMemcpyHtoD (slot.color, frame.color, bytes), "uploading the denoiser's input", error)
+            || ! cuda (cu_.cuMemcpyHtoD (slot.albedo, frame.albedo, bytes), "uploading the denoiser's input", error)
+            || ! cuda (cu_.cuMemcpyHtoD (slot.normal, frame.normal, bytes), "uploading the denoiser's input", error))
+            return false;
+        const bool usePrevious = frame.temporal && frame.usePrevious && slot.hasPrevious;
+        if (frame.temporal)
+        {
+            const std::size_t guideBytes = pixels * slot.sizes.internalGuideLayerPixelSizeInBytes;
+            // A new sequence: the noisy frame stands in for the previous output, with zero flow
+            // and a cleared guide layer, as optixDenoiserInvoke asks of a first frame.
+            if (! cuda (cu_.cuMemcpyHtoD (slot.flow, frame.flow, pixels * 2 * sizeof (float)), "uploading the flow", error)
+                || (! usePrevious && (! cuda (cu_.cuMemcpyDtoD (slot.output, slot.color, bytes), "starting the sequence", error)
+                                      || ! cuda (cu_.cuMemsetD8 (slot.guides[slot.currentGuide], 0, guideBytes), "starting the sequence", error)
+                                      || ! cuda (cu_.cuMemsetD8 (slot.flow, 0, pixels * 2 * sizeof (float)), "starting the sequence", error))))
+                return false;
+        }
+        const auto image = [&] (CUdeviceptr data, OptixPixelFormat format, unsigned int pixelBytes) {
+            OptixImage2D result {};
+            result.data = data;
+            result.width = frame.width;
+            result.height = frame.height;
+            result.rowStrideInBytes = frame.width * pixelBytes;
+            result.pixelStrideInBytes = pixelBytes;
+            result.format = format;
+            return result;
+        };
+        constexpr unsigned int float3Bytes = 3 * sizeof (float);
+        OptixDenoiserGuideLayer guides {};
+        guides.albedo = image (slot.albedo, OPTIX_PIXEL_FORMAT_FLOAT3, float3Bytes);
+        guides.normal = image (slot.normal, OPTIX_PIXEL_FORMAT_FLOAT3, float3Bytes);
+        OptixDenoiserLayer layer {};
+        layer.input = image (slot.color, OPTIX_PIXEL_FORMAT_FLOAT3, float3Bytes);
+        layer.output = image (slot.output, OPTIX_PIXEL_FORMAT_FLOAT3, float3Bytes);
+        layer.type = OPTIX_DENOISER_AOV_TYPE_BEAUTY;
+        OptixDenoiserParams params {};
+        if (frame.temporal)
+        {
+            const auto guidePixel = static_cast<unsigned int> (slot.sizes.internalGuideLayerPixelSizeInBytes);
+            guides.flow = image (slot.flow, OPTIX_PIXEL_FORMAT_FLOAT2, 2 * sizeof (float));
+            guides.previousOutputInternalGuideLayer = image (slot.guides[slot.currentGuide], OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER, guidePixel);
+            guides.outputInternalGuideLayer = image (slot.guides[1 - slot.currentGuide], OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER, guidePixel);
+            // The output buffer holds the previous frame's output; the invoke reads it first.
+            layer.previousOutput = layer.output;
+            params.temporalModeUsePreviousLayers = usePrevious ? 1u : 0u;
+        }
+        if (! check (optixDenoiserInvoke (slot.denoiser, nullptr, &params, slot.state, slot.sizes.stateSizeInBytes,
+                                                  &guides, &layer, 1, 0, 0, slot.scratch, slot.sizes.withoutOverlapScratchSizeInBytes),
+                             "running the AI denoiser", error)
+            || ! cuda (cu_.cuMemcpyDtoH (frame.output, slot.output, bytes), "reading the denoised frame back", error))
+        {
+            slot.hasPrevious = false;
+            return false;
+        }
+        if (frame.temporal)
+        {
+            slot.currentGuide = 1 - slot.currentGuide;
+            slot.hasPrevious = true;
+        }
+        return true;
+    }
+
+private:
     bool readBack (PathTracer::DevicePass& pass, std::size_t pixelBytes)
     {
         std::string& error = pass.error;
         hostPixels_.resize (pixelBytes / sizeof (optix::FilmPixel));
         hostSplats_.resize (hostPixels_.size());
+        hostAlbedo_.resize (hostPixels_.size());
+        hostNormal_.resize (hostPixels_.size());
         unsigned long long lightPaths = 0;
         optix::LaunchTotals totals;
         if (! cuda (cu_.cuMemcpyDtoH (hostPixels_.data(), pixels_, pixelBytes), "reading the film back", error)
             || ! cuda (cu_.cuMemcpyDtoH (hostSplats_.data(), splats_, pixelBytes), "reading the film back", error)
+            || ! cuda (cu_.cuMemcpyDtoH (hostAlbedo_.data(), guideAlbedo_, pixelBytes), "reading the guides back", error)
+            || ! cuda (cu_.cuMemcpyDtoH (hostNormal_.data(), guideNormal_, pixelBytes), "reading the guides back", error)
             || ! cuda (cu_.cuMemcpyDtoH (&lightPaths, lightPaths_, sizeof (lightPaths)), "reading the film back", error)
             || ! cuda (cu_.cuMemcpyDtoH (&totals, totals_, sizeof (totals)), "reading the film back", error))
             return false;
@@ -677,6 +980,11 @@ private:
             const optix::FilmPixel& splat = hostSplats_[i];
             if (splat.x != 0.0f || splat.y != 0.0f || splat.z != 0.0f)
                 pass.film.addSplat (x, y, { splat.x, splat.y, splat.z });
+            const optix::FilmPixel& albedo = hostAlbedo_[i];
+            const optix::FilmPixel& normal = hostNormal_[i];
+            if (albedo.w > 0.0f)
+                pass.film.addGuideSum (x, y, { albedo.x, albedo.y, albedo.z }, { normal.x, normal.y, normal.z },
+                                       static_cast<std::uint32_t> (albedo.w));
         }
         pass.film.addLightPaths (lightPaths);
         PathCounters counters;
@@ -684,6 +992,12 @@ private:
         pass.counters += counters;
         pass.stats.samplesAdded += totals.samplesAdded;
         pass.stats.nonFiniteSamples += totals.nonFinite;
+        std::size_t freeBytes = 0, totalBytes = 0;
+        if (cu_.cuMemGetInfo != nullptr && cu_.cuMemGetInfo (&freeBytes, &totalBytes) == 0)
+        {
+            pass.stats.deviceMemoryFreeBytes = freeBytes;
+            pass.stats.deviceMemoryTotalBytes = totalBytes;
+        }
         return true;
     }
 
@@ -701,11 +1015,14 @@ private:
     inline static bool cancelled_ = false;
     inline static OptixProgramGroup groups_[5] {};
     inline static OptixPipeline pipeline_ = nullptr;
+    inline static unsigned int stackBytesPerThread_ = 0;
+    inline static bool stackReserved_ = false;
     inline static OptixShaderBindingTable sbt_ {};
     inline static DeviceLookupTables tables_;
     inline static char log_[4096] {};
     inline static std::size_t logSize_ = 0;
     inline static std::vector<CUdeviceptr> permanent_;
+    inline static DenoiserSlot denoisers_[2];
 
     std::function<std::uint64_t()> sceneBuild_;
     std::vector<CUdeviceptr> scene_;
@@ -716,9 +1033,11 @@ private:
     const RenderScene* sceneAddress_ = nullptr;
     std::uint32_t filmWidth_ = 0;
     std::uint32_t filmHeight_ = 0;
-    CUdeviceptr pixels_ = 0, splats_ = 0, lightPaths_ = 0, totals_ = 0, paramsAddress_ = 0;
+    CUdeviceptr pixels_ = 0, splats_ = 0, guideAlbedo_ = 0, guideNormal_ = 0, lightPaths_ = 0, totals_ = 0, paramsAddress_ = 0;
     std::vector<optix::FilmPixel> hostPixels_;
     std::vector<optix::FilmPixel> hostSplats_;
+    std::vector<optix::FilmPixel> hostAlbedo_;
+    std::vector<optix::FilmPixel> hostNormal_;
 };
 
 } // namespace
@@ -734,6 +1053,15 @@ void startOptixPipelineBuild() { OptixRenderer::startBuild(); }
 void cancelOptixPipelineBuild() { OptixRenderer::cancelBuild(); }
 bool stopOptixPipelineBuildByUser() { return OptixRenderer::stopBuildByUser(); }
 void startOptixPipelineBuildByUser() { OptixRenderer::startBuildByUser(); }
+std::string optixDenoiserProblem() { return OptixRenderer::denoiserProblem(); }
+bool optixDenoise (const OptixDenoiseImage& image, std::string& error) { return OptixRenderer::denoise (image, error); }
+#else
+std::string optixDenoiserProblem() { return "this build of DonutStudio has no OptiX kernel"; }
+bool optixDenoise (const OptixDenoiseImage&, std::string& error)
+{
+    error = "OptiX AI denoiser: this build of DonutStudio has no OptiX kernel";
+    return false;
+}
 #endif // ARBIT_HAVE_OPTIX_KERNEL
 
 } // namespace videohelper::pathtrace::device

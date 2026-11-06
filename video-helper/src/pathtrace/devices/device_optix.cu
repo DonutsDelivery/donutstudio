@@ -46,7 +46,7 @@ struct OptixDevice
     {
         unsigned p0 = __float_as_uint (ray.tMax), p1 = 0, p2 = 0, p3 = kNoTriangle, p4 = ray.ignoreTriangle;
         optixTrace (accel, make_float3 (ray.origin.x, ray.origin.y, ray.origin.z),
-                    make_float3 (ray.direction.x, ray.direction.y, ray.direction.z), ray.tMin, ray.tMax, 0.0f,
+                    make_float3 (ray.direction.x, ray.direction.y, ray.direction.z), ray.tMin, ray.tMax, ray.time,
                     OptixVisibilityMask (255), OPTIX_RAY_FLAG_NONE, kRayTypeClosest, kRayTypeCount, kRayTypeClosest,
                     p0, p1, p2, p3, p4);
         if (p3 == kNoTriangle)
@@ -55,6 +55,7 @@ struct OptixDevice
         hit.u = __uint_as_float (p1);
         hit.v = __uint_as_float (p2);
         hit.triangle = p3;
+        hit.time = ray.time;
         return true;
     }
 
@@ -63,7 +64,7 @@ struct OptixDevice
         unsigned blocked = 1;  // the shadow miss program clears it
         unsigned ignored = ray.ignoreTriangle;
         optixTrace (accel, make_float3 (ray.origin.x, ray.origin.y, ray.origin.z),
-                    make_float3 (ray.direction.x, ray.direction.y, ray.direction.z), ray.tMin, ray.tMax, 0.0f,
+                    make_float3 (ray.direction.x, ray.direction.y, ray.direction.z), ray.tMin, ray.tMax, ray.time,
                     OptixVisibilityMask (255),
                     OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT, kRayTypeShadow,
                     kRayTypeCount, kRayTypeShadow, blocked, ignored);
@@ -72,23 +73,17 @@ struct OptixDevice
 
     PT_DEVICE_FN static void filmAdd (Film& film, std::uint32_t x, std::uint32_t y, Vec3 rgb) noexcept
     {
-        optix::FilmPixel& pixel = film.pixels[y * film.width + x];
-        // A non-finite channel counts as 0, as Accumulator::addSample has it.
-        atomicAdd (&pixel.x, std::isfinite (rgb.x) ? rgb.x : 0.0f);
-        atomicAdd (&pixel.y, std::isfinite (rgb.y) ? rgb.y : 0.0f);
-        atomicAdd (&pixel.z, std::isfinite (rgb.z) ? rgb.z : 0.0f);
-        atomicAdd (&pixel.w, 1.0f);
+        gpu::filmAdd (film, x, y, rgb);
     }
-
     PT_DEVICE_FN static void filmSplat (Film& film, std::uint32_t x, std::uint32_t y, Vec3 rgb) noexcept
     {
-        optix::FilmPixel& splat = film.splats[y * film.width + x];
-        atomicAdd (&splat.x, std::isfinite (rgb.x) ? rgb.x : 0.0f);
-        atomicAdd (&splat.y, std::isfinite (rgb.y) ? rgb.y : 0.0f);
-        atomicAdd (&splat.z, std::isfinite (rgb.z) ? rgb.z : 0.0f);
+        gpu::filmSplat (film, x, y, rgb);
     }
-
-    PT_DEVICE_FN static void filmCountLightPath (Film& film) noexcept { atomicAdd (film.lightPaths, 1ull); }
+    PT_DEVICE_FN static void filmCountLightPath (Film& film) noexcept { gpu::filmCountLightPath (film); }
+    PT_DEVICE_FN static void filmGuide (Film& film, std::uint32_t x, std::uint32_t y, Vec3 albedo, Vec3 normal) noexcept
+    {
+        gpu::filmGuide (film, x, y, albedo, normal);
+    }
 };
 
 } // namespace videohelper::pathtrace::device
@@ -131,11 +126,7 @@ extern "C" __global__ void __raygen__pathtrace()
         else
             ++added;
     }
-    const auto* words = reinterpret_cast<const unsigned long long*> (&counters);
-    for (std::size_t i = 0; i < optix::kPathCounterWords; ++i)
-        atomicAdd (&params.totals->counters[i], words[i]);
-    atomicAdd (&params.totals->samplesAdded, added);
-    atomicAdd (&params.totals->nonFinite, nonFinite);
+    ::videohelper::pathtrace::device::gpu::addTotals (params.totals, counters, added, nonFinite);
 }
 
 // Ray.ignoreTriangle, as the CPU BVH honours it. The GAS must leave any-hit

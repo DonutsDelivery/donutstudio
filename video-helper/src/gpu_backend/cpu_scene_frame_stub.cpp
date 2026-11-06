@@ -3,7 +3,7 @@
 namespace arbitgpu
 {
 
-// Metal and headless builds have no CPU scene upload yet.
+// Headless builds have no CPU scene upload.
 std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
     const std::string& backend, const CpuSceneImage&, std::string& error)
 {

@@ -59,6 +59,27 @@ for field in fields:
     check(f"sky.{field}" in plan, f"the compiled plan carries {field}")
 check("kSkyCloudExtensionMagic" in aov, "scene clouds use an optional trailer, so clear scenes keep their bytes")
 
+# The sun halo travels the same route, and only a sky with one writes it.
+check("float sunHalo = 0.0f;" in struct and "a.sunHalo,b.sunHalo" in same, "the scene record stores and compares the halo")
+check('"skySunHalo"' in node and '"skySunHalo",&s.sunHalo' in runtime, "the node authors and modulation reaches the halo")
+check("kSkyExtrasExtensionMagic" in aov and "analyticSkyExtrasAuthored" in plan, "the halo is optional on both wire formats")
+check("float cloudThickness = 0.0f;" in struct and "a.cloudThickness,b.cloudThickness" in same
+      and '"cloudThickness"' in node and '"cloudThickness",&s.cloudThickness' in runtime,
+      "the cloud thickness travels the halo's route")
+check("analyticSkyBackground(vWorldPosition" in read("video-helper/src/gpu_backend/backend_opengl.cpp")
+      and "analyticSkyBackground(in.worldPosition" in read("video-helper/src/gpu_backend/backend_sokol.mm"),
+      "GL and Metal draw the camera's sky with the volumetric layer")
+check("cloudvolume::march" in read("video-helper/src/pathtrace/lights.cpp"), "Path Trace marches the same layer")
+
+# The camera background is apart from world lighting: every engine reads it where
+# the hidden world would show, and both wire formats carry it only when set.
+check("kCameraBackgroundExtensionMagic" in aov and "cameraBackground" in plan, "both wire formats carry the camera background")
+for engine in ("video-helper/src/gpu_backend/backend_opengl.cpp", "video-helper/src/gpu_backend/backend_sokol.mm",
+               "video-helper/src/pathtrace/engine.cpp"):
+    check("cameraBackground" in read(engine), f"{engine} draws the camera background")
+check("analyticSkyHalo(d,zenith,sun,sunDirection)" in radiance, "analyticSkyRadiance adds the halo")
+check("sunHalo" in read("video-helper/src/pathtrace/lights.cpp"), "Path Trace draws the same halo")
+
 if failures:
     print("\n".join(f"FAIL: {failure}" for failure in failures))
     sys.exit(1)

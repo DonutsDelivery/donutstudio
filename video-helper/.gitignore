@@ -2,6 +2,7 @@ build/
 
 # Source-profile helper caches, including maintained build-directory overrides
 /build*-lgpl-*/
+/build-plan3-clt/
 
 # Opt-in Windows source dependency candidate
 dependency-cache-windows/

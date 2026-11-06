@@ -726,9 +726,10 @@ static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
             if (!growVisual3DScene(*scene, cameraGrowth, error))
                 return nullptr;
             const auto& source = asset.cameras[*node.camera];
-            if (source.type != GlbCameraType::Perspective || !source.farPlane)
+            const bool orthographic = source.type == GlbCameraType::Orthographic;
+            if (!source.farPlane || (orthographic && !(source.yMagnification > 0.0f)))
             {
-                fail(error, "Visual3DScene adaptation requires finite perspective cameras");
+                fail(error, "Visual3DScene adaptation requires cameras with a finite far plane");
                 return nullptr;
             }
             if (!nearAxisValue(transform.scale.x, 1.0f) || !nearAxisValue(transform.scale.y, 1.0f)
@@ -741,8 +742,15 @@ static std::unique_ptr<Visual3DScene> adaptStaticGlbToVisual3DSceneHeap(
             target.id = SceneCameraId {static_cast<std::uint32_t>(nodeIndex + 1)};
             target.transform = transform;
             target.transform.scale = {1.0f, 1.0f, 1.0f};
-            target.verticalFovRadians = source.verticalFovRadians;
-            target.nearPlane = source.nearPlane;
+            // glTF ymag is half the orthographic view height. The field of view keeps
+            // its default, so switching the camera to perspective has a usable lens.
+            if (orthographic)
+                target.orthographicHeight = 2.0f * source.yMagnification;
+            else
+                target.verticalFovRadians = source.verticalFovRadians;
+            // glTF lets an orthographic znear be zero; the scene record needs it above zero.
+            target.nearPlane = source.nearPlane > 0.0f ? source.nearPlane
+                : std::max(1.0e-6f, *source.farPlane * 1.0e-7f);
             target.farPlane = *source.farPlane;
             if (!scene->activeCamera)
                 scene->activeCamera = target.id;

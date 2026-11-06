@@ -266,6 +266,10 @@ void configureGlfwWindowHints (bool offscreen, bool shared, bool alwaysOnTop,
     glfwWindowHint (GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint (GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint (GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    // A GPU reset or a killed channel (NVIDIA Xid 109) then reports through
+    // glGetGraphicsResetStatus, so a frame it cut short is refused, not published
+    // empty. A driver without the robustness extension creates the plain context.
+    glfwWindowHint (GLFW_CONTEXT_ROBUSTNESS, GLFW_LOSE_CONTEXT_ON_RESET);
 #endif
     glfwWindowHint (GLFW_FLOATING, alwaysOnTop ? GLFW_TRUE : GLFW_FALSE);
     glfwWindowHint (GLFW_RESIZABLE, GLFW_TRUE);
@@ -1783,8 +1787,11 @@ std::string Viewport::setParam (const std::string& paramId, double value, double
                     impl_->visualPlanPublication->plans, clipId))
                 if (const auto* execution = impl_->visualPlanPublication->state.compiled(
                         clipId, plan->structuralRevision))
+                {
                     videohelper::importedscene::seedImportedSceneRuntimeParameters(
                         *plan, *execution, importedParameters);
+                    videowire::seedDepthEffectRuntimeParameters(execution, importedParameters);
+                }
             known = importedParameters.find(node + "/" + param) != importedParameters.end();
             // A per-key morph delta has no seed, since the mesh's key count is unknown here. A
             // deformation root seeds selectedMorphWeight, so it admits its deltas. The native
@@ -4503,6 +4510,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                             videohelper::importedscene::seedImportedSceneRuntimeParameters(
                                 *plan, *execution, p.visualParams);
                         videowire::seedFlatShaderRuntimeParameters(execution, p.visualParams);
+                        videowire::seedDepthEffectRuntimeParameters(execution, p.visualParams);
                     }
                 }
                 for (size_t ri = 0; ri < localRoutings.size(); ++ri)
@@ -6448,7 +6456,8 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 std::fprintf(stderr,
                     "[viewport-scene-trace] composite read=unavailable backend=metal error=%s\n",
                     renderer.lastError().c_str());
-            std::fprintf (stderr, "[viewport] strict Metal compositor rejected frame\n");
+            std::fprintf (stderr, "[viewport] strict Metal compositor rejected frame: %s\n",
+                          renderer.lastError().c_str());
             {
                 std::lock_guard<std::mutex> lock (im.mutex);
                 im.compositorBackend = renderer.compositorBackend();

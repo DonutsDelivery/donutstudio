@@ -9,8 +9,9 @@ the Particle Halo row missed its 12 s present window. The diffraction layer and 
 paired volume therefore live outside the released text: the layer's _main blocks
 are inserted by composeLayeredFixtureMain, and the trailing stamLayer and
 glassTransport2 uniforms by the layered and paired declarations. A Metal shader
-may declare a prefix of the FixtureUniforms block, so the released Uniforms end at
-vertexDisplacementLimits.
+may declare a prefix of the FixtureUniforms block, so the released fragment
+Uniforms end at vertexDisplacementLimits. The vertex Uniforms also declare the
+last member, the prior model matrix Motion reads.
 """
 
 from pathlib import Path
@@ -65,14 +66,24 @@ def uniforms_end(text):
 vertex = raw_string("kFixtureVertexShader")
 fragment = raw_string("kFixtureFragmentShader")
 
-# 1. The released texts carry no layer or paired-volume token.
+# 1. The released texts carry no layer or paired-volume token. The fragment
+#    Uniforms end at vertexDisplacementLimits. The vertex Uniforms skip the
+#    fragment-only tail and end at previousObjectMatrix, the last C++ member,
+#    which only Motion reads.
 for name, text in (("kFixtureVertexShader", vertex), ("kFixtureFragmentShader", fragment)):
     for token in ("stamLayer", "FIXTURE_STAM_LAYER", "StamLayer", "StamSurface", "glassTransport2"):
         require(token not in text, name + " must not contain " + token)
-    require(text.count("    float4 vertexDisplacementLimits[16];\n};") == 1,
-            name + " Uniforms must end at vertexDisplacementLimits")
-    end = uniforms_end(text)
-    require(end == 11536, name + " Uniforms must end at 11536, found " + str(end))
+require(fragment.count("    float4 vertexDisplacementLimits[16];\n};") == 1,
+        "kFixtureFragmentShader Uniforms must end at vertexDisplacementLimits")
+end = uniforms_end(fragment)
+require(end == 11536, "kFixtureFragmentShader Uniforms must end at 11536, found " + str(end))
+require(vertex.count("    float4 vertexDisplacementLimits[16];\n    float4 fragmentTail[26];\n"
+                     "    float4x4 previousObjectMatrix;\n};") == 1,
+        "kFixtureVertexShader Uniforms must end at previousObjectMatrix after the fragment tail")
+end = uniforms_end(vertex)
+require(end == 12016, "kFixtureVertexShader Uniforms must end at 12016, found " + str(end))
+require("&& offsetof (FixtureUniforms, previousObjectMatrix) == 11952" in sokol, "previousObjectMatrix offset")
+require("&& sizeof (FixtureUniforms) == 12016," in sokol, "FixtureUniforms size")
 
 # 2. That end is exactly where the C++ block's layer starts, and the layer and
 #    partner keep their offsets, so a prefix declaration reads the same bytes.
@@ -81,10 +92,10 @@ require("&& offsetof (FixtureUniforms, stamLayer) == 11536" in sokol, "stamLayer
 require("&& offsetof (FixtureUniforms, glassTransport2) == 11648" in sokol, "glassTransport2 offset")
 
 # 3. The restricted SurfacePbr archive never composes the layer.
-recipe = function_body("template<class String> auto restrictedSurfaceSourceRecipe(bool pairedVolume=false)")
+recipe = function_body("template<class String> auto restrictedSurfaceSourceRecipe(bool pairedVolume=false,")
 for token in ("composeLayeredFixtureMain", "declareLayeredFixtureUniform", "stamlayer"):
     require(token not in recipe, "restrictedSurfaceSourceRecipe must not use " + token)
-require("SurfacePbr) && !layered;" in sokol, "layered programs must leave the restricted archive")
+require("SurfacePbr) && !layered && !media;" in sokol, "layered and media programs must leave the restricted archive")
 
 # 4. Only the general path composes the layer, and only for a layered program,
 #    before the modules go in (they could repeat an anchor).
@@ -93,13 +104,27 @@ general = ("            fragmentSource=kFixtureFragmentShader;\n"
            "                result.error=\"Metal fixture diffraction layer anchor is not unique\";\n"
            "                return result;\n"
            "            }\n"
-           "            if(pairedVolume) declarePairedFixtureUniform(fragmentSource);\n"
+           "            if(viewportSolidProgram && !composeViewportSolidFixtureMain(fragmentSource)) {\n"
+           "                result.error=\"Metal fixture solid viewport anchor is not unique\";\n"
+           "                return result;\n"
+           "            }\n"
+           "            if(viewportSolidProgram && !composeRealtimeFixtureMain(fragmentSource)) {\n"
+           "                result.error=\"Metal fixture Realtime anchor is not unique\";\n"
+           "                return result;\n"
+           "            }\n"
+           "            if(media && !composeMediumFixtureMain(fragmentSource)) {\n"
+           "                result.error=\"Metal fixture material medium anchor is not unique\";\n"
+           "                return result;\n"
+           "            }\n"
+           "            if(viewportSolidProgram) declareViewportSolidFixtureUniform(fragmentSource);\n"
+           "            else if(pairedVolume) declarePairedFixtureUniform(fragmentSource);\n"
            "            else if(layered) declareLayeredFixtureUniform(fragmentSource);\n"
+           "            if(media) declareMediumFixtureUniform(fragmentSource);\n"
            "            fragmentSource.insert(")
 require(sokol.count(general) == 1, "the general Metal fragment path must gate the layer on layered")
 require(sokol.count("composeLayeredFixtureMain(") == 2, "composeLayeredFixtureMain has one caller")
 require(sokol.count("declareLayeredFixtureUniform(") == 2, "declareLayeredFixtureUniform has one caller")
-require("+(layered ? arbitgpu::stamlayer::metalShader() : std::string()));" in sokol,
+require("+(layered ? arbitgpu::stamlayer::metalShader() : std::string())\n" in sokol,
         "the layer module is appended only for a layered program")
 
 # 5. Every layer block has a unique anchor in the released _main and is gated on
@@ -125,6 +150,16 @@ require('"    float4 vertexDisplacementLimits[16];\\n    float4 stamLayer[7];\\n
         "the layered declaration adds stamLayer")
 require('"    float4 vertexDisplacementLimits[16];\\n    float4 stamLayer[7];\\n    float4 glassTransport2;\\n};"' in sokol,
         "the paired declaration adds stamLayer and glassTransport2")
+
+# 7. Every Metal path that walks glass in a scene with media carries the medium
+# text: the general fragment and the selected rough camera kernels. The
+# restricted archive keeps its released bytes, so media scenes never take it.
+selected = function_body("std::string metalSelectedRoughShader()")
+require("declareMediumFixtureUniform(source);" in selected and "rastermedium::metalShader()" in selected,
+        "the selected rough camera tints inside a medium")
+require("+(media ? rastermedium::metalShader() : std::string())" in sokol, "the general fragment composes media")
+require("rastermedium" not in function_body("template<class String> auto restrictedSurfaceSourceRecipe(bool pairedVolume=false,"),
+        "the restricted archive keeps its released bytes")
 
 if errors:
     for error in errors:

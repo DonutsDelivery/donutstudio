@@ -6,9 +6,8 @@
 namespace videohelper::geometry::coupledwaterbudget {
 using namespace videorender;
 using namespace watersourcebudget;
-// Coupled replay still has a fixed schedule, and its limit goes before
-// evaluateCoupled gets a product caller. Uncoupled Water has no such length.
-inline constexpr double kCoupledMaximumSeconds = 10;
+// Coupled replay runs from project zero, so its work grows with the frame time.
+// The recipe counts that work; only a caller threshold or a failed allocation refuses.
 using videowire::geometry::OperationRecord;
 using videowire::geometry::GeometryData;
 using videowire::geometry::WaterSurfaceGrid;
@@ -42,8 +41,8 @@ inline bool preflight(const ParticleHistorySource& source,
         return refuse("Water source budget requires finite time anchors");
     recipe.projectQuerySeconds = projectSeconds + (requestedSeconds - sceneSeconds);
     if (!std::isfinite(recipe.projectQuerySeconds) || recipe.projectQuerySeconds < 0
-        || recipe.projectQuerySeconds > kCoupledMaximumSeconds)
-        return refuse("Water source budget requires a project query from zero through 10 seconds");
+        || recipe.projectQuerySeconds > waterreplay::kMaximumClockSeconds)
+        return refuse("Water source budget requires a project query from zero that its tick clock can represent");
     // The callback's canonical clock uses the global anchor, not the query.
     if (!frame || !source.score || !std::isfinite(frame->key.fps) || frame->key.fps <= 0)
         return refuse("Water source budget requires actual score and canonical clock sources");
@@ -125,8 +124,8 @@ inline bool preflight(const ParticleHistorySource& source,
         {Work::scoreOnsetScan,operation.field.values[2]>0 ? n : 0},
         {Work::audioValidationFrames,recipe.audioPrefix},{Work::audioValidationScalars,audioScalars},
         {Work::audioValidationBands,bands},{Work::audioOnsetScan,recipe.audioPrefix},
-        {Work::canonicalTextureValues,canonicalblockc::kNoteTextureValues+canonicalblockc::kLinkTextureValues},
-        {Work::canonicalNoteRows,arbitblockc::kMaxNotes},{Work::canonicalLinkRows,arbitblockc::kMaxLinks},
+        {Work::canonicalTextureValues,arbitblockc::textureValueBound(n,l)},
+        {Work::canonicalNoteRows,n},{Work::canonicalLinkRows,l},
         {Work::gridColumnScan,v},{Work::gridVertices,v},{Work::gridIndices,restMesh.indices.size()},
         {Work::gridIdentityCalls,v},{Work::settingsValues,12},
         {Work::impulseCandidates,candidates},{Work::sortElements,recipe.impulseCapacity},
@@ -192,6 +191,10 @@ inline bool descriptorBytes(const videowire::geometry::ValueDescriptor& value,st
   for (const auto& operation:value.operations)
     if (!videowire::geometry::checkedAdd(bytes,operation.field.attributeName.capacity(),bytes)
         || !videowire::geometry::checkedAdd(bytes,1,bytes)) return false;
+  if (!addArrayBytes(value.spectrumFields.capacity(),sizeof(spectrum::Binding),bytes)) return false;
+  for (const auto& binding:value.spectrumFields)
+    if (!addArrayBytes(binding.coordinates.capacity(),sizeof(float),bytes)
+        || !addArrayBytes(binding.history.coordinates.capacity(),sizeof(float),bytes)) return false;
   if (const auto* mesh=std::get_if<GeometryData>(&value.data))
     return addArrayBytes(mesh->positions.capacity(),sizeof(Vec3),bytes)
         && addArrayBytes(mesh->vertexIds.capacity(),sizeof(StableId),bytes)
@@ -209,8 +212,7 @@ inline bool pointSourceBytes(const std::shared_ptr<const videowire::geometry::Va
   if (!source) return true;
   if (source.use_count()==0 || source->carrier!=CarrierKind::points3D || !std::holds_alternative<PointsData>(source->data)
       || !source->operations.empty() || !source->attributes.empty()
-      || !source->spectrumFields.empty() || !source->scoreFields.empty()
-      || std::get<PointsData>(source->data).points.size()>63) {
+      || !source->spectrumFields.empty() || !source->scoreFields.empty()) {
     error="Coupled family requires bounded literal static emitter/attractor points"; return false;
   }
   return descriptorBytes(*source,bytes);
@@ -229,17 +231,19 @@ inline bool complete(const ParticleParams& p,const OperationRecord& operation,co
       || p.geometryBinding->bodySource || p.geometryBinding->body || p.geometryBinding->points
       || p.preparedBodies || p.preparedSolids || p.preparedBodyReplay || p.preparedImportedSolids || p.bodyReplayContext
       || p.motionMode!=2 || !p.historicalReplay || p.simulationSpace!=1 || p.bodyShape!=0
-      || p.resetMode!=1 || p.resetTime!=0 || p.reset!=0 || p.count<1 || p.count>63
+      || p.resetMode!=1 || p.resetTime!=0 || p.reset!=0 || p.count<1
       || !std::isfinite(p.lifetime) || !std::isfinite(p.bodyRadius) || p.bodyRadius<=0 || p.bodyRadius>.1f
       || !std::isfinite(p.history->parameterFrameSeconds)
       || !std::isfinite(p.geometryBinding->centerX) || !std::isfinite(p.geometryBinding->centerY)
       || !std::isfinite(p.geometryBinding->centerZ)
-      || seconds!=p.historyProjectSeconds || !std::isfinite(seconds) || seconds<0 || seconds>10
+      || seconds!=p.historyProjectSeconds || !std::isfinite(seconds) || seconds<0
       || !std::isfinite(p.geometryBinding->scale) || p.geometryBinding->scale<=0 || p.geometryBinding->projection!=0
-      || grid.columns!=grid.rows || (grid.columns!=8 && grid.columns!=9)
-      || rest.positions.size()>256 || rest.indices.size()>384) {
+      || grid.columns<2 || grid.rows<2) {
     error="Coupled family requires one fresh released project-zero static Solid sphere request"; return false;
   }
+  // The grid and frame time size the recipe below. The only time bound is the
+  // replay tick clock's exact range (waterreplay::kMaximumClockSeconds), which
+  // the source preflight checks; past it the clock cannot represent a tick.
   // The full source census above is admitted by the caller before it reads notes.
   if (!coupledwaterbudget::preflight(*p.history,operation,rest,grid,frame,seconds,seconds,seconds,limits.source,r.source,error)) return false;
   const auto window=particleReplayWindow(p,seconds);
@@ -329,47 +333,48 @@ inline bool complete(const ParticleParams& p,const OperationRecord& operation,co
   // sorting is charged by input elements, not STL comparison complexity.
   // Four full frame byte-slot copies cover texture/identity/notation staging;
   // candidate pushes also scale with source notes and include record padding.
-  const auto resident=std::min<std::uint64_t>(r.source.sourceNotes,arbitblockc::kMaxNotes);
+  // Resident rows are content sized: at most one per source note.
+  const auto resident=r.source.sourceNotes;
   const auto B=static_cast<std::uint64_t>(p.count);
+  std::uint64_t contactComparisons=0,contactCorners=0;
   std::uint64_t noteSearches=0,rowSearches=0,identityCalls=0,pitchBends=0,bodyPairs=0;
   std::uint64_t preservation=0,bodyCopies=0,colliderCopies=0,preservationCopies=0,linkSearches=0,linkPasses=0,callbacks=0;
   std::uint64_t producerBytes=0,candidateBytes=0,outputBytes=0,heightBytes=0,notationCopies=0;
   if (!checkedMultiply(resident,r.source.sourceNotes,noteSearches) || !checkedMultiply(noteSearches,2,noteSearches)
-      || !checkedMultiply(resident,arbitblockc::kMaxNotes,rowSearches)
+      || !checkedMultiply(resident,resident,rowSearches)
       || !checkedMultiply(resident,5,identityCalls)
-      || !watersourcebudget::checkedAdd(identityCalls,2*arbitblockc::kMaxNotes,identityCalls)
+      || !watersourcebudget::checkedAdd(identityCalls,2*resident,identityCalls)
       || !checkedMultiply(r.source.sourceLinks,2,linkSearches)
       || !watersourcebudget::checkedAdd(identityCalls,linkSearches,identityCalls)
       || !checkedMultiply(sourceBends,2,pitchBends) || !checkedPairs(B,bodyPairs)
       || !checkedMultiply(bodyPairs,4,bodyPairs) || !checkedMultiply(B,B,preservation)
       || !checkedMultiply(K,5,bodyCopies) || !checkedMultiply(H,3,preservationCopies)
       || !watersourcebudget::checkedAdd(bodyCopies,preservationCopies,bodyCopies)
-      || !checkedMultiply(bodyCopies,videorender::kParticleSolidMaxBodies,bodyCopies)
+      || !checkedMultiply(bodyCopies,B,bodyCopies)
       || !watersourcebudget::checkedAdd(K,3,colliderCopies)
-      || !checkedMultiply(arbitblockc::kMaxLinks,B,linkSearches)
-      || !checkedMultiply(arbitblockc::kMaxLinks,5,linkPasses)
+      || !checkedMultiply(r.source.sourceLinks,B,linkSearches)
+      || !checkedMultiply(r.source.sourceLinks,5,linkPasses)
       || !checkedMultiply(secondsCalls,visualsimulation::parameters.size(),callbacks)
       || !watersourcebudget::checkedAdd(callbacks,3,callbacks)
       || !checkedMultiply(resident,9,notationCopies)
       || !checkedMultiply(sizeof(canonicalblockc::CanonicalBlockCFrame),4,producerBytes)
       || !checkedMultiply(r.source.sourceNotes,sizeof(const arbitmod::Note*)+sizeof(int)+alignof(const arbitmod::Note*),candidateBytes)
       || !watersourcebudget::checkedAdd(producerBytes,candidateBytes,producerBytes)
-      || !watersourcebudget::checkedAdd(sizeof(ParticleBodyState),sizeof(ParticleSolidState),outputBytes)
+      || !watersourcebudget::checkedAdd(ParticleBodyReplayState::callerOutputLogicalBytes(true,false,B),0,outputBytes)
       || !watersourcebudget::checkedAdd(outputBytes,sizeof(WaterCoupledFrame),outputBytes)
       || !watersourcebudget::checkedAdd(outputBytes,descriptorBytes,outputBytes)
       || !checkedMultiply(V,sizeof(double),heightBytes)
       || !watersourcebudget::checkedAdd(outputBytes,heightBytes,outputBytes)) {
     error="Coupled family producer/body schedule overflow"; return false;
   }
-  // updateInputs copies every body slot (kParticleSolidMaxBodies, 128, in both
-  // modes because the replay arrays are sized for Solid) plus birth/lifetime
-  // arrays, then searches the previous active bodies at every preserving history sample.
+  // updateInputs copies every body slot (Count, the size of the replay's
+  // body lists) plus birth/lifetime lists, then searches the previous active bodies at every preserving history sample.
   // advanceInterval copies bodies once plus once in each of its four passes,
   // and copies the entire collider. Triangle query work has its own ledger.
   if (!put(Work::canonicalCandidateScans,r.source.sourceNotes,H)
       || !put(Work::canonicalSortElements,r.source.sourceNotes,H)
       || !put(Work::canonicalSelectionVisits,resident,H)
-      || !put(Work::canonicalRowVisits,4*arbitblockc::kMaxNotes,H)
+      || !put(Work::canonicalRowVisits,4*resident,H)
       || !put(Work::canonicalRowAssignmentSearches,rowSearches,H)
       || !put(Work::canonicalNoteSearchVisits,noteSearches,H)
       || !put(Work::canonicalLinkVisits,r.source.sourceLinks,H)
@@ -381,9 +386,9 @@ inline bool complete(const ParticleParams& p,const OperationRecord& operation,co
       || !put(Work::sourceSnapshotCopyBytes,historyBytes,2)
       || !put(Work::bodyPreservationSearches,preservation,H-1)
       || !put(Work::bodyArrayCopyElements,bodyCopies)
-      || !put(Work::colliderCopyBytes,sizeof(ParticleSolidState),colliderCopies)
-      || !put(Work::bodyRowVisits,arbitblockc::kMaxNotes,H)
-      || !put(Work::bodySortElements,arbitblockc::kMaxNotes+arbitblockc::kMaxLinks,H)
+      || !put(Work::colliderCopyBytes,sizeof(ParticleSolidState)+B*sizeof(ParticleRigidBody),colliderCopies)
+      || !put(Work::bodyRowVisits,resident,H)
+      || !put(Work::bodySortElements,resident+r.source.sourceLinks,H)
       || !put(Work::bodyLinkSearchVisits,linkSearches,H)
       || !put(Work::bodyLinkPassVisits,linkPasses,K)
       || !put(Work::bodyIntegrationVisits,B,K)
@@ -402,8 +407,12 @@ inline bool complete(const ParticleParams& p,const OperationRecord& operation,co
       || !put(Work::massTriangles,I/3) || !put(Work::massPositionReads,I) || !put(Work::massDeposits,I)
       || !put(Work::previousHeightCopies,V,previousHeightPasses)
       || !put(Work::velocityApplications,V,boundaries) || !put(Work::impulseClears,V,boundaries)
-      || !put(Work::contacts,63,K) || !put(Work::contactDuplicateComparisons,63*63,K)
-      || !put(Work::contactCorners,6*63,K) || !put(Work::finalColliderSamples,1)
+      // One contact per body per interval; each is checked against the set of
+      // bodies already in contact, charged as B comparisons.
+      || !put(Work::contacts,B,K) || !checkedMultiply(B,B,contactComparisons)
+      || !put(Work::contactDuplicateComparisons,contactComparisons,K)
+      || !checkedMultiply(B,6,contactCorners) || !put(Work::contactCorners,contactCorners,K)
+      || !put(Work::finalColliderSamples,1)
       || !put(Work::outputCopies,outputBytes,3)
       || !put(Work::solidAppendRecords,appendWork) || !put(Work::solidAppendCopies,appendBytes,3)
       || !put(Work::solidInspectorVisits,appendWork,2)) return false;
@@ -419,7 +428,7 @@ inline bool complete(const ParticleParams& p,const OperationRecord& operation,co
       || !videowire::geometry::checkedAdd(r.retainedBytes,sizeof(canonicalblockc::CanonicalBlockCFrame),r.retainedBytes)
       || !addArrayBytes(V,2*sizeof(Vec3)+2*sizeof(StableId)+sizeof(double),r.retainedBytes)
       || !addArrayBytes(I,2*sizeof(std::uint32_t),r.retainedBytes)) return false;
-  r.scratchBytes=ParticleBodyReplayState::callerScratchLogicalBytes();
+  r.scratchBytes=ParticleBodyReplayState::callerScratchLogicalBytes(B,ParticleBodyReplayState::particleAnchorCount(p));
   if (candidateBytes>std::numeric_limits<std::size_t>::max()
       || !videowire::geometry::checkedAdd(r.scratchBytes,static_cast<std::size_t>(candidateBytes),r.scratchBytes)
       || !videowire::geometry::checkedAdd(r.scratchBytes,geometryScratch,r.scratchBytes)

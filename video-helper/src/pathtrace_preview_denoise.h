@@ -1,10 +1,8 @@
 #pragma once
 
-// The denoise step of the Path Trace engine (Plan 3, Denoising). The engine runs
-// it on the resolved image when the Render node's "denoise" switch is on.
+// The native filter of the Path Trace engine's denoise step (Plan 3, Denoising).
 //
-// The only denoiser in this build is "native-filter": the kernel of the native
-// Denoise effect (EffectType::Denoise, mode 4 of kProductionFilterFragment in
+// "native-filter" is the kernel of the native Denoise effect (EffectType::Denoise, mode 4 of kProductionFilterFragment in
 // renderer.cpp) at that effect's default strength and radius from effect_defs.h.
 // It runs here on the CPU because the effect pass cannot take these frames. A
 // linear Scene3D layer refuses every effect (FrameRenderer::validate in
@@ -43,11 +41,9 @@
 // spark, with nothing within kLoneSparkRatio of it in its 5 x 5, has no neighbour its
 // light belongs with, so it stays one pixel of the same energy. Clusters still share.
 
-// OptiX AI and OIDN have no implementation yet. Each one's compile definition
-// below goes on only when its code lands: ARBIT_DENOISE_OPTIX_AI from the
-// ARBIT_WITH_OPTIX branch of video-helper/CMakeLists.txt, and ARBIT_DENOISE_OIDN
-// from a future OIDN dependency. See
-// artifacts/planning/missing-features/evidence/video/plan3-pathtrace-denoise-20261030.md.
+// Since the AI denoisers landed this filter is the named fallback only: a frame
+// gets it when neither OptiX AI nor OIDN can run, and the viewport header says
+// why (pathtrace_denoiser.h).
 
 #include "pathtrace/engine.h"
 
@@ -81,24 +77,6 @@ constexpr const char* denoiserName (Denoiser denoiser) noexcept
     }
     return "none";
 }
-
-// The plan's order: OptiX AI, then OIDN, then what every build has.
-constexpr Denoiser selectDenoiser (bool optixAiLinked, bool oidnLinked) noexcept
-{
-    return optixAiLinked ? Denoiser::OptixAi : oidnLinked ? Denoiser::Oidn : Denoiser::NativeFilter;
-}
-
-#ifdef ARBIT_DENOISE_OPTIX_AI
-inline constexpr bool kOptixAiLinked = true;
-#else
-inline constexpr bool kOptixAiLinked = false;
-#endif
-#ifdef ARBIT_DENOISE_OIDN
-inline constexpr bool kOidnLinked = true;
-#else
-inline constexpr bool kOidnLinked = false;
-#endif
-inline constexpr Denoiser kBuildDenoiser = selectDenoiser (kOptixAiLinked, kOidnLinked);
 
 // The Denoise effect's defaults in effect_defs.h.
 inline constexpr float kNativeFilterStrength = 0.5f;

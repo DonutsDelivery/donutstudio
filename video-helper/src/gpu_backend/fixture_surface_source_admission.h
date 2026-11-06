@@ -162,21 +162,21 @@ struct Context final
     {
         auto work=setupEntry(); work.literals=1; take(work);
         const auto capacity=add(plan.literalCapacity,bytes);
-        if(capacity>renderpassoutput::kMaximumTotalBytes || (admitted && capacity>admitted->literalCapacity))
+        if(capacity>renderpassoutput::kRepresentableTotalBytes || (admitted && capacity>admitted->literalCapacity))
             throw std::length_error("Surface source literal capacity exceeds admission");
         plan.literalCapacity=capacity;
     }
     char* stage(Stage s)
     {
         auto work=setupEntry(2*sizeof(Stage)); work.stages=1; take(work);
-        if(s.scans>renderpassoutput::kMaximumTotalBytes || s.copies>renderpassoutput::kMaximumTotalBytes)
+        if(s.scans>renderpassoutput::kRepresentableTotalBytes || s.copies>renderpassoutput::kRepresentableTotalBytes)
             throw std::length_error("Surface source stage byte work exceeds recipe envelope");
         Setup loopWork; loopWork.byteControl=multiply(add(add(s.scans,s.copies),1),16); take(loopWork);
         if(plan.count==Plan::maximumStages) throw std::length_error("Surface source recipe stage overflow");
         const auto capacity=add(plan.capacity,s.capacity);
         const auto scans=add(plan.scans,s.scans), copies=add(plan.copies,s.copies);
         const auto comparisons=add(plan.comparisons,s.comparisons), formatting=add(plan.formatting,s.formatting);
-        if(capacity>renderpassoutput::kMaximumTotalBytes) throw std::length_error("Surface source capacity exceeds admission");
+        if(capacity>renderpassoutput::kRepresentableTotalBytes) throw std::length_error("Surface source capacity exceeds admission");
         if(admitted && (plan.count>=admitted->count || !(s==admitted->stages[plan.count])
             || capacity>admitted->capacity)) throw std::length_error("Surface source recipe differs from admission");
         char* result=arena ? arena+used : nullptr;
@@ -325,16 +325,30 @@ inline Setup restrictedSetupEnvelope()
     limit.arithmetic=limit.comparisons=limit.writes=multiply(entries,setupEntryOperations);
     limit.metadataCopies=add(add(multiply(entries,setupEntryMetadataRecords*sizeof(Setup)),multiply(limit.stages,2*sizeof(Stage))),
         add(multiply(limit.sourceMethods,2*sizeof(Source)),7*sizeof(Plan)));
-    // Every accepted stage has scans/copies <= the unchanged source-byte cap.
-    // Sixteen scalar loop operations per visited/copied byte also cover token,
-    // find and replacement loop control. Library byte-work stays in Stage.
-    limit.byteControl=multiply(multiply(limit.stages,add(multiply(2,renderpassoutput::kMaximumTotalBytes),1)),16);
+    // Byte control has no fixed per-stage cap. The census pass runs against the
+    // representable total, which only overflow reaches; sizedSetupEnvelope then
+    // fixes the plan's own byte control from its stages' measured source bytes.
+    limit.byteControl=renderpassoutput::kRepresentableTotalBytes;
     limit.formattingCalls=limit.stages;
+    return limit;
+}
+// Sixteen scalar loop operations per visited/copied byte and per stage also
+// cover token, find and replacement loop control. Library byte-work stays in Stage.
+inline std::uint64_t plannedByteControl(const Plan& plan)
+{
+    return multiply(add(add(plan.scans,plan.copies),plan.count),16);
+}
+// The envelope a prepared plan retains: every category of the restricted
+// envelope, with byte control sized from the plan's actual stage bytes.
+inline Setup sizedSetupEnvelope(const Plan& plan)
+{
+    auto limit=restrictedSetupEnvelope();
+    limit.byteControl=plannedByteControl(plan);
     return limit;
 }
 inline bool setupMatches(const Plan& plan)
 {
-    const auto limit=restrictedSetupEnvelope();
+    const auto limit=sizedSetupEnvelope(plan);
     if(!plan.setupLimit.within(limit)||!limit.within(plan.setupLimit)
         ||plan.metadataCopies!=multiply(2,limit.metadataCopies)) return false;
     const auto matches=[&](const Setup& used) {
@@ -344,7 +358,7 @@ inline bool setupMatches(const Plan& plan)
             add(multiply(used.sourceMethods,2*sizeof(Source)),7*sizeof(Plan)));
         return used.within(limit) && used.stages==plan.count && used.arithmetic==operations
             && used.comparisons==operations && used.writes==operations && used.metadataCopies==metadata
-            && used.byteControl==multiply(add(add(plan.scans,plan.copies),plan.count),16)
+            && used.byteControl==limit.byteControl
             && used.formattingCalls<=used.stages;
     };
     return matches(plan.censusSetup) && matches(plan.emissionSetup)
@@ -398,7 +412,7 @@ template<class Recipe> std::unique_ptr<const Archive> prepare(Recipe&& recipe,st
         multiply(Plan::maximumStages,sizeof(Source)+sizeof(Stage)+16*sizeof(std::uint64_t)+8*sizeof(Setup))),
         (12+13+3)*sizeof(std::pair<const char*,const char*>)
         +3*sizeof(std::initializer_list<std::pair<const char*,const char*>>)+32));
-    if(metadataCapacity>renderpassoutput::kMaximumTotalBytes)
+    if(metadataCapacity>renderpassoutput::kRepresentableTotalBytes)
         throw std::length_error("Surface source metadata exceeds admission");
     Context census(setupLimit);
     {
@@ -411,11 +425,12 @@ template<class Recipe> std::unique_ptr<const Archive> prepare(Recipe&& recipe,st
     census.plan.metadataCopies=multiply(2,setupLimit.metadataCopies);
     census.plan.retainedCapacityLimit=add(add(census.plan.vertexLimit,census.plan.fragmentLimit),2);
     census.plan.finalCopies=census.plan.retainedCapacityLimit;
+    census.plan.setupLimit=sizedSetupEnvelope(census.plan);
     if(add(add(add(capacity,census.plan.metadataCapacity),census.plan.literalCapacity),
-        census.plan.retainedCapacityLimit)>renderpassoutput::kMaximumTotalBytes)
+        census.plan.retainedCapacityLimit)>renderpassoutput::kRepresentableTotalBytes)
         throw std::length_error("Surface source owner exceeds admission");
     std::unique_ptr<char[]> arena(new char[capacity]);
-    Context writer(setupLimit); writer.admitted=&census.plan; writer.arena=arena.get();
+    Context writer(census.plan.setupLimit); writer.admitted=&census.plan; writer.arena=arena.get();
     Context::Scope scope(writer);
     const auto sources=recipe();
     if(writer.plan.count!=census.plan.count || writer.used!=capacity
@@ -433,7 +448,7 @@ template<class Recipe> std::unique_ptr<const Archive> prepare(Recipe&& recipe,st
     std::memcpy(retained.get(),sources.first.data(),archive->vertexLength+1);
     std::memcpy(retained.get()+archive->fragmentOffset,sources.second.data(),archive->fragmentLength+1);
     archive->arena=std::move(retained);
-    if(!census.setup.within(setupLimit)||!writer.setup.within(setupLimit)
+    if(!census.setup.within(census.plan.setupLimit)||!writer.setup.within(census.plan.setupLimit)
         ||census.setup.stages!=census.plan.count||writer.setup.stages!=writer.plan.count)
         throw std::length_error("Surface source setup schedule differs from admission");
     archive->plan.censusSetup=census.setup; archive->plan.emissionSetup=writer.setup;
@@ -536,7 +551,7 @@ public:
                 multiply(Plan::maximumStages,sizeof(Source)+sizeof(Stage)+16*sizeof(std::uint64_t)+8*sizeof(Setup))),
                 (12+13+3)*sizeof(std::pair<const char*,const char*>)
                 +3*sizeof(std::initializer_list<std::pair<const char*,const char*>>)+32)));
-        if(metadataCapacity>renderpassoutput::kMaximumTotalBytes)
+        if(metadataCapacity>renderpassoutput::kRepresentableTotalBytes)
             throw std::length_error("Surface source metadata exceeds admission");
         fixedReservation(attempt.censusSetup_,setupLimit);
         Context context(setupLimit);
@@ -551,9 +566,10 @@ public:
             context.plan.metadataCopies=multiply(2,setupLimit.metadataCopies);
             context.plan.retainedCapacityLimit=add(add(context.plan.vertexLimit,context.plan.fragmentLimit),2);
             context.plan.finalCopies=context.plan.retainedCapacityLimit;
+            context.plan.setupLimit=sizedSetupEnvelope(context.plan);
             context.plan.censusSetup=context.setup;
             if(add(add(add(context.plan.capacity,metadataCapacity),context.plan.literalCapacity),
-                context.plan.retainedCapacityLimit)>renderpassoutput::kMaximumTotalBytes)
+                context.plan.retainedCapacityLimit)>renderpassoutput::kRepresentableTotalBytes)
                 throw std::length_error("Surface source owner exceeds admission");
             attempt.censusSetup_=context.setup;
             // Only the immutable token allocates here. No emission arena,
@@ -573,9 +589,9 @@ public:
         attempt_->state_=ConstructionAttempt::State::failed;
         // This numeric limit is only the caller's source storage prerequisite.
         // It grants no whole-frame, native, public Color or driver authority.
-        if(constructionCapacityLimit>renderpassoutput::kMaximumTotalBytes || requiredCapacity()>constructionCapacityLimit)
+        if(requiredCapacity()>constructionCapacityLimit)
             throw std::length_error("Surface source outer construction capacity exceeds admission");
-        const auto setupLimit=restrictedSetupEnvelope();
+        const auto setupLimit=plan_.setupLimit;
         fixedReservation(attempt_->emissionSetup_,setupLimit);
         Context writer(setupLimit); writer.admitted=&plan_;
         attempt_->state_=ConstructionAttempt::State::emission;
@@ -635,7 +651,18 @@ private:
     std::uint64_t finalCopyAllowance_=0,retainedAllowance_=0;
     bool hasSourceAllowance_=false;
     std::uint64_t bytes_=sizeof(FrameAdmission);
+    // Whole-frame byte walk: the aggregate limit the caller admits this frame
+    // under. Identity and metadata copies are bounded by it, not by a fixed cap.
+    std::uint64_t walk_=0;
     std::size_t count_=0;
+    // Both passes' setup reserved before census. Byte control is charged from
+    // the census's measured stage bytes in reserve, or as failed census work.
+    static Setup prospectiveSetup()
+    {
+        auto setup=restrictedSetupEnvelope();
+        setup.byteControl=0;
+        return setup;
+    }
     static Setup sum(const Setup& a,const Setup& b)
     {
         return {add(a.literals,b.literals),add(a.stages,b.stages),add(a.sourceMethods,b.sourceMethods),
@@ -646,7 +673,7 @@ public:
     static constexpr std::uint64_t censusScans=maximumLiterals*Source::maximumTokenBytes;
     static constexpr std::uint64_t censusCopies=Plan::maximumStages*3*32;
     static constexpr std::uint64_t censusFormatting=Plan::maximumStages*2*32;
-    FrameAdmission()
+    explicit FrameAdmission(std::uint64_t walk):walk_(walk)
     {
         const auto scale=[](Setup b,std::uint64_t n) {
             b.literals=multiply(b.literals,n);b.stages=multiply(b.stages,n);b.sourceMethods=multiply(b.sourceMethods,n);
@@ -654,13 +681,16 @@ public:
             b.metadataCopies=multiply(b.metadataCopies,n);b.byteControl=multiply(b.byteControl,n);b.formattingCalls=multiply(b.formattingCalls,n);
             return b;
         };
-        auto fixed=setupEntry(add(multiply(4,renderpassoutput::kMaximumTotalBytes),4*sizeof(FrameWork)+4*sizeof(Record)));
+        auto fixed=setupEntry(add(multiply(4,walk_),4*sizeof(FrameWork)+4*sizeof(Record)));
         fixed.arithmetic=fixed.comparisons=fixed.writes=multiply(64,setupEntryOperations);
         fixed.metadataCopies=add(fixed.metadataCopies,multiply(63,setupEntryMetadataRecords*sizeof(Setup)));
         ConstructionCost cost;Census::constructionCost(cost);
-        auto attempt=sum(sum(scale(restrictedSetupEnvelope(),2),scale(fixed,2)),cost.setup);
-        attempt.metadataCopies=add(attempt.metadataCopies,multiply(4,renderpassoutput::kMaximumTotalBytes));
+        auto attempt=sum(sum(scale(prospectiveSetup(),2),scale(fixed,2)),cost.setup);
+        attempt.metadataCopies=add(attempt.metadataCopies,multiply(4,walk_));
         allowance_.setup=sum(scale(attempt,maximumAttempts),scale(fixed,maximumAttempts*maximumAttempts));
+        // Byte control is unknown until the first census measures its stages.
+        // Until then only overflow bounds it; reserve fixes the allowance.
+        allowance_.setup.byteControl=renderpassoutput::kRepresentableTotalBytes;
     }
     FrameAdmission(const FrameAdmission&)=delete;
     FrameAdmission& operator=(const FrameAdmission&)=delete;
@@ -670,6 +700,7 @@ public:
     std::size_t attempts() const noexcept { return count_; }
     const FrameWork& work() const noexcept { return work_; }
     const FrameWork& allowance() const noexcept { return allowance_; }
+    std::uint64_t walk() const noexcept { return walk_; }
     const Record& record(std::size_t index) const { return records_.at(index); }
     // Reserve each full Setup pass before Context/census. This retains failed
     // setup calls, metadata transfers and byte control separately from the
@@ -678,7 +709,7 @@ public:
     {
         if(count_==maximumAttempts) throw std::length_error("Surface source frame attempt journal exhausted");
         const auto index=count_++;
-        auto setup=restrictedSetupEnvelope();
+        auto setup=prospectiveSetup();
         setup=sum(setup,setup);
         // Factory/result/identity and journal control have a fixed source
         // schedule. Both parameter and result/caller transfers are charged.
@@ -691,7 +722,7 @@ public:
         // scratch/output work can touch bytes, so reserve those before Context.
         work_.scans=add(work_.scans,censusScans);work_.copies=add(work_.copies,censusCopies);
         work_.formatting=add(work_.formatting,censusFormatting);
-        if(!work_.setup.within(allowance_.setup)||limit>renderpassoutput::kMaximumTotalBytes||parentBytes>limit||bytes_>limit-parentBytes
+        if(!work_.setup.within(allowance_.setup)||parentBytes>limit||bytes_>limit-parentBytes
             ||metadataBytes>limit-parentBytes-bytes_) {
             records_[index].construction.state_=ConstructionAttempt::State::failed;
             throw std::length_error("Surface source fixed frame journal exceeds aggregate admission");
@@ -719,14 +750,19 @@ public:
             allowance_.scans=multiply(maximumAttempts,add(censusScans,add(multiply(2,p.scans),nativeCopies)));
             // Parent identities and owned metadata are bounded by the same
             // whole-frame storage cap. Four prospective copies per attempt.
-            allowance_.copies=multiply(maximumAttempts,add(censusCopies,add(add(multiply(2,p.copies),nativeCopies),multiply(4,renderpassoutput::kMaximumTotalBytes))));
+            allowance_.copies=multiply(maximumAttempts,add(censusCopies,add(add(multiply(2,p.copies),nativeCopies),multiply(4,walk_))));
             allowance_.comparisons=add(multiply(2*maximumAttempts,p.comparisons),
-                multiply(maximumAttempts*maximumAttempts,renderpassoutput::kMaximumTotalBytes));
+                multiply(maximumAttempts*maximumAttempts,walk_));
             allowance_.formatting=multiply(maximumAttempts,add(censusFormatting,multiply(2,p.formatting)));
             allowance_.finalCopies=multiply(maximumAttempts,p.finalCopies);
             allowance_.inspections=maximumAttempts*maximumAttempts;
+            // Both passes of every attempt, at this census's measured byte control.
+            allowance_.setup.byteControl=multiply(2*maximumAttempts,p.setupLimit.byteControl);
             hasSourceAllowance_=true;
         }
+        if(p.setupLimit.byteControl!=plannedByteControl(p))
+            throw std::length_error("Surface source census byte control differs from its stages");
+        work_.setup.byteControl=add(work_.setup.byteControl,multiply(2,p.setupLimit.byteControl));
         work_.scans=add(work_.scans,multiply(2,p.scans));
         work_.copies=add(work_.copies,multiply(2,p.copies));
         work_.comparisons=add(work_.comparisons,multiply(2,p.comparisons));
@@ -738,10 +774,11 @@ public:
             ||p.comparisons>sourceAllowance_.comparisons||p.formatting>sourceAllowance_.formatting
             ||p.finalCopies>finalCopyAllowance_||p.retainedCapacityLimit>retainedAllowance_
             ||work_.scans>allowance_.scans||work_.copies>allowance_.copies||work_.comparisons>allowance_.comparisons
-            ||work_.formatting>allowance_.formatting||work_.finalCopies>allowance_.finalCopies)
+            ||work_.formatting>allowance_.formatting||work_.finalCopies>allowance_.finalCopies
+            ||!work_.setup.within(allowance_.setup))
             throw std::length_error("Surface source frame work exceeds immutable census allowance");
         const auto bytes=add(census.requiredCapacity(),nativeSourceBytes);
-        if(limit>renderpassoutput::kMaximumTotalBytes||parentBytes>limit||bytes_>limit-parentBytes
+        if(parentBytes>limit||bytes_>limit-parentBytes
             ||bytes>limit-parentBytes-bytes_)
             throw std::length_error("Surface source whole frame reservation exceeds aggregate admission");
         bytes_=add(bytes_,bytes); record.bytes=add(record.bytes,bytes); record.admitted=true;
@@ -752,6 +789,11 @@ public:
         return census.attempt_==&r.construction&&r.live&&r.admitted&&r.bytes>=census.requiredCapacity()
             &&r.construction.state()==ConstructionAttempt::State::ready;
     }
+    // A census that failed part way keeps the byte control it measured.
+    void failedCensus(std::size_t index)
+    {
+        work_.setup.byteControl=add(work_.setup.byteControl,records_.at(index).construction.censusSetup().byteControl);
+    }
     void factory(const Setup& work)
     {
         work_.setup=sum(work_.setup,work);
@@ -761,7 +803,7 @@ public:
     {
         work_.copies=add(work_.copies,copies);
         work_.setup.metadataCopies=add(work_.setup.metadataCopies,copies);
-        if(!work_.setup.within(allowance_.setup)||copies>multiply(4,renderpassoutput::kMaximumTotalBytes)
+        if(!work_.setup.within(allowance_.setup)||copies>multiply(4,walk_)
             ||(hasSourceAllowance_&&work_.copies>allowance_.copies))
             throw std::length_error("Surface source aggregate identity copies exceed admission");
     }
@@ -785,13 +827,13 @@ public:
             throw std::length_error("Surface source frame inspection journal exhausted");
         ++work_.inspections;
         work_.comparisons=add(work_.comparisons,bytes);
-        if(bytes>renderpassoutput::kMaximumTotalBytes||work_.comparisons>allowance_.comparisons)
+        if(bytes>renderpassoutput::kRepresentableTotalBytes||work_.comparisons>allowance_.comparisons)
             throw std::length_error("Surface source aggregate inspection work exceeds admission");
         auto fixed=setupEntry(add(4*sizeof(FrameWork),metadataBytes));
         fixed.arithmetic=fixed.comparisons=fixed.writes=multiply(64,setupEntryOperations);
         fixed.metadataCopies=add(fixed.metadataCopies,multiply(63,setupEntryMetadataRecords*sizeof(Setup)));
         work_.setup=sum(work_.setup,fixed);
-        if(metadataBytes>multiply(4,renderpassoutput::kMaximumTotalBytes)||!work_.setup.within(allowance_.setup))
+        if(metadataBytes>multiply(4,walk_)||!work_.setup.within(allowance_.setup))
             throw std::length_error("Surface source aggregate inspection setup exceeds admission");
     }
 };
@@ -801,7 +843,9 @@ template<class Recipe> std::unique_ptr<const Archive> prepare(Recipe&& recipe,Fr
     std::size_t attempt,std::uint64_t parentBytes,std::uint64_t aggregateLimit,std::uint64_t ownerBytes=0,
     std::uint64_t creationSourceCopies=0)
 {
-    const auto census=Census::create(recipe,frame.construction(attempt),ownerBytes);
+    std::unique_ptr<const Census> census;
+    try { census=Census::create(recipe,frame.construction(attempt),ownerBytes); }
+    catch(...) { frame.failedCensus(attempt); throw; }
     try {
         frame.reserve(attempt,*census,parentBytes,aggregateLimit,creationSourceCopies);
         if(!frame.admitted(attempt,*census)) throw std::length_error("Surface source frame admission association changed");

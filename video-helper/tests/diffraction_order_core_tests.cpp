@@ -12,7 +12,9 @@
 // Usage: arbit-diffraction-order-core-tests [case count], which prints the hash.
 
 #include "diffraction_order_bsdf.h"
+#include "gpu_backend/realtime_diffraction_environment.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cinttypes>
@@ -313,10 +315,94 @@ int checkNoSilentRefusals (std::uint64_t cases)
                  wrong, ok, physical, noEnergy);
     return wrong == 0 && ok > cases / 2 ? 0 : 1;
 }
+
+// The Realtime engine's environment through the orders (realtime_diffraction_environment.h).
+// A grooved surface under one small bright patch of sky: each wavelength's first order
+// looks in its own direction, so only bands whose order points into the patch light up.
+// The spread across bands is the spectral colour Realtime shows. A grazing order and a
+// degenerate grating give finite numbers, never NaN.
+int checkRealtimeEnvironmentOrders()
+{
+    namespace rd = arbitgpu::realtimediffraction;
+    int failures = 0;
+    const auto fail = [&] (const char* what) { std::printf ("FAIL: realtime environment: %s\n", what); ++failures; };
+
+    rd::Grating grating;
+    grating.profile = dm::GrooveProfile::Sinusoidal;
+    grating.depthNanometres = 120.0f;
+    grating.periodNanometres = 1600.0f;
+    grating.direction = { 1.0f, 0.0f };
+    grating.firstOrder = 1;
+    grating.lastOrder = 3;
+    const float tilt = 0.3f;
+    const std::array<float, 3> outgoing { tilt, 0.0f, std::sqrt (1.0f - tilt * tilt) };
+
+    std::array<float, 3> patch {};
+    if (! rd::orderIncident (grating, 550.0f, 1, outgoing, patch))
+        fail ("the green first order does not propagate");
+    const auto sky = [&] (const std::array<float, 3>& incident)
+    {
+        const float cosine = incident[0] * patch[0] + incident[1] * patch[1] + incident[2] * patch[2];
+        return cosine > std::cos (0.02f) ? 10.0f : 0.0f;
+    };
+    constexpr std::array<float, 8> wavelengths { 400.0f, 450.0f, 500.0f, 550.0f, 600.0f, 650.0f, 700.0f, 750.0f };
+    std::array<float, 8> bands {};
+    float brightest = 0.0f, dimmest = 1.0e30f;
+    for (std::size_t b = 0; b < bands.size(); ++b)
+    {
+        bands[b] = rd::bandRadiance (grating, wavelengths[b], outgoing, sky);
+        if (! std::isfinite (bands[b]) || bands[b] < 0.0f)
+            fail ("a band is negative or not finite");
+        brightest = std::max (brightest, bands[b]);
+        dimmest = std::min (dimmest, bands[b]);
+    }
+    if (! (bands[3] > 0.0f))
+        fail ("the band whose order points at the patch stays dark");
+    if (! (brightest > 0.0f && dimmest < 0.1f * brightest))
+        fail ("the bands show no spectral spread");
+    // Turning the grooves turns the direction each order looks in, so the patch goes dark.
+    auto turned = grating;
+    turned.direction = { 0.0f, 1.0f };
+    if (rd::bandRadiance (turned, 550.0f, outgoing, sky) >= bands[3])
+        fail ("the groove direction does not steer the orders");
+    // A finer pitch moves the same order away from the patch.
+    auto finer = grating;
+    finer.periodNanometres = 1200.0f;
+    if (rd::bandRadiance (finer, 550.0f, outgoing, sky) >= bands[3])
+        fail ("the groove pitch does not steer the orders");
+
+    // A white sky reads one in every band.
+    if (std::abs (rd::bandShare ({ 0.3f, 0.5f, 0.2f }, { 1.0f, 1.0f, 1.0f }) - 1.0f) > 1.0e-5f)
+        fail ("a white sky is not one in a band");
+    // A blue sky leaves a red band darker than a blue band.
+    if (! (rd::bandShare ({ 0.6f, 0.3f, 0.0f }, { 0.1f, 0.2f, 1.0f })
+           < rd::bandShare ({ 0.3f, 0.1f, 1.6f }, { 0.1f, 0.2f, 1.0f })))
+        fail ("a coloured sky does not tint the bands");
+
+    // NaN guards: an order that leaves almost along the surface, a zero period and a
+    // view below the horizon each give a finite answer.
+    std::array<float, 3> grazing {};
+    const float edge = std::nextafter (1.0f, 0.0f);
+    const std::array<float, 3> nearlyFlat { edge, 0.0f, std::sqrt (std::max (0.0f, 1.0f - edge * edge)) };
+    for (int order = -3; order <= 3; ++order)
+        if (rd::orderIncident (grating, 550.0f, order, nearlyFlat, grazing)
+            && ! std::isfinite (rd::orderWeight (grating, 550.0f, order, grazing, nearlyFlat)))
+            fail ("a grazing order weight is not finite");
+    auto flat = grating;
+    flat.periodNanometres = 0.0f;
+    if (! std::isfinite (rd::bandRadiance (flat, 550.0f, outgoing, sky)))
+        fail ("a zero period is not finite");
+    if (rd::bandRadiance (grating, 550.0f, { 0.0f, 0.0f, -1.0f }, sky) != 0.0f)
+        fail ("a view below the surface reads light");
+    std::printf ("realtime environment orders: %s\n", failures == 0 ? "ok" : "FAILED");
+    return failures;
+}
 } // namespace
 
 int main (int argc, char** argv)
 {
+    if (checkRealtimeEnvironmentOrders() != 0)
+        return 1;
     const std::uint64_t cases = argc > 1 ? std::strtoull (argv[1], nullptr, 10) : kPinnedCases;
     if (checkNoSilentRefusals (cases) != 0)
         return 1;

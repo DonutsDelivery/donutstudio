@@ -44,7 +44,7 @@ inline videorender::ParticleParams manySolidBodyFixture(int notes)
     auto& key=history->key;
     key.projectGeneration=key.sourceGeneration=key.helperGeneration=key.backendGeneration=key.deviceGeneration=1;
     key.scoreGeneration=key.beatMapGeneration=key.fpsGeneration=key.loopGeneration=key.seekGeneration=1;
-    p.history=history; p.geometryCount=0; p.count=videorender::kParticleSolidMaxBodies;
+    p.history=history; p.geometryCount=0; p.count=128;
     p.bodyRadius=0.0025f;
     return p;
 }
@@ -136,7 +136,7 @@ bool verifyNativeSolidBodies(ReadPixels readPixels,std::string& error,
 struct SolidBodyMotionSample
 {
     videorender::ParticleSolidState state;
-    std::array<double,videorender::kParticleSolidMaxBodies> births {};
+    videorender::ParticleSizedList<double> births;
 };
 
 inline SolidBodyMotionSample sampleSolidBodyMotion(videorender::ParticleParams p,double time,std::string& error)
@@ -164,7 +164,7 @@ bool verifyNativeInstancedSolidBodies(ReadPixels readPixels,ReadMotion readMotio
         std::shared_ptr<const void> nativeTextureOwner;
         int texWidth=0,texHeight=0;
     };
-    constexpr int bodies=videorender::kParticleSolidMaxBodies, size=128;
+    constexpr int bodies=128, size=128;
     auto p=solidBodyFixture(); p.bodyRadius=0.025f;
     auto state=std::make_shared<videorender::ParticleSolidState>(); state->count=bodies;
     for (int i=0;i<bodies;++i) {
@@ -207,7 +207,7 @@ bool verifyNativeInstancedSolidBodies(ReadPixels readPixels,ReadMotion readMotio
     }
     // Motion: each scene carries every body's prior transform. Births use
     // equal (zero) birth times, so every body with a prior match keeps it.
-    const std::array<double,bodies> births {};
+    const videorender::ParticleSizedList<double> births(static_cast<std::size_t>(bodies));
     arbitgpu::NativeFixtureSceneRuntimeInputs motion;
     motion.imageOutput=renderpassoutput::Output::Motion;
     motion.previousMotion=arbitgpu::sceneMotionSample(motion);
@@ -458,7 +458,7 @@ bool verifyNativeComposedSolidBodyMotion(ReadMotion readMotion,std::string& erro
     current.bodies[1].x=0.5f; current.bodies[1].y=0.8f; current.bodies[1].z=0.5f; current.bodies[1].identity=1002;
     videorender::ParticleSolidState previous; previous.count=1;
     previous.bodies[0]=current.bodies[0]; previous.bodies[0].x-=0.05f;
-    const std::array<double,videorender::kParticleSolidMaxBodies> births {};
+    const videorender::ParticleSizedList<double> births;
     const videorender::ParticleSolidMotionPrior prior{previous,births,births,p.bodyRadius};
     const auto scene=videorender::appendParticleSolidBodies(source,p,current,7,{},error,&prior);
     if (!scene) return false;

@@ -74,7 +74,7 @@ check("if(seam==7) {float probeBias=glassBias(origin);queryOrigin=origin+back*(2
 check(header.count("if(seam==6) {") == 2 and header.count("} else if(seam==7) {") == 2,
       "both camera walks run the exit probe")
 check("media[pending]=!inside;seams[pending]=inside?6:0;++pending;" in header
-      and "seams[pending]=transmission&&!thin&&rayInside?6:0;++pending;" in header,
+      and "seams[pending]=transmission&&!thin&&rayInside?6:0;\n" in header,
       "only the transmitted child of a glass exit is an exit child")
 check("sg::kSeamExitChild" in tests and "sg::kSeamExitProbe" in tests and "cubeBottom(" in tests,
       "the tests walk the exit probe and check the terminal face")

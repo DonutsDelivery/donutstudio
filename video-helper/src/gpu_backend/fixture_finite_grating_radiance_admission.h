@@ -17,12 +17,14 @@ inline Costs multiply(const Costs& a,std::uint64_t count) {
 }
 // A scan walks at most 2048 wrapper records and 8 child associations per record.
 // Identity comparisons/copies, registry lookup, unwind, retained-byte scans and
-// no-elision Costs temporaries fit 32 whole-frame byte walks and 64 operations per
-// word. This excludes the separately charged optical/numerical child inspectors.
-constexpr std::uint64_t scanBytes=32*renderpassoutput::kMaximumTotalBytes;
-constexpr Costs scanCost{2048ull*2048*16,65536,2048ull*2048*32,scanBytes/4*64,scanBytes,scanBytes,65536,64};
-constexpr Costs factoryCost=scanCost;
-constexpr Costs inspectionCost=scanCost;
+// no-elision Costs temporaries fit 32 walks of the scene's admitted frame bytes
+// and 64 operations per word. The walk is fixed at caustic admission; products
+// are checked. This excludes the separately charged optical/numerical inspectors.
+inline std::uint64_t scanBytes(std::uint64_t walk) {return surfacesource::multiply(32,walk);}
+inline Costs scanCost(std::uint64_t walk) {
+    const auto bytes=scanBytes(walk);
+    return {2048ull*2048*16,65536,2048ull*2048*32,surfacesource::multiply(bytes/4,64),bytes,bytes,65536,64};
+}
 inline bool validJournal(std::uint64_t count,const Costs& costs,const Costs& per) {
     if(count>2048ull*2048)return false;
     return costs==multiply(per,count);
@@ -42,14 +44,15 @@ public:
         std::uint32_t cellX=0,cellY=0;
         bool live=false,published=false;
     };
-    Admission(std::size_t factories,const std::uint64_t* observed):factories_(factories),work_(multiply(factoryCost,factories)) {
+    Admission(std::size_t factories,std::uint64_t walk,const std::uint64_t* observed)
+        :factories_(factories),scan_(scanCost(walk)),work_(multiply(scan_,factories)) {
         if(!observed||*observed<sizeof(Admission)||*observed>sizeof(Admission)+256)
             throw std::length_error("Finite radiance fixed control allocation refused");
         baseBytes_=bytes_=*observed;
     }
     void factory() {
         if(factories_==maximumAttempts)throw std::length_error("Finite radiance factory journal exhausted");
-        const auto next=add(work_,factoryCost);++factories_;work_=next;
+        const auto next=add(work_,scan_);++factories_;work_=next;
     }
     std::size_t begin(std::uint64_t serial,std::uint64_t identityBytes,std::uint64_t identityBound,std::uint64_t firstChildSlot,
         std::uint64_t parent,std::uint64_t bytes,const Costs& construction,std::uint64_t limit) {
@@ -58,7 +61,7 @@ public:
         const auto next=add(work_,construction);auto& record=records_[count_++];
         record.serial=serial;record.identityBytes=identityBytes;record.identityBound=identityBound;record.firstChildSlot=firstChildSlot;
         record.construction=construction;work_=next;
-        if(limit>renderpassoutput::kMaximumTotalBytes||surfacesource::add(parent,surfacesource::add(bytes_,bytes))>limit)
+        if(surfacesource::add(parent,surfacesource::add(bytes_,bytes))>limit)
             throw std::length_error("Finite radiance whole-frame simultaneous storage refused");
         record.bytes=bytes;record.live=true;bytes_=surfacesource::add(bytes_,bytes);return count_-1;
     }
@@ -69,10 +72,10 @@ public:
     void publish(std::size_t slot,const std::array<std::uint32_t,5>& support) noexcept {records_[slot].support=support;records_[slot].published=true;}
     void retire(std::size_t slot) noexcept {auto& record=records_[slot];if(record.live){bytes_-=record.bytes;record.live=false;}}
     bool inspectJournal() const {
-        Costs expected=multiply(factoryCost,factories_);
+        Costs expected=multiply(scan_,factories_);
         std::uint64_t bytes=baseBytes_,scans=0;
         for(std::size_t i=0;i<count_;++i){const auto& r=records_[i];
-            if(!r.serial||(i&&r.serial<=records_[i-1].serial)||r.inspection!=multiply(inspectionCost,r.inspections))return false;
+            if(!r.serial||(i&&r.serial<=records_[i-1].serial)||r.inspection!=multiply(scan_,r.inspections))return false;
             expected=add(expected,add(r.construction,r.inspection));scans=surfacesource::add(scans,r.inspections);
             if(r.live)bytes=surfacesource::add(bytes,r.bytes);
         }
@@ -80,18 +83,19 @@ public:
     }
     const Attempt& record(std::size_t slot) const {return records_.at(slot);}
     const Costs& work() const noexcept {return work_;}
+    const Costs& perScan() const noexcept {return scan_;}
     std::uint64_t bytes() const noexcept {return bytes_;}
     std::size_t attempts() const noexcept {return count_;}
     std::size_t factories() const noexcept {return factories_;}
 private:
     void scan(std::uint64_t& count,Costs& costs) {
-        if(scans_==maximumScans||costs!=multiply(inspectionCost,count))throw std::length_error("Finite radiance permanent scan journal refused");
-        const auto next=add(work_,inspectionCost),nextCosts=multiply(inspectionCost,count+1);
+        if(scans_==maximumScans||costs!=multiply(scan_,count))throw std::length_error("Finite radiance permanent scan journal refused");
+        const auto next=add(work_,scan_),nextCosts=multiply(scan_,count+1);
         ++count;++scans_;costs=nextCosts;work_=next;
     }
     std::array<Attempt,maximumAttempts> records_{};
     std::size_t factories_=0,count_=0;
     std::uint64_t baseBytes_=0,bytes_=0,scans_=0;
-    Costs work_{};
+    Costs scan_{},work_{};
 };
 } // namespace arbitgpu::finiteradiance

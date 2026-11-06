@@ -786,7 +786,7 @@ void testBackendSources()
     check(mm.find("float stamLayer[arbitgpu::stamlayer::kUniformVec4Count][4];") != std::string::npos
               && mm.find("offsetof (FixtureUniforms, stamLayer) == 11536") != std::string::npos
               && mm.find("offsetof (FixtureUniforms, glassTransport2) == 11648") != std::string::npos
-              && mm.find("sizeof (FixtureUniforms) == 11664") != std::string::npos,
+              && mm.find("sizeof (FixtureUniforms) == 11952") != std::string::npos,
           "the C++ uniform block matches the MSL layout, with the paired partner after the layer");
     check(mm.find("(layered ? arbitgpu::stamlayer::metalShader() : std::string())") != std::string::npos,
           "Metal appends the generated module");

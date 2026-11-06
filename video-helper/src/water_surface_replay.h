@@ -4,6 +4,10 @@
 #include "../../shared/GeometryCore.h"
 
 #include <algorithm>
+#include <array>
+#include <iterator>
+#include <map>
+#include <mutex>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -172,6 +176,37 @@ public:
     const std::vector<double>& height() const { return height_; }
     const std::vector<double>& velocity() const { return velocity_; }
 
+    // A completed-step snapshot. The steps before it consumed only the impulses
+    // earlier than its boundary, and every request reaching past that boundary
+    // lists those impulses first, in the same order.
+    struct Checkpoint final
+    {
+        std::int64_t step = 0;
+        std::size_t event = 0;
+        std::vector<double> height, velocity;
+        std::uint64_t consumed = 0;   // hash of the impulses before event
+    };
+    Checkpoint checkpoint() const
+    {
+        prefixHash(event_);
+        return {step_, event_, height_, velocity_, hash_};
+    }
+
+    // Continues a freshly prepared request from a snapshot of the same simulation.
+    bool resume(const Checkpoint& saved, std::string& error)
+    {
+        const auto stepOf = [](const waterreplay::Impulse& impulse) { return impulse.tick / kParticleReplayStepTicks; };
+        if (!prepared_ || step_ != 0 || saved.step < 0 || saved.step > steps_
+            || saved.height.size() != height_.size() || saved.velocity.size() != velocity_.size()
+            || saved.event > impulses_.size()
+            || (saved.event > 0 && stepOf(impulses_[saved.event - 1]) >= saved.step)
+            || (saved.event < impulses_.size() && stepOf(impulses_[saved.event]) < saved.step)
+            || (prefixHash(saved.event), hash_ != saved.consumed))
+        { error = "Water checkpoint does not match this replay request"; return false; }
+        step_ = saved.step; event_ = saved.event; height_ = saved.height; velocity_ = saved.velocity;
+        error.clear(); return true;
+    }
+
     // An impulse belongs to [step, step+1). Only completed intervals run,
     // so neither a boundary impulse nor an unfinished interval affects rest.
     bool advance(std::string& error)
@@ -250,6 +285,26 @@ public:
 
 private:
     bool prepared_ = false;
+    // FNV-1a over every impulse field, extended as the prefix grows, so a snapshot
+    // resumes only a request whose score and audio impulses agree up to it.
+    void prefixHash(std::size_t events) const
+    {
+        if (events < hashed_) { hashed_ = 0; hash_ = 14695981039346656037ull; }
+        const auto mix = [&](const void* data, std::size_t size)
+        {
+            const auto* bytes = static_cast<const unsigned char*>(data);
+            for (std::size_t i = 0; i < size; ++i) { hash_ ^= bytes[i]; hash_ *= 1099511628211ull; }
+        };
+        for (; hashed_ < events; ++hashed_)
+        {
+            const auto& impulse = impulses_[hashed_];
+            mix(&impulse.tick, sizeof impulse.tick); mix(&impulse.identity, sizeof impulse.identity);
+            mix(&impulse.kind, sizeof impulse.kind); mix(&impulse.x, sizeof impulse.x);
+            mix(&impulse.y, sizeof impulse.y); mix(&impulse.velocity, sizeof impulse.velocity);
+        }
+    }
+    mutable std::size_t hashed_ = 0;
+    mutable std::uint64_t hash_ = 14695981039346656037ull;
     std::int64_t projectTick_ = 0, step_ = 0, steps_ = 0;
     std::size_t event_ = 0;
     videowire::geometry::WaterSurfaceGrid grid_;
@@ -291,18 +346,116 @@ struct WaterCoupledFrame final
 
 // The caller supplies PROJECT-ZERO seconds, not clip-local mesh time. Every
 // request starts at authored rest at zero; no frame-order state is retained.
+// Completed-step snapshots of uncoupled Water, one per simulated second, so a
+// frame anywhere in the project resumes from the nearest earlier second instead
+// of replaying from zero. Memory grows with the project length the user has
+// visited and the grid's vertex count; a changed plan, score or source replaces
+// the operation's entry.
+class WaterSurfaceCheckpointStore final
+{
+public:
+    static constexpr std::int64_t kIntervalSteps = kParticleReplayTicksPerSecond / kParticleReplayStepTicks;
+
+    bool find(const ParticleHistorySource& source, const videowire::geometry::OperationRecord& operation,
+              const videowire::geometry::GeometryData& restMesh, const videowire::geometry::WaterSurfaceGrid& grid,
+              std::int64_t step, WaterSurfaceReplayState::Checkpoint& checkpoint)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto at = entries_.find(operation.stableId);
+        if (at == entries_.end() || !at->second.same(source, operation, restMesh, grid)) return false;
+        auto latest = at->second.saved.upper_bound(step);
+        if (latest == at->second.saved.begin()) return false;
+        checkpoint = std::prev(latest)->second; ++resumes_;
+        return true;
+    }
+
+    void record(const ParticleHistorySource& source, const videowire::geometry::OperationRecord& operation,
+                const videowire::geometry::GeometryData& restMesh, const videowire::geometry::WaterSurfaceGrid& grid,
+                const WaterSurfaceReplayState& state)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& entry = entries_[operation.stableId];
+        if (!entry.same(source, operation, restMesh, grid))
+            entry = Entry::from(source, operation, restMesh, grid);
+        entry.saved[state.checkpoint().step] = state.checkpoint(); ++recorded_;
+    }
+
+    std::size_t resumes() const { std::lock_guard<std::mutex> lock(mutex_); return resumes_; }
+    std::size_t recorded() const { std::lock_guard<std::mutex> lock(mutex_); return recorded_; }
+
+private:
+    struct Entry final
+    {
+        const void* score = nullptr; const void* audio = nullptr; double sampleRate = 0;
+        canonicalblockc::FrameKey key {};
+        std::array<double, 8> values {};
+        std::vector<videowire::geometry::Vec3> positions;
+        videowire::geometry::WaterSurfaceGrid grid;
+        std::map<std::int64_t, WaterSurfaceReplayState::Checkpoint> saved;
+
+        static Entry from(const ParticleHistorySource& source, const videowire::geometry::OperationRecord& operation,
+                          const videowire::geometry::GeometryData& restMesh, const videowire::geometry::WaterSurfaceGrid& grid)
+        {
+            Entry entry;
+            entry.score = source.score.get(); entry.audio = source.audioFrames; entry.sampleRate = source.audioSampleRate;
+            entry.key = source.key; entry.values = operation.field.values;
+            entry.positions = restMesh.positions; entry.grid = grid;
+            return entry;
+        }
+
+        // The frame, beat, seek, loop and fps generations move with playback and
+        // do not change the simulation.
+        bool same(const ParticleHistorySource& source, const videowire::geometry::OperationRecord& operation,
+                  const videowire::geometry::GeometryData& restMesh, const videowire::geometry::WaterSurfaceGrid& other) const
+        {
+            const auto& k = source.key;
+            if (score != source.score.get() || audio != source.audioFrames || sampleRate != source.audioSampleRate
+                || key.carrierVersion != k.carrierVersion || key.projectGeneration != k.projectGeneration
+                || key.sourceGeneration != k.sourceGeneration || key.helperGeneration != k.helperGeneration
+                || key.backendGeneration != k.backendGeneration || key.deviceGeneration != k.deviceGeneration
+                || key.scoreGeneration != k.scoreGeneration || key.beatMapGeneration != k.beatMapGeneration
+                || values != operation.field.values || grid.columns != other.columns || grid.rows != other.rows
+                || grid.spacingX != other.spacingX || grid.spacingY != other.spacingY
+                || positions.size() != restMesh.positions.size()) return false;
+            for (std::size_t i = 0; i < positions.size(); ++i)
+                if (positions[i].x != restMesh.positions[i].x || positions[i].y != restMesh.positions[i].y
+                    || positions[i].z != restMesh.positions[i].z) return false;
+            return true;
+        }
+    };
+
+    mutable std::mutex mutex_;
+    std::map<videowire::geometry::StableId, Entry> entries_;
+    std::size_t resumes_ = 0, recorded_ = 0;
+};
+
+inline WaterSurfaceCheckpointStore& waterSurfaceCheckpoints()
+{
+    static WaterSurfaceCheckpointStore store;
+    return store;
+}
+
 inline bool replayWaterSurface(const ParticleHistorySource& source,
     const videowire::geometry::OperationRecord& operation,
     const videowire::geometry::GeometryData& restMesh,
     const videowire::geometry::WaterSurfaceGrid& grid, double projectSeconds,
-    std::vector<double>& localZOffsets, std::string& error)
+    std::vector<double>& localZOffsets, std::string& error,
+    WaterSurfaceCheckpointStore* checkpoints = &waterSurfaceCheckpoints())
 {
     if (operation.code==videowire::geometry::OperationCode::fieldWaterHeight && operation.field.values[4]>0) {
         error="Water body coupling requires the coupled frame coordinator"; return false;
     }
     WaterSurfaceReplayState replay;
     if (!replay.prepare(source, operation, restMesh, grid, projectSeconds, error)) return false;
-    while (!replay.complete()) if (!replay.advance(error)) return false;
+    WaterSurfaceReplayState::Checkpoint saved;
+    if (checkpoints && checkpoints->find(source, operation, restMesh, grid, replay.stepCount(), saved)
+        && !replay.resume(saved, error)) return false;
+    while (!replay.complete())
+    {
+        if (!replay.advance(error)) return false;
+        if (checkpoints && replay.checkpoint().step % WaterSurfaceCheckpointStore::kIntervalSteps == 0)
+            checkpoints->record(source, operation, restMesh, grid, replay);
+    }
     return replay.publishHeight(localZOffsets, error);
 }
 

@@ -1,4 +1,5 @@
 #include "geometry_core_backend.h"
+#include "../../shared/VertexControlBank.h"
 #include "../../shared/GeometryAudioDeformer.h"
 #include "../../shared/GeometryCoreScene.h"
 #include "../../shared/GeometryMaterialTable.h"
@@ -114,8 +115,7 @@ std::optional<RuntimeAdmission> GeometryCorePlanRuntime::admitPointsBody(const P
   context.deferredPoints.emplace(declaration.pointsOutputStableId,declaration.points);
   context.deferredBodyGeometry.emplace(declaration.outputStableId,declaration);
   const auto lowered=decodeLoweredRuntimePlan(bytes,error);
-  if (!lowered || !lowered->surfaceMaterial.empty() || !lowered->contract.attributes.empty()
-      || lowered->contract.carrier!=CarrierKind::instances3D || lowered->runtimeValue.size()<21) {
+  if (!lowered || !pairedBodyPlanShape(*lowered)) {
     if (error.empty()) {error="Paired Geometry Core requires its bounded instances-only source schedule";} return std::nullopt;
   }
   // Reconstruct the only admitted schedule before decoding any caller-authored
@@ -135,7 +135,8 @@ std::optional<RuntimeAdmission> GeometryCorePlanRuntime::admitPointsBody(const P
   expected.operations={std::move(body),{declaration.pointsOutputStableId,OperationCode::copy,0,declaration.pointsOutputStableId,{}},
       {terminal,OperationCode::instanceOnPoints,declaration.pointsOutputStableId,terminal,{},declaration.outputStableId}};
   const auto admitted=admitValue(expected,lowered->contract,limits,context,error);
-  if (!admitted || lowerRuntimePlan(lowered->contract,*admitted)!=bytes) {
+  // A body may carry its whole-object medium (slot 0), which the schedule itself never names.
+  if (!admitted || !pairedBodyWireExact(lowered->contract,*admitted,*lowered,bytes)) {
     if (error.empty()) {error="Paired Geometry Core wire differs from its exact admitted source schedule";} return std::nullopt;
   }
   return admitLowered(bytes,limits,context,owner,error,source,std::move(lease));
@@ -198,7 +199,10 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
                       const videorender::WaterCoupledFrame* coupledWater,
                       const std::shared_ptr<const videorender::ParticlePointsBodyRequest>& pointsBodyRequest,
                       const PointsBodyEvaluator& pointsBodyEvaluator,
-                      arbitgpu::NativeFixturePrepareUse prepareUse) {
+                      arbitgpu::NativeFixturePrepareUse prepareUse,
+                      const std::map<std::string, double>* runtimeParameters,
+                      const visualdeformation::RationalFrameTime* motionFrame,
+                      const GeometryMotionRecord* motionPredecessor) {
   using namespace HarmonicMIDI::grid;
   error.clear();
   try {
@@ -237,7 +241,8 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
         || pointsBodyRequest->clipSeconds()!=timelineTimeSeconds
         || admission.sourceContext.deferredBodyGeometry.size()!=1 || admission.sourceContext.deferredPoints.size()!=1
         || !admission.sourceContext.admittedGeometryOrSceneSources.empty()
-        || !admission.surfaceMaterial.empty() || !admission.plan->value().descriptor().spectrumFields.empty()
+        || !admission.surfaceMaterial.empty()
+        || !admission.plan->value().descriptor().spectrumFields.empty()
         || !admission.plan->value().descriptor().scoreFields.empty()) {
       error="Native paired body requires its independent current request, exact owner/frame/clocks and bounded source"; return std::nullopt;
     }
@@ -381,9 +386,19 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
       && std::any_of(descriptor.scoreFields.begin(),descriptor.scoreFields.end(),[](const auto& binding) {
         return binding.consumerGeometryStableId!=0;
       });
-  const bool runtimeFields=videowire::geometry::hasRuntimeFields(descriptor) || scorePrototype;
+  // A Subdivision Surface with a dicing rate replays each frame against the native
+  // view below: camera at local (0, 0, 5), vertical field of view pi/4.
+  const bool adaptiveSubdivision=videowire::geometry::hasAdaptiveSubdivision(descriptor);
+  const bool replayDisplacement=videowire::geometry::hasReplayDisplacement(descriptor);
+  const bool runtimeFields=videowire::geometry::hasRuntimeFields(descriptor) || scorePrototype
+      || replayDisplacement || adaptiveSubdivision;
   auto evaluation = videorender::waterSurfaceFrameEvaluation(
       waterHistory, waterProjectSeconds, timelineTimeSeconds, runtimeInputs.canonicalBlockCFrame, coupledWater);
+  if (adaptiveSubdivision) {
+    evaluation.subdivisionLocalToCamera={{1,0,0,0, 0,1,0,0, 0,0,1,-5}};
+    evaluation.subdivisionTanHalfFov=std::tan(0.7853981634/2.0);
+    evaluation.subdivisionViewportHeight=static_cast<double>(height);
+  }
   evaluation.scoreAt=[&](const auto& operation,const auto& positions,auto& result,auto& diagnostic) {
     if (operation.code==videowire::geometry::OperationCode::evaluateField
         && (operation.inputStableId!=operation.outputStableId || scorePrototype)) {
@@ -406,6 +421,7 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     videowire::geometry::spectrum::ScalarInput input;
     if (!spectrumEvaluation) return input;
     input.current=&spectrumEvaluation->scalars;
+    input.beatDelay=spectrumEvaluation->beatDelay;
     if (binding.source==videowire::geometry::spectrum::Source::master) {
       input.at=history ? spectrumEvaluation->historyScalarFeaturesAt : spectrumEvaluation->scalarFeaturesAt;
     } else {
@@ -497,6 +513,65 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     }
     return true;
   };
+  // A Set Position displacement that a layout change follows is added at its consumer in
+  // replay order, with the same follower and sample a terminal displacement uses. The
+  // terminal loops below skip it.
+  const auto inReplay=[&](videowire::geometry::StableId consumer) {
+    return videowire::geometry::displacementInReplay(descriptor,consumer);
+  };
+  evaluation.displaceConsumer=[&](auto& geometry,videowire::geometry::StableId consumer,std::string& failure) {
+    for (std::size_t index=0;index<descriptor.spectrumFields.size();++index) {
+      const auto& binding=descriptor.spectrumFields[index];
+      if (binding.consumerGeometryStableId!=consumer
+          || !videowire::geometry::adapterSpectrumDisplacement(descriptor,binding)) continue;
+      if (!spectrumEvaluation) { failure="Spectrum geometry requires the frame's shared master analysis"; return false; }
+      spectrumEvaluation->followers.resize(descriptor.spectrumFields.size());
+      videowire::geometry::spectrum::Bands currentBands{},followed{};
+      videowire::geometry::spectrum::FeaturesAt featuresAt,historyAt;
+      if (!spectrumInput(binding,currentBands,featuresAt,historyAt,failure)) return false;
+      std::vector<float> amounts(geometry.positions.size());
+      if (binding.history.enabled) {
+        std::vector<videowire::geometry::spectrum::Bands> rows;
+        if (!videowire::geometry::spectrum::evaluateHistory(binding,
+              currentBands, spectrumEvaluation->timeSeconds, historyAt,
+              spectrumEvaluation->liveFrameAvailable, admission.use == PlanUse::exportRender,
+              spectrumEvaluation->followers[index], rows, failure,
+              spectrumEvaluation->seekGeneration, spectrumEvaluation->loopGeneration,
+              scalarInputFor(binding,true))) return false;
+        for (std::size_t vertex=0;vertex<amounts.size();++vertex)
+          amounts[vertex]=videowire::geometry::spectrum::sampleHistory(binding,rows,vertex);
+      } else {
+        if (binding.coordinates.size()!=amounts.size()) {
+          failure="Audio Spectrum Field coordinates disagree with its Set Position mesh"; return false;
+        }
+        if (!videowire::geometry::spectrum::evaluate(binding, currentBands,
+              spectrumEvaluation->timeSeconds, featuresAt,
+              spectrumEvaluation->followers[index], followed, failure, scalarInputFor(binding,false))) return false;
+        for (std::size_t vertex=0;vertex<amounts.size();++vertex)
+          amounts[vertex]=videowire::geometry::spectrum::sample(binding,followed,binding.coordinates[vertex]);
+      }
+      for (std::size_t vertex=0;vertex<amounts.size();++vertex) {
+        auto& position=geometry.positions[vertex];
+        position.x+=amounts[vertex]*binding.direction[0];
+        position.y+=amounts[vertex]*binding.direction[1];
+        position.z+=amounts[vertex]*binding.direction[2];
+      }
+    }
+    for (const auto& binding : descriptor.scoreFields) {
+      if (binding.consumerGeometryStableId!=consumer
+          || !videowire::geometry::adapterScoreDisplacement(descriptor,binding)) continue;
+      scorefield::Evaluation evaluated;
+      if (!scorefield::evaluate(binding,runtimeInputs.canonicalBlockCFrame,evaluated,failure)) return false;
+      if (evaluated.offsets.size()!=geometry.positions.size()) {
+        failure="Score Field offsets disagree with its Set Position mesh"; return false;
+      }
+      for (std::size_t index=0;index<geometry.positions.size();++index) {
+        auto& p=geometry.positions[index]; const auto& offset=evaluated.offsets[index];
+        p.x+=offset[0]; p.y+=offset[1]; p.z+=offset[2];
+      }
+    }
+    return true;
+  };
   const bool orderedAudio=std::any_of(descriptor.spectrumFields.begin(),descriptor.spectrumFields.end(),
       [](const auto& binding) { return binding.target==videowire::geometry::spectrum::Target::geometryDeformation; });
   std::function<bool(videowire::geometry::GeometryData&,const videowire::geometry::spectrum::Binding&,
@@ -585,6 +660,8 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
           return op.stableId==binding.fieldStableId && op.code==videowire::geometry::OperationCode::fieldAudioSpectrum;
         })) continue;
       if (orderedAudio && binding.target==videowire::geometry::spectrum::Target::geometryDeformation) continue;
+      if (videowire::geometry::adapterSpectrumDisplacement(descriptor,binding)
+          && inReplay(binding.consumerGeometryStableId)) continue;
       videowire::geometry::spectrum::Bands currentBands{};
       videowire::geometry::spectrum::FeaturesAt featuresAt,historyAt;
       if (!spectrumInput(binding,currentBands,featuresAt,historyAt,error)) return std::nullopt;
@@ -665,6 +742,8 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   }
   for (const auto& binding : descriptor.scoreFields) {
     if (scorePrototype) continue;
+    if (videowire::geometry::adapterScoreDisplacement(descriptor,binding)
+        && inReplay(binding.consumerGeometryStableId)) continue;
     if (std::any_of(descriptor.operations.begin(),descriptor.operations.end(),[&](const auto& op) {
           return op.code==videowire::geometry::OperationCode::evaluateField
               && op.stableId==binding.fieldStableId && op.inputStableId!=op.outputStableId;
@@ -832,6 +911,12 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     scene->objects[0].vertexCount=scene->objects[0].indexCount=0;
     scene->objectCount=1;
   }
+  // Motion for instances: each instance carries its prior transform, and the
+  // shared draw reads it from the instance record.
+  const bool motionPass = arbitgpu::sceneUsesMotionPass(runtimeInputs);
+  const bool instancedMotion = motionPass && instances != nullptr && !instances->instances.empty();
+  if (instancedMotion)
+    geometryPriorInstanceTransforms(*scene, runtimeInputs.previousMotion ? motionPredecessor : nullptr);
   scene->lights[0].id = {1};
   scene->lights[0].kind = SceneLightKind::Directional;
   // Camera-facing key light: toLight = (-0.299, 0.399, 0.867), up and toward the viewer. Every
@@ -871,9 +956,16 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     scene->materials[0].id=id;
     for (std::size_t index=0;index<scene->objectCount;++index) scene->objects[index].material=id;
   }
+  // The slots' Volume Materials and glass or water media, as Geometry Scene keeps them.
+  const auto slotMedia=videowire::geometry::decodeSlotMedia(admission.slotMedia,error);
+  if (!slotMedia) return std::nullopt;
   std::vector<videowire::geometry::MaterialTableDrawBinding> drawBindings;
   if (!videowire::geometry::applyGeometryMaterialTable(frameDescriptor,materialized,meshAttributes,
-        *scene,0,objectCount,error,&surfaceIds,&drawBindings)) return std::nullopt;
+        *scene,0,objectCount,error,&surfaceIds,&drawBindings,&*slotMedia)) return std::nullopt;
+  // Geometry without a table draws every object with the first material, which
+  // takes the Surface override's medium.
+  if (const auto whole=slotMedia->find(0); whole!=slotMedia->end() && !hasTable)
+    scene->materials[0].volume=whole->second;
   std::shared_ptr<arbitgpu::NativeFixtureSurfaceMaterialProgram> surfaceProgram;
   if (!authoredSurfaces.empty()) {
     const auto nativeBackend = backend.info().backend;
@@ -919,6 +1011,32 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
       error = "Geometry Surface requires finite native frame time"; return std::nullopt;
     }
     runtimeInputs.timeSeconds = static_cast<float>(timelineTimeSeconds);
+    // A vertex stage that reads spectrum bands gets the frame's shared bands,
+    // as imported-scene draws do.
+    const bool vertexSpectrum=std::any_of(authoredSurfaces.begin(),authoredSurfaces.end(),[](const auto& program) {
+      return program.material.vertexModifier && std::any_of(program.material.vertexModifier->records.begin(),
+          program.material.vertexModifier->records.end(),[](const auto& record) {
+            return record.operation==videowire::VertexModifierOperation::audioParameter; });
+    });
+    if (vertexSpectrum) {
+      if (!spectrumEvaluation || !spectrumEvaluation->liveFrameAvailable) {
+        error = "Geometry Surface vertex spectrum requires the shared audio frame"; return std::nullopt;
+      }
+      static_assert(std::tuple_size_v<videowire::geometry::spectrum::Bands> == std::tuple_size_v<decltype(runtimeInputs.vertexSpectrum)>,
+                    "the vertex spectrum uniform holds the shared frame's bands");
+      std::copy(spectrumEvaluation->bands.begin(),spectrumEvaluation->bands.end(),runtimeInputs.vertexSpectrum.begin());
+    }
+    // Every Surface's Vertex Control Parameter reads share one bank: each
+    // record's authored value, or the frame's published modulation value for
+    // it. Two Surfaces on one slot must agree.
+    videowire::VertexModifierIr controls;
+    for (const auto& program : authoredSurfaces)
+      if (program.material.vertexModifier)
+        for (const auto& record : program.material.vertexModifier->records)
+          if (record.operation==videowire::VertexModifierOperation::controlParameter) controls.records.push_back(record);
+    if (!videowire::vertexcontrol::bank(controls,runtimeParameters,runtimeInputs.vertexControls,error)) {
+      error="Geometry Surface: "+error; return std::nullopt;
+    }
   }
   auto prepared = instances != nullptr && !instances->instances.empty() && !videowire::geometry::hasMaterialTable(descriptor,materialized)
       ? backend.prepareGeometryInstances(scene, surfaceProgram, framePlan,
@@ -946,6 +1064,16 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   // opts the draw into polyphonic copies of the resulting mesh.
   if (!runtimeInputs.noteInstanceMapping)
     runtimeInputs.canonicalBlockCFrame.reset();
+  // Motion: a draw keeps the positions, vertex inputs and instance transforms
+  // it rendered. A predecessor whose vertex count changed gives zero motion
+  // like a first frame; its instance transforms were read above.
+  std::optional<GeometryMotionRecord> motion;
+  if (!motionPass
+      || (runtimeInputs.previousMotion && (!runtimeInputs.previousMotion->scenePositions
+          || runtimeInputs.previousMotion->scenePositions->size() != scene->vertexCount)))
+    runtimeInputs.previousMotion.reset();
+  if (motionPass && motionFrame != nullptr)
+    motion = geometryMotionRecord(runtimeInputs, *scene, *motionFrame, width, height, instancedMotion);
   auto rendered = backend.render(scene, prepared.resources, width, height,
                                  std::move(runtimeInputs));
   if (!rendered.rendered || !rendered.frame) {
@@ -986,7 +1114,8 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
                                  admission.ownerLease,
                                  std::move(drawnInstanceIds),
                                  rendered.stats,
-                                 framePlan->receipt().backendBinding};
+                                 framePlan->receipt().backendBinding,
+                                 std::move(motion)};
   } catch (const std::bad_alloc&) {
     if (admission.sourceContext.deferredBodyGeometry.empty()) throw;
     error="Native paired body allocation failed before publication"; return std::nullopt;

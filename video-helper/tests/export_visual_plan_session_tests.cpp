@@ -257,14 +257,15 @@ void checkPublicationBoundaries()
     videowire::VisualTelemetryPlanAdmission admitted;
     admitted.clipId = 1;
     admitted.structuralRevision = 2;
-    admitted.nodeCount = videowire::kMaxCompiledNodesPerGraph;
+    // 300 nodes, above the old 256-node table.
+    admitted.nodeCount = 300;
     admitted.executableNodeTotal = admitted.nodeCount + 17;
     admitted.nodesTruncated = true;
     for (size_t index = 0; index < admitted.nodeCount; ++index)
-        admitted.stableNodeIds[index] = static_cast<int>(index + 1);
+        admitted.stableNodeIds.push_back(static_cast<int>(index + 1));
     std::string diagnostic;
     check(telemetry.admitPlans({ admitted }, &diagnostic),
-          "maximum executable publication subset is admitted");
+          "a 300-node publication subset is admitted");
     auto json = videowire::visualTelemetryJson(telemetry.snapshot());
     check(json["executableNodeTotal"] == admitted.executableNodeTotal
               && json["executableNodeReported"] == admitted.nodeCount
@@ -276,18 +277,17 @@ void checkPublicationBoundaries()
                   && node["measuredMovingNs"].is_null(),
               "unmeasured serialized node costs remain unavailable and null");
 
-    std::vector<videowire::VisualTelemetryPlanAdmission> overLimit(
-        videowire::kMaxTelemetryPlans + 1);
-    for (size_t index = 0; index < overLimit.size(); ++index)
+    std::vector<videowire::VisualTelemetryPlanAdmission> manyPlans(300);
+    for (size_t index = 0; index < manyPlans.size(); ++index)
     {
-        overLimit[index].clipId = static_cast<int>(index);
-        overLimit[index].structuralRevision = 1;
+        manyPlans[index].clipId = static_cast<int>(index);
+        manyPlans[index].structuralRevision = 1;
     }
-    check(! telemetry.admitPlans(overLimit, &diagnostic) && ! diagnostic.empty(),
-          "first over-limit publication plan is rejected");
+    check(telemetry.admitPlans(manyPlans, &diagnostic) && diagnostic.empty(),
+          "300 publication plans, above the old 256-plan table, are admitted");
     json = videowire::visualTelemetryJson(telemetry.snapshot());
-    check(json["rejectedPlans"] == 1,
-          "JSON publishes rejected plan count");
+    check(json["rejectedPlans"] == 0 && json["layers"].size() == 300,
+          "JSON publishes every admitted plan and no rejection");
 
     videowire::VisualPlanTelemetry emptyTelemetry;
     const auto unavailable = videowire::visualTelemetryJson(emptyTelemetry.snapshot());

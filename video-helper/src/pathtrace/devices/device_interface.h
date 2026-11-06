@@ -7,6 +7,9 @@
 //
 //   device_cpu.cpp    PATHTRACE_DEVICE_CPU    CpuDevice    (always built)
 //   device_optix.cu   PATHTRACE_DEVICE_OPTIX  OptixDevice  (ARBIT_HAVE_OPTIX_KERNEL, when configure finds the SDK and nvcc)
+//   device_cuda.cu    PATHTRACE_DEVICE_CUDA   ComputeDevice (ARBIT_HAVE_CUDA_KERNEL, nvcc)
+//   device_hip.hip    PATHTRACE_DEVICE_HIP    ComputeDevice (ARBIT_HAVE_HIP_KERNEL, hipcc)
+//   device_oneapi.cpp PATHTRACE_DEVICE_ONEAPI ComputeDevice (ARBIT_HAVE_ONEAPI_DEVICE, icpx -fsycl, its own library)
 //
 // device_registry.h lists the devices and selects one.
 //
@@ -30,6 +33,8 @@
 //                                                             // thread, any pixel
 //   static void filmCountLightPath (Film&);                   // one per traced
 //                                                             // light path
+//   static void filmGuide (Film&, x, y, Vec3 albedo,          // first-hit guides
+//                          Vec3 normal);                      // of an added sample
 //
 // Each device keeps its own conformance test against the CPU device on the
 // shared cases (tests/pathtrace_device_tests.cpp for the CPU device itself).
@@ -53,10 +58,10 @@ namespace videohelper::pathtrace::device
 template <typename T>
 struct BufferView
 {
-    const T* data = nullptr;
+    const PT_GLOBAL T* data = nullptr;
     std::size_t count = 0;
 
-    PT_SHARED_FN const T& operator[] (std::size_t index) const noexcept { return data[index]; }
+    PT_SHARED_FN const PT_GLOBAL T& operator[] (std::size_t index) const noexcept { return data[index]; }
     PT_SHARED_FN bool empty() const noexcept { return count == 0; }
     PT_SHARED_FN std::size_t size() const noexcept { return count; }
 };

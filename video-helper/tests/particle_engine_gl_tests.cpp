@@ -161,7 +161,7 @@ int main()
     const auto hashB = b != 0 ? hashTexture(gl, b, width, height) : 0;
 
     videorender::ParticleParams legacy;
-    legacy.count = videorender::ParticleEngine::kMaxParticles;
+    legacy.count = 100000;
     videorender::ParticleEngine legacyA, legacyB, empty;
     const auto legacyTexA = legacyA.render(&gl, clock, width, height, legacy, notes.get());
     const auto legacyTexB = legacyB.render(&gl, clock, width, height, legacy, notes.get());

@@ -383,12 +383,11 @@ void ShaderGenerator::ensureDefaults (const arbitgl::GlFuncs* gl)
     }
 }
 
-// Block C texture dims (M5) — a fixed wire contract mirroring block_c_packer.h
-// (kTexelsPerNote, kMaxNotes, kMaxLinks) and the shader prelude's sampler
-// comments. uNotes = 4 texels (x) x 128 rows (y) RGBA32F; uLinks = 256 x 1.
-static constexpr int kNoteTexW = 4;     // texels per note (x)
-static constexpr int kNoteTexH = 128;   // note rows (y)
-static constexpr int kLinkTexW = 256;   // link edges (x)
+// Block C texture dims (M5), mirroring block_c_packer.h. uNotes is 4 texels
+// (x) by one row per note (y), RGBA32F. uLinks is kLinkTextureWidth texels wide
+// with link i at (i % width, i / width). Both heights follow the frame.
+static constexpr int kNoteTexW = arbitblockc::kTexelsPerNote;
+static constexpr int kLinkTexW = arbitblockc::kLinkTextureWidth;
 
 void ShaderGenerator::ensureBandsTex (const arbitgl::GlFuncs* gl, int n)
 {
@@ -423,30 +422,41 @@ void ShaderGenerator::ensureBandsTex (const arbitgl::GlFuncs* gl, int n)
     bandsTexN_ = n;
 }
 
-void ShaderGenerator::ensureNotesTex (const arbitgl::GlFuncs* gl)
+void ShaderGenerator::ensureNotesTex (const arbitgl::GlFuncs* gl, int noteHeight, int linkHeight)
 {
     (void) gl;
-    if (notesTexAlloc_) return;   // fixed-size wire contract — allocate once.
-
-    glGenTextures (1, &notesTex2D_);
-    glBindTexture (GL_TEXTURE_2D, notesTex2D_);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);  // structured texels
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, kNoteTexH, 0,
-                  GL_RGBA, GL_FLOAT, nullptr);
-
-    glGenTextures (1, &linksTex2D_);
-    glBindTexture (GL_TEXTURE_2D, linksTex2D_);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kLinkTexW, 1, 0,
-                  GL_RGBA, GL_FLOAT, nullptr);
-
-    notesTexAlloc_ = true;
+    noteHeight = std::max (1, noteHeight);
+    linkHeight = std::max (1, linkHeight);
+    if (! notesTexAlloc_)
+    {
+        for (unsigned* texture : { &notesTex2D_, &linksTex2D_ })
+        {
+            glGenTextures (1, texture);
+            glBindTexture (GL_TEXTURE_2D, *texture);
+            glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);  // structured texels
+            glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+        notesTexH_ = linksTexH_ = 0;
+        notesTexAlloc_ = true;
+    }
+    // Reallocate only when a frame's row count changes the height; render()
+    // then uploads with glTexSubImage2D at the allocated size.
+    if (noteHeight != notesTexH_)
+    {
+        glBindTexture (GL_TEXTURE_2D, notesTex2D_);
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, noteHeight, 0,
+                      GL_RGBA, GL_FLOAT, nullptr);
+        notesTexH_ = noteHeight;
+    }
+    if (linkHeight != linksTexH_)
+    {
+        glBindTexture (GL_TEXTURE_2D, linksTex2D_);
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kLinkTexW, linkHeight, 0,
+                      GL_RGBA, GL_FLOAT, nullptr);
+        linksTexH_ = linkHeight;
+    }
 }
 
 void ShaderGenerator::ensureTarget (const arbitgl::GlFuncs* gl, int width, int height)
@@ -711,18 +721,20 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
         glBindTexture (GL_TEXTURE_2D, haveBands ? bandsTex2D_ : blackTex2D_);
         gl->Uniform1i (locs_.uAudioBands2D, 1);
     }
-    // Block C note/link textures (M5): when `notes` carries a full packed score
-    // (sizes match the fixed 4x128 / 256x1 layout) upload it into the float
-    // textures; otherwise bind black so reads return 0 (the M3/M4 zero-feed).
+    // Block C note/link textures (M5): when `notes` carries a packed score,
+    // size the float textures from its rows and upload it; otherwise bind
+    // black so reads return 0 (the M3/M4 zero-feed).
+    const int noteTexH = haveNotes ? notes->noteTextureHeight() : 0;
+    const int linkTexH = haveNotes ? notes->linkTextureHeight() : 0;
     if (haveNotes && (locs_.uNotes >= 0 || locs_.uLinks >= 0))
-        ensureNotesTex (gl);
+        ensureNotesTex (gl, noteTexH, linkTexH);
     if (locs_.uNotes >= 0)
     {
         gl->ActiveTexture (GL_TEXTURE2);
-        if (haveNotes && notes->noteTexture().size() >= (size_t) (kNoteTexW * kNoteTexH * 4))
+        if (haveNotes && notes->noteTexture().size() >= (size_t) kNoteTexW * (size_t) noteTexH * 4u)
         {
             glBindTexture (GL_TEXTURE_2D, notesTex2D_);
-            glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kNoteTexW, kNoteTexH,
+            glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kNoteTexW, noteTexH,
                              GL_RGBA, GL_FLOAT, notes->noteTexture().data());
         }
         else
@@ -734,10 +746,10 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     if (locs_.uLinks >= 0)
     {
         gl->ActiveTexture (GL_TEXTURE3);
-        if (haveNotes && notes->linkTexture().size() >= (size_t) (kLinkTexW * 4))
+        if (haveNotes && notes->linkTexture().size() >= (size_t) kLinkTexW * (size_t) linkTexH * 4u)
         {
             glBindTexture (GL_TEXTURE_2D, linksTex2D_);
-            glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kLinkTexW, 1,
+            glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kLinkTexW, linkTexH,
                              GL_RGBA, GL_FLOAT, notes->linkTexture().data());
         }
         else
@@ -897,6 +909,7 @@ void ShaderGenerator::shutdown (const arbitgl::GlFuncs* gl)
     if (notesTex2D_ != 0) { glDeleteTextures (1, &notesTex2D_); notesTex2D_ = 0; }
     if (linksTex2D_ != 0) { glDeleteTextures (1, &linksTex2D_); linksTex2D_ = 0; }
     notesTexAlloc_ = false;
+    notesTexH_ = linksTexH_ = 0;
     releasePassTargets (gl);   // ISF multipass buffers
     passes_.clear();
     targetSamplerLocs_.clear();

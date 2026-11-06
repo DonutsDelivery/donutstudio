@@ -3,13 +3,16 @@
 #include "imported_animation_playback_clock.h"
 
 #include "imported_animated_scene_payload_execution.h"
+#include "render_input_generation.h"
 #include "visual_plan_executor.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -91,6 +94,8 @@ inline VisualImportedAnimationPreparation prepareVisualImportedAnimationLayer(
     const videotime::BeatTimeline* beatTimeline = nullptr,
     double projectSeconds = 0.0)
 {
+    // A Path Trace preview drawn for this layer watches this clip's edits.
+    const videohelper::renderinput::ClipScope clipScope(clipId);
     const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
     if (plan == nullptr) return VisualImportedAnimationPreparation::notPresent;
 
@@ -140,9 +145,17 @@ inline VisualImportedAnimationPreparation prepareVisualImportedAnimationLayer(
     request.height = static_cast<std::uint32_t>(height);
 
     typename Execution::Receipt receipt;
-    const bool executed = use == NativeImportedAnimationRenderUse::Preview
-        ? execution->executePreview(request, receipt, error)
-        : execution->executeExport(request, receipt, error);
+    // An allocation that fails inside the render refuses this frame with its
+    // message instead of escaping into a noexcept caller.
+    bool executed = false;
+    try
+    {
+        executed = use == NativeImportedAnimationRenderUse::Preview
+            ? execution->executePreview(request, receipt, error)
+            : execution->executeExport(request, receipt, error);
+    }
+    catch (const std::bad_alloc&) { error = "Imported animation render could not allocate memory for this frame"; executed = false; }
+    catch (const std::length_error&) { error = "Imported animation render could not allocate memory for this frame"; executed = false; }
     if (! executed)
     {
         if (error.empty())

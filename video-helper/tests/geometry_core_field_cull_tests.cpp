@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -189,6 +190,225 @@ void cubeMeshCullKeepsSecondTrianglesAndReplays() {
   check(roundTrips(*culled, meshContract()), "cube cull admits and roundtrips");
 }
 
+// A cull after an Audio Deformer keeps the binding and re-runs on each frame's deformed
+// mesh: the index range keeps the admitted layout, and the positions are this frame's.
+void deformedCubeCullFollowsEachFrame() {
+  std::string error;
+  auto deformed = lowerAudioDeformer(cube(3041), 3042, spectrum::Binding{}, meshContract(), error);
+  check(deformed.has_value(), "the cube's audio deformer lowers");
+  if (!deformed) return;
+  auto culled = lowerCullEdit(*deformed, 3043, OperationCode::cullGeometry, {0, 11, 2, 0}, meshContract(), error);
+  if (!culled) std::fprintf(stderr, "deformed cull: %s\n", error.c_str());
+  check(culled.has_value(), "a cull of deformed geometry lowers");
+  if (!culled) return;
+  check(culled->spectrumFields.size() == 1, "the cull keeps the deformer binding");
+  const std::function<bool(GeometryData&, const spectrum::Binding&, std::string&)> lift =
+      [](GeometryData& mesh, const spectrum::Binding&, std::string&) {
+        for (auto& position : mesh.positions) position.z += 1;
+        return true;
+      };
+  MaterializedInstancePlan frame;
+  check(validateOperationPlan(*culled, {}, &frame, error, nullptr, nullptr, lift)
+            && frame.geometries.count(3043) == 1,
+        "the deformed cull replays with a frame deformer");
+  if (frame.geometries.count(3043) != 1) return;
+  const auto& evaluated = frame.geometries.at(3043);
+  const auto& rest = std::get<GeometryData>(culled->data);
+  check(evaluated.indices == rest.indices && evaluated.vertexIds == rest.vertexIds,
+        "each frame keeps the admitted layout");
+  check(evaluated.positions.size() == rest.positions.size()
+            && nearly(evaluated.positions[0].z, rest.positions[0].z + 1),
+        "each frame culls the deformed positions");
+  check(roundTrips(*culled, meshContract()), "the deformed cull admits and roundtrips");
+}
+
+// A Bounding Box after an Audio Deformer boxes each frame's deformed mesh.
+void deformedCubeBoundsFollowEachFrame() {
+  std::string error;
+  auto deformed = lowerAudioDeformer(cube(3051), 3052, spectrum::Binding{}, meshContract(), error);
+  auto box = deformed ? lowerBoundingBox(*deformed, 3053, meshContract(), error) : std::nullopt;
+  if (!box) std::fprintf(stderr, "deformed bounds: %s\n", error.c_str());
+  check(box.has_value(), "a bounding box of deformed geometry lowers");
+  if (!box) return;
+  const std::function<bool(GeometryData&, const spectrum::Binding&, std::string&)> lift =
+      [](GeometryData& mesh, const spectrum::Binding&, std::string&) {
+        for (auto& position : mesh.positions) position.z += 1;
+        return true;
+      };
+  MaterializedInstancePlan frame;
+  check(validateOperationPlan(*box, {}, &frame, error, nullptr, nullptr, lift)
+            && frame.geometries.count(3053) == 1,
+        "the deformed box replays with a frame deformer");
+  if (frame.geometries.count(3053) != 1) return;
+  const auto& evaluated = frame.geometries.at(3053);
+  const auto& rest = std::get<GeometryData>(box->data);
+  check(evaluated.positions.size() == 8 && rest.positions.size() == 8, "each frame's box has eight vertices");
+  bool lifted = evaluated.positions.size() == rest.positions.size();
+  for (std::size_t i = 0; lifted && i < rest.positions.size(); ++i)
+    lifted = nearly(evaluated.positions[i].z, rest.positions[i].z + 1);
+  check(lifted, "each frame's box follows the deformed positions");
+}
+
+// Density points on an Audio Deformer cube follow each frame's deformed area. The unit
+// cube's area 6 at density 2 admits 12 points; doubling its size gives area 24 and 48,
+// or the node's maximum when that is lower.
+void deformedCubeDensityFollowsEachFrame() {
+  std::string error;
+  auto deformed = lowerAudioDeformer(cube(3061), 3062, spectrum::Binding{}, meshContract(), error);
+  auto points = deformed ? lowerPointDensityDistribution(*deformed, 3063, 64, 7, 2, pointsContract(), error)
+                         : std::nullopt;
+  if (!points) std::fprintf(stderr, "deformed density: %s\n", error.c_str());
+  check(points.has_value(), "density points on deformed geometry lower");
+  if (!points) return;
+  check(std::get<PointsData>(points->data).points.size() == 12, "the rest area admits 12 points");
+  const std::function<bool(GeometryData&, const spectrum::Binding&, std::string&)> grow =
+      [](GeometryData& mesh, const spectrum::Binding&, std::string&) {
+        for (auto& position : mesh.positions) position = {position.x * 2, position.y * 2, position.z * 2};
+        return true;
+      };
+  MaterializedInstancePlan frame;
+  const bool replayed = validateOperationPlan(*points, {}, &frame, error, nullptr, nullptr, grow);
+  if (!replayed) std::fprintf(stderr, "deformed density replay: %s\n", error.c_str());
+  check(replayed && frame.points.count(3063) == 1, "the density points replay with a frame deformer");
+  if (frame.points.count(3063) == 1)
+    check(frame.points.at(3063).points.size() == 48, "each frame samples the deformed area");
+  // A frame past the node's maximum keeps the maximum: the node's own bound is the only one.
+  auto capped = lowerPointDensityDistribution(*deformed, 3064, 30, 7, 2, pointsContract(), error);
+  MaterializedInstancePlan cappedFrame;
+  check(capped && validateOperationPlan(*capped, {}, &cappedFrame, error, nullptr, nullptr, grow)
+            && cappedFrame.points.count(3064) == 1 && cappedFrame.points.at(3064).points.size() == 30,
+        "a frame past the node's maximum samples the maximum");
+}
+
+// A Set Position spectrum displacement that a cull follows runs at the Set Position
+// output during the replay, so the cull keeps the displaced vertices. Without the cull
+// the displacement stays with the scene adapter.
+void setPositionDisplacementCullFollowsEachFrame() {
+  std::string error;
+  auto moved = lowerTransformGeometry(cube(3071), 3072, Transform{}, meshContract(), error);
+  check(moved.has_value(), "the Set Position stand-in lowers");
+  if (!moved) return;
+  spectrum::Binding binding;
+  binding.target = spectrum::Target::vertexDisplacement;
+  binding.fieldStableId = 3079; binding.sourceGeometryStableId = 3071;
+  binding.consumerGeometryStableId = 3072;
+  binding.coordinates.assign(std::get<GeometryData>(moved->data).positions.size(), 0.0f);
+  auto bound = *moved;
+  bound.spectrumFields = {binding};
+  check(!displacedInReplay(bound, 3072), "a terminal Set Position keeps the adapter displacement");
+  auto culled = lowerCullEdit(bound, 3073, OperationCode::cullGeometry, {0, 11, 2, 0}, meshContract(), error);
+  if (!culled) std::fprintf(stderr, "set position cull: %s\n", error.c_str());
+  check(culled.has_value(), "a cull after a Set Position displacement lowers");
+  if (!culled) return;
+  check(displacedInReplay(*culled, 3072) && hasReplayDisplacement(*culled),
+        "the following cull moves the displacement into the replay");
+  std::size_t calls = 0;
+  RuntimeFieldEvaluation runtime;
+  runtime.displaceConsumer = [&calls](GeometryData& mesh, StableId consumer, std::string&) {
+    if (consumer != 3072) return false;
+    ++calls;
+    for (auto& position : mesh.positions) position.z += 1;
+    return true;
+  };
+  MaterializedInstancePlan frame;
+  const bool replayed = validateOperationPlan(*culled, {}, &frame, error, nullptr, &runtime);
+  if (!replayed) std::fprintf(stderr, "set position cull replay: %s\n", error.c_str());
+  check(replayed && calls == 1 && frame.geometries.count(3073) == 1,
+        "the replay displaces the Set Position output once");
+  if (frame.geometries.count(3073) != 1) return;
+  const auto& evaluated = frame.geometries.at(3073);
+  const auto& rest = std::get<GeometryData>(culled->data);
+  check(evaluated.vertexIds == rest.vertexIds && evaluated.indices == rest.indices,
+        "the displaced cull keeps the admitted layout");
+  bool lifted = evaluated.positions.size() == rest.positions.size();
+  for (std::size_t i = 0; lifted && i < rest.positions.size(); ++i)
+    lifted = nearly(evaluated.positions[i].z, rest.positions[i].z + 1);
+  check(lifted, "the cull keeps the displaced positions");
+  RuntimeFieldEvaluation missing;
+  MaterializedInstancePlan refused;
+  check(!validateOperationPlan(*culled, {}, &refused, error, nullptr, &missing),
+        "a replay without the frame owner refuses the displacement");
+}
+
+// In a composed scene, a Set Position displacement that a transform follows lands on the
+// transformed terminal mesh, as the image path's adapter adds it after the replay.
+void composedSetPositionDisplacementFollowsLaterTransform() {
+  std::string error;
+  auto moved = lowerTransformGeometry(cube(3081), 3082, Transform{}, meshContract(), error);
+  check(moved.has_value(), "the Set Position stand-in lowers for the order check");
+  if (!moved) return;
+  spectrum::Binding binding;
+  binding.target = spectrum::Target::vertexDisplacement;
+  binding.fieldStableId = 3089; binding.sourceGeometryStableId = 3081;
+  binding.consumerGeometryStableId = 3082; binding.direction = {0, 0, 1};
+  binding.coordinates.assign(std::get<GeometryData>(moved->data).positions.size(), 0.0f);
+  auto bound = *moved;
+  bound.spectrumFields = {binding};
+  Transform doubled;
+  doubled.scale = {2, 2, 2};
+  auto scaled = lowerTransformGeometry(bound, 3083, doubled, meshContract(), error);
+  if (!scaled) std::fprintf(stderr, "order transform: %s\n", error.c_str());
+  check(scaled.has_value(), "a transform after the Set Position displacement lowers");
+  if (!scaled) return;
+  check(!displacedInReplay(*scaled, 3082), "a transform keeps the displacement after the replay");
+  const auto& rest = std::get<GeometryData>(scaled->data);
+  std::size_t calls = 0;
+  bool sawTerminal = false;
+  RuntimeFieldEvaluation runtime;
+  runtime.displaceAdapters = true;
+  runtime.displaceConsumer = [&](GeometryData& mesh, StableId consumer, std::string&) {
+    if (consumer != 3082) return false;
+    ++calls;
+    sawTerminal = mesh.positions.size() == rest.positions.size();
+    for (std::size_t i = 0; sawTerminal && i < rest.positions.size(); ++i)
+      sawTerminal = nearlyVec(mesh.positions[i], rest.positions[i].x, rest.positions[i].y, rest.positions[i].z);
+    for (auto& position : mesh.positions) position.z += 1;
+    return true;
+  };
+  MaterializedInstancePlan frame;
+  const bool replayed = validateOperationPlan(*scaled, {}, &frame, error, nullptr, &runtime);
+  if (!replayed) std::fprintf(stderr, "order replay: %s\n", error.c_str());
+  check(replayed && calls == 1, "the composed replay displaces once");
+  check(sawTerminal, "the displacement sees the transformed terminal mesh");
+  if (frame.geometries.count(3083) != 1) return;
+  const auto& evaluated = frame.geometries.at(3083);
+  bool lifted = evaluated.positions.size() == rest.positions.size();
+  for (std::size_t i = 0; lifted && i < rest.positions.size(); ++i)
+    lifted = nearly(evaluated.positions[i].z, rest.positions[i].z + 1);
+  check(lifted, "the lift is not scaled by the later transform");
+}
+
+// Join keeps the Audio Deformer of either input and joins each frame's deformed meshes.
+void deformedCubeJoinFollowsEachFrame() {
+  std::string error;
+  auto deformed = lowerAudioDeformer(cube(3061), 3062, spectrum::Binding{}, meshContract(), error);
+  const auto plain = cube(3063);
+  auto joined = deformed ? lowerJoinGeometry(*deformed, plain, 3064, meshContract(), error) : std::nullopt;
+  if (!joined) std::fprintf(stderr, "deformed join: %s\n", error.c_str());
+  check(joined.has_value(), "a join of deformed and static geometry lowers");
+  if (!joined) return;
+  check(joined->spectrumFields.size() == 1, "the join keeps the deformer binding");
+  const std::function<bool(GeometryData&, const spectrum::Binding&, std::string&)> lift =
+      [](GeometryData& mesh, const spectrum::Binding&, std::string&) {
+        for (auto& position : mesh.positions) position.z += 1;
+        return true;
+      };
+  MaterializedInstancePlan frame;
+  check(validateOperationPlan(*joined, {}, &frame, error, nullptr, nullptr, lift)
+            && frame.geometries.count(3064) == 1,
+        "the deformed join replays with a frame deformer");
+  if (frame.geometries.count(3064) != 1) return;
+  const auto& evaluated = frame.geometries.at(3064);
+  const auto& rest = std::get<GeometryData>(joined->data);
+  check(evaluated.indices == rest.indices && evaluated.positions.size() == rest.positions.size(),
+        "each frame keeps the joined layout");
+  std::size_t lifted = 0;
+  for (std::size_t i = 0; i < rest.positions.size() && i < evaluated.positions.size(); ++i)
+    if (nearly(evaluated.positions[i].z, rest.positions[i].z + 1)) ++lifted;
+  check(lifted == 24, "only the deformed input's 24 vertices move");
+  check(roundTrips(*joined, meshContract()), "the deformed join admits and roundtrips");
+}
+
 // Points from the cube's 24 vertices carry identities 1 to 24 in vertex order. Keep-selected
 // with stride 2 keeps the even indices 0, 2, ..., 22, which have identities 1, 3, ..., 23.
 void cubePointCullKeepsEvenIdentitiesAndReplays() {
@@ -260,6 +480,12 @@ int main() {
   transformedCubePositionFieldMatchesStoredVertices();
   cubeMeshCullKeepsSecondTrianglesAndReplays();
   cubePointCullKeepsEvenIdentitiesAndReplays();
+  deformedCubeCullFollowsEachFrame();
+  deformedCubeBoundsFollowEachFrame();
+  deformedCubeJoinFollowsEachFrame();
+  deformedCubeDensityFollowsEachFrame();
+  setPositionDisplacementCullFollowsEachFrame();
+  composedSetPositionDisplacementFollowsLaterTransform();
   cubeInstanceCullKeepsStableIdentitiesAndReplays();
   if (failures != 0) {
     std::fprintf(stderr, "%d geometry field and cull check(s) failed\n", failures);

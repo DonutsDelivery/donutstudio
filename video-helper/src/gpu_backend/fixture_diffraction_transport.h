@@ -3,6 +3,7 @@
 #include "fixture_opaque_visibility.h"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -82,9 +83,27 @@ inline const char* diagnosticReasonName(std::uint32_t reason)
         case 10: return "resolve output nonfinite";
         case 11: return "pre-resolve accumulation nonfinite";
         case 12: return "receiver output nonfinite";
+        case 13: return "reflection output nonfinite";
+        case 14: return "rough resolve output nonfinite";
+        case 15: return "composite output nonfinite";
+        case 16: return "grating base nonfinite";
+        case 17: return "grating output nonfinite";
+        case 18: return "grating output past half range";
         default: break;
     }
     return "unattributed";
+}
+// A half-float target keeps no NaN payload bits, so the shader's probes also write
+// minus the reason in alpha (fixtureProbeColor in backend_opengl.cpp). A pixel whose
+// NaN lost its payload is named by that alpha when it is a whole negative number
+// naming a listed reason; otherwise the payload bits name it as before.
+inline std::uint32_t pixelDiagnosticReason(float value, float alpha) noexcept
+{
+    const auto reason=diagnosticReason(value);
+    if (reason>=1u && reason<=18u) return reason;
+    if (std::isfinite(alpha) && alpha<=-1.0f && alpha>=-18.0f && std::floor(alpha)==alpha)
+        return static_cast<std::uint32_t>(-alpha);
+    return reason;
 }
 inline bool validateWholeOutput(const std::vector<float>& rgba,std::uint32_t width,
     std::uint32_t height,std::string& error,std::size_t* firstBadOut=nullptr)
@@ -92,7 +111,7 @@ inline bool validateWholeOutput(const std::vector<float>& rgba,std::uint32_t wid
     if (!nativeFixtureDimensionsWithinBounds(width,height) || rgba.size()!=std::uint64_t(width)*height*4)
     {error="Native diffraction whole-output readback size is incomplete: got "+std::to_string(rgba.size())
         +" floats for "+std::to_string(width)+"x"+std::to_string(height);return false;}
-    std::array<std::uint64_t,13> reasons{};
+    std::array<std::uint64_t,19> reasons{};
     std::uint64_t infinite=0,overrange=0,unlisted=0;
     float maximumMagnitude=0.0f;
     std::uint32_t firstBadBits=0;
@@ -111,7 +130,7 @@ inline bool validateWholeOutput(const std::vector<float>& rgba,std::uint32_t wid
           minY=std::min(minY,by); maxY=std::max(maxY,by); }
         if (std::isnan(value))
         {
-            const auto reason=diagnosticReason(value);
+            const auto reason=pixelDiagnosticReason(value,rgba[(pixel-1)/4*4+3]);
             if (reason<reasons.size()) ++reasons[reason];
             else ++unlisted;
         }
@@ -441,10 +460,17 @@ inline bool buildFrame(const Prepared& prepared,const std::vector<opaquevisibili
     {error="Native diffraction sample count "+std::to_string(receivers+gratings)+" has no exact float form";return false;}
     candidate.sampleControl={float(receivers),float(gratings),float(kSampleStride),float(kTableVersion)};
     if (!validateQueries(prepared,candidate,error)) return false;
+    // Each sample's view of the source, traced once here: 1 lit, 0 shadowed, -1 a query
+    // that could not resolve. Realtime's gathers read it in place of a shadow ray per
+    // gathered row; Raster and Path Trace keep their own rays.
+    const Point light{candidate.sourceDirectionTrace[0],candidate.sourceDirectionTrace[1],candidate.sourceDirectionTrace[2]};
     for (const auto& s:candidate.samples)
     {
+        const auto source=opaquevisibility::closestHitCpu(prepared.query,candidate.query,s.position,light,
+            candidate.rayMinimumDistance,candidate.sourceDirectionTrace[3]);
         candidate.texels.push_back({s.position[0],s.position[1],s.position[2],s.area});
-        candidate.texels.push_back({s.normal[0],s.normal[1],s.normal[2],0});
+        candidate.texels.push_back({s.normal[0],s.normal[1],s.normal[2],
+            source.status==0 ? 1.0f : source.status==1 ? 0.0f : -1.0f});
         candidate.texels.push_back({float(s.object&65535),float(s.object>>16),float(s.material&65535),float(s.material>>16)});
         candidate.texels.push_back({float(s.instance),float(s.triangle),s.grating?1.0f:0.0f,s.reflectance?float(s.reflectance->version):0.0f});
         for (unsigned half=0;half<2;++half)

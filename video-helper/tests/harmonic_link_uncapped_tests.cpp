@@ -65,13 +65,13 @@ visualharmonicgeometry::Mapping mapping()
     return value;
 }
 
-// The packed rows stop at 128 notes and 256 links. The scene mesh reads the score.
+// The packed rows hold all 300 notes and 500 links. The scene mesh reads the score.
 void scorePastTheTextures()
 {
     const auto frame = frameFor (300, 500);
     check (frame != nullptr, "the long score packs");
     if (frame == nullptr) return;
-    check (frame->noteRows() == arbitblockc::kMaxNotes, "the frame's note rows stop at the texture size");
+    check (frame->noteRows() >= 300 && frame->linkRows() == 500, "the frame holds every note and link");
     std::string error;
     const auto value = videohelper::harmonicgeometry::lower (mapping(), frame, error, nullptr, false);
     check (value.has_value(), "the scene route lowers the long score");

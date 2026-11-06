@@ -37,6 +37,11 @@ assert 'object->setProperty("pathTraceStats"' in inline, "the inline reply forwa
 reply_header = (root / "src/path_trace_stats_reply.h").read_text()
 assert '"filmWidth", stats->filmWidth' in reply_header and '"filmHeight", stats->filmHeight' in reply_header
 assert '"temporalDenoise", stats->temporalDenoise' in reply_header, "the reply says whether the image blends history"
+# A GPU device that failed under Auto stays named after the CPU takes over: the
+# header notice reads fallbackReason, set only on that fallback.
+assert '"fallbackReason", stats->fallbackReason' in reply_header, "the reply names a failed GPU device"
+engine = (root / "src/pathtrace_fixture_engine.cpp").read_text()
+assert "stats_.fallbackReason = fellBackToCpu_ ? deviceReason_ : nullptr;" in engine, "only the device fallback sets fallbackReason"
 renderer = (root / "src/fixture_scene_renderer.cpp").read_text()
 assert "traced.filmWidth = dimensions.width;" in renderer, "the film size comes from the rendered dimensions"
 
@@ -49,8 +54,8 @@ assert scene_row.index("Path Trace film on") < scene_row.index("Imported scene r
 assert "Image: Path Trace film, presented by %BACKEND%, display fallbacks %COUNT%" in hud, "the backend row names the film as the image source"
 assert '"Display path: "' in hud and '"Display GPU: "' in hud, "the presentation rows do not read as the tracer"
 # The viewport header says which of these the tracer is doing, with its target.
-for row in ("Path Trace converging: %SAMPLES% of %TARGET%", "Path Trace settled: %SAMPLES% of %TARGET%",
-            "Path Trace playing: %SAMPLES% of %TARGET%", "Path Trace export: %SAMPLES% of %TARGET%"):
+for row in ("Path Trace %MODE% converging: %SAMPLES% of %TARGET%", "Path Trace %MODE% settled: %SAMPLES% of %TARGET%",
+            "Path Trace %MODE% playing: %SAMPLES% of %TARGET%", "Path Trace %MODE% export: %SAMPLES% of %TARGET%"):
     assert row in scene_row, "the header row names the activity and the target: " + row
 assert scene_row.count("%DENOISER%") >= 4, "every header row names the denoiser that ran"
 # The viewport tells the tracer when the transport plays, so a repeated time stays

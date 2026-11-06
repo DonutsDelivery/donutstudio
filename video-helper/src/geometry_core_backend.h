@@ -1,9 +1,12 @@
 #pragma once
 
 #include "geometry_core_admission.h"
+#include "geometry_core_motion.h"
 #include "gpu_backend/backend.h"
 #include <functional>
 #include <limits>
+#include <map>
+#include <string>
 
 namespace videorender { struct ParticleHistorySource; struct WaterCoupledFrame; class ParticlePointsBodyRequest; class ParticlePointsBodyFrame; }
 
@@ -33,6 +36,8 @@ struct NativeGeometryExecution final {
   std::vector<videowire::geometry::StableId> drawnInstanceIds;
   arbitgpu::NativeFixtureSceneStats stats {};
   std::uint64_t receipt = 0;
+  // The sample a Motion draw rendered, the next frame's predecessor.
+  std::optional<GeometryMotionRecord> motion;
 };
 
 struct SpectrumEvaluation final {
@@ -49,6 +54,8 @@ struct SpectrumEvaluation final {
   videowire::geometry::spectrum::ScalarsAt scalarFeaturesAt;
   videowire::geometry::spectrum::ScalarsAt historyScalarFeaturesAt;
   videowire::geometry::spectrum::SourceScalarsAt sourceScalarFeaturesAt;
+  // The project tempo map, for an Audio Effector delayed in beats.
+  videowire::geometry::spectrum::BeatDelay beatDelay;
   std::vector<videowire::geometry::spectrum::Follower> followers;
 };
 
@@ -66,7 +73,10 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
                       const videorender::WaterCoupledFrame* coupledWater = nullptr,
                       const std::shared_ptr<const videorender::ParticlePointsBodyRequest>& pointsBodyRequest = {},
                       const PointsBodyEvaluator& pointsBodyEvaluator = {},
-                      arbitgpu::NativeFixturePrepareUse prepareUse = arbitgpu::NativeFixturePrepareUse::Blocking);
+                      arbitgpu::NativeFixturePrepareUse prepareUse = arbitgpu::NativeFixturePrepareUse::Blocking,
+                      const std::map<std::string, double>* runtimeParameters = nullptr,
+                      const visualdeformation::RationalFrameTime* motionFrame = nullptr,
+                      const GeometryMotionRecord* motionPredecessor = nullptr);
 // Counts the Preview prepares that returned pending on this thread. A pending
 // result carries no value and no error, so a caller compares two readings of
 // this count to tell a deferral from a failure.

@@ -6,7 +6,9 @@
 // context identity and generation, and sampled single-sample views.
 //
 // The OpenGL build implements this in cpu_scene_frame_opengl.cpp with the
-// calling thread's current context. Other builds link
+// calling thread's current context. The Metal build implements it in
+// cpu_scene_frame_metal.mm on the sokol Metal device, with top-first rows and
+// BGRA8 SDR colour as Metal frames have. Headless builds link
 // cpu_scene_frame_stub.cpp, which refuses.
 //
 // Frame layers finish the image on the GPU. For each layer a fragment pass samples
@@ -16,6 +18,7 @@
 
 #include "backend.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -42,9 +45,30 @@ struct CpuSceneImage final
     const std::vector<float>* depth = nullptr;         // width * height, bottom first
     std::vector<CpuSceneFrameLayer> frameLayers;
     float background[3] { 0.0f, 0.0f, 0.0f };          // shown through a frame's zero alpha, in color's encoding
+    // Render outputs in the raster's raw pass formats, tight rows, bottom first.
+    // All six or none: without them the frame has Color and Depth alone.
+    const std::vector<std::uint16_t>* normal = nullptr;      // RGBA16F half bits
+    const std::vector<std::uint16_t>* emission = nullptr;    // RGBA16F half bits
+    const std::vector<std::uint8_t>* mask = nullptr;         // R8
+    const std::vector<std::uint32_t>* materialId = nullptr;  // R32UI
+    const std::vector<std::uint32_t>* objectId = nullptr;    // R32UI
+    const std::vector<std::uint16_t>* motion = nullptr;      // RG16F half bits, pixels, Y up
+    // What the Image shows, run on the outputs by the raster's own resolve
+    // shader: a view of one output, or the pass composite program. Color with
+    // an empty program keeps the traced colour and runs nothing.
+    renderpassoutput::Output imageOutput = renderpassoutput::Output::Color;
+    renderpasscomposite::Program passProgram {};
+    // The resolve target's clear, where the mask is empty: zero, or a pass
+    // composite inspection's value (renderpasscomposite::inspectionClear).
+    std::array<float, 4> resolveClear { 0.0f, 0.0f, 0.0f, 0.0f };
 };
 
-// backend names the fixture backend the frame must match ("opengl").
+// The raster's pass resolve shader (backend_opengl.cpp): it turns Color, Depth
+// and the raw passes into an Image view or a pass composite.
+const char* fixturePassResolveVertexSource() noexcept;
+std::string fixturePassResolveFragmentSource();
+
+// backend names the fixture backend the frame must match ("opengl" or "metal").
 std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
     const std::string& backend, const CpuSceneImage& image, std::string& error);
 

@@ -53,12 +53,24 @@ expected_mentions = {
     "video-helper/src/imported_scene_visual_plan_execution.h": (2, 2),
     "video-helper/src/imported_scene_payload_execution.h": (4, 3),
     "video-helper/src/imported_scene_payload_execution.cpp": (4, 1),
-    # The renderer declares SceneEngineMode and carries it on the selection and the
-    # Path Trace draw. It never names the node's renderMode.
-    "video-helper/src/fixture_scene_renderer.h": (5, 0),
-    # S2 readers: the Preview budget scope and the Path Trace sample seeding.
-    "video-helper/src/fixture_scene_renderer.cpp": (1, 0),
-    "video-helper/src/pathtrace_fixture_engine.cpp": (1, 0),
+    # The renderer declares SceneEngineMode and carries it on the selection, the
+    # Path Trace draw and the stats it reports (enum plus four fields, each naming
+    # the type twice). It never names the node's renderMode.
+    "video-helper/src/fixture_scene_renderer.h": (9, 0),
+    # S2 readers: the Preview budget scope and the Path Trace sample seeding. The
+    # renderer also reads the mode for Realtime's reflection pass (Fast drops it,
+    # ab89cd4c36), and the Path Trace engine reads it for the preview sample
+    # target, the Fast cost ladder and the export sample count (5bda16a43e).
+    "video-helper/src/fixture_scene_renderer.cpp": (2, 0),
+    "video-helper/src/pathtrace_fixture_engine.cpp": (3, 0),
+    # The probe and viewport reply name the mode of the drawn frame (a8b3b18dd3,
+    # ab89cd4c36). It only reports; it never branches.
+    "video-helper/src/path_trace_stats_reply.h": (2, 0),
+    # The Render properties panel lists the node's renderMode row (ed57c5f791).
+    "plugin/Source/VideoEditor/Render3DPropertiesModel.h": (1, 1),
+    # The Path Trace engine's own EngineRenderMode accessor (5cca289464) shares
+    # the identifier but is the engine's playback/settle mode, not the node's.
+    "video-helper/src/pathtrace/engine.h": (1, 1),
 }
 # The UI's own render-mode setting (SettingsMenu, set_render_mode) is unrelated
 # and never matches: these patterns need the exact lowercase identifier, the
@@ -126,7 +138,9 @@ s2_checks = {
         "return refuseLimit(\"OpenGL caustic deposition exceeds native GL limits: \"+failure);",
         "return refuseLimit(\"OpenGL caustic splat storage exceeds native GL limits: \"+failure);",
         # The Preview wait and readback rules stay keyed on previewUse alone.
-        "const bool bandFinish = smoothglass::cameraWalkBudget(runtimeInputs.previewUse, width, height).bandFinish;",
+        # A test run also finishes every band so it can yield after each one (231b51c672).
+        "const bool bandFinish = smoothglass::cameraWalkBudget(runtimeInputs.previewUse, width, height).bandFinish\n"
+        "                || testpacing::enabled();",
         "if (resources->smoothGlass.enabled && !roughGlassFrame && !runtimeInputs.previewUse) {",
         "if (!authoredDiffraction || runtimeInputs.previewUse) return true;",
     ],
@@ -155,8 +169,13 @@ for forbidden in ("glFinish", "readRawPass", "ClientWaitSync", "MapBufferRange")
 # Metal draws Preview and export through one path today, so it has no Preview
 # reduction to gate. A Metal Preview budget would have to read the scope too.
 metal = (root / "video-helper/src/gpu_backend/backend_sokol.mm").read_text(encoding="utf-8")
+# Metal reads previewUse only to pick Preview-only solid viewport shading and
+# X-ray (3d695c76c5), a display choice that reduces no budget, so those two
+# calls are set aside before the search.
+metal_budget_text = re.sub(
+    r"fixtureviewportsolid::(?:solid|xray)Applies\s*\(\s*runtimeInputs\.previewUse", "", metal)
 for reduction in ("previewUse", "GLASS_PREVIEW_VISITS", "kPreviewCameraVisits", "kPreviewCausticEntrySubdivisions"):
-    if reduction in metal and "previewbudget::" not in metal:
+    if reduction in metal_budget_text and "previewbudget::" not in metal:
         missing.append(f"backend_sokol.mm: Metal Preview reduction {reduction} is not gated on the mode")
 
 # The helper's engine selection stores the mode and nothing else reads it.

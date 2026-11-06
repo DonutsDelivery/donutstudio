@@ -63,13 +63,23 @@
 #include "gpu_backend/cpu_scene_frame.h"
 #include "pathtrace/devices/auto_device_latch.h"
 #include "pathtrace/devices/device_registry.h"
-#if defined(ARBIT_HAVE_OPTIX_KERNEL)
+#include "pathtrace/devices/device_compute_host.h"
+#if defined(ARBIT_HAVE_OPTIX)
 #include "pathtrace/devices/device_optix_host.h"
 #endif
+#if defined(ARBIT_HAVE_METAL_PATHTRACE)
+#include "pathtrace/devices/device_metal_host.h"
+#endif
 #include "pathtrace/engine.h"
+#include "pathtrace/light_paths.h"
 #include "pathtrace/environment_resident.h"
 #include "pathtrace/thread_pool.h"
+#include "pathtrace_denoiser.h"
+#include "pathtrace_oidn.h"
 #include "pathtrace_preview_denoise.h"
+#include "render_input_generation.h"
+#include "render_mode_policy.h"
+#include "vertex_program_motion.h"
 
 #include <algorithm>
 #include <cmath>
@@ -78,7 +88,9 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -89,6 +101,7 @@ namespace videorender::fixture3d
 namespace
 {
 namespace pt = videohelper::pathtrace;
+static_assert (kUnlimitedVolumeBounces == pt::kUnlimitedBounces);
 using HarmonicMIDI::grid::SceneCameraRecord;
 using HarmonicMIDI::grid::SceneMaterialRecord;
 using HarmonicMIDI::grid::SceneTransform3D;
@@ -98,23 +111,55 @@ using Program = arbitgpu::NativeFixtureSurfaceMaterialProgram;
 // the light left (Beer-Lambert), since the material IR has no distance.
 constexpr float kTintDistance = 1.0f;
 
-// The machine's device setting, read once. ARBIT_PATHTRACE_DEVICE carries it
-// until Preferences has the row. The log names every device that was passed over.
-const pt::device::DeviceSelection& pathTraceDeviceSelection()
+// The machine's device setting (Preferences > System, passed to the helper at launch
+// and on each change), and the selection it makes. ARBIT_PATHTRACE_DEVICE overrides
+// the setting for tests. Each change makes a new generation, and engines drop their
+// device pass and fallback when they see one. The log names every device passed over.
+struct DeviceChoice
 {
-    static const pt::device::DeviceSelection selection = []
-    {
-        auto chosen = pt::device::selectDevice (std::getenv ("ARBIT_PATHTRACE_DEVICE"), pt::device::productDeviceEnvironment());
-        if (chosen.ok)
-            std::fprintf (stderr, "[pt] device=%s requested=%s\n", pt::device::deviceName (chosen.device), chosen.requested);
-        else
-            std::fprintf (stderr, "[pt] %s\n", chosen.error.c_str());
-        for (const auto& status : chosen.devices)
-            if (! status.loadable)
-                std::fprintf (stderr, "[pt] %s unavailable: %s\n", pt::device::deviceName (status.kind), status.problem.c_str());
-        return chosen;
-    }();
-    return selection;
+    pt::device::DeviceSelection selection;
+    std::uint64_t generation = 0;
+};
+
+struct DeviceSetting
+{
+    std::mutex lock;
+    std::string preference = "auto";
+    std::shared_ptr<const DeviceChoice> choice;
+    std::uint64_t generations = 0;
+};
+
+DeviceSetting& deviceSetting()
+{
+    static auto* setting = new DeviceSetting();
+    return *setting;
+}
+
+std::shared_ptr<const DeviceChoice> chooseDevice (const std::string& preference, std::uint64_t generation)
+{
+    auto choice = std::make_shared<DeviceChoice>();
+    choice->generation = generation;
+    choice->selection = pt::device::selectDevice (
+        pt::device::effectiveDeviceSetting (std::getenv ("ARBIT_PATHTRACE_DEVICE"), preference.c_str()),
+        pt::device::productDeviceEnvironment());
+    const auto& chosen = choice->selection;
+    if (chosen.ok)
+        std::fprintf (stderr, "[pt] device=%s requested=%s\n", pt::device::deviceName (chosen.device), chosen.requested);
+    else
+        std::fprintf (stderr, "[pt] %s\n", chosen.error.c_str());
+    for (const auto& status : chosen.devices)
+        if (! status.loadable)
+            std::fprintf (stderr, "[pt] %s unavailable: %s\n", pt::device::deviceName (status.kind), status.problem.c_str());
+    return choice;
+}
+
+std::shared_ptr<const DeviceChoice> pathTraceDeviceSelection()
+{
+    auto& setting = deviceSetting();
+    const std::lock_guard<std::mutex> lock (setting.lock);
+    if (setting.choice == nullptr)
+        setting.choice = chooseDevice (setting.preference, ++setting.generations);
+    return setting.choice;
 }
 
 bool fail (std::string& error, std::string message)
@@ -127,18 +172,21 @@ bool fail (std::string& error, std::string message)
 namespace pathtracefixture
 {
 // Refuses inputs whose raster passes the tracer does not have, instead of
-// rendering a different picture.
+// rendering a different picture. Every Image view, data export and pass
+// composite reads the engine's render outputs (pathtrace/render_outputs.h).
 bool admitInputs (const arbitgpu::NativeFixtureSceneRuntimeInputs& in, std::string& error)
 {
     if (! arbitgpu::validFixtureRuntimeInputs (in))
         return fail (error, "Path Trace runtime inputs are invalid");
-    if (in.imageOutput != renderpassoutput::Output::Color || in.rawExportMask != 0)
-        return fail (error, "Path Trace renders the Color image only; choose Raster for other outputs and data exports");
-    if (in.passComposite || in.passProgram)
-        return fail (error, "Path Trace does not run render pass composites yet; choose Raster");
     if (in.compositionFrame || in.localSceneFrame || (in.canonicalBlockCFrame && ! in.noteInstanceMapping))
         return fail (error, "Path Trace does not render deformed or composed animation frames yet; choose Raster");
     return true;
+}
+
+bool readsRenderOutputs (const arbitgpu::NativeFixtureSceneRuntimeInputs& in) noexcept
+{
+    return in.imageOutput != renderpassoutput::Output::Color || in.rawExportMask != 0 || in.passComposite
+        || in.passProgram;
 }
 
 bool noteInstancedScene (const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
@@ -234,6 +282,20 @@ bool hasVertexProgram (const Program& root) noexcept
                         [] (const auto& program) { return program && program->vertexProgram; });
 }
 
+// The pre-BVH displacement hook: each object's vertex program moves a copy of the
+// scene on the host, so the CPU and OptiX devices trace the same triangles.
+bool displacedScene (const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& source, const Program& root,
+                     const arbitgpu::NativeFixtureSceneRuntimeInputs& in,
+                     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& out, std::string& error)
+{
+    auto displaced = std::make_shared<HarmonicMIDI::grid::Visual3DScene> (*source);
+    if (! videohelper::vertexprogramcpu::displaceScene (*displaced, root, videohelper::vertexprogramcpu::currentInputs (in),
+                                                        error))
+        return false;
+    out = std::move (displaced);
+    return true;
+}
+
 // One layer per distinct frame. A frame the draw carries that no object samples,
 // or a frame-tinted program without a frame, would lose the imagery, so both stop the draw.
 bool bindFrameLayers (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup,
@@ -263,6 +325,63 @@ bool bindFrameLayers (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup,
     return true;
 }
 
+// The parent chain of object index without the object's own local transform.
+pt::Mat4 parentWorldMatrix (const HarmonicMIDI::grid::Visual3DScene& scene, std::size_t index)
+{
+    const auto parent = scene.objects[index].parent;
+    for (std::size_t slot = 0; parent.isValid() && slot < scene.objectCount; ++slot)
+        if (scene.objects[slot].id == parent)
+            return pt::objectWorldMatrix (scene, slot);
+    return {};
+}
+
+// Motion blur: the shutter, and the scene one frame earlier, as the raster's
+// Motion pass reads it (sceneMotionUniforms). The camera one frame earlier is
+// view.previousCamera, which buildSetup set for the Motion output too. Without
+// an earlier frame everything holds still and the shutter traces the frame as it is.
+void bindShutter (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup)
+{
+    setup.shutterOpen = 0.0f;
+    setup.shutterClose = 0.0f;
+    setup.previousObjectWorlds.clear();
+    setup.previousInstances.clear();
+    setup.previousPositions = nullptr;
+    if (! draw.motionBlur.active())
+        return;
+    setup.shutterOpen = draw.motionBlur.open;
+    setup.shutterClose = draw.motionBlur.close;
+    const auto& scene = *draw.snapshot;
+    const auto& in = *draw.inputs;
+    const auto previous = arbitgpu::priorMotionSample (in);
+
+    SceneTransform3D runtime {};
+    runtime.translation = { previous.objectTranslationOffset[0], previous.objectTranslationOffset[1],
+                            previous.objectTranslationOffset[2] };
+    runtime = arbitgpu::applyRuntimeObjectTransform (runtime, previous.objectRotationDegrees, previous.objectScale);
+    const pt::Mat4 runtimeMatrix = pt::transformMatrix (runtime);
+    setup.previousObjectWorlds.reserve (scene.objectCount);
+    for (std::size_t index = 0; index < scene.objectCount; ++index)
+    {
+        const auto& object = scene.objects[index];
+        pt::Mat4 world;
+        if (arbitgpu::sceneObjectHasOwnPrior (scene, index))
+            world = parentWorldMatrix (scene, index) * pt::transformMatrix (scene.previousObjectTransforms[index]);
+        else
+            world.m = arbitgpu::nativeObjectWorldMatrix (previous.objectWorlds ? previous.objectWorlds.get()
+                                                                               : in.objectWorlds.get(),
+                                                         object, pt::objectWorldMatrix (scene, index).m);
+        if (arbitgpu::runtimeTargetsObject (in, object))
+            world = runtimeMatrix * world;
+        setup.previousObjectWorlds.push_back (world);
+    }
+    if (scene.previousObjectInstanceCount == scene.objectInstanceCount && scene.objectInstanceCount != 0)
+        setup.previousInstances.assign (scene.previousObjectInstances.begin(),
+                                        scene.previousObjectInstances.begin() + static_cast<std::ptrdiff_t> (scene.objectInstanceCount));
+    if (previous.scenePositions != nullptr && previous.scenePositions->size() <= scene.vertexCount
+        && arbitgpu::validSceneMotionPositions (previous.scenePositions))
+        setup.previousPositions = previous.scenePositions;
+}
+
 bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::EngineView& view,
                  std::vector<std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>>& frames,
                  std::string& error)
@@ -279,9 +398,16 @@ bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::E
     const SceneCameraRecord authored = in.cameraOverride ? *in.cameraOverride
         : in.animatedCamera ? *in.animatedCamera : *active;
     view.camera = arbitgpu::runtimeCameraRecord (authored, in.cameraTranslationOffset, in.cameraRotationDegrees,
-                                                 in.cameraVerticalFovDegrees);
+                                                 in.cameraVerticalFovDegrees, in.cameraLens);
+    // Focus on object: this frame's depth of the object sets the focus distance.
+    HarmonicMIDI::grid::resolveSceneCameraFocus (scene, view.camera);
     if (! arbitgpu::validFixtureCameraOverride (view.camera))
         return fail (error, "Path Trace camera is invalid");
+    // The prior camera for the Motion output and motion blur, as the raster's
+    // sceneMotionUniforms builds it.
+    view.previousCamera = arbitgpu::priorRuntimeCamera (in, authored, scene.previousCamera);
+    if (view.previousCamera && ! arbitgpu::validFixtureCameraOverride (*view.previousCamera))
+        view.previousCamera.reset();
     view.width = draw.dimensions.width;
     view.height = draw.dimensions.height;
     view.timeSeconds = in.timeSeconds;
@@ -306,6 +432,7 @@ bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::E
             world = runtimeMatrix * world;
         setup.objectWorlds.push_back (world);
     }
+    bindShutter (draw, setup);
 
     // Lights: the records the raster reads, overrides applied.
     if (! arbitgpu::validNativeImportedLightOverrideTargets (scene, in, error))
@@ -354,8 +481,6 @@ bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::E
     setup.objectMaterials.clear();
     if (draw.material != nullptr)
     {
-        if (hasVertexProgram (*draw.material))
-            return fail (error, "Path Trace does not run vertex programs yet; choose Raster");
         for (std::size_t index = 0; index < scene.objectCount; ++index)
         {
             const auto& object = scene.objects[index];
@@ -364,9 +489,13 @@ bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::E
             if (draw.diffractionField.has_value())
                 for (const auto& corner : *draw.diffractionField)
                     maskedFoil = maskedFoil || corner[3] < 1.0f;
-            if (draw.diffractionMaterial != nullptr && object.id == draw.diffractionObject && ! maskedFoil) continue;
+            const bool gratingObject = draw.diffractionMaterial != nullptr && object.id == draw.diffractionObject;
+            if (gratingObject && ! maskedFoil) continue;
             const auto* program = arbitgpu::nativeSurfaceForObject (draw.material.get(), object.id);
             if (program == nullptr) continue;
+            // The foil's own diffraction program is the grating above. Under its
+            // mask the object keeps its scene material, as the raster's litBase.
+            if (gratingObject && program->kind != arbitgpu::NativeFixtureMaterialKind::SurfacePbr) continue;
             const auto* record = HarmonicMIDI::grid::visual3d_detail::findById (scene.materials, scene.materialCount,
                                                                                 object.material);
             pt::ObjectMaterialOverride entry;
@@ -392,9 +521,24 @@ public:
 
     bool render (const SceneEngineDraw& draw, RenderedFrame& output, std::string& error) override try
     {
-        // A named device that does not load stops the frame by name. CPU and OptiX
-        // are the devices with a render path.
-        const auto& selection = pathTraceDeviceSelection();
+        const auto callStart = pt::PhaseClock::now();
+        // A named device that does not load stops the frame by name. CPU, OptiX, CUDA
+        // and HIP are the devices with a render path.
+        const auto deviceChoice = pathTraceDeviceSelection();
+        const auto& selection = deviceChoice->selection;
+        // A changed setting starts this engine over on the new device.
+        if (choice_ == nullptr || choice_->generation != deviceChoice->generation)
+        {
+            if (devicePassSet_ || fellBackToCpu_)
+            {
+                engine_.setDevicePass ({});
+                engine_.restartPreview();
+            }
+            devicePassSet_ = false;
+            fellBackToCpu_ = false;
+            deviceReason_ = nullptr;
+            choice_ = deviceChoice;
+        }
         if (! selection.ok)
             return fail (error, selection.error);
         // A failure another engine hit holds here too, so this engine compiles nothing.
@@ -417,17 +561,45 @@ public:
                 engine_.restartPreview();
             }
         }
-#if defined(ARBIT_HAVE_OPTIX_KERNEL)
-        if (selection.device == pt::device::DeviceKind::OptiX && ! devicePassSet_ && ! fellBackToCpu_)
+        if (! devicePassSet_ && ! fellBackToCpu_)
         {
-            engine_.setDevicePass (pt::device::makeOptixDevicePass ([this] { return engine_.sceneBuilds(); }),
-                                   [] { return pt::device::optixPipelineReady(); });
-            devicePassSet_ = true;
-        }
-        else
+#if defined(ARBIT_HAVE_OPTIX_KERNEL)
+            if (selection.device == pt::device::DeviceKind::OptiX)
+            {
+                engine_.setDevicePass (pt::device::makeOptixDevicePass ([this] { return engine_.sceneBuilds(); }),
+                                       [] { return pt::device::optixPipelineReady(); });
+                devicePassSet_ = true;
+            }
 #endif
-        if (selection.device != pt::device::DeviceKind::Cpu && selection.device != pt::device::DeviceKind::OptiX)
-            return fail (error, std::string ("Path Trace cannot launch ") + pt::device::deviceName (selection.device) + " yet");
+            if (selection.device == pt::device::DeviceKind::Cuda)
+            {
+                engine_.setDevicePass (pt::device::makeCudaDevicePass ([this] { return engine_.sceneBuilds(); }),
+                                       [] { return pt::device::cudaModuleReady(); });
+                devicePassSet_ = true;
+            }
+            else if (selection.device == pt::device::DeviceKind::Hip)
+            {
+                engine_.setDevicePass (pt::device::makeHipDevicePass ([this] { return engine_.sceneBuilds(); }),
+                                       [] { return pt::device::hipModuleReady(); });
+                devicePassSet_ = true;
+            }
+#if defined(ARBIT_HAVE_METAL_PATHTRACE)
+            else if (selection.device == pt::device::DeviceKind::Metal)
+            {
+                engine_.setDevicePass (pt::device::makeMetalDevicePass ([this] { return engine_.sceneBuilds(); }),
+                                       [] { return pt::device::metalPipelineReady(); });
+                devicePassSet_ = true;
+            }
+#endif
+            else if (selection.device == pt::device::DeviceKind::OneApi)
+            {
+                engine_.setDevicePass (pt::device::makeOneApiDevicePass ([this] { return engine_.sceneBuilds(); }),
+                                       [] { return pt::device::oneApiModuleReady(); });
+                devicePassSet_ = true;
+            }
+            if (selection.device != pt::device::DeviceKind::Cpu && ! devicePassSet_)
+                return fail (error, std::string ("Path Trace cannot launch ") + pt::device::deviceName (selection.device) + " in this build");
+        }
         if (! fellBackToCpu_ && deviceReason_ == nullptr)
             if (auto reason = pt::device::autoPassedOverReason (selection); ! reason.empty())
                 deviceReason_ = std::make_shared<const std::string> (std::move (reason));
@@ -452,9 +624,69 @@ public:
             }
             drawn.snapshot = noteScene_;
         }
+        // Fog from an imported scene's Environment Light replaces the scene's own.
+        // The copy is kept while the source and fog stay put, so accumulation holds.
+        if (draw.worldVolume && ! HarmonicMIDI::grid::sameSceneVolume (*draw.worldVolume, drawn.snapshot->worldVolume))
+        {
+            if (fogScene_ == nullptr || fogSceneSource_ != drawn.snapshot
+                || ! HarmonicMIDI::grid::sameSceneVolume (fogScene_->worldVolume, *draw.worldVolume))
+            {
+                auto fogged = std::make_shared<HarmonicMIDI::grid::Visual3DScene> (*drawn.snapshot);
+                fogged->worldVolume = *draw.worldVolume;
+                fogScene_ = std::move (fogged);
+                fogSceneSource_ = drawn.snapshot;
+            }
+            drawn.snapshot = fogScene_;
+        }
+        // Vertex programs displace the scene before the BVH. A program whose
+        // inputs did not change keeps the moved copy, and with it the accumulation.
+        std::shared_ptr<const std::vector<HarmonicMIDI::grid::SceneVec3>> displacedOpen;
+        if (draw.material != nullptr && hasVertexProgram (*draw.material))
+        {
+            // The shutter opens on the prior frame's displaced positions, so a
+            // program that moves its vertices over time blurs along the move.
+            if (draw.motionBlur.active())
+            {
+                const auto prior = videohelper::vertexprogramcpu::priorInputs (*draw.inputs);
+                const auto& positions = draw.inputs->previousMotion ? draw.inputs->previousMotion->scenePositions : nullptr;
+                if (displacedPrior_ == nullptr || displacedPriorSource_ != drawn.snapshot
+                    || displacedPriorProgram_ != draw.material || displacedPriorPositions_ != positions
+                    || displacedPriorTime_ != prior.timeSeconds || displacedPriorSpectrum_ != prior.spectrum
+                    || displacedPriorControls_ != prior.controls)
+                {
+                    if (! videohelper::vertexprogramcpu::priorDisplacedPositions (*drawn.snapshot, *draw.material, *draw.inputs,
+                                                                                  displacedPrior_, error))
+                        return false;
+                    displacedPriorSource_ = drawn.snapshot;
+                    displacedPriorProgram_ = draw.material;
+                    displacedPriorPositions_ = positions;
+                    displacedPriorTime_ = prior.timeSeconds;
+                    displacedPriorSpectrum_ = prior.spectrum;
+                    displacedPriorControls_ = prior.controls;
+                }
+                displacedOpen = displacedPrior_;
+            }
+            if (displacedScene_ == nullptr || displacedSource_ != drawn.snapshot || displacedProgram_ != draw.material
+                || displacedTime_ != draw.inputs->timeSeconds || displacedSpectrum_ != draw.inputs->vertexSpectrum
+                || displacedControls_ != draw.inputs->vertexControls)
+            {
+                if (! displacedScene (drawn.snapshot, *draw.material, *draw.inputs, displacedScene_, error))
+                    return false;
+                displacedSource_ = drawn.snapshot;
+                displacedProgram_ = draw.material;
+                displacedTime_ = draw.inputs->timeSeconds;
+                displacedSpectrum_ = draw.inputs->vertexSpectrum;
+                displacedControls_ = draw.inputs->vertexControls;
+            }
+            drawn.snapshot = displacedScene_;
+        }
         pt::EngineView view;
         if (! buildSetup (drawn, setup_, view, frames_, error))
             return false;
+        // bindShutter read the undisplaced prior positions; a vertex program's
+        // shutter opens on its own prior evaluation instead.
+        if (displacedOpen != nullptr)
+            setup_.previousPositions = std::move (displacedOpen);
         const auto color = draw.inputs->linearColor ? pt::EngineColor::LinearRgba16f : pt::EngineColor::DisplayRgba8;
         pt::EngineImage image;
         const bool preview = draw.use == RenderUse::Preview;
@@ -471,13 +703,29 @@ public:
             engine_.previewSeededLikeExport = accurate;
             engine_.maximumPreviewSamples = pt::previewSampleTarget (accurate, draw.previewSamples, draw.exportSamples);
             engine_.playbackActive = draw.transportPlaying;
+            engine_.watchInputs (draw.inputGeneration.has_value() ? &videohelper::renderinput::counter (draw.inputClip) : nullptr,
+                                 draw.inputGeneration.value_or (0));
         }
-        engine_.settings().maxDepth = draw.maxBounces;
+        // Render Mode Fast traces cheaper previews and exports (render_mode_policy.h);
+        // Accurate keeps the node's settings.
+        const bool fast = draw.mode == SceneEngineMode::Fast;
+        const bool fastPreview = preview && fast;
+        const std::uint32_t renderedExportSamples = exportSamples (fast, draw.exportSamples, draw.previewSamples);
+        const auto cost = pathTracePreviewCost (fast, draw.maxBounces, draw.maxVolumeBounces,
+                                                pt::kDefaultPlaybackSamples);
+        engine_.settings().maxDepth = cost.maxBounces;
+        engine_.settings().maxVolumeBounces = cost.maxVolumeBounces;
+        if (preview)
+            engine_.playbackSamples = cost.playbackSamples;
+        engine_.settings().volumesVisibleToCamera = draw.volumesVisibleToCamera;
+        pt::applyLightPaths (draw.lightPaths, engine_.settings());
         engine_.setDeviceSceneFallback (std::strcmp (selection.requested, "Auto") == 0);
         const auto renderOnDevice = [&] {
             return preview ? engine_.renderPreview (setup_, view, color, image, error)
-                           : engine_.renderExport (setup_, view, color, draw.exportSamples, image, error);
+                           : engine_.renderExport (setup_, view, color, renderedExportSamples, image, error);
         };
+        // Everything above lowered the draw to the tracer's setup; the engine adds its own lowering.
+        const double fixtureLowerMs = pt::millisecondsSince (callStart);
         bool rendered = renderOnDevice();
         if (rendered && image.pending)
         {
@@ -501,7 +749,7 @@ public:
             std::fprintf (stderr, "[pt] device=CPU requested=Auto: %s\n", error.c_str());
             engine_.setDevicePass ({});
             fellBackToCpu_ = true;
-            deviceReason_ = std::make_shared<const std::string> (pt::device::deviceFailureReason (error, pt::device::deviceLost()));
+            deviceReason_ = std::make_shared<const std::string> (pt::device::deviceFailureReason (error, pt::device::deviceLost(), selection.device));
             pt::device::autoDeviceLatch().fail (deviceReason_);
             engine_.restartPreview();
             image = {};
@@ -518,6 +766,12 @@ public:
                 sceneReason_ = std::make_shared<const std::string> (image.stats.deviceSkipped);
         }
         noteStats (draw, image);
+        // A capped preview that traced nothing keeps the phases of the call that last traced.
+        const bool timedThisCall = image.traced || image.restarted;
+        const bool restartedThisCall = image.restarted;
+        const bool tracedThisCall = image.traced;
+        if (timedThisCall)
+            stats_.phases.add (pt::FramePhase::SceneLower, fixtureLowerMs);
         // Capped preview: nothing new to resolve, so upload the last image again.
         // A fresh frame per call keeps the raster's one-frame-per-render contract.
         const bool resolvedNewImage = ! image.unchanged;
@@ -526,41 +780,87 @@ public:
         else if (last_.width != view.width || last_.height != view.height || last_.color != color)
             return fail (error, "Path Trace lost its resolved preview image");
         // The denoiser reads last_ and writes denoised_, so accumulation never
-        // sees a filtered image and a switched-off frame uploads last_ untouched.
-        if (! draw.denoise)
+        // sees a denoised image and a switched-off frame uploads last_ untouched.
+        const auto choice = draw.denoise ? draw.denoiser : pathtracedenoise::DenoiserChoice::Off;
+        if (choice == pathtracedenoise::DenoiserChoice::Off)
         {
             denoised_.clear();
             denoisedLayers_.clear();
+            reportDenoiser (pathtracedenoise::Denoiser::None, "none", {});
         }
-        else if ((resolvedNewImage || denoised_.empty()) && ! denoiseLastImage (error))
-            return false;
-        reportDenoiser (draw.denoise ? pathtracedenoise::kBuildDenoiser : pathtracedenoise::Denoiser::None);
-        stats_.denoiser = pathtracedenoise::denoiserName (denoiserRan_);
+        else
+        {
+            const auto denoiseStart = pt::PhaseClock::now();
+            // A Fast Preview still converging denoises at 1, 2, 4, 8... samples
+            // per pixel (render_mode_policy.h); a new denoiser choice always reruns.
+            const bool converging = preview && last_.mode == pt::EngineRenderMode::Converging
+                                 && engine_.previewProgressing();
+            const bool due = resolvedNewImage && denoiseThisImage (fastPreview, converging, last_.samplesPerPixel);
+            if ((due || denoised_.empty() || denoisedLayers_.size() != last_.frameLayers.size()
+                 || choice != denoisedChoice_)
+                && ! denoiseLastImage (draw, view, choice, error))
+                return false;
+            if (timedThisCall)
+                stats_.phases.set (pt::FramePhase::Denoise, pt::millisecondsSince (denoiseStart));
+        }
+        if (timedThisCall && choice == pathtracedenoise::DenoiserChoice::Off)
+            stats_.phases.markAbsent (pt::FramePhase::Denoise, "the denoiser is off");
+        denoisedChoice_ = choice;
+        stats_.denoiser = denoiserLabel_;
+        stats_.denoiserRequested = pathtracedenoise::choiceName (choice);
+        stats_.denoiserReason = denoiserReason_;
         arbitgpu::CpuSceneImage upload;
         upload.width = last_.width;
         upload.height = last_.height;
         upload.linearColor = last_.color == pt::EngineColor::LinearRgba16f;
-        upload.color = draw.denoise ? &denoised_ : &last_.colorBytes;
+        upload.color = choice != pathtracedenoise::DenoiserChoice::Off ? &denoised_ : &last_.colorBytes;
         upload.depth = &last_.depth;
         if (last_.frameLayers.size() != frames_.size())
             return fail (error, "Path Trace resolved another number of frame layers than the draw has frames");
         for (std::size_t index = 0; index < frames_.size(); ++index)
             upload.frameLayers.push_back ({ frames_[index],
-                draw.denoise ? &denoisedLayers_[index] : &last_.frameLayers[index].lightBytes,
+                choice != pathtracedenoise::DenoiserChoice::Off ? &denoisedLayers_[index] : &last_.frameLayers[index].lightBytes,
                 &last_.frameLayers[index].uvCoverage });
         const float* background = upload.linearColor ? pt::kLinearRasterBackground : pt::kRasterBackground;
         std::copy (background, background + 3, upload.background);
+        // The outputs travel only when something reads them. Denoising touched the
+        // Image alone, so they are the centre ray's values either way.
+        if (pathtracefixture::readsRenderOutputs (*draw.inputs))
+        {
+            upload.normal = &last_.normalPass;
+            upload.emission = &last_.emissionPass;
+            upload.mask = &last_.maskPass;
+            upload.materialId = &last_.materialIdPass;
+            upload.objectId = &last_.objectIdPass;
+            upload.motion = &last_.motionPass;
+            upload.imageOutput = draw.inputs->imageOutput;
+            upload.passProgram = arbitgpu::scenePassProgram (*draw.inputs);
+            if (draw.inputs->passComposite && draw.inputs->passComposite->inspectionImage)
+                upload.resolveClear = renderpasscomposite::inspectionClear (*draw.inputs->passComposite);
+        }
+        const auto imageUploadStart = pt::PhaseClock::now();
         auto frame = upload_ (draw.backend, upload, error);
         if (frame == nullptr)
             return false;
+        const auto uploaded = pt::PhaseClock::now();
+        if (timedThisCall)
+        {
+            stats_.phases.set (pt::FramePhase::ImageUpload, pt::millisecondsBetween (imageUploadStart, uploaded));
+            stats_.phases.set (pt::FramePhase::Total, pt::millisecondsBetween (callStart, uploaded));
+        }
+        noteConvergence (draw, restartedThisCall, tracedThisCall, callStart, uploaded);
         RenderedFrame result;
         result.use = draw.use;
         result.sceneId = draw.snapshot->id;
         result.dimensions = draw.dimensions;
         result.nativeFrame = std::move (frame);
-        result.stats.textureUploadCount = 2 + 2 * static_cast<std::uint32_t> (frames_.size());
+        result.stats.textureUploadCount = 2 + 2 * static_cast<std::uint32_t> (frames_.size())
+            + (upload.normal != nullptr ? 6u : 0u);
         result.stats.textureBytes = static_cast<std::uint64_t> (last_.colorBytes.size())
             + static_cast<std::uint64_t> (last_.depth.size()) * sizeof (float);
+        if (upload.normal != nullptr)
+            result.stats.textureBytes += (last_.normalPass.size() + last_.emissionPass.size() + last_.motionPass.size()) * 2u
+                + last_.maskPass.size() + (last_.materialIdPass.size() + last_.objectIdPass.size()) * 4u;
         for (const auto& layer : last_.frameLayers)
             result.stats.textureBytes += static_cast<std::uint64_t> (layer.lightBytes.size())
                 + static_cast<std::uint64_t> (layer.uvCoverage.size()) * sizeof (float);
@@ -581,7 +881,7 @@ public:
     bool previewProgressing() const noexcept override { return engine_.previewProgressing(); }
     unsigned previewTarget() const noexcept override { return engine_.previewTarget(); }
     unsigned previewSampleCount() const noexcept override { return engine_.previewSampleCount(); }
-    const char* denoiserRan() const noexcept override { return pathtracedenoise::denoiserName (denoiserRan_); }
+    const char* denoiserRan() const noexcept override { return denoiserLabel_; }
 
     bool pathTraceStats (PathTraceFrameStats& stats) const noexcept override
     {
@@ -600,18 +900,29 @@ private:
             stats_ = {};
         stats_.use = draw.use;
         stats_.mode = draw.mode;
-        stats_.device = pt::device::deviceName (fellBackToCpu_ || sceneOnCpu_ ? pt::device::DeviceKind::Cpu : pathTraceDeviceSelection().device);
-        stats_.deviceRequested = pathTraceDeviceSelection().requested;
+        stats_.maxBounces = engine_.settings().maxDepth;
+        const auto choice = choice_ != nullptr ? choice_ : pathTraceDeviceSelection();
+        stats_.device = pt::device::deviceName (fellBackToCpu_ || sceneOnCpu_ ? pt::device::DeviceKind::Cpu : choice->selection.device);
+        stats_.deviceRequested = choice->selection.requested;
         stats_.deviceReason = deviceReason_ != nullptr ? deviceReason_ : sceneOnCpu_ ? sceneReason_ : nullptr;
+        stats_.fallbackReason = fellBackToCpu_ ? deviceReason_ : nullptr;
         stats_.temporalDenoise = image.temporalDenoise;
         const bool preview = draw.use == RenderUse::Preview;
+        if (preview && engine_.lastPassObsolete())
+            ++obsoletePasses_;
+        stats_.obsoletePasses = obsoletePasses_;
         const bool playback = preview && image.mode == pt::EngineRenderMode::PlaybackFixed;
         stats_.renderActivity = ! preview ? "export"
             : playback ? "playback-fixed"
             : engine_.previewProgressing() ? "converging" : "settled";
-        stats_.sampleTarget = ! preview ? draw.exportSamples
+        stats_.sampleTarget = ! preview ? exportSamples (draw.mode == SceneEngineMode::Fast, draw.exportSamples, draw.previewSamples)
             : playback ? std::min (std::max (1u, engine_.playbackSamples), engine_.maximumPreviewSamples)
             : engine_.previewTarget();
+        if (image.traced || image.restarted)
+        {
+            stats_.phases = image.stats.phases;
+            stats_.phaseSamples = image.traced ? image.stats.samplesAdded : 0;
+        }
         if (image.traced)
         {
             stats_.samplesAdded += image.stats.samplesAdded;
@@ -622,18 +933,222 @@ private:
             stats_.limitEndedPaths += image.stats.limitEndedPaths;
             stats_.lightPaths += image.stats.lightPaths;
             stats_.causticSplats += image.stats.causticSplats;
+            if (image.stats.deviceMemoryTotalBytes != 0)
+            {
+                stats_.deviceMemoryFreeBytes = image.stats.deviceMemoryFreeBytes;
+                stats_.deviceMemoryTotalBytes = image.stats.deviceMemoryTotalBytes;
+            }
             statsValid_ = true;
         }
     }
 
+    // The viewport's clocks from an accumulation's restart, read after the image
+    // reached the compositor's texture. They stop there, before the compositor and
+    // the window's swap, and they start at the render call that restarted, so the
+    // time an edit takes to reach the tracer is not in them.
+    void noteConvergence (const SceneEngineDraw& draw, bool restarted, bool traced,
+                          pt::PhaseClock::time_point callStart, pt::PhaseClock::time_point uploaded) noexcept
+    {
+        if (draw.use != RenderUse::Preview)
+        {
+            stats_.firstSampleMs.reset();
+            stats_.targetMs.reset();
+            stats_.convergenceAbsent = "an export traces its samples in one call";
+            return;
+        }
+        if (restarted)
+        {
+            accumulationStart_ = callStart;
+            firstSampleMs_.reset();
+            targetMs_.reset();
+        }
+        if (accumulationStart_.has_value())
+        {
+            if (traced && ! firstSampleMs_.has_value())
+                firstSampleMs_ = pt::millisecondsBetween (*accumulationStart_, uploaded);
+            const bool playback = last_.mode == pt::EngineRenderMode::PlaybackFixed;
+            if (! playback && ! targetMs_.has_value() && last_.samplesPerPixel >= engine_.previewTarget())
+                targetMs_ = pt::millisecondsBetween (*accumulationStart_, uploaded);
+        }
+        stats_.firstSampleMs = firstSampleMs_;
+        stats_.targetMs = targetMs_;
+        stats_.convergenceAbsent = ! accumulationStart_.has_value() ? "no accumulation has restarted yet"
+            : last_.mode == pt::EngineRenderMode::PlaybackFixed ? "playback frames stop at the playback budget"
+            : ! targetMs_.has_value() ? "the accumulation has not reached its target yet" : nullptr;
+    }
+
+    std::optional<pt::PhaseClock::time_point> accumulationStart_;
+    std::optional<double> firstSampleMs_;
+    std::optional<double> targetMs_;
     PathTraceFrameStats stats_;
     bool statsValid_ = false;
-    bool denoiseLastImage (std::string& error)
+    std::uint64_t obsoletePasses_ = 0;
+    // Plans the denoiser for last_ from the choice and what can run, runs it, and
+    // falls back by name when it fails: OptiX AI to OIDN, OIDN to the native filter.
+    bool denoiseLastImage (const SceneEngineDraw& draw, const pt::EngineView& view,
+                           pathtracedenoise::DenoiserChoice choice, std::string& error)
     {
-        if (pathtracedenoise::kBuildDenoiser != pathtracedenoise::Denoiser::NativeFilter)
-            return fail (error, std::string ("Path Trace denoiser ")
-                                    + pathtracedenoise::denoiserName (pathtracedenoise::kBuildDenoiser)
-                                    + " is not implemented in this build");
+        namespace dn = pathtracedenoise;
+        dn::DenoiserAvailability available;
+        available.tracedOnOptix = std::strcmp (stats_.device, pt::device::deviceName (pt::device::DeviceKind::OptiX)) == 0;
+#if defined(ARBIT_HAVE_OPTIX)
+        available.optixProblem = pt::device::optixDenoiserProblem();
+#else
+        available.optixProblem = "this build of DonutStudio has no OptiX device";
+#endif
+        available.oidnProblem = dn::oidnLoadProblem();
+        auto plan = dn::planDenoiser (choice, available);
+        std::string reason = plan.reason;
+        const auto addReason = [&reason] (const std::string& why) {
+            reason += reason.empty() ? why : "; " + why;
+        };
+        dn::OidnDevice oidnUsed = dn::OidnDevice::Cpu;
+        // The temporal model follows playback frames. Converging, settled and export
+        // frames each stand alone, so they take the single-frame model.
+        const bool temporal = plan.denoiser == dn::Denoiser::OptixAi && draw.use == RenderUse::Preview
+            && last_.mode == pt::EngineRenderMode::PlaybackFixed;
+        bool ran = false;
+        if (plan.denoiser == dn::Denoiser::OptixAi)
+        {
+            std::string failure, note;
+            ran = runAiDenoiser (true, temporal, view, dn::OidnDevice::Cpu, oidnUsed, note, failure);
+            if (! ran)
+            {
+                addReason ("OptiX AI failed: " + failure);
+                plan.denoiser = available.oidnProblem.empty() ? dn::Denoiser::Oidn : dn::Denoiser::NativeFilter;
+                if (! available.oidnProblem.empty())
+                    addReason ("OIDN did not run: " + available.oidnProblem);
+            }
+        }
+        if (! temporal)
+            optixSequenceLive_ = false;
+        if (! ran && plan.denoiser == dn::Denoiser::Oidn)
+        {
+            std::string failure, note;
+            ran = runAiDenoiser (false, false, view, dn::oidnDeviceFor (stats_.device), oidnUsed, note, failure);
+            if (ran && ! note.empty())
+                addReason (note);
+            if (! ran)
+            {
+                addReason ("OIDN failed: " + failure);
+                plan.denoiser = dn::Denoiser::NativeFilter;
+            }
+        }
+        if (! ran && plan.denoiser == dn::Denoiser::NativeFilter && ! nativeFilterLastImage (error))
+            return false;
+        reportDenoiser (plan.denoiser, dn::denoiserLabel (plan.denoiser, oidnUsed, temporal), reason);
+        return true;
+    }
+
+    // OptiX AI (optix) or OIDN on last_'s colour and each frame layer, with its albedo
+    // and normal guides. Fills failure and leaves denoised_ unusable when it fails.
+    bool runAiDenoiser (bool optix, bool temporal, const pt::EngineView& view, pathtracedenoise::OidnDevice want,
+                        pathtracedenoise::OidnDevice& used, std::string& note, std::string& failure)
+    {
+        namespace dn = pathtracedenoise;
+        const std::size_t pixels = static_cast<std::size_t> (last_.width) * last_.height;
+        if (last_.albedo.size() != pixels * dn::kGuideChannels || last_.normal.size() != pixels * dn::kGuideChannels)
+        {
+            failure = "the frame has no albedo and normal guides";
+            return false;
+        }
+        pt::PinholeCamera camera;
+        const bool haveCamera = pt::makePinholeCamera (view.camera, last_.width, last_.height, camera);
+        const float* normals = last_.normal.data();
+        if (optix)
+        {
+            // The temporal model reads camera-space normals; the single-frame model takes them too.
+            if (! haveCamera)
+            {
+                failure = "the frame's camera is invalid";
+                return false;
+            }
+            denoiseNormals_.resize (last_.normal.size());
+            const pt::Quat toCamera = pt::conjugate (camera.rotation);
+            for (std::size_t index = 0; index < pixels; ++index)
+            {
+                const float* n = last_.normal.data() + index * dn::kGuideChannels;
+                const pt::Vec3 turned = pt::rotate (toCamera, pt::Vec3 { n[0], n[1], n[2] });
+                denoiseNormals_[index * dn::kGuideChannels] = turned.x;
+                denoiseNormals_[index * dn::kGuideChannels + 1] = turned.y;
+                denoiseNormals_[index * dn::kGuideChannels + 2] = turned.z;
+            }
+            normals = denoiseNormals_.data();
+        }
+        bool usePrevious = false;
+        if (temporal)
+        {
+            usePrevious = optixSequenceLive_
+                && dn::reprojectionFlow (camera, optixSequenceCamera_, last_.depth, denoiseFlow_);
+            if (! usePrevious)
+                denoiseFlow_.assign (pixels * dn::kFlowChannels, 0.0f);
+        }
+        const auto denoise = [&] (const std::vector<std::uint8_t>& bytes, bool linear, bool sequence, std::vector<std::uint8_t>& output) {
+            if (! dn::colorToFloat3 (bytes, linear, pixels, denoiseColor_))
+            {
+                failure = "the frame's colour does not match its size";
+                return false;
+            }
+            denoiseOutput_.assign (pixels * dn::kGuideChannels, 0.0f);
+            if (optix)
+            {
+#if defined(ARBIT_HAVE_OPTIX)
+                pt::device::OptixDenoiseImage image;
+                image.width = last_.width;
+                image.height = last_.height;
+                image.color = denoiseColor_.data();
+                image.albedo = last_.albedo.data();
+                image.normal = normals;
+                image.output = denoiseOutput_.data();
+                image.temporal = sequence;
+                image.usePrevious = sequence && usePrevious;
+                image.flow = sequence ? denoiseFlow_.data() : nullptr;
+                if (! pt::device::optixDenoise (image, failure))
+                    return false;
+#else
+                (void) sequence;
+                failure = "this build of DonutStudio has no OptiX device";
+                return false;
+#endif
+            }
+            else
+            {
+                dn::DenoiseFrame frame;
+                frame.width = last_.width;
+                frame.height = last_.height;
+                frame.color = denoiseColor_.data();
+                frame.albedo = last_.albedo.data();
+                frame.normal = normals;
+                frame.output = denoiseOutput_.data();
+                frame.hdr = linear;
+                if (! dn::oidnDenoise (want, frame, used, note, failure))
+                    return false;
+            }
+            dn::float3ToColor (denoiseOutput_, linear, bytes, output);
+            return true;
+        };
+        // Each layer is denoised apart from the frame, so the denoiser never blurs the
+        // imagery. A layer stands alone; only the frame's colour is a temporal sequence.
+        if (! denoise (last_.colorBytes, last_.color == pt::EngineColor::LinearRgba16f, temporal, denoised_))
+        {
+            if (temporal)
+                optixSequenceLive_ = false;
+            return false;
+        }
+        if (temporal)
+        {
+            optixSequenceLive_ = true;
+            optixSequenceCamera_ = camera;
+        }
+        denoisedLayers_.resize (last_.frameLayers.size());
+        for (std::size_t index = 0; index < last_.frameLayers.size(); ++index)
+            if (! denoise (last_.frameLayers[index].lightBytes, true, false, denoisedLayers_[index]))
+                return false;
+        return true;
+    }
+
+    bool nativeFilterLastImage (std::string& error)
+    {
         try
         {
             const pt::CancellationToken neverCancelled;
@@ -674,17 +1189,26 @@ private:
         return true;
     }
 
-    // One log line per change, so the run's log names the denoiser without a
-    // line per frame.
-    void reportDenoiser (pathtracedenoise::Denoiser denoiser)
+    // One log line per change, so the run's log names the denoiser and any
+    // fallback without a line per frame.
+    void reportDenoiser (pathtracedenoise::Denoiser denoiser, const char* label, const std::string& reason)
     {
-        if (denoiser == denoiserRan_) return;
         denoiserRan_ = denoiser;
-        std::fprintf (stderr, "[pt] denoiser=%s\n", pathtracedenoise::denoiserName (denoiser));
+        const bool sameReason = denoiserReason_ != nullptr ? *denoiserReason_ == reason : reason.empty();
+        if (std::strcmp (label, denoiserLabel_) == 0 && sameReason)
+            return;
+        denoiserLabel_ = label;
+        denoiserReason_ = reason.empty() ? nullptr : std::make_shared<const std::string> (reason);
+        if (reason.empty())
+            std::fprintf (stderr, "[pt] denoiser=%s\n", label);
+        else
+            std::fprintf (stderr, "[pt] denoiser=%s: %s\n", label, reason.c_str());
     }
 
     pathtracefixture::CpuFrameUpload upload_;
     pt::SceneEngine engine_;
+    // The device selection this engine renders with; a newer generation resets it.
+    std::shared_ptr<const DeviceChoice> choice_;
     bool devicePassSet_ = false;
     bool fellBackToCpu_ = false;
     std::shared_ptr<const std::string> deviceReason_;
@@ -692,8 +1216,21 @@ private:
     std::shared_ptr<const std::string> sceneReason_;
     pt::EngineSceneSetup setup_;  // reused so per-frame vectors keep their storage
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> noteScene_, noteSceneSource_;
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> fogScene_, fogSceneSource_;
     std::size_t noteSceneCount_ = 0;
-    std::array<std::array<float, 4>, visualnoteinstancing::kMaximumInstances> noteSceneTransforms_ {};
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> displacedScene_, displacedSource_;
+    std::shared_ptr<const Program> displacedProgram_;
+    float displacedTime_ = 0.0f;
+    std::array<float, 64> displacedSpectrum_ {};
+    std::vector<float> displacedControls_;
+    // The prior frame's displaced positions, the shutter-open key of a vertex program.
+    std::shared_ptr<const std::vector<HarmonicMIDI::grid::SceneVec3>> displacedPrior_, displacedPriorPositions_;
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> displacedPriorSource_;
+    std::shared_ptr<const Program> displacedPriorProgram_;
+    double displacedPriorTime_ = 0.0;
+    std::array<float, 64> displacedPriorSpectrum_ {};
+    std::vector<float> displacedPriorControls_;
+    std::vector<std::array<float, 4>> noteSceneTransforms_;
     pt::EngineImage last_;
     std::vector<float> denoiseInput_;
     std::vector<float> denoiseFiltered_;
@@ -705,6 +1242,18 @@ private:
     // samples the current frame without tracing again.
     std::vector<std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>> frames_;
     pathtracedenoise::Denoiser denoiserRan_ = pathtracedenoise::Denoiser::None;
+    const char* denoiserLabel_ = "none";
+    std::shared_ptr<const std::string> denoiserReason_;
+    pathtracedenoise::DenoiserChoice denoisedChoice_ = pathtracedenoise::DenoiserChoice::Off;
+    // The AI denoisers' float images, kept for their storage.
+    std::vector<float> denoiseColor_;
+    std::vector<float> denoiseOutput_;
+    std::vector<float> denoiseNormals_;
+    std::vector<float> denoiseFlow_;
+    // The OptiX temporal sequence: live while playback frames follow each other,
+    // with the camera of the last one for the flow.
+    bool optixSequenceLive_ = false;
+    pt::PinholeCamera optixSequenceCamera_ {};
 };
 
 } // namespace
@@ -739,15 +1288,53 @@ namespace pathtracefixture
 {
 void prepareDeviceAtStartup()
 {
+    const auto choice = pathTraceDeviceSelection();
+    const auto& selection = choice->selection;
+    if (! selection.ok)
+        return;
 #if defined(ARBIT_HAVE_OPTIX_KERNEL)
-    const auto& selection = pathTraceDeviceSelection();
-    if (selection.ok && selection.device == pt::device::DeviceKind::OptiX)
+    if (selection.device == pt::device::DeviceKind::OptiX)
         pt::device::startOptixPipelineBuild();
 #endif
+    if (pt::device::isComputeDevice (selection.device))
+        pt::device::startComputeModuleBuild (selection.device);
+#if defined(ARBIT_HAVE_METAL_PATHTRACE)
+    if (selection.device == pt::device::DeviceKind::Metal)
+        pt::device::startMetalPipelineBuild();
+#endif
+}
+
+std::string setDevicePreference (const std::string& value)
+{
+    {
+        auto& setting = deviceSetting();
+        const std::lock_guard<std::mutex> lock (setting.lock);
+        if (setting.choice != nullptr && setting.preference == value)
+            return setting.choice->selection.ok ? std::string() : setting.choice->selection.error;
+        setting.preference = value;
+        setting.choice = chooseDevice (setting.preference, ++setting.generations);
+    }
+    prepareDeviceAtStartup();
+    const auto choice = pathTraceDeviceSelection();
+    return choice->selection.ok ? std::string() : choice->selection.error;
+}
+
+std::string devicePreference()
+{
+    auto& setting = deviceSetting();
+    const std::lock_guard<std::mutex> lock (setting.lock);
+    return setting.preference;
 }
 
 bool cancelDeviceBuild()
 {
+    const auto device = pathTraceDeviceSelection()->selection.device;
+    if (pt::device::isComputeDevice (device))
+        return pt::device::stopComputeModuleBuildByUser (device);
+#if defined(ARBIT_HAVE_METAL_PATHTRACE)
+    if (device == pt::device::DeviceKind::Metal)
+        return pt::device::stopMetalPipelineBuildByUser();
+#endif
 #if defined(ARBIT_HAVE_OPTIX_KERNEL)
     return pt::device::stopOptixPipelineBuildByUser();
 #else
@@ -757,6 +1344,19 @@ bool cancelDeviceBuild()
 
 void startDeviceBuildAgain()
 {
+    const auto device = pathTraceDeviceSelection()->selection.device;
+    if (pt::device::isComputeDevice (device))
+    {
+        pt::device::startComputeModuleBuildByUser (device);
+        return;
+    }
+#if defined(ARBIT_HAVE_METAL_PATHTRACE)
+    if (device == pt::device::DeviceKind::Metal)
+    {
+        pt::device::startMetalPipelineBuildByUser();
+        return;
+    }
+#endif
 #if defined(ARBIT_HAVE_OPTIX_KERNEL)
     pt::device::startOptixPipelineBuildByUser();
 #endif
@@ -766,6 +1366,12 @@ void stopDeviceBuildAtExit()
 {
 #if defined(ARBIT_HAVE_OPTIX_KERNEL)
     pt::device::cancelOptixPipelineBuild();
+#endif
+    pt::device::cancelComputeModuleBuild (pt::device::DeviceKind::Cuda);
+    pt::device::cancelComputeModuleBuild (pt::device::DeviceKind::Hip);
+    pt::device::cancelComputeModuleBuild (pt::device::DeviceKind::OneApi);
+#if defined(ARBIT_HAVE_METAL_PATHTRACE)
+    pt::device::cancelMetalPipelineBuild();
 #endif
 }
 } // namespace pathtracefixture

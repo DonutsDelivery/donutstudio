@@ -15,7 +15,7 @@ enum Cost : unsigned {NativeVisits,NativeMoves,NativeScalars,NativeParser,Native
     SourceVisits,SourceMoves,SourceScalars,DecimalCalls,WrapperWords,WrapperScalars,
     RegistryVisits,CopiedBytes,ComparedBytes,TransferredBytes,LogicalScratch,CostCount};
 using Costs=std::array<std::uint64_t,CostCount>;
-struct Storage {std::uint64_t frameBytes=0,attemptBytes=0,nativeBytes=0,attempts=0,publicInspections=0,registryInspections=0,identityBytes=0,arithmeticInspections=0;};
+struct Storage {std::uint64_t frameBytes=0,attemptBytes=0,nativeBytes=0,attempts=0,publicInspections=0,registryInspections=0,identityBytes=0,arithmeticInspections=0,entryBound=0;};
 }
 // Private fixture hook. The return value describes authenticated native
 // completion/publication. The arithmetic entry's bool is read separately.

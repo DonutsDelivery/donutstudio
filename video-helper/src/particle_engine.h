@@ -71,10 +71,9 @@ public:
     ParticleEngine (const ParticleEngine&) = delete;
     ParticleEngine& operator= (const ParticleEngine&) = delete;
 
-    // Legacy generator clips retain their historical cap. The typed paid node
-    // has a separate, deliberately smaller wire/resource contract.
-    static constexpr int kMaxParticles = 100000;
-    static constexpr int kMaxVisualParticles = 4096;
+    // Free particles are not capped: the pool is sized from the count, and
+    // the node's Count parameter spans the float-exact integer range.
+    static constexpr int kMaxVisualParticles = 1 << 24;
 
     void resetSimulation (const arbitgl::GlFuncs* gl);
 
@@ -183,7 +182,8 @@ private:
     unsigned fbo_         = 0;
     unsigned outTex_      = 0;
     int      outW_ = 0, outH_ = 0;
-    unsigned notesTex_    = 0;     // 4 x 128 RGBA32F (uNotes); 0 until first upload
+    unsigned notesTex_    = 0;     // 4 x noteRows RGBA32F (uNotes); 0 until first upload
+    unsigned timelineTex_ = 0;     // anchors then bodies, 1024 x rows RGBA32F (uTimelineData)
 
     // Cached uniform locations.
     int uCount_ = -1, uSpawnTrack_ = -1, uGravity_ = -1, uForce_ = -1, uLifetime_ = -1;
@@ -191,9 +191,10 @@ private:
     int uPointSize_ = -1, uColor_ = -1;
     int uMotionMode_ = -1, uSeed_ = -1, uElapsed_ = -1, uDrag_ = -1,
         uAttraction_ = -1, uAudioMotion_ = -1, uCollision_ = -1;
-    int uGeometryCount_ = -1, uGeometryAnchors_ = -1, uBodyReplay_ = -1;
+    int uGeometryCount_ = -1, uBodyCount_ = -1, uTimelineData_ = -1;
     void cacheTimelineUniforms(const arbitgl::GlFuncs* gl, unsigned program);
-    void uploadTimelineUniforms(const arbitgl::GlFuncs* gl,
+    // False when the anchor/body texture cannot be allocated; log_ says why.
+    bool uploadTimelineUniforms(const arbitgl::GlFuncs* gl,
                                 const ShaderClock& clock, const ParticleParams& params,
                                 float aspect, const canonicalblockc::CanonicalBlockCFrame* notes);
 };

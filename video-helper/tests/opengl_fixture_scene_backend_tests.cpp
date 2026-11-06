@@ -509,7 +509,7 @@ bool queryArithmeticSourceChecks()
         "CameraTraceInput cameraInput=inputs[sampleIndex];",
         "causticCameraRay(vec2(cameraInput.pixel.xy)+vec2(dx,dy),uRotation,uProjection,uExtent)",
         "sceneClosestHit(branch.origin,branch.direction,minimum,maximum,uOpaqueControl)",
-        "CAUSTIC_MAX_PENDING","CAUSTIC_MAX_VISITS","CAUSTIC_MAX_ANCESTRY_INTERFACES","uIor[band/4][band%4]",
+        "CAUSTIC_BRANCH_TEXELS","CAUSTIC_MAX_VISITS","CAUSTIC_MAX_ANCESTRY_INTERFACES","uIor[band/4][band%4]",
         "precise float reflectedFraction=branch.fraction*visit.fresnel;",
         "precise float transmittedFraction=branch.fraction*(1.0-visit.fresnel);",
         "child.token=1u;","child.token=65u;","result[base+12]=path.ancestry[0]",
@@ -575,6 +575,13 @@ bool glassGratingTerminalNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
     if(!gc::opengl::decodeGratingDeposit(depositWords.data(),depositSentinel)||depositSentinel.ancestry[1]!=65)return fail("OpenGL smooth child ancestry did not decode");
     depositWords[22][1]=2;
     if(gc::opengl::decodeGratingDeposit(depositWords.data(),depositSentinel)||depositSentinel.ancestry[1]!=65)return fail("OpenGL child accepted a multiple-scatter ancestry token");
+    // Texel 31 carries history words 2 and 3 beside the grating extension in texel 30.
+    depositWords[22][1]=65;depositWords[0][2]=70;depositWords[31]={1,0,0,0};
+    if(!gc::opengl::decodeGratingDeposit(depositWords.data(),depositSentinel)||!depositSentinel.reflectionHistory.test(64))
+        return fail("OpenGL grating deposit history words 2 and 3 did not decode from texel 31");
+    depositWords[0][2]=2;
+    if(gc::opengl::decodeGratingDeposit(depositWords.data(),depositSentinel))return fail("OpenGL grating deposit accepted history past its interfaces");
+    depositWords[31]={};
     auto fixture=gt::ordinaryFixture();fixture.scene->lights[0].transform.rotation={0,0,0,1};
     fixture.scene->cameras[0].transform.translation={0,0,1};
     fixture.scene->cameras[0].transform.rotation={0,float(std::sqrt(.5)),0,float(std::sqrt(.5))};
@@ -996,7 +1003,7 @@ bool glassGratingTerminalNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
             ||zero.samples[0].surfaceIrradiance!=std::array<float,8>{})
             return fail("OpenGL negative grating source cosine did not complete as supported zero");
         gc::DirectGratingContributionBounds cap;
-        if(gc::calculateDirectGratingContributionBounds(*directBinding,1,renderpassoutput::kMaximumTotalBytes,0,cap,error)
+        if(gc::calculateDirectGratingContributionBounds(*directBinding,1,renderpassoutput::kRepresentableTotalBytes,0,cap,error)
             ||gc::calculateDirectGratingContributionBounds(*directBinding,1,0,gc::kMaximumQueryWork,cap,error))
             return fail("OpenGL direct native fixture's original shared cumulative caps accepted excess work or storage");
         auto excessive=inputs;excessive.resize(gc::kMaximumEntrySamples+1,inputs[0]);const auto retained=direct.submission;
@@ -1232,7 +1239,7 @@ bool glassGratingTerminalNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
             ||gc::prepareDirectGratingIrradianceCohort(duplicate,inputs,0,0,refused,error)
             ||gc::prepareDirectGratingIrradianceCohort(reordered,inputs,0,0,refused,error)
             ||gc::prepareDirectGratingIrradianceCohort(extra,inputs,0,0,refused,error)||refused!=cohort
-            ||gc::prepareDirectGratingIrradianceCohort(bindings,inputs,renderpassoutput::kMaximumTotalBytes,0,refused,error)
+            ||gc::prepareDirectGratingIrradianceCohort(bindings,inputs,renderpassoutput::kRepresentableTotalBytes,0,refused,error)
             ||gc::prepareDirectGratingIrradianceCohort(bindings,inputs,0,gc::kMaximumQueryWork,refused,error))
             return fail("OpenGL cohort bypassed complete roster or original cumulative admission");
         std::vector<gc::NativeDirectGratingEndpointInput> seam{endpoint(gc::advance(gc::advance({},triangle.positions[0],.5f),triangle.positions[2],.5f))};
@@ -1580,7 +1587,7 @@ bool glassGratingTerminalNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
                 std::unique_ptr<gc::NativeDirectGratingTerminalReceiverLease> lease;gc::DirectGratingTerminalReceiverNativeBudget budget;
                 gc::DirectGratingTerminalReceiverBounds bounds;
                 if(!native||!native->beginDirectTerminalReceiverLease(terminal.nativeResult,sum.submission,.25,lease,budget,error))return false;
-                budget.retainedBytes=renderpassoutput::kMaximumTotalBytes;
+                budget.retainedBytes=renderpassoutput::kRepresentableTotalBytes;
                 if(gc::calculateDirectGratingTerminalReceiverBounds(*terminal.nativeResult,lease->frozenFrame(),budget,receiver,bounds,error))
                     return fail("OpenGL receiver bounds accepted actual native storage at the full cap");
             }
@@ -2008,7 +2015,7 @@ bool glassGratingTerminalNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
             [](auto& r){r.bands[0].ior+=.01f;},[](auto& r){r.bands[0].wavelength++;},
             [](auto& r){r.bands[0].traceComplete=!r.bands[0].traceComplete;},[](auto& r){r.bands[0].reasons^=1;},
             [](auto& r){r.bands[0].queryWork++;},[](auto& r){r.bands[0].unresolvedFraction=.5f;},
-            [](auto& r){r.bands[0].visits[0].parent=0;},[](auto& r){r.bands[0].visits[0].history++;},
+            [](auto& r){r.bands[0].visits[0].parent=0;},[](auto& r){r.bands[0].visits[0].history=r.bands[0].visits[0].history.with(5);},
             [](auto& r){r.bands[0].visits[0].inside=true;},[](auto& r){r.bands[0].visits[0].ancestry[0]=1;},
             [](auto& r){r.bands[0].visits[0].hit.status=-1;},[](auto& r){r.bands[0].visits[0].hit.work++;},
             [](auto& r){r.bands[0].visits[0].hit.objectId++;},[](auto& r){r.bands[0].visits[0].hit.triangleId++;},
@@ -2041,19 +2048,25 @@ bool glassGratingTerminalNativeChecks(arbitgpu::NativeFixtureSceneBackend& backe
             ||owner->validateCameraTraceProductionQuery(exact.submission,exact,error))
             return fail("OpenGL camera successor omitted cumulative storage/work or revived an old query/fence receipt");
         gc::GlassCameraGratingTraceBounds cap;
-        if(gc::calculateGlassCameraGratingTraceBounds(*cameraBinding,5,renderpassoutput::kMaximumTotalBytes,0,cap,error)
+        if(gc::calculateGlassCameraGratingTraceBounds(*cameraBinding,5,renderpassoutput::kRepresentableTotalBytes,0,cap,error)
             ||gc::calculateGlassCameraGratingTraceBounds(*cameraBinding,5,0,gc::kMaximumQueryWork,cap,error))
             return fail("OpenGL camera trace bypassed original cumulative caps");
         const auto retained=trace;
-        const auto& allowance=cameraBinding->frame.query.texels[std::size_t(cameraBinding->frame.query.control[0])-1];
-        const auto perQuery=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
-        const auto overWork=(gc::kMaximumQueryWork-cameraBinding->bounds.combinedWork)/(8*gc::kMaximumBranchVisits*(perQuery+1))+1;
-        if(overWork<=gc::kMaximumEntrySamples) {
-            std::vector<gc::NativeGlassCameraGratingTraceInput> tooMuch(std::size_t(overWork),inputs[0]);
-            if(arbitgpu::produceOpenGlGlassCameraGratingTrace(cameraFrame,cameraBinding,tooMuch,.25,trace,error)
-                ||!gc::sameGlassCameraGratingTraceReadback(trace,retained))
-                return fail("OpenGL camera bounded sample count bypassed worst-case original work admission");
-        }
+        // Work refuses only at the 64-bit overflow bound kMaximumQueryWork: prior work
+        // that leaves exactly this trace's query and branch work admits and fills the
+        // bound, and one more unit refuses without replacing the bounds.
+        gc::GlassCameraGratingTraceBounds own,edge;
+        if(!gc::calculateGlassCameraGratingTraceBounds(*cameraBinding,5,0,0,own,error)
+            ||own.combinedWork!=cameraBinding->bounds.combinedWork+own.queryWork+own.branchWork)
+            return fail("OpenGL camera trace work bounds omit the trace's query or branch work");
+        const auto slack=gc::kMaximumQueryWork-own.combinedWork;
+        if(!gc::calculateGlassCameraGratingTraceBounds(*cameraBinding,5,0,slack,edge,error)
+            ||edge.combinedWork!=gc::kMaximumQueryWork||edge.queryWork!=own.queryWork)
+            return fail("OpenGL camera trace refused work that fits the 64-bit overflow bound");
+        auto over=edge;
+        if(gc::calculateGlassCameraGratingTraceBounds(*cameraBinding,5,0,slack+1,over,error)
+            ||over.combinedWork!=edge.combinedWork||over.bytes!=edge.bytes)
+            return fail("OpenGL camera trace admitted work past the 64-bit overflow bound or replaced its bounds");
         auto excessive=inputs;excessive.resize(gc::kMaximumEntrySamples+1,inputs[0]);
         if(arbitgpu::produceOpenGlGlassCameraGratingTrace(cameraFrame,cameraBinding,excessive,.25,trace,error)
             ||!gc::sameGlassCameraGratingTraceReadback(trace,retained))return fail("OpenGL camera oversized input changed incumbent output");
@@ -3863,7 +3876,7 @@ bool multipleScatterGlassCausticNativeChecks(arbitgpu::NativeFixtureSceneBackend
                     "v2 packed path decoder refuses malformed finite/integer/version/reserved fields without mutation");
             }
             const auto& deposit=receipt->deposits[0];std::array<gc::Texel,32> packedDeposit{};
-            const auto owner=words(deposit.work),historyLow=words(std::uint32_t(deposit.reflectionHistory)),historyHigh=words(std::uint32_t(deposit.reflectionHistory>>32));
+            const auto owner=words(deposit.work),historyLow=words(deposit.reflectionHistory.words[0]),historyHigh=words(deposit.reflectionHistory.words[1]);
             packedDeposit[0]={owner[0],owner[1],float(deposit.interfaces),float(deposit.cameraVisible)};
             packedDeposit[1]={historyLow[0],historyLow[1],historyHigh[0],historyHigh[1]};
             packedDeposit[2]={deposit.fraction,deposit.incidentPower,deposit.outgoingPower,deposit.absorbedPower};
@@ -4867,8 +4880,8 @@ int main()
             ok &= expect(reorderedFrame.rendered && neutral(readMotion(reorderedFrame.frame)),
                 "note Motion matches signed stable identities across table reorders");
             auto priorNotes = std::make_shared<arbitgpu::NativeSceneNoteMotionTransforms>();
-            priorNotes->count=1; priorNotes->identities[0]=batch.identities[0];
-            priorNotes->transforms[0]=batch.transforms[0]; priorNotes->transforms[0][0]-=.25f;
+            priorNotes->count=1; priorNotes->identities={batch.identities[0]};
+            priorNotes->transforms={batch.transforms[0]}; priorNotes->transforms[0][0]-=.25f;
             notes.previousMotion->noteTransforms=priorNotes;
             notes.objectTranslationOffset[0]=.1f;
             const auto changedNotes = backend.render(noteScene,noteResources.resources,64,64,notes);

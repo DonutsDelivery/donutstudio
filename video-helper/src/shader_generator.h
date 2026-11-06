@@ -263,10 +263,11 @@ private:
     // GL_R32F 1D texture (uAudioBands, for arbitBand) and a GL_R32F nx1 2D
     // texture (uAudioBands2D, the ISF audioFFT / Shadertoy iChannel0 alias).
     void ensureBandsTex (const arbitgl::GlFuncs* gl, int n);
-    // Lazily allocate the Block C textures once: uNotes as a 4 x 128 GL_RGBA32F
-    // 2D texture and uLinks as a 256 x 1 GL_RGBA32F 2D texture (GL_NEAREST —
-    // the packed texels are structured data, never interpolated).
-    void ensureNotesTex (const arbitgl::GlFuncs* gl);
+    // Lazily allocate the Block C textures and resize them to the frame:
+    // uNotes as a 4 x noteHeight GL_RGBA32F 2D texture and uLinks as a
+    // 1024 x linkHeight GL_RGBA32F 2D texture (GL_NEAREST, because the packed
+    // texels are structured data, never interpolated).
+    void ensureNotesTex (const arbitgl::GlFuncs* gl, int noteHeight, int linkHeight);
 
     unsigned program_  = 0;   // active (last good) program, 0 = none
     bool     ok_       = false;
@@ -285,8 +286,9 @@ private:
     unsigned bandsTex1D_ = 0;   // GL_R32F n-texel, uAudioBands when audio present
     unsigned bandsTex2D_ = 0;   // GL_R32F nx1, uAudioBands2D (iChannel0 alias)
     int      bandsTexN_  = 0;   // current allocated band count (0 = unallocated)
-    unsigned notesTex2D_ = 0;   // GL_RGBA32F 4x128, uNotes when notes present (M5)
-    unsigned linksTex2D_ = 0;   // GL_RGBA32F 256x1, uLinks when notes present
+    unsigned notesTex2D_ = 0;   // GL_RGBA32F 4 x notesTexH_, uNotes when notes present (M5)
+    unsigned linksTex2D_ = 0;   // GL_RGBA32F 1024 x linksTexH_, uLinks when notes present
+    int      notesTexH_ = 0, linksTexH_ = 0;  // allocated heights (0 = unallocated)
     bool     notesTexAlloc_ = false;  // true once the Block C textures are allocated
 
     // ISF multipass (M7). The PASS list captured from the dialect wrap, plus the

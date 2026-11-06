@@ -80,7 +80,7 @@ if not re.search(r"appendRealtimeStats \(nlohmann::json& reply, const std::optio
 if main.count("appendRealtimeStats") != 2:
     raise SystemExit("the probe and viewport_info replies must both name Realtime")
 require(command, '"realtimeStats"', "the MCP probe forward")
-require(hud, 'TRANS("Realtime render: %TIME% ms/frame', "the HUD render row")
+require(hud, 'TRANS("Realtime %MODE% render: %TIME% ms/frame', "the HUD render row")
 require(hud, 'TRANS("Image: Realtime, drawn by %BACKEND%, fallbacks %COUNT%")', "the HUD image row")
 
 print("realtime engine source contract: ok")

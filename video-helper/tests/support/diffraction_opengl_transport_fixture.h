@@ -22,14 +22,14 @@ inline diffractionmaterial::Description materialDescription(const Fixture* f=nul
     }
     return d;
 }
-inline bool publishPhysics(Fixture& f,std::string& error)
+inline bool publishPhysics(Fixture& f,std::string& error,const diffractionmaterial::Description* grating=nullptr)
 {
     using namespace diffractionmaterial;
     LightingDescription lighting=f.program.diffractionLightingAdmission->description();
     for(unsigned a=0;a<3;++a)lighting.paths[0].incident.direction[a]=float(f.input.source.direction[a]);
     for(unsigned b=0;b<8;++b)lighting.paths[0].incident.radiance[b]=float(f.input.source.radiance[b]);
     const auto admitted=AdmittedLightingPlan::admit(lighting,error);
-    const auto physical=admit(materialDescription(&f),error);
+    const auto physical=admit(grating?*grating:materialDescription(&f),error);
     if (!admitted || !physical) return false;
     f.program.diffractionLightingAdmission=std::make_shared<const AdmittedLightingPlan>(*admitted);
     f.program.diffractionPaths[0]=makeGpuLightingPath(physicalcheckpoint::makeGpuParameters(*physical,lighting.paths[0].incident),lighting.paths[0]);

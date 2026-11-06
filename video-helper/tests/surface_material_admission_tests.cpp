@@ -583,7 +583,7 @@ void testDispersionHasNoUpperBound()
     inputs.timeSeconds = 1.5f;
     inputs.audioBass = 0.25f;
     inputs.controlCount = 1;
-    inputs.controls[0] = 0.8f;
+    inputs.controls.assign(1, 0.8f);
     const auto evaluated = [&](float value) {
         program.operations.back().literal[0] = value;
         std::string error;
@@ -762,7 +762,7 @@ void testDeterministicEvaluation()
     inputs.timeSeconds = 1.5f;
     inputs.audioBass = 0.25f;
     inputs.controlCount = 1;
-    inputs.controls[0] = 0.8f;
+    inputs.controls.assign(1, 0.8f);
 
     const auto firstRun = evaluateReference(*admitted, inputs, error);
     const auto secondRun = evaluateReference(*admitted, inputs, error);
@@ -842,7 +842,7 @@ void testInputMappingAndCompleteValueVocabulary()
             case InputSemantic::AudioBeat: inputs.audioBeat = inputCase.value; break;
             case InputSemantic::Control:
                 inputs.controlCount = 1;
-                inputs.controls[0] = inputCase.value;
+                inputs.controls.assign(1, inputCase.value);
                 break;
             default: break;
         }
@@ -869,7 +869,7 @@ void testInputMappingAndCompleteValueVocabulary()
     MaterialEvaluationInputs inputs;
     inputs.audioBass = 0.25f;
     inputs.controlCount = 1;
-    inputs.controls[0] = 0.75f;
+    inputs.controls.assign(1, 0.75f);
     const auto block = evaluateReference(*admitted, inputs, error);
     check(block.has_value(), "all admitted value-only operations evaluate");
     if (!block)
@@ -905,7 +905,7 @@ void testMalformedEvaluationInputsAndBounds()
     valid.timeSeconds = 1.5f;
     valid.audioBass = 0.25f;
     valid.controlCount = 1;
-    valid.controls[0] = 0.8f;
+    valid.controls.assign(1, 0.8f);
 
     auto malformed = valid;
     malformed.timeSeconds = std::numeric_limits<float>::quiet_NaN();
@@ -921,15 +921,15 @@ void testMalformedEvaluationInputsAndBounds()
     expectEvaluationRejected(*admitted, malformed, "control input is missing",
                              "missing referenced runtime control is rejected");
     malformed = valid;
-    malformed.controlCount = static_cast<std::uint16_t>(kMaximumControlInputs + 1);
+    malformed.controlCount = 2;
     expectEvaluationRejected(*admitted, malformed, "control count exceeds",
-                             "runtime control count above the hard bound is rejected");
+                             "runtime control count above the supplied controls is rejected");
     malformed = valid;
     malformed.controls[0] = std::numeric_limits<float>::infinity();
     expectEvaluationRejected(*admitted, malformed, "control input is non-finite",
                              "non-finite runtime control is rejected");
     malformed = valid;
-    malformed.controls[1] = 1.0f;
+    malformed.controls.push_back(1.0f);
     expectEvaluationRejected(*admitted, malformed, "non-zero unused controls",
                              "non-zero unused runtime control is rejected");
     malformed = valid;
@@ -990,7 +990,7 @@ void testMalformedEvaluationInputsAndBounds()
         MaterialEvaluationInputs inputs;
         inputs.audioBass = 0.25f;
         inputs.controlCount = 1;
-        inputs.controls[0] = 0.75f;
+        inputs.controls.assign(1, 0.75f);
         expectEvaluationRejected(*reversedClampProgram, inputs, "clamp bounds are reversed",
                                  "runtime clamp with reversed bounds fails closed");
     }
@@ -1077,6 +1077,17 @@ void testExactBounds()
         = static_cast<std::uint16_t>(kMaximumControlInputs - 1);
     check(admit(control, error).has_value(),
           "highest valid control input index is admitted");
+    control.operations.front().parameter = 40; // the old hard bound was 32 controls
+    if (const auto wide = admit(control, error))
+    {
+        MaterialEvaluationInputs inputs;
+        inputs.controlCount = 41;
+        inputs.controls.assign(41, 0.0f);
+        inputs.controls[40] = 0.5f;
+        check(evaluateReference(*wide, inputs, error).has_value(),
+              "the forty-first runtime control evaluates");
+    }
+    else check(false, "a control index above the old 32-input bound is admitted");
     control.operations.front().parameter
         = static_cast<std::uint16_t>(kMaximumControlInputs);
     expectRejected(control, "control input limit exceeded",

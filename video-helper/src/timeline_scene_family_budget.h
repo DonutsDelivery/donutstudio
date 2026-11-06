@@ -60,7 +60,7 @@ inline bool sameTransform(const HarmonicMIDI::grid::SceneTransform3D& a,
 inline bool sameScene(const Scene& a,const Scene& b) noexcept {
   using namespace HarmonicMIDI::grid;
   if (a.schemaVersion!=b.schemaVersion || a.id!=b.id || a.activeCamera!=b.activeCamera
-      || !sameVector(a.ambientColor,b.ambientColor)
+      || !sameVector(a.ambientColor,b.ambientColor) || !sameSceneVolume(a.worldVolume,b.worldVolume)
       || a.vertexCount!=b.vertexCount || a.indexCount!=b.indexCount
       || a.objectCount!=b.objectCount || a.materialCount!=b.materialCount
       || a.textureCount!=b.textureCount || a.textureTexelCount!=b.textureTexelCount
@@ -90,6 +90,7 @@ inline bool sameScene(const Scene& a,const Scene& b) noexcept {
         || x.metallicRoughnessTexture!=y.metallicRoughnessTexture || x.normalTexture!=y.normalTexture
         || x.occlusionTexture!=y.occlusionTexture || x.emissiveTexture!=y.emissiveTexture
         || x.alphaMode!=y.alphaMode || x.doubleSided!=y.doubleSided
+        || !HarmonicMIDI::grid::sameSceneVolume(x.volume,y.volume)
         || !sameVector(x.baseColor,y.baseColor) || !sameVector(x.emissive,y.emissive)
         || !sameFloat(x.opacity,y.opacity) || !sameFloat(x.metallic,y.metallic)
         || !sameFloat(x.roughness,y.roughness) || !sameFloat(x.normalScale,y.normalScale)
@@ -111,14 +112,18 @@ inline bool sameScene(const Scene& a,const Scene& b) noexcept {
         || !sameFloat(x.range,y.range) || !sameFloat(x.innerConeAngle,y.innerConeAngle)
         || !sameFloat(x.outerConeAngle,y.outerConeAngle) || !sameAnalyticSky(x.sky,y.sky)
         || x.environmentCameraVisible!=y.environmentCameraVisible
+        || !sameCameraBackground(x.cameraBackground,y.cameraBackground)
         || !sameEnvironmentImage(x.environmentImage,y.environmentImage)
-        || !sameSpectralSource(x.spectralSource,y.spectralSource)) return false;
+        || !sameSpectralSource(x.spectralSource,y.spectralSource)
+        || !sameLightShapeAndVisibility(x,y)) return false;
   }
   for (std::size_t i=0;i<a.cameras.size();++i) {
     const auto& x=a.cameras[i]; const auto& y=b.cameras[i];
     if (x.id!=y.id || !sameTransform(x.transform,y.transform)
         || !sameFloat(x.verticalFovRadians,y.verticalFovRadians)
-        || !sameFloat(x.nearPlane,y.nearPlane) || !sameFloat(x.farPlane,y.farPlane)) return false;
+        || !sameFloat(x.nearPlane,y.nearPlane) || !sameFloat(x.farPlane,y.farPlane)
+        || !sameFloat(x.orthographicHeight,y.orthographicHeight)
+        || !sameCameraLens(x,y)) return false;
   }
   return true;
 }

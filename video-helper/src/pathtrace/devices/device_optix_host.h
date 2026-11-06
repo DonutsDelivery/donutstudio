@@ -5,6 +5,9 @@
 
 #include "../integrator.h"
 
+#include <cstdint>
+#include <string>
+
 namespace videohelper::pathtrace::device
 {
 
@@ -25,5 +28,29 @@ void cancelOptixPipelineBuild();
 // done or an export is blocked on it. A preview then waits by name until Start again.
 bool stopOptixPipelineBuildByUser();
 void startOptixPipelineBuildByUser();
+
+// One frame for the OptiX AI denoiser (Plan 3, Denoising). Every image is width *
+// height pixels of three floats, in any row order shared by all of them; flow has two.
+struct OptixDenoiseImage
+{
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    const float* color = nullptr;
+    const float* albedo = nullptr;
+    const float* normal = nullptr;  // camera space, as the temporal model reads it
+    float* output = nullptr;
+    // The temporal model, with the flow from the previous frame and that frame's
+    // output kept on the device. usePrevious false starts a new sequence.
+    bool temporal = false;
+    bool usePrevious = false;
+    const float* flow = nullptr;
+};
+
+// Why the OptiX AI denoiser cannot run now, or empty when it can: it needs the
+// context the OptiX device made, so a session that never started that device has none.
+std::string optixDenoiserProblem();
+// Uploads the frame, runs the AOV or temporal model with the albedo and normal
+// guides on the shared context and reads the output back. False with error.
+bool optixDenoise (const OptixDenoiseImage& image, std::string& error);
 
 } // namespace videohelper::pathtrace::device

@@ -1,3 +1,4 @@
+#include <limits>
 #include "../src/visual_plan_publication.h"
 #include "../src/viewport_telemetry_owner.h"
 
@@ -113,15 +114,20 @@ int main()
           "failed viewport admission rolls back without replacing the live snapshot");
 
     videowire::VisualPlanExecutionState exportAdmission;
-    std::vector<videowire::CompiledVisualLayerPlan> tooMany;
-    for (size_t i = 0; i <= videowire::VisualPlanExecutionState::kMaxAdmittedPlans; ++i)
-        tooMany.push_back(planFor(static_cast<int>(i + 1), 1));
+    std::vector<videowire::CompiledVisualLayerPlan> manyPlans;
+    for (size_t i = 0; i < 300; ++i)
+        manyPlans.push_back(planFor(static_cast<int>(i + 1), 1));
     diagnostic.clear();
-    check(! exportAdmission.admitPlans(tooMany, &diagnostic)
-          && diagnostic == "visual execution admission exceeds fixed plan capacity"
-          && exportAdmission.compiled(1, 1) == nullptr
-          && exportAdmission.telemetry().snapshot().failedLowerings == 1,
-          "export admission refuses over-capacity plans before installing partial state");
+    // The aggregate resource budget is a separate limit; open it so this checks the slot table.
+    videowire::VisualBackendResourceLimits openLimits;
+    openLimits.descriptors = openLimits.operations = openLimits.sceneRecords = openLimits.frameOutputs
+        = std::numeric_limits<size_t>::max();
+    openLimits.allocatedFrameBytes = std::numeric_limits<uint64_t>::max();
+    check(exportAdmission.admitPlans(manyPlans, &diagnostic, 1920, 1080, &openLimits)
+          && exportAdmission.compiled(1, 1) != nullptr
+          && exportAdmission.compiled(300, 1) != nullptr
+          && exportAdmission.telemetry().snapshot().failedLowerings == 0,
+          "export admission installs 300 plans, above the old 256-plan table");
 
     {
         // A describe reads what admission accounted instead of decoding the plan again.

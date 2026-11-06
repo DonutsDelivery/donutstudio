@@ -67,6 +67,16 @@ inline bool constructionCases(std::string& error)
             ||archive->plan.censusSetup.sourceMethods==0||archive->plan.censusSetup.byteControl==0
             ||archive->plan.metadataCopies<=7*sizeof(Plan))
         { error="Surface source retained setup omits construction metadata or control"; return false; }
+        // The retained plan carries byte control sized from its own stage bytes,
+        // and setupMatches compares against that number, not a fixed cap.
+        if(archive->plan.setupLimit.byteControl!=16*(archive->plan.scans+archive->plan.copies+archive->plan.count)
+            ||archive->plan.censusSetup.byteControl!=archive->plan.setupLimit.byteControl
+            ||archive->plan.setupLimit.byteControl>=restrictedSetupEnvelope().byteControl)
+        { error="Surface source plan byte control is not sized from its stages"; return false; }
+        {
+            auto tampered=archive->plan; ++tampered.setupLimit.byteControl;
+            if(setupMatches(tampered)) { error="Surface source setup matched a byte control the plan was not built with"; return false; }
+        }
         std::uint64_t capacity=0;
         for(std::size_t i=0;i<archive->plan.count;++i) capacity=add(capacity,archive->plan.stages[i].capacity);
         if(capacity!=archive->plan.capacity||archive->vertexOffset+7>archive->retainedCapacity||archive->fragmentOffset+12>archive->retainedCapacity
@@ -273,13 +283,13 @@ inline bool frameCases(std::string& error)
 {
     using namespace arbitgpu::surfacesource;
     try {
-        FrameAdmission ledger;
+        FrameAdmission ledger{renderpassoutput::kMaximumTotalBytes};
         constexpr std::uint64_t parent=4096,metadata=1024;
         const auto fixed=FrameAdmission::fixedCapacity(parent,metadata);
         if(fixed!=parent+sizeof(FrameAdmission)+metadata)
         {error="Surface frame fresh fixed capacity omits metadata or journal";return false;}
         for(const auto limit:{parent+sizeof(FrameAdmission),fixed-1}) {
-            FrameAdmission shortLedger;
+            FrameAdmission shortLedger{limit};
             bool refused=false;
             try {shortLedger.begin(parent,metadata,limit);}
             catch(const std::length_error&) {refused=true;}
@@ -323,7 +333,7 @@ inline bool frameCases(std::string& error)
         ledger.retire(shortAttempt);
         const auto work=ledger.work().copies;
         if(ledger.bytes()!=retained) {error="Surface frame failed unescaped payload did not retire exact storage";return false;}
-        FrameAdmission other;
+        FrameAdmission other{renderpassoutput::kMaximumTotalBytes};
         const auto foreign=other.begin(parent,metadata,renderpassoutput::kMaximumTotalBytes);
         refused=false;
         try {other.reserve(foreign,*census,parent,renderpassoutput::kMaximumTotalBytes);}

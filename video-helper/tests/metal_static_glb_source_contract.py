@@ -4,6 +4,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/gpu_backend/backend_sokol.mm"
+VIEWPORT_SOLID = ROOT / "src/gpu_backend/fixture_viewport_solid.h"
 CMAKE = ROOT / "CMakeLists.txt"
 RICH_TEST = ROOT / "tests/metal_rich_static_glb_backend_tests.mm"
 
@@ -17,7 +18,7 @@ class MetalStaticGlbSourceContractTests(unittest.TestCase):
         start = cls.source.index("class MetalFixtureSceneBackend final")
         end = cls.source.index("class MetalDeformationBackend final", start)
         cls.backend = cls.source[start:end]
-        shader_start = cls.source.index('const char* kFixtureVertexShader')
+        shader_start = cls.source.index('constexpr char kFixtureVertexShader[]')
         cls.shaders = cls.source[shader_start:start]
 
     def test_rich_scene_admission_and_exact_receipt_identity(self):
@@ -68,17 +69,24 @@ class MetalStaticGlbSourceContractTests(unittest.TestCase):
             "metalFixtureDeterminant3x3",
             "SG_FACEWINDING_CW",
             "SG_FACEWINDING_CCW",
-            "std::stable_sort (blendedDraws.begin(), blendedDraws.end()",
-            "drawOrder.push_back (objectIndex)",
+            "fixtureviewportsolid::drawOrder (drawCandidates, viewportXray)",
             "pipelineDesc.depth.write_enabled = blend == 0",
             "SG_BLENDFACTOR_SRC_ALPHA",
         ):
             self.assertIn(token, self.source)
+        # Opaque draws keep scene order; blended draws follow, stably back to front.
+        order = VIEWPORT_SOLID.read_text(encoding="utf-8")
+        for token in (
+            "if (! xray && ! candidates[index].blended)\n                order.push_back (index);",
+            "std::stable_sort (blended.begin(), blended.end(),",
+            "return left.first > right.first;",
+        ):
+            self.assertIn(token, order)
 
     def test_fixture_metal_uses_current_layout_and_resource_collections(self):
         for token in (
             "offsetof (FixtureUniforms, diffractionEnvironment) == 4224",
-            "sizeof (FixtureUniforms) == 8368",
+            "sizeof (FixtureUniforms) == 12016",
             "offsetof(FixtureUniforms, glassControl) == 6288",
             "offsetof(FixtureUniforms, glassReceivers) == 6320",
             "offsetof (FixtureUniforms, opaqueControl) == 6176",
@@ -94,7 +102,7 @@ class MetalStaticGlbSourceContractTests(unittest.TestCase):
         ):
             self.assertIn(token, self.source)
         for token in (
-            "validNativeFixtureDiffractionProgram (",
+            "validNativeFixtureMaterialPrograms(*materialProgram, *scene, NativeFixtureMaterialBackend::Metal",
             "static_cast<std::uint8_t> (slot)",
             "resources->pipelines[colorPipelineOffset + winding]",
             "return 1 + index * 2 + (srgb ? 1 : 0)",

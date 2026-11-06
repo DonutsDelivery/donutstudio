@@ -32,12 +32,14 @@ CERTIFIED = {
     "bsdf.h": (None, None),
     "bsdf.cpp": (None, None),
     "bvh.h": (None, "struct BvhNode"),
-    "scene_ingest.h": ("struct PinholeCamera", "bool makePinholeCamera"),
+    "bvh_traversal.h": (None, None),
+    "scene_ingest.h": ("PT_SHARED_FN Vec3 pointAtFrame", "bool makePinholeCamera"),
     "devices/device_tables.h": (None, None),
     "environment_map.h": ("class EnvironmentMapView", "class EnvironmentMap : public"),
     "environment_map.cpp": (None, None),
     "lights.h": ("struct EnvironmentField", "class LightSet : public"),
     "lights.cpp": (None, None),
+    "sky_cloud_volume.h": (None, None),
     "devices/device_interface.h": (None, None),
     "devices/integrator_body.inl": (None, None),
     "../diffraction_order_core.h": (None, None),
@@ -50,11 +52,13 @@ HOST_ONLY = {
     "spectrum.cpp": {"exportSpectrumTables"},
     "bsdf.h": {"exportGgxTables"},
     "bsdf.cpp": {"exportGgxTables"},
-    "bvh.h": {"prepareRay", "intersectTriangle"},    # the CPU BVH; OptiX traverses its GAS
+    "scene_ingest.h": {"ingestScene", "objectWorldMatrix", "transformMatrix"},  # scene build, declared
+                                                                            # beside the shutter helpers
+    "bvh.h": {"motionTriangleBounds"},              # the BVH build; traversal reads the built bounds
     "environment_map.cpp": {"valid", "copyEnvironmentPixels", "environmentImageTint",
                             "environmentImageOrientationRadians", "build", "clear", "refreshView",
                             "EnvironmentMap", "operator="},  # scene build; the device reads the built view
-    "lights.cpp": {"build", "clear", "refreshView", "sameAsset", "bindEnvironmentImage",
+    "lights.cpp": {"build", "clear", "refreshView", "sameAsset", "bindEnvironmentImage", "finiteProduct",
                    "LightSet", "operator="},         # scene build; the device reads the built view
 }
 
@@ -87,7 +91,8 @@ FORBIDDEN = {
 # Standard functions with device overloads or constexpr definitions.
 DEVICE_STD = {"sqrt", "fabs", "abs", "isfinite", "isinf", "isnan", "exp", "exp2", "log", "sin", "cos", "tan",
               "atan", "atan2", "acos", "asin", "floor", "ceil", "pow", "nextafter", "min", "max", "clamp",
-              "hypot", "quiet_NaN", "infinity", "max_digits10", "epsilon", "lowest", "denorm_min"}
+              "hypot", "copysign", "fmin", "quiet_NaN", "infinity", "max_digits10", "epsilon", "lowest",
+              "denorm_min"}
 # Constexpr functions outside the certified files. Under relaxed constexpr nvcc
 # compiles them for the device.
 DEVICE_CONSTEXPR = {"aluminiumIndexAt"}
@@ -244,7 +249,7 @@ type_like = set(re.findall(r"\b(?:struct|class|enum class|using)\s+(\w+)",
 
 ALLOWED_CALLS = annotated.keys() | KNOWN_BLOCKERS.keys() | DEVICE_CONSTEXPR | DEVICE_STD | DEVICE_BUILTINS | KEYWORDS | type_like
 # The body reaches its device through these shim members.
-ALLOWED_CALLS |= {"makeSampler", "intersect", "occluded", "filmAdd", "filmSplat", "filmCountLightPath"}
+ALLOWED_CALLS |= {"makeSampler", "intersect", "occluded", "filmAdd", "filmSplat", "filmCountLightPath", "filmGuide"}
 # A functor parameter of buildBsdf; its callers pass lambdas, which take the
 # device context of the function that writes them.
 ALLOWED_CALLS |= {"toColor"}

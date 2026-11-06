@@ -2153,6 +2153,12 @@ void FrameRenderer::releaseTargets()
     }
     exportPending_[0] = exportPending_[1] = false;
     exportPboBytes_ = 0;
+    if (exportRgba8Tex_ != 0)
+    {
+        glDeleteTextures (1, &exportRgba8Tex_);
+        exportRgba8Tex_ = 0;
+    }
+    exportRgba8W_ = exportRgba8H_ = 0;
 
     if (frameMapped_)
         endMappedReadback();
@@ -2619,6 +2625,7 @@ void FrameRenderer::shutdown()
     if (gl_ == nullptr)
         return;
     colorTransformGl_.shutdown();
+    yuvPlanesGl_.shutdown();
     releaseTargets();
     if (presentTex_ != 0) { glDeleteTextures (1, &presentTex_); presentTex_ = 0; presentW_ = presentH_ = 0; }
     if (fbo_ != 0) { gl_->DeleteFramebuffers (1, &fbo_); fbo_ = 0; }
@@ -5262,6 +5269,86 @@ bool FrameRenderer::renderToPixelsAsync (const LayerDesc* layers, int numLayers,
     gl_->BindBuffer (GL_PIXEL_PACK_BUFFER, 0);
     gl_->BindFramebuffer (GL_FRAMEBUFFER, 0);
     exportIdx_ = prev;
+    return true;
+}
+
+unsigned FrameRenderer::renderToExportTexture (const LayerDesc* layers, int numLayers, std::string& error,
+                                               const ImageLayerDesc* overlays, int numOverlays)
+{
+    if (gl_ == nullptr)
+    {
+        error = "renderer not initialized";
+        return 0;
+    }
+    const unsigned tex = renderComposite (layers, numLayers, overlays, numOverlays);
+    if (tex == 0)
+    {
+        error = lastError_.empty() ? "renderer produced no composite texture" : lastError_;
+        return 0;
+    }
+    if (exportRgba8Tex_ == 0 || exportRgba8W_ != outW_ || exportRgba8H_ != outH_)
+    {
+        if (exportRgba8Tex_ != 0)
+            glDeleteTextures (1, &exportRgba8Tex_);
+        exportRgba8Tex_ = createColorTransformTexture();  // RGBA8 at the output size
+        exportRgba8W_ = outW_;
+        exportRgba8H_ = outH_;
+    }
+    // The copy converts RGBA16F to unorm8 with the [0,1] clamp glReadPixels
+    // applies on the readback path, so both routes encode the same bytes.
+    GLint previousTexture = 0;
+    glGetIntegerv (GL_TEXTURE_BINDING_2D, &previousTexture);
+    gl_->BindFramebuffer (GL_FRAMEBUFFER, fbo_);
+    attachTarget (tex);
+    glBindTexture (GL_TEXTURE_2D, exportRgba8Tex_);
+    glCopyTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, 0, 0, outW_, outH_);
+    glBindTexture (GL_TEXTURE_2D, static_cast<unsigned> (previousTexture));
+    gl_->BindFramebuffer (GL_FRAMEBUFFER, 0);
+    return exportRgba8Tex_;
+}
+
+bool FrameRenderer::convertLastCompositeYuv (const videohelper::yuvencode::Conversion& conversion,
+                                             unsigned luma, unsigned chroma, std::string& error)
+{
+    if (gl_ == nullptr || lastCompositeFloatTexture_ == 0)
+    {
+        error = "GPU YUV conversion has no composite to convert";
+        return false;
+    }
+    if (conversion.transfer != videohelper::yuvencode::Transfer::Sdr
+        && (! hdrImageCapture_ || ! lastCompositeLinearScene_))
+    {
+        error = "GPU HDR conversion requires a live linear composite";
+        return false;
+    }
+    if (! yuvPlanesGl_.ready() && ! yuvPlanesGl_.initialize (const_cast<arbitgl::GlFuncs*> (gl_), error))
+        return false;
+    return luma == 0 && chroma == 0
+        ? yuvPlanesGl_.render (lastCompositeFloatTexture_, outW_, outH_, conversion, error)
+        : yuvPlanesGl_.renderInto (lastCompositeFloatTexture_, luma, chroma, outW_, outH_, conversion, error);
+}
+
+bool FrameRenderer::renderToExportYuv (const LayerDesc* layers, int numLayers,
+                                       const videohelper::yuvencode::Conversion& conversion,
+                                       unsigned& luma, unsigned& chroma, std::string& error,
+                                       const ImageLayerDesc* overlays, int numOverlays)
+{
+    if (gl_ == nullptr)
+    {
+        error = "renderer not initialized";
+        return false;
+    }
+    if (renderComposite (layers, numLayers, overlays, numOverlays) == 0)
+    {
+        error = lastError_.empty() ? "renderer produced no composite texture" : lastError_;
+        return false;
+    }
+    if (! convertLastCompositeYuv (conversion, luma, chroma, error))
+        return false;
+    if (luma != 0 || chroma != 0)
+        return true;
+    luma = yuvPlanesGl_.lumaTexture();
+    chroma = yuvPlanesGl_.chromaTexture();
     return true;
 }
 

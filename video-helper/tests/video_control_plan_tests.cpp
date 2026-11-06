@@ -87,9 +87,6 @@ int main()
         invalid["signalWindow"]["frameCount"] = "three";
         check(!videocontrol::parsePlanJson(invalid, plan, error), "invalid field type fails without throwing");
         invalid = wire;
-        invalid["operations"][0]["frameValues"] = std::vector<float>(videocontrol::kMaxSignalFrameValues + 1);
-        check(!videocontrol::parsePlanJson(invalid, plan, error), "frame value capacity rejected");
-        invalid = wire;
         invalid["version"] = 1;
         check(!videocontrol::parsePlanJson(invalid, plan, error), "legacy version cannot hide window data");
         {
@@ -185,11 +182,25 @@ int main()
 
     {
         videocontrol::Plan invalid;
-        invalid.numSlots = static_cast<int>(videocontrol::kMaxSlots + 1);
+        invalid.numSlots = -1;
         videocontrol::Executor executor;
         std::string error;
-        check(!executor.bind(invalid, error), "over-cap plan rejects atomically");
-        check(!error.empty(), "over-cap rejection carries a diagnostic");
+        check(!executor.bind(invalid, error), "negative slot count rejects atomically");
+        check(!error.empty(), "negative slot count rejection carries a diagnostic");
+    }
+
+    {
+        // No scene caps: 3000 slots, 3000 value operations and 600 sinks bind.
+        videocontrol::Plan large;
+        large.numSlots = 3000;
+        for (int slot = 0; slot < 3000; ++slot)
+            large.operations.push_back(valueOp(slot + 1, 0.5f, slot));
+        for (int sink = 0; sink < 600; ++sink)
+            large.operations.push_back(sinkOp(3001 + sink, sink));
+        videocontrol::Executor executor;
+        std::string error;
+        check(executor.bind(large, error), "a plan past the old 2048-slot and 128-sink caps binds");
+        check(videocontrol::sinkCount(large) == 600, "every sink of the large plan is counted");
     }
 
     {

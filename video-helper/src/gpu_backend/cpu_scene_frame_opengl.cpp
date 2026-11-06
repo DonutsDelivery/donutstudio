@@ -3,7 +3,9 @@
 
 #include <GLFW/glfw3.h>
 
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <limits>
 #include <new>
 
@@ -18,13 +20,39 @@ std::uint64_t nextCpuFrameGeneration() noexcept
     return (std::uint64_t { 1 } << 62) | (counter.fetch_add (1, std::memory_order_relaxed) + 1);
 }
 
+// Raw pass order of the raster's frames (renderpasscomposite::kInputs[2..7]).
+constexpr std::array<renderpassoutput::Output, 6> kPassOutputs {
+    renderpassoutput::Output::Normal, renderpassoutput::Output::Emission, renderpassoutput::Output::Mask,
+    renderpassoutput::Output::MaterialId, renderpassoutput::Output::ObjectId, renderpassoutput::Output::Motion };
+constexpr std::array<NativeTexturePixelFormat, 6> kPassFormats {
+    NativeTexturePixelFormat::Rgba16Float, NativeTexturePixelFormat::Rgba16Float, NativeTexturePixelFormat::R8Unorm,
+    NativeTexturePixelFormat::R32Uint, NativeTexturePixelFormat::R32Uint, NativeTexturePixelFormat::Rg16Float };
+
+// The bytes the frame's raw passes read back: the traced Color before any view
+// or composite, Depth and the six outputs, as the textures hold them.
+struct CpuScenePassBytes final
+{
+    std::vector<std::uint8_t> color;
+    std::vector<std::uint8_t> depth;
+    std::array<std::vector<std::uint8_t>, 6> passes;
+};
+
+template <typename T>
+std::vector<std::uint8_t> bytesOf (const std::vector<T>& values)
+{
+    std::vector<std::uint8_t> bytes (values.size() * sizeof (T));
+    if (! bytes.empty()) std::memcpy (bytes.data(), values.data(), bytes.size());
+    return bytes;
+}
+
 class OpenGlCpuSceneFrame final : public NativeFixtureSceneFrame
 {
 public:
-    OpenGlCpuSceneFrame (GLFWwindow* context, unsigned color, unsigned depth, std::uint32_t width,
-                         std::uint32_t height, bool linearColor) noexcept
-        : context_ (context), color_ (color), depth_ (depth), width_ (width), height_ (height),
-          linearColor_ (linearColor), generation_ (nextCpuFrameGeneration())
+    OpenGlCpuSceneFrame (GLFWwindow* context, unsigned color, unsigned depth, std::array<unsigned, 6> passes,
+                         std::uint32_t width, std::uint32_t height, bool linearColor,
+                         std::shared_ptr<const CpuScenePassBytes> bytes) noexcept
+        : context_ (context), color_ (color), depth_ (depth), passes_ (passes), width_ (width), height_ (height),
+          linearColor_ (linearColor), generation_ (nextCpuFrameGeneration()), bytes_ (std::move (bytes))
     {
     }
 
@@ -35,8 +63,9 @@ public:
         if (previous != context_) glfwMakeContextCurrent (context_);
         if (glfwGetCurrentContext() == context_)
         {
-            const unsigned textures[2] { color_, depth_ };
-            glDeleteTextures (2, textures);
+            const unsigned textures[8] { color_, depth_, passes_[0], passes_[1], passes_[2], passes_[3], passes_[4],
+                                         passes_[5] };
+            glDeleteTextures (8, textures);
         }
         if (previous != context_) glfwMakeContextCurrent (previous);
     }
@@ -64,15 +93,61 @@ public:
             colortransform::ColorSpace::Unspecified, colortransform::TransferFunction::Unspecified,
             NativeTextureRowOrder::BottomFirst };
     }
+    NativeTextureViewDescriptor passTextureDescriptor (renderpassoutput::Output output) const noexcept override
+    {
+        for (std::size_t i = 0; i < kPassOutputs.size(); ++i)
+            if (kPassOutputs[i] == output && passes_[i] != 0)
+                return { backend_, NativeTextureViewKind::Texture2D, kPassFormats[i], passes_[i], passes_[i],
+                    width_, height_, 1, true, reinterpret_cast<std::uintptr_t> (context_), generation_,
+                    colortransform::ColorSpace::Unspecified, colortransform::TransferFunction::Unspecified,
+                    NativeTextureRowOrder::BottomFirst };
+        return NativeFixtureSceneFrame::passTextureDescriptor (output);
+    }
+    // From the bytes the textures were made of, so no context is needed.
+    bool readRawPass (renderpassoutput::Output output, NativeRawPassPixels& pixels, std::string& error) const override
+    {
+        pixels = {};
+        const std::vector<std::uint8_t>* bytes = nullptr;
+        NativeTexturePixelFormat format = NativeTexturePixelFormat::Invalid;
+        if (bytes_ != nullptr && output == renderpassoutput::Output::Color)
+        {
+            bytes = &bytes_->color;
+            format = linearColor_ ? NativeTexturePixelFormat::Rgba16Float : NativeTexturePixelFormat::Rgba8Unorm;
+        }
+        else if (bytes_ != nullptr && output == renderpassoutput::Output::Depth)
+        {
+            bytes = &bytes_->depth;
+            format = NativeTexturePixelFormat::R32Float;
+        }
+        else if (bytes_ != nullptr)
+            for (std::size_t i = 0; i < kPassOutputs.size(); ++i)
+                if (kPassOutputs[i] == output && passes_[i] != 0)
+                {
+                    bytes = &bytes_->passes[i];
+                    format = kPassFormats[i];
+                }
+        if (bytes == nullptr || bytes->empty())
+        {
+            error = "Path Trace frame has no " + std::string (renderpassoutput::token (output)) + " output";
+            return false;
+        }
+        pixels.format = format;
+        pixels.width = width_;
+        pixels.height = height_;
+        pixels.bytes = *bytes;
+        return true;
+    }
 
 private:
     GLFWwindow* context_ = nullptr;
     unsigned color_ = 0;
     unsigned depth_ = 0;
+    std::array<unsigned, 6> passes_ {};
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
     bool linearColor_ = false;
     std::uint64_t generation_ = 0;
+    std::shared_ptr<const CpuScenePassBytes> bytes_;
     const std::string backend_ = "opengl";
 };
 
@@ -126,14 +201,16 @@ bool uploadTexture (unsigned texture, int internalFormat, unsigned format, unsig
 // Restores everything the frame layer pass changes.
 struct LayerPassState final
 {
-    explicit LayerPassState (const arbitgl::GlFuncs& gl) : gl_ (gl)
+    // additive: the layer pass adds onto its target. Otherwise blending is off,
+    // as the resolve pass writes each pixel once.
+    LayerPassState (const arbitgl::GlFuncs& gl, int units, bool additive) : gl_ (gl), units_ (units)
     {
         glGetIntegerv (GL_FRAMEBUFFER_BINDING, &framebuffer_);
         glGetIntegerv (GL_VIEWPORT, viewport_);
         glGetIntegerv (GL_CURRENT_PROGRAM, &program_);
         glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &vertexArray_);
         glGetIntegerv (GL_ACTIVE_TEXTURE, &activeTexture_);
-        for (int unit = 0; unit < 3; ++unit)
+        for (int unit = 0; unit < units_; ++unit)
         {
             gl_.ActiveTexture (GL_TEXTURE0 + static_cast<unsigned> (unit));
             glGetIntegerv (GL_TEXTURE_BINDING_2D, &textures_[unit]);
@@ -149,8 +226,11 @@ struct LayerPassState final
             enabled_[index] = glIsEnabled (switches()[index]);
         for (std::size_t index = 0; index < kSwitches; ++index)
             glDisable (switches()[index]);
-        glEnable (GL_BLEND);
-        gl_.BlendFuncSeparate (GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+        if (additive)
+        {
+            glEnable (GL_BLEND);
+            gl_.BlendFuncSeparate (GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+        }
         glColorMask (GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     }
     ~LayerPassState()
@@ -161,7 +241,7 @@ struct LayerPassState final
         glColorMask (colorMask_[0], colorMask_[1], colorMask_[2], colorMask_[3]);
         gl_.BlendFuncSeparate (static_cast<unsigned> (blend_[0]), static_cast<unsigned> (blend_[1]),
                                static_cast<unsigned> (blend_[2]), static_cast<unsigned> (blend_[3]));
-        for (int unit = 0; unit < 3; ++unit)
+        for (int unit = 0; unit < units_; ++unit)
         {
             gl_.ActiveTexture (GL_TEXTURE0 + static_cast<unsigned> (unit));
             glBindTexture (GL_TEXTURE_2D, static_cast<unsigned> (textures_[unit]));
@@ -185,8 +265,9 @@ private:
         return values;
     }
     const arbitgl::GlFuncs& gl_;
+    int units_ = 0;
     int framebuffer_ = 0, viewport_[4] { 0, 0, 0, 0 }, program_ = 0, vertexArray_ = 0, activeTexture_ = GL_TEXTURE0;
-    int textures_[3] { 0, 0, 0 }, samplers_[3] { 0, 0, 0 }, blend_[4] { GL_ONE, GL_ZERO, GL_ONE, GL_ZERO };
+    int textures_[8] {}, samplers_[8] {}, blend_[4] { GL_ONE, GL_ZERO, GL_ONE, GL_ZERO };
     GLboolean colorMask_[4] { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
     GLboolean enabled_[kSwitches] {};
 };
@@ -233,7 +314,8 @@ struct FrameLayerProgram final
     int light = -1, uvCoverage = -1, frame = -1, frameBottomFirst = -1, frameLinear = -1, background = -1;
 };
 
-unsigned compileLayerShader (const arbitgl::GlFuncs& gl, unsigned stage, const char* source, std::string& error)
+unsigned compileLayerShader (const arbitgl::GlFuncs& gl, unsigned stage, const char* source, const char* what,
+                             std::string& error)
 {
     const unsigned shader = gl.CreateShader (stage);
     gl.ShaderSource (shader, 1, &source, nullptr);
@@ -244,37 +326,44 @@ unsigned compileLayerShader (const arbitgl::GlFuncs& gl, unsigned stage, const c
     char log[1024] {};
     gl.GetShaderInfoLog (shader, sizeof (log), nullptr, log);
     gl.DeleteShader (shader);
-    error = std::string ("Path Trace frame layer shader did not compile: ") + log;
+    error = std::string ("Path Trace ") + what + " shader did not compile: " + log;
     return 0;
+}
+
+unsigned linkLayerProgram (const arbitgl::GlFuncs& gl, const char* vertexSource, const char* fragmentSource,
+                           const char* what, std::string& error)
+{
+    const unsigned vertex = compileLayerShader (gl, GL_VERTEX_SHADER, vertexSource, what, error);
+    if (vertex == 0) return 0;
+    const unsigned fragment = compileLayerShader (gl, GL_FRAGMENT_SHADER, fragmentSource, what, error);
+    if (fragment == 0)
+    {
+        gl.DeleteShader (vertex);
+        return 0;
+    }
+    unsigned program = gl.CreateProgram();
+    gl.AttachShader (program, vertex);
+    gl.AttachShader (program, fragment);
+    gl.LinkProgram (program);
+    gl.DeleteShader (vertex);
+    gl.DeleteShader (fragment);
+    int linked = 0;
+    gl.GetProgramiv (program, GL_LINK_STATUS, &linked);
+    if (linked == 0)
+    {
+        char log[1024] {};
+        gl.GetProgramInfoLog (program, sizeof (log), nullptr, log);
+        gl.DeleteProgram (program);
+        error = std::string ("Path Trace ") + what + " shader did not link: " + log;
+        return 0;
+    }
+    return program;
 }
 
 bool buildLayerProgram (const arbitgl::GlFuncs& gl, FrameLayerProgram& out, std::string& error)
 {
-    const unsigned vertex = compileLayerShader (gl, GL_VERTEX_SHADER, kFrameLayerVertex, error);
-    if (vertex == 0) return false;
-    const unsigned fragment = compileLayerShader (gl, GL_FRAGMENT_SHADER, kFrameLayerFragment, error);
-    if (fragment == 0)
-    {
-        gl.DeleteShader (vertex);
-        return false;
-    }
-    out.program = gl.CreateProgram();
-    gl.AttachShader (out.program, vertex);
-    gl.AttachShader (out.program, fragment);
-    gl.LinkProgram (out.program);
-    gl.DeleteShader (vertex);
-    gl.DeleteShader (fragment);
-    int linked = 0;
-    gl.GetProgramiv (out.program, GL_LINK_STATUS, &linked);
-    if (linked == 0)
-    {
-        char log[1024] {};
-        gl.GetProgramInfoLog (out.program, sizeof (log), nullptr, log);
-        gl.DeleteProgram (out.program);
-        out.program = 0;
-        error = std::string ("Path Trace frame layer shader did not link: ") + log;
-        return false;
-    }
+    out.program = linkLayerProgram (gl, kFrameLayerVertex, kFrameLayerFragment, "frame layer", error);
+    if (out.program == 0) return false;
     gl.GenVertexArrays (1, &out.vertexArray);
     out.light = gl.GetUniformLocation (out.program, "uLight");
     out.uvCoverage = gl.GetUniformLocation (out.program, "uUvCoverage");
@@ -289,7 +378,7 @@ bool buildLayerProgram (const arbitgl::GlFuncs& gl, FrameLayerProgram& out, std:
 bool drawFrameLayers (const arbitgl::GlFuncs& gl, const FrameLayerProgram& program, unsigned color,
                       const CpuSceneImage& image, std::string& error)
 {
-    const LayerPassState state (gl);
+    const LayerPassState state (gl, 3, true);
     const UploadState unpack (gl);
     unsigned framebuffer = 0;
     gl.GenFramebuffers (1, &framebuffer);
@@ -335,6 +424,77 @@ bool drawFrameLayers (const arbitgl::GlFuncs& gl, const FrameLayerProgram& progr
     gl.DeleteFramebuffers (1, &framebuffer);
     return drawn;
 }
+struct PassResolveProgram final
+{
+    unsigned program = 0;
+    unsigned vertexArray = 0;
+};
+
+bool buildPassResolveProgram (const arbitgl::GlFuncs& gl, PassResolveProgram& out, std::string& error)
+{
+    const std::string fragment = fixturePassResolveFragmentSource();
+    out.program = linkLayerProgram (gl, fixturePassResolveVertexSource(), fragment.c_str(), "pass resolve", error);
+    if (out.program == 0) return false;
+    gl.GenVertexArrays (1, &out.vertexArray);
+    return true;
+}
+
+bool resolveRequested (const CpuSceneImage& image) noexcept
+{
+    return image.imageOutput != renderpassoutput::Output::Color || image.passProgram.count > 0;
+}
+
+// The raster's resolve (backend_opengl.cpp, the diffraction and caustic routes):
+// Color, Depth and the six outputs in, the Image view or the pass composite out,
+// into target. Pixels the mask leaves empty keep the clear.
+bool drawPassResolve (const arbitgl::GlFuncs& gl, const PassResolveProgram& program,
+                      const std::array<unsigned, 8>& inputs, const CpuSceneImage& image, unsigned target,
+                      std::string& error)
+{
+    const LayerPassState state (gl, 8, false);
+    unsigned framebuffer = 0;
+    gl.GenFramebuffers (1, &framebuffer);
+    gl.BindFramebuffer (GL_FRAMEBUFFER, framebuffer);
+    gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
+    const unsigned drawBuffer = GL_COLOR_ATTACHMENT0;
+    gl.DrawBuffers (1, &drawBuffer);
+    bool drawn = gl.CheckFramebufferStatus (GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (! drawn)
+        error = "Path Trace pass resolve target is not renderable";
+    if (drawn)
+    {
+        glViewport (0, 0, static_cast<int> (image.width), static_cast<int> (image.height));
+        gl.ClearBufferfv (GL_COLOR, 0, image.resolveClear.data());
+        gl.UseProgram (program.program);
+        gl.BindVertexArray (program.vertexArray);
+        static const char* const samplers[8] { "uAccumulatedColor", "uLinearDepth", "uRawNormal", "uRawEmission",
+                                               "uRawMask", "uRawMaterialId", "uRawObjectId", "uRawMotion" };
+        for (unsigned unit = 0; unit < 8; ++unit)
+        {
+            gl.ActiveTexture (GL_TEXTURE0 + unit);
+            glBindTexture (GL_TEXTURE_2D, inputs[unit]);
+            gl.Uniform1i (gl.GetUniformLocation (program.program, samplers[unit]), static_cast<int> (unit));
+        }
+        const auto location = [&] (const char* name) { return gl.GetUniformLocation (program.program, name); };
+        auto pass = renderpasscomposite::gpuProgram (image.passProgram);
+        pass.control[2] = image.linearColor ? 1.0f : 0.0f;
+        pass.control[3] = 0.0f;
+        gl.Uniform4fv (location ("uPassProgramControl"), 1, pass.control.data());
+        gl.Uniform4fv (location ("uPassModes[0]"), 8, pass.modes[0].data());
+        gl.Uniform4fv (location ("uPassColors[0]"), 8, pass.colors[0].data());
+        gl.Uniform4fv (location ("uPassReferences[0]"), 8, pass.references[0].data());
+        gl.Uniform4fv (location ("uPassTransforms[0]"), 8, pass.transforms[0].data());
+        gl.Uniform4f (location ("uMotionViewport"), static_cast<float> (image.width), static_cast<float> (image.height),
+                      0.0f, 0.0f);
+        gl.Uniform1i (location ("uImageOutput"), static_cast<int> (image.imageOutput));
+        glDrawArrays (GL_TRIANGLES, 0, 3);
+        drawn = glGetError() == GL_NO_ERROR;
+        if (! drawn)
+            error = "Path Trace pass resolve draw was refused by the OpenGL driver";
+    }
+    gl.DeleteFramebuffers (1, &framebuffer);
+    return drawn;
+}
 } // namespace
 
 std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
@@ -365,6 +525,22 @@ std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
             error = "Path Trace frame layer does not match its image or this OpenGL context";
             return nullptr;
         }
+    const bool outputs = image.normal != nullptr;
+    if (outputs
+        && (image.emission == nullptr || image.mask == nullptr || image.materialId == nullptr
+            || image.objectId == nullptr || image.motion == nullptr
+            || image.normal->size() != pixels * 4u || image.emission->size() != pixels * 4u
+            || image.mask->size() != pixels || image.materialId->size() != pixels
+            || image.objectId->size() != pixels || image.motion->size() != pixels * 2u))
+    {
+        error = "Path Trace render outputs do not match their image";
+        return nullptr;
+    }
+    if (! outputs && resolveRequested (image))
+    {
+        error = "Path Trace Image view or pass composite has no render outputs to read";
+        return nullptr;
+    }
     auto* context = glfwGetCurrentContext();
     if (context == nullptr)
     {
@@ -376,11 +552,13 @@ std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
     thread_local GLFWwindow* loadedContext = nullptr;
     thread_local arbitgl::GlFuncs gl;
     thread_local FrameLayerProgram layerProgram;
+    thread_local PassResolveProgram resolveProgram;
     if (loadedContext != context)
     {
         std::string missing;
         loadedContext = nullptr;
         layerProgram = {};
+        resolveProgram = {};
         if (! arbitgl::loadGlFunctions (gl, missing))
         {
             error = "Path Trace upload could not load OpenGL functions: " + missing;
@@ -389,26 +567,46 @@ std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
         loadedContext = context;
     }
     for (int drained = 0; drained < 16 && glGetError() != GL_NO_ERROR; ++drained) {}
-    unsigned textures[2] { 0, 0 };
-    glGenTextures (2, textures);
-    if (textures[0] == 0 || textures[1] == 0)
-    {
-        glDeleteTextures (2, textures);
-        error = "Path Trace upload could not allocate textures";
-        return nullptr;
-    }
+    // Color, Depth, the six outputs, and the resolve target.
+    std::array<unsigned, 9> textures {};
+    const auto release = [&] { glDeleteTextures (static_cast<int> (textures.size()), textures.data()); };
+    const std::size_t count = outputs ? (resolveRequested (image) ? 9u : 8u) : 2u;
+    glGenTextures (static_cast<int> (count), textures.data());
+    for (std::size_t index = 0; index < count; ++index)
+        if (textures[index] == 0)
+        {
+            release();
+            error = "Path Trace upload could not allocate textures";
+            return nullptr;
+        }
     bool uploaded = false;
     {
         const UploadState state (gl);
-        uploaded = uploadTexture (textures[0], image.linearColor ? GL_RGBA16F : GL_RGBA8, GL_RGBA,
-                                  image.linearColor ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE,
-                                  image.width, image.height, image.color->data())
+        const int colorFormat = image.linearColor ? GL_RGBA16F : GL_RGBA8;
+        const unsigned colorType = image.linearColor ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE;
+        uploaded = uploadTexture (textures[0], colorFormat, GL_RGBA, colorType, image.width, image.height,
+                                  image.color->data())
             && uploadTexture (textures[1], GL_R32F, GL_RED, GL_FLOAT, image.width, image.height,
                               image.depth->data());
+        if (uploaded && outputs)
+            uploaded = uploadTexture (textures[2], GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, image.width, image.height,
+                                      image.normal->data())
+                && uploadTexture (textures[3], GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, image.width, image.height,
+                                  image.emission->data())
+                && uploadTexture (textures[4], GL_R8, GL_RED, GL_UNSIGNED_BYTE, image.width, image.height,
+                                  image.mask->data())
+                && uploadTexture (textures[5], GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, image.width, image.height,
+                                  image.materialId->data())
+                && uploadTexture (textures[6], GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, image.width, image.height,
+                                  image.objectId->data())
+                && uploadTexture (textures[7], GL_RG16F, GL_RG, GL_HALF_FLOAT, image.width, image.height,
+                                  image.motion->data());
+        if (uploaded && count == 9u)
+            uploaded = uploadTexture (textures[8], colorFormat, GL_RGBA, colorType, image.width, image.height, nullptr);
     }
     if (! uploaded)
     {
-        glDeleteTextures (2, textures);
+        release();
         error = "Path Trace upload was refused by the OpenGL driver";
         return nullptr;
     }
@@ -416,17 +614,44 @@ std::shared_ptr<const NativeFixtureSceneFrame> uploadCpuSceneFrame (
         && ((layerProgram.program == 0 && ! buildLayerProgram (gl, layerProgram, error))
             || ! drawFrameLayers (gl, layerProgram, textures[0], image, error)))
     {
-        glDeleteTextures (2, textures);
+        release();
         return nullptr;
+    }
+    // The Image view or composite replaces the traced colour on the Image; raw
+    // Color still reads the traced one.
+    if (count == 9u)
+    {
+        const std::array<unsigned, 8> inputs { textures[0], textures[1], textures[2], textures[3], textures[4],
+                                               textures[5], textures[6], textures[7] };
+        if ((resolveProgram.program == 0 && ! buildPassResolveProgram (gl, resolveProgram, error))
+            || ! drawPassResolve (gl, resolveProgram, inputs, image, textures[8], error))
+        {
+            release();
+            return nullptr;
+        }
+        glDeleteTextures (1, &textures[0]);
+        textures[0] = textures[8];
+        textures[8] = 0;
     }
     try
     {
-        return std::make_shared<const OpenGlCpuSceneFrame> (context, textures[0], textures[1], image.width,
-                                                            image.height, image.linearColor);
+        std::shared_ptr<CpuScenePassBytes> bytes;
+        if (outputs)
+        {
+            bytes = std::make_shared<CpuScenePassBytes>();
+            bytes->color = *image.color;
+            bytes->depth = bytesOf (*image.depth);
+            bytes->passes = { bytesOf (*image.normal), bytesOf (*image.emission), *image.mask,
+                              bytesOf (*image.materialId), bytesOf (*image.objectId), bytesOf (*image.motion) };
+        }
+        return std::make_shared<const OpenGlCpuSceneFrame> (
+            context, textures[0], textures[1],
+            std::array<unsigned, 6> { textures[2], textures[3], textures[4], textures[5], textures[6], textures[7] },
+            image.width, image.height, image.linearColor, std::move (bytes));
     }
     catch (const std::bad_alloc&)
     {
-        glDeleteTextures (2, textures);
+        release();
         error = "Path Trace frame allocation failed";
         return nullptr;
     }

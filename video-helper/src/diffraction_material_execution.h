@@ -137,7 +137,9 @@ inline PhysicalDiffractionGpuParameters makeGpuParameters(
     parameters.coating = {
         description.coating.thicknessNanometres,
         description.coating.opticalConstants.refractiveIndex,
-        description.coating.opticalConstants.extinctionCoefficient, 0.0f
+        description.coating.opticalConstants.extinctionCoefficient,
+        // A pressed disc's track: Realtime's orders and pit scatter read it.
+        description.pitStatistics == PitStatistics::PressedDisc ? 1.0f : 0.0f
     };
     parameters.roughness = {
         description.roughness.rmsHeightNanometres,

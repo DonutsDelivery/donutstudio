@@ -2,6 +2,8 @@
 
 #include "particle_rotating_exact_scalar.h"
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 
 namespace videorender::rotatingplane
 {
@@ -52,9 +54,9 @@ struct Cost {
     static constexpr std::uint64_t first(unsigned n,unsigned vertices,unsigned triangles)
     {
         using C=rotatingexact::Cost;
-        return supported(n) && vertices<=256 && triangles<=128
+        return supported(n)
             ? 20*C::decode(n)+15*C::multiply(n)+24*C::add(n)+16*C::compare(n)
-                +13*C::shift(n)+84+3*vertices+3*triangles:C::unavailable;
+                +13*C::shift(n)+84+3*std::uint64_t(vertices)+3*std::uint64_t(triangles):C::unavailable;
     }
     static constexpr std::uint64_t face(unsigned n)
     {
@@ -114,7 +116,7 @@ inline bool certificate(const Input& input,const Mesh& mesh,unsigned n,Workspace
 {
     using namespace rotatingexact;
     if (!rotatingplane::Cost::supported(n) || !mesh.positions || !mesh.indices || !mesh.vertices
-        || !mesh.triangles || mesh.vertices>256 || mesh.triangles>128 || input.normalAxis>2)
+        || !mesh.triangles || mesh.triangles>std::numeric_limits<unsigned>::max()/3 || input.normalAxis>2)
         return false;
     const unsigned g=rotatingplane::Cost::grid(n),k=input.normalAxis,i=(k+1)%3,j=(k+2)%3;
     const auto overlaps=[&workspace](const void* data,std::size_t bytes) {

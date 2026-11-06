@@ -48,7 +48,7 @@ require(opengl, "| (causticVolume != nullptr && distinctGrating == nullptr ? sta
         "OpenGL fragment feature mask")
 require(opengl, "const bool causticVolume = smoothGlass && (features & kFixtureFragmentCausticVolume) != 0;",
         "fixtureFragmentShaderSource")
-require(opengl, "smoothglass::transportShader (false, true, false, causticVolume)", "fixtureFragmentShaderSource")
+require(opengl, "smoothglass::transportShader (false, true, false, causticVolume, cameraVisits)", "fixtureFragmentShaderSource")
 require_count(opengl, "smoothglass::transportShader (false, true)", 0, "fixtureFragmentShaderSource unpaired call")
 # The uniform is looked up, required only by the paired variant, and uploaded per draw.
 require(opengl, 'uniforms.glassTransport2 = location("uGlassTransport2");', "OpenGL uniform lookup")
@@ -62,11 +62,11 @@ require_count(opengl,
 
 # Metal: the same routing, through both fragment composition paths.
 require(sokol, "const bool pairedVolume=causticVolume!=nullptr && distinctGrating==nullptr;", "Metal paired flag")
-require(sokol, "restrictedSurfaceSourceRecipe<surfacesource::Source>(pairedVolume);", "Metal restricted source")
+require(sokol, "restrictedSurfaceSourceRecipe<surfacesource::Source>(pairedVolume,cameraVisits);", "Metal restricted source")
 require(sokol, "sourceCreation->pairedVolume=pairedVolume;", "Metal source creation")
-require(sokol, "+arbitgpu::smoothglass::transportShaderRecipe<String>(true,true,false,pairedVolume)", "Metal restricted recipe")
-require(sokol, "smoothglass::transportShader(true,true,false,pairedVolume)", "Metal fragment source")
-require(sokol, "smoothglass::transportShader(true,true,false,creation.pairedVolume)", "Metal surface source oracle")
+require(sokol, "+arbitgpu::smoothglass::transportShaderRecipe<String>(true,true,false,pairedVolume,cameraVisits)", "Metal restricted recipe")
+require(sokol, "smoothglass::transportShader(true,true,false,pairedVolume,cameraVisits)", "Metal fragment source")
+require(sokol, "smoothglass::transportShader(true,true,false,creation.pairedVolume,creation.cameraVisits)", "Metal surface source oracle")
 require_count(sokol, "if(pairedVolume) declarePairedFixtureUniform(", 2, "Metal paired fragment declarations")
 require(sokol, "if(creation.pairedVolume) declarePairedFixtureUniform(fragment);", "Metal surface source oracle")
 require(sokol, "smoothglass::cameraTransport(resources->smoothGlass, drawObject.id,", "Metal per-draw transport")
@@ -84,16 +84,21 @@ if fixture is None:
     errors.append("FixtureUniforms is missing")
 else:
     members = [line.strip() for line in fixture.group(1).splitlines() if line.strip() and not line.strip().startswith("//")]
-    if members[-1] != "float glassTransport2[4];":
-        errors.append("glassTransport2 must be the last FixtureUniforms member, found " + members[-1])
+    # Motion's prior model matrix follows the medium and fog (4895a6eeee).
+    if members[-3:] != ["float medium[10][4];", "float worldFog[5][4];", "float previousObjectMatrix[16];"] \
+            or "float glassTransport2[4];" not in members:
+        errors.append("the material medium, world fog and prior model matrix must end FixtureUniforms, after glassTransport2, found " + members[-1])
 require(sokol, "&& offsetof (FixtureUniforms, stamLayer) == 11536", "FixtureUniforms layout")
 require(sokol, "&& offsetof (FixtureUniforms, glassTransport2) == 11648", "FixtureUniforms layout")
-require(sokol, "&& sizeof (FixtureUniforms) == 11664,", "FixtureUniforms layout")
+require(sokol, "&& offsetof (FixtureUniforms, medium) == 11712", "FixtureUniforms layout")
+require(sokol, "&& offsetof (FixtureUniforms, worldFog) == 11872", "FixtureUniforms layout")
+require(sokol, "&& offsetof (FixtureUniforms, previousObjectMatrix) == 11952", "FixtureUniforms layout")
+require(sokol, "&& sizeof (FixtureUniforms) == 12016,", "FixtureUniforms layout")
 require(sokol, '"    float4 vertexDisplacementLimits[16];\\n    float4 stamLayer[7];\\n    float4 glassTransport2;\\n};"',
         "Metal paired declaration")
 # A layered program never takes the restricted archive, and composes with a volume in the general source.
-require(sokol, "SurfacePbr) && !layered;", "Metal restricted archive excludes layered programs")
-require(sokol, "+(layered ? arbitgpu::stamlayer::metalShader() : std::string()));", "Metal layered module in the general source")
+require(sokol, "SurfacePbr) && !layered && !media;", "Metal restricted archive excludes layered programs")
+require(sokol, "+(layered ? arbitgpu::stamlayer::metalShader() : std::string())\n", "Metal layered module in the general source")
 
 fragment = re.search(r'constexpr char kFixtureFragmentShader\[\] = R"metal\((.*?)\)metal";', sokol, re.S)
 if fragment is None:
@@ -131,9 +136,12 @@ require(header, ": prepared.causticVolume.present ? kMaximumPixelRayQueries/kPai
 require(header, "inline constexpr std::size_t kMaximumPairRayVisits = 16;", "pair walk visit bound")
 require(header, "inline constexpr std::uint64_t kPairPixelRayQueries = 2 + 3*kMaximumPairRayVisits;", "pair pixel query count")
 require(header, "static_assert(kMaximumPairRayVisits == 16,", "pair walk visit assertion")
-require(header, "static_assert(kMaximumRayVisits == 64,", "glassTransport visit assertion")
+# The camera walk runs GLASS_CAMERA_VISITS visits, the authored setting with
+# kMaximumRayVisits as its default (scene wire extension 19).
+require(header, "inline constexpr std::size_t kMaximumRayVisits = 64;", "glassTransport default visits")
+require(header, "for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {", "glassTransport visit loop")
 require_count(header, "for(int visit=0;visit<48;++visit) {", 1, "glassPairWalk visit loop")
-require(header, "bool pairedVolume = false)", "transportShaderRecipe")
+require(header, "bool pairedVolume = false,\n                                                           std::uint32_t cameraVisits = CameraWalkBudget{}.singleVisits)", "transportShaderRecipe")
 
 # The paired walk visits the heaviest pending branch first. Branches left at the
 # visit or slot bound end without a query: in air through the environment,
@@ -350,7 +358,7 @@ for needle in ("nativeSurfaceRequiresBlend(nativeSurfaceForObject(root, object.i
     require(blend_test, needle, "blended draw test mirrors the per-draw blend rule")
 # The per-draw rule it mirrors, on both backends.
 for label, text in (("OpenGL", opengl), ("Metal", sokol)):
-    require(text, "const auto alphaMode = nativeSurfaceRequiresBlend(drawProgram) || (!resources->instanceAppearances.empty()",
+    require(text, "const auto alphaMode = viewportXray || nativeSurfaceRequiresBlend(drawProgram) || (!resources->instanceAppearances.empty()",
             label + " per-draw blend rule")
 # Raw pass export reads the same Color texture the compositor samples, so it is not gated.
 require(header, "// Raw pass export needs no gate.", "raw export encoding note")

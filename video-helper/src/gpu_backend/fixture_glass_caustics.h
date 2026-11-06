@@ -2,6 +2,7 @@
 
 #include "fixture_smooth_glass.h"
 #include "fixture_diffraction_transport.h"
+#include "glass_caustic_history.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -42,27 +43,43 @@ inline constexpr std::size_t kEntrySubdivisions = 4;
 // thinned by thinEntrySamples, which keeps its total area, so this sets caustic
 // sampling density and not which meshes can cast.
 inline constexpr std::size_t kMaximumEntrySamples = 128*kEntrySubdivisions*kEntrySubdivisions;
-// Smooth macro paths keep a 64-bit reflection history, so 48 interfaces fit.
-// Rough, multiple-scatter and grating paths store one ancestry byte per
-// interface in kMacroAncestryBytes and keep the older 32 interface ceiling.
+// Smooth macro paths keep a reflection history sized from the policy
+// (glass_caustic_history.h), four inline words plus a tail past 128 interfaces.
+// Multiple-scatter paths store one ancestry byte per interface: 32 inline in
+// kMacroAncestryBytes and the rest in the tail (ResourceBounds). Grating
+// incidents keep 32 inline tokens and a history tail sized from the policy.
 // A branch policy is only bounded by these caps; policy 32 behaves as before.
-inline constexpr std::size_t kMaximumInterfaces = 48;
+// Smooth paths carry one history bit per interface in words sized from the
+// policy (glass_caustic_history.h). The bound is the largest count deposit
+// texel 0.z stores exactly as a float, not a scene limit; memory is the limit.
+inline constexpr std::size_t kMaximumInterfaces = 16777215;
 inline constexpr std::size_t kMaximumAncestryInterfaces = kMacroAncestryBytes;
 inline constexpr std::size_t kDefaultPolicyInterfaces = 32;
-static_assert(kMaximumInterfaces<64, "Smooth caustic reflection history is one uint64 bit per interface");
 static_assert(kMaximumAncestryInterfaces<=kMaximumInterfaces && kMaximumAncestryInterfaces==32,
-    "Ancestry, camera-trace and grating layouts hold 32 interfaces");
-inline constexpr std::uint64_t kMaximumQueryWork = 128ull*1024ull*1024ull;
+    "Ancestry, camera-trace and grating layouts hold 32 inline tokens");
 // Worst-case query work of one native frame is, per path, the source and entry
 // queries plus three per visit (the visit and two camera queries per possible
 // deposit), times the BVH allowance. It grows with the scene and assumes every
-// query visits every BVH node and triangle. Only a total that does not fit 64
-// bits refuses. CPU diagnostic traces, grating bindings and multiple-scatter
-// frames keep kMaximumQueryWork.
+// query visits every BVH node and triangle. Work is not capped: this is the
+// overflow bound, a quarter of 64 bits so the checked sums of up to four
+// charges stay exact. Only a total past it refuses, for every frame kind.
+inline constexpr std::uint64_t kMaximumQueryWork = 1ull<<62;
 inline constexpr float kRayMinimum = 1.0e-5f;
 inline constexpr std::uint32_t kBranchPolicyVersion = 1;
-inline constexpr std::size_t kMaximumBranchVisits = smoothglass::kMaximumRayVisits;
-inline constexpr std::size_t kMaximumPendingBranches = 16;
+// Visits per path come from the branch policy. The bound is the largest count
+// a receipt float stores exactly, not a scene limit; 64 is only the default.
+inline constexpr std::size_t kMaximumBranchVisits = 16777215;
+inline constexpr std::size_t kDefaultBranchVisits = 64;
+// Incident locators and record counts are receipt floats too, so they share
+// that exact bound whatever the visit count multiplies out to.
+inline constexpr std::uint32_t kMaximumExactReceiptCount = 16777215;
+// Pending branches per path come from the policy too. Both native walks keep the
+// stack in the path tail, kPendingBranchTexels texels per entry sized from it, so
+// the bound is the visit bound (a depth-first walk never holds more than visits+1),
+// not a scene limit; 16 is only the default.
+inline constexpr std::size_t kMaximumPendingBranches = kMaximumBranchVisits;
+inline constexpr std::size_t kDefaultPendingBranches = 16;
+inline constexpr std::size_t kPendingBranchTexels = 9;
 // Match the existing smooth-glass maximum accumulated tail. A caustic caller
 // must explicitly admit its own policy; this is not an implicit authored value.
 // The ordinary scene-source overload binds this exact policy to its immutable
@@ -80,7 +97,7 @@ struct MultipleScatterPolicy
     // At most 64 weighted macro visits reserve half the path tail for this
     // walk, leaving half for macro truncation. The final frame gate still owns
     // the measured sum, including any caller-selected different policy.
-    float maximumResidual = kMaximumUnresolvedFraction/(2*kMaximumBranchVisits);
+    float maximumResidual = kMaximumUnresolvedFraction/(2*kDefaultBranchVisits);
 };
 inline bool validMultipleScatterPolicy(const MultipleScatterPolicy& policy)
 {
@@ -89,8 +106,8 @@ inline bool validMultipleScatterPolicy(const MultipleScatterPolicy& policy)
         && policy.maximumExits<=smoothglass::kMaximumMicrofacetExits && std::isfinite(policy.maximumResidual)
         && policy.maximumResidual>0 && policy.maximumResidual<=kMaximumUnresolvedFraction;
 }
-// Count event evaluations and random draws as additional work in the existing
-// 128 Mi work authority. This does not admit queue expansion or a native frame.
+// Count event evaluations and random draws as additional work under the same
+// overflow bound. This does not admit queue expansion or a native frame.
 inline bool multipleScatterWorkWithinBounds(std::uint64_t queryWork,std::uint64_t interfaces,
     const MultipleScatterPolicy& policy,std::uint64_t& combinedWork)
 {
@@ -146,8 +163,8 @@ struct BranchPolicyDescription
 {
     std::uint32_t version = 0;
     float maximumUnresolvedFraction = 0, minimumBranchFraction = 0;
-    std::size_t maximumInterfaces = kDefaultPolicyInterfaces, maximumVisits = kMaximumBranchVisits;
-    std::size_t maximumPending = kMaximumPendingBranches;
+    std::size_t maximumInterfaces = kDefaultPolicyInterfaces, maximumVisits = kDefaultBranchVisits;
+    std::size_t maximumPending = kDefaultPendingBranches;
 };
 class AdmittedBranchPolicy final
 {
@@ -330,9 +347,8 @@ inline bool calculateDepositionSchedule(std::uint32_t width,std::uint32_t height
     candidate.scratchBytes=2*candidate.paddedKeyCount*sizeof(DepositionKey);
     candidate.largestBufferBytes=std::max({candidate.paddedKeyCount*sizeof(DepositionKey),
         candidate.pixelCount*kAccumulatorBytesPerPixel,maximumDeposits*kDepositReceiptStride*sizeof(Texel)});
-    if(candidate.scratchBytes>renderpassoutput::kMaximumTotalBytes
-        || candidate.largestBufferBytes>renderpassoutput::kMaximumTotalBytes)
-        return refuse("Glass caustic deposition storage exceeds the whole-frame budget");
+    // Each buffer is checked against the device's own buffer limit at its
+    // allocation site (admitDepositionDevice, openGlCausticLimitFailure).
     output=candidate;error.clear();return true;
 }
 struct DeviceDepositionLimits
@@ -508,8 +524,8 @@ inline bool calculateSplatSchedule(std::uint32_t width,std::uint32_t height,std:
     // Two key arrays, a begin/end pair per tile and one float normaliser per slot.
     candidate.scratchBytes=2*candidate.paddedKeyCount*sizeof(DepositionKey)
         +candidate.tilesX*candidate.tilesY*2*sizeof(std::uint32_t)+maximumDeposits*sizeof(float);
-    if(candidate.scratchBytes>renderpassoutput::kMaximumTotalBytes)
-        return refuse("Glass caustic splat storage exceeds the whole-frame budget");
+    // The key, tile and normaliser buffers are checked against the device's
+    // buffer limit where they are allocated (Metal maxBufferLength, GL splat limits).
     output=candidate;error.clear();return true;
 }
 // Inclusive window of a deposit pixel, clipped to the image.
@@ -531,7 +547,37 @@ struct ResourceBounds
     // Zero for legacy frames. Separate optical work consumes the same query
     // budget; temporary storage reserves every pending ancestry and exit array.
     std::uint64_t combinedWork = 0, microfacetWork = 0, microfacetTemporaryBytes = 0;
+    // Smooth reflection history words 4 and up, sized from the branch policy's
+    // interface count, and the path-receipt tail texels that hold them: one block
+    // per deposit slot and maximumPending+1 branch blocks per path, then the
+    // pending branch stack, kPendingBranchTexels per entry.
+    std::uint64_t historyExtraWords = 0, historyTexels = 0;
+    // Multiple-scatter ancestry tokens for interfaces 32 and up, four per word,
+    // stored in the same tail blocks after the history words.
+    std::uint64_t ancestryExtraWords = 0;
+    // The branch policy's interface count, which sizes grating incident tails.
+    std::uint64_t policyInterfaces = 0;
 };
+// Ancestry tail words for a multiple-scatter policy of this many interfaces.
+inline std::uint64_t ancestryTailWords(std::size_t interfaces)
+{
+    return interfaces>kMacroAncestryBytes?(interfaces-kMacroAncestryBytes+3)/4:0;
+}
+// Texels of the path tail for this many paths, deposits, extra words and pending
+// branches: the history blocks, two words per texel, then each path's pending
+// stack. Refuses only a total past 64 bits.
+inline bool historyTailTexels(std::uint64_t paths,std::uint64_t deposits,std::uint64_t extraWords,
+    std::uint64_t pending,std::uint64_t& texels)
+{
+    constexpr auto maximum=std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t block=(extraWords+1)/2;
+    if(pending>=maximum/kPendingBranchTexels || (paths && pending+1>maximum/paths))return false;
+    const std::uint64_t branches=paths*(pending+1),stack=paths*pending*kPendingBranchTexels;
+    if(deposits>maximum-branches || (block && deposits+branches>maximum/block))return false;
+    const std::uint64_t history=(deposits+branches)*block;
+    if(history>maximum-stack)return false;
+    texels=history+stack;return true;
+}
 // An optional adjunct to the released v3 closest-hit payload. No query/upload,
 // path or deposit bytes change. Native producers must derive the witness from
 // their actual closest hit and these exact frozen authored vertices, never a
@@ -571,7 +617,21 @@ struct GratingTriangleWitness
 struct GratingIncidentBounds
 {
     std::uint64_t maximumIncidents=0,maximumOrders=0,queryWork=0,orderWork=0,combinedWork=0,bytes=0;
+    // Reflection history words 2 and up per incident, sized from the policy
+    // (gratingIncidentHistoryTailWords). Zero at 64 interfaces or fewer.
+    std::uint64_t historyTailWords=0;
 };
+// Incident texel 1 holds history words 0 and 1. A policy past 64 interfaces
+// adds words 2..historyWordsFor-1 after the incident records, as 16-bit halves
+// like texel 1, so records of 64 interfaces or fewer keep their bytes.
+constexpr std::size_t gratingIncidentHistoryTailWords(std::size_t interfaces)
+{
+    return interfaces>64?historyWordsFor(interfaces)-2:0;
+}
+constexpr std::size_t gratingIncidentHistoryTailTexels(std::size_t interfaces)
+{
+    return (gratingIncidentHistoryTailWords(interfaces)+1)/2;
+}
 struct GratingIncidentBinding;
 struct NativeGratingReadback;
 struct Frame
@@ -1239,7 +1299,7 @@ inline bool selectCamera(const Prepared& prepared,const NativeFixtureSceneRuntim
     if(camera.id!=owner->id || !validFixtureCameraOverride(camera))
     {error="Glass caustic camera does not retain its exact active owner";return false;}
     if(runtime) camera=runtimeCameraRecord(camera,runtime->cameraTranslationOffset,
-        runtime->cameraRotationDegrees,runtime->cameraVerticalFovDegrees);
+        runtime->cameraRotationDegrees,runtime->cameraVerticalFovDegrees,runtime->cameraLens);
     if(!validFixtureCameraOverride(camera)) {error="Glass caustic evaluated camera is invalid";return false;}
     sceneaov::detail::Writer writer;writer.u32(camera.id.value);sceneaov::detail::writeTransform(writer,camera.transform);
     for(float v:{camera.verticalFovRadians,camera.nearPlane,camera.farPlane})writer.f32(v);
@@ -1278,6 +1338,9 @@ inline std::string frameIdentity(const Prepared& prepared,const Frame& frame)
     }
     word(identity,frame.width);word(identity,frame.height);word(identity,frame.scheduling.version);word(identity,frame.scheduling.entrySubdivisions);
     word(identity,frame.bounds.queryWork);word(identity,frame.bounds.maximumDeposits);word(identity,frame.bounds.transientBytes);
+    // Frames of 128 or fewer interfaces keep their identity unchanged.
+    if(frame.bounds.historyExtraWords)word(identity,frame.bounds.historyExtraWords);
+    if(frame.bounds.ancestryExtraWords)word(identity,frame.bounds.ancestryExtraWords);
     if(frame.multipleScatterPolicy) {
         word(identity,frame.bounds.combinedWork);word(identity,frame.bounds.microfacetWork);word(identity,frame.bounds.microfacetTemporaryBytes);
     }
@@ -1334,7 +1397,7 @@ inline bool calculateResourceBounds(const Prepared& prepared,const Frame& frame,
     for(unsigned i=0;i<2;++i)if(!std::isfinite(allowance[i]) || allowance[i]<0 || allowance[i]>=65536 || std::floor(allowance[i])!=allowance[i])
         return refuse("Glass caustic native query allowance is invalid");
     const auto work=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
-    const auto visits=prepared.branchPolicy?prepared.branchPolicy->description().maximumVisits:kMaximumBranchVisits;
+    const auto visits=prepared.branchPolicy?prepared.branchPolicy->description().maximumVisits:kDefaultBranchVisits;
     // Per path, source/entry plus visits and two camera queries per possible
     // deposit. CPU diagnostic traversals check their own budget when they run.
     ResourceBounds candidate;
@@ -1345,6 +1408,14 @@ inline bool calculateResourceBounds(const Prepared& prepared,const Frame& frame,
         return refuse("Glass caustic native path/camera query work does not fit 64 bits: "
             +std::to_string(queryCount)+" queries at "+std::to_string(work)+" work");
     candidate.queryWork=queryCount*work;candidate.maximumDeposits=std::uint64_t(frame.work.size())*visits;
+    candidate.policyInterfaces=prepared.branchPolicy?prepared.branchPolicy->description().maximumInterfaces:0;
+    candidate.historyExtraWords=historyWordsFor(candidate.policyInterfaces)-kHistoryWords;
+    if(frame.multipleScatterPolicy && prepared.branchPolicy)
+        candidate.ancestryExtraWords=ancestryTailWords(prepared.branchPolicy->description().maximumInterfaces);
+    const std::uint64_t pendingBranches=prepared.branchPolicy?prepared.branchPolicy->description().maximumPending:0;
+    if(!historyTailTexels(frame.work.size(),candidate.maximumDeposits,
+        candidate.historyExtraWords+candidate.ancestryExtraWords,pendingBranches,candidate.historyTexels))
+        return refuse("Glass caustic path tail for "+std::to_string(pendingBranches)+" pending branches does not fit 64 bits");
     if(frame.multipleScatterPolicy) {
         if(!multipleScatterWorkWithinBounds(candidate.queryWork,candidate.maximumDeposits,*frame.multipleScatterPolicy,candidate.combinedWork))
             return refuse("Glass caustic combined query and microfacet work exceeds budget");
@@ -1360,15 +1431,18 @@ inline bool calculateResourceBounds(const Prepared& prepared,const Frame& frame,
     if(!calculateDepositionSchedule(frame.width,frame.height,candidate.maximumDeposits,candidate.deposition,error))return false;
     // Native scratch and completed host readback coexist at the atomic gate.
     // Reserve each once; uploaded source/query tables are charged separately.
+    // The sum only has to stay representable: each native buffer meets the
+    // device's own allocation limit where it is created.
     const auto add=[&](std::uint64_t count,std::uint64_t stride) {
-        if(count>renderpassoutput::kMaximumTotalBytes/stride
-            || candidate.transientBytes>renderpassoutput::kMaximumTotalBytes-count*stride)return false;
+        if(count>UINT64_MAX/stride
+            || candidate.transientBytes>UINT64_MAX-count*stride)return false;
         candidate.transientBytes+=count*stride;return true;
     };
     if(!add(std::uint64_t(frame.width)*frame.height,2*kAccumulatorBytesPerPixel)
         || !add(frame.workTexels.size(),sizeof(Texel)) || !add(frame.triangleTexels.size(),sizeof(Texel))
         || !add(frame.query.texels.size(),sizeof(Texel)) || !add(frame.work.size(),2*kPathReceiptStride*sizeof(Texel))
         || !add(candidate.maximumDeposits,2*kDepositReceiptStride*sizeof(Texel))
+        || !add(candidate.historyTexels,2*sizeof(Texel))
         || !add(candidate.deposition.scratchBytes,1)
         || !add(candidate.maximumDeposits,128) || !add(frame.work.size(),64)
         // Appended host fields occupy storage even in unmarked legacy frames.
@@ -1388,14 +1462,15 @@ inline bool calculateResourceBounds(const Prepared& prepared,const Frame& frame,
         // The splat words are always reserved: admission bounds a single-pixel
         // frame, and enableSplat keeps those bounds while lengthening the identity.
         || !add(reservedFrameIdentityBytes(prepared,frame),4))
-        return refuse("Glass caustic native scratch exceeds the checked whole-frame memory budget");
+        return refuse("Glass caustic native scratch total overflows 64 bits");
     output=candidate;error.clear();return true;
 }
 inline bool admitFrameMemory(const Frame& frame,std::uint64_t otherOwnedBytes,std::uint64_t& output,std::string& error)
 {
-    if(frame.bounds.transientBytes>renderpassoutput::kMaximumTotalBytes
-        || otherOwnedBytes>renderpassoutput::kMaximumTotalBytes-frame.bounds.transientBytes)
-    {error="Glass caustic scratch plus retained native frame resources exceeds budget";return false;}
+    // A frame total only has to stay representable; the device refuses an
+    // allocation it cannot hold where that allocation is made.
+    if(otherOwnedBytes>UINT64_MAX-frame.bounds.transientBytes)
+    {error="Glass caustic scratch plus retained native frame resources overflows 64 bits";return false;}
     output=otherOwnedBytes+frame.bounds.transientBytes;error.clear();return true;
 }
 inline bool validateTables(const Prepared& prepared,const Frame& frame,std::string& error,bool gratingPrerequisite=false,
@@ -1421,9 +1496,8 @@ inline bool buildFrameImpl(const Prepared& prepared, const std::vector<opaquevis
     // The absorber rule exists in the smooth CPU, GL and Metal tracers. Rough
     // volumes also need the camera rough schedule to follow the volume, not
     // the thin camera dielectric, so they stay refused here.
-    if(prepared.branchPolicy && (candidate.roughness!=0 || multipleScatterPolicy || candidate.gratingStaging)
-        && prepared.branchPolicy->description().maximumInterfaces>kMaximumAncestryInterfaces)
-        return refuse("Glass caustic rough, multiple-scatter and grating paths admit at most 32 interfaces");
+    // Grating incidents carry the full reflection history in a tail sized from
+    // the policy; ancestry tokens past 32 follow from that history.
     if(prepared.absorber.isValid() && (candidate.roughness!=0 || multipleScatterPolicy || prepared.glass.distinctGrating))
         return refuse("Glass caustics beside a thin camera dielectric require a smooth closed volume");
     if(!selectCamera(prepared,runtime,candidate.camera,candidate.cameraIdentity,error))return false;
@@ -1491,7 +1565,7 @@ inline bool buildFrameImpl(const Prepared& prepared, const std::vector<opaquevis
     const auto work=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
     // The native per-path bound calculateResourceBounds reserves. The CPU
     // diagnostic traces are not admitted here; they check their own budget.
-    const auto visits=prepared.branchPolicy?prepared.branchPolicy->description().maximumVisits:kMaximumBranchVisits;
+    const auto visits=prepared.branchPolicy?prepared.branchPolicy->description().maximumVisits:kDefaultBranchVisits;
     const auto queries=std::uint64_t(candidate.entries.size())*8*candidate.interfaceSamples*(2+3*std::uint64_t(visits));
     if (!work)return refuse("Glass caustic finite path query allowance is invalid");
     if (queries>std::numeric_limits<std::uint64_t>::max()/work)
@@ -1685,6 +1759,8 @@ inline bool validateTables(const Prepared& prepared,const Frame& frame,std::stri
     if(bounds.queryWork!=frame.bounds.queryWork || bounds.maximumDeposits!=frame.bounds.maximumDeposits || bounds.transientBytes!=frame.bounds.transientBytes
         || bounds.combinedWork!=frame.bounds.combinedWork || bounds.microfacetWork!=frame.bounds.microfacetWork
         || bounds.microfacetTemporaryBytes!=frame.bounds.microfacetTemporaryBytes
+        || bounds.historyExtraWords!=frame.bounds.historyExtraWords || bounds.historyTexels!=frame.bounds.historyTexels
+        || bounds.ancestryExtraWords!=frame.bounds.ancestryExtraWords || bounds.policyInterfaces!=frame.bounds.policyInterfaces
         || !(bounds.deposition==frame.bounds.deposition))
     {error="Glass caustic native resource reservation changed";return false;}
     for(unsigned band=0;band<8;++band)
@@ -1768,8 +1844,8 @@ inline bool validateTables(const Prepared& prepared,const Frame& frame,std::stri
     {error="Glass caustic native work table changed";return false;}
     error.clear();return true;
 }
-// CPU diagnostic traces run on the host, so they keep kMaximumQueryWork
-// instead of the native frame bound. queries is the trace's worst-case count.
+// CPU diagnostic traces share the overflow bound of native frames. queries is
+// the trace's worst-case count.
 inline bool diagnosticQueryWorkWithinBudget(const Frame& frame,std::uint64_t queries,std::string& error)
 {
     const auto root=std::size_t(frame.query.control[0]);
@@ -1801,7 +1877,7 @@ struct BranchDeposit
     opaquevisibility::ClosestHit receiver;
     Point incidentDirection {};
     double fraction = 0;
-    std::uint64_t reflectionHistory = 0;
+    CausticHistory reflectionHistory {};
     std::size_t interfaces = 0, reflections = 0;
     unsigned band = 0;
 };
@@ -1810,7 +1886,7 @@ struct BranchInterfaceReceipt
     opaquevisibility::ClosestHit surface;
     Point incomingDirection {};
     double incidentFraction = 0, reflectedFraction = 0, transmittedFraction = 0;
-    std::uint64_t reflectionHistory = 0;
+    CausticHistory reflectionHistory {};
     std::size_t depth = 0;
     bool inside = false, tir = false;
     Point facetNormal {};
@@ -1845,7 +1921,7 @@ inline bool traceBranches(const Prepared& prepared,const Frame& frame,const Entr
     {
         Point origin,direction;
         double fraction;
-        std::uint64_t history;
+        CausticHistory history;
         std::size_t interfaces,reflections;
         bool inside;
     };
@@ -1934,7 +2010,7 @@ inline bool traceBranches(const Prepared& prepared,const Frame& frame,const Entr
             if(fraction<policy.minimumBranchFraction || pending.size()>=policy.maximumPending)
             {candidate.unresolvedFraction+=fraction;return;}
             pending.push_back({advance(hit.position,normal,reflection?bias(hit.position):-bias(hit.position)),direction,
-                fraction,path.history|(reflection?(std::uint64_t(1)<<path.interfaces):0),path.interfaces+1,
+                fraction,path.history.with(path.interfaces,reflection),path.interfaces+1,
                 path.reflections+(reflection?1:0),reflection?path.inside:!path.inside});
         };
         append(optics.reflected,reflected,true);
@@ -1985,14 +2061,44 @@ struct PixelFootprint
     std::uint32_t x = 0, y = 0;
     float linearDepth = 0, worldArea = 0;
 };
+// The x of the native uProjection uniform: the tangent of half the vertical field of
+// view, or minus half the view height for an orthographic camera.
+inline float cameraProjectionX(const HarmonicMIDI::grid::SceneCameraRecord& camera)
+{return camera.orthographic()?-.5f*camera.orthographicHeight:std::tan(camera.verticalFovRadians*.5f);}
 inline Point cameraPosition(const Frame& frame)
 {return {frame.camera.transform.translation.x,frame.camera.transform.translation.y,frame.camera.transform.translation.z};}
+// An orthographic camera (orthographicHeight above zero) casts parallel rays along its
+// view axis, one from each pixel's point on the camera plane. cameraOrigin is that
+// point, and the camera position itself for a perspective camera.
 inline Point cameraRay(const Frame& frame,float x,float y)
 {
+    if(frame.camera.orthographic()) {
+        const auto forward=rotateSceneVector(frame.camera.transform.rotation,{0,0,-1});
+        Point ray{forward.x,forward.y,forward.z};normalize(ray);return ray;
+    }
     const float tangent=std::tan(frame.camera.verticalFovRadians*.5f),aspect=float(frame.width)/frame.height;
     const auto rotated=rotateSceneVector(frame.camera.transform.rotation,
         {(2*x/frame.width-1)*tangent*aspect,(1-2*y/frame.height)*tangent,-1});
     Point ray{rotated.x,rotated.y,rotated.z};normalize(ray);return ray;
+}
+inline Point cameraOrigin(const Frame& frame,float x,float y)
+{
+    auto origin=cameraPosition(frame);
+    if(!frame.camera.orthographic())return origin;
+    const float half=.5f*frame.camera.orthographicHeight,aspect=float(frame.width)/frame.height;
+    const auto offset=rotateSceneVector(frame.camera.transform.rotation,
+        {(2*x/frame.width-1)*half*aspect,(1-2*y/frame.height)*half,0});
+    return {origin[0]+offset.x,origin[1]+offset.y,origin[2]+offset.z};
+}
+// Where the camera's ray to a world point starts: the camera, or the point's
+// projection onto an orthographic camera's plane.
+inline Point cameraEndpointOrigin(const Frame& frame,const Point& point)
+{
+    auto origin=cameraPosition(frame);
+    if(!frame.camera.orthographic())return origin;
+    const auto forward=rotateSceneVector(frame.camera.transform.rotation,{0,0,-1});
+    const float along=(point[0]-origin[0])*forward.x+(point[1]-origin[1])*forward.y+(point[2]-origin[2])*forward.z;
+    return {point[0]-forward.x*along,point[1]-forward.y*along,point[2]-forward.z*along};
 }
 // One nominated triangle and pixel only. These geometric candidates establish
 // no native ownership, visibility, union coverage or radiometric contribution.
@@ -2004,6 +2110,8 @@ struct CameraCellGeometry
     std::array<Vertex,9> vertices{};
     std::size_t vertexCount=0;
     std::uint32_t camera=0,x=0,y=0,object=0,material=0,instance=0,triangle=0;
+    // Steradians for a perspective camera. An orthographic camera stores areas on
+    // its camera plane in both, so clipped/pixel stays the coverage fraction.
     double worldArea=0,clippedSolidAngle=0,pixelSolidAngle=0;
 };
 inline bool prepareCameraCellGeometry(const Frame& frame,const Triangle& triangle,
@@ -2026,6 +2134,11 @@ inline bool prepareCameraCellGeometry(const Frame& frame,const Triangle& triangl
         for(auto& v:value)v/=length;
         return finiteVertex(value);
     };
+    // An orthographic camera's rays are parallel, so its cell measures are areas on
+    // the camera plane instead of solid angles: the pixel's own area, and the
+    // clipped polygon projected along the view axis. Their ratio is the same
+    // coverage fraction either way.
+    const bool orthographic=frame.camera.orthographic();
     const auto originPoint=cameraPosition(frame);const V origin{originPoint[0],originPoint[1],originPoint[2]};
     std::array<V,3> points{};
     for(unsigned i=0;i<3;++i) {
@@ -2049,17 +2162,21 @@ inline bool prepareCameraCellGeometry(const Frame& frame,const Triangle& triangl
     // Top-left, bottom-left, bottom-right, top-right gives the front-facing
     // receiver's oriented winding. Reuse the released perspective ray formula.
     for(unsigned i=0;i<4;++i) {
-        const auto ray=cameraRay(frame,float(x)+(i>=2),float(y)+(i==1||i==2));
+        const float cornerX=float(x)+(i>=2),cornerY=float(y)+(i==1||i==2);
+        const auto ray=cameraRay(frame,cornerX,cornerY);
         rays[i]={ray[0],ray[1],ray[2]};if(!unit(rays[i]))return refuse("Camera cell boundary ray is invalid");
+        // Each orthographic corner ray starts at its own point on the camera plane.
+        const auto startPoint=cameraOrigin(frame,cornerX,cornerY);
+        const V start=subtract(V{startPoint[0],startPoint[1],startPoint[2]},origin);
         const double denominator=inner(normal,rays[i]);
         // Match the existing footprint's conservative horizon/distance bound.
         // Actual near/far clipping below uses linear camera depth, not ray range.
         if(denominator>=-1e-6||inner(forward,rays[i])<=0)
             return refuse("Camera cell pixel crosses a backface, grazing plane or receiver horizon");
-        const double distance=planeDistance/denominator;
+        const double distance=(planeDistance-inner(normal,start))/denominator;
         if(!std::isfinite(distance)||distance<=0||distance>double(frame.camera.farPlane)*1e4)
             return refuse("Camera cell plane footprint is behind the camera or unbounded");
-        for(unsigned a=0;a<3;++a)polygon[i][a]=rays[i][a]*distance;
+        for(unsigned a=0;a<3;++a)polygon[i][a]=start[a]+rays[i][a]*distance;
         if(!finiteVertex(polygon[i]))return refuse("Camera cell plane intersection is nonfinite");
     }
     const auto solidTriangle=[&](V a,V b,V c,double& angle) {
@@ -2070,12 +2187,24 @@ inline bool prepareCameraCellGeometry(const Frame& frame,const Triangle& triangl
     };
     CameraCellGeometry candidate;candidate.camera=frame.camera.id.value;candidate.x=x;candidate.y=y;
     candidate.object=triangle.object;candidate.material=triangle.material;candidate.instance=triangle.instance;candidate.triangle=triangle.triangle;
-    for(unsigned i=1;i<3;++i) {
-        double angle=0;if(!solidTriangle(rays[0],rays[i],rays[i+1],angle))return refuse("Camera cell pixel solid angle is singular");
-        candidate.pixelSolidAngle+=angle;
+    // The orthographic measure: area on the camera plane, along the view axis.
+    const auto projectedTriangle=[&](V a,V b,V c,double& area) {
+        area=.5*std::abs(inner(forward,exterior(subtract(b,a),subtract(c,a))));
+        return std::isfinite(area);
+    };
+    if(orthographic) {
+        const double height=double(frame.camera.orthographicHeight);
+        candidate.pixelSolidAngle=(height/frame.height)*(height*double(frame.width)/frame.height/frame.width);
+        if(!std::isfinite(candidate.pixelSolidAngle)||candidate.pixelSolidAngle<=0)
+            return refuse("Camera cell orthographic pixel area is singular");
+    } else {
+        for(unsigned i=1;i<3;++i) {
+            double angle=0;if(!solidTriangle(rays[0],rays[i],rays[i+1],angle))return refuse("Camera cell pixel solid angle is singular");
+            candidate.pixelSolidAngle+=angle;
+        }
+        if(candidate.pixelSolidAngle<=0||candidate.pixelSolidAngle>=2*3.14159265358979323846)
+            return refuse("Camera cell pixel solid angle is outside the perspective hemisphere");
     }
-    if(candidate.pixelSolidAngle<=0||candidate.pixelSolidAngle>=2*3.14159265358979323846)
-        return refuse("Camera cell pixel solid angle is outside the perspective hemisphere");
     const auto clip=[&](V inward,double offset) {
         if(!count)return true;
         std::array<V,9> clipped{};std::size_t next=0;
@@ -2114,7 +2243,8 @@ inline bool prepareCameraCellGeometry(const Frame& frame,const Triangle& triangl
     for(std::size_t i=1;i+1<count;++i) {
         const double area=.5*std::abs(inner(normal,exterior(subtract(polygon[i],polygon[0]),subtract(polygon[i+1],polygon[0]))));
         double angle=0;
-        if(!std::isfinite(area)||!solidTriangle(polygon[0],polygon[i],polygon[i+1],angle))
+        if(!std::isfinite(area)||!(orthographic?projectedTriangle(polygon[0],polygon[i],polygon[i+1],angle)
+            :solidTriangle(polygon[0],polygon[i],polygon[i+1],angle)))
             return refuse("Camera cell clipped measures are nonfinite or singular");
         candidate.worldArea+=area;candidate.clippedSolidAngle+=angle;
     }
@@ -2231,7 +2361,9 @@ inline bool projectReceiverFootprint(const Frame& frame,const opaquevisibility::
     const auto local=rotate(inverse,rotation.w,delta);
     const double depth=-local[2],width=frame.width,height=frame.height;
     const double nearPlane=frame.camera.nearPlane,farPlane=frame.camera.farPlane;
-    const double tangent=std::tan(double(frame.camera.verticalFovRadians)*.5),aspect=width/height;
+    const bool orthographic=frame.camera.orthographic();
+    const double tangent=orthographic?0.0:std::tan(double(frame.camera.verticalFovRadians)*.5),aspect=width/height;
+    const double half=.5*double(frame.camera.orthographicHeight);
     // Native depth carries float32 roundoff of the camera and receiver coordinates,
     // bounded by 8 unit roundoffs (8 x 2^-24) of the largest absolute coordinate.
     const double coordinateScale=std::max({std::abs(camera[0]),std::abs(camera[1]),std::abs(camera[2]),
@@ -2240,12 +2372,18 @@ inline bool projectReceiverFootprint(const Frame& frame,const opaquevisibility::
     PixelFootprint candidate;candidate.linearDepth=float(depth);
     if(!std::isfinite(depth)) {error="Glass caustic camera projection is nonfinite";return false;}
     const auto unprojected=[&]{output=candidate;areaTolerance=0;error.clear();return true;};
-    const double px=(local[0]/(depth*tangent*aspect)+1)*.5*width,py=(1-local[1]/(depth*tangent))*.5*height;
+    const double px=orthographic?(local[0]/(half*aspect)+1)*.5*width:(local[0]/(depth*tangent*aspect)+1)*.5*width;
+    const double py=orthographic?(1-local[1]/half)*.5*height:(1-local[1]/(depth*tangent))*.5*height;
     const bool inside=depth>=nearPlane && depth<=farPlane && px>=0 && py>=0 && px<width && py<height;
     if(depth>=nearPlane && depth<=farPlane && (!std::isfinite(px) || !std::isfinite(py))) {error="Glass caustic camera projection is nonfinite";return false;}
     const auto ray=[&](double x,double y) {
-        auto r=rotate(q,rotation.w,D3{(2*x/width-1)*tangent*aspect,(1-2*y/height)*tangent,-1});
+        auto r=orthographic?rotate(q,rotation.w,D3{0,0,-1})
+            :rotate(q,rotation.w,D3{(2*x/width-1)*tangent*aspect,(1-2*y/height)*tangent,-1});
         const double length=std::sqrt(dot3(r,r));for(auto& a:r)a/=length;return r;
+    };
+    // An orthographic ray starts at its film point on the camera plane, relative to the camera.
+    const auto start=[&](double x,double y) {
+        return orthographic?rotate(q,rotation.w,D3{(2*x/width-1)*half*aspect,(1-2*y/height)*half,0}):D3{0,0,0};
     };
     double facingLimit=-1e-6;
     if(!claim) {
@@ -2270,11 +2408,13 @@ inline bool projectReceiverFootprint(const Frame& frame,const opaquevisibility::
     std::array<D3,4> corners;double scale=std::max({std::abs(camera[0]),std::abs(camera[1]),std::abs(camera[2])});
     for(unsigned c=0;c<4;++c)
     {
-        const auto r=ray(double(candidate.x)+(c==1 || c==2),double(candidate.y)+(c>=2));
-        const double denominator=dot3(normal,r),distance=dot3(normal,delta)/denominator;
+        const double cx=double(candidate.x)+(c==1 || c==2),cy=double(candidate.y)+(c>=2);
+        const auto r=ray(cx,cy);const auto o=start(cx,cy);
+        const D3 reach{delta[0]-o[0],delta[1]-o[1],delta[2]-o[2]};
+        const double denominator=dot3(normal,r),distance=dot3(normal,reach)/denominator;
         if(!std::isfinite(distance) || denominator>=-1e-6 || distance<=0 || distance>double(frame.camera.farPlane)*1e4)
         {error="Glass caustic pixel footprint crosses the receiver horizon";return false;}
-        for(unsigned a=0;a<3;++a){corners[c][a]=r[a]*distance;scale=std::max(scale,std::abs(camera[a]+corners[c][a]));}
+        for(unsigned a=0;a<3;++a){corners[c][a]=o[a]+r[a]*distance;scale=std::max(scale,std::abs(camera[a]+corners[c][a]));}
         scale=std::max(scale,distance);
     }
     const auto edge=[&](unsigned a,unsigned b){return D3{corners[b][0]-corners[a][0],corners[b][1]-corners[a][1],corners[b][2]-corners[a][2]};};
@@ -2315,7 +2455,7 @@ struct RasterReceiver
 struct NativeDeposit
 {
     std::uint32_t work = 0;
-    std::uint64_t reflectionHistory = 0;
+    CausticHistory reflectionHistory {};
     std::uint32_t interfaces = 0;
     float fraction = 0, incidentPower = 0, outgoingPower = 0, absorbedPower = 0;
     opaquevisibility::ClosestHit receiver, cameraHit, pixelHit;
@@ -2325,6 +2465,9 @@ struct NativeDeposit
     // Each macro exit stores microfacet order bits0..5, transmission bit6,
     // reserved bit7 zero. Used prefix length is interfaces, never a seed hash.
     std::array<std::uint8_t,32> ancestry {};
+    // Tokens for interfaces 32 and up, from the native ancestry tail. Empty when
+    // the policy holds 32 or fewer interfaces.
+    std::vector<std::uint8_t> ancestryTail;
     std::uint32_t gratingVersion=0,gratingIncident=UINT32_MAX;
     std::int32_t gratingOrder=0;
 };
@@ -2433,15 +2576,16 @@ inline bool validMacroAncestry(const NativeDeposit& deposit,const MultipleScatte
     std::uint32_t& minimumEvents)
 {
     minimumEvents=0;bool inside=false;
-    if(!validMultipleScatterPolicy(policy) || !deposit.interfaces || deposit.interfaces>kMaximumAncestryInterfaces
-        || (deposit.reflectionHistory>>deposit.interfaces)!=0)return false;
-    for(unsigned i=0;i<deposit.ancestry.size();++i)
+    const auto stored=deposit.ancestry.size()+deposit.ancestryTail.size();
+    if(!validMultipleScatterPolicy(policy) || !deposit.interfaces || deposit.interfaces>stored
+        || !deposit.reflectionHistory.clearFrom(deposit.interfaces))return false;
+    for(std::size_t i=0;i<stored;++i)
     {
-        const auto token=deposit.ancestry[i];
+        const auto token=i<deposit.ancestry.size()?deposit.ancestry[i]:deposit.ancestryTail[i-deposit.ancestry.size()];
         if(i>=deposit.interfaces) {if(token!=0){return false;}continue;}
         const auto order=std::uint32_t(token&63);const bool transmitted=(token&64)!=0;
         if((token&128) || order>policy.maximumEvents || (matchedMedia?(order!=0 || !transmitted):order==0)
-            || bool((deposit.reflectionHistory>>i)&1)==transmitted)return false;
+            || deposit.reflectionHistory.test(i)==transmitted)return false;
         minimumEvents+=order;if(transmitted)inside=!inside;
     }
     return !inside;
@@ -2466,7 +2610,8 @@ inline std::array<Texel,8> macroAncestryTexels(const std::array<std::uint8_t,32>
     return result;
 }
 // RGBA32F encoders must split uint32 owner/query IDs into exact 16-bit words,
-// and uint64 history/work into four words. Neither float casts of full IDs nor
+// and uint64 work into four words; smooth history splits its four uint32 words
+// the same way across texels 1 and 30. Neither float casts of full IDs nor
 // RGB scratch are admissible. The reserved strides cover these exact records.
 struct SubmissionIdentity
 {
@@ -2603,7 +2748,9 @@ struct NativeGratingOrder
 struct NativeGratingIncident
 {
     std::uint32_t version=0,work=0,band=0,interfaces=0,orderCount=0;
-    std::uint64_t reflectionHistory=0;
+    // Inline tokens cover the first 32 interfaces; later ones follow from the
+    // history (1 reflect, 65 transmit).
+    CausticHistory reflectionHistory{};
     std::array<std::uint8_t,32> ancestry{};
     Point origin{},direction{}; // Actual propagation toward the grating.
     float fraction=0,power=0;
@@ -2803,7 +2950,7 @@ inline bool sameTriangle(const opaquevisibility::ClosestHit& a,const opaquevisib
 inline bool exactCameraHit(const Frame& frame,const opaquevisibility::ClosestHit& receiver,const opaquevisibility::ClosestHit& hit)
 {
     if(!receiverTriangle(frame,hit) || !sameTriangle(receiver,hit))return false;
-    const auto delta=sub(receiver.position,cameraPosition(frame));
+    const auto delta=sub(receiver.position,cameraEndpointOrigin(frame,receiver.position));
     const float distance=std::sqrt(dot(delta,delta)),tolerance=8*bias(receiver.position);
     return std::abs(hit.distance-distance)<=tolerance
         && dot(sub(hit.position,receiver.position),sub(hit.position,receiver.position))<=tolerance*tolerance;
@@ -2878,7 +3025,7 @@ inline SplatPixelQuery splatCpuQuery(const Prepared& prepared,const Frame& frame
         const auto ray=cameraRay(frame,float(x)+.5f,float(y)+.5f);
         const float maximum=4*frame.camera.farPlane;
         if(!finite(ray) || !std::isfinite(maximum) || maximum<=0) {error="Glass caustic splat camera ray is invalid";return false;}
-        hit=opaquevisibility::closestHitCpu(prepared.glass.query,frame.query,cameraPosition(frame),ray,kRayMinimum,maximum);
+        hit=opaquevisibility::closestHitCpu(prepared.glass.query,frame.query,cameraOrigin(frame,float(x)+.5f,float(y)+.5f),ray,kRayMinimum,maximum);
         if(hit.status!=0 && hit.status!=1) {error="Glass caustic splat CPU camera query failed";return false;}
         return true;
     };
@@ -2898,7 +3045,7 @@ inline SplatOffsetQuery splatCpuOffsetQuery(const Prepared& prepared,const Frame
         const auto ray=cameraRay(frame,x,y);
         const float maximum=4*frame.camera.farPlane;
         if(!finite(ray) || !std::isfinite(maximum) || maximum<=0) {error="Glass caustic splat camera ray is invalid";return false;}
-        hit=opaquevisibility::closestHitCpu(prepared.glass.query,frame.query,cameraPosition(frame),ray,kRayMinimum,maximum);
+        hit=opaquevisibility::closestHitCpu(prepared.glass.query,frame.query,cameraOrigin(frame,x,y),ray,kRayMinimum,maximum);
         if(hit.status!=0 && hit.status!=1) {error="Glass caustic splat CPU camera query failed";return false;}
         return true;
     };
@@ -3007,8 +3154,9 @@ inline bool buildSplatReference(const Frame& frame,const std::vector<NativeDepos
             // float32 roundoffs of the coordinate scale plus the distance,
             // stretched along the plane by 1/cos at the receiver.
             double ray[3],length=0,coordinates=0;
+            const auto start=cameraEndpointOrigin(frame,value.hit.position);
             for(unsigned a=0;a<3;++a) {
-                ray[a]=double(value.hit.position[a])-camera[a];length+=ray[a]*ray[a];
+                ray[a]=double(value.hit.position[a])-start[a];length+=ray[a]*ray[a];
                 coordinates=std::max({coordinates,std::abs(double(camera[a])),std::abs(double(value.hit.position[a]))});
             }
             length=std::sqrt(length);
@@ -3137,8 +3285,9 @@ inline bool buildSplatReference(const Frame& frame,const std::vector<NativeDepos
         // Neighbour weights scale by the deposit's grazing spread. The cosine
         // uses the receipt position and normal that the native pass reads.
         double toReceiver[3],receiverDistance=0,facing=0;
+        const auto viewStart=cameraEndpointOrigin(frame,deposit.receiver.position);
         for(unsigned a=0;a<3;++a) {
-            toReceiver[a]=double(deposit.receiver.position[a])-camera[a];receiverDistance+=toReceiver[a]*toReceiver[a];
+            toReceiver[a]=double(deposit.receiver.position[a])-viewStart[a];receiverDistance+=toReceiver[a]*toReceiver[a];
             facing+=toReceiver[a]*deposit.receiver.outwardNormal[a];
         }
         receiverDistance=std::sqrt(receiverDistance);
@@ -3427,8 +3576,8 @@ inline bool validateNativeReadback(const Prepared& prepared,const Frame& frame,c
     std::vector<std::size_t> counts(frame.work.size());
     std::vector<std::uint64_t> observedWork(frame.work.size());
     std::vector<std::uint32_t> minimumMicroEvents(frame.work.size());
-    std::set<std::tuple<std::uint32_t,std::uint32_t,std::uint64_t,std::int32_t>> branches;
-    std::set<std::tuple<std::uint32_t,std::uint32_t,std::array<std::uint8_t,32>>> microBranches;
+    std::set<std::tuple<std::uint32_t,std::uint32_t,CausticHistory,std::int32_t>> branches;
+    std::set<std::tuple<std::uint32_t,std::uint32_t,std::array<std::uint8_t,32>,std::vector<std::uint8_t>>> microBranches;
     EnergyLedger candidate;
     if(grating)for(std::size_t w=0;w<frame.work.size();++w)absorbed[w]=readback.gratingIncidents->paths[w].absorbedPower;
     for(const auto& deposit:readback.deposits)
@@ -3439,19 +3588,20 @@ inline bool validateNativeReadback(const Prepared& prepared,const Frame& frame,c
             return refuse("Glass caustic native closest-hit receipt exceeded its query budget");
         if(deposit.work>=frame.work.size() || !std::isfinite(deposit.fraction) || deposit.fraction<=0 || deposit.fraction>1
             || !deposit.interfaces || deposit.interfaces>prepared.branchPolicy->description().maximumInterfaces
-            || (deposit.interfaces<64 && (deposit.reflectionHistory>>deposit.interfaces)!=0))
+            || !deposit.reflectionHistory.clearFrom(deposit.interfaces))
             return refuse("Glass caustic native deposit branch identity or fraction is invalid");
         if(frame.multipleScatterPolicy) {
             std::uint32_t events=0;
             if(!validMacroAncestry(deposit,*frame.multipleScatterPolicy,frame.ior[frame.work[deposit.work].band]==1,events)
-                || !microBranches.emplace(deposit.work,deposit.interfaces,deposit.ancestry).second)
+                || !microBranches.emplace(deposit.work,deposit.interfaces,deposit.ancestry,deposit.ancestryTail).second)
                 return refuse("Glass caustic native exact microfacet ancestry is invalid or duplicated");
             minimumMicroEvents[deposit.work]=std::max(minimumMicroEvents[deposit.work],events);
         } else {
             if(deposit.gratingVersion) {
                 if(!grating||deposit.gratingVersion!=kGratingIncidentVersion||deposit.gratingIncident>=readback.gratingIncidents->incidents.size())
                     return refuse("Glass caustic grating child owner is invalid");
-            } else if(deposit.gratingIncident!=UINT32_MAX||deposit.gratingOrder||deposit.ancestry!=std::array<std::uint8_t,32>{})
+            } else if(deposit.gratingIncident!=UINT32_MAX||deposit.gratingOrder||deposit.ancestry!=std::array<std::uint8_t,32>{}
+                ||std::any_of(deposit.ancestryTail.begin(),deposit.ancestryTail.end(),[](std::uint8_t token){return token!=0;}))
                 return refuse("Glass caustic legacy native branch identity or reserved ancestry changed");
             if(!branches.emplace(deposit.work,deposit.interfaces,deposit.reflectionHistory,
                 deposit.gratingVersion?deposit.gratingOrder:INT32_MIN).second)
@@ -3476,7 +3626,7 @@ inline bool validateNativeReadback(const Prepared& prepared,const Frame& frame,c
         {
             if((deposit.cameraHit.status!=0 && deposit.cameraHit.status!=1) || (deposit.pixelHit.status!=0 && deposit.pixelHit.status!=1))
                 return refuse("Glass caustic native camera visibility query is incomplete");
-            const auto origin=cameraPosition(frame),delta=sub(deposit.receiver.position,origin);
+            const auto origin=cameraEndpointOrigin(frame,deposit.receiver.position),delta=sub(deposit.receiver.position,origin);
             const float distance=std::sqrt(dot(delta,delta));
             if(deposit.cameraHit.status!=1 || !hitTriangle(frame,deposit.cameraHit) || deposit.cameraHit.distance>distance+8*bias(deposit.receiver.position))
                 return refuse("Glass caustic native camera endpoint query is incomplete");
@@ -3487,7 +3637,7 @@ inline bool validateNativeReadback(const Prepared& prepared,const Frame& frame,c
             if(sameTriangle(deposit.receiver,deposit.cameraHit) && !exactCameraHit(frame,deposit.receiver,deposit.cameraHit))
                 return refuse("Glass caustic native camera endpoint distance or position changed");
             const auto ray=cameraRay(frame,float(footprint.x)+.5f,float(footprint.y)+.5f);
-            const auto expected=advance(origin,ray,deposit.pixelHit.distance);
+            const auto expected=advance(cameraOrigin(frame,float(footprint.x)+.5f,float(footprint.y)+.5f),ray,deposit.pixelHit.distance);
             const auto residual=sub(expected,deposit.pixelHit.position);
             if(deposit.pixelHit.status==1 && (!hitTriangle(frame,deposit.pixelHit)
                 || dot(residual,residual)>std::pow(8*bias(expected),2)))
@@ -3699,7 +3849,7 @@ inline std::string nativeContractDefines()
         +"\n#define CAUSTIC_WORK_STRIDE "+std::to_string(kWorkStride)
         +"\n#define CAUSTIC_PATH_RECEIPT_STRIDE "+std::to_string(kPathReceiptStride)
         +"\n#define CAUSTIC_DEPOSIT_RECEIPT_STRIDE "+std::to_string(kDepositReceiptStride)
-        +"\n#define CAUSTIC_MAX_PENDING "+std::to_string(kMaximumPendingBranches)
+        +"\n#define CAUSTIC_BRANCH_TEXELS "+std::to_string(kPendingBranchTexels)
         +"\n#define CAUSTIC_MAX_VISITS "+std::to_string(kMaximumBranchVisits)
         +"\n#define CAUSTIC_MAX_ANCESTRY_INTERFACES "+std::to_string(kMaximumAncestryInterfaces)
         +"\n#define CAUSTIC_MAX_SPLATS "+std::to_string(kMaximumSplatsPerDeposit)+"\n";
@@ -3713,16 +3863,32 @@ inline std::string nativeMathSource()
     return nativeContractDefines()+R"GLSL(
 bool causticFinite(float value) {return !isnan(value)&&!isinf(value);}
 vec3 causticRotate(vec4 q,vec3 p) {return p+2.0*cross(q.xyz,cross(q.xyz,p)+q.w*p);}
+// projection.x below zero is an orthographic camera, minus half its view height. Its
+// rays are parallel along the view axis, each from the pixel's point on the camera plane.
 vec3 causticCameraRay(vec2 pixel,vec4 rotation,vec4 projection,vec2 extent) {
+    if(projection.x<0.0) return normalize(causticRotate(rotation,vec3(0.0,0.0,-1.0)));
     vec2 p=vec2(2.0*pixel.x/extent.x-1.0,1.0-2.0*pixel.y/extent.y);
     return normalize(causticRotate(rotation,vec3(p.x*projection.x*projection.y,p.y*projection.x,-1.0)));
+}
+vec3 causticCameraOrigin(vec2 pixel,vec3 camera,vec4 rotation,vec4 projection,vec2 extent) {
+    if(projection.x>=0.0) return camera;
+    vec2 p=vec2(2.0*pixel.x/extent.x-1.0,1.0-2.0*pixel.y/extent.y);
+    return camera+causticRotate(rotation,vec3(-p.x*projection.x*projection.y,-p.y*projection.x,0.0));
+}
+// The start of the camera's ray to a world point: the camera, or the point's
+// projection onto an orthographic camera's plane.
+vec3 causticEndpointOrigin(vec3 position,vec3 camera,vec4 rotation,vec4 projection) {
+    if(projection.x>=0.0) return camera;
+    vec3 forward=normalize(causticRotate(rotation,vec3(0.0,0.0,-1.0)));
+    return position-forward*dot(position-camera,forward);
 }
 bool causticPixelCorner(vec2 pixel,vec3 position,vec3 normal,vec3 camera,
     vec4 rotation,vec4 projection,vec2 extent,out vec3 corner) {
     vec3 ray=causticCameraRay(pixel,rotation,projection,extent);
-    float denominator=dot(normal,ray),distance=dot(normal,position-camera)/denominator;
+    vec3 origin=causticCameraOrigin(pixel,camera,rotation,projection,extent);
+    float denominator=dot(normal,ray),distance=dot(normal,position-origin)/denominator;
     if(!causticFinite(distance)||denominator>=-1e-6||distance<=0.0||distance>projection.w*1e4) return false;
-    corner=camera+ray*distance;return true;
+    corner=origin+ray*distance;return true;
 }
 // 0 is outside/back-facing, -1 refuses a horizon/overflow footprint, 1 projects.
 // footprint is top-first x/y, linear depth, exact receiver-plane pixel area.
@@ -3731,8 +3897,9 @@ int causticProjectReceiver(vec3 position,vec3 normal,vec3 camera,vec4 rotation,
     vec3 local=causticRotate(vec4(-rotation.xyz,rotation.w),position-camera);
     float depth=-local.z;footprint=vec4(0.0,0.0,depth,0.0);
     if(depth<projection.z||depth>projection.w) return 0;
-    vec2 pixel=vec2((local.x/(depth*projection.x*projection.y)+1.0)*0.5*extent.x,
-        (1.0-local.y/(depth*projection.x))*0.5*extent.y);
+    float spread=projection.x<0.0?-projection.x:depth*projection.x;
+    vec2 pixel=vec2((local.x/(spread*projection.y)+1.0)*0.5*extent.x,
+        (1.0-local.y/spread)*0.5*extent.y);
     if(!causticFinite(pixel.x)||!causticFinite(pixel.y)) return -1;
     if(pixel.x<0.0||pixel.y<0.0||pixel.x>=extent.x||pixel.y>=extent.y) return 0;
     pixel=floor(pixel);footprint.xy=pixel;

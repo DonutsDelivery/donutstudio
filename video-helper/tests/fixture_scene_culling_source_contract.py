@@ -8,8 +8,10 @@ required = {
     "back-face culling": "winding == 0 ? SG_CULLMODE_NONE : SG_CULLMODE_BACK",
     "ordinary winding": "winding == 2 ? SG_FACEWINDING_CW",
     "mirrored winding": "metalFixtureDeterminant3x3 (objectMatrix) < 0.0f ? 2u : 1u",
-    "SDR/HDR pipeline offset": "runtimeInputs.linearColor ? resources->pipelines.size() / 2u : 0u",
-    "SDR/HDR pipeline selection": "resources->pipelines[colorPipelineOffset + blend * 3u + winding]",
+    "SDR/HDR pipeline offset": "!diffractionDraw && runtimeInputs.linearColor\n                ? resources->pipelines.size() / 2u : 0u",
+    "diffraction resolve picks HDR": "diffractionResolvePipelines[runtimeInputs.linearColor ? 1u : 0u]",
+    "SDR/HDR pipeline selection": "resources->pipelines[colorPipelineOffset + (realtimePhase == 2 ? 0u : blend) * 3u + winding]",
+    "SDR/HDR reflection pipeline selection": "realtimeReflectionPipelines[(colorPipelineOffset != 0 ? 3u : 0u) + winding]",
     "SDR/HDR diffraction winding": "resources->pipelines[colorPipelineOffset + winding]",
 }
 missing = [name for name, token in required.items() if token not in text]

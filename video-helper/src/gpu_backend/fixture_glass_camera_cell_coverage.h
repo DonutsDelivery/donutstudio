@@ -167,7 +167,7 @@ inline bool calculateCameraCellCoverageBounds(const NativeDirectGratingTerminalR
     CameraCellCoverageBounds& output,std::string& error)
 {
     const auto refuse=[&](){error="Native camera-cell arrangement exceeds authenticated whole-frame bounds";return false;};
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;const auto& rows=parent.retained();
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;const auto& rows=parent.retained();
     CameraCellCoverageBounds b;b.bytes=native.retainedBytes;
     b.triangles=frame.triangles.size();
     if(!rows.terminal||!rows.bounds.maximumRows||rows.bounds.maximumRows>UINT32_MAX||rows.rows.size()>rows.bounds.maximumRows

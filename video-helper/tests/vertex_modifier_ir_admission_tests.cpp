@@ -110,7 +110,7 @@ int main()
 
     std::set<std::string> operationTokens;
     for (int raw = static_cast<int>(VertexModifierOperation::importedPosition);
-         raw <= static_cast<int>(VertexModifierOperation::boundedDisplacementOutput); ++raw)
+         raw <= static_cast<int>(videowire::kLastVertexModifierOperation); ++raw)
     {
         const auto operation = static_cast<VertexModifierOperation>(raw);
         const auto token = std::string(videowire::vertexModifierOperationWireToken(operation));
@@ -121,7 +121,7 @@ int main()
         check(videowire::vertexModifierOperationFromWireToken(token) == operation,
               "every operation wire token round-trips");
     }
-    check(operationTokens.size() == 25,
+    check(operationTokens.size() == 28,
           "the contract contains only the bounded vertex modifier operation set");
     check(videowire::vertexModifierOperationFromWireToken("shader-source")
               == VertexModifierOperation::invalid,

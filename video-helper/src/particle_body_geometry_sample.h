@@ -18,11 +18,12 @@ struct ParticleBodyGeometrySampleRecipe final
 
 struct ParticleBodyGeometrySampleLimits final
 {
-    std::size_t maxDerivationVisits=100000;
+    // Visits size from the admitted body; only checked-sum overflow refuses.
+    std::size_t maxDerivationVisits=std::numeric_limits<std::size_t>::max();
     std::size_t maxRetainedLogicalBytes=videowire::geometry::kMaximumBufferBytes;
     // Includes the shared source, every escaped sample and concurrent attempts.
     std::size_t maxAttemptLogicalBytes=videowire::geometry::kMaximumBufferBytes;
-    std::size_t maxTotalVisits=1000000000;
+    std::size_t maxTotalVisits=std::numeric_limits<std::size_t>::max();
 };
 
 struct ParticleBodyGeometrySampleAttempt final

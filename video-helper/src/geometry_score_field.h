@@ -30,9 +30,8 @@ inline bool evaluate(const videowire::geometry::scorefield::Binding& binding,
   const auto texel=[&](std::size_t note, std::size_t column, std::size_t channel) {
     return frame->noteTextureValues[(notes.canonicalRows[note]*arbitblockc::kTexelsPerNote+column)*4+channel];
   };
-  std::array<int,arbitblockc::kMaxNotes> instanceForRow;
-  instanceForRow.fill(-1);
-  std::array<double,arbitblockc::kMaxNotes> pitch {}, spacing {};
+  std::vector<int> instanceForRow(static_cast<std::size_t>(std::max(frame->noteRows(),0)),-1);
+  std::vector<double> pitch(notes.count), spacing(notes.count);
   for (std::size_t note=0;note<notes.count;++note) {
     instanceForRow[notes.canonicalRows[note]]=static_cast<int>(note);
     if (texel(note,1,3)!=0 && texel(note,1,3)!=1) {
@@ -66,10 +65,15 @@ inline bool evaluate(const videowire::geometry::scorefield::Binding& binding,
     }
     return value;
   };
-  result.offsets.reserve(binding.positions.size());
-  result.closestNoteIds.reserve(binding.positions.size());
-  result.closestLinkIds.reserve(binding.positions.size());
-  result.linkRatios.reserve(binding.positions.size());
+  try {
+    result.offsets.reserve(binding.positions.size());
+    result.closestNoteIds.reserve(binding.positions.size());
+    result.closestLinkIds.reserve(binding.positions.size());
+    result.linkRatios.reserve(binding.positions.size());
+  } catch (const std::bad_alloc&) {
+    error="Score Field could not allocate memory for "+std::to_string(binding.positions.size())+" geometry samples";
+    return false;
+  }
   for (const auto& position : binding.positions) {
     std::size_t nearest=0;
     double distance=std::numeric_limits<double>::infinity(), influence=0;
@@ -99,6 +103,7 @@ inline bool evaluate(const videowire::geometry::scorefield::Binding& binding,
       if (binding.mode == contract::Mode::rootFlag) scalar=texel(nearest,1,3);
       if (binding.mode == contract::Mode::midiNoteNumber) scalar=texel(nearest,0,0);
       if (binding.mode == contract::Mode::resolvedFrequencyHz) scalar=texel(nearest,1,0);
+      if (binding.mode == contract::Mode::midiLane) scalar=texel(nearest,1,2);
       if (linkMode) {
         double best=std::numeric_limits<double>::infinity();
         for (int row=0;row<frame->linkRows();++row) {
@@ -205,6 +210,7 @@ inline bool evaluateSampleField(const videowire::geometry::OperationRecord& oper
   binding.radius=static_cast<float>(p[0]); binding.gain=static_cast<float>(p[1]); binding.bias=static_cast<float>(p[2]);
   binding.mapping.xScale=binding.mapping.yScale=binding.mapping.zScale=static_cast<float>(p[3]);
   binding.direction={1,0,0};
+  if (!geometry::scorefield::reserveSamples(binding,positions.elements.size(),"Score Sample Field",error)) return false;
   for (const auto& position : positions.elements) {
     binding.positions.push_back({static_cast<float>(position.components[0]),static_cast<float>(position.components[1]),
                                 static_cast<float>(position.components[2])});

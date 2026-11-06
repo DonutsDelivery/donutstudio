@@ -130,11 +130,17 @@ void explicitTests()
     selection = device::selectDevice ("optix", oldDriver);
     check (! selection.ok && contains (selection.error, "driver is older"), "the error carries the driver's refusal");
 
-    for (const char* name : { "cuda", "hip", "metal", "oneapi" })
+    for (const char* name : { "cuda", "hip" })
     {
         selection = device::selectDevice (name, workingMachine());
-        check (! selection.ok && contains (selection.error, "no ") && contains (selection.error, "device yet"),
-               std::string (name) + " reports that this build has no such device");
+        check (! selection.ok && contains (selection.error, "this build of DonutStudio has no") && contains (selection.error, "kernel"),
+               std::string (name) + " without its kernel reports that this build has none: " + selection.error);
+    }
+    for (const char* name : { "metal", "oneapi" })
+    {
+        selection = device::selectDevice (name, workingMachine());
+        check (! selection.ok && contains (selection.error, "is unavailable"),
+               std::string (name) + " reports why it is unavailable: " + selection.error);
     }
 
     for (const char* name : { "none", "None", "cpu", "CPU" })

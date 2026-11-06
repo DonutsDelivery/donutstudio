@@ -186,12 +186,13 @@ inline std::size_t tree(std::vector<Texel>& texels, std::vector<Primitive>& prim
     return node;
 }
 // Upper bound of one query table for this scene: seven texels per triangle of each
-// distinct mesh range, one identity per object and eight per instance matrix, rounded
+// distinct mesh range, one identity per object and eight per instance matrix (notes is
+// the drawn note count, one without note instancing), rounded
 // up to a whole row. Saturates rather than wraps, so an impossible table fails its charge.
 // Glass receiver normal blocks are not counted. They add three texels per smooth receiver
 // triangle, and the callers charge this figure four times over.
 inline std::uint64_t sceneQueryPayloadTexels(const HarmonicMIDI::grid::Visual3DScene& scene,
-                                             std::uint64_t notes = visualnoteinstancing::kMaximumInstances)
+                                             std::uint64_t notes = 1)
 {
     std::set<std::array<std::uint32_t, 4>> ranges;
     std::uint64_t triangles = 0;
@@ -858,6 +859,8 @@ inline bool prepareScene(const HarmonicMIDI::grid::Visual3DScene& scene,
                     (appearances.empty() || appearances[o].color[3] >= 1.0f);
         for (std::size_t v = 0; opaque[o] && v < object.vertexCount; ++v)
             opaque[o] = scene.vertices[object.firstVertex + v].color[3] >= 1.0f;
+        // An object hidden from shadow rays casts no raster shadow.
+        if ((object.visibility & sceneRayVisibility::Shadow) == 0) opaque[o] = false;
     }
     if (!glassReceiverNormals)
         return prepare(scene, opaque, output, error, mode);

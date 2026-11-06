@@ -537,7 +537,7 @@ inline float combine (Mode m, float base, float value)
 enum class SourceType
 {
     // Tier 1 — symbolic
-    NotePitch, NoteVelocity, NoteGate, NoteTrigger, NoteCount, NoteAge,
+    NotePitch, NoteVelocity, NoteGate, NoteTrigger, NoteCount, NoteAge, NoteCounter,
     CentsFromRoot, PrimeEnergy, RootTrigger,
     ClockBeatPhase, ClockBarPhase, ClockBeat,
     // Tier 1b — ratio-native
@@ -546,7 +546,7 @@ enum class SourceType
     // Tier 2 — generators
     Env, Lfo,
     // Tier 3 — audio-derived
-    AudioRms, AudioPeak, AudioOnset, AudioBand
+    AudioRms, AudioPeak, AudioOnset, AudioBand, AudioEnvelope
 };
 
 struct LfoSpec
@@ -572,6 +572,8 @@ struct ModSource
     int   band         = 0;        // AudioBand index
     int   lissajousK   = 7;        // Lissajous octave slowdown
     float triggerDecayBeats = 0.5f;// NoteTrigger / RootTrigger exp decay
+    float envAttack  = 0.01f;     // AudioEnvelope rise time, seconds
+    float envRelease = 0.2f;      // AudioEnvelope fall time, seconds
     AdsrSpec adsr {};
     LfoSpec  lfo {};
 };
@@ -613,6 +615,19 @@ inline float evaluateSource (const ModSource& s, const Score& score,
         {
             const float onset = score.latestOnsetBeat (s.trackId, beat, s.pitchLo, s.pitchHi);
             return onset < -1e29f ? 0.0f : std::max (0.0f, beat - onset);  // beats (unnormalised)
+        }
+        case SourceType::NoteCounter:
+        {
+            // Note onsets already passed, in this track and pitch range, cycled so one step is a
+            // sixteenth of the range: a counter that wraps instead of pinning a control at its
+            // maximum once the notes pile up. Stateless, so an export replays it exactly.
+            double count = 0.0;
+            for (const auto& note : score.notes)
+                if (Score::inTrack (note, s.trackId) && Score::inRange (note, s.pitchLo, s.pitchHi)
+                    && note.startBeat <= beat)
+                    ++count;
+            if (count <= 0.0) return 0.0f;
+            return static_cast<float> (std::fmod (count, 16.0) / 16.0);
         }
         case SourceType::CentsFromRoot:
         {
@@ -728,6 +743,11 @@ inline float evaluateSource (const ModSource& s, const Score& score,
                 s.trackId >= 0 && f && f->bandsReady && s.band >= 0 && s.band < 64)
                 return clamp01(f->bands[static_cast<std::size_t>(s.band)]);
             return s.trackId < 0 ? clamp01(audio.band(s.band)) : 0.0f;
+        case SourceType::AudioEnvelope:
+            // The rise and fall run where the state lives (envelopeFollow), so the raw value
+            // here is the same block RMS Audio RMS reads.
+            if (const auto* f = audio.sourceFor(s.trackId)) return clamp01(f->rms);
+            return s.trackId < 0 ? clamp01(audio.rms) : 0.0f;
     }
     return 0.0f;
 }
@@ -736,7 +756,9 @@ inline float evaluateSource (const ModSource& s, const Score& score,
 // intentional hits — §5.1 step-change policy).
 inline bool isDiscreteSource (SourceType t)
 {
-    return t == SourceType::HarmRatioNum || t == SourceType::HarmRatioDen;
+    // The ratio integers and the note counter step: smoothing would blur the steps it exists for.
+    return t == SourceType::HarmRatioNum || t == SourceType::HarmRatioDen
+        || t == SourceType::NoteCounter;
 }
 
 // ---------------------------------------------------------------------------
@@ -753,11 +775,41 @@ struct Routing
     bool        enabled        = true;
 };
 
+// The AudioEnvelope follower's memory. Each consumer keeps one of these where it already
+// keeps per-route or per-node state (RoutingState, the canonical node, the Control plan's
+// operation), so this step is the only copy of the follower math and the three paths agree.
+struct EnvelopeState
+{
+    float value  = 0.0f;
+    bool  primed = false;
+};
+
+// One-pole rise and fall in seconds: attack while the target is above the held value,
+// release below it. A first step holds the target (like the smoothing path), a zero or
+// negative time constant is instantaneous, and no elapsed time holds.
+inline float envelopeFollow (EnvelopeState& st, float target,
+                             float attackSec, float releaseSec, float dtSec)
+{
+    if (! std::isfinite (target)) target = 0.0f;
+    if (! st.primed)
+    {
+        st.value = target;
+        st.primed = true;
+        return clamp01 (st.value);
+    }
+    const float tau = target > st.value ? attackSec : releaseSec;
+    if (! (tau > 0.0f)) { st.value = target; return clamp01 (st.value); }
+    if (! (dtSec > 0.0f)) return clamp01 (st.value);
+    st.value += (1.0f - std::exp (-dtSec / tau)) * (target - st.value);
+    return clamp01 (st.value);
+}
+
 // Per-routing running state (the only mutable piece — the smoothing memory).
 struct RoutingState
 {
     float smoothed = 0.0f;
     bool  primed   = false;
+    EnvelopeState envelope {};
 };
 
 // Evaluate one routing against a base value. dtBeats is the beat delta since the
@@ -769,7 +821,13 @@ inline float evaluateRouting (const Routing& r, RoutingState& st, float base,
 {
     if (!r.enabled) return base;
 
-    const float raw = evaluateSource (r.source, score, clk, audio);
+    float raw = evaluateSource (r.source, score, clk, audio);
+    if (r.source.type == SourceType::AudioEnvelope)
+    {
+        const float bpm = clk.bpm > 0.0f ? clk.bpm : 120.0f;
+        raw = envelopeFollow (st.envelope, raw, r.source.envAttack, r.source.envRelease,
+                              dtBeats * 60.0f / bpm);
+    }
 
     // Linear passes the source through at its native range (discrete ratioNum,
     // physical Hz/cents/age all scale via depth). The nonlinear curves are only
@@ -812,6 +870,7 @@ inline SourceType sourceTypeFromString (const std::string& s)
     if (s == "NoteTrigger")     return ST::NoteTrigger;
     if (s == "NoteCount")       return ST::NoteCount;
     if (s == "NoteAge")         return ST::NoteAge;
+    if (s == "NoteCounter")    return ST::NoteCounter;
     if (s == "CentsFromRoot")   return ST::CentsFromRoot;
     if (s == "PrimeEnergy")     return ST::PrimeEnergy;
     if (s == "RootTrigger")     return ST::RootTrigger;
@@ -832,6 +891,7 @@ inline SourceType sourceTypeFromString (const std::string& s)
     if (s == "AudioPeak")       return ST::AudioPeak;
     if (s == "AudioOnset")      return ST::AudioOnset;
     if (s == "AudioBand")       return ST::AudioBand;
+    if (s == "AudioEnvelope")   return ST::AudioEnvelope;
     return ST::ClockBeatPhase;
 }
 

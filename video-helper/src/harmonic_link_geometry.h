@@ -100,8 +100,7 @@ inline std::optional<videowire::geometry::ValueDescriptor> lower(
             error = "Harmonic link endpoint coordinates exceed the geometry bounds";
             return std::nullopt;
         }
-        std::array<int, arbitblockc::kMaxNotes> instanceForRow;
-        instanceForRow.fill(-1);
+        std::vector<int> instanceForRow(static_cast<std::size_t>(std::max(frame->noteRows(), 0)), -1);
         for (std::size_t index = 0; index < notes.count; ++index)
             instanceForRow[notes.canonicalRows[index]] = static_cast<int>(index);
         collected.reserve(static_cast<std::size_t>(frame->linkRows()));

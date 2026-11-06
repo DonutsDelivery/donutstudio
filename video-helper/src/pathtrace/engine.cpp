@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "../diffraction_material_admission.h"
+#include "devices/device_cpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -83,7 +84,9 @@ static_assert (sizeof (grid::SceneLightRecord)
                == sizeof (grid::SceneLightId) + 4 + sizeof (grid::SceneTransform3D) + sizeof (grid::SceneVec3)
                       + 4 * sizeof (float) + sizeof (grid::SceneAnalyticSky)
                       + sizeof (bool) + 3 // environmentCameraVisible, then padding
-                      + sizeof (grid::SceneEnvironmentImage) + sizeof (grid::SceneSpectralSource));
+                      + sizeof (grid::SceneCameraBackground)
+                      + sizeof (grid::SceneEnvironmentImage) + sizeof (grid::SceneSpectralSource)
+                      + 5 * sizeof (float) + 2 + 2); // size and area fields, shape, visibility, padding
 } // namespace scene_record_size
 
 bool sameLightRecord (const SceneLightRecord& a, const SceneLightRecord& b) noexcept
@@ -94,6 +97,7 @@ bool sameLightRecord (const SceneLightRecord& a, const SceneLightRecord& b) noex
         && sameBits (a.innerConeAngle, b.innerConeAngle) && sameBits (a.outerConeAngle, b.outerConeAngle)
         && HarmonicMIDI::grid::sameAnalyticSky (a.sky, b.sky)
         && a.environmentCameraVisible == b.environmentCameraVisible
+        && HarmonicMIDI::grid::sameCameraBackground (a.cameraBackground, b.cameraBackground)
         && HarmonicMIDI::grid::sameEnvironmentImage (a.environmentImage, b.environmentImage)
         && a.spectralSource.version == b.spectralSource.version
         && std::memcmp (a.spectralSource.wavelengthsNanometres.data(), b.spectralSource.wavelengthsNanometres.data(),
@@ -102,7 +106,8 @@ bool sameLightRecord (const SceneLightRecord& a, const SceneLightRecord& b) noex
                         sizeof (float) * a.spectralSource.radiance.size()) == 0
         && sameBits (a.spectralSource.traceMaximumDistance, b.spectralSource.traceMaximumDistance)
         && HarmonicMIDI::grid::sameDirectionalIrradiance (a.spectralSource.directionalIrradiance,
-                                                         b.spectralSource.directionalIrradiance);
+                                                         b.spectralSource.directionalIrradiance)
+        && HarmonicMIDI::grid::sameLightShapeAndVisibility (a, b);
 }
 
 bool sameMaterial (const Material& a, const Material& b) noexcept
@@ -135,7 +140,17 @@ bool sameCameraRecord (const SceneCameraRecord& a, const SceneCameraRecord& b) n
 {
     return a.id.value == b.id.value && sameTransform (a.transform, b.transform)
         && sameBits (a.verticalFovRadians, b.verticalFovRadians)
-        && sameBits (a.nearPlane, b.nearPlane) && sameBits (a.farPlane, b.farPlane);
+        && sameBits (a.nearPlane, b.nearPlane) && sameBits (a.farPlane, b.farPlane)
+        && sameBits (a.orthographicHeight, b.orthographicHeight)
+        && HarmonicMIDI::grid::sameCameraLens (a, b);
+}
+
+// The cameras of two views agree, including the one a motion blur shutter opens from.
+bool sameViewCamera (const EngineView& a, const EngineView& b) noexcept
+{
+    if (! sameCameraRecord (a.camera, b.camera) || a.previousCamera.has_value() != b.previousCamera.has_value())
+        return false;
+    return ! a.previousCamera || sameCameraRecord (*a.previousCamera, *b.previousCamera);
 }
 
 const char* sceneContentDifference (const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& a,
@@ -143,14 +158,15 @@ const char* sceneContentDifference (const std::shared_ptr<const HarmonicMIDI::gr
 {
     if (a == b) return nullptr;
     if (a == nullptr || b == nullptr) return "scene snapshot";
-    // The tracer ingests these records and arrays. The Motion history the scene
-    // also carries is not one of them: Path Trace refuses Motion outputs, so a
-    // prior-frame transform that moved cannot change what it traces.
+    // The tracer ingests these records and arrays. The previous transforms Motion
+    // reads are not among them: a moved time restarts the preview, and the first-hit
+    // pass then reads them from the call's own snapshot (traceDepth).
     if (a->id != b->id) return "scene identity";
     if (a->activeCamera != b->activeCamera) return "active camera";
     if (a->ambientColor.x != b->ambientColor.x || a->ambientColor.y != b->ambientColor.y
         || a->ambientColor.z != b->ambientColor.z)
         return "ambient colour";
+    if (! HarmonicMIDI::grid::sameSceneVolume (a->worldVolume, b->worldVolume)) return "world volume";
     if (a->vertexCount != b->vertexCount) return "vertex count";
     if (a->indexCount != b->indexCount) return "index count";
     if (a->objectCount != b->objectCount) return "object count";
@@ -212,6 +228,23 @@ const char* sceneSetupDifference (const EngineSceneSetup& a, const EngineSceneSe
         return "light shape count";
     if (a.areaLights.size() != b.areaLights.size())
         return "area light count";
+    if (! sameBits (a.shutterOpen, b.shutterOpen) || ! sameBits (a.shutterClose, b.shutterClose))
+        return "motion blur shutter";
+    if (a.previousObjectWorlds.size() != b.previousObjectWorlds.size()
+        || a.previousInstances.size() != b.previousInstances.size())
+        return "previous frame count";
+    for (std::size_t i = 0; i < a.previousObjectWorlds.size(); ++i)
+        if (std::memcmp (a.previousObjectWorlds[i].m.data(), b.previousObjectWorlds[i].m.data(), sizeof (float) * 16) != 0)
+            return "previous object world";
+    for (std::size_t i = 0; i < a.previousInstances.size(); ++i)
+        if (std::memcmp (&a.previousInstances[i], &b.previousInstances[i], sizeof (a.previousInstances[i])) != 0)
+            return "previous instance";
+    if (a.previousPositions != b.previousPositions
+        && (a.previousPositions == nullptr || b.previousPositions == nullptr
+            || a.previousPositions->size() != b.previousPositions->size()
+            || std::memcmp (a.previousPositions->data(), b.previousPositions->data(),
+                            sizeof (HarmonicMIDI::grid::SceneVec3) * a.previousPositions->size()) != 0))
+        return "previous positions";
     for (std::size_t i = 0; i < a.lightShapes.size(); ++i)
         if (! sameLightShape (a.lightShapes[i], b.lightShapes[i]))
             return "light shape";
@@ -327,11 +360,24 @@ bool SceneEngine::prepare (const EngineSceneSetup& setup, const EngineView& view
         error = "Path Trace requires a finite camera with a near plane in front of the far plane";
         return false;
     }
+    if (view.previousCamera)
+        setCameraShutter (camera, *view.previousCamera, setup.shutterOpen, setup.shutterClose);
     if (! sceneValid_ || ! sameSceneSetup (setup, cachedSetup_))
     {
         PrepareOptions options;
         options.ingest.objectWorlds = setup.objectWorlds.empty() ? nullptr : setup.objectWorlds.data();
         options.ingest.objectWorldCount = setup.objectWorlds.size();
+        options.ingest.shutterOpen = setup.shutterOpen;
+        options.ingest.shutterClose = setup.shutterClose;
+        options.ingest.previousObjectWorlds = setup.previousObjectWorlds.empty() ? nullptr : setup.previousObjectWorlds.data();
+        options.ingest.previousObjectWorldCount = setup.previousObjectWorlds.size();
+        options.ingest.previousInstances = setup.previousInstances.empty() ? nullptr : setup.previousInstances.data();
+        options.ingest.previousInstanceCount = setup.previousInstances.size();
+        if (setup.previousPositions != nullptr)
+        {
+            options.ingest.previousPositions = setup.previousPositions->data();
+            options.ingest.previousPositionCount = setup.previousPositions->size();
+        }
         options.objectMaterials = setup.objectMaterials;
         options.objectGratings = setup.objectGratings;
         options.objectFrames = setup.objectFrames;
@@ -344,6 +390,7 @@ bool SceneEngine::prepare (const EngineSceneSetup& setup, const EngineView& view
         prepareRenderScene (*setup.scene, scene_, options);
         cachedSetup_ = setup;
         skyVisible_ = rasterDrawsSkyBackground (setup.lights);
+        cameraBackground_ = HarmonicMIDI::grid::sceneCameraBackground (setup.lights.data(), setup.lights.size());
         sceneValid_ = true;
         ++sceneBuilds_;
         rebuilt = true;
@@ -352,14 +399,51 @@ bool SceneEngine::prepare (const EngineSceneSetup& setup, const EngineView& view
     return true;
 }
 
-void SceneEngine::traceDepth (const PinholeCamera& camera)
+bool SceneEngine::timedPrepare (const EngineSceneSetup& setup, const EngineView& view, PinholeCamera& camera,
+                                bool& rebuilt, FramePhaseTimes& phases, std::string& error)
+{
+    const auto start = PhaseClock::now();
+    if (! prepare (setup, view, camera, rebuilt, error))
+        return false;
+    const double bvh = rebuilt ? scene_.bvhBuildMs : 0.0;
+    phases.set (FramePhase::SceneLower, std::max (0.0, millisecondsSince (start) - bvh));
+    phases.set (FramePhase::CpuBvhBuild, bvh);
+    return true;
+}
+
+void SceneEngine::traceDepth (const PinholeCamera& camera, const EngineView& engineView, const EngineSceneSetup& setup)
 {
     const std::size_t pixels = static_cast<std::size_t> (camera.width) * camera.height;
     depth_.assign (pixels, 1.0f);
     covered_.assign (pixels, 0);
+    outputs_.assign (pixels, FirstHitOutput {});
     const Vec3 forward = rotate (camera.rotation, Vec3 { 0.0f, 0.0f, -1.0f });
     const float range = camera.farPlane - camera.nearPlane;
     const std::uint32_t width = camera.width;
+    // The render outputs (render_outputs.h) read the hit the depth ray found: the
+    // integrator's own first-hit normal, the hit material's emission and the
+    // triangle's ids, and the hit point carried back to its previous transform.
+    const device::cpu::SceneView view = device::cpu::makeSceneView (scene_);
+    const auto* scene = setup.scene.get();
+    PinholeCamera previousCamera = camera;
+    if (! engineView.previousCamera.has_value()
+        || ! makePinholeCamera (*engineView.previousCamera, camera.width, camera.height, previousCamera))
+        previousCamera = camera;
+    const bool cameraMoved = ! sameView (camera, previousCamera);
+    const bool motion = scene != nullptr && (cameraMoved || sceneHasMotionHistory (*scene));
+    std::vector<Mat4> currentWorlds, previousWorlds;
+    if (motion)
+    {
+        const std::size_t objectCount = scene->objectCount;
+        const bool overrides = setup.objectWorlds.size() == objectCount;
+        currentWorlds.resize (objectCount);
+        previousWorlds.resize (objectCount);
+        for (std::size_t object = 0; object < objectCount; ++object)
+        {
+            currentWorlds[object] = overrides ? setup.objectWorlds[object] : objectWorldMatrix (*scene, object);
+            previousWorlds[object] = previousObjectWorld (*scene, object, currentWorlds[object]);
+        }
+    }
     tracer_.forEachTile (camera.width, camera.height, cancel_, [&] (const Tile& tile, unsigned) {
         for (std::uint32_t y = tile.y0; y < tile.y1; ++y)
             for (std::uint32_t x = tile.x0; x < tile.x1; ++x)
@@ -372,6 +456,28 @@ void SceneEngine::traceDepth (const PinholeCamera& camera)
                 const float viewDepth = hit.t * dot (ray.direction, forward);
                 depth_[index] = std::min (1.0f, std::max (0.0f, (viewDepth - camera.nearPlane) / range));
                 covered_[index] = 1;
+                FirstHitOutput& output = outputs_[index];
+                output.depth = depth_[index];
+                output.mask = 255;
+                const Vec3 normal = device::cpu::firstHitWorldNormal (view, ray);
+                output.normal = { normal.x, normal.y, normal.z };
+                const Material& material = scene_.materialOf (hit.triangle);
+                output.emission = { material.emission.x, material.emission.y, material.emission.z };
+                if (hit.triangle >= scene_.geometry.triangles.size())
+                    continue;
+                const TriangleAttributes& attributes = scene_.geometry.triangles[hit.triangle];
+                output.materialId = attributes.materialId;
+                output.objectId = attributes.objectId;
+                if (! motion || attributes.objectIndex >= currentWorlds.size())
+                    continue;
+                Mat4 current = currentWorlds[attributes.objectIndex];
+                Mat4 previous = previousWorlds[attributes.objectIndex];
+                if (attributes.instanceIndex != kNoInstance && attributes.instanceIndex < scene->objectInstanceCount)
+                {
+                    current = current * transformMatrix (scene->objectInstances[attributes.instanceIndex]);
+                    previous = previous * previousInstanceMatrix (*scene, attributes.instanceIndex);
+                }
+                output.motion = pixelMotion (camera, previousCamera, ray.origin + ray.direction * hit.t, current, previous);
             }
     });
 }
@@ -387,9 +493,31 @@ void SceneEngine::resolve (EngineColor color, EngineImage& image) const
     image.color = color;
     image.colorBytes.assign (pixels * stride, 0);
     image.depth.assign (pixels, 1.0f);
+    image.albedo.assign (pixels * 3, 0.0f);
+    image.normal.assign (pixels * 3, 0.0f);
+    image.normalPass.assign (pixels * 4, 0);
+    image.emissionPass.assign (pixels * 4, 0);
+    image.maskPass.assign (pixels, 0);
+    image.materialIdPass.assign (pixels, 0);
+    image.objectIdPass.assign (pixels, 0);
+    image.motionPass.assign (pixels * 2, 0);
     const bool depthValid = depth_.size() == pixels && covered_.size() == pixels;
+    const bool outputsValid = outputs_.size() == pixels;
     const std::uint16_t halfOne = halfBits (1.0f);
     const float* background = color == EngineColor::LinearRgba16f ? kLinearRasterBackground : kRasterBackground;
+    // A camera background replaces the stage colour: a colour (sRGB encoded for the
+    // 8-bit image, as the stage colour is) or zero alpha.
+    using BackgroundMode = HarmonicMIDI::grid::SceneCameraBackgroundMode;
+    const auto encode = [&] (float linear) {
+        if (color == EngineColor::LinearRgba16f) return linear;
+        const float c = std::max (0.0f, linear);
+        return c <= 0.0031308f ? 12.92f * c : 1.055f * std::pow (c, 1.0f / 2.4f) - 0.055f;
+    };
+    const float colourBackground[3] { encode (cameraBackground_.color.x), encode (cameraBackground_.color.y),
+                                      encode (cameraBackground_.color.z) };
+    if (cameraBackground_.mode == BackgroundMode::Colour)
+        background = colourBackground;
+    const bool transparentBackground = cameraBackground_.mode == BackgroundMode::Transparent;
     for (std::uint32_t y = 0; y < height; ++y)
     {
         // The tracer's rows run top first; GL scene attachments bottom first.
@@ -400,14 +528,40 @@ void SceneEngine::resolve (EngineColor color, EngineImage& image) const
             const Rgb mean = historyShown_ ? history_[source] : accumulator.mean (x, y);
             float rgb[3] { mean.r, mean.g, mean.b };
             const bool covered = depthValid && covered_[source] != 0;
-            if (! skyVisible_ && ! covered)
+            const bool backdrop = ! skyVisible_ && ! covered;
+            if (backdrop && ! transparentBackground)
                 for (int channel = 0; channel < 3; ++channel)
                     rgb[channel] += background[channel];
+            const bool clear = backdrop && transparentBackground;
             if (depthValid) image.depth[target + x] = depth_[source];
+            if (outputsValid && outputs_[source].mask != 0)
+            {
+                const FirstHitOutput& output = outputs_[source];
+                std::uint16_t* const normalOut = image.normalPass.data() + (target + x) * 4;
+                std::uint16_t* const emissionOut = image.emissionPass.data() + (target + x) * 4;
+                for (int channel = 0; channel < 3; ++channel)
+                {
+                    normalOut[channel] = halfBits (output.normal[static_cast<std::size_t> (channel)]);
+                    emissionOut[channel] = halfBits (output.emission[static_cast<std::size_t> (channel)]);
+                }
+                normalOut[3] = emissionOut[3] = halfOne;
+                image.maskPass[target + x] = output.mask;
+                image.materialIdPass[target + x] = output.materialId;
+                image.objectIdPass[target + x] = output.objectId;
+                image.motionPass[(target + x) * 2] = halfBits (output.motion[0]);
+                image.motionPass[(target + x) * 2 + 1] = halfBits (output.motion[1]);
+            }
+            Rgb albedo, normal;
+            accumulator.guideMean (x, y, albedo, normal);
+            float* const guideAlbedo = image.albedo.data() + (target + x) * 3;
+            float* const guideNormal = image.normal.data() + (target + x) * 3;
+            guideAlbedo[0] = albedo.r; guideAlbedo[1] = albedo.g; guideAlbedo[2] = albedo.b;
+            guideNormal[0] = normal.r; guideNormal[1] = normal.g; guideNormal[2] = normal.b;
             std::uint8_t* out = image.colorBytes.data() + (target + x) * stride;
             if (color == EngineColor::LinearRgba16f)
             {
-                const std::uint16_t halves[4] { halfBits (rgb[0]), halfBits (rgb[1]), halfBits (rgb[2]), halfOne };
+                const std::uint16_t halves[4] { halfBits (rgb[0]), halfBits (rgb[1]), halfBits (rgb[2]),
+                                                clear ? halfBits (0.0f) : halfOne };
                 std::memcpy (out, halves, sizeof (halves));
             }
             else
@@ -415,7 +569,7 @@ void SceneEngine::resolve (EngineColor color, EngineImage& image) const
                 out[0] = unorm8 (rgb[0]);
                 out[1] = unorm8 (rgb[1]);
                 out[2] = unorm8 (rgb[2]);
-                out[3] = 255;
+                out[3] = clear ? 0 : 255;
             }
         }
     }
@@ -515,6 +669,24 @@ void SceneEngine::updatePlaybackHistory (bool blend)
     historyCovered_ = covered_;
 }
 
+namespace
+{
+// The pass's device phases plus the engine's own. A device that traces the CPU BVH
+// (the CPU, and the compute devices) leaves AccelBuild to this: that BVH's build,
+// when this call made a new scene.
+void notePassPhases (FramePhaseTimes& passPhases, const FramePhaseTimes& enginePhases, bool rebuilt, double bvhBuildMs)
+{
+    FramePhaseTimes merged = enginePhases;
+    merged.merge (passPhases);
+    if (! merged.has (FramePhase::AccelBuild) && merged.absentReason (FramePhase::AccelBuild) == nullptr)
+    {
+        merged.set (FramePhase::AccelBuild, rebuilt ? bvhBuildMs : 0.0);
+        merged.accelBuild = rebuilt ? "build" : "reused";
+    }
+    passPhases = merged;
+}
+} // namespace
+
 bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView& view, EngineColor color,
                                  EngineImage& image, std::string& error)
 {
@@ -522,12 +694,14 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
     // pass; clear the token so this call can trace.
     const bool cancelled = cancel_.isCancelled();
     cancel_.reset();
+    lastPassObsolete_ = false;
     image = {};
     PinholeCamera camera;
     bool rebuilt = false;
     // Captured before prepare, which stores the incoming setup as the cached one.
     const char* setupDifference = sceneSetupDifference (setup, cachedSetup_);
-    if (! prepare (setup, view, camera, rebuilt, error))
+    FramePhaseTimes phases;
+    if (! timedPrepare (setup, view, camera, rebuilt, phases, error))
         return false;
     // A scene with frame layers never reaches the device, so it has nothing to wait for.
     // What prepare just found (a rebuild, a cancel) still applies when the device is ready.
@@ -542,10 +716,10 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
     const bool playbackFrame = playbackActive || timeMoved;
     const bool restart = ! previewValid_ || rebuilt || cancelled
         || view.width != previewView_.width || view.height != previewView_.height
-        || ! sameCameraRecord (view.camera, previewView_.camera)
+        || ! sameViewCamera (view, previewView_)
         || timeMoved
         || previewSeededLikeExport != previewSeeded_
-        || tracer_.settings.maxDepth != previewMaxDepth_
+        || ! sameLightPathSettings (tracer_.settings, previewLightPaths_)
         // A lowered target (Export Samples or Preview Samples edited while the preview is
         // live) restarts, so the settled image has exactly the target's samples, as the
         // export of the same count does.
@@ -554,7 +728,7 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
     // it, because each pixel rejects what no longer holds.
     if (! playbackFrame || ! previewValid_
         || view.width != previewView_.width || view.height != previewView_.height
-        || ! sameCameraRecord (view.camera, previewView_.camera)
+        || ! sameViewCamera (view, previewView_)
         || previewSeededLikeExport != previewSeeded_)
         historyValid_ = false;
     const bool historyWasShown = historyShown_;
@@ -567,9 +741,13 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
         previewView_ = view;
         previewValid_ = true;
         previewSeeded_ = previewSeededLikeExport;
-        previewMaxDepth_ = tracer_.settings.maxDepth;
-        traceDepth (camera);
+        previewLightPaths_ = tracer_.settings;
+        const auto depthStart = PhaseClock::now();
+        traceDepth (camera, view, setup);
+        phases.set (FramePhase::DepthPass, millisecondsSince (depthStart));
     }
+    else
+        phases.set (FramePhase::DepthPass, 0.0);
     image.restarted = restart;
     image.sceneRebuilt = rebuilt;
     renderMode_ = playbackFrame ? EngineRenderMode::PlaybackFixed : EngineRenderMode::Converging;
@@ -583,6 +761,7 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
         image.stats = tracer_.renderProgressive (scene_, camera, view.width, view.height, samples,
                                                  previewGeneration_, cancel_,
                                                  previewSeeded_ ? kExportGeneration : 0);
+        notePassPhases (image.stats.phases, phases, rebuilt, scene_.bvhBuildMs);
     if (image.stats.deviceFailed)
     {
         error = "Path Trace device failed: " + tracer_.deviceFailure();
@@ -599,6 +778,7 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
         // Some pixels may lack this pass; the next call starts over.
         if (image.stats.cancelled)
         {
+            lastPassObsolete_ = cancel_.obsolete();
             previewValid_ = false;
             historyValid_ = false;
             historyShown_ = false;
@@ -660,7 +840,11 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
         return true;
     }
     previewColor_ = color;
+    const auto resolveStart = PhaseClock::now();
     resolve (color, image);
+    if (! image.traced)
+        image.stats.phases = phases;
+    image.stats.phases.set (FramePhase::Resolve, millisecondsSince (resolveStart));
     error.clear();
     return true;
 }
@@ -669,6 +853,7 @@ bool SceneEngine::renderExport (const EngineSceneSetup& setup, const EngineView&
                                 std::uint32_t samplesPerPixel, EngineImage& image, std::string& error)
 {
     cancel_.reset();
+    cancel_.watch (nullptr, 0);  // an edit during an export does not stop it
     image = {};
     if (samplesPerPixel == 0)
     {
@@ -677,7 +862,8 @@ bool SceneEngine::renderExport (const EngineSceneSetup& setup, const EngineView&
     }
     PinholeCamera camera;
     bool rebuilt = false;
-    if (! prepare (setup, view, camera, rebuilt, error))
+    FramePhaseTimes phases;
+    if (! timedPrepare (setup, view, camera, rebuilt, phases, error))
         return false;
     // The export reuses the accumulator, so preview starts over afterwards. History
     // stops here too, and the export resolves the accumulator alone.
@@ -686,9 +872,12 @@ bool SceneEngine::renderExport (const EngineSceneSetup& setup, const EngineView&
     historyShown_ = false;
     renderMode_ = EngineRenderMode::Export;
     image.mode = renderMode_;
-    traceDepth (camera);
+    const auto depthStart = PhaseClock::now();
+    traceDepth (camera, view, setup);
+    phases.set (FramePhase::DepthPass, millisecondsSince (depthStart));
     image.stats = tracer_.renderFixed (scene_, camera, view.width, view.height, samplesPerPixel,
                                        kExportGeneration, cancel_);
+    notePassPhases (image.stats.phases, phases, rebuilt, scene_.bvhBuildMs);
     if (image.stats.deviceFailed)
     {
         error = "Path Trace device failed: " + tracer_.deviceFailure();
@@ -707,7 +896,9 @@ bool SceneEngine::renderExport (const EngineSceneSetup& setup, const EngineView&
     if (const char* filmPath = std::getenv ("ARBIT_PATHTRACE_EXPORT_FILM"); filmPath != nullptr && *filmPath != '\0')
         if (! writeExportFilm (tracer_.accumulator(), filmPath, error))
             return false;
+    const auto resolveStart = PhaseClock::now();
     resolve (color, image);
+    image.stats.phases.set (FramePhase::Resolve, millisecondsSince (resolveStart));
     image.generation = kExportGeneration;
     image.samplesPerPixel = samplesPerPixel;
     image.restarted = true;

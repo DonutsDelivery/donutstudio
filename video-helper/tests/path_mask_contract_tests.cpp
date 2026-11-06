@@ -315,13 +315,17 @@ void testFailClosedAdmission()
     expectRejected(value, AdmissionFailure::emptyAsset,
                    "empty contour data is rejected");
     value = square();
-    value.contours.resize(kMaximumContours + 1, value.contours.front());
+    Limits sixteenContours;
+    sixteenContours.maximumContours = 16;
+    value.contours.resize(17, value.contours.front());
     expectRejected(value, AdmissionFailure::contourLimitExceeded,
-                   "contour budget is checked before traversal");
+                   "a caller's contour limit is checked before traversal", sixteenContours);
     value = square();
-    value.segments.resize(kMaximumSegments + 1, value.segments.front());
+    Limits manySegments;
+    manySegments.maximumSegments = 1024;
+    value.segments.resize(1025, value.segments.front());
     expectRejected(value, AdmissionFailure::segmentLimitExceeded,
-                   "segment budget is checked before traversal");
+                   "a caller's segment limit is checked before traversal", manySegments);
 
     value = square();
     value.contours[0].id = 0;
@@ -386,9 +390,9 @@ void testFailClosedAdmission()
                    lowPointLimit);
     value = square();
     Limits invalidLimits;
-    invalidLimits.maximumSegments = kMaximumSegments + 1;
+    invalidLimits.maximumSegments = 0;
     expectRejected(value, AdmissionFailure::invalidLimits,
-                   "caller limits cannot weaken hard segment bounds",
+                   "a zero segment limit is invalid",
                    invalidLimits);
 }
 

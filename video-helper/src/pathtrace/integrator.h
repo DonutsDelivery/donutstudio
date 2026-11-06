@@ -17,15 +17,22 @@
 // delta reflection counts as glossy, any transmission as transmission), and
 // maxTransparentHits caps alpha cut-outs, false interfaces and thin sheets
 // crossed. A path that reaches a limit ends there and keeps the radiance it
-// gathered; RenderStats counts it. No limit ever refuses a frame. The tracer
-// has no volume scattering yet (media only absorb), so there is no volume
-// bounce limit to reach.
+// gathered; RenderStats counts it. No limit ever refuses a frame. A scatter
+// inside a participating medium is a volume bounce, capped by
+// maxVolumeBounces and by maxDepth; its light sample is taken before the limit
+// ends the path, so a limit of 0 still shows single scattering.
 //
 // Nothing is clamped by default. A sample whose radiance is NaN or infinite
 // is dropped before it reaches the accumulator and counted in
-// RenderStats::nonFiniteSamples. The optional indirect clamp is off unless
-// IntegratorSettings::indirectClamp > 0, and RenderStats reports both its
-// value and how many contributions it changed.
+// RenderStats::nonFiniteSamples. The optional clamps are off unless
+// IntegratorSettings::directClamp or indirectClamp > 0; RenderStats reports
+// the indirect value and how many contributions either clamp changed.
+//
+// Filter Glossy (filterGlossy > 0) blurs lobes after a rough bounce, as
+// Cycles does (bsdf.h filteredGlossRoughness). The caustic switches
+// (reflectiveCaustics, refractiveCaustics) drop glossy reflection or
+// refraction lobes after a diffuse bounce, and the light tracer's caustics
+// through a reflection or a refraction.
 //
 // Output is linear scene-referred RGB in the Accumulator. Pixel samples use a
 // box filter over the pixel footprint.
@@ -56,6 +63,18 @@
 // bounce and shadow rays all follow. Shadow rays still stop at real
 // refracting interfaces: light seen through glass arrives by BSDF sampling.
 //
+// Participating media (media.h). The owning medium, or the world volume
+// outside every medium, also scatters, absorbs and emits by its volume
+// (Material::volumeDensity and the fields after it). Paths sample a scatter
+// distance per segment; a scatter is a vertex with a Henyey-Greenstein phase
+// function that takes one light sample from any light type (combined with
+// phase sampling by MIS for lights with a size) and then continues by phase
+// sampling. Shadow rays carry the medium's transmittance, so lit fog shows
+// the shafts and shadows of the objects in it. A volume-only material's
+// surface is crossed like a false interface: only the medium stack changes.
+// The light tracer carries the unscattered part of its light through media;
+// paths with a volume scatter stay with the camera path.
+//
 // Caustics (light tracing). A camera path cannot reach a point or
 // directional light through glass, a mirror chain or a grating, and finds
 // small lights that way only by chance. When the scene has a refracting
@@ -84,7 +103,9 @@
 // intern/cycles/kernel/light/sample.h, intern/cycles/kernel/sample/mis.h,
 // intern/cycles/kernel/geom/shader_data.h (wavelength setup).
 
+#if ! defined(PATHTRACE_DEVICE_METAL)
 #include "accumulator.h"
+#endif
 #include "bsdf.h"
 #include "bvh.h"
 #include "environment_map.h"
@@ -93,9 +114,14 @@
 #include "sampler.h"
 #include "spectrum.h"
 #include "scene_ingest.h"
+#if ! defined(PATHTRACE_DEVICE_METAL)
+#include "phase_times.h"
 #include "thread_pool.h"
+#endif
 #include "devices/device_interface.h"
+#if ! defined(PATHTRACE_DEVICE_METAL)
 #include "../../../shared/Visual3DScene.h"
+#endif
 
 #include <array>
 #include <cstdint>
@@ -136,20 +162,51 @@ struct IntegratorSettings
     std::uint32_t maxDiffuseBounces = kUnlimitedBounces;
     std::uint32_t maxGlossyBounces = kUnlimitedBounces;
     std::uint32_t maxTransmissionBounces = kUnlimitedBounces;
+    std::uint32_t maxVolumeBounces = kUnlimitedBounces;
     std::uint32_t rouletteStartDepth = 3;   // first bounce that may be terminated
     std::uint32_t maxTransparentHits = 16;  // alpha cut-outs crossed per path
     // 0 disables. Otherwise the largest channel of every indirect contribution
     // (two or more bounces) is limited to this value; RenderStats counts them.
     float indirectClamp = 0.0f;
+    // 0 disables. Otherwise the same limit on light seen directly or after one
+    // scatter (fewer than two bounces).
+    float directClamp = 0.0f;
+    // 0 disables; see the header comment.
+    float filterGlossy = 0.0f;
+    bool reflectiveCaustics = true;
+    bool refractiveCaustics = true;
     LightStrategy strategy = LightStrategy::MultipleImportance;
     SpectralMode spectral = SpectralMode::Automatic;
     SamplePattern pattern = SamplePattern::OwenSobol;
     bool environmentVisibleToCamera = true;
+    // Off, camera rays cross every volume as if it were empty (Cycles' camera
+    // ray visibility for volumes); the light the volumes scatter onto surfaces
+    // still shows. Uniform Beer-Lambert absorption of glass and water stays.
+    bool volumesVisibleToCamera = true;
     // Light tracing for caustics (see the header comment). It runs only for
     // scenes with a refracting interface or a bound grating.
     bool causticLightPaths = true;
+#if ! defined(PATHTRACE_DEVICE_METAL)
     std::uint32_t tileSize = TileGrid::kDefaultTileSize;
+#else
+    std::uint32_t tileSize = 0;  // the host's; the Metal kernel has no TileGrid
+#endif
 };
+
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
+// The settings the Render node's light paths set. A live preview restarts when
+// any of them changes.
+inline bool sameLightPathSettings (const IntegratorSettings& a, const IntegratorSettings& b) noexcept
+{
+    return a.maxDepth == b.maxDepth && a.maxDiffuseBounces == b.maxDiffuseBounces
+        && a.maxGlossyBounces == b.maxGlossyBounces && a.maxTransmissionBounces == b.maxTransmissionBounces
+        && a.maxVolumeBounces == b.maxVolumeBounces && a.maxTransparentHits == b.maxTransparentHits
+        && a.indirectClamp == b.indirectClamp && a.directClamp == b.directClamp
+        && a.filterGlossy == b.filterGlossy
+        && a.reflectiveCaustics == b.reflectiveCaustics && a.refractiveCaustics == b.refractiveCaustics
+        && a.volumesVisibleToCamera == b.volumesVisibleToCamera;
+}
 
 // An object tinted by a frame texture. Camera samples that first hit it go to
 // frame layer `layer` instead of the accumulator (FrameLayerFilm).
@@ -183,14 +240,29 @@ struct RenderScene
     std::vector<std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR>> gratingMaterials;
     std::vector<device::GratingBinding> gratings;
     std::vector<ObjectFrameBinding> frameBindings;
+    // Scene fog: the volume of this material (its volume fields only) fills a
+    // ball of worldVolumeRadius around the scene's bounds centre, outside
+    // every other medium. Density 0 is no world volume. A radius of 0 or less
+    // is four times the scene's bounding radius. World volumes are uniform;
+    // their density field is ignored.
+    Material worldVolume {};
+    float worldVolumeRadius = 0.0f;
 
     // Built by commit().
     Bvh bvh;
+    // Host milliseconds commit() took to build bvh.
+    double bvhBuildMs = 0.0;
     LightSet lights;
     bool anyPartialCoverage = false;
     bool anyThinSheet = false;
     bool anyMediumBoundary = false;
     bool anyDispersive = false;
+    // Some material or the world volume holds a participating medium.
+    bool anyVolume = false;
+    bool hasWorldVolume = false;
+    float worldVolumeExtent = 0.0f;  // the radius in force
+    // Some triangle hides from a kind of ray (TriangleAttributes::visibility).
+    bool anyHiddenObjects = false;
     // Bounding sphere of the triangles; radius 0 for an empty scene.
     Vec3 boundsCentre {};
     float boundsRadius = 0.0f;
@@ -225,6 +297,9 @@ struct PrepareOptions
     std::vector<ObjectMaterialOverride> objectMaterials;
     // Applied after objectMaterials; a null material is skipped.
     std::vector<ObjectGratingBinding> objectGratings;
+    // Scene fog (RenderScene::worldVolume and worldVolumeRadius).
+    Material worldVolume {};
+    float worldVolumeRadius = 0.0f;
     std::vector<ObjectFrameBinding> objectFrames;
     // When set, these records light the scene instead of scene.lights, e.g.
     // the records a runtime light override produced. Must outlive the call.
@@ -246,9 +321,12 @@ struct PrepareOptions
 };
 
 Material materialFromRecord (const HarmonicMIDI::grid::SceneMaterialRecord& record) noexcept;
+// Copies a scene medium onto a material's volume fields, clamped to its ranges.
+void applySceneVolume (const HarmonicMIDI::grid::SceneVolume& volume, Material& material) noexcept;
 // Ingests the scene, converts its materials and lights, and commits.
 void prepareRenderScene (const HarmonicMIDI::grid::Visual3DScene& scene, RenderScene& out,
                          const PrepareOptions& options = {});
+#endif
 
 // Per-thread path counters, summed into RenderStats.
 struct PathCounters
@@ -268,6 +346,8 @@ struct PathCounters
     PathCounters& operator+= (const PathCounters& other) noexcept;
 };
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 struct RenderStats
 {
     std::uint64_t samplesAdded = 0;
@@ -286,6 +366,10 @@ struct RenderStats
     std::uint64_t lightPathRays = 0;
     std::uint64_t causticSplats = 0;
     std::array<std::uint64_t, 7> causticSplatsByLight {};  // by LightType
+    // The GPU's free and total memory after the pass; zero on the CPU and on a
+    // driver that cannot tell.
+    std::uint64_t deviceMemoryFreeBytes = 0;
+    std::uint64_t deviceMemoryTotalBytes = 0;
     std::uint32_t samplesPerPixel = 0;     // requested by this call
     std::uint32_t firstSampleIndex = 0;
     std::uint32_t tileCount = 0;
@@ -298,6 +382,10 @@ struct RenderStats
     const char* deviceSkipped = nullptr;
     bool deviceFailed = false;             // PathTracer::deviceFailure(); the frame must not show
     LightSetStats lights {};
+    // Host wall-clock times of the pass (phase_times.h). The device fills
+    // PipelineWait, AccelBuild, Upload, Trace and Readback and sets accelBuild, or
+    // marks a phase it has not got as absent; the engine fills the rest.
+    FramePhaseTimes phases {};
 };
 
 // Whether a render of scene with settings uses spectral transport.
@@ -307,12 +395,20 @@ bool usesSpectralTransport (const RenderScene& scene, const IntegratorSettings& 
 // radiance unspecified) when the estimate is NaN or infinite.
 bool tracePath (const RenderScene& scene, const IntegratorSettings& settings, const Ray& cameraRay,
                 const PathSampler& sampler, PathCounters& counters, Vec3& radiance) noexcept;
+#endif
 
 // Sample dimension of the pixel filter jitter (2D).
 constexpr std::uint32_t kPixelFilterDimension = 0;
 // Sample dimension of the hero wavelength (1D, independent of the 2D one).
 constexpr std::uint32_t kWavelengthDimension = 0;
+// Sample dimension of a camera ray's lens point (2D), clear of the path
+// vertices' blocks and of the light path's.
+constexpr std::uint32_t kLensDimension = 0x00200000u;
+// Sample dimension of a camera ray's time within the motion blur shutter (1D).
+constexpr std::uint32_t kShutterTimeDimension = 0x00200001u;
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 class PathTracer
 {
 public:
@@ -390,5 +486,6 @@ private:
     // Seeds the sample streams of the live accumulation (see renderProgressive).
     std::uint64_t samplerGeneration_ = 0;
 };
+#endif
 
 } // namespace videohelper::pathtrace

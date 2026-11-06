@@ -117,7 +117,7 @@ inline bool calculateGratingIncidentBounds(const Frame& frame,std::size_t triang
     if(frame.work.empty()||frame.work.size()>kMaximumEntrySamples*8||!frame.bounds.maximumDeposits
         ||frame.bounds.maximumDeposits>frame.work.size()*kMaximumBranchVisits||frame.bounds.queryWork>kMaximumQueryWork
         ||frame.bounds.deposition.depositionWork>kMaximumDepositionWork
-        ||frame.bounds.transientBytes>renderpassoutput::kMaximumTotalBytes||!triangles
+        ||frame.bounds.transientBytes>renderpassoutput::kRepresentableTotalBytes||!triangles
         ||!std::isfinite(frame.query.control[0])||frame.query.control[0]<1
         ||frame.query.control[0]>=frame.query.texels.size()||std::floor(frame.query.control[0])!=frame.query.control[0])
     {error="Glass to grating staging bounds are incomplete";return false;}
@@ -131,14 +131,17 @@ inline bool calculateGratingIncidentBounds(const Frame& frame,std::size_t triang
     // camera legs. The native visit/stack/deposit caps still apply globally.
     candidate.queryWork=frame.bounds.queryWork+candidate.maximumOrders*3*query;
     candidate.orderWork=candidate.maximumOrders;candidate.combinedWork=candidate.queryWork+candidate.orderWork;
+    candidate.historyTailWords=gratingIncidentHistoryTailWords(frame.bounds.policyInterfaces);
     candidate.bytes=triangles*(2*kGratingWitnessStride*sizeof(Texel)+sizeof(GratingTriangleWitness))
-        +candidate.maximumIncidents*kGratingIncidentStride*sizeof(Texel)
+        +candidate.maximumIncidents*(kGratingIncidentStride+gratingIncidentHistoryTailTexels(frame.bounds.policyInterfaces))*sizeof(Texel)
         +candidate.maximumOrders*kGratingOrderStride*sizeof(Texel);
     // Reserve native adjunct storage and decoded host copies simultaneously.
-    candidate.bytes+=candidate.maximumIncidents*sizeof(NativeGratingIncident);
-    // Reserve the entire aligned private pending array, including ancestry and
-    // both origin derivatives. GL uses registers; Metal CBranch is 128 bytes.
-    candidate.bytes+=frame.work.size()*(kMaximumPendingBranches*kGratingPendingBranchBytes+kGratingBranchLocalBytes);
+    candidate.bytes+=candidate.maximumIncidents*(sizeof(NativeGratingIncident)
+        +historyWordsFor(frame.bounds.policyInterfaces)*sizeof(std::uint32_t));
+    // The pending stack lives in the path tail (ResourceBounds::historyTexels);
+    // reserve only the walked branch locals, including ancestry and both origin
+    // derivatives.
+    candidate.bytes+=frame.work.size()*kGratingBranchLocalBytes;
     // The frozen staging Frame owns its copied arrays alongside the caller's
     // frame. Prepared retains immutable scene/material owners; its query copy
     // and retained program/identity strings are charged at binding admission.
@@ -151,7 +154,7 @@ inline bool calculateGratingIncidentBounds(const Frame& frame,std::size_t triang
     candidate.bytes+=frame.identity.size()+frame.sourceIdentity.size()+frame.branchPolicyIdentity.size()+frame.cameraIdentity.size();
     if(!query||query>opaquevisibility::kMaximumClosestHitWork||candidate.combinedWork>kMaximumQueryWork
         ||candidate.orderWork>kMaximumDepositionWork-frame.bounds.deposition.depositionWork
-        ||candidate.bytes>renderpassoutput::kMaximumTotalBytes-frame.bounds.transientBytes)
+        ||candidate.bytes>renderpassoutput::kRepresentableTotalBytes-frame.bounds.transientBytes)
     {error="Glass to grating queries, orders or storage exceed existing frame bounds";return false;}
     output=candidate;error.clear();return true;
 }
@@ -239,7 +242,7 @@ inline bool prepareGratingIncidentBinding(const Prepared& prepared,const Frame& 
         +prepared.glass.query.texels.size()*sizeof(Texel)+prepared.glass.query.meshes.size()*sizeof(opaquevisibility::Mesh)
         +prepared.identity.size()+frame.identity.size()+material->structuralDigest().size()+gratingOwner->bindingDigest.size()
         +gratingOwner->programIdentity.size()+candidate->witnessTexels.size()*16*sizeof(float)+128;
-    if(programBytes>renderpassoutput::kMaximumTotalBytes-frame.bounds.transientBytes-candidate->bounds.bytes)
+    if(programBytes>renderpassoutput::kRepresentableTotalBytes-frame.bounds.transientBytes-candidate->bounds.bytes)
         return refuse("Glass to grating retained material storage exceeds the existing frame bound");
     candidate->bounds.bytes+=programBytes;
     candidate->identity=frame.identity;word(candidate->identity,kGratingIncidentVersion);
@@ -361,10 +364,10 @@ inline bool calculateDirectGratingContributionBounds(const GratingIncidentBindin
     const auto refuse=[&](){error="Direct grating contribution exceeds original whole-frame work or storage caps";return false;};
     if(!endpoints||endpoints>kMaximumEntrySamples||binding.bounds.combinedWork!=original.combinedWork
         ||binding.bounds.queryWork!=original.queryWork||binding.bounds.orderWork!=original.orderWork
-        ||binding.bounds.bytes<original.bytes||binding.bounds.bytes>renderpassoutput::kMaximumTotalBytes-binding.frame.bounds.transientBytes)
+        ||binding.bounds.bytes<original.bytes||binding.bounds.bytes>renderpassoutput::kRepresentableTotalBytes-binding.frame.bounds.transientBytes)
         return refuse();
     if(otherWork>kMaximumQueryWork-binding.bounds.combinedWork
-        ||otherOwnedBytes>renderpassoutput::kMaximumTotalBytes-binding.frame.bounds.transientBytes-binding.bounds.bytes)
+        ||otherOwnedBytes>renderpassoutput::kRepresentableTotalBytes-binding.frame.bounds.transientBytes-binding.bounds.bytes)
         return refuse();
     const auto& allowance=binding.frame.query.texels[std::size_t(binding.frame.query.control[0])-1];
     const auto perQuery=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
@@ -382,7 +385,7 @@ inline bool calculateDirectGratingContributionBounds(const GratingIncidentBindin
         +4*binding.identity.size();
     if(candidate.combinedWork>kMaximumQueryWork
         ||candidate.bandWork>kMaximumDepositionWork-binding.frame.bounds.deposition.depositionWork-binding.bounds.orderWork
-        ||candidate.bytes>renderpassoutput::kMaximumTotalBytes-binding.frame.bounds.transientBytes-binding.bounds.bytes-otherOwnedBytes)
+        ||candidate.bytes>renderpassoutput::kRepresentableTotalBytes-binding.frame.bounds.transientBytes-binding.bounds.bytes-otherOwnedBytes)
         return refuse();
     output=candidate;error.clear();return true;
 }
@@ -594,7 +597,7 @@ inline bool prepareDirectGratingIrradianceCohort(
     const auto refuse=[&](const char* message){error=message;return false;};
     if(sources.empty()
         ||!sources.front()||inputs.empty()||inputs.size()>kMaximumEntrySamples
-        ||otherOwnedBytes>renderpassoutput::kMaximumTotalBytes||otherWork>kMaximumQueryWork)
+        ||otherOwnedBytes>renderpassoutput::kRepresentableTotalBytes||otherWork>kMaximumQueryWork)
         return refuse("Directional cohort source or endpoint count is unsupported");
     std::vector<HarmonicMIDI::grid::SceneLightId> roster;
     std::size_t count=0;if(!directionalSourceRoster(sources.front()->prepared,roster,count,error))return false;
@@ -612,7 +615,7 @@ inline bool prepareDirectGratingIrradianceCohort(
             +2*sizeof(NativeDirectionalSourceEcho)+4*binding.identity.size();
         bounds.combinedWork+=batch.combinedWork;bounds.queryWork+=batch.queryWork;bounds.bandWork+=batch.bandWork;
         bounds.depositionWork+=binding.frame.bounds.deposition.depositionWork+binding.bounds.orderWork+batch.bandWork;
-        if(bounds.bytes>renderpassoutput::kMaximumTotalBytes||bounds.combinedWork>kMaximumQueryWork
+        if(bounds.bytes>renderpassoutput::kRepresentableTotalBytes||bounds.combinedWork>kMaximumQueryWork
             ||bounds.depositionWork>kMaximumDepositionWork)return refuse("Directional cohort exceeds cumulative frame bounds");
     }
     auto candidate=std::shared_ptr<DirectGratingIrradianceCohort>(new DirectGratingIrradianceCohort);
@@ -650,7 +653,7 @@ inline bool prepareDirectGratingIrradianceCohort(
     bounds.bytes+=sizeof(DirectGratingIrradianceCohort)+2*count*sizeof(sources.front())+2*candidate->identity_.size()
         +2*inputs.size()*(sizeof(NativeDirectGratingEndpointInput)+sizeof(DirectGratingEndpointIrradianceSum))
         +2*sizeof(DirectGratingIrradianceCohortReadback)+2*candidate->identity_.size();
-    if(bounds.bytes>renderpassoutput::kMaximumTotalBytes)return refuse("Directional cohort retained sum storage exceeds frame bounds");
+    if(bounds.bytes>renderpassoutput::kRepresentableTotalBytes)return refuse("Directional cohort retained sum storage exceeds frame bounds");
     candidate->bounds_=bounds;candidate->inputs_=inputs;
     output=std::move(candidate);error.clear();return true;
 }
@@ -846,6 +849,20 @@ inline constexpr std::uint32_t kGlassCameraGratingTraceVersion=1;
 inline constexpr std::uint32_t kGlassCameraTraceRoot=std::numeric_limits<std::uint32_t>::max();
 inline constexpr std::size_t kGlassCameraTraceHeaderLanes=10,kGlassCameraTraceVisitLanes=16;
 using GlassCameraTraceWords=std::array<std::uint32_t,4>;
+// Camera trace storage follows the branch policy's visit count. A visit's
+// interface count stays below the visits, so visits bits of history always
+// suffice: words 0-1 sit in lanes 1.y and 15.x, words 2 and up in extra lanes
+// after lane 15 (four per lane). At 64 visits or fewer a visit is 16 lanes.
+constexpr std::size_t glassCameraTraceHistoryWords(std::size_t visits)
+{return std::max<std::size_t>(2,(visits+31)/32);}
+constexpr std::size_t glassCameraTraceVisitLanes(std::size_t visits)
+{return kGlassCameraTraceVisitLanes+(glassCameraTraceHistoryWords(visits)-2+3)/4;}
+// One pending camera-trace branch on the GPU: six 16-byte lanes on GL, the
+// 96-byte CTBranch on Metal. Each band owns visits+1 of them, the most a
+// depth-first walk of that many visits can hold, so the stack never fills.
+inline constexpr std::uint64_t kGlassCameraTracePendingBytes = 96;
+constexpr std::size_t glassCameraTraceBandLanes(std::size_t visits)
+{return kGlassCameraTraceHeaderLanes+visits*glassCameraTraceVisitLanes(visits);}
 struct alignas(16) NativeGlassCameraGratingTraceInput
 {
     // Top-first pixel x/y; location0 center,1 TL,2 TR,3 BR,4 BL; version.
@@ -863,7 +880,9 @@ enum GlassCameraTraceReason : std::uint32_t {
 };
 struct NativeGlassCameraGratingTraceVisit
 {
-    std::uint32_t visit=0,parent=kGlassCameraTraceRoot,token=0,interfaces=0,history=0;
+    std::uint32_t visit=0,parent=kGlassCameraTraceRoot,token=0,interfaces=0;
+    // One bit per interface, sized from the band's visit count.
+    CausticHistory history{};
     bool inside=false,tir=false;
     GlassCameraTraceDisposition disposition=GlassCameraTraceDisposition::Unresolved;
     Texel originMinimum{},directionFraction{};
@@ -903,12 +922,12 @@ struct NativeGlassCameraGratingTraceUpload
 // Header0..3 input;4..5 native ray;6 version/sample/band/count;
 // 7 traceComplete/reasons/queryLo32/queryHi32;8 ior/wavelength/unresolved/known;
 // lane8.w is a native uint0/1, not float bits. Header9 is zero.
-// Visit0 visit/parent/token/interfaces;1 inside/history/disposition/tir;
+// Visit0 visit/parent/token/interfaces;1 inside/history low word/disposition/tir;
 // 2 origin/min;3 direction/fraction;4 status/object/material/instance;
 // 5 triangle/work/entering/0;6 position/distance;7 outwardNormal/0;
 // 8 orientedNormal/Fresnel;9 transmitted/transmittedFraction;
 // 10 reflected/reflectedFraction;11 barycentric/ior;12..13 packed ancestry;
-// 14 fromIor/toIor/0/0;15 zero. Unused fixed visit slots are zero.
+// 14 fromIor/toIor/0/0;15 history high word/0/0/0. Unused fixed visit slots are zero.
 using NativeGlassCameraGratingTracePackedHeader=std::array<GlassCameraTraceWords,kGlassCameraTraceHeaderLanes>;
 using NativeGlassCameraGratingTracePackedVisit=std::array<GlassCameraTraceWords,kGlassCameraTraceVisitLanes>;
 inline constexpr std::size_t kGlassCameraTraceHeaderBytes=sizeof(NativeGlassCameraGratingTracePackedHeader);
@@ -981,7 +1000,7 @@ inline bool makeGlassCameraGratingTraceInput(const Frame& frame,std::uint32_t x,
     if(!admitGlassCameraGratingTraceCamera(frame,error))return false;
     const float dx=location==0?.5f:(location==2||location==3?1.0f:0.0f);
     const float dy=location==0?.5f:(location==3||location==4?1.0f:0.0f);
-    const auto origin=cameraPosition(frame),ray=cameraRay(frame,float(x)+dx,float(y)+dy);
+    const auto origin=cameraOrigin(frame,float(x)+dx,float(y)+dy),ray=cameraRay(frame,float(x)+dx,float(y)+dy);
     if(!finite(origin)||!finite(ray)||std::abs(dot(ray,ray)-1)>1e-4f)
     {error="Camera trace owning projection is nonfinite";return false;}
     NativeGlassCameraGratingTraceInput result;
@@ -995,7 +1014,7 @@ inline bool decodeGlassCameraGratingTraceBand(const NativeGlassCameraGratingTrac
     NativeGlassCameraGratingTraceBand& output,std::string& error)
 {
     const auto zero=GlassCameraTraceWords{};
-    if(header[6][3]>kMaximumBranchVisits||header[6][3]>available||(!packed&&header[6][3])
+    if(header[6][3]>available||(!packed&&header[6][3])
         ||header[7][0]>1||header[8][3]>1||header[9]!=zero)
     {error="Camera trace native header/count is malformed";return false;}
     const auto floats=[](const auto& row){return Texel{glassCameraTraceFloat(row[0]),glassCameraTraceFloat(row[1]),
@@ -1012,11 +1031,11 @@ inline bool decodeGlassCameraGratingTraceBand(const NativeGlassCameraGratingTrac
     for(std::size_t i=0;i<header[6][3];++i) {
         const auto& words=packed[i];
         if(words[1][0]>1||words[1][2]>4||words[1][3]>1||words[5][2]>1||words[5][3]||words[7][3]
-            ||words[14][2]||words[14][3]||words[15]!=zero||(words[4][0]>1&&words[4][0]!=kGlassCameraTraceRoot))
+            ||words[14][2]||words[14][3]||words[15][1]||words[15][2]||words[15][3]||(words[4][0]>1&&words[4][0]!=kGlassCameraTraceRoot))
         {error="Camera trace native visit flags or padding are malformed";return false;}
         NativeGlassCameraGratingTraceVisit visit;
         visit.visit=words[0][0];visit.parent=words[0][1];visit.token=words[0][2];visit.interfaces=words[0][3];
-        visit.inside=words[1][0]!=0;visit.history=words[1][1];visit.disposition=GlassCameraTraceDisposition(words[1][2]);visit.tir=words[1][3]!=0;
+        visit.inside=words[1][0]!=0;visit.history=CausticHistory(words[1][1]|(std::uint64_t(words[15][0])<<32));visit.disposition=GlassCameraTraceDisposition(words[1][2]);visit.tir=words[1][3]!=0;
         visit.originMinimum=floats(words[2]);visit.directionFraction=floats(words[3]);
         visit.hit.status=words[4][0]==kGlassCameraTraceRoot?-1:int(words[4][0]);visit.hit.objectId=words[4][1];visit.hit.materialId=words[4][2];visit.hit.instanceId=words[4][3];
         visit.hit.triangleId=words[5][0];visit.hit.work=words[5][1];visit.hit.entering=words[5][2]!=0;
@@ -1029,6 +1048,41 @@ inline bool decodeGlassCameraGratingTraceBand(const NativeGlassCameraGratingTrac
         visit.fromIor=glassCameraTraceFloat(words[14][0]);visit.toIor=glassCameraTraceFloat(words[14][1]);band.visits.push_back(visit);
     }
     output=std::move(band);error.clear();return true;
+}
+// Visits of one band at the policy's stride: glassCameraTraceVisitLanes(visits)
+// lanes each. Extra lanes carry history words 2 and up; unused slots stay zero.
+inline bool decodeGlassCameraGratingTraceVisitLanes(const NativeGlassCameraGratingTracePackedHeader& header,
+    const GlassCameraTraceWords* lanes,std::size_t visits,NativeGlassCameraGratingTraceBand& output,std::string& error)
+{
+    if(!lanes||!visits){error="Camera trace native visit storage is missing";return false;}
+    const auto visitLanes=glassCameraTraceVisitLanes(visits),extraWords=glassCameraTraceHistoryWords(visits)-2;
+    const auto count=std::min<std::size_t>(header[6][3],visits);
+    std::vector<NativeGlassCameraGratingTracePackedVisit> packed(count);
+    for(std::size_t i=0;i<count;++i)std::copy(lanes+i*visitLanes,lanes+i*visitLanes+kGlassCameraTraceVisitLanes,packed[i].begin());
+    if(!decodeGlassCameraGratingTraceBand(header,packed.data(),visits,output,error))return false;
+    for(std::size_t i=0;i<visits;++i) {
+        const auto* at=lanes+i*visitLanes;
+        if(i>=count) {
+            for(std::size_t lane=0;lane<visitLanes;++lane)if(at[lane]!=GlassCameraTraceWords{})
+            {error="Camera trace unused native visit slots changed";return false;}
+            continue;
+        }
+        for(std::size_t k=extraWords;k<(visitLanes-kGlassCameraTraceVisitLanes)*4;++k)
+            if(at[kGlassCameraTraceVisitLanes+k/4][k%4]){error="Camera trace history lane padding is nonzero";return false;}
+        if(!extraWords)continue;
+        auto& words=output.visits[i].history.words;words.resize(std::max<std::size_t>(words.size(),2+extraWords),0u);
+        for(std::size_t k=0;k<extraWords;++k)words[2+k]=at[kGlassCameraTraceVisitLanes+k/4][k%4];
+    }
+    error.clear();return true;
+}
+// One band of the OpenGL buffer: header lanes, then the visit lanes.
+inline bool decodeGlassCameraGratingTraceBandLanes(const GlassCameraTraceWords* lanes,std::size_t visits,
+    NativeGlassCameraGratingTraceBand& output,std::string& error)
+{
+    if(!lanes){error="Camera trace native band storage is missing";return false;}
+    NativeGlassCameraGratingTracePackedHeader header;
+    std::copy(lanes,lanes+kGlassCameraTraceHeaderLanes,header.begin());
+    return decodeGlassCameraGratingTraceVisitLanes(header,lanes+kGlassCameraTraceHeaderLanes,visits,output,error);
 }
 // Existing native frame only. The hook authenticates current camera/IOR/query
 // uniforms, retained scene-triangle/query resources and outside-camera bounds,
@@ -1050,7 +1104,7 @@ protected:
 };
 struct GlassCameraGratingTraceBounds
 {
-    std::uint64_t maximumSamples=0,maximumBands=0,maximumVisits=0,queryWork=0,branchWork=0;
+    std::uint64_t maximumSamples=0,maximumBands=0,maximumVisits=0,queryWork=0,branchWork=0,visitsPerBand=0;
     std::uint64_t nativeInputBytes=0,nativeOutputBytes=0,pendingBytes=0,combinedWork=0,bytes=0;
 };
 inline bool calculateGlassCameraGratingTraceBounds(const GratingIncidentBinding& binding,std::size_t samples,
@@ -1062,7 +1116,7 @@ inline bool calculateGlassCameraGratingTraceBounds(const GratingIncidentBinding&
     if(!std::isfinite(control)||control<1||std::floor(control)!=control||control>binding.frame.query.texels.size())return refuse();
     GratingIncidentBounds original;
     if(!calculateGratingIncidentBounds(binding.frame,binding.triangles.size(),original,error))return false;
-    const auto totalBytes=renderpassoutput::kMaximumTotalBytes;
+    const auto totalBytes=renderpassoutput::kRepresentableTotalBytes;
     if(!samples||samples>kMaximumEntrySamples||binding.bounds.combinedWork!=original.combinedWork
         ||binding.bounds.queryWork!=original.queryWork||binding.bounds.orderWork!=original.orderWork||binding.bounds.bytes<original.bytes
         ||binding.frame.bounds.transientBytes>totalBytes||binding.bounds.bytes>totalBytes-binding.frame.bounds.transientBytes
@@ -1073,17 +1127,21 @@ inline bool calculateGlassCameraGratingTraceBounds(const GratingIncidentBinding&
     if(!exactReceiptInteger(allowance[0],65535,low)||!exactReceiptInteger(allowance[1],65535,high))return refuse();
     const auto perQuery=std::uint64_t(low)+(std::uint64_t(high)<<16);
     GlassCameraGratingTraceBounds candidate;
-    candidate.maximumSamples=samples;candidate.maximumBands=samples*8;candidate.maximumVisits=candidate.maximumBands*kMaximumBranchVisits;
+    // Visit storage per band follows the branch policy's visit setting.
+    const auto visits=binding.prepared.branchPolicy?binding.prepared.branchPolicy->description().maximumVisits:kDefaultBranchVisits;
+    if(!visits)return refuse();
+    candidate.maximumSamples=samples;candidate.maximumBands=samples*8;candidate.visitsPerBand=visits;
+    candidate.maximumVisits=candidate.maximumBands*visits;
     if(!perQuery||candidate.maximumVisits>kMaximumQueryWork/perQuery)return refuse();
     candidate.queryWork=candidate.maximumVisits*perQuery;candidate.branchWork=candidate.maximumVisits;
     const auto remainingWork=kMaximumQueryWork-binding.bounds.combinedWork-otherWork;
     if(candidate.queryWork>remainingWork||candidate.branchWork>remainingWork-candidate.queryWork)return refuse();
     candidate.combinedWork=binding.bounds.combinedWork+otherWork+candidate.queryWork+candidate.branchWork;
     candidate.nativeInputBytes=samples*sizeof(NativeGlassCameraGratingTraceInput);
-    candidate.nativeOutputBytes=candidate.maximumBands*kGlassCameraTraceHeaderBytes+candidate.maximumVisits*kGlassCameraTraceVisitBytes;
-    // Fixed16 pending plus popped and child copies, each128 bytes including
-    // full ancestry. Native buffers/readbacks and two decoded copies coexist.
-    candidate.pendingBytes=candidate.maximumBands*(kMaximumPendingBranches+2)*128;
+    candidate.nativeOutputBytes=candidate.maximumBands*glassCameraTraceBandLanes(visits)*sizeof(GlassCameraTraceWords);
+    // The native pending stacks (visits+1 branches per band) plus the popped
+    // and child copies. Native buffers/readbacks and two decoded copies coexist.
+    candidate.pendingBytes=candidate.maximumBands*(visits+3)*kGlassCameraTracePendingBytes;
     candidate.bytes=4*candidate.nativeInputBytes+2*candidate.nativeOutputBytes+candidate.pendingBytes
         +4*candidate.maximumVisits*sizeof(NativeGlassCameraGratingTraceVisit)
         +4*candidate.maximumBands*sizeof(NativeGlassCameraGratingTraceBand)
@@ -1117,11 +1175,14 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
         ||readback.queryWork>bounds.queryWork||readback.bands.capacity()>2*bounds.maximumBands
         ||upload.inputs.capacity()>2*upload.inputs.size()||upload.submission.frameIdentity.capacity()>2*binding.identity.size()
         ||readback.submission.frameIdentity.capacity()>2*binding.identity.size())return refuse("Camera trace native count, work or completion changed");
-    for(const auto& band:readback.bands)if(band.visits.size()>kMaximumBranchVisits||band.visits.capacity()>2*kMaximumBranchVisits)
+    for(const auto& band:readback.bands)if(band.visits.size()>bounds.visitsPerBand||band.visits.capacity()>2*bounds.visitsPerBand)
         return refuse("Camera trace decoded visit storage exceeds original limits");
     if(!native.validateCameraTraceProductionQuery(expected,readback,error))return false;
     const auto& allowance=frame.query.texels[std::size_t(frame.query.control[0])-1];
     const auto perQuery=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
+    // The interface setting bounds the trace; ancestry bytes cover the first 32
+    // and the history carries every interface.
+    const auto interfaceLimit=binding.prepared.branchPolicy?binding.prepared.branchPolicy->description().maximumInterfaces:0;
     const auto unit=[](Point p){return finite(p)&&std::abs(dot(p,p)-1)<=1e-4f;};
     const auto splitNear=[](double actual,double expected,float parent) {
         return std::abs(actual-expected)<=8*double(std::numeric_limits<float>::epsilon())*parent
@@ -1145,14 +1206,14 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
             ||!std::isfinite(band.unresolvedFraction)||band.unresolvedFraction<0||band.unresolvedFraction>1.0002f
             ||(band.traceComplete&&(!band.unresolvedFractionKnown||band.visits.empty()||band.unresolvedFraction!=0)))
             return refuse("Camera trace sample, spectral owner or incomplete prefix changed");
-        std::array<std::array<bool,2>,kMaximumBranchVisits> children{};std::uint64_t work=0;bool unresolved=false;
+        std::vector<std::array<bool,2>> children(band.visits.size());std::uint64_t work=0;bool unresolved=false;
         double unresolvedFraction=band.visits.empty()?1:0;bool unknownFraction=false;
         for(std::size_t v=0;v<band.visits.size();++v) {
             const auto& visit=band.visits[v];const auto& hit=visit.hit;
             const Point origin{visit.originMinimum[0],visit.originMinimum[1],visit.originMinimum[2]};
             const Point direction{visit.directionFraction[0],visit.directionFraction[1],visit.directionFraction[2]};
             const auto fraction=visit.directionFraction[3];
-            if(visit.visit!=v||visit.interfaces>kMaximumAncestryInterfaces||!finite(origin)||!unit(direction)
+            if(visit.visit!=v||visit.interfaces>interfaceLimit||!finite(origin)||!unit(direction)
                 ||visit.originMinimum[3]!=kRayMinimum||!std::isfinite(fraction)||fraction<=0||fraction>1.0002f
                 ||glassCameraTraceFloatBits(visit.ior)!=glassCameraTraceFloatBits(band.ior)||hit.work>perQuery
                 ||hit.status<-1||hit.status>1||std::uint32_t(visit.disposition)>4||!std::isfinite(hit.distance)
@@ -1162,7 +1223,7 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
                 ||!std::isfinite(visit.fromIor)||!std::isfinite(visit.toIor))
                 return refuse("Camera trace visit or query work is malformed");
             if(v==0) {
-                if(visit.parent!=kGlassCameraTraceRoot||visit.token||visit.interfaces||visit.history||visit.inside
+                if(visit.parent!=kGlassCameraTraceRoot||visit.token||visit.interfaces||visit.history!=CausticHistory{}||visit.inside
                     ||visit.ancestry!=std::array<std::uint8_t,32>{}||fraction!=1
                     ||!sameGlassCameraTraceFloats(visit.originMinimum,band.nativeOriginMinimum)
                     ||!sameGlassCameraTraceFloats(direction,nativeRay))return refuse("Camera trace root is not the actual native camera ray");
@@ -1170,13 +1231,15 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
                 if(visit.parent>=v||(visit.token!=1&&visit.token!=65))return refuse("Camera trace ancestry has no preceding native parent");
                 const auto& parent=band.visits[visit.parent];const bool reflected=visit.token==1;const unsigned child=reflected?0:1;
                 auto ancestry=parent.ancestry;
-                if(parent.disposition!=GlassCameraTraceDisposition::Interface||parent.interfaces>=kMaximumAncestryInterfaces||children[visit.parent][child])
+                if(parent.disposition!=GlassCameraTraceDisposition::Interface||parent.interfaces>=interfaceLimit
+                    ||children[visit.parent][child])
                     return refuse("Camera trace branch repeats or crosses a terminal parent");
-                ancestry[parent.interfaces]=std::uint8_t(visit.token);children[visit.parent][child]=true;
+                if(parent.interfaces<32)ancestry[parent.interfaces]=std::uint8_t(visit.token);
+                children[visit.parent][child]=true;
                 const auto expectedFraction=reflected?parent.reflectedFraction:parent.transmittedFraction;
                 const auto expectedDirection=reflected?parent.reflected:parent.transmitted;
                 const auto expectedOrigin=advance(parent.hit.position,parent.orientedNormal,(reflected?1.0f:-1.0f)*bias(parent.hit.position));
-                const auto history=parent.history|(reflected?(1u<<parent.interfaces):0u);
+                const auto history=parent.history.with(parent.interfaces,reflected);
                 if(visit.interfaces!=parent.interfaces+1||visit.ancestry!=ancestry||visit.history!=history
                     ||visit.inside!=(reflected?parent.inside:!parent.inside)||expectedFraction<=0
                     ||glassCameraTraceFloatBits(fraction)!=glassCameraTraceFloatBits(expectedFraction)
@@ -1209,7 +1272,7 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
                 ||hit.entering!=(dot(direction,hit.outwardNormal)<0))return refuse("Camera trace hit differs from its owning primitive or query ray");
             if(visit.disposition==GlassCameraTraceDisposition::Interface) {
                 Point normal=hit.outwardNormal;if(visit.inside)for(auto& value:normal)value=-value;
-                if(!triangle->glass||visit.inside==hit.entering||visit.interfaces>=kMaximumAncestryInterfaces
+                if(!triangle->glass||visit.inside==hit.entering||visit.interfaces>=interfaceLimit
                     ||!sameGlassCameraTraceFloats(normal,visit.orientedNormal)||dot(direction,normal)>=0
                     ||!std::isfinite(visit.reflection)||visit.reflection<0||visit.reflection>1
                     ||!unit(visit.reflected)||(!visit.tir&&!unit(visit.transmitted))
@@ -1260,7 +1323,7 @@ inline bool validateGlassCameraGratingTraceReadback(const GratingIncidentBinding
                     ||(!visit.tir&&visit.reflection<1&&visit.transmittedFraction==0))unknownFraction=true;
             }
         }
-        const auto fractionTolerance=kMaximumBranchVisits*double(std::numeric_limits<float>::epsilon())*unresolvedFraction
+        const auto fractionTolerance=double(std::max(kDefaultBranchVisits,band.visits.size()))*double(std::numeric_limits<float>::epsilon())*unresolvedFraction
             +double(std::numeric_limits<float>::denorm_min());
         if(band.unresolvedFractionKnown!=(!unknownFraction)
             ||(!band.unresolvedFractionKnown&&glassCameraTraceFloatBits(band.unresolvedFraction)!=0)
@@ -1314,7 +1377,8 @@ inline bool validateGratingIncident(const GratingIncidentBinding& binding,const 
         ||!expected.submissionSerial||!expected.rasterGeneration||!expected.queryGeneration
         ||!expected.scratchGeneration||expected.completedFence!=expected.submissionSerial
         ||event.version!=kGratingIncidentVersion||!event.complete||event.work>=binding.frame.work.size()
-        ||event.band!=binding.frame.work[event.work].band||!event.interfaces||event.interfaces>kMaximumAncestryInterfaces
+        ||event.band!=binding.frame.work[event.work].band||!event.interfaces
+        ||event.interfaces>binding.prepared.branchPolicy->description().maximumInterfaces
         ||event.orderCount>kGratingOrdersPerIncident||!finite(event.origin)||!finite(event.direction)
         ||std::abs(dot(event.direction,event.direction)-1)>1e-4f||!std::isfinite(event.fraction)
         ||event.fraction<=0||event.fraction>1||!nearPower(event.power,binding.frame.work[event.work].incidentPower*event.fraction)
@@ -1322,15 +1386,17 @@ inline bool validateGratingIncident(const GratingIncidentBinding& binding,const 
         ||event.hit.distance<kRayMinimum||event.hit.distance>binding.frame.sourceDirectionTrace[3])return refuse();
     const auto& allowance=binding.frame.query.texels[std::size_t(binding.frame.query.control[0])-1];
     if(event.hit.work>std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16))return refuse();
+    // Inline tokens mirror the first 32 history bits; later interfaces live in
+    // the history alone. Every transmission flips the side.
     bool inside=false;
-    for(unsigned depth=0;depth<32;++depth) {
-        const bool reflected=(event.reflectionHistory>>depth)&1u;
+    for(std::size_t depth=0;depth<std::max<std::size_t>(event.interfaces,32);++depth) {
+        const bool reflected=event.reflectionHistory.test(depth);
         if(depth<event.interfaces) {
-            if(event.ancestry[depth]!=(reflected?1u:65u))return refuse();
+            if(depth<32&&event.ancestry[depth]!=(reflected?1u:65u))return refuse();
             if(!reflected)inside=!inside;
         } else if(event.ancestry[depth]||reflected)return refuse();
     }
-    if(inside||(event.reflectionHistory>>32))return refuse();
+    if(inside||!event.reflectionHistory.clearFrom(event.interfaces))return refuse();
     const auto found=std::find_if(binding.triangles.begin(),binding.triangles.end(),[&](const auto& t) {
         return std::tie(t.object,t.material,t.instance,t.triangle)==std::tie(event.hit.objectId,event.hit.materialId,event.hit.instanceId,event.hit.triangleId);});
     if(found==binding.triangles.end()||dot(event.direction,found->normal)>=-1e-6f
@@ -1393,7 +1459,7 @@ inline bool validateGratingIncidentReadback(const GratingIncidentBinding& bindin
     } else if(sourceBinding ||readback.directionalSource) {
         error="Legacy grating incident batch cannot carry a directional source grant";return false;
     }
-    std::set<std::tuple<std::uint32_t,std::uint32_t,std::uint64_t>> branches;
+    std::set<std::tuple<std::uint32_t,std::uint32_t,CausticHistory>> branches;
     std::vector<double> fractions(binding.frame.work.size()),unresolved(binding.frame.work.size());
     std::uint64_t orderQueries=0;
     for(const auto& event:readback.incidents) {
@@ -1442,7 +1508,7 @@ inline bool calculateGratingCameraBounds(const GratingIncidentBinding& binding,G
     GratingIncidentBounds exact;
     if(!calculateGratingIncidentBounds(binding.frame,binding.triangles.size(),exact,error))return false;
     if(binding.bounds.maximumOrders!=exact.maximumOrders ||binding.bounds.combinedWork!=exact.combinedWork
-        ||binding.bounds.bytes<exact.bytes ||binding.bounds.bytes>renderpassoutput::kMaximumTotalBytes-binding.frame.bounds.transientBytes)
+        ||binding.bounds.bytes<exact.bytes ||binding.bounds.bytes>renderpassoutput::kRepresentableTotalBytes-binding.frame.bounds.transientBytes)
     {error="Grating camera retained incident resource admission changed";return false;}
     const auto& allowance=binding.frame.query.texels[std::size_t(binding.frame.query.control[0])-1];
     const auto query=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
@@ -1451,7 +1517,7 @@ inline bool calculateGratingCameraBounds(const GratingIncidentBinding& binding,G
     candidate.bytes=sizeof(NativeGratingCameraReadback)+binding.identity.size()
         +candidate.maximumOrders*(kGratingCameraOrderNativeBytes+2*sizeof(NativeGratingCameraReadback::OrderReceipt));
     if(candidate.queryWork>kMaximumQueryWork-exact.combinedWork
-        ||candidate.bytes>renderpassoutput::kMaximumTotalBytes-binding.frame.bounds.transientBytes-binding.bounds.bytes)
+        ||candidate.bytes>renderpassoutput::kRepresentableTotalBytes-binding.frame.bounds.transientBytes-binding.bounds.bytes)
     {error="Grating camera optional queries or storage exceed the existing whole-frame budget";return false;}
     candidate.combinedWork=exact.combinedWork+candidate.queryWork;
     output=candidate;error.clear();return true;
@@ -1525,6 +1591,7 @@ inline bool validateGratingCameraReadback(const GratingIncidentBinding& binding,
     if(!gratingCameraOpticalFrame(rotate({1,0,0}),rotate({0,1,0}),rotate({0,0,1}),axes))
         return refuse("Grating camera native camera axes exceed optical conversion precision");
     const double halfY=std::tan(double(frame.camera.verticalFovRadians)/2),halfX=halfY*frame.width/frame.height;
+    const bool orthographic=frame.camera.orthographic();
     std::size_t count=0;std::uint64_t queries=0;
     for(std::size_t i=0;i<receipt.incidents->incidents.size();++i) {
         const auto& event=receipt.incidents->incidents[i];
@@ -1550,7 +1617,9 @@ inline bool validateGratingCameraReadback(const GratingIncidentBinding& binding,
                 return refuse("Grating camera incident, order or band is duplicated, reordered or incomplete");
             double backward=0,imageX=0,imageY=0;
             for(unsigned a=0;a<3;++a) {backward+=found->direction[a]*axes.normal[a];imageX-=found->direction[a]*axes.tangent[a];imageY-=found->direction[a]*axes.bitangent[a];}
-            const bool inCamera=backward>0 &&imageX>=-halfX*backward &&imageX<halfX*backward
+            // An orthographic camera's rays are parallel, so a discrete order (one exact
+            // direction) lands in no pixel: its pixels hold no angular extent.
+            const bool inCamera=!orthographic &&backward>0 &&imageX>=-halfX*backward &&imageX<halfX*backward
                 &&imageY<=halfY*backward &&imageY>-halfY*backward;
             const auto x=inCamera?std::uint32_t((imageX/(backward*halfX)+1)*.5*frame.width):0;
             const auto y=inCamera?std::uint32_t((1-imageY/(backward*halfY))*.5*frame.height):0;
@@ -1562,7 +1631,7 @@ inline bool validateGratingCameraReadback(const GratingIncidentBinding& binding,
                 {diffractionmaterial::DiffractionIncidentMeasure::SurfaceSpectralIrradiance,irradiance},pixel,integral,error))return false;
             const auto measured=std::find_if(integral.orders.begin(),integral.orders.begin()+integral.orderCount,
                 [&](const auto& o){return o.order.primary==order &&o.order.secondary==0;});
-            if(measured==integral.orders.begin()+integral.orderCount ||measured->inPixel!=inCamera
+            if(measured==integral.orders.begin()+integral.orderCount ||(!orthographic &&measured->inPixel!=inCamera)
                 ||!nearDirectionalSourcePotential(event.substrateReflectedPower,integral.substrateReflectedIrradiance*receiving.area)
                 ||!nearDirectionalSourcePotential(event.absorbedPower,integral.absorbedIrradiance*receiving.area)
                 ||!nearDirectionalSourcePotential(event.unresolvedPower,integral.unresolvedReflectedIrradiance*receiving.area)
@@ -1637,16 +1706,25 @@ inline bool validateGratingCameraReadback(const GratingIncidentBinding& binding,
     // and a complete native base draw have their own validated authority.
     error.clear();return true;
 }
+// Appends history words 2 and up from one incident's tail of
+// gratingIncidentHistoryTailTexels texels, and refuses bits past its interfaces.
+inline bool decodeGratingIncidentHistoryTail(const Texel* tail,std::size_t tailWords,NativeGratingIncident& incident)
+{
+    CausticHistory history;
+    if(!gratingIncidentHistoryDecode(incident.reflectionHistory.low64(),tail,tailWords,history))return false;
+    incident.reflectionHistory=history;return history.clearFrom(incident.interfaces);
+}
 inline bool decodeGratingDepositExtension(const Texel& extension,const Texel& reserved,NativeDeposit& output)
 {
+    // GL passes texel 31 here only after reading its history words, so a
+    // nonzero reserved texel is a malformed record on both backends.
     if(reserved!=Texel{}||extension[3]!=0)return false;
     if(extension==Texel{}){output.gratingVersion=0;output.gratingIncident=UINT32_MAX;output.gratingOrder=0;return true;}
     std::uint32_t incident=0,order=0;
-    // A grating child keeps 32-byte ancestry. Both callers decode interfaces
-    // first: GL decodeGratingDeposit (fixture_glass_caustics_opengl.h) and
-    // Metal decodeCoupledDeposit (metal_glass_caustic_consumer.h).
-    if(extension[0]!=kGratingIncidentVersion||!exactReceiptInteger(extension[1],kMaximumEntrySamples*8*kMaximumBranchVisits,incident)
-        ||!exactReceiptInteger(extension[2],2,order)||output.interfaces>kMaximumAncestryInterfaces)return false;
+    // A grating child keeps 32 inline ancestry tokens; its full history carries
+    // later interfaces. The validator bounds interfaces by the branch policy.
+    if(extension[0]!=kGratingIncidentVersion||!exactReceiptInteger(extension[1],kMaximumExactReceiptCount,incident)
+        ||!exactReceiptInteger(extension[2],2,order))return false;
     output.gratingVersion=kGratingIncidentVersion;output.gratingIncident=incident;output.gratingOrder=int(order)-1;return true;
 }
 // Coupled smooth children carry exact binary interface ancestry in the
@@ -1803,7 +1881,7 @@ inline bool calculateDirectGratingTerminalOrderBounds(const DirectGratingIrradia
     DirectGratingTerminalOrderBounds& output,std::string& error)
 {
     const auto refuse=[&](){error="Directional terminal orders exceed authenticated whole-frame bounds";return false;};
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;
     if(cohort.sources().empty()||cohort.sources().size()>16||cohort.inputs().empty()||cohort.inputs().size()>kMaximumEntrySamples
         ||sources.size()!=cohort.sources().size()||sources.capacity()>2*sources.size()
         ||native.retainedBytes<cohort.bounds().bytes||native.retainedBytes>maximum
@@ -2143,7 +2221,7 @@ inline bool calculateDirectGratingTerminalReceiverBounds(const NativeDirectGrati
     const DirectGratingTerminalReceiverReadback& incumbent,DirectGratingTerminalReceiverBounds& output,std::string& error)
 {
     const auto refuse=[&](){error="Directional terminal receivers exceed authenticated whole-frame bounds";return false;};
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;const auto& scattering=terminal.retained();
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;const auto& scattering=terminal.retained();
     DirectGratingTerminalReceiverBounds b;b.bytes=native.retainedBytes;b.maximumRows=scattering.bounds.maximumOrders;
     if(!b.maximumRows||b.maximumRows>UINT32_MAX||scattering.orders.size()>b.maximumRows
         ||!scattering.incident.cohort||native.retainedBytes<scattering.bounds.bytes||native.retainedBytes>maximum
@@ -2195,9 +2273,11 @@ inline bool projectDirectGratingTerminalReceiver(const Frame& frame,const opaque
     PixelFootprint candidate;candidate.linearDepth=-local.z;
     if(!std::isfinite(candidate.linearDepth)){error="Directional terminal receiver depth is nonfinite";return false;}
     if(candidate.linearDepth>=frame.camera.nearPlane&&candidate.linearDepth<=frame.camera.farPlane) {
-        const float tangent=std::tan(frame.camera.verticalFovRadians*.5f);
-        const float x=(local.x/(candidate.linearDepth*tangent*float(frame.width)/frame.height)+1)*.5f*frame.width;
-        const float y=(1-local.y/(candidate.linearDepth*tangent))*.5f*frame.height;
+        // An orthographic view spans its height at every depth.
+        const float spread=frame.camera.orthographic()?.5f*frame.camera.orthographicHeight
+            :candidate.linearDepth*std::tan(frame.camera.verticalFovRadians*.5f);
+        const float x=(local.x/(spread*float(frame.width)/frame.height)+1)*.5f*frame.width;
+        const float y=(1-local.y/spread)*.5f*frame.height;
         if(!std::isfinite(x)||!std::isfinite(y)){error="Directional terminal receiver projection is nonfinite";return false;}
         if(x>=0&&y>=0&&x<frame.width&&y<frame.height) {
             candidate.x=std::uint32_t(x);candidate.y=std::uint32_t(y);
@@ -2252,7 +2332,7 @@ inline bool validateDirectGratingTerminalReceiverRows(const DirectGratingTermina
         const auto triangle=std::find_if(frame.triangles.begin(),frame.triangles.end(),[&](const auto& t) {
             return std::tie(t.object,t.material,t.instance,t.triangle)==std::tie(raster.object,raster.material,raster.instance,raster.triangle);});
         if(triangle==frame.triangles.end())return refuse();
-        const auto origin=cameraPosition(frame),ray=cameraRay(frame,float(pixel.x)+.5f,float(pixel.y)+.5f);
+        const auto origin=cameraOrigin(frame,float(pixel.x)+.5f,float(pixel.y)+.5f),ray=cameraRay(frame,float(pixel.x)+.5f,float(pixel.y)+.5f);
         const auto& q=frame.camera.transform.rotation;
         const auto local=rotateSceneVector({-q.x,-q.y,-q.z,q.w},{ray[0],ray[1],ray[2]});
         if(!finite(ray)||!std::isfinite(local.z)||local.z>=0)return refuse();

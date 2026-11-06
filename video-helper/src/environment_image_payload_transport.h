@@ -84,7 +84,7 @@ public:
         {
             auto victim=std::find_if(resident_.begin(),resident_.end(),[](const auto& value)
                 { return value.second.use_count()==1; });
-            if (victim==resident_.end()) { reject(error,"HDR environment resident budget is occupied"); return {}; }
+            if (victim==resident_.end()) break;
             sourceBytes_-=victim->second->payload->bytes().size();
             decodedBytes_-=visualenvironmentimage::decodedBytes(victim->second->image.metadata);
             resident_.erase(victim);

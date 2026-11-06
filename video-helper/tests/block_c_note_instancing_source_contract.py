@@ -42,22 +42,22 @@ class BlockCNoteInstancingSourceContract(unittest.TestCase):
         self.assertIn("== inputs.noteInstanceMapping.has_value()", backend)
         self.assertIn("visualnoteinstancing::valid(*inputs.noteInstanceMapping)", backend)
 
-    def test_both_production_backends_issue_bounded_instanced_draws(self) -> None:
+    def test_both_production_backends_issue_content_sized_instanced_draws(self) -> None:
         backend = source("video-helper/src/gpu_backend/backend.h")
         opengl = source("video-helper/src/gpu_backend/backend_opengl.cpp")
         metal = source("video-helper/src/gpu_backend/backend_sokol.mm")
 
-        self.assertIn("visualnoteinstancing::kMaximumInstances", backend)
+        self.assertIn("noteInstanceTextureRows", backend)
         self.assertIn("frame.noteIdentities[row]", backend)
-        self.assertIn("batch.canonicalRows[index]", backend)
+        self.assertIn("batch.canonicalRows.push_back(", backend)
         self.assertIn("prepareNativeNoteInstances(runtimeInputs)", opengl)
-        self.assertIn("uNoteInstanceTransforms[noteIndex]", opengl)
+        self.assertIn("texelFetch(uNoteInstanceTransforms, ivec2(noteIndex % 1024, noteIndex / 1024), 0)", opengl)
         self.assertIn("uNoteInstanceIndex >= 0 ? uNoteInstanceIndex : gl_InstanceID", opengl)
         self.assertIn("gl.DrawElementsInstanced", opengl)
         self.assertIn("prepareNativeNoteInstances(runtimeInputs)", metal)
         self.assertIn("uint instance [[instance_id]]", metal)
         self.assertIn("u.noteInstanceTransforms[noteIndex]", metal)
-        self.assertIn("static_cast<int>(noteInstances.count)", metal)
+        self.assertIn("noteWindowCount(first)", metal)
 
     def test_geometry_and_note_instance_authorities_remain_separate(self) -> None:
         backend = source("video-helper/src/gpu_backend/backend.h")

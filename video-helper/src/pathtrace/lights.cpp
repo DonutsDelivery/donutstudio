@@ -1,5 +1,6 @@
 #include "lights.h"
 #include "bvh.h"
+#include "sky_cloud_volume.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,15 +14,19 @@ namespace videohelper::pathtrace
 namespace
 {
 
+#if ! defined(PATHTRACE_DEVICE_METAL)
 using HarmonicMIDI::grid::SceneLightKind;
 using HarmonicMIDI::grid::SceneLightRecord;
 using HarmonicMIDI::grid::SceneVec3;
+#endif
 
 constexpr float kLightTwoPi = 6.28318530717958647692f;
 constexpr float kFourPi = 12.5663706143591729539f;
 constexpr float kDegrees = 0.01745329251994329577f;
 
+#if ! defined(PATHTRACE_DEVICE_METAL)
 PT_SHARED_ENTRY Vec3 toVec3 (const SceneVec3& v) noexcept { return { v.x, v.y, v.z }; }
+#endif
 
 // A sum past a float divides first, so the brightest light still weighs a finite amount.
 PT_SHARED_ENTRY float meanOf (Vec3 v) noexcept
@@ -90,6 +95,8 @@ PT_SHARED_ENTRY float cloudOpacity (const EnvironmentField& field, Vec3 d) noexc
 
 PT_SHARED_ENTRY float finiteOrZero (float x) noexcept { return std::isfinite (x) ? x : 0.0f; }
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 // A float holds any radiance short of overflow, the one bound authored light has. A product past
 // it keeps its hue at the largest float instead of going infinite and dropping the light.
 Vec3 finiteProduct (const Vec3& a, const Vec3& b, float gain) noexcept
@@ -100,7 +107,10 @@ Vec3 finiteProduct (const Vec3& a, const Vec3& b, float gain) noexcept
     const double fit = peak > limit ? limit / peak : 1.0;
     return { static_cast<float> (x * fit), static_cast<float> (y * fit), static_cast<float> (z * fit) };
 }
+#endif
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 PT_SHARED_ENTRY bool normalizedRotation (const SceneLightRecord& record, Quat& q) noexcept
 {
     const auto& r = record.transform.rotation;
@@ -110,6 +120,7 @@ PT_SHARED_ENTRY bool normalizedRotation (const SceneLightRecord& record, Quat& q
     q = { r.x / norm, r.y / norm, r.z / norm, r.w / norm };
     return true;
 }
+#endif
 
 // GLSL smoothstep(cosOuter, cosInner, cosAngle), as the raster spot cone.
 PT_SHARED_ENTRY float spotCone (float cosAngle, float cosOuter, float cosInner) noexcept
@@ -133,7 +144,7 @@ PT_SHARED_ENTRY bool normalizedQuat (Quat in, Quat& q) noexcept
 
 // Distance falloff, range window and spot cone of a point or spot light, at
 // squared distance d2 from its centre in unit direction fromLight.
-PT_SHARED_ENTRY float pointFalloff (const Light& light, float d2, Vec3 fromLight) noexcept
+PT_SHARED_ENTRY float pointFalloff (const PT_GLOBAL Light& light, float d2, Vec3 fromLight) noexcept
 {
     float falloff = 1.0f / std::max (d2, 1.0f);
     if (light.range > 0.0f)
@@ -154,7 +165,7 @@ PT_SHARED_ENTRY float sphereConeOneMinusCos (float r, float d2) noexcept
     return sin2 / (1.0f + std::sqrt (std::max (0.0f, 1.0f - sin2)));
 }
 
-PT_SHARED_ENTRY bool outsideSphere (const Light& light, float d2) noexcept
+PT_SHARED_ENTRY bool outsideSphere (const PT_GLOBAL Light& light, float d2) noexcept
 {
     return std::isfinite (d2) && d2 > light.radius * light.radius * (1.0f + 1.0e-4f);
 }
@@ -162,13 +173,13 @@ PT_SHARED_ENTRY bool outsideSphere (const Light& light, float d2) noexcept
 // Radiance of a sphere light seen from squared distance d2 in unit direction
 // fromLight (centre to viewer), chosen so it delivers the point light's
 // irradiance.
-PT_SHARED_ENTRY Vec3 sphereRadiance (const Light& light, float d2, Vec3 fromLight) noexcept
+PT_SHARED_ENTRY Vec3 sphereRadiance (const PT_GLOBAL Light& light, float d2, Vec3 fromLight) noexcept
 {
     return light.strength * (pointFalloff (light, d2, fromLight) * d2 / (kPi * light.radius * light.radius));
 }
 
 // Planar lights emit on the side their normal points to, or both.
-PT_SHARED_ENTRY bool planarLightFaces (const Light& light, Vec3 p) noexcept
+PT_SHARED_ENTRY bool planarLightFaces (const PT_GLOBAL Light& light, Vec3 p) noexcept
 {
     const Vec3 onPlane = light.type == LightType::Rect ? light.vertex0 : light.position;
     return light.twoSided || dot (p - onPlane, light.normal) > 0.0f;
@@ -226,7 +237,7 @@ PT_SHARED_ENTRY float angleBetweenPlanes (Vec3 a, Vec3 b) noexcept
 
 // False when the point is in the rect's plane or the solid angle is too
 // small to sample this way.
-PT_SHARED_ENTRY bool sphericalRectFrom (const Light& light, Vec3 p, SphericalRect& out) noexcept
+PT_SHARED_ENTRY bool sphericalRectFrom (const PT_GLOBAL Light& light, Vec3 p, SphericalRect& out) noexcept
 {
     const float lengthX = length (light.edge1);
     const float lengthY = length (light.edge2);
@@ -287,6 +298,8 @@ PT_SHARED_ENTRY bool sampleSphericalRect (const SphericalRect& rect, Vec2 u, Vec
     return isFinite (point);
 }
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 bool sameAsset (const visualenvironmentimage::Identity& a, const visualenvironmentimage::Identity& b) noexcept
 {
     return a.id == b.id && a.version == b.version && a.contentSha256 == b.contentSha256;
@@ -312,12 +325,13 @@ std::shared_ptr<const EnvironmentMap> bindEnvironmentImage (const SceneLightReco
         return {};
     }
 }
+#endif
 
 } // namespace
 
 PT_SHARED_ENTRY bool EnvironmentField::active() const noexcept
 {
-    if (maxComponent (constant) > 0.0f || (image != nullptr && image->active()))
+    if (maxComponent (uniformRadiance) > 0.0f || (image != nullptr && environmentMapAt (image).active()))
         return true;
     return analytic && (maxComponent (zenith) > 0.0f || maxComponent (horizon) > 0.0f
                         || maxComponent (ground) > 0.0f || maxComponent (sunRadiance) > 0.0f);
@@ -325,9 +339,9 @@ PT_SHARED_ENTRY bool EnvironmentField::active() const noexcept
 
 PT_SHARED_ENTRY Vec3 EnvironmentField::radiance (Vec3 direction) const noexcept
 {
-    Vec3 result = constant;
+    Vec3 result = uniformRadiance;
     if (image != nullptr)
-        return result + image->radiance (direction);
+        return result + environmentMapAt (image).radiance (direction);
     if (! analytic)
         return result;
     const float y = direction.y;
@@ -335,10 +349,35 @@ PT_SHARED_ENTRY Vec3 EnvironmentField::radiance (Vec3 direction) const noexcept
     Vec3 sky = horizon + (pole - horizon) * std::fabs (y);
     // The clouds subtract this sky, so an infinite term here would turn into NaN.
     const float capWidth = 1.0f - sunCosRadius;
+    if (sunHalo > 0.0f && capWidth > 1.0e-7f)
+    {
+        // The cap's irradiance pi*(1-cos radius)*peak in a Henyey-Greenstein lobe (g 0.8),
+        // strongest at the horizon, as the raster's analyticSkyHalo.
+        const float g = 0.8f;
+        const float mu = dot (direction, sunDirection);
+        const float t = std::max (1.0f + g * g - 2.0f * g * mu, 1.0e-6f);
+        const float lobe = (1.0f - g * g) / (12.566370614359172f * t * std::sqrt (t));
+        sky = saturatedRadiance (sky + sunRadiance * (3.141592653589793f * capWidth * sunHalo * lobe * (1.0f - 0.65f * std::fabs (y))));
+    }
     if (capWidth > 1.0e-7f && maxComponent (sunRadiance) > 0.0f)
     {
         const float c = clampLightUnit ((dot (direction, sunDirection) - sunCosRadius) / capWidth);
         sky = saturatedRadiance (sky + sunRadiance * (c * c * (3.0f - 2.0f * c)));
+    }
+    if (cloudThickness > 0.0f && cloudCoverage > 0.0f)
+    {
+        // The volumetric layer dims the sky and sun behind it, so a sampled sun is shadowed.
+        cloudvolume::Layer layer;
+        layer.coverage = cloudCoverage;
+        layer.kind = cloudKind;
+        layer.headingRadians = cloudHeadingRadians;
+        layer.drift = cloudDrift;
+        layer.thickness = cloudThickness;
+        const Vec3 irradiance = sunRadiance * (3.141592653589793f * capWidth);
+        const float white = maxComponent (horizon * 0.5f + zenith * 0.5f);
+        const auto volume = cloudvolume::march (layer, direction.x, direction.y, direction.z, sunDirection.x, sunDirection.y,
+                                                sunDirection.z, irradiance.x, irradiance.y, irradiance.z, white);
+        return saturatedRadiance (result + sky * volume.transmittance + Vec3 { volume.r, volume.g, volume.b });
     }
     const float cloud = cloudOpacity (*this, direction);
     if (cloud > 0.0f)
@@ -354,7 +393,7 @@ PT_SHARED_ENTRY Vec3 EnvironmentField::radiance (Vec3 direction) const noexcept
 PT_SHARED_ENTRY float EnvironmentField::pdf (Vec3 direction) const noexcept
 {
     if (image != nullptr)
-        return (1.0f - imageSampleProbability) / kFourPi + imageSampleProbability * image->pdf (direction);
+        return (1.0f - imageSampleProbability) / kFourPi + imageSampleProbability * environmentMapAt (image).pdf (direction);
     float density = (1.0f - sunSampleProbability) / kFourPi;
     if (sunSampleProbability > 0.0f && dot (direction, sunDirection) >= sunCosRadius)
         density += sunSampleProbability / (kLightTwoPi * (1.0f - sunCosRadius));
@@ -367,7 +406,7 @@ PT_SHARED_ENTRY Vec3 EnvironmentField::sample (Vec2 u, float& pdfOut) const noex
     if (image != nullptr && u.x < imageSampleProbability)
     {
         float imagePdf = 0.0f;
-        direction = image->sample ({ u.x / imageSampleProbability, u.y }, imagePdf);
+        direction = environmentMapAt (image).sample ({ u.x / imageSampleProbability, u.y }, imagePdf);
         if (! (imagePdf > 0.0f))
         {
             pdfOut = 0.0f;
@@ -404,6 +443,8 @@ PT_SHARED_ENTRY Vec3 EnvironmentField::sample (Vec2 u, float& pdfOut) const noex
     return direction;
 }
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 void LightSet::clear() noexcept
 {
     ownedLights_.clear();
@@ -519,6 +560,19 @@ PT_SHARED_ENTRY bool authoredSpectralSourceLight (const diffractionmaterial::Lig
     return true;
 }
 
+#endif
+
+PT_SHARED_ENTRY float areaSpreadAttenuation (float tanHalfSpread, float normalization, float cosAtLight) noexcept
+{
+    if (! (normalization > 0.0f))
+        return 1.0f;
+    if (! (cosAtLight > 0.0f))
+        return 0.0f;
+    const float sinAtLight = std::sqrt (std::max (0.0f, 1.0f - cosAtLight * cosAtLight));
+    return std::max (0.0f, (tanHalfSpread - sinAtLight / cosAtLight) * normalization);
+}
+
+#if ! defined(PATHTRACE_DEVICE_METAL)
 void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 ambient,
                       const IngestedScene& geometry, const std::vector<Material>& materials,
                       const Material& fallback, const EnvironmentPixels* environmentImage,
@@ -552,6 +606,59 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
         weights.push_back (weight);
     };
 
+    // Rects, disks and ellipses, from areaLights and from Area records.
+    const auto addArea = [&] (const AreaLightRecord& record) {
+        const Vec3 emitted = record.color * record.intensity;
+        Quat q;
+        if (! isFinite (emitted) || ! isFinite (record.position) || ! normalizedQuat (record.rotation, q)
+            || ! std::isfinite (record.sizeX) || ! std::isfinite (record.sizeY) || ! (record.sizeX > 0.0f)
+            || ! (record.sizeY > 0.0f))
+        {
+            ++stats_.invalidLights;
+            return;
+        }
+        const Vec3 axisX = normalizeOrZero (rotate (q, { 1.0f, 0.0f, 0.0f }));
+        const Vec3 axisY = normalizeOrZero (rotate (q, { 0.0f, 1.0f, 0.0f }));
+        Light light;
+        light.strength = nonNegative (emitted);
+        light.normal = normalizeOrZero (rotate (q, { 0.0f, 0.0f, -1.0f }));
+        light.twoSided = record.twoSided;
+        light.visibility = record.visibility;
+        const float spreadNormalization = HarmonicMIDI::grid::sceneAreaSpreadNormalization (record.spread);
+        if (spreadNormalization > 0.0f)
+        {
+            light.tanHalfSpread = std::tan (0.5f * std::max (record.spread, 1.0e-4f));
+            light.spreadNormalization = spreadNormalization;
+        }
+        if (record.shape == AreaLightShape::Rect)
+        {
+            light.type = LightType::Rect;
+            light.edge1 = axisX * record.sizeX;
+            light.edge2 = axisY * record.sizeY;
+            light.vertex0 = record.position - light.edge1 * 0.5f - light.edge2 * 0.5f;
+            light.area = record.sizeX * record.sizeY;
+        }
+        else
+        {
+            light.type = LightType::Disk;
+            light.position = record.position;
+            light.edge1 = axisX * (0.5f * record.sizeX);
+            light.edge2 = axisY * (0.5f * record.sizeY);
+            light.area = 0.25f * kPi * record.sizeX * record.sizeY;
+        }
+        if (! std::isfinite (light.area) || ! (light.area > 0.0f))
+        {
+            ++stats_.invalidLights;
+            return;
+        }
+        const std::size_t before = ownedLights_.size();
+        // pi * L * A per emitting face.
+        push (light, (light.twoSided ? 2.0 : 1.0) * kPi * static_cast<double> (meanOf (light.strength))
+                         * static_cast<double> (light.area));
+        if (ownedLights_.size() > before)
+            ++stats_.areaLights;
+    };
+
     bool haveAnalytic = false;
     std::shared_ptr<const EnvironmentMap> image;
     for (std::size_t i = 0; records != nullptr && i < count; ++i)
@@ -564,12 +671,51 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
             continue;
         }
         const Vec3 strength = nonNegative (finiteProduct (color, { 1.0f, 1.0f, 1.0f }, record.intensity));
-        const LightShape shape = shapes != nullptr && i < shapes->size() ? (*shapes)[i] : LightShape {};
+        LightShape shape = shapes != nullptr && i < shapes->size() ? (*shapes)[i] : LightShape {};
+        // A size the caller's shape sets was not authored as a visible emitter
+        // (a grating's widened sun, a spectral plan's source): the camera does
+        // not see it. Otherwise the record's own size and visibility apply.
+        const bool callerSized = shape.radius > 0.0f || shape.angularRadius > 0.0f;
+        if (! (shape.radius > 0.0f))
+            shape.radius = record.radius;
+        if (! (shape.angularRadius > 0.0f))
+            shape.angularRadius = record.angularRadius;
         Quat q;
         const bool rotationValid = normalizedRotation (record, q);
         Light light;
+        light.visibility = record.visibility;
+        if (callerSized)
+            light.visibility = static_cast<std::uint8_t> (light.visibility & ~HarmonicMIDI::grid::sceneRayVisibility::Camera);
         switch (record.kind)
         {
+            case SceneLightKind::Area:
+            {
+                const HarmonicMIDI::grid::SceneVec2 extent = HarmonicMIDI::grid::sceneAreaLightExtent (record);
+                AreaLightRecord area;
+                area.shape = record.areaShape == HarmonicMIDI::grid::SceneAreaLightShape::Square
+                                     || record.areaShape == HarmonicMIDI::grid::SceneAreaLightShape::Rectangle
+                                 ? AreaLightShape::Rect
+                                 : record.areaShape == HarmonicMIDI::grid::SceneAreaLightShape::Disk ? AreaLightShape::Disk
+                                                                                                     : AreaLightShape::Ellipse;
+                area.position = toVec3 (record.transform.translation);
+                area.rotation = q;
+                area.sizeX = extent.x;
+                area.sizeY = extent.y;
+                const float emittingArea = area.shape == AreaLightShape::Rect ? extent.x * extent.y
+                                                                              : 0.25f * kPi * extent.x * extent.y;
+                // intensity is the radiant intensity along the axis, as a point light's.
+                area.color = color;
+                area.intensity = record.intensity / emittingArea;
+                area.spread = record.spread;
+                area.visibility = light.visibility;
+                if (! rotationValid || ! (emittingArea > 0.0f) || ! std::isfinite (area.intensity))
+                {
+                    ++stats_.invalidLights;
+                    break;
+                }
+                addArea (area);
+                break;
+            }
             case SceneLightKind::Directional:
             {
                 const Vec3 toLight = normalizeOrZero (rotate (q, { 0.0f, 0.0f, 1.0f }));
@@ -662,7 +808,7 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
                 }
                 if (record.sky.version == 0)
                 {
-                    environment_.constant = environment_.constant + strength;
+                    environment_.uniformRadiance = environment_.uniformRadiance + strength;
                     ++stats_.environment;
                     break;
                 }
@@ -690,6 +836,7 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
                 environment_.sunRadiance = 1.0f - sunCos > 1.0e-7f ? nonNegative (sun) : Vec3 {};
                 environment_.sunDirection = sunDirection;
                 environment_.sunCosRadius = std::min (sunCos, 1.0f);
+                environment_.sunHalo = std::round (std::min (1.0f, std::max (0.0f, sky.sunHalo)) * 63.0f) / 63.0f;
                 const float coverage = std::round (std::min (1.0f, std::max (0.0f, sky.cloudCoverage)) * 1023.0f);
                 if (coverage > 0.0f)
                 {
@@ -699,6 +846,7 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
                     environment_.cloudKind = std::round (std::min (1.0f, std::max (0.0f, sky.cloudType)) * 63.0f) / 63.0f;
                     environment_.cloudHeadingRadians = headingCode * 6.283185307179586f / 256.0f;
                     environment_.cloudDrift = sky.cloudDrift;
+                    environment_.cloudThickness = std::round (std::min (1.0f, std::max (0.0f, sky.cloudThickness)) * 63.0f) / 63.0f;
                 }
                 ++stats_.environment;
                 break;
@@ -718,13 +866,13 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
 
     if (isFinite (ambient))
     {
-        const Vec3 sum = environment_.constant + nonNegative (ambient), top = Vec3 { 1.0f, 1.0f, 1.0f } * std::numeric_limits<float>::max();
-        environment_.constant = { std::min (sum.x, top.x), std::min (sum.y, top.y), std::min (sum.z, top.z) };
+        const Vec3 sum = environment_.uniformRadiance + nonNegative (ambient), top = Vec3 { 1.0f, 1.0f, 1.0f } * std::numeric_limits<float>::max();
+        environment_.uniformRadiance = { std::min (sum.x, top.x), std::min (sum.y, top.y), std::min (sum.z, top.z) };
     }
 
     if (environment_.active())
     {
-        Vec3 meanSky = environment_.constant;
+        Vec3 meanSky = environment_.uniformRadiance;
         if (environment_.analytic)
             meanSky = meanSky + (environment_.horizon * 2.0f + environment_.zenith + environment_.ground) * 0.25f;
         double skyIrradiance = kPi * static_cast<double> (meanOf (meanSky));
@@ -735,16 +883,16 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
                 const double sky = environment_.analytic ? (2.0 * horizon + zenith + ground) * 0.25 : 0.0;
                 return constant + sky;
             };
-            const double r = channel (environment_.constant.x, environment_.horizon.x, environment_.zenith.x, environment_.ground.x);
-            const double g = channel (environment_.constant.y, environment_.horizon.y, environment_.zenith.y, environment_.ground.y);
-            const double b = channel (environment_.constant.z, environment_.horizon.z, environment_.zenith.z, environment_.ground.z);
+            const double r = channel (environment_.uniformRadiance.x, environment_.horizon.x, environment_.zenith.x, environment_.ground.x);
+            const double g = channel (environment_.uniformRadiance.y, environment_.horizon.y, environment_.zenith.y, environment_.ground.y);
+            const double b = channel (environment_.uniformRadiance.z, environment_.horizon.z, environment_.zenith.z, environment_.ground.z);
             skyIrradiance = kPi * (r + g + b) / 3.0;
         }
         if (environment_.image != nullptr)
         {
             // Mean radiance over the sphere is the integral over 4 pi.
             const double imageIntegral = static_cast<double> (meanOf (environment_.image->integratedRadiance()));
-            const double constantIntegral = static_cast<double> (meanOf (environment_.constant)) * kFourPi;
+            const double constantIntegral = static_cast<double> (meanOf (environment_.uniformRadiance)) * kFourPi;
             skyIrradiance += kPi * imageIntegral / kFourPi;
             float share = 1.0f;
             if (constantIntegral > 0.0)
@@ -807,51 +955,12 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
         }
     }
 
+    // Caller-given rects and disks keep their old rule: the camera does not see them.
     for (std::size_t a = 0; areaLights != nullptr && a < areaLights->size(); ++a)
     {
-        const AreaLightRecord& record = (*areaLights)[a];
-        const Vec3 emitted = record.color * record.intensity;
-        Quat q;
-        if (! isFinite (emitted) || ! isFinite (record.position) || ! normalizedQuat (record.rotation, q)
-            || ! std::isfinite (record.sizeX) || ! std::isfinite (record.sizeY) || ! (record.sizeX > 0.0f)
-            || ! (record.sizeY > 0.0f))
-        {
-            ++stats_.invalidLights;
-            continue;
-        }
-        const Vec3 axisX = normalizeOrZero (rotate (q, { 1.0f, 0.0f, 0.0f }));
-        const Vec3 axisY = normalizeOrZero (rotate (q, { 0.0f, 1.0f, 0.0f }));
-        Light light;
-        light.strength = nonNegative (emitted);
-        light.normal = normalizeOrZero (rotate (q, { 0.0f, 0.0f, -1.0f }));
-        light.twoSided = record.twoSided;
-        if (record.shape == AreaLightShape::Rect)
-        {
-            light.type = LightType::Rect;
-            light.edge1 = axisX * record.sizeX;
-            light.edge2 = axisY * record.sizeY;
-            light.vertex0 = record.position - light.edge1 * 0.5f - light.edge2 * 0.5f;
-            light.area = record.sizeX * record.sizeY;
-        }
-        else
-        {
-            light.type = LightType::Disk;
-            light.position = record.position;
-            light.edge1 = axisX * (0.5f * record.sizeX);
-            light.edge2 = axisY * (0.5f * record.sizeY);
-            light.area = 0.25f * kPi * record.sizeX * record.sizeY;
-        }
-        if (! std::isfinite (light.area) || ! (light.area > 0.0f))
-        {
-            ++stats_.invalidLights;
-            continue;
-        }
-        const std::size_t before = ownedLights_.size();
-        // pi * L * A per emitting face.
-        push (light, (light.twoSided ? 2.0 : 1.0) * kPi * static_cast<double> (meanOf (light.strength))
-                         * static_cast<double> (light.area));
-        if (ownedLights_.size() > before)
-            ++stats_.areaLights;
+        AreaLightRecord area = (*areaLights)[a];
+        area.visibility = static_cast<std::uint8_t> (area.visibility & ~HarmonicMIDI::grid::sceneRayVisibility::Camera);
+        addArea (area);
     }
 
     double total = 0.0;
@@ -883,6 +992,7 @@ void LightSet::build (const SceneLightRecord* records, std::size_t count, Vec3 a
     }
     ownedCdf_.back() = 1.0f;
 }
+#endif
 
 PT_SHARED_ENTRY float LightSetView::selectionProbability (std::size_t light) const noexcept
 {
@@ -899,7 +1009,7 @@ PT_SHARED_ENTRY bool LightSetView::sample (Vec3 p, float uSelect, Vec2 u, LightS
     const float selection = probability_[index];
     if (! (selection > 0.0f))
         return false;
-    const Light& light = lights_[index];
+    const PT_GLOBAL Light& light = lights_[index];
     out.light = static_cast<std::uint32_t> (index);
     switch (light.type)
     {
@@ -1032,7 +1142,7 @@ PT_SHARED_ENTRY bool LightSetView::sample (Vec3 p, float uSelect, Vec2 u, LightS
                 return false;
             if (! (directionPdf > 0.0f))
                 directionPdf = d2 / (cosAtLight * light.area);
-            out.radiance = light.strength;
+            out.radiance = light.strength * areaSpreadAttenuation (light.tanHalfSpread, light.spreadNormalization, cosAtLight);
             out.point = q;
             out.lightNormal = light.normal;
             out.distance = d;
@@ -1047,7 +1157,7 @@ PT_SHARED_ENTRY float LightSetView::spectralBandScale (std::uint32_t index, floa
 {
     if (index >= lights_.size() || ! lights_[index].spectralBands)
         return 1.0f;
-    const auto& scale = lights_[index].bandScale;
+    const PT_GLOBAL auto& scale = lights_[index].bandScale;
     // Copied, since device code cannot bind a reference to a host global.
     constexpr auto grid = diffractionmaterial::kProductionWavelengthsNanometres;
     if (wavelengthNm <= grid[0])
@@ -1070,7 +1180,7 @@ PT_SHARED_ENTRY bool LightSetView::analyticHit (std::size_t index, Vec3 origin, 
     if (index >= analytic_.size())
         return false;
     const std::size_t slot = analytic_[index];
-    const Light& light = lights_[slot];
+    const PT_GLOBAL Light& light = lights_[slot];
     const float selection = probability_[slot];
     switch (light.type)
     {
@@ -1127,7 +1237,8 @@ PT_SHARED_ENTRY bool LightSetView::analyticHit (std::size_t index, Vec3 origin, 
                 directionPdf = 1.0f / rect.solidAngle;
             else
                 directionPdf = t * t / (std::fabs (denominator) * light.area);
-            radiance = light.strength;
+            radiance = light.strength
+                     * areaSpreadAttenuation (light.tanHalfSpread, light.spreadNormalization, std::fabs (denominator));
             pdf = selection * directionPdf;
             distance = t;
             return std::isfinite (pdf);
@@ -1194,7 +1305,7 @@ PT_SHARED_ENTRY bool LightSetView::sampleEmission (float uSelect, Vec2 uPosition
     const float selection = probability_[index];
     if (! (selection > 0.0f))
         return false;
-    const Light& light = lights_[index];
+    const PT_GLOBAL Light& light = lights_[index];
     out.light = static_cast<std::uint32_t> (index);
     out.type = light.type;
     const bool farLightsReachable = std::isfinite (sceneRadius) && sceneRadius > 0.0f && isFinite (sceneCentre);
@@ -1296,6 +1407,9 @@ PT_SHARED_ENTRY bool LightSetView::sampleEmission (float uSelect, Vec2 uPosition
             // Radiance L over area A and the cosine-weighted hemisphere:
             // L A pi, times 2 when a face was picked at random.
             out.weight = light.strength * (light.area * kPi * (twoSided ? 2.0f : 1.0f) / selection);
+            if (light.type != LightType::Triangle)
+                out.weight = out.weight
+                           * areaSpreadAttenuation (light.tanHalfSpread, light.spreadNormalization, dot (out.direction, face));
             break;
         }
     }
@@ -1307,7 +1421,7 @@ PT_SHARED_ENTRY float LightSetView::emissionFalloff (const EmissionSample& sampl
 {
     if (! sample.receiverFalloff || sample.light >= lights_.size())
         return 1.0f;
-    const Light& light = lights_[sample.light];
+    const PT_GLOBAL Light& light = lights_[sample.light];
     const Vec3 fromLight = receiver - light.position;
     const float d2 = dot (fromLight, fromLight);
     if (! (d2 > 0.0f) || ! std::isfinite (d2))

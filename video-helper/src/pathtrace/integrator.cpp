@@ -17,6 +17,9 @@ namespace
 
 using HarmonicMIDI::grid::SceneAlphaMode;
 using HarmonicMIDI::grid::SceneMaterialRecord;
+using HarmonicMIDI::grid::SceneVolume;
+using HarmonicMIDI::grid::SceneVolumeField;
+using HarmonicMIDI::grid::sceneVolumeActive;
 using HarmonicMIDI::grid::Visual3DScene;
 
 float finiteOr (float value, float fallback) noexcept { return std::isfinite (value) ? value : fallback; }
@@ -40,15 +43,22 @@ PathCounters& PathCounters::operator+= (const PathCounters& other) noexcept
 
 void RenderScene::commit()
 {
-    bvh.build (geometry.positions);
-    // Gratings have delta orders only: see kGratingSourceAngularRadius.
+    const auto bvhStart = PhaseClock::now();
+    if (geometry.motionOpen.empty())
+        bvh.build (geometry.positions);
+    else
+        bvh.buildMotion (geometry.motionOpen.data(), geometry.motionClose.data(), geometry.triangleCount());
+    bvhBuildMs = millisecondsSince (bvhStart);
+    // Every authored size lights the scene (LightSet::build reads the records).
+    // Gratings have delta orders only, so an unsized sun gets a small disk in a
+    // grating scene: see kGratingSourceAngularRadius.
     if (! gratings.empty())
     {
         if (lightShapes.size() < lightRecords.size())
             lightShapes.resize (lightRecords.size());
         for (std::size_t i = 0; i < lightRecords.size(); ++i)
             if (lightRecords[i].kind == HarmonicMIDI::grid::SceneLightKind::Directional
-                && ! (lightShapes[i].angularRadius > 0.0f))
+                && ! (lightShapes[i].angularRadius > 0.0f) && ! (lightRecords[i].angularRadius > 0.0f))
                 lightShapes[i].angularRadius = kGratingSourceAngularRadius;
     }
     lights.build (lightRecords.data(), lightRecords.size(), ambient, geometry, materials, fallbackMaterial,
@@ -58,14 +68,19 @@ void RenderScene::commit()
         anyThinSheet = anyThinSheet || isThinSheet (material);
         anyMediumBoundary = anyMediumBoundary || isMediumBoundary (material);
         anyDispersive = anyDispersive || materialDispersive (material);
+        anyVolume = anyVolume || materialHasVolume (material);
     };
     anyPartialCoverage = false;
     anyThinSheet = false;
     anyMediumBoundary = false;
     anyDispersive = false;
+    anyVolume = false;
     note (fallbackMaterial);
     for (const Material& material : materials)
         note (material);
+    anyHiddenObjects = false;
+    for (const TriangleAttributes& triangle : geometry.triangles)
+        anyHiddenObjects = anyHiddenObjects || triangle.visibility != HarmonicMIDI::grid::sceneRayVisibility::All;
     boundsCentre = {};
     boundsRadius = 0.0f;
     if (! geometry.positions.empty())
@@ -86,6 +101,16 @@ void RenderScene::commit()
             boundsRadius = 0.0f;
         }
     }
+    // The world volume needs a ball to fill: four scene radii unless given.
+    worldVolumeExtent = std::isfinite (worldVolumeRadius) && worldVolumeRadius > 0.0f ? worldVolumeRadius : 4.0f * boundsRadius;
+    hasWorldVolume = materialHasVolume (worldVolume) && worldVolumeExtent > 0.0f;
+    if (hasWorldVolume)
+    {
+        // A medium of its own with no surface; a Noise field still shapes it.
+        worldVolume.transmission = 0.0f;
+        worldVolume.absorptionDistance = 0.0f;
+    }
+    anyVolume = anyVolume || hasWorldVolume;
 }
 
 const Material& RenderScene::materialOf (std::uint32_t triangle) const noexcept
@@ -119,7 +144,31 @@ Material materialFromRecord (const SceneMaterialRecord& record) noexcept
         case SceneAlphaMode::Mask: material.alphaMode = MaterialAlphaMode::Mask; break;
         case SceneAlphaMode::Blend: material.alphaMode = MaterialAlphaMode::Blend; break;
     }
+    applySceneVolume (record.volume, material);
     return material;
+}
+
+void applySceneVolume (const SceneVolume& volume, Material& material) noexcept
+{
+    const auto unit = [] (float value) {
+        return std::isfinite (value) ? std::min (1.0f, std::max (0.0f, value)) : 0.0f;
+    };
+    const auto radiance = [] (float value) {
+        return std::isfinite (value) && value > 0.0f ? value : 0.0f;
+    };
+    material.volumeDensity = radiance (volume.density);
+    material.volumeColor = { unit (volume.color.x), unit (volume.color.y), unit (volume.color.z) };
+    material.volumeAbsorptionColor = { unit (volume.absorptionColor.x), unit (volume.absorptionColor.y),
+                                       unit (volume.absorptionColor.z) };
+    material.volumeAnisotropy = std::isfinite (volume.anisotropy)
+        ? std::min (1.0f, std::max (-1.0f, volume.anisotropy)) : 0.0f;
+    material.volumeEmission = { radiance (volume.emission.x), radiance (volume.emission.y), radiance (volume.emission.z) };
+    material.volumeField = volume.field == SceneVolumeField::Noise ? VolumeDensityField::Noise : VolumeDensityField::Uniform;
+    material.volumeFieldDetail = static_cast<std::uint8_t> (std::min<std::uint32_t> (8, std::max<std::uint32_t> (1, volume.fieldDetail)));
+    material.volumeFieldScale = std::isfinite (volume.fieldScale) && volume.fieldScale > 0.0f ? volume.fieldScale : 1.0f;
+    material.volumeFieldOffset = { finiteOr (volume.fieldOffset.x, 0.0f), finiteOr (volume.fieldOffset.y, 0.0f),
+                                   finiteOr (volume.fieldOffset.z, 0.0f) };
+    material.volumeOnly = volume.volumeOnly && material.volumeDensity > 0.0f;
 }
 
 void prepareRenderScene (const Visual3DScene& scene, RenderScene& out, const PrepareOptions& options)
@@ -130,6 +179,15 @@ void prepareRenderScene (const Visual3DScene& scene, RenderScene& out, const Pre
     for (std::size_t i = 0; i < materialCount; ++i)
         out.materials.push_back (materialFromRecord (scene.materials[i]));
     out.fallbackMaterial = Material {};
+    // An explicit world volume from the caller wins; otherwise the scene's fog.
+    out.worldVolume = options.worldVolume;
+    out.worldVolumeRadius = options.worldVolumeRadius;
+    if (! materialHasVolume (out.worldVolume) && sceneVolumeActive (scene.worldVolume))
+    {
+        out.worldVolume = Material {};
+        applySceneVolume (scene.worldVolume, out.worldVolume);
+        out.worldVolumeRadius = std::isfinite (scene.worldVolume.radius) ? scene.worldVolume.radius : 0.0f;
+    }
     // Object overrides append their materials after the record materials and
     // point that object's triangles at them.
     for (const ObjectMaterialOverride& entry : options.objectMaterials)
@@ -403,6 +461,12 @@ RenderStats PathTracer::runPass (const RenderScene& scene, const PinholeCamera& 
         return stats;
     }
 
+    // The CPU traces into host memory: it has no pipeline, upload or readback,
+    // and its BVH is the scene's (the engine times that as AccelBuild).
+    stats.phases.markAbsent (FramePhase::PipelineWait, "the CPU device has no kernel build");
+    stats.phases.markAbsent (FramePhase::Upload, "the CPU device traces from host memory");
+    stats.phases.markAbsent (FramePhase::Readback, "the CPU device accumulates into host memory");
+    const auto traceStart = PhaseClock::now();
     const TilePassResult result = pool_.runTiles (grid, cancel, [&] (const Tile& tile, unsigned threadIndex) {
         ThreadTotals local;
         for (std::uint32_t y = tile.y0; y < tile.y1; ++y)
@@ -428,7 +492,13 @@ RenderStats PathTracer::runPass (const RenderScene& scene, const PinholeCamera& 
                         outcome = device::cpu::traceCameraSample (view, config, camera, x, y, width, firstSample + s,
                                                                   generation, accumulator_, local.counters, ray, radiance);
                         if (outcome == device::SampleOutcome::Added)
+                        {
                             addFrameSample (x, y, ray, radiance);
+                            Vec3 albedo;
+                            Vec3 normal;
+                            device::cpu::firstHitGuides (view, ray, albedo, normal);
+                            accumulator_.addGuide (x, y, { albedo.x, albedo.y, albedo.z }, { normal.x, normal.y, normal.z });
+                        }
                     }
                     if (outcome == device::SampleOutcome::NonFinite)
                         ++local.nonFinite;
@@ -443,6 +513,7 @@ RenderStats PathTracer::runPass (const RenderScene& scene, const PinholeCamera& 
         slot.nonFinite += local.nonFinite;
         slot.stoppedEarly = slot.stoppedEarly || local.stoppedEarly;
     });
+    stats.phases.set (FramePhase::Trace, millisecondsSince (traceStart));
 
     bool stoppedEarly = false;
     PathCounters counters;

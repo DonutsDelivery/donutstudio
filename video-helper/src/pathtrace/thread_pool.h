@@ -21,15 +21,33 @@ namespace videohelper::pathtrace
 
 // Shared stop flag. One owner calls cancel(); any number of passes poll it.
 // reset() re-arms it once the cancelled pass has returned.
+//
+// It can also watch a generation counter: once the counter moves past the
+// value captured with the pass's inputs, the pass is obsolete and stops at the
+// same polls (render_input_generation.h). The owner sets the watch between
+// passes, never while one runs.
 class CancellationToken
 {
 public:
     void cancel() noexcept { cancelled_.store (true, std::memory_order_release); }
     void reset() noexcept { cancelled_.store (false, std::memory_order_release); }
-    bool isCancelled() const noexcept { return cancelled_.load (std::memory_order_acquire); }
+    bool isCancelled() const noexcept { return cancelled_.load (std::memory_order_acquire) || obsolete(); }
+
+    void watch (const std::atomic<std::uint64_t>* generation, std::uint64_t captured) noexcept
+    {
+        generation_ = generation;
+        captured_ = captured;
+    }
+    // The watched generation moved: the inputs this pass renders were edited.
+    bool obsolete() const noexcept
+    {
+        return generation_ != nullptr && generation_->load (std::memory_order_acquire) != captured_;
+    }
 
 private:
     std::atomic<bool> cancelled_ { false };
+    const std::atomic<std::uint64_t>* generation_ = nullptr;
+    std::uint64_t captured_ = 0;
 };
 
 // Half-open pixel rectangle [x0, x1) x [y0, y1).

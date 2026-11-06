@@ -92,7 +92,7 @@ inline bool calculateGratingCellTransportBounds(const GratingEntryCellBinding& c
     const auto& parent=*cells.incidentBinding;const auto& frame=parent.frame;
     const auto interfaces=parent.prepared.branchPolicy->description().maximumInterfaces;
     const auto query=gratingCellQueryAllowance(frame);
-    if(!interfaces||interfaces>kMaximumAncestryInterfaces||incidents>kMaximumEntrySamples*8*kMaximumBranchVisits
+    if(!interfaces||interfaces>kMaximumInterfaces||incidents>kMaximumEntrySamples*8*kMaximumBranchVisits
         ||incidents>parent.bounds.maximumIncidents
         ||!query||query>opaquevisibility::kMaximumClosestHitWork)return refuse("Cell transport schedule or query allowance is invalid");
     GratingCellTransportBounds bounds;bounds.maximumRecords=incidents;bounds.maximumInterfaces=interfaces;
@@ -114,11 +114,11 @@ inline bool calculateGratingCellTransportBounds(const GratingEntryCellBinding& c
         +recordsBytes+cells.bounds.nativeUploadBytes+incidents*sizeof(std::uint32_t)
         +2*cells.identity.size()+9*parent.identity.size()+640;
     bounds.bytes=bounds.hostBytes+bounds.nativeBytes;
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;
     if(frame.bounds.transientBytes>maximum||parent.bounds.bytes>maximum-frame.bounds.transientBytes
         ||cells.bounds.bytes>maximum-frame.bounds.transientBytes-parent.bounds.bytes
         ||bounds.bytes>maximum-frame.bounds.transientBytes-parent.bounds.bytes-cells.bounds.bytes)
-        return refuse("Cell transport storage exceeds the existing whole-frame byte cap");
+        return refuse("Cell transport storage total is not representable");
     output=bounds;error.clear();return true;
 }
 inline std::string gratingCellTransportIdentity(const GratingCellTransportBinding& binding)
@@ -181,7 +181,7 @@ inline bool decodeGratingCellTransportRecord(const Texel* row,const GratingCellT
 {
     const auto refuse=[&](){error="Native cell transport row is malformed";return false;};
     if(!row||!binding.sourceCells||!binding.pointReadback||!binding.bounds.maximumInterfaces
-        ||binding.bounds.maximumInterfaces>kMaximumAncestryInterfaces
+        ||binding.bounds.maximumInterfaces>kMaximumInterfaces
         ||binding.bounds.recordStride!=kGratingCellTransportHeaderStride+kGratingCellTracePaths*(binding.bounds.maximumInterfaces+1)*kGratingCellTraceStepStride)return refuse();
     for(std::size_t i=0;i<binding.bounds.recordStride;++i)for(float x:row[i])if(!std::isfinite(x))return refuse();
     NativeGratingCellTransportRecord r;std::uint32_t disposition=0,words[4]{};
@@ -253,7 +253,7 @@ inline bool validateGratingCellTransportRecord(const GratingCellTransportBinding
         Point expectedOrigin=advance(start,source,2*bias(start)),expectedDirection=advance({},source,-1);
         for(std::size_t depth=0;depth<steps.size();++depth) {
             const auto& step=steps[depth];const auto& hit=step.hit;
-            if(!continuing||step.depth!=depth||step.token!=(depth<point.interfaces?point.ancestry[depth]:0u)
+            if(!continuing||step.depth!=depth||step.token!=(depth<point.interfaces?(point.reflectionHistory.test(depth)?1u:65u):0u)
                 ||!finite(step.origin)||!finite(step.direction)||std::abs(dot(step.direction,step.direction)-1)>1e-4f
                 ||!sameGratingPoint(step.origin,expectedOrigin,8*bias(expectedOrigin))||!sameGratingPoint(step.direction,expectedDirection)
                 ||!std::isfinite(step.signedBias)||hit.status<0||hit.status>1||!hit.work||hit.work>allowance

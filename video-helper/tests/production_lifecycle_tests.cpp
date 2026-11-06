@@ -371,8 +371,8 @@ int main (int argc, char** argv)
 #if defined(__linux__)
     // A grant from the earlier session cannot authorize a replacement helper.
     // Only a grant projected from the replacement's fresh session is accepted.
-    auto replacement = configFor(helper, matte, 0x79, 19);
-    assert(manager.launch(replacement));
+    auto rolloverReplacement = configFor(helper, matte, 0x79, 19);
+    assert(manager.launch(rolloverReplacement));
     error.clear(); result = manager.sendRequestSync("viewport_set_script", makeScriptParams(freshGrant), 2000, error);
     assert(error.containsIgnoreCase("session") || error.containsIgnoreCase("authentication"));
     programmableruntime::SessionSecret secretC {}; secretC.fill(0x79);

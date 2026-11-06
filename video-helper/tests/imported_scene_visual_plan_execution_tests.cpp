@@ -3917,7 +3917,7 @@ void testMaterialFieldBinding()
     for (int mutation = 0; mutation < 4; ++mutation)
     {
         auto invalid = *request.materialField;
-        if (mutation == 0) invalid.index = materialfield::kMaximumElements;
+        if (mutation == 0) invalid.fieldPlan.clear();
         if (mutation == 1) invalid.gain = std::numeric_limits<double>::quiet_NaN();
         if (mutation == 2) { invalid.reduction = materialfield::Reduction::index; invalid.index = 4; }
         if (mutation == 3) invalid.materialNode = 9000;
@@ -3934,8 +3934,14 @@ void testMaterialFieldBinding()
               "each bounded reduction uses the canonical evaluated Field samples");
     }
     const auto score = videohelper::tests::materialFieldFixture(72, true);
-    check(!materialfield::admit(videohelper::tests::materialFieldFixture(72, false, 2049), error),
-          "Material Field rejects excess cardinality before runtime evaluation");
+    {
+        auto large = videohelper::tests::materialFieldFixture(72, false, 10000);
+        large.reduction = materialfield::Reduction::index; large.index = 9999;
+        double amount = 0;
+        check(materialfield::admit(large, error).has_value()
+                  && materialfield::sample(large, videowire::geometry::RuntimeFieldEvaluation{}, amount, error),
+              "Material Field admits and samples a 10000-sample field");
+    }
     videowire::geometry::RuntimeFieldEvaluation evaluation;
     diffractionmaterialbinding::RuntimeParameters parameters;
     check(!materialfield::evaluate(score, evaluation, *request.diffractionMaterial, parameters, error),
@@ -5281,7 +5287,7 @@ void testImportedSolidComposition()
         identified->bodies[0].identity=1; identified->bodies[1].identity=2;
         auto previous=std::make_unique<ParticleSolidState>(*identified);
         previous->count=1; previous->bodies[0].x-=.05f;
-        const std::array<double,kParticleSolidMaxBodies> births {};
+        const ParticleSizedList<double> births;
         const ParticleSolidMotionPrior prior{*previous,births,births,p.bodyRadius};
         const auto moving=appendParticleSolidsToScene(current,*request->sceneSnapshot,*request->timelineGeometry,
             p,*identified,90,error,&prior);
@@ -5321,8 +5327,15 @@ void testImportedSolidComposition()
     refuse(nonuniform,p,solids,"nonuniform bound object scale refuses before native preparation");
     auto projected=p; selected=std::make_shared<ParticleGeometryBinding>(*p.geometryBinding); selected->projection=1; projected.geometryBinding=selected;
     refuse(current,projected,solids,"non-XYZ simulation mapping refuses explicitly");
-    auto overCount=solids; overCount.count=videorender::kParticleImportedSolidMaxBodies+1;
-    refuse(current,p,overCount,"imported Solid composition above 64 bodies refuses before appending objects");
+    {
+        // Composition grows the scene to the Count; 300 bodies append past the old 64.
+        auto many=solids; many.count=300; many.bodies.resize(300);
+        for (std::size_t i=0;i<300;++i) many.bodies[i]=solids.bodies[0];
+        const auto manyScene=appendParticleSolidsToScene(current,*request->sceneSnapshot,*request->timelineGeometry,p,many,90,error);
+        check(manyScene && manyScene->objectCount==current->objectCount+300
+            && manyScene->objects[manyScene->objectCount-1].id.value==arbitgpu::kAppendedSolidObjectIdBase+300u,
+            "imported Solid composition appends 300 bodies as their own scene objects: "+error);
+    }
     // An oriented box replay draws its static body Geometry with the same
     // bounding-radius normalization and bodyRadius scale as its contact box.
     auto boxParams=rigidParams; boxParams.bodyShape=2; boxParams.collisionMode=2;
@@ -6128,18 +6141,22 @@ void testTimelineFamilySolidComposition()
         refusedFamily("colliderFamilyPlans=\"10:"+water->bindings[0].loweredPlan+";11:"+water->bindings[1].loweredPlan+"\"",
             "Water children","Water family children refuse because coupled family Water has no shared replay");
     else check(false,"family Water fixture authors: " + error);
-    // A 9x9 grid has 128 triangles and a 2x2 grid has 2, so the pair passes
-    // the per-child checks and exceeds the 128-triangle family limit.
+    // A 9x9 grid has 128 triangles and a 2x2 grid has 2. Together they are
+    // past the old 128-triangle family limit; the family sizes from its meshes.
     PortContract gridContract; gridContract.carrier=CarrierKind::geometry3D;
     gridContract.maxVertices=4096; gridContract.maxIndices=12288;
     const auto dense=lowerGrid(18300,18300,1,9,9,.25f,gridContract,error);
     const auto sparse=lowerGrid(18301,18301,1,2,2,.25f,gridContract,error);
     const auto denseValue=dense ? admitValue(*dense,gridContract,error):std::nullopt;
     const auto sparseValue=sparse ? admitValue(*sparse,gridContract,error):std::nullopt;
-    if (denseValue && sparseValue)
-        refusedFamily("colliderFamilyPlans=\"10:"+encodeLoweredPlanText(lowerRuntimePlan(gridContract,*denseValue))
-            +";11:"+encodeLoweredPlanText(lowerRuntimePlan(gridContract,*sparseValue))+"\"","exceed 256 vertices and 128 triangles",
-            "family children that together exceed 128 triangles refuse");
+    if (denseValue && sparseValue) {
+        ParticleParams wide;
+        const bool admittedWide=videowire::admitParticleParameters(particleXml("colliderFamilyPlans=\"10:"
+            +encodeLoweredPlanText(lowerRuntimePlan(gridContract,*denseValue))
+            +";11:"+encodeLoweredPlanText(lowerRuntimePlan(gridContract,*sparseValue))+"\""),wide,error,true);
+        check(admittedWide && wide.geometryBinding && wide.geometryBinding->meshFamily.size()==2,
+            "family children past 128 triangles together admit: "+error);
+    }
     else check(false,"oversized family grids author: " + error);
 
     auto request = familyProductionRequest(*source);
@@ -6398,7 +6415,7 @@ void testTimelineFamilySolidComposition()
             auto recorded=std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*receipt.sourceScene);
             recorded->previousObjectTransformCount=recorded->objectCount;
             for (std::size_t i=0;i<recorded->objectCount;++i) recorded->previousObjectTransforms[i]=recorded->objects[i].transform;
-            const std::array<double,videorender::kParticleSolidMaxBodies> births {};
+            const videorender::ParticleSizedList<double> births;
             const videorender::ParticleSolidMotionPrior prior{state,births,births,direct.parameters.bodyRadius};
             auto moved=std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*recorded);
             moved->previousObjectTransforms[parentIndex].translation.x+=0.1f;
@@ -8350,7 +8367,7 @@ int main(int argc, char** argv)
     }
     const auto largeVertexEncoded = visualimportedscenerender::encode(largeVertexRequest);
     visualimportedscenerender::Request decodedLargeVertex;
-    check(largeVertexEncoded.size() > visualimportedscenerender::kMaximumV4EncodedBytes
+    check(largeVertexEncoded.size() > 128u * 1024u
               && visualimportedscenerender::decode(largeVertexEncoded, decodedLargeVertex)
               && visualimportedscenerender::sameRequest(largeVertexRequest, decodedLargeVertex),
           "a vertex modifier above 128 KiB of wire keeps its exact round trip");
@@ -8405,11 +8422,6 @@ int main(int argc, char** argv)
     }
     check(visualimportedscenerender::detail::validVertexModifier(deepVertex),
           "the transport walks a long vertex chain with an explicit stack");
-    auto tooManyTextures = exactMaterialRequest;
-    tooManyTextures.material->binding.textures.resize(
-        surfacematerialbinding::kMaximumTextureBindings + 1u);
-    check(visualimportedscenerender::encode(tooManyTextures).empty(),
-          "material transport rejects an oversized texture-binding count");
     visualimportedscenerender::Request rejectedMaterial;
     check(!visualimportedscenerender::decode(
               replaceLine(materialEncoded, 9, "1 1 129"), rejectedMaterial),

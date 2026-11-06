@@ -18,6 +18,9 @@ namespace videorender::fixture3d::pathtracefixture
 // (AOVs and raw exports, pass composites, deformed or composed frames). Glass caustics and an admitted diffraction material render
 // in the tracer itself, and frame textures in the upload's GPU pass.
 bool admitInputs (const arbitgpu::NativeFixtureSceneRuntimeInputs& inputs, std::string& error);
+// Whether a draw shows an Image view, exports data passes or runs a pass
+// composite, so its frame carries the render outputs.
+bool readsRenderOutputs (const arbitgpu::NativeFixtureSceneRuntimeInputs& inputs) noexcept;
 
 // The scene with its one mesh object instanced once per note the frame sends through
 // the mapping. Note appearance and several objects are refused by name.
@@ -47,6 +50,12 @@ std::shared_ptr<SceneRenderEngine> makeEngineWithUpload (CpuFrameUpload upload);
 // Starts the kernel build in the background where OptiX is this machine's device, so a
 // first render after an update finds it done or joins it.
 void prepareDeviceAtStartup();
+// The machine's Path Trace device setting from Preferences: "auto", "optix", "cuda",
+// "hip", "metal", "oneapi" or "cpu". ARBIT_PATHTRACE_DEVICE still overrides it. A
+// change moves every engine to the new selection on its next draw and starts that
+// device's kernel build. Returns the selection's error, empty when it can render.
+std::string setDevicePreference (const std::string& value);
+std::string devicePreference();
 // The notice's Cancel and Start again. Cancel says whether it applied.
 bool cancelDeviceBuild();
 void startDeviceBuildAgain();

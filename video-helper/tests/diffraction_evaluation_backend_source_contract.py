@@ -299,10 +299,11 @@ for name, source in metal_shader_sources.items():
 
 
 for name, source in (("OpenGL", gl), ("Metal", metal)):
-    # One definition plus three production call sites: the 1D diffraction path
-    # and both sides of the spectral triangle transport (59571489d9, 21e852c5b2).
-    assert source.count("propagatingOneDimensionalOrders(") == 4, (
-        f"{name} needs one bound and all three production call sites")
+    # One definition plus four production call sites: the 1D diffraction path,
+    # both sides of the spectral triangle transport (59571489d9, 21e852c5b2), and
+    # the Realtime environment through the orders.
+    assert source.count("propagatingOneDimensionalOrders(") == 5, (
+        f"{name} needs one bound and all four production call sites")
     bound = source.split("propagatingOneDimensionalOrders(", 1)[1].split(
         "// Integrate discrete reciprocal orders", 1)[0]
     for token in ("dot(incidentTangent, grooveDirection) / grooveLength",

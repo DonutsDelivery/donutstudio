@@ -192,8 +192,8 @@ inline bool environmentImageCases(arbitgpu::NativeFixtureSceneBackend& backend,s
     auto ninth=key;ninth.id="resident-nine";
     if (!isolated.begin("resident-overflow",ninth,metadata,bytes.size(),error)
         || !isolated.append("resident-overflow",0,encoded,received,error)
-        || isolated.commit("resident-overflow",error))
-    {error="HDR environment aggregate resident count admitted nine leased owners";return false;}
+        || !isolated.commit("resident-overflow",error))
+    {error="HDR environment refused a ninth leased owner past the resident cache target";return false;}
     error.clear();return true;
 }
 } // namespace videohelper::tests

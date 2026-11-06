@@ -1,4 +1,4 @@
-// Focused coverage for every Score Sample Field measurement (choices 0 to 13).
+// Focused coverage for every Score Sample Field measurement (choices 0 to 14).
 //
 // The expected values are derived by hand from the small score below. They are
 // not read back from the implementation. Sample positions are mapping-space
@@ -39,7 +39,7 @@ using videowire::geometry::FieldData;
 using videowire::geometry::FieldElement;
 
 constexpr double kTolerance = 1.0e-5;
-constexpr std::uint8_t kMeasureCount = 14;
+constexpr std::uint8_t kMeasureCount = 15;
 using Expected = std::array<double, kMeasureCount>;
 using FramePointer = std::shared_ptr<const CanonicalBlockCFrame>;
 
@@ -260,7 +260,8 @@ void checkChoiceTable()
         scoreContract::Mode::remainingDurationBeats, scoreContract::Mode::rootFlag,
         scoreContract::Mode::midiNoteNumber, scoreContract::Mode::resolvedFrequencyHz,
         scoreContract::Mode::harmonicLinkRatio, scoreContract::Mode::primeLattice,
-        scoreContract::Mode::primeLattice, scoreContract::Mode::primeLattice};
+        scoreContract::Mode::primeLattice, scoreContract::Mode::primeLattice,
+        scoreContract::Mode::midiLane};
     for (std::uint8_t choice = 0; choice < kMeasureCount; ++choice)
     {
         scoreContract::Mode mode = scoreContract::Mode::velocityInfluence;
@@ -268,7 +269,7 @@ void checkChoiceTable()
               "choice " + std::to_string(static_cast<int>(choice)) + " maps to its measure");
     }
     scoreContract::Mode unused = scoreContract::Mode::velocityInfluence;
-    check(!scoreContract::sampleFieldMode(kMeasureCount, unused), "choice 14 is refused");
+    check(!scoreContract::sampleFieldMode(kMeasureCount, unused), "choice 15 is refused");
 
     std::uint8_t slot = 99;
     check(scoreContract::samplePrimeLatticeSlot(11, slot) && slot == 0, "choice 11 reads X slot 0");
@@ -291,11 +292,11 @@ void checkSampleMeasures()
     checkSampleField(frameAt(measureScore(), 1.0f),
         {
             Sample{{0.0, 0.0, 0.0},
-                   {1.0, 1.25 - s3 / 8.0, 12.0, linkA, 0.0, 1.0, 3.0, 1.0, 69.0, 440.0, 2.0, 1.0, 2.0, 3.0}},
+                   {1.0, 1.25 - s3 / 8.0, 12.0, linkA, 0.0, 1.0, 3.0, 1.0, 69.0, 440.0, 2.0, 1.0, 2.0, 3.0, 0.0}},
             Sample{{2.0, 0.0, 0.0},
-                   {s3, 0.8125 - s3 / 8.0, 12.0, s3, -12.0, -1.0, 5.0, 0.0, 93.0, 880.0, 2.0, 11.0, 12.0, 13.0}},
+                   {s3, 0.8125 - s3 / 8.0, 12.0, s3, -12.0, -1.0, 5.0, 0.0, 93.0, 880.0, 2.0, 11.0, 12.0, 13.0, 1.0}},
             Sample{{3.0, -2.0, 2.0},
-                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, -3.0, 5.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0}},
+                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, -3.0, 5.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0, 2.0}},
         },
         "beat 1");
 
@@ -305,9 +306,9 @@ void checkSampleMeasures()
     checkSampleField(frameAt(measureScore(), 3.0f),
         {
             Sample{{0.0, 0.0, 0.0},
-                   {s3, 0.8125 - s3 / 8.0, 12.0, s3, -12.0, 1.0, 3.0, 0.0, 93.0, 880.0, 2.0, 11.0, 12.0, 13.0}},
+                   {s3, 0.8125 - s3 / 8.0, 12.0, s3, -12.0, 1.0, 3.0, 0.0, 93.0, 880.0, 2.0, 11.0, 12.0, 13.0, 1.0}},
             Sample{{1.0, -2.0, 2.0},
-                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, -1.0, 3.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0}},
+                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, -1.0, 3.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0, 2.0}},
         },
         "beat 3");
 
@@ -316,7 +317,7 @@ void checkSampleMeasures()
     checkSampleField(frameAt(measureScore(), 6.0f),
         {
             Sample{{-2.0, -2.0, 2.0},
-                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, 2.0, 0.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0}},
+                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, 2.0, 0.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0, 2.0}},
         },
         "beat 6 ended");
 
@@ -325,7 +326,7 @@ void checkSampleMeasures()
     checkSampleField(frameAt(measureScore(), 7.0f),
         {
             Sample{{-3.0, -2.0, 2.0},
-                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, 3.0, -1.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0}},
+                   {0.0, 0.75 - s14 / 8.0, 24.0, s14, 0.0, 3.0, -1.0, 0.0, 45.0, 110.0, 2.0, 21.0, 22.0, 23.0, 2.0}},
         },
         "beat 7 past end");
 }
@@ -359,7 +360,7 @@ void checkUnknownChoiceRefused()
     std::string error;
     check(!scoreHelper::evaluateSampleField(op, positions, frame, result, error)
               && error.find("unknown measurement") != std::string::npos,
-          "choice 14 refused as an unknown measurement");
+          "choice 15 refused as an unknown measurement");
 }
 
 void checkVectorEvaluation()

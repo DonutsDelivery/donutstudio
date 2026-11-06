@@ -2,6 +2,7 @@
 
 #include "../../../shared/Visual3DScene.h"
 #include "fixture_surface_source_admission.h"
+#include "../pathtrace/sky_cloud_volume.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -16,6 +17,9 @@ namespace arbitgpu::analyticsky
 // color is a radiance, not irradiance. Light RGB/intensity tint the whole field.
 // horizon.w packs heading (8 bits), type (6) and coverage (10) as an integer that
 // binary32 holds exactly. ground.w is the authored drift. Zero means no clouds.
+// zenith.w is the version plus code/16384, where code packs the sun halo and the
+// cloud thickness in 63rds as halo*64+thickness. It stays below 1.25, under the
+// environment image's 2, so every version test reads it unchanged.
 using Uniforms = std::array<std::array<float,4>,5>;
 // Raster's RGBA16F target can't hold a brighter emission or ambient, and a float past this can
 // overflow in the shader, so the peak clips here and keeps its hue. Path Trace reads the authored value.
@@ -48,6 +52,17 @@ inline float packedClouds(const HarmonicMIDI::grid::SceneAnalyticSky& s,double h
     const auto heading=std::lround((turns-std::floor(turns))*256)%256;
     return static_cast<float>(heading*65536+kind*1024+coverage);
 }
+// Halo and cloud thickness, in 63rds, as the shader decodes them from zenith.w.
+inline float extraCode(const HarmonicMIDI::grid::SceneAnalyticSky& s)
+{
+    if(s.version==0) return 0;
+    const auto halo=std::lround(std::clamp(s.sunHalo,0.0f,1.0f)*63);
+    const auto thickness=std::lround(std::clamp(s.cloudThickness,0.0f,1.0f)*63);
+    return static_cast<float>(halo*64+thickness);
+}
+inline constexpr float kExtraScale=16384.0f;
+// Mie anisotropy of the halo's Henyey-Greenstein lobe, the Physical sky's dust.
+inline constexpr float kHaloAnisotropy=0.8f;
 inline Uniforms uniforms(const HarmonicMIDI::grid::SceneLightRecord& light)
 {
     const auto& s=light.sky;
@@ -68,7 +83,7 @@ inline Uniforms uniforms(const HarmonicMIDI::grid::SceneLightRecord& light)
     const auto sunColor=scaled(s.sunColor,static_cast<float>(std::cos(s.sunRadiusDegrees*radians)),std::numeric_limits<float>::max());
     const auto sunPeak=std::max({sunColor[0],sunColor[1],sunColor[2]});
     const auto storedSun=sunPeak>0.0f ? std::min(s.sunIntensity,60000.0f/sunPeak) : s.sunIntensity;
-    return {color(s.zenith,static_cast<float>(s.version)),
+    return {color(s.zenith,static_cast<float>(s.version)+extraCode(s)/kExtraScale),
         color(s.horizon,packedClouds(s,static_cast<double>(s.cloudHeadingDegrees)+s.orientationDegrees)),
         color(s.ground,s.cloudCoverage>0 ? s.cloudDrift : 0.0f),sunColor,
         std::array<float,4>{static_cast<float>(std::sin(az)*std::cos(el)),
@@ -123,10 +138,21 @@ float analyticSkyCloudOpacity(vec3 d,vec4 horizon,vec4 ground) {
     float threshold=mix(0.85,-edge,coverage);
     return smoothstep(threshold,threshold+edge,value)*mix(0.96,0.7,kind)*smoothstep(0.015,0.14,d.y);
 }
+// The sun halo: the cap's irradiance pi*(1-cos radius)*peak, scattered by the
+// halo share into a Henyey-Greenstein lobe (g 0.8) and strongest at the horizon.
+float analyticSkyExtra(vec4 zenith) { return floor(max(zenith.w-1.0,0.0)*16384.0+0.5); }
+vec3 analyticSkyHalo(vec3 d, vec4 zenith, vec4 sun, vec4 sunDirection) {
+    float halo=floor(analyticSkyExtra(zenith)/64.0)/63.0;
+    if(halo<=0.0) return vec3(0.0);
+    float mu=dot(d,sunDirection.xyz);
+    float lobe=0.36/(12.566370614359172*pow(max(1.64-1.6*mu,1.0e-6),1.5));
+    return sun.rgb*(sunDirection.w*3.141592653589793*(1.0-sun.w)*halo*lobe*(1.0-0.65*abs(d.y)));
+}
 vec3 analyticSkyRadiance(vec3 direction, vec4 zenith, vec4 horizon,
                         vec4 ground, vec4 sun, vec4 sunDirection) {
     vec3 d=normalize(direction);
-    vec3 sky=mix(horizon.rgb,d.y>=0.0 ? zenith.rgb : ground.rgb,abs(d.y));
+    vec3 sky=mix(horizon.rgb,d.y>=0.0 ? zenith.rgb : ground.rgb,abs(d.y))
+        +analyticSkyHalo(d,zenith,sun,sunDirection);
     float cap=clamp((dot(d,sunDirection.xyz)-sun.w)/(1.0-sun.w),0.0,1.0);
     vec3 clear=sky+sun.rgb*sunDirection.w*cap*cap*(3.0-2.0*cap);
     float cloud=analyticSkyCloudOpacity(d,horizon,ground);
@@ -135,6 +161,92 @@ vec3 analyticSkyRadiance(vec3 direction, vec4 zenith, vec4 horizon,
     float white=max(max(ambient.x,ambient.y),ambient.z);
     vec3 lit=vec3(white,white,white)+sun.rgb*sunDirection.w*(1.0-sun.w)*max(sunDirection.y,0.0);
     return mix(clear,lit*(1.0-0.3*cloud*cloud),cloud);
+}
+// Volumetric clouds, the arithmetic of pathtrace/sky_cloud_volume.h: a layer one
+// unit up and thickness units deep, with the flat layer's coverage, kind, heading
+// and drift. The camera sees it; reflections and image-based light keep the flat
+// layer, whose quadrature can't afford the march.
+float analyticSkyVolumeNoise(vec3 p) {
+    vec3 cell=floor(p);
+    vec3 f=p-cell;
+    f=f*f*(3.0-2.0*f);
+    vec2 lower=cell.xz+vec2(cell.y*57.0,cell.y*113.0);
+    vec2 upper=lower+vec2(57.0,113.0);
+    float a=mix(mix(analyticSkyCloudHash(lower),analyticSkyCloudHash(lower+vec2(1.0,0.0)),f.x),
+                mix(analyticSkyCloudHash(lower+vec2(0.0,1.0)),analyticSkyCloudHash(lower+vec2(1.0,1.0)),f.x),f.z);
+    float b=mix(mix(analyticSkyCloudHash(upper),analyticSkyCloudHash(upper+vec2(1.0,0.0)),f.x),
+                mix(analyticSkyCloudHash(upper+vec2(0.0,1.0)),analyticSkyCloudHash(upper+vec2(1.0,1.0)),f.x),f.z);
+    return mix(a,b,f.y);
+}
+float analyticSkyVolumeDensity(vec2 q,float h,float kind,float coverage,float depth) {
+    vec3 p=vec3(q.x*mix(1.6,0.35,kind),h*depth*2.0,q.y*mix(1.6,2.8,kind));
+    float value=0.62*analyticSkyVolumeNoise(p)+0.38*analyticSkyVolumeNoise(p*2.03+vec3(17.0,5.0,9.0));
+    float edge=mix(0.12,0.3,kind);
+    float threshold=mix(0.85,-edge,coverage);
+    float profile=smoothstep(0.0,mix(0.25,0.45,kind),h)*(1.0-smoothstep(mix(0.55,0.75,kind),1.0,h));
+    return smoothstep(threshold,threshold+edge,value)*profile;
+}
+float analyticSkyPhase(float mu,float g) {
+    float t=max(1.0+g*g-2.0*g*mu,1.0e-6);
+    return (1.0-g*g)/(12.566370614359172*t*sqrt(t));
+}
+vec4 analyticSkyCloudVolume(vec3 d, vec4 zenith, vec4 horizon, vec4 ground, vec4 sun, vec4 sunDirection) {
+    float code=analyticSkyExtra(zenith);
+    float depth=(code-floor(code/64.0)*64.0)/63.0;
+    if(depth<=0.0 || horizon.w<=0.0 || d.y<=0.0) return vec4(0.0,0.0,0.0,1.0);
+    float heading=floor(horizon.w/65536.0);
+    float rest=horizon.w-heading*65536.0;
+    float kindCode=floor(rest/1024.0);
+    float coverage=(rest-kindCode*1024.0)/1023.0;
+    float kind=kindCode/63.0;
+    float angle=heading*6.283185307179586/256.0;
+    vec2 along=vec2(sin(angle),cos(angle));
+    vec2 across=vec2(along.y,-along.x);
+    float fade=smoothstep(0.015,0.14,d.y);
+    float sigma=6.0/depth;
+    float span=depth/(d.y+0.1);
+    float stride=span/8.0;
+    vec2 base=vec2(d.x,d.z)/(d.y+0.1);
+    vec2 toSun=vec2(dot(sunDirection.xz,along),dot(sunDirection.xz,across));
+    float sunUp=max(sunDirection.y,0.05);
+    float mu=dot(d,sunDirection.xyz);
+    float phase=0.7*analyticSkyPhase(mu,0.6)+0.3*analyticSkyPhase(mu,-0.2);
+    vec3 irradiance=sun.rgb*(sunDirection.w*3.141592653589793*(1.0-sun.w))
+        *smoothstep(-0.05,0.05,sunDirection.y);
+    vec3 ambient=mix(horizon.rgb,zenith.rgb,0.5);
+    float white=max(max(ambient.x,ambient.y),ambient.z);
+    vec3 scattered=vec3(0.0);
+    float transmittance=1.0;
+    for(int i=0;i<8;++i) {
+        float h=(float(i)+0.5)/8.0;
+        vec2 p=base*(1.0+depth*h);
+        vec2 q=vec2(dot(p,along)-ground.w,dot(p,across));
+        float density=analyticSkyVolumeDensity(q,h,kind,coverage,depth);
+        if(density<=0.0) continue;
+        float reach=min((1.0-h)*depth/sunUp,4.0*depth);
+        float shade=0.0;
+        for(int j=0;j<2;++j) {
+            float s=(float(j)+0.5)*0.5*reach;
+            float hs=min(h+s*sunUp/depth,1.0);
+            shade+=analyticSkyVolumeDensity(q+toSun*s,hs,kind,coverage,depth);
+        }
+        float sunShadow=exp(-sigma*shade*0.5*reach);
+        float absorbed=1.0-exp(-sigma*density*stride);
+        scattered+=transmittance*absorbed*(irradiance*sunShadow*phase+vec3(white*(0.5+0.5*h)));
+        transmittance*=1.0-absorbed;
+    }
+    return vec4(scattered*fade,mix(1.0,transmittance,fade));
+}
+// The camera's view of the sky: the volumetric layer when the sky has a cloud
+// thickness, else the same field reflections read.
+vec3 analyticSkyBackground(vec3 direction, vec4 zenith, vec4 horizon,
+                           vec4 ground, vec4 sun, vec4 sunDirection) {
+    vec4 volume=analyticSkyCloudVolume(normalize(direction),zenith,horizon,ground,sun,sunDirection);
+    if(volume.a>=1.0) return analyticSkyRadiance(direction,zenith,horizon,ground,sun,sunDirection);
+    vec3 d=normalize(direction);
+    vec3 sky=mix(horizon.rgb,d.y>=0.0 ? zenith.rgb : ground.rgb,abs(d.y))+analyticSkyHalo(d,zenith,sun,sunDirection);
+    float cap=clamp((dot(d,sunDirection.xyz)-sun.w)/(1.0-sun.w),0.0,1.0);
+    return (sky+sun.rgb*sunDirection.w*cap*cap*(3.0-2.0*cap))*volume.a+volume.rgb;
 }
 // Integral Li(w)*f(w,v)*N.w dOmega. 64 GGX visible-normal importance samples
 // (p_h=D*G1(v)*v.h/N.v, p_w=p_h/(4*v.h)), plus 32 cosine diffuse samples.
@@ -262,6 +374,17 @@ inline float cloudOpacity(float dx,float dy,float dz,float horizonW,float ground
     return cloudSmoothstep(threshold,threshold+edge,value)*cloudMix(0.96f,0.7f,kind)
         *cloudSmoothstep(0.015f,0.14f,dy);
 }
+// The halo's gain on the sun colour toward unit direction d, as analyticSkyHalo.
+inline float decodedExtra(float zenithW) { return std::floor(std::max(zenithW-1,0.0f)*kExtraScale+0.5f); }
+inline float haloGlow(const std::array<float,3>& d,float zenithW,float cosRadius,const std::array<float,4>& sunDirection)
+{
+    const auto halo=std::floor(decodedExtra(zenithW)/64)/63;
+    if(halo<=0) return 0;
+    const auto g=kHaloAnisotropy;
+    const auto mu=d[0]*sunDirection[0]+d[1]*sunDirection[1]+d[2]*sunDirection[2];
+    const auto lobe=(1-g*g)/(12.566370614359172f*std::pow(std::max(1+g*g-2*g*mu,1.0e-6f),1.5f));
+    return sunDirection[3]*3.141592653589793f*(1-cosRadius)*halo*lobe*(1-0.65f*std::abs(d[1]));
+}
 inline std::array<float,3> radiance(const std::array<float,3>& direction,const Uniforms& u)
 {
     const auto length=std::sqrt(direction[0]*direction[0]+direction[1]*direction[1]+direction[2]*direction[2]);
@@ -272,14 +395,51 @@ inline std::array<float,3> radiance(const std::array<float,3>& direction,const U
         /(1-sun[3]),0.0f,1.0f);
     const auto cloud=cloudOpacity(d[0],d[1],d[2],u[1][3],u[2][3]);
     const auto white=std::max({(u[1][0]+u[0][0])/2,(u[1][1]+u[0][1])/2,(u[1][2]+u[0][2])/2});
+    const auto glow=haloGlow(d,u[0][3],sun[3],sunDirection);
     std::array<float,3> result{};
     for(int c=0;c<3;++c)
     {
         const auto clear=cloudMix(u[1][c],d[1]>=0 ? u[0][c] : u[2][c],std::abs(d[1]))
-            +sun[c]*sunDirection[3]*cap*cap*(3-2*cap);
+            +sun[c]*glow+sun[c]*sunDirection[3]*cap*cap*(3-2*cap);
         const auto lit=white+sun[c]*sunDirection[3]*(1-sun[3])*std::max(sunDirection[1],0.0f);
         result[c]=cloud<=0 ? clear : cloudMix(clear,lit*(1-0.3f*cloud*cloud),cloud);
     }
+    return result;
+}
+// The camera's view, as analyticSkyBackground: the volumetric layer when the sky
+// has a cloud thickness, else radiance().
+inline std::array<float,3> background(const std::array<float,3>& direction,const Uniforms& u)
+{
+    const auto code=decodedExtra(u[0][3]);
+    const auto thickness=(code-std::floor(code/64)*64)/63;
+    if(thickness<=0 || u[1][3]<=0) return radiance(direction,u);
+    const auto length=std::sqrt(direction[0]*direction[0]+direction[1]*direction[1]+direction[2]*direction[2]);
+    const std::array<float,3> d{direction[0]/length,direction[1]/length,direction[2]/length};
+    const auto packed=u[1][3];
+    const auto heading=std::floor(packed/65536);
+    const auto rest=packed-heading*65536;
+    const auto kindCode=std::floor(rest/1024);
+    videohelper::pathtrace::cloudvolume::Layer layer;
+    layer.coverage=(rest-kindCode*1024)/1023;
+    layer.kind=kindCode/63;
+    layer.headingRadians=heading*6.283185307179586f/256;
+    layer.drift=u[2][3];
+    layer.thickness=thickness;
+    const auto& sun=u[3];
+    const auto& sunDirection=u[4];
+    const auto irradiance=sunDirection[3]*3.141592653589793f*(1-sun[3]);
+    const auto white=std::max({(u[1][0]+u[0][0])/2,(u[1][1]+u[0][1])/2,(u[1][2]+u[0][2])/2});
+    const auto volume=videohelper::pathtrace::cloudvolume::march(layer,d[0],d[1],d[2],
+        sunDirection[0],sunDirection[1],sunDirection[2],sun[0]*irradiance,sun[1]*irradiance,sun[2]*irradiance,white);
+    if(volume.transmittance>=1) return radiance(direction,u);
+    const auto cap=std::clamp((d[0]*sunDirection[0]+d[1]*sunDirection[1]+d[2]*sunDirection[2]-sun[3])
+        /(1-sun[3]),0.0f,1.0f);
+    const auto glow=haloGlow(d,u[0][3],sun[3],sunDirection);
+    const float scattered[3]{volume.r,volume.g,volume.b};
+    std::array<float,3> result{};
+    for(int c=0;c<3;++c)
+        result[c]=(cloudMix(u[1][c],d[1]>=0 ? u[0][c] : u[2][c],std::abs(d[1]))+sun[c]*glow
+            +sun[c]*sunDirection[3]*cap*cap*(3-2*cap))*volume.transmittance+scattered[c];
     return result;
 }
 } // namespace arbitgpu::analyticsky

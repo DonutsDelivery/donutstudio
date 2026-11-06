@@ -3,6 +3,7 @@
 #include "visual_plan_executor.h"
 #include "surface_material_admission.h"
 #include "vertex_modifier_ir_admission.h"
+#include "../../shared/VertexControlBank.h"
 
 #include <algorithm>
 #include <array>
@@ -185,7 +186,14 @@ inline void seed(const videowire::CompiledVisualLayerPlan& plan,
         }
     }
     if (const auto* root = displacementRoot(plan, render))
+    {
         parameters.emplace(prefixFor(root->stableId) + kMaximumDisplacement, root->parameters[0]);
+        // Vertex Control Parameter values feed the per-frame control bank.
+        for (const auto& record : sourceMaterial(render)->vertexModifier->records)
+            if (record.operation == videowire::VertexModifierOperation::controlParameter)
+                parameters.emplace(videowire::vertexcontrol::runtimeKey(record.stableId),
+                                   record.parameterCount > 1 ? record.parameters[1] : 0.0);
+    }
 }
 
 // The last evaluation revision a clip published for a derived material. The

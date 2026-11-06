@@ -1,5 +1,7 @@
 #include <chrono>
 #include "fixture_scene_renderer.h"
+#include "render_input_generation.h"
+#include "render_mode_policy.h"
 #include "diffraction_uv_validation.h"
 #include "diffractive_foil_admission.h"
 #include "diffraction_material_execution.h"
@@ -8,12 +10,15 @@
 #include "gpu_backend/fixture_glass_caustics.h"
 #include "gpu_backend/fixture_preview_budget.h"
 #include "gpu_backend/fixture_realtime_opengl.h"
+#include "gpu_backend/realtime_gpu_timer.h"
 #if ARBIT_HAVE_METAL_BACKEND
 #include "gpu_backend/metal_glass_caustic_consumer.h"
 #elif ARBIT_HAVE_OPENGL_SDF_BACKEND
 #include "gpu_backend/fixture_glass_caustics_opengl.h"
 #endif
 #include "../../shared/VisualImportedSceneRenderOperationContract.h"
+#include "../../shared/WorldVolumeDepthFog.h"
+#include "../../shared/RasterMedium.h"
 #include "loop_step_probe.h"
 
 #include <limits>
@@ -52,6 +57,10 @@ std::optional<PathTraceFrameStats> pathTracePreviewStats;
 std::optional<PathTraceFrameStats> pathTraceExportStats;
 std::optional<RealtimeFrameStats> realtimePreviewStats;
 std::optional<RealtimeFrameStats> realtimeExportStats;
+// The viewport's last Realtime GPU times, kept for one size at a time.
+videorender::speedstats::FrameTimeWindow realtimeGpuWindow;
+std::uint32_t realtimeGpuWindowWidth = 0;
+std::uint32_t realtimeGpuWindowHeight = 0;
 // Counts the Preview reports published, so a finished render knows whether it left one.
 std::uint64_t previewStatsPublications = 0;
 
@@ -90,11 +99,21 @@ private:
     std::uint64_t publicationsAtStart_ = 0;
 };
 
-void publishRealtimeStats (const RealtimeFrameStats& stats) noexcept
+void publishRealtimeStats (const RealtimeFrameStats& published) noexcept
 {
     const std::lock_guard<std::mutex> lock (pathTraceStatsMutex);
+    auto stats = published;
     if (stats.use == RenderUse::Preview)
     {
+        if (stats.width != realtimeGpuWindowWidth || stats.height != realtimeGpuWindowHeight)
+        {
+            realtimeGpuWindow.clear();
+            realtimeGpuWindowWidth = stats.width;
+            realtimeGpuWindowHeight = stats.height;
+        }
+        if (stats.times.gpuMs.has_value())
+            realtimeGpuWindow.push (*stats.times.gpuMs);
+        stats.times.window = realtimeGpuWindow.summary();
         realtimePreviewStats = stats;
         pathTracePreviewStats.reset();
         ++previewStatsPublications;
@@ -123,12 +142,16 @@ void publishPathTraceStats (const PathTraceFrameStats& stats) noexcept
     total.renderActivity = stats.renderActivity;
     total.sampleTarget = std::max (total.sampleTarget, stats.sampleTarget);
     total.denoiser = stats.denoiser;
+    total.denoiserRequested = stats.denoiserRequested;
+    total.denoiserReason = stats.denoiserReason;
     // One layer that fell back names the fallback for the whole frame.
     if (stats.deviceReason != nullptr)
     {
         total.device = stats.device;
         total.deviceReason = stats.deviceReason;
     }
+    if (stats.fallbackReason != nullptr)
+        total.fallbackReason = stats.fallbackReason;
     total.samplesAdded += stats.samplesAdded;
     total.samplesPerPixel = std::max (total.samplesPerPixel, stats.samplesPerPixel);
     total.nonFiniteSamples += stats.nonFiniteSamples;
@@ -137,8 +160,15 @@ void publishPathTraceStats (const PathTraceFrameStats& stats) noexcept
     total.limitEndedPaths += stats.limitEndedPaths;
     total.lightPaths += stats.lightPaths;
     total.causticSplats += stats.causticSplats;
+    if (stats.deviceMemoryTotalBytes != 0)
+    {
+        total.deviceMemoryFreeBytes = stats.deviceMemoryFreeBytes;
+        total.deviceMemoryTotalBytes = stats.deviceMemoryTotalBytes;
+    }
     total.filmWidth = stats.filmWidth;
     total.filmHeight = stats.filmHeight;
+    total.phases.merge (stats.phases);
+    total.phaseSamples += stats.phaseSamples;
 }
 std::atomic<const char*> pathTraceDenoiserRan { "none" };
 
@@ -1133,8 +1163,19 @@ bool FixtureSceneRenderer::renderWithEngine (
     draw.diffractionLighting = std::move (diffractionLighting);
     draw.diffractionField = diffractionField;
     draw.denoise = engineSelection_.denoise;
+    draw.denoiser = engineSelection_.denoiser;
     draw.maxBounces = engineSelection_.maxBounces;
+    draw.maxVolumeBounces = engineSelection_.maxVolumeBounces;
+    draw.volumesVisibleToCamera = engineSelection_.volumesVisibleToCamera;
+    draw.lightPaths = engineSelection_.lightPaths;
+    draw.worldVolume = engineSelection_.worldVolume;
+    draw.motionBlur = engineSelection_.motionBlur;
     draw.transportPlaying = use == RenderUse::Preview && pathTraceTransportPlaying.load();
+    if (use == RenderUse::Preview && ! draw.transportPlaying)
+    {
+        draw.inputClip = videohelper::renderinput::activeClip();
+        draw.inputGeneration = videohelper::renderinput::current (draw.inputClip);
+    }
     RenderedFrame rendered;
     if (! pathTraceEngine_->render (draw, rendered, error))
         return false;
@@ -1370,13 +1411,39 @@ bool FixtureSceneRenderer::renderAttempt (
     pathTraceDenoiserRan.store ("none");
     // Realtime does not render caustics. The frame renders without the selection
     // and says that it needs Path Trace, so nothing past here sees a caustic.
-    const bool realtimeEngine = engineSelection_.engine == SceneEngineKind::Realtime;
-    const bool realtimeDroppedCaustic = realtimeEngine && sceneInputs.glassCaustic.has_value();
+    // Solid viewport shading is a Preview look drawn by the raster program whatever
+    // engine the clip picked. Export never carries it.
+    const bool viewportSolid = use == RenderUse::Preview && sceneInputs.viewportSolid[0] > 0.5f;
+    if (! viewportSolid)
+    {
+        sceneInputs.viewportSolid = {};
+        sceneInputs.viewportSolidEffects = {};
+    }
+    const auto engine = viewportSolid ? SceneEngineKind::Realtime : engineSelection_.engine;
+    const bool realtimeEngine = engine == SceneEngineKind::Realtime;
+    const bool realtimeDroppedCaustic = realtimeEngine && ! viewportSolid && sceneInputs.glassCaustic.has_value();
     if (realtimeEngine)
     {
         sceneInputs.glassCaustic.reset();
         sceneInputs.realtimeEngine = true;
+        // Fast drops the reflection pass from previews and exports alike.
+        sceneInputs.realtimeSkipReflections = ! realtimeReflections (engineSelection_.mode == SceneEngineMode::Fast);
     }
+    // Scene fog draws as Raster's and Realtime's volumetric world fog: a march
+    // from the camera that single scatters every light with the raster's shadow
+    // visibility (RasterMedium.h), so it casts light shafts. It replaces the
+    // Depth Fog approximation. An authored pass composite wins.
+    const bool rasterEngine = engineSelection_.engine == SceneEngineKind::Raster;
+    std::optional<rastermedium::WorldFogScope> worldFogScope;
+    if ((realtimeEngine || rasterEngine) && snapshot && ! sceneInputs.passComposite && ! sceneInputs.passProgram
+        && sceneInputs.imageOutput == renderpassoutput::Output::Color)
+    {
+        const auto fog = rastermedium::worldFogForScene (
+            *snapshot, engineSelection_.worldVolume ? &*engineSelection_.worldVolume : nullptr);
+        if (rastermedium::worldFogOn (fog))
+            worldFogScope.emplace (fog);
+    }
+    const bool worldFogProgram = rastermedium::worldFogOn (rastermedium::currentWorldFog());
     std::optional<arbitgpu::realtimeengine::Scope> realtimeScope;
     if (realtimeEngine)
         realtimeScope.emplace();
@@ -1530,7 +1597,7 @@ bool FixtureSceneRenderer::renderAttempt (
     }
 
     // Raster's shader has one isotropic slope, so it would drop this one.
-    if (engineSelection_.engine != SceneEngineKind::PathTrace && diffractionMaterial
+    if (engine != SceneEngineKind::PathTrace && ! viewportSolid && diffractionMaterial
         && diffractionMaterial->authoredRequest_
         && diffractionMaterial->authoredRequest_->material.roughness.acrossGrooveSlope > 0.0f)
     {
@@ -1540,7 +1607,7 @@ bool FixtureSceneRenderer::renderAttempt (
     // Realtime has no form of the relief yet: the frame renders without it and says so.
     const bool authoredRelief = diffractionMaterial && diffractionMaterial->authoredRequest_
         && diffractionMaterial->authoredRequest_->material.roughness.reliefRmsHeightNanometres > 0.0f;
-    if (engineSelection_.engine == SceneEngineKind::Raster && authoredRelief)
+    if (engine == SceneEngineKind::Raster && authoredRelief)
     {
         error = "Relief Height doesn't render in Raster; choose Path Trace or set it to 0";
         return false;
@@ -1606,7 +1673,7 @@ bool FixtureSceneRenderer::renderAttempt (
     }
 
     sceneInputs.timeSeconds = runtimeInputs.timeSeconds;
-    if (engineSelection_.engine == SceneEngineKind::PathTrace)
+    if (engine == SceneEngineKind::PathTrace)
     {
         // Path Trace renders glass caustics by light tracing, and a diffraction
         // material by the discrete orders of its admitted physical material
@@ -1803,7 +1870,7 @@ bool FixtureSceneRenderer::renderAttempt (
     const bool exactCacheHit = cachedSnapshot == snapshot && cache_.native != nullptr
                             && (residentFrame || ! cache_.residentRefreshed)
                             && exactMaterialHit && cache_.causticVolume == requestedVolume
-                            && cache_.realtime == realtimeEngine
+                            && cache_.realtime == realtimeEngine && cache_.worldFog == worldFogProgram
                             && cache_.cameraVolumeOnly == requestedCameraOnly;
     // Preview structural hit. A snapshot whose only change is the deformed vertex
     // data of one admitted mesh (the animated water) keeps every static resource.
@@ -1813,7 +1880,7 @@ bool FixtureSceneRenderer::renderAttempt (
     bool structuralCacheHit = false;
     if ((! exactCacheHit || refitPlanMissing) && residentFrame && cache_.native != nullptr
         && cache_.mixedSurfaces == nullptr && cache_.mixedDiffraction == nullptr
-        && cache_.realtime == realtimeEngine
+        && cache_.realtime == realtimeEngine && cache_.worldFog == worldFogProgram
         && cache_.causticVolume == requestedVolume && cache_.cameraVolumeOnly == requestedCameraOnly)
     {
         loopstep::Scope residentScope ("advance:imported-scene:fixture-resident-refresh");
@@ -1915,6 +1982,7 @@ bool FixtureSceneRenderer::renderAttempt (
         cache_.footprint = preparation.stats;
         cache_.causticVolume = requestedVolume;
         cache_.realtime = realtimeEngine;
+        cache_.worldFog = worldFogProgram;
         cache_.cameraVolumeOnly = requestedCameraOnly;
         cache_.residentRefreshed = false;
     }
@@ -1947,6 +2015,10 @@ bool FixtureSceneRenderer::renderAttempt (
         causticDegradation += visualimportedscenerender::kRealtimeReliefNeedsPathTrace;
     }
     // Encodes, submits and (for checked paths) waits on the frame's GPU work.
+    const auto submitStart = std::chrono::steady_clock::now();
+#if ! ARBIT_HAVE_METAL_BACKEND && ARBIT_HAVE_OPENGL_SDF_BACKEND && ! defined(__APPLE__)
+    const bool realtimeGpuTimed = realtimeEngine && arbitgpu::realtimeGpuTimerBegin (use != RenderUse::Preview);
+#endif
     std::optional<loopstep::Scope> submitScope;
     submitScope.emplace (sceneInputs.glassCaustic && !causticProgramsPending
                              ? "advance:imported-scene:fixture-caustic-submit"
@@ -2026,6 +2098,11 @@ bool FixtureSceneRenderer::renderAttempt (
             snapshot, cache_.native, dimensions.width, dimensions.height, baseInputs);
     }
     submitScope.reset();
+#if ! ARBIT_HAVE_METAL_BACKEND && ARBIT_HAVE_OPENGL_SDF_BACKEND && ! defined(__APPLE__)
+    if (realtimeGpuTimed)
+        arbitgpu::realtimeGpuTimerEnd();
+#endif
+    const double submitCpuMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - submitStart).count();
     {
         // The trading card resolved and leased its frame yet drew only the
         // background: the fixture's own draw count distinguishes a missing mesh
@@ -2152,8 +2229,28 @@ bool FixtureSceneRenderer::renderAttempt (
     rendered.stats.reusedMaterialProgram = nativeMaterial != nullptr && staticReuse;
     rendered.causticDegradation = std::move (causticDegradation);
     if (realtimeEngine)
-        publishRealtimeStats ({ use, engineSelection_.mode, rendered.stats.realtimeProgramApplied,
-                                realtimeDroppedCaustic, dimensions.width, dimensions.height });
+    {
+        RealtimeFrameStats realtime { use, engineSelection_.mode, rendered.stats.realtimeProgramApplied,
+                                      realtimeDroppedCaustic, sceneInputs.realtimeSkipReflections,
+                                      dimensions.width, dimensions.height,
+                                      viewportSolid, rendered.stats.viewportSolidApplied };
+        realtime.times.cpuMs = submitCpuMs;
+#if ! ARBIT_HAVE_METAL_BACKEND && ARBIT_HAVE_OPENGL_SDF_BACKEND && ! defined(__APPLE__)
+        // An export reads the frame back next, so waiting here costs it nothing extra.
+        // A Preview takes the newest earlier frame whose time is ready.
+        if (realtimeGpuTimed)
+            realtime.times.gpuMs = arbitgpu::realtimeGpuTimerResult (use != RenderUse::Preview);
+        if (! realtime.times.gpuMs.has_value())
+            realtime.times.gpuAbsent = ! realtimeGpuTimed ? "this OpenGL context has no timer queries"
+                : use == RenderUse::Preview ? "no earlier frame's GPU time is ready yet"
+                : "the GPU timer returned no time for this frame";
+#elif ARBIT_HAVE_METAL_BACKEND
+        realtime.times.gpuAbsent = "not measured on Metal yet";
+#else
+        realtime.times.gpuAbsent = "this renderer has no GPU timer";
+#endif
+        publishRealtimeStats (realtime);
+    }
     output = std::move (rendered);
     error.clear();
     return true;

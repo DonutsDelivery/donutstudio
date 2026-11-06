@@ -121,8 +121,8 @@ def main() -> int:
                 f"{backend_name} starter fixture must use generated Geometry Core and detect every dielectric control")
     require("Metal fixture preparation requires an exact bounded material binding" in backend,
             "production Metal backend must retain fail-closed material admission")
-    vertex_shader = between(backend, "const char* kFixtureVertexShader", "const char* kFixtureFragmentShader")
-    fragment_shader = between(backend, "const char* kFixtureFragmentShader", "[[maybe_unused]] const char* kDeformationComputeShader")
+    vertex_shader = between(backend, "constexpr char kFixtureVertexShader[]", "constexpr char kFixtureFragmentShader[]")
+    fragment_shader = between(backend, "constexpr char kFixtureFragmentShader[]", "[[maybe_unused]] const char* kDeformationComputeShader")
     require("float4 surfaceCoating;" in vertex_shader and "float4 surfaceCoating;" in fragment_shader
             and "u.surfaceCoating.x" in fragment_shader and "u.surfaceCoating.y" in fragment_shader
             and "u.surfaceCoating.z" in fragment_shader
@@ -133,7 +133,8 @@ def main() -> int:
             and "float3 f0 = mix(float3(dielectric), base, metallic);" in fragment_shader
             and "float visibility = 1.0f / ((nl + sqrt" in fragment_shader
             and "return (distribution * visibility * fresnel + diffuse) * nl;" in fragment_shader
-            and "u.cameraTranslation.xyz - in.worldPosition" in fragment_shader
+            and "const float3 toView = fixtureToViewer(in.worldPosition, u);" in fragment_shader
+            and "if (u.projection.x >= 0.0f) return u.cameraTranslation.xyz - world;" in fragment_shader
             and "directBase += radiance * baseSurfaceDirect" in fragment_shader
             and "float3 lighting = u.ambient.xyz;" in fragment_shader
             and "float3 directBase = float3(0.0f);" in fragment_shader

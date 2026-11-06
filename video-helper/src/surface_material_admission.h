@@ -530,8 +530,8 @@ inline bool validateEvaluationInputs(const MaterialEvaluationInputs& inputs,
         if (!std::isfinite(value) || value < 0.0f || value > 1.0f)
             return reject(error, "surface material audio input is outside [0, 1]");
 
-    if (inputs.controlCount > kMaximumControlInputs)
-        return reject(error, "surface material runtime control count exceeds the hard bound");
+    if (inputs.controlCount > inputs.controls.size())
+        return reject(error, "surface material runtime control count exceeds the supplied controls");
     for (std::size_t index = 0; index < inputs.controls.size(); ++index)
     {
         if (index < inputs.controlCount)

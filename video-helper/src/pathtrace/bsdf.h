@@ -84,6 +84,12 @@ enum class DielectricTransport : std::uint8_t
 // caller that knows them (for example from a surface material program) sets
 // them on RenderScene::materials. The defaults give the PT-A2 behaviour: a
 // closed, non-dispersive volume tinted at its surface, priority 0.
+enum class VolumeDensityField : std::uint8_t
+{
+    Uniform = 0,
+    Noise = 1
+};
+
 struct Material
 {
     Vec3 baseColor { 1.0f, 1.0f, 1.0f };
@@ -112,6 +118,30 @@ struct Material
     // Beer-Lambert absorption inside the medium instead, with the base colour
     // as the fraction of light left after this distance in scene units.
     float absorptionDistance = 0.0f;
+    // Participating medium inside the closed surface (Principled Volume), used
+    // whenever the path is inside this material's medium: the medium stack's
+    // owner, or the scene's world volume. Density 0 has none, and nothing
+    // below changes the render then.
+    float volumeDensity = 0.0f;
+    // Scattering colour: sigma_s = density * colour. Absorption is
+    // density * (1 - colour) * (1 - absorption colour), as Cycles' Principled
+    // Volume without its square root.
+    Vec3 volumeColor { 0.5f, 0.5f, 0.5f };
+    Vec3 volumeAbsorptionColor {};
+    float volumeAnisotropy = 0.0f;  // Henyey-Greenstein g, -1 back to 1 forward
+    // Emitted radiance per scene unit of path length, colour times strength.
+    Vec3 volumeEmission {};
+    // Density field. Uniform is homogeneous. Noise multiplies every volume
+    // coefficient by fBm value noise in [0, 1] at the world position, scaled
+    // by volumeFieldScale features per scene unit and moved by
+    // volumeFieldOffset, with volumeFieldDetail octaves.
+    VolumeDensityField volumeField = VolumeDensityField::Uniform;
+    std::uint8_t volumeFieldDetail = 3;
+    float volumeFieldScale = 1.0f;
+    Vec3 volumeFieldOffset {};
+    // The surface has no BSDF: only the volume inside it renders, and rays
+    // cross the surface as if it were not there (Cycles' volume-only shader).
+    bool volumeOnly = false;
 };
 
 // Fraction of light the surface stops: 1 opaque, 0 fully cut out. Opaque mode
@@ -134,11 +164,47 @@ PT_SHARED_ENTRY float materialIorAt (const Material& material, float nm, bool sp
 // Beer-Lambert absorption coefficient per scene unit for each channel, 0
 // when the material does not absorb by distance.
 PT_SHARED_ENTRY Spectrum mediumAbsorption (const Material& material, const Wavelengths& wavelengths) noexcept;
+// True when the material holds a participating medium (volumeDensity > 0).
+PT_SHARED_ENTRY bool materialHasVolume (const Material& material) noexcept;
+// The volume's coefficients per channel at full field density, per scene
+// unit: absorption, scattering and emitted radiance. All 0 without a volume.
+PT_SHARED_ENTRY void volumeCoefficients (const Material& material, const Wavelengths& wavelengths, Spectrum& absorption,
+                                         Spectrum& scattering, Spectrum& emission) noexcept;
 // Fraction of light a thin sheet passes straight through at |cos| = cosine,
 // excluding alpha coverage. etaD is the sheet's index over the surrounding
 // index at the d line. 0 for anything that is not a thin sheet.
 PT_SHARED_ENTRY Spectrum straightTransmittance (const Material& material, float cosine, float etaD,
                                 const Wavelengths& wavelengths) noexcept;
+
+#if defined(PATHTRACE_DEVICE_METAL)
+// The scene's materials sit in device memory, which Metal does not bind to the
+// thread references above: these read a scene material through a copy.
+PT_SHARED_FN Material materialCopy (const device Material& material) noexcept { return material; }
+PT_SHARED_FN float materialCoverage (const device Material& m) noexcept { return materialCoverage (materialCopy (m)); }
+PT_SHARED_FN float dielectricWeight (const device Material& m) noexcept { return dielectricWeight (materialCopy (m)); }
+PT_SHARED_FN bool isMediumBoundary (const device Material& m) noexcept { return isMediumBoundary (materialCopy (m)); }
+PT_SHARED_FN bool isThinSheet (const device Material& m) noexcept { return isThinSheet (materialCopy (m)); }
+PT_SHARED_FN float materialCauchyB (const device Material& m) noexcept { return materialCauchyB (materialCopy (m)); }
+PT_SHARED_FN bool materialDispersive (const device Material& m) noexcept { return materialDispersive (materialCopy (m)); }
+PT_SHARED_FN float materialIorAt (const device Material& m, float nm, bool spectral) noexcept
+{
+    return materialIorAt (materialCopy (m), nm, spectral);
+}
+PT_SHARED_FN Spectrum mediumAbsorption (const device Material& m, thread const Wavelengths& wavelengths) noexcept
+{
+    return mediumAbsorption (materialCopy (m), wavelengths);
+}
+PT_SHARED_FN bool materialHasVolume (const device Material& m) noexcept { return materialHasVolume (materialCopy (m)); }
+PT_SHARED_FN void volumeCoefficients (const device Material& m, thread const Wavelengths& wavelengths, thread Spectrum& absorption,
+                                thread Spectrum& scattering, thread Spectrum& emission) noexcept
+{
+    volumeCoefficients (materialCopy (m), wavelengths, absorption, scattering, emission);
+}
+PT_SHARED_FN Spectrum straightTransmittance (const device Material& m, float cosine, float etaD, thread const Wavelengths& wavelengths) noexcept
+{
+    return straightTransmittance (materialCopy (m), cosine, etaD, wavelengths);
+}
+#endif
 
 enum BsdfFlags : std::uint32_t
 {
@@ -280,16 +346,42 @@ public:
     // wavelength only before this BSDF is evaluated or sampled.
     PT_SHARED_FN bool requiresHeroWavelength() const noexcept { return heroOnly_; }
     PT_SHARED_FN void requireHeroWavelength() noexcept { heroOnly_ = true; }
+    // The Render node's caustic switches after a diffuse bounce, as Cycles
+    // filters closures: glossyReflection drops the GGX reflection lobes,
+    // refraction the dielectric lobes (reflection and refraction alike, as
+    // Cycles' glass closure goes with refraction). The rest are re-weighted.
+    PT_SHARED_FN void dropCausticLobes (bool glossyReflection, bool refraction) noexcept
+    {
+        int kept = 0;
+        for (int i = 0; i < count_; ++i)
+        {
+            const LobeKind kind = lobes_[static_cast<std::size_t> (i)].kind;
+            const bool drop = (glossyReflection && kind == LobeKind::GgxReflection)
+                           || (refraction && (kind == LobeKind::SmoothDielectric || kind == LobeKind::RoughDielectric));
+            if (! drop)
+                lobes_[static_cast<std::size_t> (kept++)] = lobes_[static_cast<std::size_t> (i)];
+        }
+        if (kept == count_)
+            return;
+        count_ = kept;
+        finalize();
+    }
 
     // World-space directions, both pointing away from the surface. Delta
     // lobes contribute nothing. A direction on the wrong side of the
     // geometric normal for its lobe type (reflection below, refraction above)
     // evaluates to zero.
     PT_SHARED_ENTRY BasicBsdfEval<Color> eval (Vec3 wo, Vec3 wi) const noexcept;
+    // As eval, with value summed only over the lobes a light with ray visibility
+    // rayKinds (HarmonicMIDI::grid::sceneRayVisibility bits) reaches: Lambert is
+    // diffuse, GGX reflection glossy, and a dielectric or sheet lobe glossy on
+    // the reflected side and transmission on the far side. pdf stays the whole
+    // BSDF's, which BSDF sampling draws from.
+    PT_SHARED_ENTRY BasicBsdfEval<Color> eval (Vec3 wo, Vec3 wi, std::uint8_t rayKinds) const noexcept;
     PT_SHARED_ENTRY bool sample (Vec3 wo, float uLobe, Vec2 uDirection, BasicBsdfSample<Color>& out) const noexcept;
 
 private:
-    PT_SHARED_ENTRY BasicBsdfEval<Color> evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept;
+    PT_SHARED_ENTRY BasicBsdfEval<Color> evalLocal (Vec3 woLocal, Vec3 wiLocal, std::uint8_t rayKinds = 0x3fu) const noexcept;
 
     Frame frame_ {};
     Vec3 geometricNormal_ { 0.0f, 0.0f, 1.0f };
@@ -305,6 +397,22 @@ extern template class BasicBsdf<Spectrum>;
 
 using Bsdf = BasicBsdf<Vec3>;
 using SpectralBsdf = BasicBsdf<Spectrum>;
+
+// Filter Glossy, as Cycles' blur_glossy. minPdf is the smallest sampling
+// density of the non-delta bounces the path took (infinite before the first),
+// filterGlossy the Render node's value (0 off). With blurPdf = minPdf /
+// filterGlossy under 1, a lobe is at least as rough as GGX alpha
+// sqrt(1 - blurPdf) / 2. Returns the perceptual roughness to shade with.
+PT_SHARED_FN float filteredGlossRoughness (float roughness, float filterGlossy, float minPdf) noexcept
+{
+    if (! (filterGlossy > 0.0f) || ! std::isfinite (filterGlossy) || ! std::isfinite (minPdf) || ! (minPdf >= 0.0f))
+        return roughness;
+    const float blurPdf = minPdf / filterGlossy;
+    if (! (blurPdf < 1.0f))
+        return roughness;
+    const float alpha = std::sqrt (1.0f - blurPdf) * 0.5f;
+    return std::max (roughness, std::sqrt (alpha));
+}
 
 // Indices across a dielectric boundary, worked out by the caller from the
 // media on both sides.

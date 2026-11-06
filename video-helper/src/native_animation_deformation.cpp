@@ -403,6 +403,8 @@ static bool prepareOriginalNativeDeformationFrame (
         }
     candidate.vertexCount = static_cast<std::uint32_t> (mesh->vertexCount());
     candidate.morphTargetCount = static_cast<std::uint32_t> (mesh->morphTargets().size());
+    candidate.morphWeights.assign (std::max<std::size_t> (1, mesh->morphTargets().size()), 0.0f);
+    candidate.jointPalette.assign (16, 0.0f);
     const auto skinId = source.skin.value_or(mesh->skin());
     auto pose = snapshot.pose();
     if (source.batchMember && (pose.meshStableId != mesh->id().value
@@ -445,6 +447,7 @@ static bool prepareOriginalNativeDeformationFrame (
             return false;
         }
         candidate.jointCount = static_cast<std::uint32_t> (skin->joints().size());
+        candidate.jointPalette.assign (skin->joints().size() * 16u, 0.0f);
     }
     else if (! source.jointBaseTransforms.empty() || ! mesh->jointWeightSets().empty())
     {
@@ -751,7 +754,7 @@ bool sameMaterial(const HarmonicMIDI::grid::Visual3DScene& a,
         && am->opacity==bm->opacity && am->metallic==bm->metallic && am->roughness==bm->roughness
         && am->normalScale==bm->normalScale && am->occlusionStrength==bm->occlusionStrength
         && am->alphaMode==bm->alphaMode && am->alphaCutoff==bm->alphaCutoff
-        && am->doubleSided==bm->doubleSided;
+        && am->doubleSided==bm->doubleSided && HarmonicMIDI::grid::sameSceneVolume(am->volume,bm->volume);
 }
 
 bool sameBase(const NativeDeformationJointBaseTransform& a, const NativeDeformationJointBaseTransform& b) noexcept
@@ -1062,7 +1065,7 @@ std::shared_ptr<const NativeDeformationCompositionOwner> NativeDeformationCompos
                 || (leaf.selectedMesh!=0 && draw->mesh.value!=leaf.selectedMesh)
                 || draw->deformation!=source->deformation || draw->animationNodeStableId!=rawNode[i]
                 || !mesh || mesh->vertexCount()!=object->vertexCount || mesh->jointWeightSets().size()>1
-                || mesh->morphTargets().size()>kNativeDeformationMaxMorphTargets || draw->jointBaseTransforms.size()>64)
+                || mesh->morphTargets().size()>kNativeDeformationMaxMorphTargets || draw->jointBaseTransforms.size()>kNativeDeformationMaxJoints)
                 return refuse("native composition imported member loses deformation identity");
             const auto skinId=draw->skin.value_or(mesh->skin());
             const auto* skin=skinId.isValid()?draw->deformation->findSkin(skinId):nullptr;

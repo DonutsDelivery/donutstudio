@@ -1,7 +1,10 @@
 #include "fixture_analytic_sky.h"
+#include "fixture_depth_range.h"
 #include "fixture_environment_image.h"
+#include "lens_shutter_pass.h"
 #include "gpu_residency_ledger.h"
 #include "backend.h"
+#include "cpu_scene_frame.h"
 #include "fixture_vertex_modifier_shader.h"
 #include "fixture_texture_upload.h"
 #include "fixture_opaque_visibility.h"
@@ -9,7 +12,13 @@
 #include "fixture_glass_overdraw_probe.h"
 #include "fixture_glass_caustics_opengl.h"
 #include "fixture_preview_budget.h"
+#include "fixture_viewport_solid.h"
 #include "fixture_realtime_opengl.h"
+#include "realtime_diffraction_emitters.h"
+#include "realtime_diffraction_efficiency_table.h"
+#include "realtime_diffraction_gather.h"
+#include "realtime_diffraction_mirror.h"
+#include "../../../shared/RasterMedium.h"
 #include "fixture_rough_glass_tiles_opengl.h"
 #include "fixture_rough_lane_slices.h"
 #include "fixture_diffraction_transport.h"
@@ -24,6 +33,8 @@
 #include "../sdf_native_render_admission.h"
 #include "../optical_flow_native_executor.h"
 #include "../loop_step_probe.h"
+#include "grating_submission_clock.h"
+#include "realtime_gpu_timer.h"
 
 #include <GLFW/glfw3.h>
 
@@ -66,6 +77,167 @@ bool deformationMotionProbeEnabled()
         return value != nullptr && std::strcmp(value, "1") == 0;
     }();
     return enabled;
+}
+
+bool causticContextIntact(std::string& error);
+std::string causticGlErrorName(unsigned code);
+
+// GPU time per submission of a grating frame. A timestamp at each flush closes the
+// span that submission ran, so a frame names any submission near the driver's context
+// switch timeout, about 2 s, past which NVIDIA kills the channel (Xid 109).
+thread_local std::vector<GratingSubmissionSpan> lastGratingSpans;
+class GratingSubmissionClock
+{
+public:
+    using Span = GratingSubmissionSpan;
+    explicit GratingSubmissionClock(bool enabled)
+    {
+        if (!enabled) return;
+        counter = reinterpret_cast<PFNGLQUERYCOUNTERPROC>(glfwGetProcAddress("glQueryCounter"));
+        result = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VPROC>(glfwGetProcAddress("glGetQueryObjectui64v"));
+        generate = reinterpret_cast<PFNGLGENQUERIESPROC>(glfwGetProcAddress("glGenQueries"));
+        remove = reinterpret_cast<PFNGLDELETEQUERIESPROC>(glfwGetProcAddress("glDeleteQueries"));
+        if (!(counter && result && generate && remove)) counter = nullptr;
+        mark("start");
+    }
+    ~GratingSubmissionClock()
+    {
+        if (!queries.empty()) remove(static_cast<GLsizei>(queries.size()), queries.data());
+    }
+    GratingSubmissionClock(const GratingSubmissionClock&) = delete;
+    GratingSubmissionClock& operator=(const GratingSubmissionClock&) = delete;
+    // Closes the span since the last mark under this name. Call before each flush.
+    void mark(std::string name)
+    {
+        if (!counter) return;
+        GLuint query = 0;
+        generate(1, &query);
+        if (query == 0) return;
+        counter(query, GL_TIMESTAMP);
+        queries.push_back(query);
+        names.push_back(std::move(name));
+        if (probe() && queries.size() > 1)
+        {
+            // Probe: each submission finishes before the next, so a context lost
+            // mid-frame leaves the log naming every span that completed before it.
+            glFinish();
+            GLuint64 begin = 0, end = 0;
+            result(queries[queries.size() - 2], GL_QUERY_RESULT, &begin);
+            result(queries.back(), GL_QUERY_RESULT, &end);
+            std::fprintf(stderr, "[gl] grating submission %s %.2f ms\n", names.back().c_str(),
+                         end >= begin ? double(end - begin) * 1e-6 : 0.0);
+        }
+    }
+    // ARBIT_GL_SUBMISSION_PROBE=1 finishes and logs every submission as it ends.
+    static bool probe()
+    {
+        static const bool enabled = [] {
+            const char* value = std::getenv("ARBIT_GL_SUBMISSION_PROBE");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        return enabled;
+    }
+    // After the frame finished: each span in submission order.
+    std::vector<Span> spans() const
+    {
+        std::vector<Span> out;
+        GLuint64 previous = 0;
+        for (std::size_t i = 0; i < queries.size(); ++i)
+        {
+            GLuint64 stamp = 0;
+            result(queries[i], GL_QUERY_RESULT, &stamp);
+            if (i != 0) out.push_back({names[i], stamp >= previous ? double(stamp - previous) * 1e-6 : 0.0});
+            previous = stamp;
+        }
+        return out;
+    }
+private:
+    PFNGLQUERYCOUNTERPROC counter = nullptr;
+    PFNGLGETQUERYOBJECTUI64VPROC result = nullptr;
+    PFNGLGENQUERIESPROC generate = nullptr;
+    PFNGLDELETEQUERIESPROC remove = nullptr;
+    std::vector<GLuint> queries;
+    std::vector<std::string> names;
+};
+
+// The Realtime frame timer (realtime_gpu_timer.h): the GL_TIMESTAMP counters above.
+// The span is the GPU clock from reaching the first counter to reaching the second,
+// so GPU idle while the host still submits counts too. A Preview uses one pair per
+// frame from a ring of four per thread. A new current context, or one whose names
+// are no longer queries (a window recreated at the same address), starts a new
+// ring; the old context keeps its names. An Export renders in a context made for
+// the frame, so it times with a pair of its own that it deletes after reading.
+struct RealtimeGpuTimerRing
+{
+    static constexpr int kPairs = 4;
+    GLFWwindow* context = nullptr;
+    PFNGLQUERYCOUNTERPROC counter = nullptr;
+    PFNGLGETQUERYOBJECTUI64VPROC result = nullptr;
+    PFNGLGETQUERYOBJECTIVPROC available = nullptr;
+    GLuint queries[kPairs][2] {};
+    bool pending[kPairs] {};  // closed and not read yet
+    int open = -1;
+    int next = 0;
+    int lastClosed = -1;
+    bool ready = false;
+    // The Export pair: generated at begin, deleted once read.
+    GLuint blocking[2] {};
+    bool blockingOpen = false;
+    bool blockingClosed = false;
+};
+thread_local RealtimeGpuTimerRing realtimeGpuTimerRing;
+
+bool bindRealtimeGpuTimer(RealtimeGpuTimerRing& ring)
+{
+    GLFWwindow* context = glfwGetCurrentContext();
+    if (context == nullptr) return false;
+    if (ring.context == context && ring.ready && ring.lastClosed >= 0)
+    {
+        const auto isQuery = reinterpret_cast<PFNGLISQUERYPROC>(glfwGetProcAddress("glIsQuery"));
+        if (isQuery == nullptr || isQuery(ring.queries[0][0]) == GL_TRUE) return true;
+    }
+    else if (ring.context == context) return ring.ready;
+    ring = {};
+    ring.context = context;
+    ring.counter = reinterpret_cast<PFNGLQUERYCOUNTERPROC>(glfwGetProcAddress("glQueryCounter"));
+    ring.result = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VPROC>(glfwGetProcAddress("glGetQueryObjectui64v"));
+    ring.available = reinterpret_cast<PFNGLGETQUERYOBJECTIVPROC>(glfwGetProcAddress("glGetQueryObjectiv"));
+    const auto generate = reinterpret_cast<PFNGLGENQUERIESPROC>(glfwGetProcAddress("glGenQueries"));
+    if (!(ring.counter && ring.result && ring.available && generate)) return false;
+    generate(RealtimeGpuTimerRing::kPairs * 2, &ring.queries[0][0]);
+    ring.ready = ring.queries[0][0] != 0;
+    return ring.ready;
+}
+
+double realtimeGpuSpanMs(const RealtimeGpuTimerRing& ring, int pair)
+{
+    GLuint64 begin = 0, end = 0;
+    ring.result(ring.queries[pair][0], GL_QUERY_RESULT, &begin);
+    ring.result(ring.queries[pair][1], GL_QUERY_RESULT, &end);
+    return end >= begin ? double(end - begin) * 1e-6 : 0.0;
+}
+
+// ARBIT_GL_REALTIME_ABLATE=GATHER,SKY,... removes those Realtime grating loops from the
+// fixture program, one #define REALTIME_ABLATE_<NAME> each, so a probe run can time the
+// frame without them. A diagnostic only: the names are letters, and the frame it draws
+// is not the scene's.
+std::string realtimeAblationDefines()
+{
+    static const std::string defines = [] {
+        std::string out;
+        const char* value = std::getenv("ARBIT_GL_REALTIME_ABLATE");
+        std::string name;
+        for (const char* c = value ? value : ""; ; ++c)
+        {
+            if (*c >= 'A' && *c <= 'Z') { name += *c; continue; }
+            if (! name.empty()) out += "#define REALTIME_ABLATE_" + name + " 1\n";
+            name.clear();
+            if (*c == '\0') break;
+        }
+        if (! out.empty()) std::fprintf(stderr, "[gl] realtime ablation: %s\n", value);
+        return out;
+    }();
+    return defines;
 }
 
 // Batch member index for the probe. The recursive member render receives no index.
@@ -811,22 +983,21 @@ public:
                 ? compiledProgram->storageBytes() : 0;
             for (const auto bytes : { request.geometryCacheBytes, uncachedProgramBytes,
                     backendProgramBytes, uniformBytes, attachmentBytes, nativeTextBytes })
-                if (! renderpassoutput::detail::checkedAdd (admittedTextBytes, bytes, admittedTextBytes)
-                    || admittedTextBytes > renderpassoutput::kMaximumTotalBytes)
+                if (! renderpassoutput::detail::checkedAdd (admittedTextBytes, bytes, admittedTextBytes))
                 {
-                    result.error = "OpenGL native SDF text aggregate exceeds resource capacity";
+                    result.error = "OpenGL native SDF text aggregate overflows 64 bits";
                     return result;
                 }
         }
 
         // Upload tables one at a time. The host staging vector is transient,
-        // but its peak overlaps every retained allocation and must fit too.
+        // but its peak overlaps every retained allocation. Each table meets the
+        // device texture limit and GL_OUT_OF_MEMORY where it is uploaded.
         std::uint64_t peakTextBytes = admittedTextBytes;
         if (hasText
-            && (! renderpassoutput::detail::checkedAdd (peakTextBytes, uploadStagingBytes, peakTextBytes)
-                || peakTextBytes > renderpassoutput::kMaximumTotalBytes))
+            && ! renderpassoutput::detail::checkedAdd (peakTextBytes, uploadStagingBytes, peakTextBytes))
         {
-            result.error = "OpenGL native SDF text upload exceeds aggregate resource capacity";
+            result.error = "OpenGL native SDF text upload total overflows 64 bits";
             return result;
         }
 
@@ -1374,6 +1545,13 @@ void main() {
     vec3 camera=rotateQ(iq,world-uCameraTranslation);
     float distance=-camera.z;
     vDepth=distance;
+    // uProjection.x below zero is an orthographic camera, minus half the view height.
+    if (uProjection.x < 0.0) {
+        float halfHeight=-uProjection.x;
+        gl_Position=vec4(camera.x/(halfHeight*uProjection.y),camera.y/halfHeight,
+            2.0*(distance-uProjection.z)/(uProjection.w-uProjection.z)-1.0,1.0);
+        return;
+    }
     gl_Position=vec4(camera.x/(uProjection.x*uProjection.y),camera.y/uProjection.x,
         distance*uProjection.w/(uProjection.w-uProjection.z)
           -uProjection.z*uProjection.w/(uProjection.w-uProjection.z),distance);
@@ -1808,7 +1986,8 @@ void main(){ vec3 n=normalize(texture(uSource,vUv).xyz); outColor=vec4(n*0.5+0.5
         set4 ("uCameraRotation", camera.transform.rotation);
         set3 ("uCameraTranslation", camera.transform.translation);
         gl.Uniform4f (gl.GetUniformLocation (program, "uProjection"),
-                      std::tan (camera.verticalFovRadians * 0.5f),
+                      camera.orthographic() ? -0.5f * camera.orthographicHeight
+                                            : std::tan (camera.verticalFovRadians * 0.5f),
                       static_cast<float> (payload.extent.width) / payload.extent.height,
                       camera.nearPlane, camera.farPlane);
         { float emission[3]{material.emissive.x,material.emissive.y,material.emissive.z};
@@ -1922,8 +2101,7 @@ void main() {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     vec2 motion = texelFetch(uField, pixel, 0).rg * uScale;
     vec4 sum = vec4(0.0);
-    for (int i = 0; i < 64; ++i) {
-        if (i >= uSamples) break;
+    for (int i = 0; i < uSamples; ++i) {
         float position = uSamples == 1 ? 0.0 : float(i) / float(uSamples - 1) - 0.5;
         vec2 uv = clamp((vec2(pixel) + vec2(0.5) + motion * position) / uExtent,
                         vec2(0.0), vec2(1.0));
@@ -2602,10 +2780,14 @@ layout(location=5) in vec4 aInstanceMatrix0;
 layout(location=6) in vec4 aInstanceMatrix1;
 layout(location=7) in vec4 aInstanceMatrix2;
 layout(location=8) in vec4 aInstanceMatrix3;
-layout(location=9) in vec4 aInstanceIdentityColor;
-layout(location=10) in vec4 aInstanceColor;
-layout(location=11) in vec4 aInstanceEmission;
+layout(location=9) in vec4 aInstancePrevious0;
+layout(location=10) in vec4 aInstancePrevious1;
+layout(location=11) in vec4 aInstancePrevious2;
 layout(location=12) in vec3 aPreviousPosition;
+layout(location=13) in vec2 aRoughness;
+layout(location=14) in vec4 aInstanceColor;
+layout(location=15) in vec4 aInstanceEmissionIdentity;
+uniform mat4 uPreviousObjectMatrix;
 uniform int uUsePreviousDeformation;
 uniform int uNoteMotion;
 uniform sampler2D uPreviousNoteTransforms;
@@ -2622,6 +2804,9 @@ uniform int uDiffractionInstanceCount;
 uniform vec4 uCameraRotation;
 uniform vec3 uCameraTranslation;
 uniform vec4 uProjection;
+// Clip depth spans this camera distance range, fitted to the scene's bounds
+// inside the authored planes. Unset (y <= x) uses the authored planes.
+uniform vec2 uClipDepthRange;
 uniform vec4 uBaseColor;
 uniform vec4 uMotionRotation;
 uniform vec4 uMotionTranslationScale;
@@ -2636,9 +2821,11 @@ uniform vec4 uVertexTime;
 uniform vec4 uVertexSpectrum[16];
 uniform vec4 uPreviousVertexSpectrum[16];
 uniform vec4 uVertexDisplacementLimits[16];
+uniform sampler2D uVertexWaves;
+uniform sampler2D uVertexControls;
 uniform vec3 uEmissive;
 uniform vec3 uAmbient;
-uniform vec4 uNoteInstanceTransforms[128];
+uniform sampler2D uNoteInstanceTransforms;
 uniform int uNoteInstanceIndex;
 uniform float uNoteMeshScale;
 uniform vec4 uNoteAppearanceLow;
@@ -2663,7 +2850,9 @@ void main() {
     if (uSkyBackground>0.5) {
         vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2)*2.0-1.0;
         gl_Position=vec4(p,0.0,1.0);
-        vWorldPosition=rotateQ(uCameraRotation,vec3(p.x*uProjection.x*uProjection.y,p.y*uProjection.x,-1.0));
+        // An orthographic camera (uProjection.x < 0) looks along one direction everywhere.
+        vWorldPosition=rotateQ(uCameraRotation,uProjection.x<0.0 ? vec3(0.0,0.0,-1.0)
+            : vec3(p.x*uProjection.x*uProjection.y,p.y*uProjection.x,-1.0));
         return;
     }
     vDiffractionInstance = uint(uRawObjectIndex * uDiffractionInstanceCount + gl_InstanceID);
@@ -2675,16 +2864,23 @@ void main() {
         ? mat4(aInstanceMatrix0, aInstanceMatrix1,
                aInstanceMatrix2, aInstanceMatrix3)
         : uObjectMatrix;
-    // Mode 2 has no per-instance appearance. Its identity, color and emission
-    // vectors carry the instance's prior world matrix for Motion.
-    mat4 previousObjectMatrix = uUseInstanceMatrix == 2
-        ? mat4(vec4(aInstanceIdentityColor.xyz, 0.0),
-               vec4(aInstanceIdentityColor.w, aInstanceColor.xy, 0.0),
-               vec4(aInstanceColor.zw, aInstanceEmission.x, 0.0),
-               vec4(aInstanceEmission.yzw, 1.0))
-        : objectMatrix;
+    // Motion's prior model matrix: per instance from attributes 9 to 11 in
+    // modes 1 and 2, else the draw's uniform. A uniform the draw never set
+    // reads zero and repeats the current matrix.
+    mat4 previousObjectMatrix = uUseInstanceMatrix != 0
+        ? mat4(vec4(aInstancePrevious0.xyz, 0.0),
+               vec4(aInstancePrevious0.w, aInstancePrevious1.xy, 0.0),
+               vec4(aInstancePrevious1.zw, aInstancePrevious2.x, 0.0),
+               vec4(aInstancePrevious2.yzw, 1.0))
+        : uPreviousObjectMatrix[3][3] == 1.0 ? uPreviousObjectMatrix : objectMatrix;
+    // Mode 1 appearance: color, emission and, in w, the diagnostic identity
+    // color's 24-bit slot, or -1 without one.
+    vec4 instanceIdentityColor = aInstanceEmissionIdentity.w >= 0.0
+        ? vec4(vec3((uvec3(uint(aInstanceEmissionIdentity.w)) >> uvec3(16u, 8u, 0u)) & uvec3(255u)) / 255.0, 1.0)
+        : vec4(0.0);
     int noteIndex = uNoteInstanceIndex >= 0 ? uNoteInstanceIndex : gl_InstanceID;
-    vec4 noteInstance = uNoteInstanceTransforms[noteIndex];
+    // One texel per note, 1024 wide, sized from the Block C frame.
+    vec4 noteInstance = texelFetch(uNoteInstanceTransforms, ivec2(noteIndex % 1024, noteIndex / 1024), 0);
     vNoteAppearance = mix(uNoteAppearanceLow, uNoteAppearanceHigh, noteInstance.w);
     // ARBIT_VERTEX_MODIFIER
     vec3 world = (objectMatrix
@@ -2693,17 +2889,25 @@ void main() {
     vec4 inverseCamera = vec4(-uCameraRotation.xyz, uCameraRotation.w);
     vec3 camera = rotateQ(inverseCamera, world - uCameraTranslation);
     float distance = -camera.z;
-    gl_Position = vec4(camera.x / (uProjection.x * uProjection.y),
-                       camera.y / uProjection.x,
-                       distance * (uProjection.w + uProjection.z)
-                                   / (uProjection.w - uProjection.z)
-                           - 2.0 * uProjection.z * uProjection.w
-                               / (uProjection.w - uProjection.z),
-                       distance);
+    vec2 depthRange = uClipDepthRange.y > uClipDepthRange.x ? uClipDepthRange : uProjection.zw;
+    if (uProjection.x < 0.0) {
+        // Orthographic: uProjection.x is minus half the view height in world units.
+        float halfHeight = -uProjection.x;
+        gl_Position = vec4(camera.x / (halfHeight * uProjection.y), camera.y / halfHeight,
+                           2.0 * (distance - depthRange.x) / (depthRange.y - depthRange.x) - 1.0, 1.0);
+    } else {
+        gl_Position = vec4(camera.x / (uProjection.x * uProjection.y),
+                           camera.y / uProjection.x,
+                           distance * (depthRange.y + depthRange.x)
+                                       / (depthRange.y - depthRange.x)
+                               - 2.0 * depthRange.x * depthRange.y
+                                   / (depthRange.y - depthRange.x),
+                           distance);
+    }
     float metallic = uMaterialParams.x;
     vMotionCurrentClip = gl_Position;
     vec4 previousNote = uNoteMotion != 0
-        ? texelFetch(uPreviousNoteTransforms,ivec2(noteIndex,0),0)
+        ? texelFetch(uPreviousNoteTransforms,ivec2(noteIndex % 1024,noteIndex / 1024),0)
         : vec4(noteInstance.xyz,uNoteMeshScale);
     // The modifier block starts the prior pose at aPreviousPosition when a
     // prior deformation exists and applies any vertex program to it.
@@ -2715,10 +2919,15 @@ void main() {
         previousWorld - uPreviousCameraTranslation.xyz);
     vMotionPreviousClip = uPreviousProjection.w > 0.5 && previousNote.w > 0.0
         && -previousCamera.z > uPreviousProjection.z
-        ? vec4(previousCamera.x / (uPreviousProjection.x * uPreviousProjection.y),
-               previousCamera.y / uPreviousProjection.x, 0.0, -previousCamera.z)
+        ? (uPreviousProjection.x < 0.0
+            ? vec4(previousCamera.x / (-uPreviousProjection.x * uPreviousProjection.y),
+                   previousCamera.y / -uPreviousProjection.x, 0.0, 1.0)
+            : vec4(previousCamera.x / (uPreviousProjection.x * uPreviousProjection.y),
+                   previousCamera.y / uPreviousProjection.x, 0.0, -previousCamera.z))
         : vMotionCurrentClip;
-    float roughness = uMaterialParams.y;
+    // The vertex roughness lane blends in by its weight. A disabled
+    // attribute reads (0, 0), which keeps the material's roughness.
+    float roughness = mix(uMaterialParams.y, aRoughness.x, clamp(aRoughness.y, 0.0, 1.0));
     vec3 resolvedBaseColor = uMaterialParams.w > 0.5
         ? mix(uBaseColor.xyz, uTimeMixEndColorAndTime.xyz,
               clamp(uTimeMixEndColorAndTime.w, 0.0, 1.0))
@@ -2726,12 +2935,12 @@ void main() {
     vUv = aUv;
     vBaseColor = resolvedBaseColor * aColor.rgb
         * (uUseInstanceMatrix == 1
-            ? mix(vec3(1.0), aInstanceIdentityColor.rgb,
-                  step(0.5, aInstanceIdentityColor.a))
+            ? mix(vec3(1.0), instanceIdentityColor.rgb,
+                  step(0.5, instanceIdentityColor.a))
             : vec3(1.0));
     if (uUseInstanceMatrix == 1) vBaseColor *= aInstanceColor.rgb;
     vLitBase = vBaseColor * uAmbient;
-    vEmissive = uEmissive + (uUseInstanceMatrix == 1 ? aInstanceEmission.rgb : vec3(0.0));
+    vEmissive = uEmissive + (uUseInstanceMatrix == 1 ? aInstanceEmissionIdentity.rgb : vec3(0.0));
     vWorldPosition = world;
     vWorldNormal = worldNormal;
     vWorldTangent = normalize(mat3(objectMatrix) * aTangent.xyz);
@@ -2742,7 +2951,7 @@ void main() {
         / max(uProjection.w - uProjection.z, 0.000001), 0.0, 1.0);
     vOpacity = uBaseColor.w * aColor.a * (uUseInstanceMatrix == 1 ? aInstanceColor.a : 1.0);
     vInstanceIdentityColor = uUseInstanceMatrix == 1
-        ? aInstanceIdentityColor : vec4(0.0);
+        ? instanceIdentityColor : vec4(0.0);
 }
 )glsl";
 
@@ -2779,6 +2988,12 @@ uniform vec4 uTexturePresence;
 uniform float uEmissiveTexturePresence;
 uniform vec2 uAlphaModeCutoff;
 uniform vec4 uImageOutput;
+// Preview-only solid viewport shading (NativeImportedSceneRuntimeInputs::viewportSolid).
+uniform vec4 uViewportSolid;
+uniform vec4 uViewportSolidEffects;
+uniform vec4 uCameraRotation;
+// x below zero is an orthographic camera (minus half the view height).
+uniform vec4 uProjection;
 uniform sampler2D uSelectedRoughResult;
 uniform vec4 uSelectedRoughTile;
 uniform float uSelectedRoughResolve;
@@ -2794,11 +3009,46 @@ uniform vec4 uLightRotation;
 uniform int uLightCount;
 uniform sampler2D uSceneTable;
 vec4 sceneTableRead(int record) { return texelFetch(uSceneTable, ivec2(record % 1024, record / 1024), 0); }
+// From a surface point toward the viewer. An orthographic camera sees every point
+// straight back along its view axis, at the point's view depth.
+vec3 fixtureToViewer(vec3 world) {
+    if (uProjection.x >= 0.0) return uCameraTranslation - world;
+    vec3 q = uCameraRotation.xyz;
+    vec3 back = vec3(0.0, 0.0, 1.0) + 2.0 * cross(q, cross(q, vec3(0.0, 0.0, 1.0)) + uCameraRotation.w * vec3(0.0, 0.0, 1.0));
+    return back * max(dot(uCameraTranslation - world, back), 1.0e-6);
+}
+// Where the camera ray through `world` starts: the camera itself, or for an
+// orthographic camera the point on its plane straight behind `world`.
+vec3 fixtureViewerPosition(vec3 world) {
+    return uProjection.x >= 0.0 ? uCameraTranslation : world + fixtureToViewer(world);
+}
 #define fixtureLightRotation(i) sceneTableRead(4 * (i))
 #define fixtureLightColor(i) sceneTableRead(4 * (i) + 1)
 #define fixtureLightPosition(i) sceneTableRead(4 * (i) + 2)
 #define fixtureLightCone(i) sceneTableRead(4 * (i) + 3)
-#define fixtureLightKind(i) int(sceneTableRead(4 * (i) + 3).z)
+// Record 3's z is the light's kind, plus 8 when the light is hidden from
+// volume scatter rays: the fog and medium marches skip it.
+#define fixtureLightKind(i) (int(sceneTableRead(4 * (i) + 3).z) & 7)
+#define fixtureLightInVolumes(i) (int(sceneTableRead(4 * (i) + 3).z) < 8)
+// Record 3's w is the light's size (sun: angular radius; point and spot: sphere
+// radius; area: half its X extent), stored as -1 - size when the light casts no
+// shadow. An area light has no range, so its record 2 w holds half its Y extent,
+// negative for a disk or ellipse.
+vec3 rotateQ(vec4 q, vec3 v);
+bool fixtureLightShadows(int i) { return sceneTableRead(4 * i + 3).w >= 0.0; }
+float fixtureLightSize(int i) { float w = sceneTableRead(4 * i + 3).w; return w >= 0.0 ? w : -1.0 - w; }
+// An area light (kind 4) shades as a point at its centre: the raster does not
+// integrate over its surface. Its emission toward unit fromLight is the
+// Lambertian cosine times the spread profile, record 3 holding tan of half the
+// spread in x and the profile's normalization in y (0 for no spread limit).
+float fixtureAreaEmission(int i, vec3 fromLight) {
+    vec3 normal = rotateQ(fixtureLightRotation(i), vec3(0.0, 0.0, -1.0));
+    float cosine = dot(normal, fromLight);
+    if (cosine <= 0.0) return 0.0;
+    vec4 spread = fixtureLightCone(i);
+    if (spread.y <= 0.0) return cosine;
+    return cosine * max(0.0, (spread.x - sqrt(max(0.0, 1.0 - cosine * cosine)) / cosine) * spread.y);
+}
 uniform vec4 uDiffractionGeometry;
 uniform vec4 uDiffractionSecondaryGeometry;
 uniform vec4 uDiffractionMicrostructure;
@@ -2834,8 +3084,77 @@ layout(location=7) out vec2 outRawMotion;
 )glsl";
 
 const char* kFixturePassCompositeShader = R"glsl(
+// A nonfinite test on the bits. isnan and isinf on arithmetic results may be folded
+// away by a driver's fast-math, which let an unnamed NaN reach the orb's Realtime
+// readback past both probes below.
+bool fixtureNonfiniteBits(vec4 value) {
+    return any(equal(floatBitsToUint(value) & uvec4(0x7f800000u), uvec4(0x7f800000u)));
+}
+// Diffraction frames draw into an RGBA16F target, and a half float keeps no NaN payload
+// bits: every tagged NaN reached the orb's readback as plain 0x7fffffff, so no probe
+// could name its pass. The reason also rides in alpha as minus the reason, a finite
+// value that survives the target and that no shaded pixel writes
+// (diffractiontransportnative::validateWholeOutput reads it back).
+vec4 fixtureProbeColor(uint reason) {
+    return vec4(vec3(uintBitsToFloat(0x7fc00000u | (reason << 10u))), -float(reason));
+}
+// The same alpha tag for a colour that already carries a tagged NaN payload.
+vec4 fixtureTaggedColor(vec3 rgb) {
+    uvec3 bits = floatBitsToUint(rgb);
+    for (int c = 0; c < 3; ++c) {
+        uint reason = (bits[c] >> 10u) & 0xffu;
+        if ((bits[c] & 0x7f800000u) == 0x7f800000u && (bits[c] & 0x7fffffu) != 0u && reason != 0u)
+            return vec4(rgb, -float(reason));
+    }
+    return vec4(rgb, 1.0);
+}
 #ifdef FIXTURE_REALTIME
 vec3 gRealtimeFog = vec3(1.0);
+// Realtime's reduced-resolution diffraction transport (realtime_diffraction_gather.h).
+// x is the mode: 0 every pixel gathers, 1 the gather pass writes only the gather term,
+// 2 the full pass reads it; yz are the gather target's size over the frame's.
+uniform vec4 uRealtimeGather;
+uniform sampler2D uRealtimeGatherColor;
+uniform sampler2D uRealtimeGatherDepth;
+uniform sampler2D uRealtimeGatherNormal;
+uniform usampler2D uRealtimeGatherObject;
+vec3 gRealtimeGatherTerm = vec3(0.0);
+bool gRealtimeGatherValid = false;
+// Set when the full pass took a receiver's term from the gather target.
+bool gRealtimeGatherReused = false;
+// The probe (uRealtimeGather.w 1, full pass): which gather pixels reused the term.
+int gRealtimeGatherProbe = 0;
+int realtimeGatherMode() { return int(uRealtimeGather.x + 0.5); }
+// The gather term at this pixel from the gather texels of the same object around it,
+// weighted by distance and by how close each texel's depth and normal are to this
+// pixel's. False where no texel matches, as at a silhouette, so the pixel gathers.
+bool realtimeGatherUpsample(out vec3 gathered) {
+    gathered = vec3(0.0);
+    vec2 p = gl_FragCoord.xy * uRealtimeGather.yz - 0.5;
+    ivec2 base = ivec2(floor(p));
+    vec2 f = p - vec2(base);
+    ivec2 last = textureSize(uRealtimeGatherColor, 0) - 1;
+    vec3 n = normalize(vWorldNormal);
+    float depth = vLinearDepth;
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    for (int j = -1; j <= 2; ++j)
+        for (int i = -1; i <= 2; ++i) {
+            ivec2 q = clamp(base + ivec2(i, j), ivec2(0), last);
+            vec4 g = texelFetch(uRealtimeGatherColor, q, 0);
+            if (!(g.a > 0.5) || texelFetch(uRealtimeGatherObject, q, 0).r != outRawObjectId) continue;
+            float relative = abs(texelFetch(uRealtimeGatherDepth, q, 0).r - depth) / max(abs(depth), 1.0e-4);
+            float facing = dot(texelFetch(uRealtimeGatherNormal, q, 0).xyz, n);
+            if (relative > 0.05 || facing < 0.9) continue;
+            vec2 o = abs(vec2(i, j) - f);
+            float w = max(0.0, 1.0 - 0.5 * o.x) * max(0.0, 1.0 - 0.5 * o.y) * exp(-40.0 * relative) * facing * facing;
+            sum += w * g.rgb;
+            total += w;
+        }
+    if (!(total > 1.0e-6)) return false;
+    gathered = sum / total;
+    return true;
+}
 #endif
 // Scene-linear Color is stored as RGBA16F, whose largest finite value is 65504.
 // A brighter finite highlight is stored at that ceiling and stays finite.
@@ -2844,7 +3163,14 @@ vec4 fixtureHalfRange(vec4 color) {
     return mix(clamp(color, vec4(-65504.0), vec4(65504.0)), color,
         bvec4(vec4(isnan(color)) + vec4(isinf(color))));
 }
+#ifdef FIXTURE_WORLD_FOG
+// The world fog march (shared/RasterMedium.h), defined after this text.
+vec4 worldFogApply(vec4 color);
+#endif
 vec4 compositePass(vec4 color) {
+#ifdef FIXTURE_WORLD_FOG
+    color = worldFogApply(color);
+#endif
     int count = int(uPassProgramControl.x);
     if (count == 0 && uPassProgramControl.w > 0.5) {
         // Camera-only glass (Glass Caustics off) on the SDR target: the same
@@ -3009,9 +3335,51 @@ vec2 profileAmplitude(int profile, int signedOrder, float duty,
     return vec2(0.0);
 }
 
+// The profile amplitudes of orders -8..8 at one phase, which a third-family lattice
+// order up to 4 reads 27 times. Each entry is the value profileAmplitude returns: the
+// sinusoidal series runs as besselJ's does, with the prefactor carried from one
+// magnitude to the next in besselJ's own product order, and the binary and sinusoidal
+// amplitudes depend on the order's magnitude only. 27 series per lattice order made
+// the hexagonal orb's grating cost seconds per row band.
+const int kLatticeAmplitudeReach = 8;
+vec2 latticeAmplitudes[2 * kLatticeAmplitudeReach + 1];
+void fillLatticeAmplitudes(int profile, float duty, float phase, vec2 terracePhase) {
+    if (profile == profileSinusoidal) {
+        float halfArgument = 0.5 * (0.5 * phase);
+        float prefactor = 1.0;
+        for (int magnitude = 0; magnitude <= kLatticeAmplitudeReach; ++magnitude) {
+            if (magnitude > 0) prefactor *= halfArgument / float(magnitude);
+            float term = prefactor, bessel = term;
+            for (int seriesIndex = 1; seriesIndex <= 24; ++seriesIndex) {
+                term *= -(halfArgument * halfArgument)
+                      / (float(seriesIndex) * float(magnitude + seriesIndex));
+                bessel += term;
+                if (abs(term) <= 2.98e-8 * abs(bessel))
+                    break;
+            }
+            int quarterTurns = magnitude - 4 * (magnitude / 4);
+            vec2 amplitude = quarterTurns == 0 ? vec2(bessel, 0.0)
+                : quarterTurns == 1 ? vec2(0.0, bessel)
+                : quarterTurns == 2 ? vec2(-bessel, 0.0) : vec2(0.0, -bessel);
+            latticeAmplitudes[kLatticeAmplitudeReach + magnitude] = amplitude;
+            latticeAmplitudes[kLatticeAmplitudeReach - magnitude] = amplitude;
+        }
+        return;
+    }
+    bool symmetric = profile == profileBinaryRectangular;
+    for (int order = symmetric ? 0 : -kLatticeAmplitudeReach; order <= kLatticeAmplitudeReach; ++order) {
+        vec2 amplitude = profileAmplitude(profile, order, duty, phase, terracePhase);
+        latticeAmplitudes[kLatticeAmplitudeReach + order] = amplitude;
+        if (symmetric) latticeAmplitudes[kLatticeAmplitudeReach - order] = amplitude;
+    }
+}
+
 float latticeEfficiency(int profile, int primary, int secondary,
                         bool crossed, bool thirdFamily, float duty,
                         float phase, vec2 terracePhase) {
+#ifdef REALTIME_ABLATE_LATTICE
+    return 0.25;
+#endif
     vec2 first = profileAmplitude(profile, primary, duty, phase, terracePhase);
     if (!crossed)
         return dot(first, first);
@@ -3023,6 +3391,17 @@ float latticeEfficiency(int profile, int primary, int secondary,
     // lands on (m + r, n - r) and the amplitudes convolve. Radius 4 matches
     // kThirdFamilyConvolutionRadius.
     vec2 sum = vec2(0.0);
+    if (abs(primary) + 4 <= kLatticeAmplitudeReach && abs(secondary) + 4 <= kLatticeAmplitudeReach) {
+        // The 27 amplitudes are 17 orders' values, each one evaluated once.
+        fillLatticeAmplitudes(profile, duty, phase, terracePhase);
+        for (int r = -4; r <= 4; ++r)
+            sum += complexMultiply(
+                complexMultiply(
+                    latticeAmplitudes[kLatticeAmplitudeReach + primary - r],
+                    latticeAmplitudes[kLatticeAmplitudeReach + secondary + r]),
+                latticeAmplitudes[kLatticeAmplitudeReach + r]);
+        return dot(sum, sum);
+    }
     for (int r = -4; r <= 4; ++r)
         sum += complexMultiply(
             complexMultiply(
@@ -3031,6 +3410,22 @@ float latticeEfficiency(int profile, int primary, int secondary,
             profileAmplitude(profile, r, duty, phase, terracePhase));
     return dot(sum, sum);
 }
+#ifdef FIXTURE_REALTIME
+// The grating's order efficiencies (realtime_diffraction_efficiency_table.h): band b's
+// order k, or its normalising sum at k == orders, for an incident tangent xy. Control x
+// is 1 when the table holds the bound grating, y the tile grid, z the orders, w the
+// tiles per row.
+uniform sampler2D uDiffractionEfficiencyTable;
+uniform vec4 uDiffractionEfficiencyControl;
+float realtimeOrderEfficiency(int band, int order, vec2 incident) {
+    int grid = int(uDiffractionEfficiencyControl.y + 0.5), orders = int(uDiffractionEfficiencyControl.z + 0.5);
+    int perRow = int(uDiffractionEfficiencyControl.w + 0.5);
+    int tile = band * (orders + 1) + order;
+    vec2 node = clamp((incident * 0.5 + 0.5) * float(grid - 1), vec2(0.0), vec2(float(grid - 1)));
+    vec2 texel = vec2(float((tile - perRow * (tile / perRow)) * grid), float((tile / perRow) * grid)) + node + 0.5;
+    return texture(uDiffractionEfficiencyTable, texel / vec2(textureSize(uDiffractionEfficiencyTable, 0))).r;
+}
+#endif
 
 
 void resolveGrooveGeometry(vec2 uv, out vec4 geometry,
@@ -3241,6 +3636,9 @@ vec3 diffractionLocal(vec3 direction, vec3 tangent, vec3 bitangent, vec3 normal)
 // One directional scalar-wave BSDF per physical wavelength, including zero order.
 // The raw authored source and rho are multiplied only after evaluating this BSDF.
 float diffractionTriangleBsdf(int band, vec2 uv, vec3 incident, vec3 outgoing) {
+#ifdef REALTIME_ABLATE_BSDF
+    return 0.0;
+#endif
     if (incident.z <= 1.0e-6 || outgoing.z <= 0.0) return 0.0;
     vec4 geometry, secondaryGeometry;
     resolveGrooveGeometry(uv, geometry, secondaryGeometry);
@@ -3257,6 +3655,37 @@ float diffractionTriangleBsdf(int band, vec2 uv, vec3 incident, vec3 outgoing) {
             geometry.z, wavelength, lastOrder);
         firstPrimary = range.x; lastPrimary = range.y;
     }
+    bool tabled = false;
+#ifdef FIXTURE_REALTIME
+    // Realtime reads each order's efficiency and the band's normalising sum from the
+    // grating's table, and evaluates only the orders whose lobe reaches outgoing: past
+    // 87.5 lobe widths squared exp() is zero in float.
+    if (uDiffractionEfficiencyControl.x > 0.5) {
+        tabled = true;
+        efficiencySum = realtimeOrderEfficiency(band, int(uDiffractionEfficiencyControl.z + 0.5), incident.xy);
+        float reach = 175.0*sigma*sigma;
+        if (sigma > 0.0)
+        for (int primary=firstPrimary; primary<=lastPrimary; ++primary) {
+            if (primary != 0 && abs(primary)<firstOrder) continue;
+            int limit = crossed ? lastOrder : 0;
+            for (int secondary=-limit; secondary<=limit; ++secondary) {
+                if (secondary != 0 && abs(secondary)<firstOrder) continue;
+                vec2 centre = -incident.xy + float(primary)*wavelength/geometry.z*geometry.xy;
+                if (crossed) centre += float(secondary)*wavelength/secondaryGeometry.z*secondaryGeometry.xy;
+                float square = dot(centre,centre);
+                vec2 delta = outgoing.xy-centre;
+                float spread = dot(delta,delta);
+                if (square >= 1.0 || spread > reach) continue;
+                float z = sqrt(max(0.0,1.0-square));
+                int order = crossed ? (primary+lastOrder)*(2*lastOrder+1)+secondary+lastOrder : primary+lastOrder;
+                float height = 2.0*pi*uDiffractionRoughness.x*(incident.z+z)/wavelength;
+                float efficiency = realtimeOrderEfficiency(band, order, incident.xy)*exp(-height*height)*z/incident.z;
+                radiance += efficiency*exp(-spread/(2.0*sigma*sigma))/(2.0*pi*sigma*sigma);
+            }
+        }
+    }
+#endif
+    if (!tabled)
     for (int primary=firstPrimary; primary<=lastPrimary; ++primary) {
         if (primary != 0 && abs(primary)<firstOrder) continue;
         int limit = crossed ? lastOrder : 0;
@@ -3279,8 +3708,13 @@ float diffractionTriangleBsdf(int band, vec2 uv, vec3 incident, vec3 outgoing) {
             efficiencySum += efficiency;
         }
     }
-    if (!diffractionSceneFinite(efficiencySum) || efficiencySum > 1.0002)
+    if (!diffractionSceneFinite(efficiencySum))
         return uintBitsToFloat(0x7fc00000u | (7u << 10u));
+    // The scalar model's z / incident.z factor is not energy conserving at a steep view:
+    // the orders sum above 1, up to 1.12 at 26 degrees from the surface. Path Trace has
+    // the orders share exactly what the metal reflects (diffraction_order_core.h), and so
+    // does this. Refusing it here left NaN at the orb's contact with its plate.
+    if (efficiencySum > 1.0) radiance /= efficiencySum;
     return radiance * spectralReflectance(wavelength,int(uDiffractionControl.w+0.5),
         uDiffractionMicrostructure.y,uDiffractionMicrostructure.z);
 }
@@ -3296,6 +3730,453 @@ vec3 diffractionBandsToRgb(float bands[8]) {
         -0.9689*xyz.x+1.8758*xyz.y+0.0415*xyz.z,
         0.0557*xyz.x-0.2040*xyz.y+1.0570*xyz.z),vec3(0.0));
 }
+#ifdef FIXTURE_REALTIME
+// Realtime lights the grating by the scene's environment through its orders
+// (realtime_diffraction_environment.h): each band and order reads the sky where
+// the grating equation says that order's light comes from. An order whose ray
+// reaches a glowing object reads that object instead (realtime_diffraction_emitters.h).
+uniform int uRealtimeEmitterFirst;
+uniform int uRealtimeEmitterTriangles;
+// The nearest emissive triangle along the ray, from either side, unless something
+// opaque stands in front of it. False when the ray reaches no emitter.
+bool realtimeDiffractionEmitter(vec3 position, vec3 normal, vec3 direction, out vec3 radiance) {
+    radiance = vec3(0.0);
+#ifdef REALTIME_ABLATE_CHORD
+    return false;
+#endif
+    float nearest = 3.402823e38;
+    bool found = false;
+    #pragma optionNV(unroll none)
+    for (int t = 0; t < uRealtimeEmitterTriangles; ++t) {
+        int record = uRealtimeEmitterFirst + 3 * t;
+        vec4 a = sceneTableRead(record), b = sceneTableRead(record + 1), c = sceneTableRead(record + 2);
+        vec3 e1 = b.xyz - a.xyz, e2 = c.xyz - a.xyz;
+        vec3 p = cross(direction, e2);
+        float det = dot(e1, p);
+        if (abs(det) <= 1.0e-12) continue;
+        float inverse = 1.0 / det;
+        vec3 s = position - a.xyz;
+        float u = dot(s, p) * inverse;
+        if (u < 0.0 || u > 1.0) continue;
+        vec3 q = cross(s, e1);
+        float v = dot(direction, q) * inverse;
+        if (v < 0.0 || u + v > 1.0) continue;
+        float distance = dot(e2, q) * inverse;
+        if (!(distance > 1.0e-4) || distance >= nearest) continue;
+        nearest = distance;
+        radiance = vec3(a.w, b.w, c.w);
+        found = true;
+    }
+    if (found && opaqueVisibility(position, normal, direction, nearest * (1.0 - 1.0e-3), uOpaqueControl) < 0.5)
+        radiance = vec3(0.0);
+    return found;
+}
+// The normal distribution's CDF in the logistic form realtimediffraction::softEdge uses.
+float realtimeSoftEdge(float x) { return 1.0 / (1.0 + exp(-1.702 * x)); }
+// The emitters seen along the straight piece from d0 to d1 of an arc of directions from
+// position (realtimediffraction::chordTriangleShare): a direction reaches a triangle when
+// it lies in the cone of its corners, which is linear along the piece, so each triangle
+// covers an exact share of it. Returns the shares times each emitter's radiance, with
+// one shadow ray per triangle at the middle of its share, and the covered share.
+// A rough grating's lobe of per-axis width sigma blurs each triangle's image as Path
+// Trace's lobe sampling does (realtimediffraction::lobeTriangleShare): each edge of the
+// cone becomes a soft step over sigma at the piece's middle, which is far shorter than
+// sigma. Hard-edged panels through every order and sub-wavelength made a block mosaic.
+vec3 realtimeDiffractionEmitterChord(vec3 position, vec3 normal, vec3 d0, vec3 d1, float sigma, out float covered) {
+    vec3 sum = vec3(0.0);
+    covered = 0.0;
+#ifdef REALTIME_ABLATE_LOBE
+    sigma = 0.0;
+#endif
+#ifdef REALTIME_ABLATE_CHORD
+    return sum;
+#endif
+    vec3 e = d1 - d0;
+    #pragma optionNV(unroll none)
+    for (int t = 0; t < uRealtimeEmitterTriangles; ++t) {
+        int record = uRealtimeEmitterFirst + 3 * t;
+        vec4 a = sceneTableRead(record), b = sceneTableRead(record + 1), c = sceneTableRead(record + 2);
+        vec3 A = a.xyz - position, B = b.xyz - position, C = c.xyz - position;
+        float det = dot(A, cross(B, C));
+        if (abs(det) <= 1.0e-12) continue;
+        float orientation = det > 0.0 ? 1.0 : -1.0;
+        vec3 planes[3] = vec3[3](cross(B, C), cross(C, A), cross(A, B));
+        float share;
+        vec3 direction;
+        if (sigma > 0.0) {
+            vec3 middle = normalize(d0 + 0.5 * e);
+            share = 1.0;
+            bool inside = true;
+            for (int k = 0; k < 3; ++k) {
+                float signedSine = orientation * dot(planes[k], middle) / max(length(planes[k]), 1.0e-30);
+                share *= realtimeSoftEdge(signedSine / sigma);
+                inside = inside && signedSine >= 0.0;
+            }
+            if (!(share > 1.0e-4)) continue;
+            // Only the lobe reaches a triangle the middle misses: its shadow ray aims at the centre.
+            direction = inside ? middle : normalize(A + B + C);
+        } else {
+            float low = 0.0, high = 1.0;
+            for (int k = 0; k < 3; ++k) {
+                float p = orientation * dot(planes[k], d0), q = orientation * dot(planes[k], e);
+                if (abs(q) <= 1.0e-12) { if (p < 0.0) high = -1.0; }
+                else if (q > 0.0) low = max(low, -p / q);
+                else high = min(high, -p / q);
+            }
+            if (!(high > low)) continue;
+            share = high - low;
+            direction = normalize(d0 + 0.5 * (low + high) * e);
+        }
+        vec3 n = cross(B - A, C - A);
+        float distance = dot(n, A) / dot(n, direction);
+        if (!(distance > 1.0e-4)) continue;
+        if (opaqueVisibility(position, normal, direction, distance * (1.0 - 1.0e-3), uOpaqueControl) < 0.5) continue;
+        sum += share * vec3(a.w, b.w, c.w);
+        covered += share;
+    }
+    // Overlapping emitters along one piece count once.
+    if (covered > 1.0) { sum /= covered; covered = 1.0; }
+    return sum;
+}
+// The sky without its analytic sun disc, which realtimeDiffractionSunArc integrates
+// over each order's arc instead. The scene's ambient colour is environment radiance
+// from every direction, as Path Trace adds it (pathtrace/lights.h).
+vec3 realtimeDiffractionSkyRadiance(vec3 direction, float solidAngle) {
+    if (uSky[0].w > 1.5) return environmentImageFiltered(direction, uSky[0], uSky[1], solidAngle) + uAmbient;
+    if (uSky[0].w > 0.5) {
+        vec3 d = normalize(direction);
+        float cap = clamp((dot(d, uSky[4].xyz) - uSky[3].w) / (1.0 - uSky[3].w), 0.0, 1.0);
+        vec3 disc = uSky[3].rgb * uSky[4].w * cap * cap * (3.0 - 2.0 * cap);
+        return max(analyticSkyRadiance(d, uSky[0], uSky[1], uSky[2], uSky[3], uSky[4])
+            - (1.0 - analyticSkyCloudOpacity(d, uSky[1], uSky[2])) * disc, vec3(0.0)) + uAmbient;
+    }
+    vec3 flatSky = uAmbient;
+    for (int i = 0; i < uLightCount; ++i)
+        if (fixtureLightKind(i) == 2) flatSky += fixtureLightColor(i).rgb * fixtureLightColor(i).a;
+    return flatSky;
+}
+// The analytic sun disc seen along the straight piece from d0 to d1 of an order's arc
+// (realtimediffraction::sunArc): the share of the piece inside the disc times the
+// disc's radiance at the middle of that share.
+// A rough grating spreads each order over a Gaussian lobe of per-axis width sigma, so a
+// small source seen through an order is its disc widened to the radius whose spread
+// matches, sqrt(r^2 + (2 sigma)^2), at the same power (realtimediffraction::lobeDisc).
+// Path Trace spreads it the same way by sampling the lobe. x is the widened disc's
+// edge cosine and y the radiance factor that keeps its power.
+vec2 realtimeDiffractionLobeDisc(float cosRadius, float sigma) {
+    if (!(sigma > 0.0)) return vec2(cosRadius, 1.0);
+    float radius = acos(clamp(cosRadius, -1.0, 1.0));
+    float cosWide = cos(min(sqrt(radius * radius + 4.0 * sigma * sigma), pi));
+    return vec2(cosWide, (1.0 - cosRadius) / max(1.0 - cosWide, 1.0e-12));
+}
+vec3 realtimeDiffractionSunArc(vec3 d0, vec3 d1, float sigma) {
+    if (!(uSky[0].w > 0.5 && uSky[0].w <= 1.5) || !(uSky[4].w > 0.0)) return vec3(0.0);
+    vec2 disc = realtimeDiffractionLobeDisc(uSky[3].w, sigma);
+    vec3 sun = uSky[4].xyz, e = d1 - d0, f = d0 - sun;
+    float a = dot(e, e), b = dot(e, f), c = dot(f, f) - 2.0 * (1.0 - disc.x);
+    float share = 0.0, middle = 0.5;
+    if (!(a > 1.0e-12)) {
+        share = c < 0.0 ? 1.0 : 0.0;
+    } else {
+        float discriminant = b * b - a * c;
+        if (!(discriminant > 0.0)) return vec3(0.0);
+        float root = sqrt(discriminant);
+        float low = max((-b - root) / a, 0.0), high = min((-b + root) / a, 1.0);
+        if (!(high > low)) return vec3(0.0);
+        share = high - low; middle = 0.5 * (low + high);
+    }
+    if (!(share > 0.0)) return vec3(0.0);
+    vec3 d = normalize(mix(d0, d1, middle));
+    float cap = clamp((dot(d, sun) - disc.x) / (1.0 - disc.x), 0.0, 1.0);
+    return share * (1.0 - analyticSkyCloudOpacity(d, uSky[1], uSky[2]))
+        * uSky[3].rgb * uSky[4].w * disc.y * cap * cap * (3.0 - 2.0 * cap);
+}
+float realtimeDiffractionBandShare(int band, vec3 rgb) {
+    vec3 xyz = vec3(uDiffractionSpectral[band].z, uDiffractionSpectral[band].w, uDiffractionSpectralZ[band].x);
+    vec3 response = max(vec3(3.2406*xyz.x-1.5372*xyz.y-0.4986*xyz.z,
+        -0.9689*xyz.x+1.8758*xyz.y+0.0415*xyz.z, 0.0557*xyz.x-0.2040*xyz.y+1.0570*xyz.z), vec3(0.0));
+    float total = response.x + response.y + response.z;
+    return total > 0.0 ? dot(rgb, response) / total : dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+// Lands light of one wavelength from band b's interval on the band centres either side
+// of it (realtimediffraction::tentBands): the share of arriving light in each, mixed by
+// distance, then split between the two by the same weights. Past the first or last
+// centre it all lands on that band.
+void realtimeDiffractionDeposit(int b, float wavelength, vec3 arriving, float amount, inout float deposits[8]) {
+    int lower = b, upper = b;
+    if (wavelength < uDiffractionSpectral[b].x && b > 0) lower = b - 1;
+    else if (wavelength > uDiffractionSpectral[b].x && b < 7) upper = b + 1;
+    float span = uDiffractionSpectral[upper].x - uDiffractionSpectral[lower].x;
+    float t = span > 0.0 ? clamp((wavelength - uDiffractionSpectral[lower].x) / span, 0.0, 1.0) : 0.0;
+    float share = mix(realtimeDiffractionBandShare(lower, arriving), realtimeDiffractionBandShare(upper, arriving), t);
+    deposits[lower] += amount * share * (1.0 - t);
+    deposits[upper] += amount * share * t;
+}
+// The world direction order (primary, secondary) of one wavelength arrives from, toward
+// outgoing. False when the order does not propagate at that wavelength.
+bool realtimeDiffractionOrderDirection(vec4 geometry, vec4 secondaryGeometry, bool crossed, int primary,
+    int secondary, float wavelength, vec3 tangent, vec3 bitangent, vec3 normal, vec3 outgoing,
+    out vec3 direction, out float z) {
+    vec2 xy = -outgoing.xy + float(primary) * wavelength / geometry.z * geometry.xy;
+    if (crossed) xy += float(secondary) * wavelength / secondaryGeometry.z * secondaryGeometry.xy;
+    float square = dot(xy, xy);
+    z = square < 1.0 ? sqrt(1.0 - square) : 0.0;
+    direction = xy.x * tangent + xy.y * bitangent + z * normal;
+    return z > 1.0e-6;
+}
+// The share of the straight piece from d0 to d1 inside a disc around unit axis whose
+// edge is at cosine cosRadius (realtimediffraction::sunArc).
+float realtimeDiffractionDiscShare(vec3 d0, vec3 d1, vec3 axis, float cosRadius) {
+    vec3 e = d1 - d0, f = d0 - axis;
+    float a = dot(e, e), b = dot(e, f), c = dot(f, f) - 2.0 * (1.0 - cosRadius);
+    if (!(a > 1.0e-12)) return c < 0.0 ? 1.0 : 0.0;
+    float discriminant = b * b - a * c;
+    if (!(discriminant > 0.0)) return 0.0;
+    float root = sqrt(discriminant);
+    return max(min((-b + root) / a, 1.0) - max((-b - root) / a, 0.0), 0.0);
+}
+// The scene's directional lights through the orders. A light of irradiance E and angular
+// radius r is a disc of radiance E / (pi r^2), with kRealtimeLightRadius for one authored
+// without a size, so an order's arc that crosses it carries the light's own colour.
+const int kRealtimeDiffractionLights = 4;
+// A rough grating's lobe widens each disc as for the sun (realtimeDiffractionLobeDisc).
+vec3 realtimeDiffractionLightArcs(vec3 d0, vec3 d1, float lightVisible[kRealtimeDiffractionLights], float sigma) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < kRealtimeDiffractionLights; ++i) {
+        if (i >= uLightCount || !(lightVisible[i] > 0.0)) continue;
+        float radius = fixtureLightSize(i) > 0.0 ? min(fixtureLightSize(i), 1.5) : kRealtimeLightRadius;
+        radius = min(sqrt(radius * radius + 4.0 * sigma * sigma), pi);
+        vec3 axis = rotateQ(fixtureLightRotation(i), vec3(0.0, 0.0, 1.0));
+        float share = realtimeDiffractionDiscShare(d0, d1, axis, cos(radius));
+        if (share > 0.0)
+            sum += lightVisible[i] * share * fixtureLightColor(i).rgb * fixtureLightColor(i).a / (pi * radius * radius);
+    }
+    return sum;
+}
+// A pressed track's order efficiency (pressedDiscEfficiency in diffraction_order_core.h):
+// a pit stripe of the track's duty share, pit or land along it with mean one half.
+float realtimePressedDiscEfficiency(int order, float stripeFraction, float phase) {
+    vec2 step = vec2(cos(phase) - 1.0, sin(phase));
+    float meanStripe = 0.5 * stripeFraction;
+    if (order == 0) return dot(vec2(1.0, 0.0) + meanStripe * step, vec2(1.0, 0.0) + meanStripe * step);
+    float argument = pi * float(order) * stripeFraction;
+    float amplitude = meanStripe * sin(argument) / argument;
+    return dot(step, step) * amplitude * amplitude;
+}
+// Pressed-disc pit scatter, Path Trace's lobe (integrator_body.inl): the pits' random
+// runs leave stripeFraction q (1 - q) |e^(i phase) - 1|^2 of the light out of the orders,
+// spread around the mirror as sinc^2 across the tracks, of width lambda / pit width, and
+// a Lorentzian along them, of half width lambda / (pi mean run). Realtime integrates the
+// lobe on fixed nodes (realtimediffraction::pitScatterNodes): three lines along at the
+// Lorentzian's sixths, each cut across into pieces weighted by sinc^2, and each piece
+// reads the emitters it crosses and the sky, so the lobe is smooth from pixel to pixel.
+// A piece past the horizon stays in the mirror, as Path Trace keeps it.
+const int kRealtimePitScatterPieces = 12;
+const float kRealtimePitScatterReach = 3.0;
+const float realtimediffractionMeanRun = 1354.0;
+vec3 realtimePitScatterDirection(vec2 xy, vec3 tangent, vec3 bitangent, vec3 normal) {
+    return xy.x * tangent + xy.y * bitangent + sqrt(max(0.0, 1.0 - dot(xy, xy))) * normal;
+}
+void realtimePitScatter(int b, float wavelength, vec4 geometry, vec3 tangent, vec3 bitangent, vec3 normal,
+    vec3 outgoing, vec3 origin, vec3 side, float visibility, float solidAngle, inout float deposits[8]) {
+    float duty = uDiffractionMicrostructure.x;
+    float mirrorPhase = 2.0 * pi * geometry.w * 2.0 * outgoing.z / wavelength;
+    float halfSine = sin(0.5 * mirrorPhase);
+    float power = duty * halfSine * halfSine;
+    float reciprocal = length(geometry.xy);
+    if (!(power > 0.0) || !(reciprocal > 0.0) || !(geometry.z > 0.0)) return;
+    vec2 across = geometry.xy / reciprocal, along = vec2(-across.y, across.x);
+    float acrossWidth = wavelength / (duty * geometry.z / reciprocal);
+    float alongWidth = wavelength / (pi * realtimediffractionMeanRun);
+    vec3 mirror = realtimePitScatterDirection(-outgoing.xy, tangent, bitangent, normal);
+    vec3 light = vec3(0.0);
+    float total = 0.0;
+    #pragma optionNV(unroll none)
+    for (int line = 0; line < 3; ++line) {
+        // tan(pi (u - 1/2)) at u = 1/6, 1/2, 5/6.
+        vec2 base = -outgoing.xy + along * (alongWidth * 0.57735027 * float(line - 1));
+        float pieceWidth = 2.0 * kRealtimePitScatterReach / float(kRealtimePitScatterPieces);
+        float x0 = -kRealtimePitScatterReach;
+        vec2 xy0 = base + across * (acrossWidth * x0);
+        #pragma optionNV(unroll none)
+        for (int k = 0; k < kRealtimePitScatterPieces; ++k) {
+            float x1 = x0 + pieceWidth, middle = 0.5 * (x0 + x1);
+            float argument = pi * middle;
+            float sinc = abs(argument) > 1.0e-4 ? sin(argument) / argument : 1.0;
+            float weight = sinc * sinc * pieceWidth;
+            vec2 xy1 = base + across * (acrossWidth * x1);
+            vec3 arriving;
+            if (dot(xy0, xy0) < 1.0 && dot(xy1, xy1) < 1.0) {
+                vec3 d0 = realtimePitScatterDirection(xy0, tangent, bitangent, normal);
+                vec3 d1 = realtimePitScatterDirection(xy1, tangent, bitangent, normal);
+                float covered;
+                arriving = realtimeDiffractionEmitterChord(origin, side, d0, d1, 0.0, covered)
+                    + (1.0 - covered) * visibility * realtimeDiffractionSkyRadiance(normalize(d0 + d1), solidAngle);
+            } else {
+                vec3 emitted;
+                arriving = realtimeDiffractionEmitter(origin, side, mirror, emitted)
+                    ? emitted : visibility * realtimeDiffractionSkyRadiance(mirror, solidAngle);
+            }
+            light += weight * arriving;
+            total += weight;
+            x0 = x1; xy0 = xy1;
+        }
+    }
+    if (total > 0.0) deposits[b] += power * realtimeDiffractionBandShare(b, light / total);
+}
+// Sub-wavelengths per band (realtimediffraction::bandInterval). Each band's light is
+// read across its whole interval, so an order's colour moves smoothly along its arc.
+const int kRealtimeDiffractionSubbands = 8;
+void realtimeDiffractionSky(vec2 uv, vec3 tangent, vec3 bitangent, vec3 normal, vec3 outgoing,
+    inout float bands[8]) {
+    if (outgoing.z <= 0.0) return;
+#ifdef REALTIME_ABLATE_SKY
+    return;
+#endif
+    // The order rays start just off the grating on the viewed side, so they do not find
+    // the grating's own triangles or a coplanar carrier at its own depth.
+    vec3 side = dot(vWorldNormal, normal) < 0.0 ? -vWorldNormal : vWorldNormal;
+    vec3 origin = vWorldPosition + side * 1.0e-4 * max(1.0, uProjection.w - uProjection.z);
+    float visibility = realtimeSkyVisibility(origin, side);
+    // The sun's own shadow is one ray, not the hemisphere estimate.
+    float sunVisible = uSky[0].w > 0.5 && uSky[0].w <= 1.5 && uSky[4].w > 0.0
+        ? opaqueVisibility(origin, side, uSky[4].xyz, 3.402823e38, uOpaqueControl) : 0.0;
+    // Each directional light's shadow is one ray as well. A grating with its own direct
+    // path or authored source already has its light, so only the environment route with
+    // no direct intensity reads the scene's lights here.
+    float lightVisible[kRealtimeDiffractionLights];
+    bool anyLight = false;
+    bool sceneLights = uDiffractionEnvironment.x == 2.0 && uDiffractionSampleControl.w != 1.0
+        && !(uDiffractionIncidentDirectionAndIntensity.w > 0.0);
+    for (int i = 0; i < kRealtimeDiffractionLights; ++i) {
+        lightVisible[i] = 0.0;
+        if (!sceneLights || i >= uLightCount || fixtureLightKind(i) != 0) continue;
+        vec3 toLight = rotateQ(fixtureLightRotation(i), vec3(0.0, 0.0, 1.0));
+        lightVisible[i] = !(fixtureLightColor(i).a > 0.0) ? 0.0 : !fixtureLightShadows(i) ? 1.0
+            : opaqueVisibility(origin, side, toLight, 3.402823e38, uOpaqueControl);
+        anyLight = anyLight || lightVisible[i] > 0.0;
+    }
+    if (visibility <= 0.0 && sunVisible <= 0.0 && !anyLight && uRealtimeEmitterTriangles <= 0) return;
+    vec4 geometry, secondaryGeometry;
+    resolveGrooveGeometry(uv, geometry, secondaryGeometry);
+    bool crossed = int(secondaryGeometry.w + 0.5) == 2;
+    int firstOrder = int(round(uDiffractionMicrostructure.w));
+    int lastOrder = int(uDiffractionControl.x + 0.5);
+    int profile = int(uDiffractionControl.y + 0.5);
+    float sigma = 2.0 * uDiffractionRoughness.y;
+    float solidAngle = 2.0 * pi * max(sigma * sigma, 1.0e-6);
+    // A pressed disc's track (PitStatistics::PressedDisc, coating lane w): its orders
+    // and the pits' scatter, as Path Trace has them (diffraction_order_core.h).
+    bool pressedDisc = uDiffractionCoating.w > 0.5;
+    // Each sub-wavelength's light lands on the two band centres around it, by distance,
+    // so its colour is its own and not its band's: an order seen through a narrow
+    // range of wavelengths runs through the hues instead of stepping between eight.
+    float deposits[8];
+    for (int b = 0; b < 8; ++b) deposits[b] = 0.0;
+    #pragma optionNV(unroll none)
+    for (int b = 0; b < 8; ++b) {
+        float centre = uDiffractionSpectral[b].x;
+        float below = b > 0 ? uDiffractionSpectral[max(b - 1, 0)].x : 2.0 * centre - uDiffractionSpectral[1].x;
+        float above = b < 7 ? uDiffractionSpectral[min(b + 1, 7)].x : 2.0 * centre - uDiffractionSpectral[6].x;
+        float low = 0.5 * (below + centre), width = 0.5 * (above + centre) - low;
+        if (!(width > 0.0)) continue;
+        // Orders that propagate anywhere in the band: the shortest wavelength has the
+        // widest range.
+        int firstPrimary = -lastOrder, lastPrimary = lastOrder;
+        if (!crossed) {
+            ivec2 range = propagatingOneDimensionalOrders(outgoing.xy, geometry.xy, geometry.z, low, lastOrder);
+            firstPrimary = range.x; lastPrimary = range.y;
+        }
+        for (int primary = firstPrimary; primary <= lastPrimary; ++primary) {
+            if (primary != 0 && abs(primary) < firstOrder) continue;
+            int limit = crossed ? lastOrder : 0;
+            for (int secondary = -limit; secondary <= limit; ++secondary) {
+                if (secondary != 0 && abs(secondary) < firstOrder) continue;
+                vec3 edge, direction; float z;
+                bool edgeLive = realtimeDiffractionOrderDirection(geometry, secondaryGeometry, crossed, primary, secondary,
+                    low, tangent, bitangent, normal, outgoing, edge, z);
+                // An order propagates for wavelengths from 0 up to one root: |l G - o|^2 < 1
+                // holds at l = 0 and grows past the root. So an order dead at the band's
+                // shortest wavelength is dead across it, and one whose next edge dies has no
+                // later sub-wavelength. A crossed lattice up to order 4 is 81 orders, of
+                // which a band sees a few dozen.
+                if (!edgeLive) continue;
+                #pragma optionNV(unroll none)
+                for (int k = 0; k < kRealtimeDiffractionSubbands; ++k) {
+                    float stride = width / float(kRealtimeDiffractionSubbands);
+                    float wavelength = low + (float(k) + 0.5) * stride;
+                    vec3 next; float nextZ;
+                    bool nextLive = realtimeDiffractionOrderDirection(geometry, secondaryGeometry, crossed, primary, secondary,
+                        low + float(k + 1) * stride, tangent, bitangent, normal, outgoing, next, nextZ);
+                    if (realtimeDiffractionOrderDirection(geometry, secondaryGeometry, crossed, primary, secondary,
+                            wavelength, tangent, bitangent, normal, outgoing, direction, z)) {
+                        float phase = 2.0 * pi * geometry.w * (z + outgoing.z) / wavelength;
+                        float efficiency;
+                        if (!pressedDisc && uDiffractionEfficiencyControl.x > 0.5) {
+                            // The table's band tiles hold the order at each band centre;
+                            // a sub-wavelength reads the two centres around it.
+                            int order = crossed ? (primary + lastOrder) * (2 * lastOrder + 1) + secondary + lastOrder
+                                                : primary + lastOrder;
+                            int other = clamp(wavelength < centre ? b - 1 : b + 1, 0, 7);
+                            float span = uDiffractionSpectral[other].x - centre;
+                            float t = other == b || abs(span) < 1.0e-3 ? 0.0
+                                : clamp((wavelength - centre) / span, 0.0, 1.0);
+                            efficiency = mix(realtimeOrderEfficiency(b, order, outgoing.xy),
+                                realtimeOrderEfficiency(other, order, outgoing.xy), t);
+                        } else
+                            efficiency = pressedDisc
+                                ? realtimePressedDiscEfficiency(primary, uDiffractionMicrostructure.x, phase)
+                                : latticeEfficiency(profile, primary, secondary, crossed,
+                                    uDiffractionControl.z > 0.5, uDiffractionMicrostructure.x, phase, vec2(cos(phase), sin(phase)));
+                        float height = 2.0 * pi * uDiffractionRoughness.x * (z + outgoing.z) / wavelength;
+                        efficiency *= exp(-height * height) * outgoing.z / z;
+                        if (!isnan(efficiency) && !isinf(efficiency)) {
+                            // The piece of the order's arc this sub-wavelength spans reads the
+                            // share of it each emitter covers, so a fan's edge across a panel
+                            // moves smoothly instead of in sub-wavelength steps.
+                            vec3 emitted, arriving;
+                            if (edgeLive && nextLive) {
+                                float covered;
+                                arriving = realtimeDiffractionEmitterChord(origin, side, edge, next, sigma, covered)
+                                    + (1.0 - covered) * visibility * realtimeDiffractionSkyRadiance(direction, solidAngle);
+                            } else {
+                                arriving = realtimeDiffractionEmitter(origin, side, direction, emitted)
+                                    ? emitted : visibility * realtimeDiffractionSkyRadiance(direction, solidAngle);
+                            }
+                            if (edgeLive && nextLive && sunVisible > 0.0)
+                                arriving += sunVisible * realtimeDiffractionSunArc(edge, next, sigma);
+                            if (edgeLive && nextLive && anyLight)
+                                arriving += realtimeDiffractionLightArcs(edge, next, lightVisible, sigma);
+                            realtimeDiffractionDeposit(b, wavelength, arriving,
+                                clamp(efficiency, 0.0, 1.0) / float(kRealtimeDiffractionSubbands), deposits);
+                        }
+                    }
+                    edge = next; edgeLive = nextLive;
+                    if (!nextLive) break;
+                }
+            }
+        }
+        if (pressedDisc)
+            realtimePitScatter(b, centre, geometry, tangent, bitangent, normal, outgoing, origin, side,
+                visibility, solidAngle, deposits);
+    }
+    for (int b = 0; b < 8; ++b) {
+        float reflectance = spectralReflectance(uDiffractionSpectral[b].x, int(uDiffractionControl.w + 0.5),
+            uDiffractionMicrostructure.y, uDiffractionMicrostructure.z);
+        if (reflectance > 0.0) bands[b] += reflectance * deposits[b];
+    }
+}
+// The same light for a grating lit without the transport table, once per frame.
+// The admitted environment path is a smooth stand-in for the environment light, so
+// the scene sky's sun and the emitters it cannot show come through the orders here.
+vec3 realtimeDiffractionSkyRgb(vec3 tangent, vec3 bitangent, vec3 normal, vec3 outgoing) {
+    if (uDiffractionPathIndex != 0) return vec3(0.0);
+    float skyBands[8];
+    for (int b = 0; b < 8; ++b) skyBands[b] = 0.0;
+    realtimeDiffractionSky(vUv, tangent, bitangent, normal, outgoing, skyBands);
+    return diffractionBandsToRgb(skyBands);
+}
+#endif
 // Exact endpoint checks distinguish an admitted nearer blocker from a stale or
 // missing endpoint. Refusal is propagated as diagnostic Color for the whole frame.
 // A ray in the endpoint triangle's plane can miss it or clip a neighbour by
@@ -3347,11 +4228,43 @@ float diffractionSourceVisibility(vec3 position, out bool complete) {
     complete=hit.status==0 || hit.status==1;
     return hit.status==0 ? 1.0 : 0.0;
 }
+#ifdef FIXTURE_REALTIME
+// Realtime's segment from this fragment to a table sample, with no ray. The sample's
+// own view of the source is the table's lane 1 w, traced once per frame on the host
+// (1 lit, 0 shadowed, -1 unresolved). The segment counts when the source lights the
+// sample and both ends face each other, which is exact for a convex grating such as
+// the orb's sphere and drops only a third object between the two.
+bool realtimeGatherSegment(int sampleIndex, vec3 pixelNormal, out vec3 toSample,
+    out float distance, out float source) {
+    vec4 p = diffractionSample(sampleIndex,0), n = diffractionSample(sampleIndex,1);
+    source = max(n.w,0.0);
+    vec3 delta = p.xyz-vWorldPosition;
+    distance = length(delta); toSample = delta/max(distance,1.0e-30);
+    return source > 0.0 && dot(n.xyz,uDiffractionSourceDirectionTrace.xyz) > 0.0
+        && diffractionSceneFinite(distance) && distance > 2.0*uDiffractionRayMinimum
+        && dot(pixelNormal,toSample) > 0.0 && dot(n.xyz,toSample) < 0.0;
+}
+#endif
 vec3 evaluateTriangleDiffraction(vec3 tangent, vec3 bitangent, vec3 normal, vec3 outgoing) {
     if (!diffractionTableValid()) return diffractionDiagnosticReason(1);
     bool complete;
-    float direct = diffractionSourceVisibility(vWorldPosition,complete);
+#ifdef REALTIME_ABLATE_DIRECT
+    complete = true;
+    float direct = 1.0;
+#else
+    float direct = 0.0;
+    complete = true;
+    // The gather pass keeps only the gather term, so it traces no direct ray.
+#ifdef FIXTURE_REALTIME
+    if (realtimeGatherMode() != 1)
+#endif
+    direct = diffractionSourceVisibility(vWorldPosition,complete);
+#endif
+#ifdef FIXTURE_REALTIME
+    if (!complete) direct = 0.0;
+#else
     if (!complete) return diffractionDiagnosticReason(2);
+#endif
     vec3 incident = diffractionLocal(uDiffractionSourceDirectionTrace.xyz,tangent,bitangent,normal);
     float bands[8];
     #pragma optionNV(unroll none)
@@ -3365,25 +4278,60 @@ vec3 evaluateTriangleDiffraction(vec3 tangent, vec3 bitangent, vec3 normal, vec3
     receiverStride=max(1,int(sqrt(uDiffractionSampleControl.x)));
     receiverFirst=int(realtimeNoise()*float(receiverStride));
     realtimeStride=float(receiverStride);
+#ifdef REALTIME_ABLATE_GATHER
+    receiverFirst=int(uDiffractionSampleControl.x);
+#endif
+    // The gather pass keeps only the gather and the sky; the full pass reads them back.
+    vec3 upsampled;
+    bool reused = realtimeGatherMode()==2 && realtimeGatherUpsample(upsampled);
+    if (realtimeGatherMode()==2) gRealtimeGatherProbe = reused ? 2 : 1;
+    gRealtimeGatherReused = reused;
+    if (realtimeGatherMode()==1) for (int b=0; b<8; ++b) bands[b]=0.0;
+    if (reused) receiverFirst=int(uDiffractionSampleControl.x);
 #endif
     #pragma optionNV(unroll none)
     for (int r=receiverFirst; float(r)<uDiffractionSampleControl.x; r+=receiverStride) {
         vec3 direction; float distance;
+#ifdef FIXTURE_REALTIME
+        // Realtime's gather is an estimate with no ray per row: the sample's view of the
+        // source comes from the table, and the segment is seen when both ends face it.
+        // Three closest-hit rays per gathered row made the orb's frame cost seconds.
+        float source;
+        if (!realtimeGatherSegment(r,normal,direction,distance,source)) continue;
+#else
         bool visible = diffractionSegment(r,normal,direction,distance,complete);
         if (!complete) return diffractionDiagnosticReason(3);
         float source = diffractionSourceVisibility(diffractionSample(r,0).xyz,complete);
         if (!complete) return diffractionDiagnosticReason(4);
         if (!visible) continue;
+#endif
         vec3 receiverNormal = diffractionSample(r,1).xyz;
         float receiverCosine = max(dot(receiverNormal,-direction),0.0);
         float lightCosine = max(dot(receiverNormal,uDiffractionSourceDirectionTrace.xyz),0.0)*source;
         vec3 local = diffractionLocal(direction,tangent,bitangent,normal);
+#ifdef FIXTURE_REALTIME
+        // The sample's patch seen as a coaxial disc of its area, A / (pi d^2 + A): exact on
+        // the axis, the point form A / (pi d^2) far away, and bounded at a contact, where
+        // the point form overflowed the half-float target.
+        float weight = diffractionSample(r,0).w*receiverCosine*max(local.z,0.0)
+            /(pi*distance*distance+diffractionSample(r,0).w);
+#else
         float weight = diffractionSample(r,0).w*receiverCosine*max(local.z,0.0)/(pi*distance*distance);
+#endif
         #pragma optionNV(unroll none)
         for (int b=0; b<8; ++b) bands[b] += realtimeStride*weight*lightCosine*uDiffractionSourceRadiance[b/4][b%4]
             *diffractionSample(r,4+b/4)[b%4]*diffractionTriangleBsdf(b,vUv,local,outgoing);
     }
+#ifdef FIXTURE_REALTIME
+    // Realtime adds the environment through the orders, once per frame.
+    if (uDiffractionPathIndex == 0 && !reused) realtimeDiffractionSky(vUv,tangent,bitangent,normal,outgoing,bands);
+#endif
     for (int b=0; b<8; ++b) if (!diffractionSceneFinite(bands[b])) return diffractionDiagnosticReason(5);
+#ifdef FIXTURE_REALTIME
+    if (realtimeGatherMode()==1) { gRealtimeGatherTerm=diffractionBandsToRgb(bands); gRealtimeGatherValid=true; }
+    if (reused) return diffractionBandsToRgb(bands)+upsampled;
+    return diffractionBandsToRgb(bands);
+#endif
     return diffractionBandsToRgb(bands);
 }
 float diffractionScatterCoverage(vec2 uv) {
@@ -3403,22 +4351,40 @@ float diffractionScatterCoverage(vec2 uv) {
     }
     return clamp(coverage*occupancy,0.0,1.0);
 }
+// The draw's first receiver row, found on the host (-1 none). A fragment whose ids it
+// does not match, such as an instance with ids of its own, searches the rows.
+uniform int uDiffractionReceiverRow;
 vec3 evaluateSpectralReceiver(vec3 normal, out bool receiver) {
     receiver=true;
     if (!diffractionTableValid()) return diffractionDiagnosticReason(1);
     receiver=false;
     int receiverIndex=-1;
+    if (uDiffractionReceiverRow>=0 && float(uDiffractionReceiverRow)<uDiffractionSampleControl.x) {
+        vec4 ids=diffractionSample(uDiffractionReceiverRow,2);
+        if (diffractionId(ids.xy)==outRawObjectId && diffractionId(ids.zw)==outRawMaterialId) {
+            receiverIndex=uDiffractionReceiverRow; receiver=true;
+        }
+    }
     #pragma optionNV(unroll none)
-    for (int r=0; float(r)<uDiffractionSampleControl.x; ++r) {
+    for (int r=0; !receiver && float(r)<uDiffractionSampleControl.x; ++r) {
         vec4 ids=diffractionSample(r,2);
         if (diffractionId(ids.xy)==outRawObjectId && diffractionId(ids.zw)==outRawMaterialId) {
             receiverIndex=r; receiver=true; break;
         }
     }
     if (!receiver) return vec3(0.0);
-    bool complete;
-    float source=diffractionSourceVisibility(vWorldPosition,complete);
+    bool complete=true;
+    float source=0.0;
+#ifdef FIXTURE_REALTIME
+    // The gather pass keeps only the gather term, so it traces no direct ray.
+    if (realtimeGatherMode() != 1)
+#endif
+    source=diffractionSourceVisibility(vWorldPosition,complete);
+#ifdef FIXTURE_REALTIME
+    if (!complete) source=0.0;
+#else
     if (!complete) return diffractionDiagnosticReason(2);
+#endif
     float bands[8];
     #pragma optionNV(unroll none)
     for (int b=0; b<8; ++b) bands[b]=source*max(dot(normal,uDiffractionSourceDirectionTrace.xyz),0.0)
@@ -3430,22 +4396,45 @@ vec3 evaluateSpectralReceiver(vec3 normal, out bool receiver) {
     gratingStride=max(1,int(sqrt(uDiffractionSampleControl.y)));
     gratingFirst=int(realtimeNoise()*float(gratingStride));
     realtimeStride=float(gratingStride);
+#ifdef REALTIME_ABLATE_RECEIVER
+    gratingFirst=int(uDiffractionSampleControl.y);
+#endif
+    vec3 upsampled;
+    bool reused = realtimeGatherMode()==2 && realtimeGatherUpsample(upsampled);
+    if (realtimeGatherMode()==2) gRealtimeGatherProbe = reused ? 2 : 1;
+    gRealtimeGatherReused = reused;
+    if (realtimeGatherMode()==1) for (int b=0; b<8; ++b) bands[b]=0.0;
+    if (reused) gratingFirst=int(uDiffractionSampleControl.y);
 #endif
     #pragma optionNV(unroll none)
     for (int g=gratingFirst; float(g)<uDiffractionSampleControl.y; g+=gratingStride) {
         int index=int(uDiffractionSampleControl.x)+g;
         vec3 direction; float distance;
+#ifdef FIXTURE_REALTIME
+        // The same ray-free segment as the grating's gather. A grating row the source
+        // does not light, or that faces away from this point, costs three fetches.
+        float sourceVisible;
+        if (!realtimeGatherSegment(index,normal,direction,distance,sourceVisible)) continue;
+#else
         bool visible=diffractionSegment(index,normal,direction,distance,complete);
         if (!complete) return diffractionDiagnosticReason(3);
         float sourceVisible=diffractionSourceVisibility(diffractionSample(index,0).xyz,complete);
         if (!complete) return diffractionDiagnosticReason(4);
         if (!visible) continue;
+#endif
         vec3 n=diffractionSample(index,1).xyz;
         vec4 t=diffractionSample(index,6),bt=diffractionSample(index,7);
         vec3 localLight=diffractionLocal(uDiffractionSourceDirectionTrace.xyz,t.xyz,bt.xyz,n);
         vec3 outgoing=diffractionLocal(-direction,t.xyz,bt.xyz,n);
+#ifdef FIXTURE_REALTIME
+        // The grating's patch as a coaxial disc of its area, as in the grating's gather.
+        float weight=diffractionSample(index,0).w*max(dot(normal,direction),0.0)
+            *max(outgoing.z,0.0)*pi/(pi*distance*distance+diffractionSample(index,0).w)
+            *diffractionScatterCoverage(vec2(t.w,bt.w));
+#else
         float weight=diffractionSample(index,0).w*max(dot(normal,direction),0.0)
             *max(outgoing.z,0.0)/(distance*distance)*diffractionScatterCoverage(vec2(t.w,bt.w));
+#endif
         #pragma optionNV(unroll none)
         for (int b=0; b<8; ++b) bands[b]+=realtimeStride*weight*sourceVisible*uDiffractionSourceRadiance[b/4][b%4]
             *max(localLight.z,0.0)*diffractionTriangleBsdf(b,vec2(t.w,bt.w),localLight,outgoing);
@@ -3454,6 +4443,10 @@ vec3 evaluateSpectralReceiver(vec3 normal, out bool receiver) {
         bands[b]*=diffractionSample(receiverIndex,4+b/4)[b%4]/pi;
         if (!diffractionSceneFinite(bands[b])) return diffractionDiagnosticReason(5);
     }
+#ifdef FIXTURE_REALTIME
+    if (realtimeGatherMode()==1) { gRealtimeGatherTerm=diffractionBandsToRgb(bands); gRealtimeGatherValid=true; }
+    if (reused) return diffractionBandsToRgb(bands)+upsampled;
+#endif
     return diffractionBandsToRgb(bands);
 }
 
@@ -3492,6 +4485,17 @@ vec3 brushedReliefNormal(vec3 normal, vec3 tangent, vec2 uv, vec3 toView, vec4 r
 vec3 evaluateDiffraction() {
     vec3 normal = uDiffractionSampleControl.w == 1.0
         ? diffractionGeometricNormal() : normalize(vWorldNormal);
+#ifdef FIXTURE_REALTIME
+    // Realtime's grating shades from the interpolated vertex normal on the face's side,
+    // as Path Trace's shading normal does. The face's own normal held every order still
+    // across a facet, and the orb showed its quads as flat blocks of one colour.
+#ifndef REALTIME_ABLATE_SMOOTHNORMAL
+    if (uDiffractionSampleControl.w == 1.0) {
+        vec3 smoothNormal = normalize(vWorldNormal);
+        normal = dot(smoothNormal, normal) < 0.0 ? -smoothNormal : smoothNormal;
+    }
+#endif
+#endif
     vec3 dpdx = dFdx(vWorldPosition);
     vec3 dpdy = dFdy(vWorldPosition);
     vec2 duvdx = dFdx(vUv);
@@ -3500,7 +4504,13 @@ vec3 evaluateDiffraction() {
     if (abs(determinant) <= 1.0e-8)
         return uDiffractionSampleControl.w == 1.0 ? diffractionDiagnosticReason(6) : vec3(0.0);
     vec3 tangent = normalize((dpdx * duvdy.y - dpdy * duvdx.y) / determinant);
-    vec3 toViewWorld = normalize(uCameraTranslation - vWorldPosition);
+#ifdef FIXTURE_REALTIME
+    // The vertices' smooth groove direction, signed as this triangle's dP/du, where it
+    // agrees with it; a constant +X tangent on a polar cap does not, and keeps dP/du.
+    vec3 grooveTangent = vWorldTangent * (dot(vWorldTangent, tangent) < 0.0 ? -1.0 : 1.0);
+    if (dot(grooveTangent, tangent) > 0.7) tangent = grooveTangent;
+#endif
+    vec3 toViewWorld = normalize(fixtureToViewer(vWorldPosition));
     normal = brushedReliefNormal(normal, tangent, vUv, toViewWorld, uDiffractionRoughness);
     tangent = normalize(tangent - normal * dot(normal, tangent));
     vec3 bitangent = normalize(cross(normal, tangent));
@@ -3514,14 +4524,34 @@ vec3 evaluateDiffraction() {
         return vec3(0.0);
     if (uDiffractionSampleControl.w == 1.0)
         return evaluateTriangleDiffraction(tangent,bitangent,normal,outgoing);
+#ifdef FIXTURE_REALTIME
+    // The scene's sky, ambient, sun, lights and emitters through the orders, as Path
+    // Trace lights a grating. The admitted environment and diffuse-plane paths are
+    // Raster's analytic stand-in for that light: added here too, they lit a grating
+    // twice, the second time by a bright grey dome the scene does not have, and the
+    // Grooved Sphere read as an opaque olive ball.
+    if (uDiffractionEnvironment.x == 2.0 && uDiffractionPathKindAndBounce.x != 1.0)
+        return realtimeDiffractionSkyRgb(tangent, bitangent, normal, outgoing);
+#else
     if (uDiffractionEnvironment.x == 2.0 && uDiffractionPathKindAndBounce.x != 1.0)
         return integrateDiffractionEnvironment(outgoing, tangent, bitangent, normal);
+#endif
     if (uDiffractionEnvironment.x == 2.0) {
+#ifdef FIXTURE_REALTIME
+        // No light still leaves the scene's sky, sun and emitters through the orders.
+        if (uLightCount == 0) return realtimeDiffractionSkyRgb(tangent, bitangent, normal, outgoing);
+#else
         if (uLightCount == 0) return vec3(0.0);
+#endif
         vec3 toLight = normalize(rotateQ(fixtureLightRotation(0), vec3(0.0, 0.0, 1.0)));
         incident = vec3(dot(toLight, tangent), dot(toLight, bitangent), dot(toLight, normal));
     }
+#ifdef FIXTURE_REALTIME
+    // A light below the horizon still leaves the environment.
+    if (incident.z <= 1.0e-6) return realtimeDiffractionSkyRgb(tangent, bitangent, normal, outgoing);
+#else
     if (incident.z <= 1.0e-6) return vec3(0.0);
+#endif
 
     float duty = uDiffractionMicrostructure.x;
     float substrateN = uDiffractionMicrostructure.y;
@@ -3612,9 +4642,13 @@ vec3 evaluateDiffraction() {
         referenceWhiteY += quadrature * spectral.w;
     }
     xyz /= max(referenceWhiteY, 1.0e-8);
-    return vec3(3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z,
+    vec3 lit = vec3(3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z,
                 -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z,
                 0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z);
+#ifdef FIXTURE_REALTIME
+    lit += realtimeDiffractionSkyRgb(tangent, bitangent, normal, outgoing);
+#endif
+    return lit;
 }
 
 #endif
@@ -3649,7 +4683,52 @@ vec3 baseSurfaceDirect(vec3 base, float metallic, float roughness,
                   * (1.0 - transmission) / 3.14159265358979323846;
     return (distribution * visibility * fresnel + diffuse) * nl;
 }
+#ifdef FIXTURE_REALTIME
+#if FIXTURE_DIFFRACTION
+// One edge's part of a polygon's vector irradiance (realtimediffraction::emitterIrradianceVector).
+vec3 realtimeEdgeIrradiance(vec3 p, vec3 q) {
+    vec3 n = cross(p, q);
+    float length2 = dot(n, n);
+    return length2 > 1.0e-24 ? 0.5 * acos(clamp(dot(p, q), -1.0, 1.0)) * n * inversesqrt(length2) : vec3(0.0);
+}
+// Direct light from the scene's glowing triangles, the room lights Path Trace samples as
+// emitters (realtime_diffraction_emitters.h). Each triangle's vector irradiance gives its
+// power and mean direction, exact for the diffuse term above the horizon. The light is
+// unshadowed: shadow rays from beside the orb visit much of its BVH, and eight a pixel ran
+// the plate's submission past the driver's context switch timeout. coatLight gathers the coat's share.
+vec3 realtimeEmitterDirect(vec3 position, vec3 normal, vec3 toView, vec3 base, float metallic,
+    float roughness, float dielectric, float transmission, inout vec3 coatLight) {
+    vec3 sum = vec3(0.0);
+#ifdef REALTIME_ABLATE_EMITTERLIGHT
+    return sum;
+#endif
+    #pragma optionNV(unroll none)
+    for (int t = 0; t < uRealtimeEmitterTriangles; ++t) {
+        int record = uRealtimeEmitterFirst + 3 * t;
+        vec4 a = sceneTableRead(record), b = sceneTableRead(record + 1), c = sceneTableRead(record + 2);
+        vec3 A = a.xyz - position, B = b.xyz - position, C = c.xyz - position;
+        vec3 plane = cross(B - A, C - A);
+        float planeLength = length(plane);
+        // A point in the triangle's own plane is the emitter itself, which shows its emission.
+        if (!(planeLength > 0.0) || abs(dot(plane, A)) <= 1.0e-6 * planeLength) continue;
+        vec3 va = normalize(A), vb = normalize(B), vc = normalize(C);
+        vec3 vector = realtimeEdgeIrradiance(va, vb) + realtimeEdgeIrradiance(vb, vc) + realtimeEdgeIrradiance(vc, va);
+        if (dot(vector, va + vb + vc) < 0.0) vector = -vector;
+        float magnitude = length(vector);
+        if (!(magnitude > 0.0)) continue;
+        vec3 toLight = vector / magnitude;
+        if (dot(normal, toLight) <= 0.0) continue;
+        vec3 radiance = vec3(a.w, b.w, c.w) * magnitude;
+        sum += radiance * baseSurfaceDirect(base, metallic, roughness, dielectric, transmission, normal, toLight, toView);
+        coatLight += radiance * max(dot(normal, toLight), 0.0);
+    }
+    return sum;
+}
+#endif
+void fixtureSceneMain() {
+#else
 void main() {
+#endif
     if(uSelectedRoughResolve>0.5) {
         ivec2 nativePixel=ivec2(floor(gl_FragCoord.xy));
         ivec2 pixel=ivec2(nativePixel.x,int(uRoughCameraControl.w)-1-nativePixel.y);
@@ -3668,21 +4747,41 @@ void main() {
         outRawMotion=texelFetch(uEmissiveTexture,nativePixel,0).xy;
         outRawObjectId=object;outRawMaterialId=owners.z|(owners.w<<16u);
         outColor=compositePass(vec4(result.rgb,1.0));
+        // Probe: the rough-glass resolve's own output.
+        if (fixtureNonfiniteBits(outColor)) outColor=fixtureProbeColor(14u);
         return;
     }
     if (uSkyBackground>0.5) {
         outLinearDepth=1.0; outRawNormal=vec4(0.0); outRawEmission=vec4(0.0);
         outRawMask=0.0; outRawMaterialId=0u; outRawObjectId=0u; outRawMotion=vec2(0.0);
+        // The world fog's backdrop pass: a frame with no sky draw fogs its
+        // cleared backdrop, uSky[0], over the far distance.
+        if (uSkyBackground>1.5) {
+            outColor=compositePass(uSky[0]);
+            if (fixtureNonfiniteBits(outColor)) outColor=fixtureProbeColor(15u);
+            return;
+        }
+        // Solid viewport shading draws a neutral studio backdrop instead of the sky.
+        if (uViewportSolid.x>0.5) {
+            float up=clamp(normalize(vWorldPosition).y*0.5+0.5,0.0,1.0);
+            outColor=compositePass(vec4(mix(vec3(0.030),vec3(0.075),up),1.0));
+            return;
+        }
         vec3 radiance=uSky[0].w>1.5 ? environmentImageRadiance(vWorldPosition,uSky[0],uSky[1])
-            : analyticSkyRadiance(vWorldPosition,uSky[0],uSky[1],uSky[2],uSky[3],uSky[4]);
+            : analyticSkyBackground(vWorldPosition,uSky[0],uSky[1],uSky[2],uSky[3],uSky[4]);
+#ifdef FIXTURE_REALTIME
+        // Path Trace's camera rays see the scene's ambient colour as environment too.
+        radiance+=uAmbient;
+#endif
         // Probe: name a nonfinite sky result so the whole-output readback can
         // attribute it to this branch before the branch bounds it to zero. The
         // payload is a literal because non-diffraction program variants compile
         // without diffractionDiagnosticReason, and those variants draw sky too.
-        if (any(isnan(radiance))||any(isinf(radiance))) {
-            outColor=vec4(vec3(uintBitsToFloat(0x7fc00000u|(8u<<10u))),1.0); return;
+        if (fixtureNonfiniteBits(vec4(radiance,1.0))) {
+            outColor=fixtureProbeColor(8u); return;
         }
         outColor=compositePass(vec4(radiance,1.0));
+        if (fixtureNonfiniteBits(outColor)) outColor=fixtureProbeColor(15u);
         return;
     }
     outLinearDepth = vLinearDepth;
@@ -3736,7 +4835,7 @@ void main() {
                 uint reason = (diagnosticPayload[component] >> 10u) & 0xffu;
                 namedRefusal = namedRefusal || (reason >= 1u && reason <= 7u);
             }
-            if (namedRefusal) { outColor = vec4(diffraction, 1.0); return; }
+            if (namedRefusal) { outColor = fixtureTaggedColor(diffraction); return; }
             diffraction = vec3(0.0);
         }
         outColor = vec4((uDiffractionPathIndex == 0 ? vLitBase * (1.0 - clamp(occupancy, 0.0, 1.0))
@@ -3748,6 +4847,17 @@ void main() {
         }
         outColor.rgb = vNoteAppearance.rgb * (outColor.rgb
             + (uDiffractionPathIndex == 0 ? vec3(vNoteAppearance.a) : vec3(0.0)));
+        // The grating's own output: a nonfinite base or note tint, nonfinite
+        // arithmetic after the diffraction guard, or a value the half-float target
+        // stores as infinity, where a later path's additive blend can meet an
+        // infinity of the other sign (authored lighting only, whose readback refuses
+        // an infinity anyway). Past path 0 the blend keeps the target's alpha,
+        // so the readback site names the band and path as well.
+        if (any(isnan(outColor.rgb)) || any(isinf(outColor.rgb)))
+            outColor = fixtureProbeColor(any(isnan(vLitBase)) || any(isinf(vLitBase))
+                || any(isnan(vNoteAppearance)) || any(isinf(vNoteAppearance)) ? 16u : 17u);
+        else if (uDiffractionEnvironment.x == 3.0 && any(greaterThan(abs(outColor.rgb), vec3(65504.0))))
+            outColor = fixtureProbeColor(18u);
         return;
     }
     bool receiverTransport = uDiffractionSampleControl.w == 1.0;
@@ -3762,16 +4872,32 @@ void main() {
             // Probe: a receiver result that is neither finite nor a tagged
             // transport refusal is attributed to this branch before it is
             // bounded to zero.
-            if (any(isnan(color))||any(isinf(color))) {
+            if (fixtureNonfiniteBits(vec4(color,1.0))) {
                 uvec3 payload=floatBitsToUint(color);
                 bool named=false;
                 for (int c=0;c<3;++c) {
                     uint r=(payload[c]>>10u)&0xffu;
                     named=named||(r>=1u&&r<=7u);
                 }
-                if (!named) { outColor=vec4(diffractionDiagnosticReason(12),1.0); return; }
+                if (!named) { outColor=fixtureProbeColor(12u); return; }
             }
-            outColor=vec4(color,1.0); return;
+            outColor=fixtureTaggedColor(color);
+#ifdef FIXTURE_REALTIME
+            // The receiver is lit by the room's glowing objects as well as the transport,
+            // as in Path Trace. The light is diffuse and smooth, so it rides in the gather
+            // term: the gather pass adds it there, and a full-pass pixel that reused the
+            // term already holds it. A pixel that gathered itself lights itself.
+#ifndef REALTIME_ABLATE_EMITTERPLATE
+            if (!fixtureNonfiniteBits(vec4(color,1.0)) && (realtimeGatherMode() == 1 || !gRealtimeGatherReused)) {
+                vec3 coatLight = vec3(0.0);
+                vec3 light = realtimeEmitterDirect(vWorldPosition, normalize(vWorldNormal),
+                    fixtureToViewer(vWorldPosition), vBaseColor, 0.0, 1.0, 0.04, 0.0, coatLight);
+                if (realtimeGatherMode() == 1) gRealtimeGatherTerm += light;
+                else outColor.rgb += light;
+            }
+#endif
+#endif
+            return;
         }
     }
 #endif
@@ -3819,10 +4945,10 @@ void main() {
         vec3 terminal, masked, tail;
         int status, queryCount, microEvents=0;
         if (uGlassTransport.x == 2.0)
-            roughThinInterfaceTransport(uCameraTranslation,vWorldPosition,normal,roughness,true,
+            roughThinInterfaceTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,normal,roughness,true,
                 terminal,masked,tail,status,queryCount);
         else
-            roughCameraTransport(uCameraTranslation,vWorldPosition,roughness,true,
+            roughCameraTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,roughness,true,
                 vec2(gl_FragCoord.x,uRoughCameraControl.w-gl_FragCoord.y)+uRoughCameraControl.yz,
                 terminal,masked,tail,status,queryCount,microEvents);
         outColor = vec4(terminal,float(status));
@@ -3835,6 +4961,76 @@ void main() {
         // roughness <= 0.0 test. Either way this block always discards.
         discard;
 #endif
+    }
+    if (imageOutput == 0 && uViewportSolid.x > 0.5) {
+        // Workbench-style solid shading: view-space lighting over a flat colour.
+        vec4 inverseView = vec4(-uCameraRotation.xyz, uCameraRotation.w);
+        vec3 viewNormal = normalize(normal + 2.0 * cross(inverseView.xyz,
+            cross(inverseView.xyz, normal) + inverseView.w * normal));
+        if (!gl_FrontFacing) viewNormal = -viewNormal;
+        int colourMode = int(uViewportSolid.w + 0.5);
+        vec3 albedo = vec3(0.8);
+        if (colourMode == 0) albedo = clamp(vBaseColor, vec3(0.0), vec3(1.0));
+        if (colourMode == 1 || colourMode == 2) {
+            uint key = colourMode == 1 ? outRawObjectId : outRawObjectId * 0x85ebca6bu + outRawMaterialId;
+            uint hash = key * 0x9e3779b9u;
+            hash ^= hash >> 15u;
+            hash *= 0x2c1b3c6du;
+            hash ^= hash >> 12u;
+            float hue = float(hash & 1023u) / 1023.0;
+            vec3 tint = clamp(abs(mod(hue * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+            // Object colour is a soft tint of one hue; Random spreads saturation too.
+            float saturation = colourMode == 1 ? 0.35 : 0.45 + 0.4 * float((hash >> 10u) & 255u) / 255.0;
+            albedo = mix(vec3(1.0), tint, saturation) * 0.75;
+        }
+        vec3 shade;
+        if (uViewportSolid.y < 0.5) {
+            // Studio: key, fill and back light fixed to the view, as Blender's default rig.
+            vec3 key = normalize(vec3(-0.45, 0.6, 0.65));
+            vec3 fill = normalize(vec3(0.7, 0.15, 0.7));
+            vec3 back = normalize(vec3(0.1, -0.5, -0.85));
+            float keyLight = max(dot(viewNormal, key), 0.0);
+            shade = vec3(0.22)
+                + vec3(1.00, 0.97, 0.92) * 0.85 * keyLight
+                + vec3(0.80, 0.86, 1.00) * 0.35 * max(dot(viewNormal, fill), 0.0)
+                + vec3(0.9) * 0.25 * max(dot(viewNormal, back), 0.0);
+            shade = shade * albedo
+                + vec3(0.18) * pow(max(dot(viewNormal, normalize(key + vec3(0.0, 0.0, 1.0))), 0.0), 24.0);
+        } else {
+            // Matcaps are procedural, indexed by the view normal: clay, metal, toon, jade.
+            int matcap = int(uViewportSolid.z + 0.5);
+            vec2 m = viewNormal.xy;
+            float facing = clamp(viewNormal.z, 0.0, 1.0);
+            float top = clamp(dot(viewNormal, normalize(vec3(-0.35, 0.65, 0.68))), 0.0, 1.0);
+            vec3 cap;
+            if (matcap == 1) {
+                float band = 0.5 + 0.5 * sin(m.y * 4.2 + 0.6);
+                cap = mix(vec3(0.10, 0.11, 0.13), vec3(0.95, 0.96, 1.0), band * band)
+                    + vec3(1.0) * pow(top, 40.0) * 0.8;
+            } else if (matcap == 2) {
+                float step = top > 0.75 ? 1.0 : top > 0.35 ? 0.72 : top > 0.08 ? 0.45 : 0.28;
+                cap = vec3(step) + vec3(0.35) * float(facing < 0.25);
+            } else if (matcap == 3) {
+                float wrap = clamp((dot(viewNormal, normalize(vec3(-0.3, 0.6, 0.74))) + 0.5) / 1.5, 0.0, 1.0);
+                cap = mix(vec3(0.10, 0.28, 0.20), vec3(0.62, 0.92, 0.74), wrap)
+                    + vec3(0.25, 0.35, 0.30) * pow(1.0 - facing, 3.0);
+            } else {
+                cap = vec3(0.16, 0.14, 0.13) + vec3(0.80, 0.74, 0.68) * top
+                    + vec3(0.25) * pow(1.0 - facing, 2.5);
+            }
+            shade = cap * (colourMode == 3 ? vec3(1.0) : albedo * 1.25);
+        }
+        if (uViewportSolidEffects.x > 0.5) {
+            // Screen-space cavity: convex ridges brighten, creases darken.
+            float curvature = dFdx(viewNormal.x) - dFdy(viewNormal.y);
+            curvature = clamp(curvature * 6.0, -1.0, 1.0);
+            shade *= curvature < 0.0 ? 1.0 + 0.55 * curvature : 1.0 + 0.30 * curvature;
+        }
+        // X-ray: the renderer draws every object back to front with blending, both
+        // face sides and no depth writes, so this alpha shows what lies behind.
+        float solidAlpha = uViewportSolidEffects.y > 0.5 ? 0.4 : 1.0; // fixtureviewportsolid::kXrayAlpha
+        outColor = compositePass(vec4(max(shade, vec3(0.0)), solidAlpha));
+        return;
     }
     if (imageOutput != 0) {
         vec3 image = uImageOutput.yzw;
@@ -3850,6 +5046,11 @@ void main() {
                          32u + ((hash >> 16u) & 191u)) / 255.0;
         }
         outColor = vec4(image, alpha);
+        return;
+    }
+    // A Volume Material draws no surface: its draw marches the medium inside its bounds.
+    if (int(uMedium[0].w) == 2) {
+        outColor = compositePass(mediumVolume(vWorldPosition, gl_FrontFacing));
         return;
     }
 #if FIXTURE_SMOOTH_GLASS
@@ -3880,26 +5081,26 @@ void main() {
         // Every glass draw of this program has roughness 0, so the selection below takes one of
         // its two smooth arms. The rough walks are not in the text.
         if (uGlassTransport.x == 2.0)
-            glass = thinInterfaceTransport(uCameraTranslation,vWorldPosition,normal,complete,glassStatus);
+            glass = thinInterfaceTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,normal,complete,glassStatus);
         else
-            glass = glassTransport(uCameraTranslation,vWorldPosition,complete,glassStatus);
+            glass = glassTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,complete,glassStatus);
 #else
         if (uGlassTransport.x == 2.0 && roughness == 0.0)
-            glass = thinInterfaceTransport(uCameraTranslation,vWorldPosition,normal,complete,glassStatus);
+            glass = thinInterfaceTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,normal,complete,glassStatus);
         else if (uGlassTransport.x == 2.0) {
             vec3 terminal, masked, tail;
             int status, queryCount;
-            glass = roughThinInterfaceTransport(uCameraTranslation,vWorldPosition,normal,roughness,false,
+            glass = roughThinInterfaceTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,normal,roughness,false,
                 terminal,masked,tail,status,queryCount);
             complete = status == 1;
             glassStatus = glassRoughReason(status);
         }
         else if (roughness == 0.0)
-            glass = glassTransport(uCameraTranslation,vWorldPosition,complete,glassStatus);
+            glass = glassTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,complete,glassStatus);
         else {
             vec3 terminal, masked, tail;
             int status, queryCount, microEvents;
-            glass = roughCameraTransport(uCameraTranslation,vWorldPosition,roughness,false,
+            glass = roughCameraTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,roughness,false,
                 vec2(gl_FragCoord.x,uRoughCameraControl.w-gl_FragCoord.y)+uRoughCameraControl.yz,
                 terminal,masked,tail,status,queryCount,microEvents);
             complete = status == (uRoughCameraControl.x==2.0?33:1);
@@ -3921,10 +5122,12 @@ void main() {
     vec3 directBase = vec3(0.0);
     vec3 directCoat = vec3(0.0);
     vec3 skyBase = vec3(0.0);
-    vec3 toView = uCameraTranslation - vWorldPosition;
+    vec3 toView = fixtureToViewer(vWorldPosition);
 #ifdef FIXTURE_REALTIME
     if (int(uRealtimeControl.x) == 1) {
         outColor = realtimeReflection(vWorldPosition, normal, toView, vBaseColor * texel.rgb, metallic, roughness, dielectric);
+        // Probe: the reflection phase blends over phase 0 and has its own output.
+        if (fixtureNonfiniteBits(outColor)) outColor = fixtureProbeColor(13u);
         return;
     }
 #endif
@@ -3964,26 +5167,33 @@ void main() {
         vec3 delta = fixtureLightPosition(lightIndex).xyz - vWorldPosition;
         vec3 toLight = kind == 0 ? rotateQ(fixtureLightRotation(lightIndex), vec3(0.0, 0.0, 1.0)) : baseSurfaceUnit(delta);
         float attenuation = 1.0;
-        if (kind == 1 || kind == 3) {
+        if (kind == 1 || kind == 3 || kind == 4) {
             float lightDistance = length(delta);
             attenuation = 1.0 / max(lightDistance * lightDistance, 1.0);
-            float range = fixtureLightPosition(lightIndex).w;
+            float range = kind == 4 ? 0.0 : fixtureLightPosition(lightIndex).w;
             if (range > 0.0) attenuation *= pow(clamp(1.0 - lightDistance / range, 0.0, 1.0), 2.0);
             if (kind == 3) {
                 vec3 spotDirection = rotateQ(fixtureLightRotation(lightIndex), vec3(0.0, 0.0, -1.0));
                 float coneCosine = dot(spotDirection, baseSurfaceUnit(vWorldPosition - fixtureLightPosition(lightIndex).xyz));
                 attenuation *= smoothstep(fixtureLightCone(lightIndex).y, fixtureLightCone(lightIndex).x, coneCosine);
             }
+            if (kind == 4) attenuation *= fixtureAreaEmission(lightIndex, -toLight);
         }
         vec3 radiance = fixtureLightColor(lightIndex).rgb * fixtureLightColor(lightIndex).a * attenuation;
+        bool shadowed = fixtureLightShadows(lightIndex);
 #ifdef FIXTURE_REALTIME
-        float visibility = uAlphaModeCutoff.x == 0.0 && transmission == 0.0 && alpha >= 1.0
-            ? realtimeSoftVisibility(vWorldPosition,vWorldNormal,
-                toLight,kind == 0 ? 3.402823e38 : length(delta)) : 1.0;
+        // A sized light's shadow softens by the angle it subtends from here.
+        float lightSize = fixtureLightSize(lightIndex);
+        float subtended = kind == 0 ? lightSize : atan(lightSize, max(length(delta), 1e-4));
+        float visibility = !(shadowed && uAlphaModeCutoff.x == 0.0 && transmission == 0.0 && alpha >= 1.0) ? 1.0
+            : kind == 4 ? realtimeAreaVisibility(lightIndex,vWorldPosition,vWorldNormal)
+            : realtimeSoftVisibility(vWorldPosition,vWorldNormal,
+                toLight,kind == 0 ? 3.402823e38 : length(delta),subtended);
 #else
         float visibility = uAlphaModeCutoff.x == 0.0 && transmission == 0.0 && alpha >= 1.0
             ? opaqueVisibility(vWorldPosition,vWorldNormal,
                 toLight,kind == 0 ? 3.402823e38 : length(delta),uOpaqueControl) : 1.0;
+        if (!shadowed) visibility = 1.0;
 #endif
         directBase += radiance * baseSurfaceDirect(vBaseColor * texel.rgb, metallic, roughness,
             dielectric, transmission, normal, toLight, toView) * visibility;
@@ -3999,6 +5209,14 @@ void main() {
 #ifdef FIXTURE_REALTIME
     if (uSky[0].w > 0.5 && uAlphaModeCutoff.x == 0.0 && transmission == 0.0 && alpha >= 1.0)
         skyBase *= realtimeSkyVisibility(vWorldPosition, vWorldNormal);
+    // The room's glowing objects light it as Path Trace's emitters do. The gather pass keeps
+    // only the grating's gather term, so it skips them. The emitter table is declared with the
+    // grating's sources, so a frame without a grating keeps its old cost.
+#if FIXTURE_DIFFRACTION && !defined(REALTIME_ABLATE_EMITTERSURFACE)
+    if (realtimeGatherMode() != 1)
+        directBase += realtimeEmitterDirect(vWorldPosition, normal, toView, vBaseColor * texel.rgb,
+            metallic, roughness, dielectric, transmission, directCoat);
+#endif
 #endif
     float diffuseWeight = (1.0 - metallic) * (1.0 - 0.5 * roughness) * (1.0 - transmission);
     float specularWeight = mix(dielectric, 1.0, metallic) * (1.0 - roughness);
@@ -4023,11 +5241,31 @@ void main() {
     // can attribute it to this branch before the branch bounds it to zero. The
     // payload is a literal because non-diffraction program variants compile
     // without diffractionDiagnosticReason, and those variants draw base too.
-    if (any(isnan(outColor))||any(isinf(outColor))) {
-        outColor = vec4(vec3(uintBitsToFloat(0x7fc00000u|(9u<<10u))), 1.0); return;
+    if (fixtureNonfiniteBits(outColor)) {
+        outColor = fixtureProbeColor(9u); return;
     }
     outColor = compositePass(outColor);
+    // Probe: the pass composite (fog, AOV modes and view transform) runs after the base probe.
+    if (fixtureNonfiniteBits(outColor)) outColor = fixtureProbeColor(15u);
 }
+#ifdef FIXTURE_REALTIME
+// The gather pass writes the gather term alone, alpha 1 where a grating or receiver
+// gathered and 0 elsewhere, so the full pass reads only gather surfaces.
+void main() {
+    gRealtimeGatherTerm = vec3(0.0);
+    gRealtimeGatherValid = false;
+    gRealtimeGatherReused = false;
+    gRealtimeGatherProbe = 0;
+    fixtureSceneMain();
+    if (realtimeGatherMode() == 1) {
+        bool valid = gRealtimeGatherValid && !fixtureNonfiniteBits(vec4(gRealtimeGatherTerm, 1.0));
+        outColor = vec4(valid ? gRealtimeGatherTerm : vec3(0.0), valid ? 1.0 : 0.0);
+    }
+    // The probe's colour: red where a pixel gathered itself, green where it reused the term.
+    if (realtimeGatherMode() == 2 && uRealtimeGather.w > 0.5)
+        outColor = vec4(float(gRealtimeGatherProbe == 1), float(gRealtimeGatherProbe == 2), 0.0, 1.0);
+}
+#endif
 )glsl";
 
 const char* kDiffractionResolveVertexShader = R"glsl(#version 330 core
@@ -4598,7 +5836,7 @@ struct RoughSelectedCamera final
             gl.Uniform4f(loc("uTile"),float(tile.x),float(tile.y),float(tile.width),float(tile.height));
             std::array<float,4> rotation{};storeFixtureQuaternion(rotation,key.camera.transform.rotation);
             gl.Uniform4fv(loc("uCameraRotation"),1,rotation.data());
-            gl.Uniform4f(loc("uProjection"),std::tan(key.camera.verticalFovRadians*.5f),float(key.width)/key.height,0,0);
+            gl.Uniform4f(loc("uProjection"),glasscaustics::cameraProjectionX(key.camera),float(key.width)/key.height,0,0);
             const auto& camera=key.camera.transform.translation;
             gl.Uniform3f(loc("uCameraTranslation"),camera.x,camera.y,camera.z);
             gl.Uniform1i(loc("uGlassVisibility"),6);gl.Uniform4fv(loc("uGlassControl"),1,queryControl.data());
@@ -4723,7 +5961,7 @@ void main() {
     uint index=gl_GlobalInvocationID.x+uDispatchOffset;
     vec3 ray=causticCameraRay(cameraPixel(index),uCameraRotation,uProjection,uExtent);
     atomicAdd(executed[index].x,1u);
-    GlassClosestHit hit=glassSceneClosestHit(uCameraTranslation,ray,0.0,3.402823e38,uGlassControl);
+    GlassClosestHit hit=glassSceneClosestHit(causticCameraOrigin(cameraPixel(index),uCameraTranslation,uCameraRotation,uProjection,uExtent),ray,0.0,3.402823e38,uGlassControl);
     atomicAdd(executed[index].z,1u);
     primary[index].ray=vec4(ray,0.0);primary[index].position=vec4(hit.position,hit.distance);
     primary[index].normal=vec4(hit.outwardNormal,hit.entering?1.0:0.0);
@@ -4760,7 +5998,7 @@ void main() {
         int status,queries=int(result.masked.w),events=int(result.tail.w);
         if(uLaneBegin==0) atomicAdd(executed[index].y,1u); // Count the actual expensive entry before any event walk.
         int queriesBefore=max(queries,1),eventsBefore=events;
-        vec3 color=roughGlassTransportV2Selected(uCameraTranslation,selection.ray.xyz,first,uRoughness,false,
+        vec3 color=roughGlassTransportV2Selected(causticCameraOrigin(cameraPixel(index),uCameraTranslation,uCameraRotation,uProjection,uExtent),selection.ray.xyz,first,uRoughness,false,
             glassCameraPixelKey(cameraPixel(index)),uLaneBegin,uLaneEnd,result.color.rgb,terminal,masked,tail,status,queries,events);
         result.color=vec4(color,float(status));result.terminal=vec4(terminal,float(status));
         result.masked=vec4(masked,float(queries));result.tail=vec4(tail,float(events));
@@ -4844,13 +6082,16 @@ struct OpenGlFixtureUniformLocations final
     int opaqueTexture = -1, opaqueControl = -1;
     int glassTexture = -1, glassControl = -1, glassTransport = -1;
     int glassTransport2 = -1;
+    int medium = -1, worldFog = -1;
     int roughCameraControl = -1;
     int objectMatrix = -1;
+    int previousObjectMatrix = -1; // read only by Motion
     int tangentHandednessSign = -1;
     int useInstanceMatrix = -1;
     int cameraRotation = -1;
     int cameraTranslation = -1;
     int projection = -1;
+    int clipDepthRange = -1;
     int baseColor = -1;
     int materialParams = -1;
     int surfaceCoating = -1;
@@ -4872,6 +6113,7 @@ struct OpenGlFixtureUniformLocations final
     int emissiveTexturePresence = -1;
     int alphaModeCutoff = -1;
     int imageOutput = -1;
+    int viewportSolid = -1, viewportSolidEffects = -1;
     int sceneTable = -1, sceneTableObjects = -1, rawObjectIndex = -1;
     int passProgramControl = -1, passModes = -1, passColors = -1, passReferences = -1, passTransforms = -1;
     int motionRotation = -1, motionTranslationScale = -1;
@@ -4879,6 +6121,8 @@ struct OpenGlFixtureUniformLocations final
     int motionViewport = -1;
     int usePreviousDeformation = -1, noteMotion = -1, previousNoteTransforms = -1;
     int vertexTime = -1, vertexSpectrum = -1, previousVertexSpectrum = -1, vertexDisplacementLimits = -1;
+    int vertexWaves = -1; // read only by Ocean Waves programs, so not part of complete()
+    int vertexControls = -1; // read only by Vertex Control Parameter programs, likewise
     int materialKind = -1;
     int diffractionGeometry = -1;
     int diffractionSecondaryGeometry = -1;
@@ -4932,14 +6176,16 @@ struct OpenGlFixtureUniformLocations final
             && noteInstanceIndex >= 0 && noteMeshScale >= 0
             && noteAppearanceLow >= 0 && noteAppearanceHigh >= 0;
         // Smooth glass: the transport GLSL (fixture_smooth_glass.h) reads receivers and emission
-        // from the scene table. The glass query reads glassTexture and glassControl.
-        // The paired caustic volume text also reads GU_GlassTransport2.
+        // from the scene table (sceneTable, sceneTableObjects). The glass query reads glassTexture
+        // and glassControl. The paired caustic volume text also reads GU_GlassTransport2.
         const bool glass = ! smoothGlass
-            || (glassTexture >= 0 && glassControl >= 0
+            || (glassTexture >= 0 && glassControl >= 0 && sceneTable >= 0 && sceneTableObjects >= 0
                 && (! causticVolume || glassTransport2 >= 0));
         // Diffraction: the #if FIXTURE_DIFFRACTION blocks and diffractionQueryShader. materialKind is
         // read only by the diffraction block in main. diffractionInstanceCount reaches the fragment
-        // only through vDiffractionInstance, which only that block reads.
+        // only through vDiffractionInstance, which only the exact segment query reads, as does
+        // diffractionTriangleCount. Realtime's gathers trace no segment, so its linker drops both.
+        const bool exactSegment = (features & kFixtureFragmentRealtime) == 0;
         const bool diffractionUniforms = ! diffraction
             || (materialKind >= 0 && diffractionGeometry >= 0
             && diffractionSecondaryGeometry >= 0
@@ -4952,9 +6198,10 @@ struct OpenGlFixtureUniformLocations final
             && diffractionFoilField >= 0 && diffractionOccupancyRectangles >= 0
             && diffractionSpatialCounts >= 0
             && diffractionEvaluationSchedule >= 0 && diffractionEnvironment >= 0
-            && diffractionPathIndex >= 0 && diffractionTriangleCount >= 0
+            && diffractionPathIndex >= 0 && (! exactSegment || diffractionTriangleCount >= 0)
             && diffractionQueryTexture >= 0 && diffractionQueryControl >= 0
-            && diffractionSamples >= 0 && diffractionSampleControl >= 0 && diffractionInstanceCount >= 0
+            && diffractionSamples >= 0 && diffractionSampleControl >= 0
+            && (! exactSegment || diffractionInstanceCount >= 0)
             && diffractionSourceDirectionTrace >= 0 && diffractionSourceRadiance >= 0 && diffractionRayMinimum >= 0);
         // Diffraction layer: only the stam_diffraction_layer.h module and the #if FIXTURE_STAM_LAYER
         // blocks in main read uStamLayer.
@@ -5278,6 +6525,16 @@ public:
         unsigned id = 0;
         unsigned diffractionResolveId = 0;
         unsigned diffractionResolveVao = 0;
+        // The Realtime depth-of-field pass, built on the first frame whose camera has a lens.
+        unsigned bokehId = 0;
+        unsigned bokehVao = 0;
+        // The Raster and Realtime velocity motion blur pass, built on the first frame with a shutter.
+        unsigned velocityBlurId = 0;
+        unsigned velocityBlurVao = 0;
+        // Realtime's grating mirror pass over the gather target (realtime_diffraction_mirror.h),
+        // built on the first gathered grating frame.
+        unsigned mirrorId = 0;
+        unsigned mirrorVao = 0;
         // The Preview glass variant of this program: the same text with the Preview
         // camera walk budget. Built after the first Preview draw, without a wait, from
         // the disk binary cache or an async compile. Until it is Ready, Preview draws
@@ -5314,6 +6571,12 @@ public:
                 if (id != 0) gl.DeleteProgram(id);
                 if (diffractionResolveId != 0) gl.DeleteProgram(diffractionResolveId);
                 if (diffractionResolveVao != 0) gl.DeleteVertexArrays(1, &diffractionResolveVao);
+                if (bokehId != 0) gl.DeleteProgram(bokehId);
+                if (bokehVao != 0) gl.DeleteVertexArrays(1, &bokehVao);
+                if (velocityBlurId != 0) gl.DeleteProgram(velocityBlurId);
+                if (velocityBlurVao != 0) gl.DeleteVertexArrays(1, &velocityBlurVao);
+                if (mirrorId != 0) gl.DeleteProgram(mirrorId);
+                if (mirrorVao != 0) gl.DeleteVertexArrays(1, &mirrorVao);
             }
         }
     };
@@ -5805,7 +7068,8 @@ struct OpenGlCameraGlassGratingBatch
     glasscaustics::NativeGlassCameraGratingTraceUpload upload;
     glasscaustics::NativeGlassCameraGratingTraceReadback readback;
     glasscaustics::GlassCameraGratingTraceBounds bounds;
-    std::vector<glasscaustics::opengl::CameraGlassGratingPacked> packed;
+    // Native lanes, glassCameraTraceBandLanes(visits) per band.
+    std::vector<glasscaustics::GlassCameraTraceWords> packed;
     unsigned queryTexture=0,sceneBuffer=0;
     std::array<float,4> queryControl{};
     std::uint64_t ownedBytes=0,retainedWork=0,nativeBytes=0;
@@ -5877,7 +7141,7 @@ bool openGlCameraCoverageReadbackBytes(const glasscaustics::CameraCellCoverageRe
 {
     const auto add=[&](std::uint64_t count,std::uint64_t stride=1){
         std::uint64_t amount=0;return renderpassoutput::detail::checkedMultiply(count,stride,amount)
-            &&renderpassoutput::detail::checkedAdd(bytes,amount,bytes)&&bytes<=renderpassoutput::kMaximumTotalBytes;
+            &&renderpassoutput::detail::checkedAdd(bytes,amount,bytes)&&bytes<=renderpassoutput::kRepresentableTotalBytes;
     };
     return add(sizeof(value))&&add(value.submission.frameIdentity.capacity()+1)
         &&add(value.preparation.pixels.capacity(),sizeof(glasscaustics::CameraCellCoverageInput))
@@ -5997,9 +7261,16 @@ public:
         directGratingCohort.reset();directGratingBatch.reset();cameraGlassTraceBatch.reset();directGratingBytes=directGratingWork=0;cameraGlassTraceBytes=cameraGlassTraceWork=0;
         if (previousNoteTexture != 0) glDeleteTextures(1,&previousNoteTexture);
         previousNoteTexture = 0;
+        if (vertexWaveTexture != 0) glDeleteTextures(1,&vertexWaveTexture);
+        vertexWaveTexture = 0;
+        if (vertexControlTexture != 0) glDeleteTextures(1,&vertexControlTexture);
+        vertexControlTexture = 0;
+        if (noteInstanceTexture != 0) glDeleteTextures(1,&noteInstanceTexture);
+        noteInstanceTexture = 0;
         if (diffractionQueryTexture != 0) glDeleteTextures(1, &diffractionQueryTexture);
         if (diffractionSamplesTexture != 0) glDeleteTextures(1, &diffractionSamplesTexture);
-        diffractionQueryTexture = diffractionSamplesTexture = 0;
+        if (diffractionEfficiencyTexture != 0) glDeleteTextures(1, &diffractionEfficiencyTexture);
+        diffractionQueryTexture = diffractionSamplesTexture = diffractionEfficiencyTexture = 0;
         glDeleteTextures(static_cast<int>(roughReceiptTextures.size()), roughReceiptTextures.data());
         roughReceiptTextures = {};
         roughReceiptComplete = false;
@@ -6240,6 +7511,9 @@ public:
     mutable std::array<unsigned,2> gratingCameraSpectrumBuffers{};
     mutable unsigned gratingCameraSpectrumTexture=0;
     mutable std::uint64_t gratingCameraSpectrumBytes=0;
+    // The grating staging frame's admitted bytes, fixed when the stage is
+    // admitted. One complete host walk in the work envelopes is this many bytes.
+    std::uint64_t walkBytes=0;
     mutable std::shared_ptr<const OpenGlGratingCameraSpectrum> gratingCameraSpectrum;
     mutable std::shared_ptr<const glasscaustics::NativeGratingCellSourceUpload> gratingCellSourceUpload;
     mutable std::uint64_t gratingCellSourceBytes=0;
@@ -6283,8 +7557,11 @@ public:
     unsigned texture_ = 0;
     unsigned opaqueTexture = 0;
     unsigned glassTexture = 0;
-    unsigned diffractionQueryTexture = 0, diffractionSamplesTexture = 0;
+    unsigned diffractionQueryTexture = 0, diffractionSamplesTexture = 0, diffractionEfficiencyTexture = 0;
     unsigned previousNoteTexture = 0;
+    unsigned vertexWaveTexture = 0;
+    unsigned vertexControlTexture = 0;
+    unsigned noteInstanceTexture = 0;
     unsigned accumulationTexture_ = 0;
     unsigned depthTexture_ = 0;
     std::array<unsigned, 3> roughReceiptTextures {};
@@ -6569,6 +7846,28 @@ static bool allocateFixtureCameraAttachments(
     const unsigned drawBuffers[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
         GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4,
         GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT6, GL_COLOR_ATTACHMENT7 };
+    // A diffraction frame draws into its accumulation target and writes the base
+    // Color only at its resolve. Until then the base Color holds whatever its storage
+    // held: a fresh allocation is undefined, and a pooled one keeps an earlier frame's
+    // Color, which no Preview frame validated. The whole-output readback reads it
+    // before any scene draw and refused the diffraction orb on an unlisted NaN
+    // payload (0xffffffff, a value no diffraction or resolve shader writes) there.
+    // The frame now owns those bytes from the start.
+    if (diffractionFrame && frame->texture_ != 0)
+    {
+        GLboolean scissor = glIsEnabled (GL_SCISSOR_TEST);
+        GLboolean mask[4] {};
+        glGetBooleanv (GL_COLOR_WRITEMASK, mask);
+        glDisable (GL_SCISSOR_TEST);
+        glColorMask (GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, frame->texture_, 0);
+        gl.DrawBuffers (1, drawBuffers);
+        const float transparent[4] {};
+        gl.ClearBufferfv (GL_COLOR, 0, transparent);
+        gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, frame->accumulationTexture_, 0);
+        glColorMask (mask[0], mask[1], mask[2], mask[3]);
+        if (scissor) glEnable (GL_SCISSOR_TEST);
+    }
     gl.DrawBuffers (8, drawBuffers);
     if (frame->texture_ == 0 || frame->depthTexture_ == 0
         || (diffractionFrame && frame->accumulationTexture_ == 0)
@@ -6615,10 +7914,15 @@ static std::uint64_t fixtureLinearCameraStorageStride()
 struct OpenGlInstanceGpuRecord final
 {
     std::array<float, 16> matrix {};
-    std::array<float, 4> identityColor {};
+    // Motion's prior model matrix (nativePreviousMatrixColumns), attributes 9 to 11.
+    std::array<std::array<float, 4>, 3> previous {};
+    // Mode 1 appearance, attributes 14 and 15: color, then emission with the
+    // diagnostic identity color's 24-bit slot in w, or -1 without one.
     std::array<float, 4> color {1,1,1,1};
-    std::array<float, 4> emission {};
+    std::array<float, 4> emissionIdentity {0,0,0,-1};
 };
+static_assert (sizeof (OpenGlInstanceGpuRecord) == 36 * sizeof (float),
+               "OpenGL fixture instance record layout changed");
 
 struct OpenGlFixtureUniforms final
 {
@@ -6833,13 +8137,16 @@ unsigned fixtureFragmentFeatures (const NativeFixtureSurfaceMaterialProgram* roo
 }
 
 // In-memory key of one scene program. The disk cache keys on the final fragment text,
-// which already contains the feature defines.
-std::string fixtureProgramCacheKey (const std::string& vertexSource, unsigned features)
+// which already contains the feature defines. The camera walk visits join the key
+// only past the default, so released keys stay the same.
+std::string fixtureProgramCacheKey (const std::string& vertexSource, unsigned features,
+                                    std::uint32_t cameraVisits = std::uint32_t (smoothglass::kMaximumRayVisits))
 {
-    return vertexSource + "\nfragmentFeatures=" + std::to_string (features);
+    return vertexSource + "\nfragmentFeatures=" + std::to_string (features)
+        + (cameraVisits == smoothglass::kMaximumRayVisits ? std::string() : "\ncameraVisits=" + std::to_string (cameraVisits));
 }
 
-// The Fast Preview camera walk cap. ARBIT_GL_GLASS_PREVIEW_VISITS=<1..64> replaces
+// The Fast Preview camera walk cap. ARBIT_GL_GLASS_PREVIEW_VISITS=<1..16777215> replaces
 // kPreviewCameraVisits in the Preview glass variant text, and only there. The Accurate
 // and export program text never reads it. The variable is read once per process.
 std::uint32_t fastPreviewGlassVisits()
@@ -6867,6 +8174,211 @@ const std::string& glassProgramDumpDirectory()
         return std::string (value != nullptr ? value : "");
     }();
     return directory;
+}
+
+// ARBIT_GL_DUMP_REALTIME_SCENE=<dir> writes what the backend drew each Realtime grating
+// frame from, as the app called it, to <dir>/frame-<n>-<width>x<height>: scene.txt names
+// the inputs (runtime fields and overrides, counts, every object with its drawn world
+// matrix, material and light), scene-<buffer>.bin holds each record buffer's raw bytes,
+// program.txt and program-<k>-<block>.bin the drawn material programs (the root, then its
+// object programs) with their parameter, path, lighting and reflectance blocks,
+// scene-table.f32 the backend's resolved light, emission and emitter table, and color.f32
+// the scene-linear RGBA32F Color after the lens and shutter, bottom row first. Off when unset.
+const std::string& realtimeSceneDumpDirectory()
+{
+    static const std::string directory = []
+    {
+        const char* value = std::getenv ("ARBIT_GL_DUMP_REALTIME_SCENE");
+        return std::string (value != nullptr ? value : "");
+    }();
+    return directory;
+}
+
+void dumpRealtimeScene (const HarmonicMIDI::grid::Visual3DScene& scene,
+                        const NativeFixtureSceneRuntimeInputs& inputs,
+                        std::uint32_t width, std::uint32_t height, const std::vector<float>& color,
+                        const NativeFixtureSurfaceMaterialProgram* program,
+                        const std::vector<std::array<float, 16>>& worlds,
+                        const std::vector<float>& sceneTable, std::uint32_t sceneTableHeight)
+{
+    static std::atomic<std::uint32_t> frames { 0 };
+    const auto number = frames.fetch_add (1);
+    const auto directory = realtimeSceneDumpDirectory() + "/frame-" + std::to_string (number) + "-"
+        + std::to_string (width) + "x" + std::to_string (height);
+    std::error_code ignored;
+    std::filesystem::create_directories (directory, ignored);
+    bool ok = true;
+    const auto write = [&ok] (const std::string& path, const void* data, std::size_t size)
+    {
+        auto* file = std::fopen (path.c_str(), "wb");
+        if (file == nullptr) { ok = false; return; }
+        ok = std::fwrite (data, 1, size, file) == size && ok;
+        ok = std::fclose (file) == 0 && ok;
+    };
+    std::string text;
+    char line[2048];
+    const auto add = [&] (const char* format, auto... values)
+    {
+        std::snprintf (line, sizeof (line), format, values...);
+        text += line;
+    };
+    add ("size %ux%u linearColor %d previewUse %d realtimeEngine %d skipReflections %d time %.6f "
+         "emissionGain %.6f fov %.6f objectScale %.6f output %d\n",
+         width, height, int (inputs.linearColor), int (inputs.previewUse), int (inputs.realtimeEngine),
+         int (inputs.realtimeSkipReflections), double (inputs.timeSeconds), double (inputs.emissionGain),
+         double (inputs.cameraVerticalFovDegrees), double (inputs.objectScale), int (inputs.imageOutput));
+    add ("ambient %.6f %.6f %.6f activeCamera %u vertices %zu indices %zu objects %zu materials %zu "
+         "textures %zu lights %zu cameras %zu instances %zu\n",
+         double (scene.ambientColor.x), double (scene.ambientColor.y), double (scene.ambientColor.z),
+         scene.activeCamera.value, scene.vertexCount, scene.indexCount, scene.objectCount, scene.materialCount,
+         scene.textureCount, scene.lightCount, scene.cameraCount, scene.objectInstanceCount);
+    add ("overrides objectWorlds %d diffractionSource %d diffractionEvaluated %d cameraOverride %d "
+         "animatedCamera %d lightOverride %d animatedLights %zu lightOverrides %zu objectTranslation %.6f %.6f %.6f "
+         "objectRotation %.6f %.6f %.6f cameraTranslation %.6f %.6f %.6f cameraRotation %.6f %.6f %.6f\n",
+         int (inputs.objectWorlds != nullptr), int (inputs.diffractionSourceProgram != nullptr),
+         int (inputs.diffractionEvaluatedProgram != nullptr), int (inputs.cameraOverride.has_value()),
+         int (inputs.animatedCamera.has_value()), int (inputs.lightOverride.has_value()), inputs.animatedLights.size(),
+         inputs.lightOverrides.size(), double (inputs.objectTranslationOffset[0]),
+         double (inputs.objectTranslationOffset[1]), double (inputs.objectTranslationOffset[2]),
+         double (inputs.objectRotationDegrees[0]), double (inputs.objectRotationDegrees[1]),
+         double (inputs.objectRotationDegrees[2]), double (inputs.cameraTranslationOffset[0]),
+         double (inputs.cameraTranslationOffset[1]), double (inputs.cameraTranslationOffset[2]),
+         double (inputs.cameraRotationDegrees[0]), double (inputs.cameraRotationDegrees[1]),
+         double (inputs.cameraRotationDegrees[2]));
+    for (std::size_t i = 0; i < scene.objectCount; ++i)
+    {
+        const auto& o = scene.objects[i];
+        add ("object %u parent %u material %u vertices %u+%u indices %u+%u visibility %u\n", o.id.value,
+             o.parent.value, o.material.value, o.firstVertex, o.vertexCount, o.firstIndex, o.indexCount,
+             unsigned (o.visibility));
+        if (i < worlds.size())
+        {
+            text += "  world";
+            for (const float value : worlds[i]) add (" %.9g", double (value));
+            text += "\n";
+        }
+    }
+    const auto lightLine = [&] (const char* label, const HarmonicMIDI::grid::SceneLightRecord& l)
+    {
+        const auto& t = l.transform;
+        add ("%s %u kind %u translation %.9g %.9g %.9g rotation %.9g %.9g %.9g %.9g color %.9g %.9g %.9g "
+             "intensity %.9g range %.9g cone %.9g %.9g radius %.9g angularRadius %.9g area %.9g %.9g shape %u "
+             "spread %.9g visibility %u cameraVisible %d sky %u zenith %.9g %.9g %.9g horizon %.9g %.9g %.9g "
+             "sunIntensity %.9g\n", label, l.id.value, unsigned (l.kind),
+             double (t.translation.x), double (t.translation.y), double (t.translation.z), double (t.rotation.x),
+             double (t.rotation.y), double (t.rotation.z), double (t.rotation.w), double (l.color.x),
+             double (l.color.y), double (l.color.z), double (l.intensity), double (l.range),
+             double (l.innerConeAngle), double (l.outerConeAngle), double (l.radius), double (l.angularRadius),
+             double (l.areaSizeX), double (l.areaSizeY), unsigned (l.areaShape), double (l.spread),
+             unsigned (l.visibility), int (l.environmentCameraVisible), unsigned (l.sky.version),
+             double (l.sky.zenith.x), double (l.sky.zenith.y), double (l.sky.zenith.z), double (l.sky.horizon.x),
+             double (l.sky.horizon.y), double (l.sky.horizon.z), double (l.sky.sunIntensity));
+    };
+    for (std::size_t i = 0; i < scene.lightCount; ++i) lightLine ("light", scene.lights[i]);
+    for (const auto& l : inputs.animatedLights) lightLine ("animatedLight", l);
+    if (inputs.lightOverride) lightLine ("lightOverride", *inputs.lightOverride);
+    // A light holds an environment image identity, so it is written by part: its scalars
+    // above, its sky, spectral source and camera background blocks raw beside them.
+    const auto lightBlock = [&] (std::size_t i, const char* name, const auto& value)
+    {
+        using Value = std::decay_t<decltype (value)>;
+        if constexpr (std::is_trivially_copyable_v<Value>)
+            write (directory + "/light-" + std::to_string (i) + "-" + name + ".bin", &value, sizeof (Value));
+        else
+            add ("light %zu block %s: not trivially copyable, not written\n", i, name);
+    };
+    for (std::size_t i = 0; i < scene.lightCount; ++i)
+    {
+        const auto& l = scene.lights[i];
+        lightBlock (i, "sky", l.sky);
+        lightBlock (i, "spectral", l.spectralSource);
+        lightBlock (i, "background", l.cameraBackground);
+        add ("light %zu environmentImage version %u orientation %.9g exposure %.9g\n", i, l.environmentImage.version,
+             double (l.environmentImage.orientationDegrees), double (l.environmentImage.exposureStops));
+    }
+    for (std::size_t i = 0; i < scene.materialCount; ++i)
+    {
+        const auto& m = scene.materials[i];
+        add ("material %zu base %.6f %.6f %.6f emissive %.6f %.6f %.6f metallic %.6f roughness %.6f\n", i,
+             double (m.baseColor.x), double (m.baseColor.y), double (m.baseColor.z), double (m.emissive.x),
+             double (m.emissive.y), double (m.emissive.z), double (m.metallic), double (m.roughness));
+    }
+    const auto raw = [&] (const char* name, const auto& buffer, std::size_t count)
+    {
+        using Record = typename std::decay_t<decltype (buffer)>::value_type;
+        if constexpr (std::is_trivially_copyable_v<Record>)
+        {
+            add ("buffer %s: %zu records of %zu bytes\n", name, count, sizeof (Record));
+            write (directory + "/scene-" + name + ".bin", buffer.data(), count * sizeof (Record));
+        }
+        else
+            add ("buffer %s: %zu records, not trivially copyable, not written\n", name, count);
+    };
+    raw ("vertices", scene.vertices, scene.vertexCount);
+    raw ("indices", scene.indices, scene.indexCount);
+    raw ("objects", scene.objects, scene.objectCount);
+    raw ("materials", scene.materials, scene.materialCount);
+    raw ("lights", scene.lights, scene.lightCount);
+    raw ("cameras", scene.cameras, scene.cameraCount);
+    write (directory + "/scene.txt", text.data(), text.size());
+    std::string programText;
+    const auto block = [&] (std::size_t k, const char* name, const auto& value)
+    {
+        using Value = std::decay_t<decltype (value)>;
+        char entry[256];
+        if constexpr (std::is_trivially_copyable_v<Value>)
+        {
+            write (directory + "/program-" + std::to_string (k) + "-" + name + ".bin", &value, sizeof (Value));
+            std::snprintf (entry, sizeof (entry), "  block %s: %zu bytes\n", name, sizeof (Value));
+        }
+        else
+            std::snprintf (entry, sizeof (entry), "  block %s: not trivially copyable, not written\n", name);
+        programText += entry;
+    };
+    std::vector<const NativeFixtureSurfaceMaterialProgram*> programs;
+    if (program != nullptr)
+    {
+        programs.push_back (program);
+        for (const auto& child : program->objectPrograms) programs.push_back (child.get());
+    }
+    for (std::size_t k = 0; k < programs.size(); ++k)
+    {
+        const auto* p = programs[k];
+        if (p == nullptr) { programText += "program " + std::to_string (k) + " null\n"; continue; }
+        const auto& q = p->parameters;
+        char entry[2048];
+        std::snprintf (entry, sizeof (entry), "program %zu object %u kind %u baseColorSource %u authoredMaterial %u "
+            "baseColorMetallic %.9g %.9g %.9g %.9g emissionRoughness %.9g %.9g %.9g %.9g normalOpacity %.9g %.9g "
+            "%.9g %.9g transmissionIorClearcoat %.9g %.9g %.9g %.9g paths %u bounce %u patternMask %u coverage %.9g "
+            "spectralReflectance %d diffractionLayer %d lightingAdmission %d vertexProgram %d identity %s\n",
+            k, p->object.value, unsigned (p->kind), unsigned (p->baseColorSource), p->authoredMaterial.value,
+            double (q.baseColorMetallic[0]), double (q.baseColorMetallic[1]), double (q.baseColorMetallic[2]),
+            double (q.baseColorMetallic[3]), double (q.emissionRoughness[0]), double (q.emissionRoughness[1]),
+            double (q.emissionRoughness[2]), double (q.emissionRoughness[3]), double (q.normalOpacity[0]),
+            double (q.normalOpacity[1]), double (q.normalOpacity[2]), double (q.normalOpacity[3]),
+            double (q.transmissionIorClearcoat[0]), double (q.transmissionIorClearcoat[1]),
+            double (q.transmissionIorClearcoat[2]), double (q.transmissionIorClearcoat[3]),
+            unsigned (p->diffractionPathCount), unsigned (p->diffractionMaximumBounceDepth),
+            unsigned (p->diffractionPatternMask), double (p->diffractionMaskCoverage),
+            int (p->spectralReflectance.has_value()), int (p->diffractionLayer.has_value()),
+            int (p->diffractionLightingAdmission != nullptr), int (p->vertexProgram != nullptr),
+            p->programIdentity.c_str());
+        programText += entry;
+        block (k, "parameters", p->parameters);
+        block (k, "paths", p->diffractionPaths);
+        if (p->diffractionLightingAdmission) block (k, "lighting", p->diffractionLightingAdmission->description());
+        if (p->spectralReflectance) block (k, "reflectance", *p->spectralReflectance);
+        if (p->diffractionLayer) block (k, "layer", *p->diffractionLayer);
+    }
+    write (directory + "/program.txt", programText.data(), programText.size());
+    if (! sceneTable.empty())
+    {
+        const std::string header = "1024 " + std::to_string (sceneTableHeight) + "\n";
+        write (directory + "/scene-table.txt", header.data(), header.size());
+        write (directory + "/scene-table.f32", sceneTable.data(), sceneTable.size() * sizeof (float));
+    }
+    write (directory + "/color.f32", color.data(), color.size() * sizeof (float));
+    std::fprintf (stderr, "[gl] realtime scene dump %s %s\n", directory.c_str(), ok ? "written" : "write failed");
 }
 
 // A dumped binary needs the retrievable hint before the link. It is set only while the
@@ -6945,7 +8457,8 @@ void dumpGlassProgram (const arbitgl::GlFuncs& gl, unsigned program, unsigned fe
 #endif
 }
 
-std::string fixtureFragmentShaderSource (unsigned features)
+std::string fixtureFragmentShaderSource (unsigned features,
+                                         std::uint32_t cameraVisits = std::uint32_t (smoothglass::kMaximumRayVisits))
 {
     const bool smoothGlass = (features & kFixtureFragmentSmoothGlass) != 0;
     const bool diffraction = (features & kFixtureFragmentDiffraction) != 0;
@@ -6961,15 +8474,22 @@ std::string fixtureFragmentShaderSource (unsigned features)
         + std::string ("#define FIXTURE_STAM_LAYER ") + (layered ? "1" : "0") + "\n"
         + std::string ("#define FIXTURE_ROUGH_GLASS ") + (roughGlass ? "1" : "0") + "\n"
         + std::string ((features & kFixtureFragmentRealtime) != 0 ? "#define FIXTURE_REALTIME 1\n" : "")
+        + ((features & kFixtureFragmentRealtime) != 0 ? realtimeAblationDefines() : std::string())
+        // The fixture program always carries the world fog march (RasterMedium.h);
+        // uWorldFog[0].w turns it on.
+        + "#define FIXTURE_WORLD_FOG 1\n"
         + head.substr (version.size());
     // The smooth-glass transport text declares these two uniforms. Without it, declare them here.
     if (! smoothGlass) text += "uniform vec4 uRoughCameraControl;\nuniform vec4 uGlassTransport;\n";
     // The direct opaque BVH stays on. Its visibility result can be needed without a feature bit.
     text += opaquevisibility::glslShader() + analyticsky::shader (false) + environmentimage::shader (false) + kFixturePassCompositeShader;
+    // Material media (shared/RasterMedium.h): the Volume Material march, and the
+    // glass walks' medium hook, so it comes before the transport text.
+    text += rastermedium::glslShader();
     if (smoothGlass)
     {
         auto query = smoothglass::queryShader (false);
-        auto transport = smoothglass::transportShader (false, true, false, causticVolume);
+        auto transport = smoothglass::transportShader (false, true, false, causticVolume, cameraVisits);
         // A missing Preview anchor returns empty text, which the variant build refuses.
         if ((features & kFixtureFragmentGlassPreview) != 0)
         {
@@ -7013,13 +8533,17 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.glassControl = location("uGlassControl");
     uniforms.glassTransport = location("uGlassTransport");
     uniforms.glassTransport2 = location("uGlassTransport2");
+    uniforms.medium = location("uMedium[0]");
+    uniforms.worldFog = location("uWorldFog[0]");
     uniforms.roughCameraControl = location("uRoughCameraControl");
     uniforms.objectMatrix = location ("uObjectMatrix");
+    uniforms.previousObjectMatrix = location ("uPreviousObjectMatrix");
     uniforms.tangentHandednessSign = location ("uTangentHandednessSign");
     uniforms.useInstanceMatrix = location("uUseInstanceMatrix");
     uniforms.cameraRotation = location ("uCameraRotation");
     uniforms.cameraTranslation = location ("uCameraTranslation");
     uniforms.projection = location ("uProjection");
+    uniforms.clipDepthRange = location ("uClipDepthRange");
     uniforms.baseColor = location ("uBaseColor");
     uniforms.materialParams = location ("uMaterialParams");
     uniforms.surfaceCoating = location ("uSurfaceCoating");
@@ -7029,6 +8553,8 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.vertexSpectrum = location ("uVertexSpectrum[0]");
     uniforms.previousVertexSpectrum = location ("uPreviousVertexSpectrum[0]");
     uniforms.vertexDisplacementLimits = location ("uVertexDisplacementLimits[0]");
+    uniforms.vertexWaves = location ("uVertexWaves");
+    uniforms.vertexControls = location ("uVertexControls");
     uniforms.emissive = location ("uEmissive");
     uniforms.ambient = location ("uAmbient");
     uniforms.sky = location("uSky[0]");
@@ -7048,6 +8574,8 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.emissiveTexturePresence = location ("uEmissiveTexturePresence");
     uniforms.alphaModeCutoff = location ("uAlphaModeCutoff");
     uniforms.imageOutput = location ("uImageOutput");
+    uniforms.viewportSolid = location ("uViewportSolid");
+    uniforms.viewportSolidEffects = location ("uViewportSolidEffects");
     uniforms.sceneTable = location("uSceneTable");
     uniforms.sceneTableObjects = location("uSceneTableObjects");
     uniforms.rawObjectIndex = location("uRawObjectIndex");
@@ -7098,7 +8626,7 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.diffractionRayMinimum = location("uDiffractionRayMinimum");
     uniforms.diffractionEvaluationSchedule
         = location ("uDiffractionEvaluationSchedule");
-    uniforms.noteInstanceTransforms = location ("uNoteInstanceTransforms[0]");
+    uniforms.noteInstanceTransforms = location ("uNoteInstanceTransforms");
     uniforms.noteInstanceIndex = location ("uNoteInstanceIndex");
     uniforms.noteMeshScale = location ("uNoteMeshScale");
     uniforms.noteAppearanceLow = location ("uNoteAppearanceLow");
@@ -7977,7 +9505,8 @@ bool residentSceneMatches(const HarmonicMIDI::grid::Visual3DScene& prepared,
             || !bits(a.opacity, b.opacity) || !bits(a.metallic, b.metallic) || !bits(a.roughness, b.roughness)
             || !vec3(a.emissive, b.emissive) || !bits(a.normalScale, b.normalScale)
             || !bits(a.occlusionStrength, b.occlusionStrength) || a.alphaMode != b.alphaMode
-            || !bits(a.alphaCutoff, b.alphaCutoff) || a.doubleSided != b.doubleSided)
+            || !bits(a.alphaCutoff, b.alphaCutoff) || a.doubleSided != b.doubleSided
+            || !HarmonicMIDI::grid::sameSceneVolume(a.volume, b.volume))
             return false;
     }
     static_assert(sizeof(SceneTexelRgba8) == 4, "resident texel compare layout changed");
@@ -7985,7 +9514,7 @@ bool residentSceneMatches(const HarmonicMIDI::grid::Visual3DScene& prepared,
         && std::memcmp(prepared.textureTexels.data(), next.textureTexels.data(),
                        next.textureTexelCount * sizeof(SceneTexelRgba8)) != 0)
         return false;
-    static_assert(sizeof(SceneVertex) == 16 * sizeof(float), "resident vertex compare layout changed");
+    static_assert(sizeof(SceneVertex) == 18 * sizeof(float), "resident vertex compare layout changed");
     const auto& object = next.objects[dynamic];
     const auto end = std::size_t(object.firstVertex) + object.vertexCount;
     if (object.firstVertex != 0
@@ -8508,7 +10037,7 @@ public:
     // and the first frame reports what it always reported.
     void startFixtureProgramLink (
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& requestedMaterialProgram,
-        bool distinctGrating, bool causticVolume) override
+        bool distinctGrating, bool causticVolume, std::uint32_t cameraVisits) override
     {
         // The async submit branch of the prepare is the diffraction-free path
         // only, and the driver must offer parallel shader compile for it.
@@ -8564,7 +10093,7 @@ public:
         const auto fragmentFeatures = fixtureFragmentFeatures (materialProgram.get(), distinctGrating)
             | (causticVolume && ! distinctGrating
                 ? static_cast<unsigned> (kFixtureFragmentCausticVolume) : 0u);
-        const auto programCacheKey = fixtureProgramCacheKey (vertexSource, fragmentFeatures);
+        const auto programCacheKey = fixtureProgramCacheKey (vertexSource, fragmentFeatures, cameraVisits);
         if (contextCache.programs.find (programCacheKey) != contextCache.programs.end()
             || contextCache.inFlight.find (programCacheKey) != contextCache.inFlight.end())
         { previous.restore(); return; }
@@ -8575,7 +10104,7 @@ public:
                 && std::chrono::steady_clock::now() - found->second <= kFixtureResubmitWindow;
         };
         if (recentlyRetired()) { previous.restore(); return; }
-        const auto fragmentSource = fixtureFragmentShaderSource (fragmentFeatures);
+        const auto fragmentSource = fixtureFragmentShaderSource (fragmentFeatures, cameraVisits);
         if (fragmentSource.empty()) { previous.restore(); return; }
         FixtureProgramBinaryDriver binaryDriver (gl);
         arbitglprogramcache::ProgramBinaryCache binaryCache (binaryDriver,
@@ -8733,9 +10262,8 @@ public:
             existingContext->second.queryContext->drainDeferredUnlocked();
         std::uint64_t staticOwned=0;
         if(!renderpassoutput::detail::checkedAdd(privateStaticBytes,textureBytes,staticOwned)
-            ||!renderpassoutput::detail::checkedAdd(staticOwned,sizeof(OpenGlQueryContext)+512,staticOwned)
-            ||staticOwned>renderpassoutput::kMaximumTotalBytes)
-        {result.error="OpenGL query context ownership exceeds static admission";return result;}
+            ||!renderpassoutput::detail::checkedAdd(staticOwned,sizeof(OpenGlQueryContext)+512,staticOwned))
+        {result.error="OpenGL query context ownership total overflows 64 bits";return result;}
         OpenGlFixtureState previous (gl);
         auto resources = std::make_shared<OpenGlFixtureSceneResources>();
         resources->ownerContext = glfwGetCurrentContext();
@@ -8850,7 +10378,7 @@ public:
         smoothglass::glassProgramDecisions().fetch_add (1, std::memory_order_relaxed);
         if ((fragmentFeatures & kFixtureFragmentSmoothOnlyGlass) != 0)
             smoothglass::smoothOnlyProgramChoices().fetch_add (1, std::memory_order_relaxed);
-        const auto programCacheKey = fixtureProgramCacheKey (vertexSource, fragmentFeatures);
+        const auto programCacheKey = fixtureProgramCacheKey (vertexSource, fragmentFeatures, smoothglass::cameraVisitsFor (*scene));
         // Solid-body and harmonic-geometry frames can release every scene lease
         // before the next preparation. Retain only the immutable linked program
         // for the exact context and vertex source; the fragment source is fixed.
@@ -8893,7 +10421,7 @@ public:
             FixtureProgramBinaryDriver binaryDriver (gl);
             arbitglprogramcache::ProgramBinaryCache binaryCache (binaryDriver,
                 arbitglprogramcache::cacheDirectory());
-            const auto fragmentSource = fixtureFragmentShaderSource (fragmentFeatures);
+            const auto fragmentSource = fixtureFragmentShaderSource (fragmentFeatures, smoothglass::cameraVisitsFor (*scene));
             // Records when a key left inFlight. Entries older than the window are dropped
             // here, so the map holds only recent keys.
             const auto recordRetired = [&] (const std::string& key)
@@ -9090,7 +10618,7 @@ public:
 
         }
 
-        static_assert (sizeof (SceneVertex) == 16 * sizeof (float),
+        static_assert (sizeof (SceneVertex) == 18 * sizeof (float),
                        "fixture vertex upload layout changed");
         static_assert (sizeof (SceneTexelRgba8) == 4,
                        "fixture texel upload layout changed");
@@ -9101,8 +10629,35 @@ public:
         gl.BindVertexArray (resources->vertexArray);
         gl.GenBuffers (1, &resources->vertexBuffer);
         gl.BindBuffer (GL_ARRAY_BUFFER, resources->vertexBuffer);
+        // The grating's vertices carry the smooth groove direction in their tangent, as
+        // Path Trace reads it (realtimediffraction::smoothGrooveTangents). Realtime's
+        // grating frame follows it, so a polar cap's concentric grooves turn smoothly
+        // instead of stepping wedge by wedge; generated meshes carry a constant +X
+        // tangent that nothing else on a grating reads.
+        const SceneVertex* uploadVertices = scene->vertices.data();
+        std::vector<SceneVertex> grooveVertices;
+        if (materialProgram && materialProgram->kind == NativeFixtureMaterialKind::DiffractionReflective)
+            if (const auto* grating = visual3d_detail::findById (scene->objects, scene->objectCount, materialProgram->object))
+            {
+                std::vector<std::array<float, 3>> positions;
+                std::vector<std::array<float, 2>> uvs;
+                for (std::size_t v = 0; v < grating->vertexCount; ++v)
+                {
+                    const auto& vertex = scene->vertices[grating->firstVertex + v];
+                    positions.push_back ({ vertex.position.x, vertex.position.y, vertex.position.z });
+                    uvs.push_back ({ vertex.uv.x, vertex.uv.y });
+                }
+                const std::vector<std::uint32_t> local (scene->indices.begin() + grating->firstIndex,
+                    scene->indices.begin() + grating->firstIndex + grating->indexCount);
+                const auto grooves = realtimediffraction::smoothGrooveTangents (positions, uvs, local);
+                grooveVertices.assign (scene->vertices.begin(), scene->vertices.begin() + scene->vertexCount);
+                for (std::size_t v = 0; v < grooves.size(); ++v)
+                    if (grooves[v][0] != 0.0f || grooves[v][1] != 0.0f || grooves[v][2] != 0.0f)
+                        for (int i = 0; i < 3; ++i) grooveVertices[grating->firstVertex + v].tangent[i] = grooves[v][i];
+                uploadVertices = grooveVertices.data();
+            }
         gl.BufferData (GL_ARRAY_BUFFER, static_cast<std::ptrdiff_t> (vertexBytes),
-                       scene->vertices.data(), GL_STATIC_DRAW);
+                       uploadVertices, GL_STATIC_DRAW);
         resources->vertexBufferCharge = residency::ResidencyCharge (
             residency::BackingClass::fixtureScene, residency::nominalBufferBytes (vertexBytes));
         gl.GenBuffers (1, &resources->indexBuffer);
@@ -9131,6 +10686,9 @@ public:
                                 reinterpret_cast<const void*> (offsetof (SceneVertex, color)));
         gl.VertexAttribPointer (4, 4, GL_FLOAT, GL_FALSE, sizeof (SceneVertex),
                                 reinterpret_cast<const void*> (offsetof (SceneVertex, tangent)));
+        gl.VertexAttribPointer (13, 2, GL_FLOAT, GL_FALSE, sizeof (SceneVertex),
+                                reinterpret_cast<const void*> (offsetof (SceneVertex, roughness)));
+        gl.EnableVertexAttribArray (13);
         gl.EnableVertexAttribArray (0);
         gl.EnableVertexAttribArray (1);
         gl.EnableVertexAttribArray (2);
@@ -9157,15 +10715,18 @@ public:
                 gl.EnableVertexAttribArray(attribute);
                 gl.VertexAttribDivisor(attribute, 1);
             }
-            gl.VertexAttribPointer(9, 4, GL_FLOAT, GL_FALSE,
-                sizeof(OpenGlInstanceGpuRecord), reinterpret_cast<const void*>(
-                    offsetof(OpenGlInstanceGpuRecord, identityColor)));
-            gl.EnableVertexAttribArray(9);
-            gl.VertexAttribDivisor(9, 1);
-            for (unsigned attribute=10;attribute<=11;++attribute) {
+            for (unsigned column = 0; column < 3; ++column)
+            {
+                gl.VertexAttribPointer(9 + column, 4, GL_FLOAT, GL_FALSE,
+                    sizeof(OpenGlInstanceGpuRecord), reinterpret_cast<const void*>(
+                        offsetof(OpenGlInstanceGpuRecord, previous) + column * 4u * sizeof(float)));
+                gl.EnableVertexAttribArray(9 + column);
+                gl.VertexAttribDivisor(9 + column, 1);
+            }
+            for (unsigned attribute=14;attribute<=15;++attribute) {
                 gl.VertexAttribPointer(attribute,4,GL_FLOAT,GL_FALSE,sizeof(OpenGlInstanceGpuRecord),
-                    reinterpret_cast<const void*>(attribute==10 ? offsetof(OpenGlInstanceGpuRecord,color)
-                                                               : offsetof(OpenGlInstanceGpuRecord,emission)));
+                    reinterpret_cast<const void*>(attribute==14 ? offsetof(OpenGlInstanceGpuRecord,color)
+                                                               : offsetof(OpenGlInstanceGpuRecord,emissionIdentity)));
                 gl.EnableVertexAttribArray(attribute);
                 gl.VertexAttribDivisor(attribute,1);
             }
@@ -9254,7 +10815,7 @@ public:
         }
         if (!resources->sharedProgram)
         {
-            const auto fragmentSource = fixtureFragmentShaderSource (fragmentFeatures);
+            const auto fragmentSource = fixtureFragmentShaderSource (fragmentFeatures, smoothglass::cameraVisitsFor (*scene));
             // A program linked by an earlier session on this driver is loaded from
             // the disk cache. A hit skips both compiles and the link, so the build
             // count for this preparation stays at zero.
@@ -9299,7 +10860,7 @@ public:
         resources->program=resources->sharedProgram->id;
         // The fragment text is rebuilt only while the dump is on.
         if (! glassProgramDumpDirectory().empty() && (fragmentFeatures & kFixtureFragmentSmoothGlass) != 0)
-            dumpGlassProgram (gl, resources->program, fragmentFeatures, false, fixtureFragmentShaderSource (fragmentFeatures));
+            dumpGlassProgram (gl, resources->program, fragmentFeatures, false, fixtureFragmentShaderSource (fragmentFeatures, smoothglass::cameraVisitsFor (*scene)));
         // The Preview glass variant is built from this exact key's sources.
         if (resources->sharedProgram->vertexSource.empty())
         {
@@ -9330,7 +10891,14 @@ public:
             || (resources->instancedSharedGeometry && resources->instanceBuffer == 0)
             || resources->program == 0 || ! uniforms.complete (fragmentFeatures))
         {
-            return fail ("OpenGL fixture static GPU resource creation failed");
+            // Names the first missing resource; a uniform the linker dropped reads -1.
+            const char* missing = resources->vertexArray == 0 ? "vertex array"
+                : resources->vertexBuffer == 0 ? "vertex buffer" : resources->indexBuffer == 0 ? "index buffer"
+                : resources->textures.empty() ? "textures"
+                : resources->instancedSharedGeometry && resources->instanceBuffer == 0 ? "instance buffer"
+                : resources->program == 0 ? "program" : "a required uniform location";
+            return fail (std::string ("OpenGL fixture static GPU resource creation failed: ") + missing
+                + " (GL error " + causticGlErrorName (glGetError()) + ")");
         }
 
         if (cached == contextPrograms.end())
@@ -9587,6 +11155,10 @@ public:
                 diffractiontransportnative::consumerCanRender(kOpenGlDiffractionConsumer, NativeFixtureMaterialBackend::OpenGl))) return result;
         // Version 3 lighting admits its lobe work in the transport frame below.
         NativeFixtureDiffractionBands diffractionBands;
+        // The schedule before the query split and the queries a pixel gathers, so the
+        // reduced-resolution gather can band its own passes (realtime_diffraction_gather.h).
+        NativeFixtureDiffractionBands unsplitDiffractionBands;
+        std::uint64_t diffractionPixelQueries = 0;
         if (materialProgram != nullptr
             && ! nativeFixtureDiffractionBandSchedule (*materialProgram, width, height,
                 !materialProgram->diffractionLightingAdmission
@@ -9663,9 +11235,7 @@ public:
             return result;
         }
         if (!nativeObjectInstancesSupported(*scene, materialProgram.get(), false, result.error)
-            || !nativeObjectInstanceRuntimeSupported(*scene, runtimeInputs, result.error)
-            || !nativeObjectPriorTransformsSupported(*scene, runtimeInputs,
-                resources->instancedSharedGeometry, result.error))
+            || !nativeObjectInstanceRuntimeSupported(*scene, runtimeInputs, result.error))
             return result;
         if (materialProgram != nullptr
             && nativeSurfaceUsesTime(*materialProgram)
@@ -9687,7 +11257,7 @@ public:
         if (motionPass && runtimeInputs.previousMotion)
             priorScenePositions = runtimeInputs.previousMotion->scenePositions;
         if (priorScenePositions && (!sceneMotionPositionsMatch(*scene, priorScenePositions->size())
-            || resources->instancedSharedGeometry || resources->usePreviousDeformation
+            || resources->usePreviousDeformation
             || runtimeInputs.previousMotion->deformation))
         {
             result.error = "Motion output prior Geometry3D positions do not match the scene vertices";
@@ -9738,7 +11308,7 @@ public:
             roughKey.camera = runtimeCameraRecord(runtimeInputs.cameraOverride ? *runtimeInputs.cameraOverride
                 : runtimeInputs.animatedCamera ? *runtimeInputs.animatedCamera : *selected,
                 runtimeInputs.cameraTranslationOffset, runtimeInputs.cameraRotationDegrees,
-                runtimeInputs.cameraVerticalFovDegrees);
+                runtimeInputs.cameraVerticalFovDegrees, runtimeInputs.cameraLens);
             roughKey.sceneRevision = materialProgram->sceneRevision;
             roughKey.rendererGeneration = resources->rendererGeneration;
             roughKey.width = width; roughKey.height = height;
@@ -9766,7 +11336,7 @@ public:
             // Query frame tables are sized from this scene. Charge both GPU tables
             // and both host staging copies, the scene table, prepared tables,
             // static owners, runtime leases and tile depth.
-            bool memory = charge(4 * opaquevisibility::sceneQueryPayloadTexels(*scene, noteInstances.admitted ? visualnoteinstancing::kMaximumInstances : 0), sizeof(opaquevisibility::Texel))
+            bool memory = charge(4 * opaquevisibility::sceneQueryPayloadTexels(*scene, noteInstances.admitted ? noteInstances.count : 0), sizeof(opaquevisibility::Texel))
                 && charge(4 * std::uint64_t(scene->lightCount) + 3 * std::uint64_t(scene->objectCount), sizeof(float) * 4u)
                 && charge(resources->opaqueVisibility.texels.capacity()
                     + resources->smoothGlass.query.texels.capacity(), sizeof(opaquevisibility::Texel))
@@ -9776,7 +11346,8 @@ public:
                 && charge(3, resources->environmentBudget ? resources->environmentBudget->ownedBytes : 0)
                 && charge(2, sizeof(*scene)) && charge(scene->textureTexels.capacity(), sizeof(SceneTexelRgba8)*2)
                 && charge(scene->vertexCount, sizeof(SceneVertex)*(resources->previousVertexBuffer ? 3u : 2u))
-                && charge(noteInstances.admitted ? visualnoteinstancing::kMaximumInstances : 0, sizeof(float)*8u)
+                && charge(std::uint64_t(noteInstanceTextureRows(noteInstances.count)) * kNoteInstanceTextureWidth,
+                          sizeof(float)*(noteInstances.admitted ? 8u : 4u))
                 && charge(scene->indexCount, sizeof(std::uint32_t))
                 && charge(1, sizeof(*resources) + sizeof(NativeFixtureSceneRuntimeInputs) + sizeof(OpenGlFixtureSceneFrame))
                 && charge(2*runtimeInputs.animatedLights.capacity(), sizeof(SceneLightRecord))
@@ -9848,13 +11419,23 @@ public:
             if (!diffractiontransportnative::buildFrame(*prepared,
                     opaquevisibility::noteInstances(visibilityMatrices, noteInstances), width, height,
                     diffractionTransportFrame, result.error)) return result;
-            std::uint64_t diffractionPixelQueries = 0;
-            if (!nativeFixtureDiffractionPixelQueries(std::size_t(diffractionTransportFrame.sampleControl[0]),
-                    std::size_t(diffractionTransportFrame.sampleControl[1]), diffractionPixelQueries))
+            // Realtime is budgeted by the rows its shader gathers, every Nth. A gathered row
+            // is now three table fetches and the tabled BSDF, with no ray: the source view
+            // and the order efficiencies come from per-frame tables. Budgeted by every row,
+            // the orb's 1920x1080 frame drew in 1080 one-row bands of about 5 ms each, a
+            // GPU that idles on one row's latency, 11 s in all.
+            const auto receiverRowsGathered = realtimeFrame
+                ? nativeFixtureRealtimeDiffractionGatherRows(std::size_t(diffractionTransportFrame.sampleControl[0]))
+                : std::size_t(diffractionTransportFrame.sampleControl[0]);
+            const auto gratingRowsGathered = realtimeFrame
+                ? nativeFixtureRealtimeDiffractionGatherRows(std::size_t(diffractionTransportFrame.sampleControl[1]))
+                : std::size_t(diffractionTransportFrame.sampleControl[1]);
+            if (!nativeFixtureDiffractionPixelQueries(receiverRowsGathered, gratingRowsGathered, diffractionPixelQueries))
             {
                 result.error = "OpenGL fixture diffraction query count does not fit 64 bits";
                 return result;
             }
+            unsplitDiffractionBands = diffractionBands;
             nativeFixtureDiffractionSplitBandsByQueries(diffractionBands, diffractionPixelQueries);
             if (maximumTextureSize < static_cast<int>(diffractiontransportnative::kTextureWidth)
                 || maximumTextureSize < static_cast<int>(diffractionTransportFrame.height)
@@ -9867,14 +11448,8 @@ public:
                 return result;
             }
         }
-        if (noteInstances.admitted)
-        {
-            constexpr auto noteBytes = visualnoteinstancing::kMaximumInstances * 4u * sizeof(float);
-            const std::uint64_t motionResident = std::uint64_t(scene->vertexCount)*sizeof(SceneVertex)*3
-                + resources->retainedTextureBytes + std::uint64_t(width)*height*56 + noteBytes*2;
-            if (motionResident > renderpassoutput::kMaximumTotalBytes)
-            { result.error = "OpenGL preceding note data exceeds resource capacity"; return result; }
-        }
+        // Preceding note data has no whole-frame total: each note texture and
+        // motion buffer meets the device limit and GL_OUT_OF_MEMORY where it is made.
         std::unique_ptr<roughglasstiles::Completion> roughCompletion;
         if (roughGlassFrame)
         {
@@ -10037,18 +11612,63 @@ public:
             return fail ("OpenGL fixture render cannot resolve the active camera");
         const auto& authoredCamera = runtimeInputs.cameraOverride ? *runtimeInputs.cameraOverride
             : runtimeInputs.animatedCamera ? *runtimeInputs.animatedCamera : *selectedCamera;
-        const auto camera = runtimeCameraRecord (authoredCamera, runtimeInputs.cameraTranslationOffset,
-            runtimeInputs.cameraRotationDegrees, runtimeInputs.cameraVerticalFovDegrees);
+        auto camera = runtimeCameraRecord (authoredCamera, runtimeInputs.cameraTranslationOffset,
+            runtimeInputs.cameraRotationDegrees, runtimeInputs.cameraVerticalFovDegrees, runtimeInputs.cameraLens);
+        // Focus on object: this frame's depth of the object sets the focus distance.
+        HarmonicMIDI::grid::resolveSceneCameraFocus (*scene, camera);
         OpenGlFixtureUniforms values;
         values.objectMatrix = nativeObjectWorldMatrix (runtimeInputs.objectWorlds.get(), object,
             fixtureWorldMatrix (*scene, object));
         storeFixtureQuaternion (values.cameraRotation, camera.transform.rotation);
         storeFixtureVec3 (values.cameraTranslation, camera.transform.translation);
+        // A negative x is an orthographic camera's half height (the fixture vertex shader).
         values.projection = {
-            std::tan (camera.verticalFovRadians * 0.5f),
+            camera.orthographic() ? -0.5f * camera.orthographicHeight
+                                  : std::tan (camera.verticalFovRadians * 0.5f),
             static_cast<float> (width) / static_cast<float> (height),
             camera.nearPlane, camera.farPlane
         };
+        // The depth test spans the scene's camera distances, not the authored planes:
+        // a far camera with a small near plane otherwise loses millimetre layers. Each
+        // object's vertex box is taken under its draw matrices. Instances, note
+        // instances, vertex programs and deformation move vertices on the GPU, so
+        // those frames keep the authored planes.
+        std::array<float, 2> clipDepthRange {camera.nearPlane, camera.farPlane};
+        {
+            bool gpuMovesVertices = noteInstances.admitted || resources->instancedSharedGeometry
+                || scene->instancedObject.isValid() || resources->usePreviousDeformation
+                || !resources->deformedWindings.empty();
+            if (materialProgram != nullptr) {
+                gpuMovesVertices = gpuMovesVertices || materialProgram->vertexProgram != nullptr;
+                for (const auto& program : materialProgram->objectPrograms)
+                    gpuMovesVertices = gpuMovesVertices || (program && program->vertexProgram != nullptr);
+            }
+            if (!gpuMovesVertices) {
+                namespace fd = arbitgpu::fixturedepth;
+                fd::Range range;
+                const std::array<float, 3> eye {values.cameraTranslation[0], values.cameraTranslation[1],
+                                                values.cameraTranslation[2]};
+                for (std::size_t o = 0; o < scene->objectCount && o < visibilityMatrices.size(); ++o) {
+                    const auto& drawn = scene->objects[o];
+                    if (drawn.vertexCount == 0 || std::size_t(drawn.firstVertex) + drawn.vertexCount > scene->vertexCount)
+                        continue;
+                    std::array<float, 3> low {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                                              std::numeric_limits<float>::max()};
+                    std::array<float, 3> high {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
+                                               std::numeric_limits<float>::lowest()};
+                    for (std::uint32_t v = 0; v < drawn.vertexCount; ++v) {
+                        const auto& position = scene->vertices[drawn.firstVertex + v].position;
+                        low = {std::min(low[0], position.x), std::min(low[1], position.y), std::min(low[2], position.z)};
+                        high = {std::max(high[0], position.x), std::max(high[1], position.y), std::max(high[2], position.z)};
+                    }
+                    fd::includeBox(range, visibilityMatrices[o], low, high, values.cameraRotation, eye);
+                    // The grating's own draw in a mixed frame takes the scene matrix alone.
+                    if (runtimeInputs.objectWorlds)
+                        fd::includeBox(range, fixtureWorldMatrix(*scene, drawn), low, high, values.cameraRotation, eye);
+                }
+                clipDepthRange = fd::fitted(range, camera.nearPlane, camera.farPlane);
+            }
+        }
         if (materialProgram != nullptr)
         {
             const auto& program = *materialProgram;
@@ -10138,9 +11758,15 @@ public:
         // A camera-hidden environment still lights and reflects; only the backdrop is skipped.
         // The skipped pixels are opaque black, as Path Trace sees no world on a camera ray.
         bool skyCameraVisible = true;
+        HarmonicMIDI::grid::SceneCameraBackground cameraBackground;
         for (std::size_t i=0;i<lightCount;++i)
-            if (lightAt(i).kind==SceneLightKind::Environment && !lightAt(i).environmentCameraVisible)
+        {
+            const auto light = lightAt(i);
+            if (light.kind==SceneLightKind::Environment && !light.environmentCameraVisible)
                 skyCameraVisible = false;
+            if (light.kind==SceneLightKind::Environment && cameraBackground.mode==HarmonicMIDI::grid::SceneCameraBackgroundMode::World)
+                cameraBackground = light.cameraBackground;
+        }
         const bool cameraHiddenBackdrop = !skyCameraVisible
             && runtimeInputs.imageOutput == renderpassoutput::Output::Color
             && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage);
@@ -10148,7 +11774,19 @@ public:
             cameraOnlyEncode ? smoothglass::displayEncode(7.0f / 255.0f) : 7.0f / 255.0f,
             cameraOnlyEncode ? smoothglass::displayEncode(10.0f / 255.0f) : 10.0f / 255.0f,
             cameraOnlyEncode ? smoothglass::displayEncode(18.0f / 255.0f) : 18.0f / 255.0f, 1.0f };
-        const float hiddenBackdrop[4] { 0, 0, 0, 1 };
+        // A camera background shows its colour, encoded as the stage colour is, or
+        // zero alpha in place of the black.
+        const auto backdropChannel = [&](float linear) {
+            const auto c = std::max(0.0f, linear);
+            return cameraOnlyEncode ? smoothglass::displayEncode(c) : c;
+        };
+        const bool colourBackdrop = cameraBackground.mode==HarmonicMIDI::grid::SceneCameraBackgroundMode::Colour;
+        const bool transparentBackdrop = cameraBackground.mode==HarmonicMIDI::grid::SceneCameraBackgroundMode::Transparent;
+        const float hiddenBackdrop[4] {
+            colourBackdrop ? backdropChannel(cameraBackground.color.x) : 0.0f,
+            colourBackdrop ? backdropChannel(cameraBackground.color.y) : 0.0f,
+            colourBackdrop ? backdropChannel(cameraBackground.color.z) : 0.0f,
+            transparentBackdrop ? 0.0f : 1.0f };
         const float* background = cameraHiddenBackdrop ? hiddenBackdrop : stageBackground;
         const float emptyPass[4] { 0, 0, 0, 0 };
         const float farDepth[4] { 1, 0, 0, 0 };
@@ -10402,6 +12040,68 @@ public:
                     diffractionTransportFrame.height, diffractionTransportFrame.texels))
                 return fail("OpenGL diffraction RGBA32F table/query upload failed");
         }
+        // Realtime reads the grating's order efficiencies from a table on unit 16
+        // (realtime_diffraction_efficiency_table.h). A groove field that varies over the
+        // grating, or a context with 16 units, keeps the per-pixel evaluation.
+        std::shared_ptr<const arbitgpu::realtimediffractionefficiency::Table> efficiencyTable;
+        const diffractionmaterial::PhysicalDiffractionGpuParameters* efficiencySource = nullptr;
+        const int efficiencyControlLocation = gl.GetUniformLocation(sceneProgram, "uDiffractionEfficiencyControl");
+        if (realtimeFrame && authoredDiffraction && efficiencyControlLocation >= 0) {
+            const auto& source = materialProgram->diffractionPaths[0].material;
+            int units = 0; glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+            if (units <= 16) {
+                static std::atomic<bool> logged {false};
+                if (!logged.exchange(true))
+                    std::fprintf(stderr, "[realtime-diffraction] %d fragment texture units: no efficiency table on unit 16, "
+                        "orders evaluated per pixel\n", units);
+            } else if (arbitgpu::realtimediffractionefficiency::uniformGrooveField(source,
+                           materialProgram->diffractionFoilMaximumEvaluations > 0)) {
+                efficiencyTable = arbitgpu::realtimediffractionefficiency::cached(source);
+                gl.ActiveTexture(GL_TEXTURE16); gl.BindSampler(16, 0);
+                glGenTextures(1, &frame->diffractionEfficiencyTexture);
+                glBindTexture(GL_TEXTURE_2D, frame->diffractionEfficiencyTexture);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, efficiencyTable->width, efficiencyTable->height, 0,
+                    GL_RED, GL_FLOAT, efficiencyTable->texels.data());
+                if (!frame->diffractionEfficiencyTexture || glGetError() != GL_NO_ERROR)
+                    return fail("OpenGL diffraction efficiency R32F table upload failed");
+                efficiencySource = &source;
+            }
+        }
+        // The sampler stays on its own unit even with no table, apart from unit 0's material sampler.
+        if (efficiencyControlLocation >= 0)
+            gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uDiffractionEfficiencyTable"), 16);
+        // Only a draw whose bound grating is the table's reads it.
+        const auto bindEfficiencyTable = [&](const diffractionmaterial::PhysicalDiffractionGpuParameters& bound) {
+            if (efficiencyControlLocation < 0) return;
+            const bool valid = efficiencySource != nullptr
+                && arbitgpu::realtimediffractionefficiency::sameGrating(*efficiencySource, bound);
+            gl.Uniform4f(efficiencyControlLocation, valid ? 1.0f : 0.0f,
+                float(arbitgpu::realtimediffractionefficiency::kGrid), valid ? float(efficiencyTable->orders) : 0.0f,
+                float(arbitgpu::realtimediffractionefficiency::kTilesPerRow));
+        };
+        bindEfficiencyTable(diffractionmaterial::PhysicalDiffractionGpuParameters {});
+        // Uniforms outlive the frame: every Realtime frame starts with each pixel gathering.
+        // The gather samplers keep units 17-20 so the unsigned one never shares unit 0's
+        // material sampler.
+        if (realtimeFrame)
+            if (const int location = gl.GetUniformLocation(sceneProgram, "uRealtimeGather"); location >= 0)
+            {
+                gl.Uniform4f(location, 0.0f, 1.0f, 1.0f, 0.0f);
+                int units = 0; glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+                if (units >= 21)
+                {
+                    constexpr std::array<const char*, 4> samplerNames {"uRealtimeGatherColor", "uRealtimeGatherDepth",
+                        "uRealtimeGatherNormal", "uRealtimeGatherObject"};
+                    for (int i = 0; i < 4; ++i)
+                        gl.Uniform1i(gl.GetUniformLocation(sceneProgram, samplerNames[std::size_t(i)]), 17 + i);
+                }
+            }
         gl.Uniform1i(locations.diffractionQueryTexture, 8);
         gl.Uniform1i(locations.diffractionSamples, 9);
         gl.Uniform1i(locations.diffractionInstanceCount, static_cast<int>(noteInstances.count));
@@ -10413,7 +12113,7 @@ public:
         gl.ActiveTexture(GL_TEXTURE0);
 
         // Motion rebuilds the prior camera from the authored record and its prior adjustments.
-        const auto motion = sceneMotionUniforms(runtimeInputs, authoredCamera, width, height);
+        const auto motion = sceneMotionUniforms(runtimeInputs, authoredCamera, width, height, scene->previousCamera);
         if (deformationMotionProbeEnabled())
             std::fprintf (stderr,
                 "[scene-motion] previousMotion=%d projectionW=%s usePrevious=%d rotation=[%s] translationScale=[%s] cameraRotation=[%s] cameraTranslation=[%s]\n",
@@ -10437,7 +12137,8 @@ public:
         gl.Uniform1i(locations.previousNoteTransforms,10);
         if (noteInstances.admitted)
         {
-            std::array<std::array<float,4>,visualnoteinstancing::kMaximumInstances> previousNotes {};
+            std::vector<std::array<float,4>> previousNotes(
+                noteInstanceTextureRows(noteInstances.count) * kNoteInstanceTextureWidth);
             if (runtimeInputs.previousMotion && runtimeInputs.previousMotion->noteTransforms)
                 for (std::size_t index=0;index<noteInstances.count;++index)
                     if (const auto transform = runtimeInputs.previousMotion->noteTransforms->find(noteInstances.identities[index]))
@@ -10449,11 +12150,12 @@ public:
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_BASE_LEVEL,0);
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,0);
-            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,visualnoteinstancing::kMaximumInstances,1,0,
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,int(kNoteInstanceTextureWidth),
+                         int(noteInstanceTextureRows(noteInstances.count)),0,
                          GL_RGBA,GL_FLOAT,previousNotes.data());
             if (!frame->previousNoteTexture || glGetError()!=GL_NO_ERROR)
                 return fail("OpenGL preceding note transform allocation failed");
-            result.stats.textureBytes += sizeof(previousNotes);
+            result.stats.textureBytes += previousNotes.size() * sizeof(previousNotes[0]);
             gl.ActiveTexture(GL_TEXTURE0);
         }
         // Without a predecessor the prior inputs equal the current ones, so the
@@ -10470,6 +12172,55 @@ public:
             gl.Uniform4fv(locations.previousVertexSpectrum, spectrumVectors, priorVertexSpectrum.data());
             const auto displacementLimits = fixtureVertexDisplacementLimits (materialProgram->vertexProgram.get());
             gl.Uniform4fv(locations.vertexDisplacementLimits, static_cast<int> (kVertexDisplacementLimitCapacity / 4), displacementLimits.data());
+            FixtureVertexWaveTable waveTable;
+            std::string waveError;
+            if (! fixtureVertexWaveTable (materialProgram->vertexProgram.get(), waveTable, waveError))
+                return fail(waveError);
+            if (! waveTable.texels.empty())
+            {
+                if (locations.vertexWaves < 0)
+                    return fail("OpenGL vertex program reads Ocean Waves but links no wave table");
+                gl.ActiveTexture(GL_TEXTURE12); gl.BindSampler(12,0);
+                if (frame->vertexWaveTexture != 0) glDeleteTextures(1,&frame->vertexWaveTexture);
+                glGenTextures(1,&frame->vertexWaveTexture);
+                glBindTexture(GL_TEXTURE_2D,frame->vertexWaveTexture);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_BASE_LEVEL,0);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,0);
+                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,static_cast<int>(waveTable.width),
+                             static_cast<int>(waveTable.rows),0,GL_RGBA,GL_FLOAT,waveTable.texels.data());
+                if (!frame->vertexWaveTexture || glGetError()!=GL_NO_ERROR)
+                    return fail("OpenGL vertex wave table allocation failed");
+                result.stats.textureBytes += waveTable.texels.size() * sizeof(waveTable.texels[0]);
+                gl.Uniform1i(locations.vertexWaves,12);
+                gl.ActiveTexture(GL_TEXTURE0);
+            }
+            // The control bank, two RGBA32F rows (this frame, prior frame): slot i
+            // is lane i % 4 of texel i / 4.
+            if (materialProgram->vertexProgram->resources().controlParameterSlots != 0)
+            {
+                const auto texels = videowire::vertexcontrol::motionTexels (runtimeInputs.vertexControls,
+                    runtimeInputs.previousMotion ? &runtimeInputs.previousMotion->vertexControls : nullptr);
+                if (runtimeInputs.vertexControls.size() < materialProgram->vertexProgram->resources().controlParameterSlots)
+                    return fail("OpenGL vertex program reads a Vertex Control Parameter slot the control bank lacks");
+                if (locations.vertexControls < 0)
+                    return fail("OpenGL vertex program reads Vertex Control Parameter but links no control bank");
+                gl.ActiveTexture(GL_TEXTURE13); gl.BindSampler(13,0);
+                if (frame->vertexControlTexture != 0) glDeleteTextures(1,&frame->vertexControlTexture);
+                glGenTextures(1,&frame->vertexControlTexture);
+                glBindTexture(GL_TEXTURE_2D,frame->vertexControlTexture);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_BASE_LEVEL,0);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,0);
+                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,static_cast<int>(texels.size()/8),2,0,GL_RGBA,GL_FLOAT,texels.data());
+                if (!frame->vertexControlTexture || glGetError()!=GL_NO_ERROR)
+                    return fail("OpenGL vertex control bank allocation failed");
+                result.stats.textureBytes += texels.size() * sizeof(float);
+                gl.Uniform1i(locations.vertexControls,13);
+                gl.ActiveTexture(GL_TEXTURE0);
+            }
         }
         gl.Uniform1i(locations.rawObjectIndex, 0);
         auto passProgram = renderpasscomposite::gpuProgram(scenePassProgram(runtimeInputs));
@@ -10489,6 +12240,8 @@ public:
         gl.Uniform3f (locations.cameraTranslation, values.cameraTranslation[0],
                       values.cameraTranslation[1], values.cameraTranslation[2]);
         gl.Uniform4fv (locations.projection, 1, values.projection.data());
+        if (locations.clipDepthRange >= 0)
+            gl.Uniform2f (locations.clipDepthRange, clipDepthRange[0], clipDepthRange[1]);
         gl.Uniform4fv (locations.baseColor, 1, values.baseColor.data());
         gl.Uniform4fv (locations.materialParams, 1, values.materialParams.data());
         const bool surfacePbr = materialProgram != nullptr
@@ -10518,10 +12271,27 @@ public:
                       values.emissive[1], values.emissive[2]);
         gl.Uniform3f (locations.ambient, values.ambient[0],
                       values.ambient[1], values.ambient[2]);
-        const auto noteTransforms = noteInstanceShaderTransforms(noteInstances);
-        gl.Uniform4fv (locations.noteInstanceTransforms,
-                       static_cast<int>(visualnoteinstancing::kMaximumInstances),
-                       noteTransforms[0].data());
+        {
+            // Every drawn note's transform, in a texture sized from the note count.
+            auto noteTransforms = noteInstanceShaderTransforms(noteInstances);
+            const auto noteRows = noteInstanceTextureRows(noteInstances.count);
+            noteTransforms.resize(noteRows * kNoteInstanceTextureWidth);
+            gl.ActiveTexture(GL_TEXTURE12); gl.BindSampler(12,0);
+            glGenTextures(1,&frame->noteInstanceTexture);
+            glBindTexture(GL_TEXTURE_2D,frame->noteInstanceTexture);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_BASE_LEVEL,0);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,0);
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,int(kNoteInstanceTextureWidth),int(noteRows),0,
+                         GL_RGBA,GL_FLOAT,noteTransforms.data());
+            if (!frame->noteInstanceTexture || glGetError()!=GL_NO_ERROR)
+                return fail("OpenGL note instance transform allocation failed for "
+                    + std::to_string(noteInstances.count) + " notes");
+            result.stats.textureBytes += noteTransforms.size() * sizeof(noteTransforms[0]);
+            gl.ActiveTexture(GL_TEXTURE0);
+            gl.Uniform1i (locations.noteInstanceTransforms, 12);
+        }
         gl.Uniform1i (locations.noteInstanceIndex, -1);
         gl.Uniform1f (locations.noteMeshScale, noteInstances.meshScale);
         gl.Uniform4fv (locations.noteAppearanceLow, 1, noteInstances.appearanceLow.data());
@@ -10537,7 +12307,65 @@ public:
         // Lights and per-object records live in one RGBA32F table sized from the
         // scene: four texels per light, then raw identifiers, receivers and emission.
         const auto tableObjects = static_cast<std::size_t> (scene->objectCount);
-        const auto tableRecords = 4 * lightCount + 3 * tableObjects;
+        // A Realtime grating casts its orders at the scene's glowing objects
+        // (realtime_diffraction_emitters.h). Their triangles follow the objects.
+        std::vector<realtimediffraction::EmitterTexel> emitterTexels;
+        // Each object's id, base colour and glow, for the grating mirror pass.
+        std::vector<realtimediffractionmirror::Texel> mirrorObjects;
+        if (realtimeFrame && diffractionFrame)
+        {
+            for (std::size_t i = 0; i < tableObjects; ++i)
+            {
+                const auto& object = scene->objects[i];
+                std::array<float, 4> emission {};
+                std::array<float, 3> base { 1.0f, 1.0f, 1.0f };
+                float metallic = 0.0f;
+                if (const auto* program = nativeSurfaceForObject (materialProgram.get(), object.id))
+                {
+                    emission = { program->parameters.emissionRoughness[0], program->parameters.emissionRoughness[1],
+                                 program->parameters.emissionRoughness[2], 0.0f };
+                    base = { program->parameters.baseColorMetallic[0], program->parameters.baseColorMetallic[1],
+                             program->parameters.baseColorMetallic[2] };
+                    metallic = program->parameters.baseColorMetallic[3];
+                }
+                else if (const auto* material = visual3d_detail::findById (scene->materials, scene->materialCount, object.material))
+                {
+                    storeFixtureVec3 (emission, material->emissive);
+                    base = { material->baseColor.x, material->baseColor.y, material->baseColor.z };
+                    metallic = material->metallic;
+                }
+                arbitgpu::analyticsky::clipRasterRadiance (emission.data(), runtimeInputs.emissionGain);
+                const bool glows = realtimediffraction::emits ({ emission[0], emission[1], emission[2] });
+                realtimediffractionmirror::appendObject (mirrorObjects, object.id.value, base, metallic, glows);
+                if (! glows) continue;
+                auto runtimeTransform = HarmonicMIDI::grid::SceneTransform3D {};
+                if (runtimeTargetsObject (runtimeInputs, object))
+                {
+                    runtimeTransform.translation = { runtimeInputs.objectTranslationOffset[0],
+                        runtimeInputs.objectTranslationOffset[1], runtimeInputs.objectTranslationOffset[2] };
+                    runtimeTransform = applyRuntimeObjectTransform (
+                        runtimeTransform, runtimeInputs.objectRotationDegrees, runtimeInputs.objectScale);
+                }
+                const auto world = multiplyFixtureMatrices (fixtureTransformMatrix (runtimeTransform),
+                    nativeObjectWorldMatrix (runtimeInputs.objectWorlds.get(), object, fixtureWorldMatrix (*scene, object)));
+                std::vector<std::array<float, 3>> positions (object.vertexCount);
+                for (std::size_t v = 0; v < positions.size(); ++v)
+                {
+                    const auto& p = scene->vertices[object.firstVertex + v].position;
+                    positions[v] = { p.x, p.y, p.z };
+                }
+                std::vector<std::uint32_t> indices (object.indexCount);
+                for (std::size_t n = 0; n < indices.size(); ++n) indices[n] = scene->indices[object.firstIndex + n];
+                {
+                    realtimediffraction::EmitterMatrix matrix {};
+                    std::copy (world.begin(), world.end(), matrix.begin());
+                    if (! realtimediffraction::appendEmitter (emitterTexels, matrix, positions, indices,
+                            { emission[0], emission[1], emission[2] }))
+                        return fail ("Realtime grating emitter object has an index past its vertices");
+                }
+            }
+        }
+        const auto tableRecords = 4 * lightCount + 3 * tableObjects + emitterTexels.size();
         const auto tableHeight = std::max<std::size_t> (1, (tableRecords + 1023) / 1024);
         if (maximumTextureSize < 1024 || static_cast<std::size_t> (maximumTextureSize) < tableHeight)
             return fail (nativeTextureAxisError ("scene table", std::max<std::size_t> (1024, tableHeight), maximumTextureSize));
@@ -10552,6 +12380,22 @@ public:
             storeFixtureVec3 (record[2], light.transform.translation, light.range);
             record[3] = { std::cos (light.innerConeAngle), std::cos (light.outerConeAngle),
                           static_cast<float> (light.kind), 0.0f };
+            if (light.kind == SceneLightKind::Area)
+            {
+                // The spread profile, as Path Trace has it (pathtrace/lights.h).
+                const float normalization = HarmonicMIDI::grid::sceneAreaSpreadNormalization (light.spread);
+                record[3][0] = normalization > 0.0f ? std::tan (0.5f * std::max (light.spread, 1.0e-4f)) : 0.0f;
+                record[3][1] = normalization;
+            }
+            const auto extent = HarmonicMIDI::grid::sceneAreaLightExtent (light);
+            const bool round = light.areaShape == HarmonicMIDI::grid::SceneAreaLightShape::Disk
+                            || light.areaShape == HarmonicMIDI::grid::SceneAreaLightShape::Ellipse;
+            if (light.kind == SceneLightKind::Area) record[2][3] = round ? -0.5f * extent.y : 0.5f * extent.y;
+            const float size = light.kind == SceneLightKind::Directional ? light.angularRadius
+                             : light.kind == SceneLightKind::Area ? 0.5f * extent.x
+                             : light.radius;
+            record[3][3] = (light.visibility & HarmonicMIDI::grid::sceneRayVisibility::Shadow) != 0 ? size : -1.0f - size;
+            if ((light.visibility & HarmonicMIDI::grid::sceneRayVisibility::VolumeScatter) == 0) record[3][2] += 8.0f;
         }
         const auto receiverRecords = 4 * lightCount + tableObjects, emissionRecords = receiverRecords + tableObjects;
         const auto& smoothGlassTable = resources->smoothGlass;
@@ -10569,6 +12413,7 @@ public:
                 sceneTable[emissionRecords + i] = emission;
             }
         }
+        std::copy (emitterTexels.begin(), emitterTexels.end(), sceneTable.begin() + emissionRecords + tableObjects);
         if (resources->sceneTableTexture == 0) glGenTextures (1, &resources->sceneTableTexture);
         gl.ActiveTexture (GL_TEXTURE11);
         gl.BindSampler (11, 0);
@@ -10584,6 +12429,13 @@ public:
         gl.ActiveTexture (GL_TEXTURE0);
         gl.Uniform1i (locations.sceneTable, 11);
         gl.Uniform1i (locations.sceneTableObjects, static_cast<int> (tableObjects));
+        if (realtimeFrame)
+        {
+            gl.Uniform1i (gl.GetUniformLocation (sceneProgram, "uRealtimeEmitterFirst"),
+                static_cast<int> (emissionRecords + tableObjects));
+            gl.Uniform1i (gl.GetUniformLocation (sceneProgram, "uRealtimeEmitterTriangles"),
+                static_cast<int> (emitterTexels.size() / 3));
+        }
         analyticsky::Uniforms sky {};
         for (std::size_t i=0;i<lightCount;++i)
             if (lightAt(i).kind==SceneLightKind::Environment && lightAt(i).sky.version!=0)
@@ -10610,6 +12462,18 @@ public:
         gl.Uniform1i (locations.materialKind, static_cast<int> (materialKind));
         gl.Uniform4f (locations.imageOutput, static_cast<float> (runtimeInputs.imageOutput),
                       0.0f, 0.0f, 0.0f);
+        // Preview-only: the fixture renderer clears both for export.
+        const bool viewportSolid = fixtureviewportsolid::solidApplies (runtimeInputs.previewUse, runtimeInputs.viewportSolid)
+            && locations.viewportSolid >= 0;
+        const std::array<float, 4> noSolid {};
+        gl.Uniform4fv (locations.viewportSolid, 1,
+                       viewportSolid ? runtimeInputs.viewportSolid.data() : noSolid.data());
+        gl.Uniform4fv (locations.viewportSolidEffects, 1,
+                       viewportSolid ? runtimeInputs.viewportSolidEffects.data() : noSolid.data());
+        result.stats.viewportSolidApplied = viewportSolid;
+        // Solid X-ray blends every object, sorted back to front by object origin.
+        const bool viewportXray = viewportSolid && fixtureviewportsolid::xrayApplies (
+            runtimeInputs.previewUse, runtimeInputs.viewportSolid, runtimeInputs.viewportSolidEffects);
         diffractivefoil::EvaluationSchedule spatialSchedule;
         std::uint32_t instanceBufferUploadCount = 0;
         std::uint32_t instancedDrawCount = 0;
@@ -10618,11 +12482,38 @@ public:
         std::uint32_t submittedNoteInstanceCount = 0;
         std::uint32_t objectInstanceDrawCount = 0;
         std::uint32_t submittedObjectInstanceCount = 0;
-        if (sky[0][3]>0.5f && skyCameraVisible && materialKind!=NativeFixtureMaterialKind::DiffractionReflective
+        // A Realtime grating frame draws the sky behind its grating, as Path Trace does;
+        // Raster's grating frames keep their cleared backdrop.
+        const bool skyDraw = sky[0][3]>0.5f && skyCameraVisible
+            && (materialKind!=NativeFixtureMaterialKind::DiffractionReflective || realtimeFrame)
             && runtimeInputs.imageOutput==renderpassoutput::Output::Color
+            && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage);
+        // With no sky draw the world fog still covers the backdrop: the backdrop
+        // pass (uSkyBackground 2) fogs the linear clear colour over the far distance.
+        if (!skyDraw && !diffractionFrame && rastermedium::worldFogOn (rastermedium::currentWorldFog())
+            && materialKind!=NativeFixtureMaterialKind::DiffractionReflective
+            && runtimeInputs.imageOutput==renderpassoutput::Output::Color
+            && (!runtimeInputs.passComposite || cameraHiddenBackdrop)
             && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage))
         {
+            auto backdrop = sky;
+            backdrop[0] = rastermedium::backdropRow (cameraHiddenBackdrop, cameraBackground);
+            gl.Uniform4fv(locations.sky,5,backdrop[0].data());
+            gl.Uniform1f(locations.skyBackground,2.0f);
+            if (locations.worldFog >= 0)
+                gl.Uniform4fv (locations.worldFog, 5, rastermedium::currentWorldFog()[0].data());
+            glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+            glDrawArrays(GL_TRIANGLES,0,3);
+            glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST);
+            gl.Uniform1f(locations.skyBackground,0.0f);
+            gl.Uniform4fv(locations.sky,5,sky[0].data());
+        }
+        if (skyDraw)
+        {
             gl.Uniform1f(locations.skyBackground,1.0f);
+            // The sky fogs over the far distance (RasterMedium.h world fog).
+            if (locations.worldFog >= 0)
+                gl.Uniform4fv (locations.worldFog, 5, rastermedium::currentWorldFog()[0].data());
             glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
             glDrawArrays(GL_TRIANGLES,0,3);
             glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST);
@@ -10634,8 +12525,21 @@ public:
         bool diffractionComplete = true;
         std::vector<float> lastGoodReadback;
         std::string lastGoodSite;
+        // 1 while the reduced-resolution gather pass draws (realtime_diffraction_gather.h).
+        int realtimeGatherRound = 0;
+        // Each whole-output readback and scan cost the orb's 1920x1080 frame about 27 ms of
+        // GPU time, and per-draw sites read back twice per surface and phase: 20 of them,
+        // over half of a Realtime frame. Realtime validates at its stage boundaries
+        // (post-stage0, the grating's bands, scene-complete), which still refuse a
+        // nonfinite frame and name the stage; Raster keeps the per-draw sites.
+        const bool perDrawValidation = !realtimeFrame;
+        // The row bands the grating and receiver draws use now: the frame's, or a gather round's.
+        const NativeFixtureDiffractionBands* activeDiffractionBands = &diffractionBands;
+        NativeFixtureDiffractionBands gatherPassBands, fullPassBands;
         const auto validateDiffractionDraw = [&](unsigned texture = 0,
             const std::string& site = "scene") {
+            // The gather pass draws into its own target; the full pass is the one validated.
+            if (realtimeGatherRound == 1) return true;
             // Preview skips the whole-output host readback and CPU validation.
             if (!authoredDiffraction || runtimeInputs.previewUse) return true;
             GLint savedTexture = 0, savedBuffer = 0;
@@ -10830,8 +12734,9 @@ public:
         const bool realtimePhased = realtimeFrame
             && runtimeInputs.imageOutput == renderpassoutput::Output::Color
             && !(runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage);
-        const bool realtimePasses = realtimePhased && !diffractionFrame;
-        const bool realtimeGratingPasses = realtimePhased && mixedMaterials;
+        const auto realtimeFramePhases = arbitgpu::realtimeengine::framePhases(realtimePhased, diffractionFrame, mixedMaterials);
+        const bool realtimePasses = realtimeFramePhases == arbitgpu::realtimeengine::FramePhases::kSurfaces;
+        const bool realtimeGratingPasses = realtimeFramePhases == arbitgpu::realtimeengine::FramePhases::kAroundGrating;
         std::array<unsigned, 2> realtimeTextures {};
         const auto realtimeSnapshot = [&] {
             for (unsigned index = 0; index < realtimeTextures.size(); ++index)
@@ -10844,10 +12749,40 @@ public:
             glReadBuffer(GL_COLOR_ATTACHMENT0);
             gl.ActiveTexture(GL_TEXTURE0);
         };
+        // The paired walk's water body, once per frame: a branch that leaves the
+        // scene below the water is tinted over its path through it. Every object
+        // takes the runtime transform its draw takes.
+        rastermedium::Uniforms waterBody {};
+        if (resources->smoothGlass.causticVolume.present)
+            rastermedium::packWaterBody (waterBody, *scene, resources->smoothGlass.object,
+                [&](const HarmonicMIDI::grid::SceneObjectRecord& object) {
+                    auto runtimeTransform = HarmonicMIDI::grid::SceneTransform3D {};
+                    if (runtimeTargetsObject (runtimeInputs, object))
+                    {
+                        runtimeTransform.translation = { runtimeInputs.objectTranslationOffset[0],
+                            runtimeInputs.objectTranslationOffset[1], runtimeInputs.objectTranslationOffset[2] };
+                        runtimeTransform = applyRuntimeObjectTransform (
+                            runtimeTransform, runtimeInputs.objectRotationDegrees, runtimeInputs.objectScale);
+                    }
+                    return multiplyFixtureMatrices (fixtureTransformMatrix (runtimeTransform),
+                        nativeObjectWorldMatrix (runtimeInputs.objectWorlds.get(), object, fixtureWorldMatrix (*scene, object)));
+                });
         const auto realtimeGlassObject = [&](HarmonicMIDI::grid::SceneObjectId id) {
             const auto* program = nativeSurfaceForObject(materialProgram.get(), id);
             return program && program->parameters.identifiers[1] != 0;
         };
+        GratingSubmissionClock gratingClock (diffractionFrame);
+        lastGratingSpans.clear();
+        // Each receiver's first sample row, so a receiver pixel need not search every row
+        // for its own (uDiffractionReceiverRow).
+        std::map<std::pair<std::uint32_t, std::uint32_t>, int> receiverRows;
+        const int receiverRowLocation = authoredDiffraction
+            ? gl.GetUniformLocation(sceneProgram, "uDiffractionReceiverRow") : -1;
+        if (receiverRowLocation >= 0)
+            for (std::size_t r = 0; r < diffractionTransportFrame.samples.size()
+                     && float(r) < diffractionTransportFrame.sampleControl[0]; ++r)
+                receiverRows.emplace(std::make_pair(diffractionTransportFrame.samples[r].object,
+                    diffractionTransportFrame.samples[r].material), int(r));
         const auto drawSurfaces = [&](int stage) {
             if (realtimeFrame)
             {
@@ -10881,6 +12816,7 @@ public:
             gl.Uniform4fv(locations.diffractionGrooveVariation, 1, &diffraction.grooveVariation.x);
             gl.Uniform4fv (locations.diffractionSpectral, 8, &diffraction.spectral[0].x);
             gl.Uniform4fv (locations.diffractionSpectralZ, 8, &diffraction.spectralZ[0].x);
+            bindEfficiencyTable(diffraction);
             if (authoredDiffraction) {
                 gl.Uniform4fv(locations.diffractionFoilField, 4, &materialProgram->diffractionFoilField[0].x);
                 gl.Uniform4fv(locations.diffractionOccupancyRectangles, 5, &materialProgram->diffractionOccupancyRectangles[0].x);
@@ -10895,31 +12831,26 @@ public:
                     materialProgram->diffractionFoilMaximumEvaluations > 0 ? 4.0f : 0.0f,
                     static_cast<float>(materialProgram->diffractionOccupancyRectangleCount), 0.0f, 0.0f);
             }
-            std::vector<std::size_t> drawOrder;
-            std::vector<std::pair<float, std::size_t>> blendedDraws;
-            drawOrder.reserve (scene->objectCount);
+            std::vector<fixtureviewportsolid::DrawCandidate> drawCandidates (scene->objectCount);
             for (std::size_t objectIndex = 0; objectIndex < scene->objectCount; ++objectIndex)
             {
                 const auto* queuedMaterial = visual3d_detail::findById (
                     scene->materials, scene->materialCount, scene->objects[objectIndex].material);
                 const bool transparentInstance=!resources->instanceAppearances.empty()
                     && resources->instanceAppearances[objectIndex].color[3]<1.0f;
-                if (!nativeSurfaceRequiresBlend(nativeSurfaceForObject(materialProgram.get(), scene->objects[objectIndex].id)) && !transparentInstance && (queuedMaterial == nullptr || queuedMaterial->alphaMode != SceneAlphaMode::Blend))
-                    drawOrder.push_back (objectIndex);
-                else
+                auto& candidate = drawCandidates[objectIndex];
+                candidate.blended = nativeSurfaceRequiresBlend(nativeSurfaceForObject(materialProgram.get(), scene->objects[objectIndex].id)) || transparentInstance || (queuedMaterial != nullptr && queuedMaterial->alphaMode == SceneAlphaMode::Blend);
+                if (candidate.blended || viewportXray)
                 {
                     const auto matrix = nativeObjectWorldMatrix (runtimeInputs.objectWorlds.get(),
                         scene->objects[objectIndex], fixtureWorldMatrix (*scene, scene->objects[objectIndex]));
                     const auto dx = matrix[12] - values.cameraTranslation[0];
                     const auto dy = matrix[13] - values.cameraTranslation[1];
                     const auto dz = matrix[14] - values.cameraTranslation[2];
-                    blendedDraws.emplace_back (dx * dx + dy * dy + dz * dz, objectIndex);
+                    candidate.distanceSquared = dx * dx + dy * dy + dz * dz;
                 }
             }
-            std::stable_sort (blendedDraws.begin(), blendedDraws.end(),
-                              [] (const auto& left, const auto& right)
-                              { return left.first > right.first; });
-            for (const auto& blend : blendedDraws) drawOrder.push_back (blend.second);
+            auto drawOrder = fixtureviewportsolid::drawOrder (drawCandidates, viewportXray);
             // Glass draws back to front whether or not it blends, so each one sees the last.
             if (realtimePhase == 2)
             {
@@ -10967,17 +12898,20 @@ public:
                         runtimeMatrix, fixtureWorldMatrix(*scene, scene->objects[index]));
                     if (!runtimeTargetsObject(runtimeInputs, scene->objects[index]))
                         instanceRecords[index].matrix = fixtureWorldMatrix(*scene, scene->objects[index]);
+                    // Each instance's prior world for Motion, with its own
+                    // runtime frame step when the runtime transform targets it.
+                    instanceRecords[index].previous = nativePreviousMatrixColumns(nativeSharedInstancePreviousWorld(
+                        *scene, index, motion, runtimeTargetsObject(runtimeInputs, scene->objects[index]),
+                        runtimeMatrix, instanceRecords[index].matrix));
                     const auto stableIdentity = scene->objects[index].id.value;
                     const auto colorSlot = videohelper::geometry::diagnosticColorSlot(
                         diagnosticStableIdentities, stableIdentity);
-                    instanceRecords[index].identityColor = {
-                        static_cast<float>((colorSlot >> 16) & 0xffu) / 255.0f,
-                        static_cast<float>((colorSlot >> 8) & 0xffu) / 255.0f,
-                        static_cast<float>(colorSlot & 0xffu) / 255.0f,
-                        resources->diagnosticInstanceIdentityColors ? 1.0f : 0.0f };
                     instanceRecords[index].color=resources->instanceAppearances[index].color;
-                    instanceRecords[index].emission=resources->instanceAppearances[index].emission;
-                    arbitgpu::analyticsky::clipRasterRadiance(instanceRecords[index].emission.data(),runtimeInputs.emissionGain);
+                    std::copy_n(resources->instanceAppearances[index].emission.begin(), 3,
+                                instanceRecords[index].emissionIdentity.begin());
+                    arbitgpu::analyticsky::clipRasterRadiance(instanceRecords[index].emissionIdentity.data(),runtimeInputs.emissionGain);
+                    instanceRecords[index].emissionIdentity[3] = resources->diagnosticInstanceIdentityColors
+                        ? static_cast<float>(colorSlot & 0xffffffu) : -1.0f;
                 }
                 gl.BindBuffer(GL_ARRAY_BUFFER, resources->instanceBuffer);
                 gl.BufferData(GL_ARRAY_BUFFER,
@@ -11000,6 +12934,13 @@ public:
                 }
                 const auto world = multiplyFixtureMatrices(fixtureTransformMatrix(runtimeTransform),
                     fixtureWorldMatrix(*scene, *instanced));
+                // The instanced object's prior world, when it moved on its own.
+                std::size_t instancedIndex = 0;
+                while (instancedIndex < scene->objectCount && scene->objects[instancedIndex].id != instanced->id)
+                    ++instancedIndex;
+                const auto previousWorld = !sceneObjectHasOwnPrior(*scene, instancedIndex) ? world
+                    : nativeWorldProduct(fixtureTransformMatrix(runtimeTransform),
+                                         nativePreviousSceneWorld(*scene, instancedIndex));
                 std::vector<OpenGlInstanceGpuRecord> objectRecords (scene->objectInstanceCount);
                 std::vector<std::pair<float, std::size_t>> order (scene->objectInstanceCount);
                 for (std::size_t index = 0; index < scene->objectInstanceCount; ++index)
@@ -11022,9 +12963,7 @@ public:
                     const auto source = order[index].second;
                     auto& record = objectRecords[index];
                     record.matrix = nativeObjectInstanceMatrix(world, scene->objectInstances[source]);
-                    // Mode 2 reads these three vectors as the prior world matrix.
-                    const auto prior = nativeObjectInstancePreviousColumns(world, *scene, source);
-                    record.identityColor = prior[0]; record.color = prior[1]; record.emission = prior[2];
+                    record.previous = nativeObjectInstancePreviousColumns(previousWorld, *scene, source);
                 }
                 gl.BindBuffer(GL_ARRAY_BUFFER, resources->instanceBuffer);
                 gl.BufferData(GL_ARRAY_BUFFER,
@@ -11035,17 +12974,25 @@ public:
             for (const auto objectIndex : drawOrder)
             {
                 const auto& drawObject = scene->objects[objectIndex];
+                // Hidden from camera rays: still casts shadows, never drawn.
+                if ((drawObject.visibility & HarmonicMIDI::grid::sceneRayVisibility::Camera) == 0) continue;
                 if (roughReceiptPass && drawObject.id != resources->smoothGlass.object) continue;
                 if (diffractionFrame && drawObject.id == materialProgram->object) continue;
                 const auto* queued = visual3d_detail::findById(scene->materials, scene->materialCount, drawObject.material);
-                const bool blendDraw = nativeSurfaceRequiresBlend(nativeSurfaceForObject(materialProgram.get(), drawObject.id))
+                const auto* stagedMaterial = visual3d_detail::findById (scene->materials, scene->materialCount, drawObject.material);
+                const bool blendDraw = viewportXray || nativeSurfaceRequiresBlend(nativeSurfaceForObject(materialProgram.get(), drawObject.id))
                     || (!resources->instanceAppearances.empty() && resources->instanceAppearances[objectIndex].color[3] < 1.0f)
-                    || (queued && queued->alphaMode == SceneAlphaMode::Blend);
+                    || (queued && queued->alphaMode == SceneAlphaMode::Blend)
+                    || (stagedMaterial != nullptr && rastermedium::modeOf (stagedMaterial->volume) == rastermedium::Mode::Volume);
                 if (stage >= 0 && blendDraw != (stage == 1)) continue;
                 if (realtimePhase >= 0 && realtimePhase != 2
                     && (realtimeGlassObject(drawObject.id) || (realtimePhase == 1 && blendDraw))) continue;
                 if (realtimePhase == 2) realtimeSnapshot();
                 gl.Uniform1i(locations.rawObjectIndex, static_cast<int>(objectIndex));
+                if (receiverRowLocation >= 0) {
+                    const auto row = receiverRows.find({drawObject.id.value, drawObject.material.value});
+                    gl.Uniform1i(receiverRowLocation, row == receiverRows.end() ? -1 : row->second);
+                }
                 gl.Uniform1i(locations.diffractionTriangleCount, static_cast<int>((drawObject.indexCount ? drawObject.indexCount : drawObject.vertexCount)/3));
                 const auto identityColor = render3dimage::identityColor (
                     runtimeInputs.imageOutput == renderpassoutput::Output::MaterialId
@@ -11151,11 +13098,26 @@ public:
                 }
                 gl.UniformMatrix4fv (locations.objectMatrix, 1, GL_FALSE,
                                      values.objectMatrix.data());
-                const auto objectMotion = runtimeInputs.objectWorlds
+                // Instanced draws carry each instance's prior matrix, so they take
+                // the frame step alone. Other draws take a similarity own step in
+                // the uniforms and any other step as a full prior model matrix.
+                const bool instancedDraw = resources->instancedSharedGeometry
+                    || drawObject.id == scene->instancedObject;
+                // A shared draw's records carry each instance's runtime step.
+                const auto objectMotion = instancedDraw
+                    ? sceneFrameMotionUniforms(motion, objectTargeted && !resources->instancedSharedGeometry)
+                    : runtimeInputs.objectWorlds
                     ? sceneObjectWorldMotionUniforms(motion, runtimeTransform, objectTargeted,
                         runtimeInputs.previousMotion ? runtimeInputs.previousMotion->objectWorlds.get() : nullptr,
                         runtimeInputs.objectWorlds.get(), drawObject.id)
                     : sceneObjectMotionUniforms(motion, *scene, objectIndex, runtimeTransform, objectTargeted);
+                if (locations.previousObjectMatrix >= 0)
+                {
+                    const auto previousObjectMatrix = instancedDraw ? values.objectMatrix
+                        : nativePreviousObjectMatrix(*scene, objectIndex, runtimeInputs,
+                              fixtureTransformMatrix(runtimeTransform), values.objectMatrix);
+                    gl.UniformMatrix4fv(locations.previousObjectMatrix, 1, GL_FALSE, previousObjectMatrix.data());
+                }
                 gl.Uniform4fv(locations.motionRotation, 1, objectMotion.rotation.data());
                 gl.Uniform4fv(locations.motionTranslationScale, 1, objectMotion.translationScale.data());
                 if (deformationMotionProbeEnabled())
@@ -11186,8 +13148,9 @@ public:
                 }
                 // Probe: validate before this object's draw so a poison produced
                 // by the previous object (whose post-draw path may be skipped by
-                // a continue) is caught at the exact iteration boundary.
-                if (authoredDiffraction
+                // a continue) is caught at the exact iteration boundary. Realtime
+                // validates per stage instead (perDrawValidation).
+                if (authoredDiffraction && perDrawValidation
                     && !validateDiffractionDraw(0,
                         "pre-draw#" + std::to_string(objectIndex)))
                 { diffractionComplete = false; return; }
@@ -11235,8 +13198,42 @@ public:
                                   : materialFrameIsBottomFirst(selectedFrame) ? 2.0f : 1.0f) : 0.0f);
                 gl.Uniform1f (locations.emissiveTexturePresence,
                               textureIds[4].isValid() ? 1.0f : 0.0f);
-                const auto alphaMode = nativeSurfaceRequiresBlend(drawProgram) || (!resources->instanceAppearances.empty()
-                    && resources->instanceAppearances[objectIndex].color[3]<1.0f) ? SceneAlphaMode::Blend
+                // The draw's medium: a glass tint or a Volume Material march inside its world bounds.
+                rastermedium::Uniforms medium {};
+                if (drawMaterial != nullptr && rastermedium::modeOf (drawMaterial->volume) != rastermedium::Mode::None)
+                {
+                    HarmonicMIDI::grid::SceneVec3 low, high;
+                    rastermedium::worldBounds (*scene, drawObject, values.objectMatrix, low, high);
+                    // An instanced draw holds every instance's own box.
+                    if (objectInstanceDraw)
+                    {
+                        low = { 3.402823e38f, 3.402823e38f, 3.402823e38f };
+                        high = { -3.402823e38f, -3.402823e38f, -3.402823e38f };
+                        for (std::size_t index = 0; index < scene->objectInstanceCount; ++index)
+                        {
+                            HarmonicMIDI::grid::SceneVec3 instanceLow, instanceHigh;
+                            rastermedium::worldBounds (*scene, drawObject,
+                                nativeObjectInstanceMatrix (values.objectMatrix, scene->objectInstances[index]),
+                                instanceLow, instanceHigh);
+                            rastermedium::unite (low, high, instanceLow, instanceHigh);
+                        }
+                        if (! (low.x <= high.x)) low = high = {};
+                    }
+                    medium = rastermedium::pack (drawMaterial->volume, low, high);
+                }
+                // The paired walk's partner dielectric tints its own segments.
+                rastermedium::packPartner (medium, *scene,
+                    rastermedium::partnerId (smoothglass::cameraPartner (resources->smoothGlass, drawObject.id)));
+                medium[7] = waterBody[7];
+                medium[8] = waterBody[8];
+                medium[9] = waterBody[9];
+                if (locations.medium >= 0)
+                    gl.Uniform4fv (locations.medium, GLsizei (medium.size()), medium[0].data());
+                if (locations.worldFog >= 0)
+                    gl.Uniform4fv (locations.worldFog, 5, rastermedium::currentWorldFog()[0].data());
+                const bool volumeDraw = medium[0][3] == float (static_cast<int> (rastermedium::Mode::Volume));
+                const auto alphaMode = viewportXray || nativeSurfaceRequiresBlend(drawProgram) || (!resources->instanceAppearances.empty()
+                    && resources->instanceAppearances[objectIndex].color[3]<1.0f) || volumeDraw ? SceneAlphaMode::Blend
                     : drawMaterial != nullptr ? drawMaterial->alphaMode : SceneAlphaMode::Opaque;
                 gl.Uniform2f (locations.alphaModeCutoff,
                               alphaMode == SceneAlphaMode::Mask ? 1.0f : 0.0f,
@@ -11278,7 +13275,7 @@ public:
                 // restores the previous cull and front-face state when this member's draw ends.
                 const OpenGlCullStateScope cullScope (jointsMixed);
                 if ((drawMaterial != nullptr && drawMaterial->doubleSided)
-                    || (drawProgram && drawProgram->parameters.identifiers[1] != 0) || jointsMixed)
+                    || (drawProgram && drawProgram->parameters.identifiers[1] != 0) || jointsMixed || viewportXray)
                     glDisable (GL_CULL_FACE);
                 else
                 {
@@ -11428,10 +13425,44 @@ public:
                 }
                 gl.Uniform1i(locations.noteInstanceIndex, -1);
                 if (!roughReceiptPass) ++surfaceDrawCount;
-                gl.DrawElementsInstanced(GL_TRIANGLES,
-                    static_cast<int>(drawObject.indexCount), GL_UNSIGNED_INT,
-                    indexOffset, static_cast<int>(noteInstances.count));
-                if (authoredDiffraction
+                // A receiver gathers over every grating row per pixel, as costly as the
+                // grating's own gather, so in a banded grating frame each surface draws in
+                // the grating's row bands, one submission apiece. The orb's plate drawn
+                // whole ran for seconds and the driver's context switch timeout killed it.
+                // The reduced-resolution gather bands each of its passes by its own schedule.
+                const auto& surfaceBands = *activeDiffractionBands;
+                if (diffractionFrame && surfaceBands.bandCount > 1 && realtimePhase != 1
+                    && diffractionTransportFrame.sampleControl[3] == 1.0f)
+                {
+                    GLint scissorBox[4] {};
+                    glGetIntegerv(GL_SCISSOR_BOX, scissorBox);
+                    const bool scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
+                    glEnable(GL_SCISSOR_TEST);
+                    for (std::uint32_t band = 0; band < surfaceBands.bandCount; ++band)
+                    {
+                        const auto bandOrigin = nativeFixtureDiffractionBandOrigin(surfaceBands, band);
+                        glScissor(0, static_cast<int>(bandOrigin), static_cast<int>(surfaceBands.width),
+                                  static_cast<int>(nativeFixtureDiffractionBandRows(surfaceBands, band)));
+                        gl.DrawElementsInstanced(GL_TRIANGLES,
+                            static_cast<int>(drawObject.indexCount), GL_UNSIGNED_INT,
+                            indexOffset, static_cast<int>(noteInstances.count));
+                        gratingClock.mark("surface " + std::to_string(drawObject.id.value) + " phase "
+                            + std::to_string(realtimePhase) + " band " + std::to_string(band)
+                            + (realtimeGatherRound == 1 ? " gather" : ""));
+                        glFlush();
+                    }
+                    glScissor(scissorBox[0], scissorBox[1], scissorBox[2], scissorBox[3]);
+                    if (!scissorWasEnabled) glDisable(GL_SCISSOR_TEST);
+                }
+                else
+                {
+                    gl.DrawElementsInstanced(GL_TRIANGLES,
+                        static_cast<int>(drawObject.indexCount), GL_UNSIGNED_INT,
+                        indexOffset, static_cast<int>(noteInstances.count));
+                    gratingClock.mark("surface " + std::to_string(drawObject.id.value) + " phase "
+                        + std::to_string(realtimePhase));
+                }
+                if (authoredDiffraction && perDrawValidation
                     && !validateDiffractionDraw(0,
                         "draw[s" + std::to_string(stage)
                         + "#" + std::to_string(objectIndex)
@@ -11453,8 +13484,10 @@ public:
             std::array<unsigned, 2>& ids;
             ~SnapshotTextures() { if (ids[0] != 0 || ids[1] != 0) glDeleteTextures (2, ids.data()); }
         } const snapshotTextures { realtimeTextures };
-        // Draws phases 1 and 2 over what the frame holds now. False if a snapshot has no texture.
-        const auto realtimeReflectionAndGlass = [&] {
+        // The colour and linear depth snapshot textures on units 14 and 15, made once a frame.
+        const auto ensureRealtimeTextures = [&]() -> bool {
+            if (realtimeTextures[0] != 0 && realtimeTextures[1] != 0)
+                return true;
             glGenTextures (2, realtimeTextures.data());
             for (unsigned index = 0; index < realtimeTextures.size(); ++index)
             {
@@ -11469,11 +13502,171 @@ public:
                 glTexImage2D (GL_TEXTURE_2D, 0, index == 1 ? GL_R32F : frame->linearColor || diffractionFrame ? GL_RGBA16F : GL_RGBA8,
                               int(width), int(height), 0, index == 1 ? GL_RED : GL_RGBA, GL_FLOAT, nullptr);
             }
-            if (realtimeTextures[0] == 0 || realtimeTextures[1] == 0)
+            gl.ActiveTexture (GL_TEXTURE0);
+            return realtimeTextures[0] != 0 && realtimeTextures[1] != 0;
+        };
+        // Depth of field over the finished Raster or Realtime image: snapshot colour and
+        // linear depth, then the bokeh gather (fixture_realtime_opengl.h) into attachment 0.
+        const auto realtimeDepthOfField = [&]() -> bool {
+            if (!ensureRealtimeTextures())
+            {
+                result.error = "OpenGL depth of field snapshot allocation failed";
+                return false;
+            }
+            auto& shared = *resources->sharedProgram;
+            if (shared.bokehId == 0)
+            {
+                const auto vertex = compileFixtureShader (gl, GL_VERTEX_SHADER, kVertexShader, result.error);
+                const auto fragment = vertex == 0 ? 0u
+                    : compileFixtureShader (gl, GL_FRAGMENT_SHADER, realtimeengine::bokehFragmentShader(), result.error);
+                if (vertex == 0 || fragment == 0)
+                {
+                    if (vertex != 0) gl.DeleteShader (vertex);
+                    result.error = "OpenGL Realtime depth of field shader failed: " + result.error;
+                    return false;
+                }
+                const auto program = gl.CreateProgram();
+                gl.AttachShader (program, vertex);
+                gl.AttachShader (program, fragment);
+                gl.LinkProgram (program);
+                gl.DeleteShader (vertex);
+                gl.DeleteShader (fragment);
+                int linked = 0;
+                gl.GetProgramiv (program, GL_LINK_STATUS, &linked);
+                unsigned vao = 0;
+                if (linked == GL_TRUE) gl.GenVertexArrays (1, &vao);
+                if (linked != GL_TRUE || vao == 0)
+                {
+                    gl.DeleteProgram (program);
+                    result.error = "OpenGL Realtime depth of field program link failed";
+                    return false;
+                }
+                shared.bokehId = program;
+                shared.bokehVao = vao;
+            }
+            realtimeSnapshot();
+            int previousProgram = 0, previousArray = 0;
+            std::array<int, 8> previousBuffers {};
+            glGetIntegerv (GL_CURRENT_PROGRAM, &previousProgram);
+            glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &previousArray);
+            for (unsigned index = 0; index < previousBuffers.size(); ++index)
+                glGetIntegerv (GL_DRAW_BUFFER0 + index, &previousBuffers[index]);
+            const GLboolean depthTest = glIsEnabled (GL_DEPTH_TEST), blend = glIsEnabled (GL_BLEND);
+            const unsigned colorOnly[] { GL_COLOR_ATTACHMENT0 };
+            gl.DrawBuffers (1, colorOnly);
+            glDisable (GL_DEPTH_TEST);
+            glDisable (GL_BLEND);
+            gl.UseProgram (shared.bokehId);
+            gl.BindVertexArray (shared.bokehVao);
+            gl.Uniform1i (gl.GetUniformLocation (shared.bokehId, "uColor"), 14);
+            gl.Uniform1i (gl.GetUniformLocation (shared.bokehId, "uDepth"), 15);
+            const auto bokeh = lensshutter::bokehParameters (camera, width, height);
+            gl.Uniform4fv (gl.GetUniformLocation (shared.bokehId, "uLens"), 1, bokeh.lens.data());
+            gl.Uniform4fv (gl.GetUniformLocation (shared.bokehId, "uAperture"), 1, bokeh.aperture.data());
+            glDrawArrays (GL_TRIANGLES, 0, 3);
+            std::array<unsigned, 8> restore {};
+            for (unsigned index = 0; index < restore.size(); ++index) restore[index] = unsigned (previousBuffers[index]);
+            gl.DrawBuffers (8, restore.data());
+            if (depthTest) glEnable (GL_DEPTH_TEST);
+            if (blend) glEnable (GL_BLEND);
+            gl.UseProgram (unsigned (previousProgram));
+            gl.BindVertexArray (unsigned (previousArray));
+            return true;
+        };
+        // Velocity motion blur over the finished Raster or Realtime image: snapshot
+        // colour, then gather along each pixel's Motion (fixture_realtime_opengl.h)
+        // over the Render node's shutter into attachment 0.
+        const auto velocityMotionBlur = [&]() -> bool {
+            if (!ensureRealtimeTextures())
+            {
+                result.error = "OpenGL motion blur snapshot allocation failed";
+                return false;
+            }
+            auto& shared = *resources->sharedProgram;
+            if (shared.velocityBlurId == 0)
+            {
+                const auto vertex = compileFixtureShader (gl, GL_VERTEX_SHADER, kVertexShader, result.error);
+                const auto fragment = vertex == 0 ? 0u
+                    : compileFixtureShader (gl, GL_FRAGMENT_SHADER, realtimeengine::velocityBlurFragmentShader(), result.error);
+                if (vertex == 0 || fragment == 0)
+                {
+                    if (vertex != 0) gl.DeleteShader (vertex);
+                    result.error = "OpenGL motion blur shader failed: " + result.error;
+                    return false;
+                }
+                const auto program = gl.CreateProgram();
+                gl.AttachShader (program, vertex);
+                gl.AttachShader (program, fragment);
+                gl.LinkProgram (program);
+                gl.DeleteShader (vertex);
+                gl.DeleteShader (fragment);
+                int linked = 0;
+                gl.GetProgramiv (program, GL_LINK_STATUS, &linked);
+                unsigned vao = 0;
+                if (linked == GL_TRUE) gl.GenVertexArrays (1, &vao);
+                if (linked != GL_TRUE || vao == 0)
+                {
+                    gl.DeleteProgram (program);
+                    result.error = "OpenGL motion blur program link failed";
+                    return false;
+                }
+                shared.velocityBlurId = program;
+                shared.velocityBlurVao = vao;
+            }
+            realtimeSnapshot();
+            int previousProgram = 0, previousArray = 0;
+            std::array<int, 8> previousBuffers {};
+            glGetIntegerv (GL_CURRENT_PROGRAM, &previousProgram);
+            glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &previousArray);
+            for (unsigned index = 0; index < previousBuffers.size(); ++index)
+                glGetIntegerv (GL_DRAW_BUFFER0 + index, &previousBuffers[index]);
+            const GLboolean depthTest = glIsEnabled (GL_DEPTH_TEST), blend = glIsEnabled (GL_BLEND);
+            const unsigned colorOnly[] { GL_COLOR_ATTACHMENT0 };
+            gl.DrawBuffers (1, colorOnly);
+            glDisable (GL_DEPTH_TEST);
+            glDisable (GL_BLEND);
+            gl.UseProgram (shared.velocityBlurId);
+            gl.BindVertexArray (shared.velocityBlurVao);
+            gl.ActiveTexture (GL_TEXTURE13);
+            gl.BindSampler (13, 0);
+            glBindTexture (GL_TEXTURE_2D, frame->rawTextures[5]);
+            gl.ActiveTexture (GL_TEXTURE0);
+            gl.Uniform1i (gl.GetUniformLocation (shared.velocityBlurId, "uColor"), 14);
+            gl.Uniform1i (gl.GetUniformLocation (shared.velocityBlurId, "uMotion"), 13);
+            gl.Uniform4f (gl.GetUniformLocation (shared.velocityBlurId, "uShutter"),
+                          runtimeInputs.motionBlur.open, runtimeInputs.motionBlur.close, 0.0f, 0.0f);
+            glDrawArrays (GL_TRIANGLES, 0, 3);
+            gl.ActiveTexture (GL_TEXTURE13);
+            glBindTexture (GL_TEXTURE_2D, 0);
+            gl.ActiveTexture (GL_TEXTURE0);
+            std::array<unsigned, 8> restore {};
+            for (unsigned index = 0; index < restore.size(); ++index) restore[index] = unsigned (previousBuffers[index]);
+            gl.DrawBuffers (8, restore.data());
+            if (depthTest) glEnable (GL_DEPTH_TEST);
+            if (blend) glEnable (GL_BLEND);
+            gl.UseProgram (unsigned (previousProgram));
+            gl.BindVertexArray (unsigned (previousArray));
+            return true;
+        };
+        // The camera's lens and the Render node's shutter over a finished Color image:
+        // motion blur first, then depth of field over the blurred frame.
+        const bool colorImage = runtimeInputs.imageOutput == renderpassoutput::Output::Color
+            && !(runtimeInputs.passComposite && runtimeInputs.passComposite->inspectionImage);
+        const auto lensAndShutter = [&]() -> bool {
+            const auto passes = lensshutter::colorPasses (colorImage, runtimeInputs.motionBlur, camera);
+            if (passes.velocity && !velocityMotionBlur()) return false;
+            return !passes.bokeh || realtimeDepthOfField();
+        };
+        // Draws phases 1 and 2 over what the frame holds now. False if a snapshot has no texture.
+        const auto realtimeReflectionAndGlass = [&] {
+            if (!ensureRealtimeTextures())
                 return false;
             realtimeSnapshot();
-            realtimePhase = 1;
-            drawSurfaces (-1);
+            if (!runtimeInputs.realtimeSkipReflections)
+            {
+                realtimePhase = 1;
+                drawSurfaces (-1);
+            }
             realtimePhase = 2;
             drawSurfaces (-1);
             realtimePhase = -1;
@@ -11488,20 +13681,311 @@ public:
             // readback inspects frame->accumulationTexture_ while the scene may
             // draw into frame->texture_; whichever one already reads nonfinite
             // names the poisoned buffer.
-            if (authoredDiffraction && !validateDiffractionDraw(0, "before-draws@accumulation"))
+            if (authoredDiffraction && perDrawValidation && !validateDiffractionDraw(0, "before-draws@accumulation"))
                 return fail(result.error);
-            if (authoredDiffraction && !validateDiffractionDraw(frame->texture_, "before-draws@texture"))
+            if (authoredDiffraction && perDrawValidation && !validateDiffractionDraw(frame->texture_, "before-draws@texture"))
                 return fail(result.error);
+            const auto* gratingDeformed = resources->deformedWindingFor (object.firstVertex);
+            const bool gratingJointsMixed = mixedMaterials && gratingDeformed != nullptr
+                && gratingDeformed->jointsMixed;
+            const OpenGlCullStateScope gratingCullScope (gratingJointsMixed);
+            // The orb's one grating path with receivers gathers at reduced resolution first:
+            // round 1 draws stage 0 and the grating bands into the gather target, keeping
+            // only the gather term; round 2 draws them at full resolution and reads it back
+            // through the depth/normal-aware upsample (realtime_diffraction_gather.h).
+            namespace gather = arbitgpu::realtimediffractiongather;
+            const int gatherLocation = realtimeFrame ? gl.GetUniformLocation(sceneProgram, "uRealtimeGather") : -1;
+            std::uint32_t gatherScale = 1;
+            if (gatherLocation >= 0 && authoredDiffraction && realtimeGratingPasses && mixedMaterials
+                && diffractionTransportFrame.sampleControl[3] == 1.0f && materialProgram->diffractionPathCount == 1)
+            {
+                gatherScale = gather::frameScale(width, height);
+                int units = 0; glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+                if (gatherScale > 1 && units < 21) {
+                    static std::atomic<bool> logged {false};
+                    if (!logged.exchange(true))
+                        std::fprintf(stderr, "[realtime-diffraction] %d fragment texture units: the gather "
+                            "target needs units 17-20, every pixel gathers at full resolution\n", units);
+                    gatherScale = 1;
+                }
+            }
+            const auto gatherWidth = gather::extent(width, gatherScale);
+            const auto gatherHeight = gather::extent(height, gatherScale);
+            // Each round bands by its own work: the gather pass by the rows a pixel
+            // gathers over the target's width, the full pass by the gather spread over the
+            // scale's square, since only a pixel with no matching gather texel gathers
+            // there. Bands of the full frame's rows left the 640-pixel gather target's
+            // bands too small to fill the GPU.
+            if (gatherScale > 1)
+            {
+                gatherPassBands = gather::gatherPassBands(unsplitDiffractionBands, diffractionPixelQueries, gatherScale);
+                fullPassBands = gather::fullPassBands(unsplitDiffractionBands, diffractionPixelQueries, gatherScale);
+            }
+            // ARBIT_GL_REALTIME_GATHER_PROBE=1 colours the full pass by which pixels reused
+            // the gather term and logs the counts; the frame is then a probe, not an image.
+            static const bool gatherProbe = [] {
+                const char* value = std::getenv("ARBIT_GL_REALTIME_GATHER_PROBE");
+                return value != nullptr && value[0] == '1';
+            }();
+            if (gatherLocation >= 0) gl.Uniform4f(gatherLocation, 0.0f, 1.0f, 1.0f, 0.0f);
+            unsigned gatherFramebuffer = 0;
+            std::array<unsigned, 5> gatherTextures {};
+            ScopeCleanup gatherCleanup { [&]
+            {
+                if (gatherFramebuffer != 0) gl.DeleteFramebuffers(1, &gatherFramebuffer);
+                for (auto& texture : gatherTextures)
+                    if (texture != 0) glDeleteTextures(1, &texture);
+                gatherFramebuffer = 0;
+                gatherTextures = {};
+            } };
+            GLint savedDrawFramebuffer = 0;
+            if (gatherScale > 1)
+            {
+                glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &savedDrawFramebuffer);
+                // Colour (the term, alpha marks a gather texel), linear depth, normal,
+                // object id, and the depth buffer the gather pass tests against.
+                const std::array<std::array<GLenum, 3>, 5> formats {{
+                    {GL_RGBA32F, GL_RGBA, GL_FLOAT}, {GL_R32F, GL_RED, GL_FLOAT},
+                    {GL_RGBA16F, GL_RGBA, GL_FLOAT}, {GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT},
+                    {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT}}};
+                const std::array<GLenum, 5> attachmentsOf {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+                    GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT6, GL_DEPTH_ATTACHMENT};
+                gl.ActiveTexture(GL_TEXTURE0);
+                GLint savedTexture = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTexture);
+                gl.GenFramebuffers(1, &gatherFramebuffer);
+                gl.BindFramebuffer(GL_FRAMEBUFFER, gatherFramebuffer);
+                glGenTextures(5, gatherTextures.data());
+                for (std::size_t i = 0; i < gatherTextures.size(); ++i) {
+                    glBindTexture(GL_TEXTURE_2D, gatherTextures[i]);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GLint(formats[i][0]), int(gatherWidth), int(gatherHeight), 0,
+                        formats[i][1], formats[i][2], nullptr);
+                    gl.FramebufferTexture2D(GL_FRAMEBUFFER, attachmentsOf[i], GL_TEXTURE_2D, gatherTextures[i], 0);
+                }
+                glBindTexture(GL_TEXTURE_2D, GLuint(savedTexture));
+                if (gatherFramebuffer == 0 || gatherTextures[4] == 0 || glGetError() != GL_NO_ERROR
+                    || gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                    return fail("OpenGL Realtime diffraction gather target allocation failed ("
+                        + std::to_string(gatherWidth) + "x" + std::to_string(gatherHeight) + ")");
+                gl.BindFramebuffer(GL_FRAMEBUFFER, GLuint(savedDrawFramebuffer));
+            }
+            // The grating's mirror (realtime_diffraction_mirror.h): after the gather round's
+            // grating bands, one pass over the gather target adds the zero order's view of the
+            // lit room to each grating texel's gather term, which the full pass upsamples.
+            // Its weight comes from the efficiency table, so a grating without one has no mirror.
+            namespace mirror = arbitgpu::realtimediffractionmirror;
+            std::vector<mirror::Texel> mirrorWeights;
+            if (gatherScale > 1)
+            {
+                if (efficiencyTable && efficiencySource != nullptr
+                    && arbitgpu::realtimediffractionefficiency::sameGrating(*efficiencySource,
+                        materialProgram->diffractionPaths[0].material))
+                    mirrorWeights = mirror::weights(*efficiencyTable, *efficiencySource);
+                else
+                {
+                    static std::atomic<bool> logged {false};
+                    if (!logged.exchange(true))
+                        std::fprintf(stderr, "[realtime-diffraction] the grating has no efficiency table: "
+                            "Realtime shows no mirror reflection of the room in it\n");
+                }
+            }
+            static_assert(mirror::kWeightSamples == 33, "the mirror shader declares uMirrorWeight[33]");
+            const auto realtimeMirror = [&]() -> bool {
+                if (mirrorWeights.empty() || mirrorObjects.empty()) return true;
+                auto& shared = *resources->sharedProgram;
+                if (shared.mirrorId == 0)
+                {
+                    const std::string fragmentSource = std::string("#version 330 core\n")
+                        + opaquevisibility::glslShader() + mirror::fragmentShader();
+                    const auto vertex = compileFixtureShader (gl, GL_VERTEX_SHADER, kVertexShader, result.error);
+                    const auto fragment = vertex == 0 ? 0u
+                        : compileFixtureShader (gl, GL_FRAGMENT_SHADER, fragmentSource.c_str(), result.error);
+                    if (vertex == 0 || fragment == 0)
+                    {
+                        if (vertex != 0) gl.DeleteShader (vertex);
+                        result.error = "OpenGL Realtime grating mirror shader failed: " + result.error;
+                        return false;
+                    }
+                    const auto program = gl.CreateProgram();
+                    gl.AttachShader (program, vertex);
+                    gl.AttachShader (program, fragment);
+                    gl.LinkProgram (program);
+                    gl.DeleteShader (vertex);
+                    gl.DeleteShader (fragment);
+                    int linked = 0;
+                    gl.GetProgramiv (program, GL_LINK_STATUS, &linked);
+                    unsigned vao = 0;
+                    if (linked == GL_TRUE) gl.GenVertexArrays (1, &vao);
+                    if (linked != GL_TRUE || vao == 0)
+                    {
+                        gl.DeleteProgram (program);
+                        result.error = "OpenGL Realtime grating mirror program link failed";
+                        return false;
+                    }
+                    shared.mirrorId = program;
+                    shared.mirrorVao = vao;
+                }
+                // The object records, 1024 texels a row like the scene table.
+                auto records = mirrorObjects;
+                const auto recordRows = (records.size() + 1023) / 1024;
+                if (maximumTextureSize < 1024 || std::size_t (maximumTextureSize) < recordRows)
+                {
+                    result.error = nativeTextureAxisError ("grating mirror objects", std::max<std::size_t> (1024, recordRows), maximumTextureSize);
+                    return false;
+                }
+                records.resize (recordRows * 1024, mirror::Texel {});
+                unsigned recordTexture = 0, framebuffer = 0;
+                ScopeCleanup mirrorCleanup { [&]
+                {
+                    if (framebuffer != 0) gl.DeleteFramebuffers (1, &framebuffer);
+                    if (recordTexture != 0) glDeleteTextures (1, &recordTexture);
+                } };
+                GLint previousProgram = 0, previousArray = 0, previousFramebuffer = 0;
+                GLint viewport[4] {};
+                glGetIntegerv (GL_CURRENT_PROGRAM, &previousProgram);
+                glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &previousArray);
+                glGetIntegerv (GL_DRAW_FRAMEBUFFER_BINDING, &previousFramebuffer);
+                glGetIntegerv (GL_VIEWPORT, viewport);
+                const GLboolean depthTest = glIsEnabled (GL_DEPTH_TEST), blend = glIsEnabled (GL_BLEND),
+                    scissor = glIsEnabled (GL_SCISSOR_TEST);
+                gl.ActiveTexture (GL_TEXTURE20);
+                gl.BindSampler (20, 0);
+                glGenTextures (1, &recordTexture);
+                glBindTexture (GL_TEXTURE_2D, recordTexture);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, 1024, int (recordRows), 0, GL_RGBA, GL_FLOAT, records.data());
+                // Only the gather Colour is attached, so the pass reads the depth, normal and
+                // object targets with no feedback loop.
+                gl.GenFramebuffers (1, &framebuffer);
+                gl.BindFramebuffer (GL_FRAMEBUFFER, framebuffer);
+                gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gatherTextures[0], 0);
+                const unsigned colorOnly[] { GL_COLOR_ATTACHMENT0 };
+                gl.DrawBuffers (1, colorOnly);
+                if (recordTexture == 0 || framebuffer == 0 || glGetError() != GL_NO_ERROR
+                    || gl.CheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                {
+                    gl.BindFramebuffer (GL_FRAMEBUFFER, GLuint (previousFramebuffer));
+                    gl.ActiveTexture (GL_TEXTURE0);
+                    result.error = "OpenGL Realtime grating mirror target allocation failed ("
+                        + std::to_string (gatherWidth) + "x" + std::to_string (gatherHeight) + ")";
+                    return false;
+                }
+                for (int i = 0; i < 3; ++i)
+                {
+                    gl.ActiveTexture (GLenum (GL_TEXTURE0 + 17 + i));
+                    gl.BindSampler (GLuint (17 + i), 0);
+                    glBindTexture (GL_TEXTURE_2D, gatherTextures[std::size_t (i + 1)]);
+                }
+                gl.ActiveTexture (GL_TEXTURE8);
+                gl.BindSampler (8, 0);
+                glBindTexture (GL_TEXTURE_2D, frame->diffractionQueryTexture);
+                gl.ActiveTexture (GL_TEXTURE11);
+                gl.BindSampler (11, 0);
+                glBindTexture (GL_TEXTURE_2D, resources->sceneTableTexture);
+                gl.ActiveTexture (GL_TEXTURE0);
+                glViewport (0, 0, int (gatherWidth), int (gatherHeight));
+                glDisable (GL_DEPTH_TEST);
+                glDisable (GL_SCISSOR_TEST);
+                glEnable (GL_BLEND);
+                gl.BlendFuncSeparate (GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+                const auto id = shared.mirrorId;
+                gl.UseProgram (id);
+                gl.BindVertexArray (shared.mirrorVao);
+                const auto at = [&] (const char* name) { return gl.GetUniformLocation (id, name); };
+                gl.Uniform1i (at ("uMirrorDepth"), 17);
+                gl.Uniform1i (at ("uMirrorNormal"), 18);
+                gl.Uniform1i (at ("uMirrorObjectIds"), 19);
+                gl.Uniform1i (at ("uMirrorObjects"), 20);
+                gl.Uniform1i (at ("uOpaqueVisibility"), 8);
+                gl.Uniform1i (at ("uSceneTable"), 11);
+                gl.Uniform4fv (at ("uOpaqueControl"), 1, diffractionTransportFrame.query.control.data());
+                gl.Uniform1ui (at ("uMirrorGrating"), object.id.value);
+                gl.Uniform2f (at ("uMirrorExtent"), float (gatherWidth), float (gatherHeight));
+                gl.Uniform4fv (at ("uCameraRotation"), 1, gratingValues.cameraRotation.data());
+                gl.Uniform3f (at ("uCameraTranslation"), gratingValues.cameraTranslation[0],
+                    gratingValues.cameraTranslation[1], gratingValues.cameraTranslation[2]);
+                gl.Uniform4fv (at ("uProjection"), 1, gratingValues.projection.data());
+                gl.Uniform4fv (at ("uMirrorWeight[0]"), mirror::kWeightSamples, mirrorWeights[0].data());
+                gl.Uniform1i (at ("uMirrorObjectCount"), int (mirrorObjects.size() / 2));
+                gl.Uniform1i (at ("uMirrorEmitterFirst"), int (emissionRecords + tableObjects));
+                gl.Uniform1i (at ("uMirrorEmitterTriangles"), int (emitterTexels.size() / 3));
+                gl.Uniform3f (at ("uAmbient"), gratingValues.ambient[0], gratingValues.ambient[1], gratingValues.ambient[2]);
+                glDrawArrays (GL_TRIANGLES, 0, 3);
+                glFlush();
+                gratingClock.mark ("grating mirror gather");
+                gl.BindFramebuffer (GL_FRAMEBUFFER, GLuint (previousFramebuffer));
+                glViewport (viewport[0], viewport[1], viewport[2], viewport[3]);
+                if (depthTest) glEnable (GL_DEPTH_TEST);
+                if (!blend) glDisable (GL_BLEND);
+                if (scissor) glEnable (GL_SCISSOR_TEST);
+                gl.UseProgram (unsigned (previousProgram));
+                gl.BindVertexArray (unsigned (previousArray));
+                return true;
+            };
+            // Counters count the full pass's submissions once.
+            const auto countersBefore = std::array<std::uint32_t, 8> {instanceBufferUploadCount, instancedDrawCount,
+                submittedInstanceCount, noteInstanceDrawCount, submittedNoteInstanceCount, objectInstanceDrawCount,
+                submittedObjectInstanceCount, surfaceDrawCount};
+            for (realtimeGatherRound = gatherScale > 1 ? 1 : 0; ; ++realtimeGatherRound)
+            {
+            const unsigned allAttachments[] {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
+                GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT6, GL_COLOR_ATTACHMENT7};
+            if (realtimeGatherRound == 1)
+            {
+                gl.BindFramebuffer(GL_FRAMEBUFFER, gatherFramebuffer);
+                const unsigned gatherAttachments[] {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
+                    GL_NONE, GL_NONE, GL_NONE, GL_COLOR_ATTACHMENT6, GL_NONE};
+                gl.DrawBuffers(8, gatherAttachments);
+                glViewport(0, 0, int(gatherWidth), int(gatherHeight));
+                glDisable(GL_SCISSOR_TEST);
+                glDepthMask(GL_TRUE);
+                const float zero[4] {0.0f, 0.0f, 0.0f, 0.0f};
+                const float one = 1.0f;
+                const unsigned noObject[4] {0u, 0u, 0u, 0u};
+                gl.ClearBufferfv(GL_COLOR, 0, zero);
+                gl.ClearBufferfv(GL_COLOR, 1, zero);
+                gl.ClearBufferfv(GL_COLOR, 2, zero);
+                gl.ClearBufferuiv(GL_COLOR, 6, noObject);
+                gl.ClearBufferfv(GL_DEPTH, 0, &one);
+                gl.DrawBuffers(8, allAttachments);
+                gl.Uniform4f(gatherLocation, 1.0f, float(gatherWidth) / float(width),
+                    float(gatherHeight) / float(height), 0.0f);
+                activeDiffractionBands = &gatherPassBands;
+            }
+            else if (realtimeGatherRound == 2)
+            {
+                std::uint32_t* const counters[] {&instanceBufferUploadCount, &instancedDrawCount,
+                    &submittedInstanceCount, &noteInstanceDrawCount, &submittedNoteInstanceCount,
+                    &objectInstanceDrawCount, &submittedObjectInstanceCount, &surfaceDrawCount};
+                for (std::size_t i = 0; i < countersBefore.size(); ++i) *counters[i] = countersBefore[i];
+                gl.BindFramebuffer(GL_FRAMEBUFFER, GLuint(savedDrawFramebuffer));
+                gl.DrawBuffers(8, allAttachments);
+                glViewport(0, 0, int(width), int(height));
+                glDisable(GL_SCISSOR_TEST);
+                gl.Uniform4f(gatherLocation, 2.0f, float(gatherWidth) / float(width),
+                    float(gatherHeight) / float(height), gatherProbe ? 1.0f : 0.0f);
+                activeDiffractionBands = &fullPassBands;
+                for (int i = 0; i < 4; ++i) {
+                    gl.ActiveTexture(GLenum(GL_TEXTURE0 + 17 + i));
+                    gl.BindSampler(GLuint(17 + i), 0);
+                    glBindTexture(GL_TEXTURE_2D, gatherTextures[std::size_t(i)]);
+                }
+                gl.ActiveTexture(GL_TEXTURE0);
+            }
             realtimePhase = realtimeGratingPasses ? 0 : -1;
             if (mixedMaterials) drawSurfaces(0);
             if (!diffractionComplete) return fail(result.error);
             if (authoredDiffraction && !validateDiffractionDraw(0, "post-stage0"))
                 return fail(result.error);
             values = gratingValues;
-            const auto* gratingDeformed = resources->deformedWindingFor (object.firstVertex);
-            const bool gratingJointsMixed = mixedMaterials && gratingDeformed != nullptr
-                && gratingDeformed->jointsMixed;
-            const OpenGlCullStateScope gratingCullScope (gratingJointsMixed);
             if (mixedMaterials) {
                 SceneTransform3D transform {};
                 transform.translation = {runtimeInputs.objectTranslationOffset[0], runtimeInputs.objectTranslationOffset[1], runtimeInputs.objectTranslationOffset[2]};
@@ -11557,15 +14041,45 @@ public:
             };
             // Each band is one scissored draw per lighting path. Bands cover
             // disjoint rows, so path accumulation per pixel is unchanged.
-            const bool bandedDiffraction = diffractionBands.bandCount > 1;
-            for (std::uint32_t band = 0; band < diffractionBands.bandCount; ++band)
+            const auto& gratingBands = *activeDiffractionBands;
+            const bool bandedDiffraction = gratingBands.bandCount > 1;
             {
-            const auto bandOrigin = nativeFixtureDiffractionBandOrigin(diffractionBands, band);
-            const auto bandRows = nativeFixtureDiffractionBandRows(diffractionBands, band);
+                // One line per grating draw whose route differs from the last: the program,
+                // whether it carries the Realtime define, which branch of evaluateDiffraction
+                // the uniforms select, and the light the Realtime orders read.
+                const char* route = diffractionTransportFrame.sampleControl[3] == 1.0f ? "receiver"
+                    : lighting.version == 2 ? "environment"
+                    : lighting.version == 3 ? "authored" : "light";
+                std::string kinds;
+                for (std::uint8_t p = 0; p < diffractionPathCount; ++p)
+                    kinds += (p ? "," : "") + std::to_string (materialKind == NativeFixtureMaterialKind::DiffractionReflective
+                        ? materialProgram->diffractionPaths[p].kindBounceAndReserved[0] : 0u);
+                char text[512];
+                std::snprintf (text, sizeof (text),
+                    "[gl] diffraction draw prog=%u features=0x%x realtimeDefine=%d realtimePhases=%d route=%s "
+                    "lighting=%u bands=%u%s paths=%u kinds=%s emitterTriangles=%zu sky=%.0f sun=%g",
+                    sceneProgram, resources->sharedProgram ? resources->sharedProgram->fragmentFeatures : 0u,
+                    realtimeFrame ? 1 : 0, realtimeGratingPasses ? 1 : 0, route,
+                    static_cast<unsigned> (lighting.version), diffractionBands.bandCount,
+                    bandedDiffraction ? " banded" : " plain", static_cast<unsigned> (diffractionPathCount),
+                    kinds.c_str(), emitterTexels.size() / 3, sky[0][3], sky[4][3]);
+                static std::mutex mutex; static std::string last;
+                const std::lock_guard lock (mutex);
+                if (last != text)
+                {
+                    last = text;
+                    std::fprintf (stderr, "%s\n", text);
+                }
+            }
+            for (std::uint32_t band = 0; band < gratingBands.bandCount; ++band)
+            {
+            const auto bandOrigin = nativeFixtureDiffractionBandOrigin(gratingBands, band);
+            const auto bandRows = nativeFixtureDiffractionBandRows(gratingBands, band);
             if (bandedDiffraction)
             {
                 if (band != 0)
                 {
+                    gratingClock.mark("grating band " + std::to_string(band - 1) + (realtimeGatherRound == 1 ? " gather" : ""));
                     glFlush();
                     const unsigned attachments[] {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
                         GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT6, GL_COLOR_ATTACHMENT7};
@@ -11573,14 +14087,14 @@ public:
                     glDisable(GL_BLEND); glDepthMask(GL_TRUE); glDepthFunc(GL_LESS);
                 }
                 glEnable(GL_SCISSOR_TEST);
-                glScissor(0, static_cast<int>(bandOrigin), static_cast<int>(width), static_cast<int>(bandRows));
+                glScissor(0, static_cast<int>(bandOrigin), static_cast<int>(gratingBands.width), static_cast<int>(bandRows));
                 if (materialProgram->diffractionFoilMaximumEvaluations != 0
-                    && !diffractivefoil::makeEvaluationSchedule(diffractionBands.maximumEvaluations,
-                        width, bandRows, diffractionBands.pathCount, spatialSchedule))
+                    && !diffractivefoil::makeEvaluationSchedule(gratingBands.maximumEvaluations,
+                        gratingBands.width, bandRows, gratingBands.pathCount, spatialSchedule))
                     return fail ("OpenGL fixture diffraction workload exceeds backend limits");
             }
             const auto bandEvaluationLimit = bandedDiffraction
-                ? nativeFixtureDiffractionBandEvaluationLimit(diffractionBands, band)
+                ? nativeFixtureDiffractionBandEvaluationLimit(gratingBands, band)
                 : spatialSchedule.maximumEvaluations;
             for (std::uint8_t pathIndex = 0; pathIndex < diffractionPathCount; ++pathIndex)
             {
@@ -11603,6 +14117,7 @@ public:
                                &diffraction.grooveVariation.x);
                 gl.Uniform4fv (locations.diffractionSpectral, 8, &diffraction.spectral[0].x);
                 gl.Uniform4fv (locations.diffractionSpectralZ, 8, &diffraction.spectralZ[0].x);
+                bindEfficiencyTable(diffraction);
                 gl.Uniform4fv (locations.diffractionIncidentDirectionAndIntensity, 1,
                                &lightingPath.incidentDirectionAndIntensity.x);
                 float maskCoverage = 0.0f;
@@ -11644,7 +14159,11 @@ public:
                                           static_cast<int> (object.indexCount),
                                           GL_UNSIGNED_INT, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(object.firstIndex) * sizeof(std::uint32_t)),
                                           static_cast<int>(noteInstances.count));
-                if (authoredDiffraction && !validateDiffractionDraw(0, "banded-draw")) return fail(result.error);
+                // A banded frame is read back once after its last band below: one whole-output
+                // readback and scan per band and path made the orb's 540 bands take minutes.
+                if (authoredDiffraction && !bandedDiffraction
+                        && !validateDiffractionDraw(0, "banded-draw band 0/1 path " + std::to_string(pathIndex)))
+                    return fail(result.error);
                 if (noteInstances.admitted)
                 {
                     ++noteInstanceDrawCount;
@@ -11652,7 +14171,42 @@ public:
                 }
             }
             }
+            gratingClock.mark((bandedDiffraction ? "grating band " + std::to_string(gratingBands.bandCount - 1)
+                                                 : std::string("grating")) + (realtimeGatherRound == 1 ? " gather" : ""));
             if (bandedDiffraction) glDisable(GL_SCISSOR_TEST);
+            if (authoredDiffraction && bandedDiffraction
+                    && !validateDiffractionDraw(0, "banded-draw " + std::to_string(diffractionBands.bandCount)
+                        + " bands of " + std::to_string(diffractionBands.bandHeight) + " rows, "
+                        + std::to_string(diffractionPathCount) + " paths"))
+                return fail(result.error);
+            if (realtimeGatherRound != 1) break;
+            if (!realtimeMirror()) return fail(result.error);
+            }
+            if (gatherProbe && gatherScale > 1)
+            {
+                // Red: gathered itself; green: reused the gather term.
+                GLint savedRead = 0, savedPack = 0, savedAlignment = 0;
+                glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &savedRead);
+                glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &savedPack);
+                glGetIntegerv(GL_PACK_ALIGNMENT, &savedAlignment);
+                gl.BindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(savedDrawFramebuffer));
+                gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                glPixelStorei(GL_PACK_ALIGNMENT, 4);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                std::vector<float> probe(std::size_t(width) * height * 4);
+                glReadPixels(0, 0, int(width), int(height), GL_RGBA, GL_FLOAT, probe.data());
+                std::size_t own = 0, reused = 0;
+                for (std::size_t p = 0; p < std::size_t(width) * height; ++p) {
+                    own += probe[p * 4] > 0.5f && probe[p * 4 + 1] < 0.5f;
+                    reused += probe[p * 4 + 1] > 0.5f && probe[p * 4] < 0.5f;
+                }
+                std::fprintf(stderr, "[gl] realtime gather probe %ux%u at scale %u (%ux%u): %zu pixels reused the "
+                    "gather term, %zu gathered themselves (%.2f%%)\n", width, height, gatherScale, gatherWidth,
+                    gatherHeight, reused, own, 100.0 * double(own) / double(std::max<std::size_t>(1, own + reused)));
+                gl.BindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(savedRead));
+                gl.BindBuffer(GL_PIXEL_PACK_BUFFER, GLuint(savedPack));
+                glPixelStorei(GL_PACK_ALIGNMENT, savedAlignment);
+            }
             if (mixedMaterials) {
                 const unsigned attachments[] {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
                     GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_COLOR_ATTACHMENT5, GL_COLOR_ATTACHMENT6, GL_COLOR_ATTACHMENT7};
@@ -11664,9 +14218,49 @@ public:
                     if (!realtimeReflectionAndGlass())
                         return fail("OpenGL Realtime snapshot allocation failed");
                     if (!diffractionComplete) return fail(result.error);
+                    if (!lensAndShutter()) return fail(result.error);
                 }
             }
+            // Raster with gratings: the lens and shutter passes over the accumulated radiance.
+            if (!realtimeGratingPasses && !lensAndShutter()) return fail(result.error);
             if (authoredDiffraction && !validateDiffractionDraw(0, "scene-complete")) return fail(result.error);
+            gratingClock.mark("lens and shutter");
+            if (realtimeGratingPasses && !realtimeSceneDumpDirectory().empty())
+            {
+                // The scene framebuffer is still bound for drawing; its first attachment is Color.
+                GLint savedRead = 0, savedPack = 0, savedAlignment = 0, sceneFramebuffer = 0;
+                glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &savedRead);
+                glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &savedPack);
+                glGetIntegerv(GL_PACK_ALIGNMENT, &savedAlignment);
+                glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &sceneFramebuffer);
+                gl.BindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(sceneFramebuffer));
+                gl.BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                glPixelStorei(GL_PACK_ALIGNMENT, 4);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                std::vector<float> color(std::size_t(width) * height * 4);
+                glReadPixels(0, 0, int(width), int(height), GL_RGBA, GL_FLOAT, color.data());
+                gl.BindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(savedRead));
+                gl.BindBuffer(GL_PIXEL_PACK_BUFFER, GLuint(savedPack));
+                glPixelStorei(GL_PACK_ALIGNMENT, savedAlignment);
+                std::vector<std::array<float, 16>> worlds;
+                for (std::size_t i = 0; i < scene->objectCount; ++i)
+                    worlds.push_back(nativeObjectWorldMatrix(runtimeInputs.objectWorlds.get(), scene->objects[i],
+                        fixtureWorldMatrix(*scene, scene->objects[i])));
+                // The scene table as drawn: lights, per-object records, emission and emitters.
+                std::vector<float> table;
+                GLint tableHeight = 0, savedTexture = 0;
+                if (resources->sceneTableTexture != 0)
+                {
+                    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTexture);
+                    glBindTexture(GL_TEXTURE_2D, resources->sceneTableTexture);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &tableHeight);
+                    table.resize(std::size_t(1024) * std::size_t(std::max(tableHeight, 0)) * 4);
+                    if (! table.empty()) glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, table.data());
+                    glBindTexture(GL_TEXTURE_2D, GLuint(savedTexture));
+                }
+                dumpRealtimeScene(*scene, runtimeInputs, width, height, color, materialProgram.get(), worlds,
+                    table, std::uint32_t(std::max(tableHeight, 0)));
+            }
             gl.GenFramebuffers(1, &resolveFramebuffer);
             gl.BindFramebuffer(GL_FRAMEBUFFER, resolveFramebuffer);
             gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -11905,6 +14499,8 @@ public:
             frame->roughReceiptComplete = true;
             gl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
             glViewport(0, 0, int(width), int(height));
+            // Rough glass: the lens and shutter passes over the published tiles.
+            if (!lensAndShutter()) return fail(result.error);
         }
         else if (resources->smoothGlass.enabled)
         {
@@ -12060,6 +14656,8 @@ public:
                 glClearStencil (stencil[7]);
             }
             glassDepthPrepass = false;
+            // Closed glass: the lens and shutter passes over the finished bands.
+            if (!lensAndShutter()) return fail(result.error);
             // The coverage passes run after the end timestamp, outside the glass GPU time.
             if (overdraw) overdraw->endFrame(gl, bandCount, frame->rawTextures[4]);
             if (previewGlassFrame)
@@ -12092,9 +14690,17 @@ public:
             drawSurfaces (-1);
             if (!realtimeReflectionAndGlass())
                 return fail ("OpenGL Realtime snapshot allocation failed");
+            if (!lensAndShutter())
+                return fail (result.error);
         }
         else
-        { drawSurfaces(-1); }
+        {
+            drawSurfaces(-1);
+            // Raster: the same lens and shutter passes over its single draw.
+            if (!lensAndShutter())
+                return fail (result.error);
+        }
+        bool frameFinished = false;
         // A Preview caustic base never waits here. It is flushed, and the caustic passes,
         // the resolve and the present read it in this context, after it in GL order.
         {
@@ -12102,14 +14708,42 @@ public:
         if (!(runtimeInputs.previewUse && runtimeInputs.previewCallerWaits))
         {
             loopstep::Scope drawFinishScope ("gl:fixture-draw-finish");
+            gratingClock.mark("resolve");
             glFinish();
+            frameFinished = true;
         }
         else glFlush();
         }
+        // A reset context or a killed channel (NVIDIA Xid 109) leaves the frame unwritten
+        // and later calls do nothing, so the frame is refused, never published empty.
+        if (std::string resetError; !causticContextIntact(resetError))
+            return fail ("OpenGL fixture GPU context was lost during the frame, so its unwritten image is refused"
+                + std::string (diffractionFrame && !GratingSubmissionClock::probe()
+                    ? " (ARBIT_GL_SUBMISSION_PROBE=1 names each submission as it finishes)" : ""));
         const auto gpuError = glGetError();
         if (gpuError != GL_NO_ERROR)
-            return fail ("OpenGL fixture draw reported GPU error "
-                         + std::to_string (static_cast<unsigned> (gpuError)));
+            return fail ("OpenGL fixture draw reported GPU error " + causticGlErrorName(gpuError)
+                         + (gpuError == 0x0507u ? ": the GPU context was lost during the frame" : ""));
+        if (frameFinished && diffractionFrame)
+        {
+            lastGratingSpans = gratingClock.spans();
+            const auto longest = std::max_element(lastGratingSpans.begin(), lastGratingSpans.end(),
+                [] (const auto& left, const auto& right) { return left.milliseconds < right.milliseconds; });
+            double total = 0.0;
+            for (const auto& span : lastGratingSpans) total += span.milliseconds;
+            // A submission past a quarter second is named, at most once a second.
+            static std::mutex submissionLogMutex;
+            static std::optional<std::chrono::steady_clock::time_point> submissionLogged;
+            const auto now = std::chrono::steady_clock::now();
+            const std::lock_guard submissionLock (submissionLogMutex);
+            if (longest != lastGratingSpans.end() && longest->milliseconds > 250.0
+                && (!submissionLogged || now - *submissionLogged >= std::chrono::seconds (1)))
+            {
+                submissionLogged = now;
+                std::fprintf (stderr, "[gl] grating frame %ux%u: %zu submissions over %.1f ms, longest %s %.1f ms\n",
+                              width, height, lastGratingSpans.size(), total, longest->name.c_str(), longest->milliseconds);
+            }
+        }
         if (authoredDiffraction && runtimeInputs.linearColor
             && !validateDiffractionDraw(frame->texture_, "resolve-output")) return fail(result.error);
         // Preview keeps the frame on the GPU: no Normal or Color readback and no CPU scan.
@@ -12221,9 +14855,9 @@ void main()
 {
     uint vertex = gl_GlobalInvocationID.x;
     if (vertex >= uVertexCount) return;
-    uint base = vertex * 16u;
-    uint outputBase = (vertex + uOutputOffset) * 16u;
-    for (uint component = 0u; component < 16u; ++component)
+    uint base = vertex * 18u;
+    uint outputBase = (vertex + uOutputOffset) * 18u;
+    for (uint component = 0u; component < 18u; ++component)
         outputVertices[outputBase + component] = baseVertices[base + component];
     vec3 position = vec3(baseVertices[base], baseVertices[base + 1u],
                          baseVertices[base + 2u]);
@@ -12552,12 +15186,7 @@ public:
                 std::copy (normal.begin(), normal.end(), morphNormals.begin() + first);
         }
         const auto fullVertexBytes = source->scene->vertexCount * sizeof(HarmonicMIDI::grid::SceneVertex);
-        const std::uint64_t retained = std::uint64_t(fullVertexBytes)*3
-            + jointIndices.size()*sizeof(std::uint32_t) + jointWeights.size()*sizeof(float)
-            + (morphPositions.size()+morphNormals.size())*sizeof(float)
-            + resources->fixture->retainedTextureBytes;
-        if (fullVertexBytes > 64u*1024u*1024u || retained > renderpassoutput::kMaximumTotalBytes)
-            return fail("OpenGL preceding deformation buffer exceeds resource capacity");
+        // No size cap: the buffer allocation below reports GL_OUT_OF_MEMORY itself.
         const auto previousBufferBytes = resources->fixture->previousVertexBuffer == 0 ? fullVertexBytes : 0;
         if (previousBufferBytes != 0)
         {
@@ -12574,8 +15203,10 @@ public:
             if (!resources->fixture->previousVertexBuffer || glGetError()!=GL_NO_ERROR)
                 return fail("OpenGL preceding deformation buffer allocation failed");
         }
-        std::array<float, kNativeDeformationMaxJoints * 16> jointPalette {};
-        std::array<float, kNativeDeformationMaxMorphTargets> morphWeights {};
+        // Placeholders; every dispatch re-uploads the palette and weights at their sized length.
+        const NativeDeformationFrameData placeholder {};
+        const auto& jointPalette = placeholder.jointPalette;
+        const auto& morphWeights = placeholder.morphWeights;
         gl.GenBuffers (static_cast<int> (resources->buffers.size()),
                        resources->buffers.data());
         const auto upload = [&] (std::size_t index, const void* bytes,
@@ -12901,7 +15532,7 @@ public:
                 if (precedingData)
                 {
                     float paletteDiff = 0.0f;
-                    for (std::size_t index = 0; index < frameData.jointPalette.size(); ++index)
+                    for (std::size_t index = 0; index < std::min (frameData.jointPalette.size(), precedingData->jointPalette.size()); ++index)
                     {
                         const float diff = std::fabs (frameData.jointPalette[index] - precedingData->jointPalette[index]);
                         if (std::isnan (diff) || diff > paletteDiff) paletteDiff = diff;
@@ -13016,6 +15647,17 @@ public:
     }
 };
 } // namespace
+
+const char* fixturePassResolveVertexSource() noexcept
+{
+    return kDiffractionResolveVertexShader;
+}
+
+std::string fixturePassResolveFragmentSource()
+{
+    return std::string(kDiffractionResolveFragmentShaderHead) + kFixturePassCompositeShader
+        + kDiffractionResolveFragmentShaderTail;
+}
 
 BackendInfo queryNativeBackend()
 {
@@ -13257,7 +15899,7 @@ bool OpenGlFixtureSceneFrame::validateDirectBatch(const glasscaustics::GratingIn
     for(auto reserved:{directGratingWork,cameraGlassTraceWork,gratingNativeWork,gratingCameraWork,gratingCellWork,gratingCoverageWork})
         if(!renderpassoutput::detail::checkedAdd(work,reserved,work))return refuse("OpenGL direct contribution aggregate work overflow");
     std::uint64_t deposition=0;
-    if(bytes>renderpassoutput::kMaximumTotalBytes||work>gc::kMaximumQueryWork||!directDepositionBudget(deposition)
+    if(bytes>renderpassoutput::kRepresentableTotalBytes||work>gc::kMaximumQueryWork||!directDepositionBudget(deposition)
         ||!batch->nativeBytes||batch->nativeBytes>batch->ownedBytes)
         return refuse("OpenGL direct contribution aggregate admission changed");
     // This retained result was decoded from the completed native buffer whose
@@ -13359,13 +16001,13 @@ bool openGlCameraCoverageCosts(const OpenGlFixtureSceneFrame& frame,const OpenGl
     // Thirty-two lifecycle/inspection/reconciliation passes cover begin,
     // reservation, dispatch, the three guarded proof inspections and
     // their nested accounting checks; each may visit the common source
-    // lanes, parent program lanes and every fixed attempt. The byte gate stops
-    // an oversized walk, so even a refused setup has a finite host envelope.
+    // lanes, parent program lanes and every fixed attempt. A walk is the
+    // staging frame's admitted bytes, so even a refused setup has a finite host envelope.
     // Local/world association additionally scans one bounded BLAS per triangle.
     const auto passes=32ull*(attempt.cohort->sources().size()+std::size_t(OpenGlQueryArithmeticRole::Count)+1)
         *(OpenGlFixtureSceneFrame::kMaximumNativeAttempts+1);
     std::uint64_t association=0,source=0;
-    if(!mul(renderpassoutput::kMaximumTotalBytes/4,passes,w[7])
+    if(!frame.walkBytes||!mul(frame.walkBytes/4,passes,w[7])
         ||!mul(t,frozen.query.texels.size(),association)||!mul(association,8,association)
         ||!mul(kQueryProgramSourceReservation/4,8,source)||!add(w[7],association)||!add(w[7],source))return false;
     if(attempt.cameraCoverageReserved) {
@@ -13492,7 +16134,7 @@ bool openGlTerminalLedgerBytes(const terminalgc::DirectGratingTerminalOrderLedge
 {
     const auto add=[&](std::uint64_t count,std::uint64_t stride=1) {
         std::uint64_t amount=0;return renderpassoutput::detail::checkedMultiply(count,stride,amount)
-            &&renderpassoutput::detail::checkedAdd(bytes,amount,bytes)&&bytes<=renderpassoutput::kMaximumTotalBytes;
+            &&renderpassoutput::detail::checkedAdd(bytes,amount,bytes)&&bytes<=renderpassoutput::kRepresentableTotalBytes;
     };
     if(!add(sizeof(value))||!add(value.sources.capacity(),sizeof(terminalgc::NativeDirectGratingContributionReadback))
         ||!add(value.bands.capacity(),sizeof(terminalgc::DirectGratingTerminalBand))
@@ -13572,7 +16214,7 @@ bool openGlTerminalNativeBudget(const OpenGlFixtureSceneFrame& frame,terminalgc:
     terminalgc::DirectGratingTerminalNativeBudget result;
     const auto add=[](std::uint64_t& total,std::uint64_t count,std::uint64_t stride=1) {
         std::uint64_t amount=0;return renderpassoutput::detail::checkedMultiply(count,stride,amount)
-            &&renderpassoutput::detail::checkedAdd(total,amount,total)&&total<=renderpassoutput::kMaximumTotalBytes;
+            &&renderpassoutput::detail::checkedAdd(total,amount,total)&&total<=renderpassoutput::kRepresentableTotalBytes;
     };
     result.retainedBytes=frame.causticDiagnostics.admittedFrameBytes;
     for(auto owned:{frame.directGratingBytes,frame.cameraGlassTraceBytes,frame.queryRetainedBytes,frame.nativeAttemptBytes,frame.gratingCameraSpectrumBytes,
@@ -13691,8 +16333,8 @@ bool openGlTerminalNativeBudget(const OpenGlFixtureSceneFrame& frame,terminalgc:
     };
     for(auto name:frame.causticTextures)if(!retainedTexture(name))return refuse();
     for(auto name:{frame.texture_,frame.accumulationTexture_,frame.depthTexture_,frame.gratingCameraDepthAttachment,
-        frame.gratingCameraSpectrumTexture,frame.glassTexture,frame.opaqueTexture,frame.diffractionQueryTexture,frame.diffractionSamplesTexture,
-        frame.previousNoteTexture,resources->environmentTexture})if(!retainedTexture(name))return refuse();
+        frame.gratingCameraSpectrumTexture,frame.glassTexture,frame.opaqueTexture,frame.diffractionQueryTexture,frame.diffractionSamplesTexture,frame.diffractionEfficiencyTexture,
+        frame.previousNoteTexture,frame.noteInstanceTexture,frame.vertexWaveTexture,frame.vertexControlTexture,resources->environmentTexture})if(!retainedTexture(name))return refuse();
     for(auto name:frame.rawTextures)if(!retainedTexture(name))return refuse();
     for(auto name:resources->textures)if(!retainedTexture(name))return refuse();
     const auto direct=[&](const OpenGlDirectGratingBatch& batch) {
@@ -13725,7 +16367,7 @@ bool openGlTerminalNativeBudget(const OpenGlFixtureSceneFrame& frame,terminalgc:
             ||!vector(batch->readback.bands)||!add(actual,batch->upload.submission.frameIdentity.capacity()+batch->readback.submission.frameIdentity.capacity()+2))return refuse();
         for(const auto& band:batch->readback.bands)if(!vector(band.visits))return refuse();
         for(unsigned slot=0;slot<3;++slot)if(!buffer(batch->program->directBuffers[slot],slot==0?batch->upload.inputs.size()*sizeof(terminalgc::NativeGlassCameraGratingTraceInput)
-            :slot==1?batch->packed.size()*sizeof(terminalgc::opengl::CameraGlassGratingPacked):frame.gratingStagingBinding->witnessTexels.size()*sizeof(terminalgc::Texel)))return refuse();
+            :slot==1?batch->packed.size()*sizeof(terminalgc::GlassCameraTraceWords):frame.gratingStagingBinding->witnessTexels.size()*sizeof(terminalgc::Texel)))return refuse();
     }
     // Program identities and all their sources are retained by this resource
     // context's intrusive native lease list, including deferred owners.
@@ -14012,7 +16654,7 @@ bool openGlReceiverBudget(const OpenGlFixtureSceneFrame& frame,
 {
     glasscaustics::DirectGratingTerminalNativeBudget native;
     if(!openGlTerminalNativeBudget(frame,native,error))return false;
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;
     const auto floor=terminal.retained().bounds.bytes;
     if(floor>maximum||native.retainedBytes>maximum)return false;
     glasscaustics::DirectGratingTerminalReceiverNativeBudget budget;
@@ -14041,7 +16683,7 @@ bool openGlReceiverReadbackBytes(const glasscaustics::DirectGratingTerminalRecei
     std::uint64_t rows=0;
     return renderpassoutput::detail::checkedMultiply(value.rows.capacity(),sizeof(glasscaustics::DirectGratingTerminalReceiverRow),rows)
         &&renderpassoutput::detail::checkedAdd(bytes,sizeof(value)+rows+value.submission.frameIdentity.capacity()+1,bytes)
-        &&bytes<=renderpassoutput::kMaximumTotalBytes;
+        &&bytes<=renderpassoutput::kRepresentableTotalBytes;
 }
 
 }
@@ -14106,7 +16748,7 @@ bool OpenGlFixtureSceneFrame::reserveNativeAttempt(OpenGlNativeAttemptKind kind,
             :causticReadback?causticReadback->deposition.submission.submissionSerial:0,count,leaves,adjuncts};
     attempt.terminal=terminal;
     if(!openGlAddAttempt(*this,attempt,after,error)||after.bytes<before.bytes
-        ||maximumBytes>renderpassoutput::kMaximumTotalBytes||after.bytes-before.bytes>renderpassoutput::kMaximumTotalBytes-maximumBytes)
+        ||maximumBytes>renderpassoutput::kRepresentableTotalBytes||after.bytes-before.bytes>renderpassoutput::kRepresentableTotalBytes-maximumBytes)
     {error="OpenGL retained native attempt owner exceeds storage admission";return false;}
     const auto& base=gratingStagingBinding?*gratingStagingBinding:*binding;
     std::uint64_t work=base.bounds.combinedWork,deposition=base.frame.bounds.deposition.depositionWork;
@@ -14144,7 +16786,7 @@ bool OpenGlFixtureSceneFrame::beginDirectCohortTerminalLease(const glasscaustics
     glasscaustics::DirectGratingTerminalNativeBudget native;
     if(!openGlTerminalNativeBudget(*this,native,error))return false;
     const auto overhead=sizeof(OpenGlDirectTerminalLease)+sizeof(OpenGlDirectTerminalRecord)+directGratingCohort->binding->bounds().bytes;
-    if(overhead>renderpassoutput::kMaximumTotalBytes||native.retainedBytes>renderpassoutput::kMaximumTotalBytes-overhead)
+    if(overhead>renderpassoutput::kRepresentableTotalBytes||native.retainedBytes>renderpassoutput::kRepresentableTotalBytes-overhead)
     {error="OpenGL terminal lease registration exceeds storage cap";return false;}
     auto lease=std::make_unique<OpenGlDirectTerminalLease>(*this,std::move(guard),sources,time);lease->budget=native;
     lease->budget.retainedBytes+=overhead;
@@ -14378,7 +17020,7 @@ bool openGlInspectReceiver(const OpenGlFixtureSceneFrame& frame,const OpenGlDire
     };
     const auto camera=gc::cameraPosition(frozen);const auto& q=frozen.camera.transform.rotation;
     const gc::Texel position{camera[0],camera[1],camera[2],0},rotation{q.x,q.y,q.z,q.w};
-    const gc::Texel projection{std::tan(frozen.camera.verticalFovRadians*.5f),float(frozen.width)/frozen.height,frozen.camera.nearPlane,frozen.camera.farPlane};
+    const gc::Texel projection{glasscaustics::cameraProjectionX(frozen.camera),float(frozen.width)/frozen.height,frozen.camera.nearPlane,frozen.camera.farPlane};
     const gc::Texel extent{float(frozen.width),float(frozen.height),0,0};
     if(!integer("uRowCount",int(terminal.orders.size()))||!integer("uTriangleCount",int(frozen.triangles.size()))
         ||!integer("uOpaqueVisibility",0)||!integer("uRasterOwners",1)||!integer("uRasterTriangle",2)
@@ -14484,7 +17126,7 @@ bool OpenGlFixtureSceneFrame::dispatchDirectTerminalReceivers(glasscaustics::Nat
     gl.Uniform4fv(location("uOpaqueControl"),1,frozen.query.control.data());
     const auto camera=gc::cameraPosition(frozen);const auto& q=frozen.camera.transform.rotation;
     gl.Uniform4f(location("uCamera"),camera[0],camera[1],camera[2],0);gl.Uniform4f(location("uRotation"),q.x,q.y,q.z,q.w);
-    gl.Uniform4f(location("uProjection"),std::tan(frozen.camera.verticalFovRadians*.5f),float(frozen.width)/frozen.height,frozen.camera.nearPlane,frozen.camera.farPlane);
+    gl.Uniform4f(location("uProjection"),glasscaustics::cameraProjectionX(frozen.camera),float(frozen.width)/frozen.height,frozen.camera.nearPlane,frozen.camera.farPlane);
     gl.Uniform2f(location("uExtent"),float(frozen.width),float(frozen.height));
     const char* samplers[]{"uOpaqueVisibility","uRasterOwners","uRasterTriangle"};
     for(unsigned slot=0;slot<3;++slot) {
@@ -14963,7 +17605,7 @@ bool openGlCameraCoverageBudget(const OpenGlFixtureSceneFrame& frame,
     auto budget=glasscaustics::NativeCameraCellCoverageBudget{};
     budget.retainedBytes=std::max(native.retainedBytes,parent.retained().bounds.bytes);
     if(!renderpassoutput::detail::checkedAdd(budget.retainedBytes,sizeof(OpenGlCameraCoverageLease),budget.retainedBytes)
-        ||budget.retainedBytes>renderpassoutput::kMaximumTotalBytes)return false;
+        ||budget.retainedBytes>renderpassoutput::kRepresentableTotalBytes)return false;
     budget.combinedWork=native.combinedWork;
     // Separate logical native live locals, not a driver spill measurement.
     constexpr std::uint64_t logical=cameraraycoefficients::kLogicalScratchBytes+camerapixelsigns::kLogicalScratchBytes
@@ -14977,7 +17619,7 @@ bool openGlCameraCoverageBudget(const OpenGlFixtureSceneFrame& frame,
         +2*frozen.query.texels.size()*sizeof(glasscaustics::Texel)+4ull*frame.width_*frame.height_*sizeof(glasscaustics::Texel);
     // Header is separately allocated for each admitted pre-dedup Pixel row.
     budget.pixelBytes+=4*glasscaustics::opengl::kCameraDiagonalHeaderWords*4;
-    if(budget.fixedBytes>renderpassoutput::kMaximumTotalBytes)return false;
+    if(budget.fixedBytes>renderpassoutput::kRepresentableTotalBytes)return false;
     output=budget;return true;
 }
 }
@@ -15050,7 +17692,7 @@ bool OpenGlFixtureSceneFrame::reserveCameraCellCoverageLease(glasscaustics::Nati
     const auto storage=bounds.bytes-base.retainedBytes;
     if(bounds.operationWork>gc::kMaximumQueryWork-base.combinedWork
         ||bounds.operationWork>gc::kMaximumDepositionWork-base.depositionWork
-        ||storage>renderpassoutput::kMaximumTotalBytes-directGratingBytes)return false;
+        ||storage>renderpassoutput::kRepresentableTotalBytes-directGratingBytes)return false;
     nativeAttempts[lease->ordinal-1]=std::move(prospective);cameraCoverageWork=after.cameraCoverageWork;
     gratingCoverageWork+=bounds.operationWork;directGratingBytes+=storage;activeCameraCoverageStorage=storage;
     lease->reservation=bounds;lease->reserved=true;
@@ -15072,7 +17714,7 @@ bool OpenGlFixtureSceneFrame::dispatchCameraCellCoverage(glasscaustics::NativeCa
     if(preparation.pixels.size()>record.reservation.maximumPixels
         ||!openGlCameraCoverageInputs(*this,record,preparation,&record.inputs,error))return false;
     const auto words=std::max<std::uint64_t>(1,preparation.pixels.size()*(16+record.reservation.triangles*gc::opengl::kCameraDiagonalPairWords));
-    if(words>renderpassoutput::kMaximumTotalBytes/4)return false;
+    if(words>renderpassoutput::kRepresentableTotalBytes/4)return false;
     record.certificate.resize(words);
     if(record.inputs.capacity()>2*record.inputs.size()||record.certificate.capacity()>2*words)return false;
     const auto source=gc::opengl::cameraDiagonalComputeSource();
@@ -15252,12 +17894,16 @@ bool OpenGlFixtureSceneFrame::validateCameraTraceProductionQuery(const glasscaus
     };
     const auto camera=gc::cameraPosition(binding.frame);const auto& rotation=binding.frame.camera.transform.rotation;
     const gc::Texel cameraUniform{camera[0],camera[1],camera[2],0},rotationUniform{rotation.x,rotation.y,rotation.z,rotation.w};
-    const gc::Texel projection{std::tan(binding.frame.camera.verticalFovRadians*.5f),float(width_)/height_,binding.frame.camera.nearPlane,binding.frame.camera.farPlane};
+    const gc::Texel projection{glasscaustics::cameraProjectionX(binding.frame.camera),float(width_)/height_,binding.frame.camera.nearPlane,binding.frame.camera.farPlane};
     const gc::Texel glass{float(binding.prepared.glass.object.value&65535u),float(binding.prepared.glass.object.value>>16),
         float(binding.prepared.glass.material.value&65535u),float(binding.prepared.glass.material.value>>16)};
     const std::array<float,2> extent{float(width_),float(height_)};
     if(!matchesInt("uSampleCount",int(batch->upload.inputs.size()))||!matchesInt("uSceneTriangleCount",int(binding.frame.triangles.size()))
         ||!matchesInt("uGratingCount",int(binding.triangles.size()))||!matchesInt("uOpaqueVisibility",0)
+        ||!binding.prepared.branchPolicy||!matchesInt("uCameraInterfaces",int(binding.prepared.branchPolicy->description().maximumInterfaces))
+        ||!matchesInt("uCameraVisits",int(binding.prepared.branchPolicy->description().maximumVisits))
+        ||!matchesInt("uCameraVisitLanes",int(gc::glassCameraTraceVisitLanes(binding.prepared.branchPolicy->description().maximumVisits)))
+        ||!matchesInt("uCameraPending",int(binding.prepared.branchPolicy->description().maximumVisits+1))
         ||!matchesFloat("uOpaqueControl",batch->queryControl.data(),4)||!matchesFloat("uCamera",cameraUniform.data(),4)
         ||!matchesFloat("uRotation",rotationUniform.data(),4)||!matchesFloat("uProjection",projection.data(),4)
         ||!matchesFloat("uExtent",extent.data(),2)||!matchesFloat("uGlass",glass.data(),4)
@@ -15283,7 +17929,7 @@ bool OpenGlFixtureSceneFrame::validateCameraTraceProductionQuery(const glasscaus
         return gl.UnmapBuffer(GL_SHADER_STORAGE_BUFFER)==GL_TRUE&&same;
     };
     if(!matchesBuffer(batch->program->directBuffers[0],batch->upload.inputs.data(),batch->upload.inputs.size()*sizeof(gc::NativeGlassCameraGratingTraceInput))
-        ||!matchesBuffer(batch->program->directBuffers[1],batch->packed.data(),batch->packed.size()*sizeof(gc::opengl::CameraGlassGratingPacked))
+        ||!matchesBuffer(batch->program->directBuffers[1],batch->packed.data(),batch->packed.size()*sizeof(gc::GlassCameraTraceWords))
         ||!matchesBuffer(batch->program->directBuffers[2],binding.witnessTexels.data(),binding.witnessTexels.size()*sizeof(gc::Texel))
         ||!matchesBuffer(batch->sceneBuffer,binding.frame.triangleTexels.data(),binding.frame.triangleTexels.size()*sizeof(gc::Texel)))
         return refuse("OpenGL camera glass grating trace actual input/scene/result buffers changed");
@@ -15311,7 +17957,7 @@ bool OpenGlFixtureSceneFrame::validateCameraTraceProductionQuery(const glasscaus
         if(!renderpassoutput::detail::checkedAdd(bytes,owned,bytes))return refuse("OpenGL camera glass grating trace aggregate storage overflow");
     for(auto reserved:{directGratingWork,cameraGlassTraceWork,gratingNativeWork,gratingCameraWork,gratingCellWork,gratingCoverageWork})
         if(!renderpassoutput::detail::checkedAdd(work,reserved,work))return refuse("OpenGL camera glass grating trace aggregate work overflow");
-    if(bytes>renderpassoutput::kMaximumTotalBytes||work>gc::kMaximumQueryWork||!batch->nativeBytes||batch->nativeBytes>batch->ownedBytes)
+    if(bytes>renderpassoutput::kRepresentableTotalBytes||work>gc::kMaximumQueryWork||!batch->nativeBytes||batch->nativeBytes>batch->ownedBytes)
         return refuse("OpenGL camera glass grating trace aggregate admission changed");
     // This retained result was decoded from the completed native buffer whose
     // exact packed bytes were checked above. Caller edits cannot replace it.
@@ -16308,8 +18954,9 @@ NativeFixtureSceneSubmission renderOpenGlGlassCausticScene(
         ||!gc::admitFrameMemory(scheduled,other,total,refused.error))
     {if(refused.error.empty())refused.error="OpenGL caustic full resource accounting overflow";return refused;}
     diagnostics.admittedFrameBytes=total;
+    // Path receipts carry the reflection history tail past 128 interfaces.
     const std::array<std::uint64_t,7> bytes{
-        scheduled.work.size()*gc::kPathReceiptStride*sizeof(gc::Texel),
+        (scheduled.work.size()*gc::kPathReceiptStride+scheduled.bounds.historyTexels)*sizeof(gc::Texel),
         scheduled.bounds.maximumDeposits*gc::kDepositReceiptStride*sizeof(gc::Texel),
         pixels*4*sizeof(float),
         scheduled.workTexels.size()*sizeof(gc::Texel),scheduled.triangleTexels.size()*sizeof(gc::Texel),
@@ -17143,7 +19790,7 @@ const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.c
             gl.UseProgram(program);const auto loc=[&](const char* n){return gl.GetUniformLocation(program,n);};
             gl.Uniform4f(loc("uCamera"),camera[0],camera[1],camera[2],0);
             gl.Uniform4f(loc("uRotation"),rotation.x,rotation.y,rotation.z,rotation.w);
-            gl.Uniform4f(loc("uProjection"),std::tan(scheduled.camera.verticalFovRadians*.5f),float(width)/height,scheduled.camera.nearPlane,scheduled.camera.farPlane);
+            gl.Uniform4f(loc("uProjection"),glasscaustics::cameraProjectionX(scheduled.camera),float(width)/height,scheduled.camera.nearPlane,scheduled.camera.farPlane);
         };
         // Export waits on a fence after each stage and band, so a failed stage names itself
         // and no submission queues behind a long one. Preview flushes between stages only
@@ -17173,6 +19820,8 @@ const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.c
         gl.Uniform1i(loc("uVisits"),int(policy.description().maximumVisits));gl.Uniform1i(loc("uInterfaces"),int(policy.description().maximumInterfaces));
         gl.Uniform1i(loc("uPending"),int(policy.description().maximumPending));gl.Uniform2f(loc("uPolicy"),policy.description().maximumUnresolvedFraction,policy.description().minimumBranchFraction);
         gl.Uniform1i(loc("uInterfaceSamples"),int(scheduled.interfaceSamples));gl.Uniform1f(loc("uRoughness"),scheduled.roughness);
+        gl.Uniform1i(loc("uHistoryExtra"),int(scheduled.bounds.historyExtraWords));
+        gl.Uniform1i(loc("uAncestryExtra"),int(scheduled.bounds.ancestryExtraWords));
         if(scheduled.multipleScatterPolicy) {
             gl.Uniform1i(loc("uMicroEvents"),int(scheduled.multipleScatterPolicy->maximumEvents));
             gl.Uniform1i(loc("uMicroExits"),int(scheduled.multipleScatterPolicy->maximumExits));
@@ -17364,7 +20013,8 @@ const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.c
             if(!gc::validateTables(prepared,scheduled,result.error))return fail(result.error);
             readback->paths.resize(scheduled.work.size());
             gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,frame->causticBuffers[0]);
-            const auto* packedPaths=static_cast<const gc::Texel*>(gl.MapBufferRange(GL_SHADER_STORAGE_BUFFER,0,std::ptrdiff_t(bytes[0]),GL_MAP_READ_BIT));
+            const auto* packedPaths=static_cast<const gc::Texel*>(gl.MapBufferRange(GL_SHADER_STORAGE_BUFFER,0,
+                std::ptrdiff_t(scheduled.work.size()*gc::kPathReceiptStride*sizeof(gc::Texel)),GL_MAP_READ_BIT));
             if(!packedPaths)return fail("OpenGL caustic completed path mapping failed");
             bool decoded=true;std::size_t depositCount=0;std::string pathRefusal;
             for(std::size_t w=0;w<readback->paths.size();++w)
@@ -17416,6 +20066,38 @@ const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.c
                 }
             }
             if(!decoded)return fail("OpenGL caustic deposit receipt is malformed");
+            if(const auto extra=scheduled.bounds.historyExtraWords+scheduled.bounds.ancestryExtraWords)
+            {
+                // Reflection history words 4 and up, then multiple-scatter ancestry words,
+                // follow the path receipts: one block of (extra+1)/2 texels per deposit
+                // slot, in deposit order.
+                const auto historyExtra=scheduled.bounds.historyExtraWords,ancestryExtra=scheduled.bounds.ancestryExtraWords;
+                const std::uint64_t visits=policy.description().maximumVisits,blockTexels=(extra+1)/2;
+                const std::uint64_t tail=scheduled.work.size()*gc::kPathReceiptStride,blockBytes=blockTexels*sizeof(gc::Texel);
+                const std::size_t pathsPerWindow=std::size_t(std::max<std::uint64_t>(1,kCausticReadbackWindowBytes/(visits*blockBytes)));
+                std::vector<std::uint32_t> words(extra);std::size_t next=0;
+                gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,frame->causticBuffers[0]);
+                for(std::size_t first=0;first<readback->paths.size()&&decoded;first+=pathsPerWindow)
+                {
+                    std::size_t used=std::min(readback->paths.size(),first+pathsPerWindow);
+                    while(used>first&&!readback->paths[used-1].depositCount)--used;
+                    if(used==first)continue;
+                    const std::uint64_t begin=std::uint64_t(first)*visits,end=std::uint64_t(used-1)*visits+readback->paths[used-1].depositCount;
+                    const auto* blocks=static_cast<const gc::Texel*>(gl.MapBufferRange(GL_SHADER_STORAGE_BUFFER,
+                        std::ptrdiff_t(tail*sizeof(gc::Texel)+begin*blockBytes),std::ptrdiff_t((end-begin)*blockBytes),GL_MAP_READ_BIT));
+                    if(!blocks)return fail("OpenGL caustic reflection history mapping failed");
+                    for(std::size_t w=first;w<used&&decoded;++w)for(std::size_t d=0;d<readback->paths[w].depositCount;++d)
+                    {
+                        auto& deposit=readback->deposits[next++];
+                        if(!gc::openGlHistoryTailDecode(blocks+((w-first)*visits+d)*blockTexels,extra,words.data())) {decoded=false;break;}
+                        deposit.reflectionHistory=deposit.reflectionHistory.withExtraWords(words.data(),historyExtra);
+                        if(ancestryExtra)deposit.ancestryTail=gc::ancestryTailTokens(words.data(),historyExtra,ancestryExtra);
+                        if(!deposit.reflectionHistory.clearFrom(deposit.interfaces)) {decoded=false;break;}
+                    }
+                    if(gl.UnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE)decoded=false;
+                }
+                if(!decoded||next!=readback->deposits.size())return fail("OpenGL caustic reflection history receipt is malformed");
+            }
             // Every band of every pixel is written below, so the host copy needs no
             // zero fill from the device side.
             try {readback->spectralRadiance.resize(std::size_t(pixels)*8);}
@@ -17730,8 +20412,8 @@ NativeFixtureScenePreparation prepareOpenGlGlassGratingResources(
             ||!charge(4*opaquevisibility::sceneQueryPayloadTexels(*scene),sizeof(opaquevisibility::Texel))
             ||!charge(8,sceneaov::detail::sceneWireBytes(*scene))
             ||!charge(scene->vertexCount,2*sizeof(SceneVertex))||!charge(scene->indexCount,2*sizeof(std::uint32_t))
-            ||!charge(1,sizeof(OpenGlFixtureSceneResources))||total>renderpassoutput::kMaximumTotalBytes)
-        {refused.error="OpenGL private mixed static storage exceeds the whole-frame cap";return refused;}
+            ||!charge(1,sizeof(OpenGlFixtureSceneResources)))
+        {refused.error="OpenGL private mixed static storage total overflows 64 bits";return refused;}
         const auto snapshot=std::make_shared<const Visual3DScene>(*scene);
         const auto leaf=snapshotNativeSurfaceProgram(compiledLeaf);
         auto* backend=dynamic_cast<OpenGlFixtureSceneBackend*>(&nativeFixtureSceneBackend());
@@ -17864,7 +20546,7 @@ bool stageOpenGlGlassGratingFrame(
         std::unique_lock<std::mutex> lock(fixtureMutex());OpenGlFixtureState previous(gl);
         auto frame=std::make_shared<OpenGlFixtureSceneFrame>();frame->ownerContext=resources->ownerContext;frame->staticResources=resources;
         frame->rendererGeneration_=resources->rendererGeneration;frame->width_=width;frame->height_=height;frame->linearColor=true;
-        frame->causticDiagnostics.admittedFrameBytes=total;frame->causticDiagnostics.deposition=scheduled.bounds.deposition;
+        frame->causticDiagnostics.admittedFrameBytes=total;frame->walkBytes=total;frame->causticDiagnostics.deposition=scheduled.bounds.deposition;
         int storage=0,indexed=0;GLint64 start=0,size=0;glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING,&storage);
         gl.GetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,4,&indexed);indexed64(GL_SHADER_STORAGE_BUFFER_START,4,&start);indexed64(GL_SHADER_STORAGE_BUFFER_SIZE,4,&size);
         unsigned raster=0,fbo=0,vao=0,cameraFbo=0;bool cleaned=false;
@@ -17946,7 +20628,7 @@ bool stageOpenGlGlassGratingFrame(
         gl.UseProgram(raster);const auto location=[&](const char* name){return gl.GetUniformLocation(raster,name);};
         const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.camera.transform.rotation;
         gl.Uniform4f(location("uCamera"),camera[0],camera[1],camera[2],0);gl.Uniform4f(location("uRotation"),rotation.x,rotation.y,rotation.z,rotation.w);
-        gl.Uniform4f(location("uProjection"),std::tan(scheduled.camera.verticalFovRadians*.5f),float(width)/height,scheduled.camera.nearPlane,scheduled.camera.farPlane);
+        gl.Uniform4f(location("uProjection"),glasscaustics::cameraProjectionX(scheduled.camera),float(width)/height,scheduled.camera.nearPlane,scheduled.camera.farPlane);
         for(std::size_t t=0;t<scheduled.triangles.size();++t)
         {
             // The receiver-surface raster answers for a glass-penetrating
@@ -18345,7 +21027,7 @@ bool openGlFrozenCohortBounds(const glasscaustics::DirectGratingIrradianceCohort
     if(!add(bounds.bytes,sizeof(gc::DirectGratingIrradianceCohort)+2*cohort.sources().size()*sizeof(cohort.sources().front())
         +4*cohort.identity().size()+2*cohort.inputs().size()*(sizeof(gc::NativeDirectGratingEndpointInput)+sizeof(gc::DirectGratingEndpointIrradianceSum))
         +2*sizeof(gc::DirectGratingIrradianceCohortReadback))
-        ||bounds.bytes>renderpassoutput::kMaximumTotalBytes||bounds.combinedWork>gc::kMaximumQueryWork
+        ||bounds.bytes>renderpassoutput::kRepresentableTotalBytes||bounds.combinedWork>gc::kMaximumQueryWork
         ||bounds.depositionWork>gc::kMaximumDepositionWork)
     {error="OpenGL directional cohort exceeds cumulative frame bounds";return false;}
     output=bounds;return true;
@@ -18396,12 +21078,12 @@ static bool produceOpenGlDirectGratingIrradianceCohortImpl(
         }
         if(sourceIndex!=binding->sources().size())
         {error="OpenGL directional cohort adds an owner to the actual frozen source roster";return false;}
-        if(output.endpoints.capacity()>renderpassoutput::kMaximumTotalBytes/sizeof(gc::DirectGratingEndpointIrradianceSum)
-            ||output.submission.frameIdentity.capacity()>renderpassoutput::kMaximumTotalBytes
-            ||sourceReadbacks.capacity()>renderpassoutput::kMaximumTotalBytes/sizeof(gc::NativeDirectGratingContributionReadback))
+        if(output.endpoints.capacity()>renderpassoutput::kRepresentableTotalBytes/sizeof(gc::DirectGratingEndpointIrradianceSum)
+            ||output.submission.frameIdentity.capacity()>renderpassoutput::kRepresentableTotalBytes
+            ||sourceReadbacks.capacity()>renderpassoutput::kRepresentableTotalBytes/sizeof(gc::NativeDirectGratingContributionReadback))
         {error="OpenGL directional cohort incumbent storage exceeds the original cap";return false;}
-        for(const auto& old:sourceReadbacks)if(old.samples.capacity()>renderpassoutput::kMaximumTotalBytes/sizeof(gc::NativeDirectGratingContributionSample)
-            ||old.submission.frameIdentity.capacity()>renderpassoutput::kMaximumTotalBytes)
+        for(const auto& old:sourceReadbacks)if(old.samples.capacity()>renderpassoutput::kRepresentableTotalBytes/sizeof(gc::NativeDirectGratingContributionSample)
+            ||old.submission.frameIdentity.capacity()>renderpassoutput::kRepresentableTotalBytes)
         {error="OpenGL directional cohort incumbent source storage exceeds the original cap";return false;}
         std::uint64_t priorBytes=frame->causticDiagnostics.admittedFrameBytes,priorWork=0;
         const auto add=[](std::uint64_t& total,std::uint64_t amount){return renderpassoutput::detail::checkedAdd(total,amount,total);};
@@ -18698,12 +21380,18 @@ bool produceOpenGlGlassCameraGratingTrace(
         }
         glGetIntegerv(GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS,&textures);
         if(integerSize)integerSize(GL_MAX_SHADER_STORAGE_BLOCK_SIZE,&maximum);
+        // Visit storage per band follows the branch policy's visit setting.
+        const std::size_t cameraVisits=binding->prepared.branchPolicy?binding->prepared.branchPolicy->description().maximumVisits:gc::kDefaultBranchVisits;
+        const std::size_t cameraVisitLanes=gc::glassCameraTraceVisitLanes(cameraVisits),cameraBandLanes=gc::glassCameraTraceBandLanes(cameraVisits);
         const std::array<std::uint64_t,3> nativeSizes{inputs.size()*sizeof(gc::NativeGlassCameraGratingTraceInput),
-            inputs.size()*8*sizeof(gc::opengl::CameraGlassGratingPacked),binding->witnessTexels.size()*sizeof(gc::Texel)};
-        if((major<4||(major==4&&minor<3))||slots<4||blocks<4||groups<int((inputs.size()*8+31)/32)||threads<32||local<32||textures<1
+            inputs.size()*8*cameraBandLanes*sizeof(gc::GlassCameraTraceWords),binding->witnessTexels.size()*sizeof(gc::Texel)};
+        // Each invocation's pending stack, visits+1 branches (bounds.pendingBytes).
+        const std::uint64_t cameraPending=cameraVisits+1,pendingBytes=inputs.size()*8*cameraPending*gc::kGlassCameraTracePendingBytes;
+        if((major<4||(major==4&&minor<3))||slots<5||blocks<5||groups<int((inputs.size()*8+31)/32)||threads<32||local<32||textures<1
             ||!bufferSize||!indexedSize||!bindRange||!integerSize||!uniformFloat||!uniformInt||!label||!gl.GetIntegeri_v
             ||!gl.DispatchCompute||!gl.MapBufferRange||!gl.UnmapBuffer||!gl.MemoryBarrier||!gl.FenceSync||!gl.ClientWaitSync||!gl.DeleteSync
-            ||maximum<=0||*std::max_element(nativeSizes.begin(),nativeSizes.end())>std::uint64_t(maximum))
+            ||maximum<=0||*std::max_element(nativeSizes.begin(),nativeSizes.end())>std::uint64_t(maximum)
+            ||pendingBytes>std::uint64_t(maximum)||cameraPending*inputs.size()*8*6>std::uint64_t(std::numeric_limits<int>::max()))
         {error="OpenGL camera glass grating trace exceeds native compute, storage or inspection limits";return false;}
         const auto baseBytes=binding->frame.bounds.transientBytes+binding->bounds.bytes;
         if(frame->causticDiagnostics.admittedFrameBytes<baseBytes)
@@ -18742,21 +21430,23 @@ bool produceOpenGlGlassCameraGratingTrace(
         candidate->queryTexture=frame->causticTextures[0];candidate->sceneBuffer=frame->causticBuffers[4];
         candidate->queryControl=binding->frame.query.control;
         candidate->upload.otherOwnedBytes=otherBytes;candidate->upload.otherWork=otherWork;
-        candidate->upload.inputs.resize(inputs.size());candidate->packed.resize(bounds.maximumBands);candidate->readback.bands.reserve(bounds.maximumBands);
-        if(candidate->upload.inputs.capacity()>2*inputs.size()||candidate->packed.capacity()>2*bounds.maximumBands
+        candidate->upload.inputs.resize(inputs.size());candidate->packed.resize(bounds.maximumBands*cameraBandLanes);candidate->readback.bands.reserve(bounds.maximumBands);
+        if(candidate->upload.inputs.capacity()>2*inputs.size()||candidate->packed.capacity()>2*bounds.maximumBands*cameraBandLanes
             ||candidate->readback.bands.capacity()>2*bounds.maximumBands)
         {error="OpenGL camera glass grating trace decoded vector capacity exceeded reservation";return false;}
         const auto source=gc::opengl::cameraGlassGratingComputeSource();
         if(source.capacity()>kQueryProgramSourceReservation/8)
         {error="OpenGL camera glass grating trace generated source exceeds its reservation";return false;}
         OpenGlFixtureState previous(gl);int generic=0;glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING,&generic);
-        std::array<int,4> indexed{};std::array<GLint64,4> starts{},sizes{};
-        for(unsigned slot=0;slot<4;++slot) {
+        std::array<int,5> indexed{};std::array<GLint64,5> starts{},sizes{};
+        for(unsigned slot=0;slot<5;++slot) {
             gl.GetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,slot,&indexed[slot]);
             indexedSize(GL_SHADER_STORAGE_BUFFER_START,slot,&starts[slot]);indexedSize(GL_SHADER_STORAGE_BUFFER_SIZE,slot,&sizes[slot]);
         }
+        unsigned pendingBuffer=0;
         int stateToken=0;auto restoreState=[&](int*) {
-            for(unsigned slot=0;slot<4;++slot) {
+            if(pendingBuffer)gl.DeleteBuffers(1,&pendingBuffer);
+            for(unsigned slot=0;slot<5;++slot) {
                 if(indexed[slot]&&sizes[slot]>0)bindRange(GL_SHADER_STORAGE_BUFFER,slot,unsigned(indexed[slot]),starts[slot],sizes[slot]);
                 else gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,slot,unsigned(indexed[slot]));
             }
@@ -18780,6 +21470,18 @@ bool produceOpenGlGlassCameraGratingTrace(
         }
         if(candidate->program->retainedBytes>candidate->ownedBytes||candidate->nativeBytes>candidate->ownedBytes)
         {error="OpenGL camera glass grating trace linked native ownership exceeds admission";return false;}
+        // The pending stacks are scratch for this dispatch only; the guard
+        // deletes them, and admission charged them in bounds.pendingBytes.
+        gl.GenBuffers(1,&pendingBuffer);
+        if(!pendingBuffer){error="OpenGL camera glass grating trace pending stack allocation failed";return false;}
+        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,pendingBuffer);label(GL_BUFFER,pendingBuffer,-1,candidate->program->label.data());
+        gl.BufferData(GL_SHADER_STORAGE_BUFFER,std::ptrdiff_t(pendingBytes),nullptr,GL_DYNAMIC_COPY);
+        {
+            GLint64 actual=0;bufferSize(GL_SHADER_STORAGE_BUFFER,GL_BUFFER_SIZE,&actual);
+            if(actual<0||std::uint64_t(actual)!=pendingBytes||glGetError()!=GL_NO_ERROR)
+            {error="OpenGL camera glass grating trace pending stack allocation failed";return false;}
+        }
+        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,4,pendingBuffer);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,0,candidate->program->directBuffers[0]);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,1,candidate->program->directBuffers[1]);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER,2,candidate->sceneBuffer);
@@ -18787,16 +21489,19 @@ bool produceOpenGlGlassCameraGratingTrace(
         gl.ActiveTexture(GL_TEXTURE0);gl.BindSampler(0,0);glBindTexture(GL_TEXTURE_2D,candidate->queryTexture);
         gl.UseProgram(candidate->program->program);
         const auto location=[&](const char* name){return gl.GetUniformLocation(candidate->program->program,name);};
-        for(const auto* name:{"uSampleCount","uSceneTriangleCount","uGratingCount","uOpaqueVisibility","uOpaqueControl",
+        for(const auto* name:{"uSampleCount","uSceneTriangleCount","uGratingCount","uCameraInterfaces","uCameraVisits","uCameraVisitLanes","uCameraPending","uOpaqueVisibility","uOpaqueControl",
             "uCamera","uRotation","uProjection","uExtent","uGlass","uIor[0]","uIor[1]","uWavelength[0]","uWavelength[1]"})
             if(location(name)<0){error="OpenGL camera trace required native uniform is absent";return false;}
         gl.Uniform1i(location("uSampleCount"),int(inputs.size()));gl.Uniform1i(location("uSceneTriangleCount"),int(binding->frame.triangles.size()));
         gl.Uniform1i(location("uGratingCount"),int(binding->triangles.size()));
+        gl.Uniform1i(location("uCameraInterfaces"),int(binding->prepared.branchPolicy->description().maximumInterfaces));
+        gl.Uniform1i(location("uCameraVisits"),int(cameraVisits));gl.Uniform1i(location("uCameraVisitLanes"),int(cameraVisitLanes));
+        gl.Uniform1i(location("uCameraPending"),int(cameraPending));
         gl.Uniform1i(location("uOpaqueVisibility"),0);gl.Uniform4fv(location("uOpaqueControl"),1,candidate->queryControl.data());
         const auto camera=gc::cameraPosition(binding->frame);const auto& rotation=binding->frame.camera.transform.rotation;
         gl.Uniform4f(location("uCamera"),camera[0],camera[1],camera[2],0);
         gl.Uniform4f(location("uRotation"),rotation.x,rotation.y,rotation.z,rotation.w);
-        gl.Uniform4f(location("uProjection"),std::tan(binding->frame.camera.verticalFovRadians*.5f),float(frame->width_)/frame->height_,
+        gl.Uniform4f(location("uProjection"),glasscaustics::cameraProjectionX(binding->frame.camera),float(frame->width_)/frame->height_,
             binding->frame.camera.nearPlane,binding->frame.camera.farPlane);
         gl.Uniform2f(location("uExtent"),float(frame->width_),float(frame->height_));
         gl.Uniform4f(location("uGlass"),float(binding->prepared.glass.object.value&65535u),float(binding->prepared.glass.object.value>>16),
@@ -18832,12 +21537,9 @@ bool produceOpenGlGlassCameraGratingTrace(
             ||!readBuffer(candidate->program->directBuffers[1],candidate->packed.data(),nativeSizes[1])
             ||std::memcmp(candidate->upload.inputs.data(),inputs.data(),nativeSizes[0])!=0)
         {error="OpenGL camera glass grating trace completed input/output readback failed";return false;}
-        for(const auto& packed:candidate->packed) {
+        for(std::size_t index=0;index<bounds.maximumBands;++index) {
             gc::NativeGlassCameraGratingTraceBand band;
-            if(!gc::decodeGlassCameraGratingTraceBand(packed.header,packed.visits.data(),packed.visits.size(),band,error))return false;
-            for(std::size_t unused=band.visits.size();unused<packed.visits.size();++unused)
-                if(packed.visits[unused]!=gc::NativeGlassCameraGratingTracePackedVisit{})
-                {error="OpenGL camera trace unused native output slots changed";return false;}
+            if(!gc::decodeGlassCameraGratingTraceBandLanes(candidate->packed.data()+index*cameraBandLanes,cameraVisits,band,error))return false;
             candidate->readback.queryWork+=band.queryWork;candidate->readback.bands.push_back(std::move(band));
         }
         const auto serial=++resources->causticSubmissionSerial;
@@ -18976,8 +21678,12 @@ static bool produceOpenGlGlassGratingReadback(
         const auto pixels=std::uint64_t(scheduled.width)*scheduled.height;
         const auto workBase=binding->bounds.maximumIncidents*gc::kGratingIncidentStride;
         const auto childBase=binding->bounds.maximumOrders*gc::kGratingOrderStride;
-        std::array<std::uint64_t,13> bytes{{scheduled.work.size()*gc::kPathReceiptStride*sizeof(gc::Texel),
-            (workBase+(terminal?scheduled.work.size()*2:0))*sizeof(gc::Texel),
+        // Incident history words 2 and up follow the work receipts; the walked
+        // branch's words 4 and up live in the Paths history tail.
+        const auto historyBase=workBase+(terminal?scheduled.work.size()*2:0);
+        const std::uint64_t incidentTailWords=binding->bounds.historyTailWords,incidentTailTexels=(incidentTailWords+1)/2;
+        std::array<std::uint64_t,13> bytes{{(scheduled.work.size()*gc::kPathReceiptStride+scheduled.bounds.historyTexels)*sizeof(gc::Texel),
+            (historyBase+binding->bounds.maximumIncidents*incidentTailTexels)*sizeof(gc::Texel),
             (childBase+(terminal?binding->bounds.maximumOrders*8:0))*sizeof(gc::Texel),binding->witnessTexels.size()*sizeof(gc::Texel),
             terminal?scheduled.bounds.maximumDeposits*gc::kDepositReceiptStride*sizeof(gc::Texel):0,
             terminal?deposition.paddedKeyCount*sizeof(gc::DepositionKey):0,
@@ -19132,7 +21838,7 @@ static bool produceOpenGlGlassGratingReadback(
                     ||(terminalOutput->gratingIncidents->directionalSource
                         &&(!charge(terminalOutput->gratingIncidents->directionalSource->potential.capacity(),sizeof(float))
                             ||!charge(1,terminalOutput->gratingIncidents->directionalSource->submission.frameIdentity.capacity())))))))
-            ||total>renderpassoutput::kMaximumTotalBytes)
+            ||total>renderpassoutput::kRepresentableTotalBytes)
         {error="OpenGL grating incident storage exceeds the existing whole-frame memory cap";return false;}
         const auto attemptIndex=frame->nativeAttemptCount;
         if(!frame->reserveNativeAttempt(OpenGlNativeAttemptKind::Adjunct,binding,{},0,
@@ -19327,7 +22033,7 @@ static bool produceOpenGlGlassGratingReadback(
             const auto camera=gc::cameraPosition(scheduled);const auto& rotation=scheduled.camera.transform.rotation;
             gl.Uniform4f(loc("uCamera"),camera[0],camera[1],camera[2],0);
             gl.Uniform4f(loc("uRotation"),rotation.x,rotation.y,rotation.z,rotation.w);
-            gl.Uniform4f(loc("uProjection"),std::tan(scheduled.camera.verticalFovRadians*.5f),float(scheduled.width)/scheduled.height,
+            gl.Uniform4f(loc("uProjection"),glasscaustics::cameraProjectionX(scheduled.camera),float(scheduled.width)/scheduled.height,
                 scheduled.camera.nearPlane,scheduled.camera.farPlane);
             gl.Uniform2f(loc("uExtent"),float(scheduled.width),float(scheduled.height));
             for(unsigned i=1;i<3;++i) {
@@ -19336,6 +22042,8 @@ static bool produceOpenGlGlassGratingReadback(
             }
         }
         gl.Uniform1i(loc("uWitnessCount"),int(binding->triangles.size()));gl.Uniform1i(loc("uVisits"),int(policy.maximumVisits));
+        gl.Uniform1i(loc("uGratingHistoryBase"),int(historyBase));gl.Uniform1i(loc("uGratingHistoryWords"),int(incidentTailWords));
+        gl.Uniform1i(loc("uHistoryExtra"),int(scheduled.bounds.historyExtraWords));gl.Uniform1i(loc("uAncestryExtra"),0);
         gl.Uniform1i(loc("uInterfaces"),int(policy.maximumInterfaces));gl.Uniform1i(loc("uPending"),int(policy.maximumPending));
         gl.Uniform2f(loc("uPolicy"),policy.maximumUnresolvedFraction,policy.minimumBranchFraction);
         gl.Uniform4fv(loc("uSource"),1,scheduled.sourceDirectionTrace.data());gl.Uniform4fv(loc("uOpaqueControl"),1,scheduled.query.control.data());
@@ -19417,9 +22125,16 @@ static bool produceOpenGlGlassGratingReadback(
         candidate.incidents.reserve(std::size_t(binding->bounds.maximumIncidents));
         for(std::size_t w=0;w<counts.size()&&decoded;++w)for(std::size_t i=0;i<policy.maximumVisits;++i) {
             const auto* p=events+(w*policy.maximumVisits+i)*gc::kGratingIncidentStride;
-            if(i>=counts[w]) {for(unsigned t=0;t<gc::kGratingIncidentStride;++t)if(p[t]!=gc::Texel{})decoded=false;continue;}
+            if(i>=counts[w]) {
+                for(unsigned t=0;t<gc::kGratingIncidentStride;++t)if(p[t]!=gc::Texel{})decoded=false;
+                for(std::uint64_t t=0;t<incidentTailTexels;++t)
+                    if(events[historyBase+(w*policy.maximumVisits+i)*incidentTailTexels+t]!=gc::Texel{})decoded=false;
+                continue;
+            }
             gc::NativeGratingIncident incident;
-            if(!gc::opengl::decodeGratingIncident(p,incident)||incident.work!=w){decoded=false;break;}
+            if(!gc::opengl::decodeGratingIncident(p,incident)||incident.work!=w
+                ||!gc::decodeGratingIncidentHistoryTail(events+historyBase+(w*policy.maximumVisits+i)*incidentTailTexels,
+                    std::size_t(incidentTailWords),incident)){decoded=false;break;}
             if(!terminal){tails[w]+=incident.unresolvedPower;}candidate.incidents.push_back(incident);
         }
         if(gl.UnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE||!decoded)return fail("OpenGL grating incident witness is malformed");
@@ -19495,6 +22210,22 @@ static bool produceOpenGlGlassGratingReadback(
                 full.deposits.push_back(deposit);
             }
             if(gl.UnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE||!decoded)return fail("OpenGL grating completed receiver deposit is malformed");
+            if(const auto historyExtra=scheduled.bounds.historyExtraWords) {
+                // Deposit history words 4 and up: one Paths tail block per deposit slot.
+                const std::uint64_t blockTexels=(historyExtra+1)/2,tailBase=scheduled.work.size()*gc::kPathReceiptStride;
+                gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[0]);
+                const auto* blocks=static_cast<const gc::Texel*>(gl.MapBufferRange(GL_SHADER_STORAGE_BUFFER,
+                    std::ptrdiff_t(tailBase*sizeof(gc::Texel)),std::ptrdiff_t(full.paths.size()*policy.maximumVisits*blockTexels*sizeof(gc::Texel)),GL_MAP_READ_BIT));
+                if(!blocks)return fail("OpenGL grating deposit history mapping failed");
+                std::vector<std::uint32_t> words(static_cast<std::size_t>(historyExtra));std::size_t next=0;
+                for(std::size_t w=0;w<full.paths.size()&&decoded;++w)for(std::size_t d=0;d<full.paths[w].depositCount;++d) {
+                    auto& deposit=full.deposits[next++];
+                    if(!gc::openGlHistoryTailDecode(blocks+(w*policy.maximumVisits+d)*blockTexels,std::size_t(historyExtra),words.data())) {decoded=false;break;}
+                    deposit.reflectionHistory=deposit.reflectionHistory.withExtraWords(words.data(),std::size_t(historyExtra));
+                    if(!deposit.reflectionHistory.clearFrom(deposit.interfaces)) {decoded=false;break;}
+                }
+                if(gl.UnmapBuffer(GL_SHADER_STORAGE_BUFFER)!=GL_TRUE||!decoded)return fail("OpenGL grating deposit history is malformed");
+            }
             full.spectralRadiance.resize(std::size_t(pixels*8));
             for(unsigned half=0;half<2;++half) {
                 gl.BindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[6+half]);
@@ -19553,7 +22284,7 @@ static bool produceOpenGlGlassGratingReadback(
                     const auto location=[&](const char* name){return gl.GetUniformLocation(shader,name);};
                     gl.Uniform4f(location("uCamera"),camera[0],camera[1],camera[2],0);
                     gl.Uniform4f(location("uRotation"),rotation.x,rotation.y,rotation.z,rotation.w);
-                    gl.Uniform4f(location("uProjection"),std::tan(scheduled.camera.verticalFovRadians*.5f),
+                    gl.Uniform4f(location("uProjection"),glasscaustics::cameraProjectionX(scheduled.camera),
                         float(scheduled.width)/scheduled.height,scheduled.camera.nearPlane,scheduled.camera.farPlane);
                 };
                 gl.UseProgram(cameraPrograms[1]);configureCamera(cameraPrograms[1]);
@@ -19815,6 +22546,8 @@ static bool produceOpenGlGlassGratingReadback(
                 gl.Uniform1i(location("uRecordCount"),int(bounds.maximumRecords));
                 gl.Uniform1i(location("uMaximumInterfaces"),int(bounds.maximumInterfaces));
                 gl.Uniform1i(location("uRecordStride"),int(bounds.recordStride));
+                gl.Uniform1i(location("uGratingHistoryBase"),int(historyBase));
+                gl.Uniform1i(location("uGratingHistoryWords"),int(incidentTailWords));
                 gl.Uniform1i(location("uEntryCount"),int(sourceCells->cells.size()));
                 gl.Uniform1i(location("uTriangleCount"),int(scheduled.triangles.size()));
                 gl.Uniform4fv(location("uSource"),1,scheduled.sourceDirectionTrace.data());
@@ -20080,5 +22813,133 @@ NativeDeformationBackend& nativeDeformationBackend()
 {
     static OpenGlDeformationBackend backend;
     return backend;
+}
+std::vector<GratingSubmissionSpan> lastGratingSubmissions()
+{
+    return lastGratingSpans;
+}
+// Compiles the Realtime fixture fragment shader for every feature mask fixtureFragmentFeatures
+// can give it (Realtime drops smooth glass, so with or without the grating and the Stam layer)
+// in the current context. Returns one line per variant that fails, with its compiler log.
+std::vector<std::string> realtimeFixtureVariantCompileErrors()
+{
+    std::vector<std::string> errors;
+    arbitgl::GlFuncs gl;
+    std::string missing;
+    if (! arbitgl::loadGlFunctions (gl, missing)) return { "OpenGL functions missing: " + missing };
+    for (const unsigned extra : { 0u, unsigned (kFixtureFragmentDiffraction), unsigned (kFixtureFragmentStamLayer),
+                                  unsigned (kFixtureFragmentDiffraction | kFixtureFragmentStamLayer) })
+    {
+        const unsigned features = kFixtureFragmentRealtime | extra;
+        const auto source = fixtureFragmentShaderSource (features);
+        char name[32];
+        std::snprintf (name, sizeof (name), "features=0x%x", features);
+        if (source.empty()) { errors.push_back (std::string (name) + ": no source"); continue; }
+        const GLuint shader = gl.CreateShader (GL_FRAGMENT_SHADER);
+        const char* text = source.c_str();
+        gl.ShaderSource (shader, 1, &text, nullptr);
+        gl.CompileShader (shader);
+        GLint compiled = GL_FALSE, length = 0;
+        gl.GetShaderiv (shader, GL_COMPILE_STATUS, &compiled);
+        if (compiled != GL_TRUE)
+        {
+            gl.GetShaderiv (shader, GL_INFO_LOG_LENGTH, &length);
+            std::string log (static_cast<std::size_t> (std::max (length, 1)), '\0');
+            gl.GetShaderInfoLog (shader, length, nullptr, log.data());
+            errors.push_back (std::string (name) + ": " + log.c_str());
+        }
+        gl.DeleteShader (shader);
+    }
+    // The grating mirror pass's own program (realtime_diffraction_mirror.h).
+    {
+        const std::string source = std::string ("#version 330 core\n") + opaquevisibility::glslShader()
+            + realtimediffractionmirror::fragmentShader();
+        std::string error;
+        const auto shader = compileFixtureShader (gl, GL_FRAGMENT_SHADER, source.c_str(), error);
+        if (shader == 0) errors.push_back ("grating mirror: " + error);
+        else gl.DeleteShader (shader);
+    }
+    return errors;
+}
+} // namespace arbitgpu
+
+namespace arbitgpu
+{
+bool realtimeGpuTimerBegin(bool blocking) noexcept
+{
+    auto& ring = realtimeGpuTimerRing;
+    if (!bindRealtimeGpuTimer(ring)) return false;
+    if (blocking)
+    {
+        const auto generate = reinterpret_cast<PFNGLGENQUERIESPROC>(glfwGetProcAddress("glGenQueries"));
+        const auto remove = reinterpret_cast<PFNGLDELETEQUERIESPROC>(glfwGetProcAddress("glDeleteQueries"));
+        if (generate == nullptr || remove == nullptr) return false;
+        if (ring.blockingOpen || ring.blockingClosed) remove(2, ring.blocking);
+        ring.blocking[0] = ring.blocking[1] = 0;
+        ring.blockingOpen = ring.blockingClosed = false;
+        generate(2, ring.blocking);
+        if (ring.blocking[0] == 0 || ring.blocking[1] == 0) return false;
+        ring.counter(ring.blocking[0], GL_TIMESTAMP);
+        ring.blockingOpen = true;
+        return true;
+    }
+    // A pair nobody read is dropped: its frame is three frames old.
+    ring.pending[ring.next] = false;
+    ring.counter(ring.queries[ring.next][0], GL_TIMESTAMP);
+    ring.open = ring.next;
+    return true;
+}
+
+void realtimeGpuTimerEnd() noexcept
+{
+    auto& ring = realtimeGpuTimerRing;
+    if (!ring.ready || ring.context != glfwGetCurrentContext()) { ring.open = -1; ring.blockingOpen = false; return; }
+    if (ring.blockingOpen)
+    {
+        ring.counter(ring.blocking[1], GL_TIMESTAMP);
+        ring.blockingOpen = false;
+        ring.blockingClosed = true;
+        return;
+    }
+    if (ring.open < 0) return;
+    ring.counter(ring.queries[ring.open][1], GL_TIMESTAMP);
+    ring.pending[ring.open] = true;
+    ring.lastClosed = ring.open;
+    ring.next = (ring.open + 1) % RealtimeGpuTimerRing::kPairs;
+    ring.open = -1;
+}
+
+std::optional<double> realtimeGpuTimerResult(bool waitForResult) noexcept
+{
+    auto& ring = realtimeGpuTimerRing;
+    if (!ring.ready || ring.context != glfwGetCurrentContext()) return std::nullopt;
+    if (waitForResult)
+    {
+        if (!ring.blockingClosed) return std::nullopt;
+        GLuint64 begin = 0, end = 0;
+        ring.result(ring.blocking[0], GL_QUERY_RESULT, &begin);
+        ring.result(ring.blocking[1], GL_QUERY_RESULT, &end);
+        if (const auto remove = reinterpret_cast<PFNGLDELETEQUERIESPROC>(glfwGetProcAddress("glDeleteQueries")))
+            remove(2, ring.blocking);
+        ring.blocking[0] = ring.blocking[1] = 0;
+        ring.blockingClosed = false;
+        return end >= begin ? double(end - begin) * 1e-6 : 0.0;
+    }
+    if (ring.lastClosed < 0) return std::nullopt;
+    // Newest first. Older pairs than the one read are dropped, so each frame's
+    // window gets one span, never a backlog.
+    std::optional<double> newest;
+    for (int step = 0; step < RealtimeGpuTimerRing::kPairs; ++step)
+    {
+        const int pair = (ring.lastClosed - step + RealtimeGpuTimerRing::kPairs) % RealtimeGpuTimerRing::kPairs;
+        if (!ring.pending[pair]) continue;
+        if (newest.has_value()) { ring.pending[pair] = false; continue; }
+        GLint ready = 0;
+        ring.available(ring.queries[pair][1], GL_QUERY_RESULT_AVAILABLE, &ready);
+        if (ready == 0) continue;
+        ring.pending[pair] = false;
+        newest = realtimeGpuSpanMs(ring, pair);
+    }
+    return newest;
 }
 } // namespace arbitgpu

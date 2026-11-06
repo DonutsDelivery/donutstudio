@@ -192,11 +192,8 @@ int main()
                              immutableScore, midWarmHostile,
                              "mid-warm hostile beat clears partial output and receipts");
 
-    auto oversized = std::make_shared<arbitmod::Score>(score);
-    oversized->notes.resize(arbitblockc::kMaxNotes + 1, root);
-    expectRejectedAndCleared(canonicalblockc::PreviewFrameRequest { identity, 1, 4.0 },
-                             oversized, beatAt,
-                             "oversized note count clears output and receipts");
+    // Note rows are sized from the score, so a long score is no longer an
+    // oversized rejection; block_c_content_sized_tests covers it packing.
 
     const auto noteTail = static_cast<std::size_t>(frozen->noteRowCount) * 16u;
     const auto linkTail = static_cast<std::size_t>(frozen->linkRowCount) * 4u;

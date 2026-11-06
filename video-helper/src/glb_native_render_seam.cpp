@@ -811,7 +811,8 @@ bool GlbNativeRenderSeam::publishSurfacePrograms (
         const bool volume = arbitgpu::smoothglass::causticVolumeNeedsSlot (
             candidate->nativeProgram().get(), caustic->glassObject);
         backend_.startFixtureProgramLink (candidate->nativeProgram(),
-                                          grating != nullptr, volume);
+                                          grating != nullptr, volume,
+                                          arbitgpu::smoothglass::cameraVisitsFor (*admission.scene));
     }
     warmScope.reset ();
     // The dispatch warm submits after the fixture link: the link's context
@@ -863,7 +864,7 @@ void GlbNativeRenderSeam::clearSurfaceMaterial (
 bool GlbNativeRenderSeam::publishDiffractionMaterial (
     const GlbNativeSceneAdmission& admission,
     const diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest& request,
-    std::string& error)
+    std::string& error, bool exactComposedTarget)
 {
     auto reject = [&] (std::string diagnostic)
     {
@@ -894,8 +895,9 @@ bool GlbNativeRenderSeam::publishDiffractionMaterial (
         return reject ("native fixture backend has no admitted diffraction target");
 
     std::string diagnostic;
+    // A composed scene may put another object first; its foil names its object.
     auto candidate = videorender::fixture3d::admitDiffractionMaterialBinding (
-        admission.scene, request, target, diagnostic);
+        admission.scene, request, target, diagnostic, exactComposedTarget);
     if (candidate == nullptr)
         return reject (std::move (diagnostic));
 

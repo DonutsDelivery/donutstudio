@@ -8,6 +8,7 @@
 #include "../src/imported_animated_scene_payload_execution.h"
 #include "../src/pathtrace_fixture_engine.h"
 #include "../src/path_trace_stats_reply.h"
+#include "../src/pathtrace_oidn.h"
 #include "../src/pathtrace_preview_denoise.h"
 #include "../src/diffraction_material_admission.h"
 #include "DiffractionMaterialPresets.h"
@@ -19,6 +20,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -453,7 +455,6 @@ void inputRefusalTests()
         std::string error;
         return ! ptfixture::admitInputs (inputs, error) && error == expected;
     };
-    constexpr const char* composites = "Path Trace does not run render pass composites yet; choose Raster";
 
     arbitgpu::NativeFixtureSceneRuntimeInputs plain;
     std::string error;
@@ -471,22 +472,30 @@ void inputRefusalTests()
     evaluated.diffractionEvaluatedProgram = std::make_shared<const Program>();
     check (ptfixture::admitInputs (evaluated, error), "an evaluated diffraction program is admitted");
 
+    // Image views, data exports and pass composites read the render outputs.
+    check (! ptfixture::readsRenderOutputs (plain), "a plain Color draw carries no render outputs");
     auto composite = plain;
     composite.passComposite = renderpasscomposite::Parameters {};
-    check (refused (composite, composites), "a render pass composite is refused by name");
+    check (ptfixture::admitInputs (composite, error) && ptfixture::readsRenderOutputs (composite),
+           "a render pass composite is admitted and reads the outputs");
     // A program is only valid beside the composite its output step matches.
     auto program = plain;
     renderpasscomposite::Program compositeProgram;
     compositeProgram.count = 1u;
     program.passProgram = compositeProgram;
     program.passComposite = compositeProgram.steps[compositeProgram.output].parameters;
-    check (renderpasscomposite::valid (compositeProgram) && refused (program, composites),
-           "a render pass program is refused by name");
+    check (renderpasscomposite::valid (compositeProgram) && ptfixture::admitInputs (program, error)
+               && ptfixture::readsRenderOutputs (program),
+           "a render pass program is admitted and reads the outputs");
 
     auto depth = plain;
     depth.imageOutput = renderpassoutput::Output::Depth;
-    check (refused (depth, "Path Trace renders the Color image only; choose Raster for other outputs and data exports"),
-           "a non-Color image output is refused by name");
+    check (ptfixture::admitInputs (depth, error) && ptfixture::readsRenderOutputs (depth),
+           "a Depth View image output is admitted and reads the outputs");
+    auto exported = plain;
+    exported.rawExportMask = 1u << static_cast<unsigned> (renderpassoutput::Output::ObjectId);
+    check (ptfixture::admitInputs (exported, error) && ptfixture::readsRenderOutputs (exported),
+           "an Object ID data export is admitted and reads the outputs");
     auto frame = plain;
     frame.materialFrameTexture = std::make_shared<FakeFrame> ("opengl", 4, 4, 9);
     check (ptfixture::admitInputs (frame, error), "a material frame texture is admitted");
@@ -542,7 +551,8 @@ void inputRefusalTests()
            "note appearance is refused by name");
     auto scoreOnly = plain;
     scoreOnly.canonicalBlockCFrame = notes.canonicalBlockCFrame;
-    check (! ptfixture::admitInputs (scoreOnly, error), "a score frame without a note mapping stays refused");
+    check (refused (scoreOnly, "Path Trace does not render deformed or composed animation frames yet; choose Raster"),
+           "a score frame without a note mapping stays refused by name");
 }
 
 // ---------------------------------------------------------------- FixtureSceneRenderer engine branch
@@ -1003,12 +1013,6 @@ void denoiseKernelTests()
                && std::string (denoise::denoiserName (denoise::Denoiser::OptixAi)) == "optix-ai"
                && std::string (denoise::denoiserName (denoise::Denoiser::Oidn)) == "oidn",
            "each denoiser has its telemetry name");
-    check (denoise::selectDenoiser (true, true) == denoise::Denoiser::OptixAi
-               && denoise::selectDenoiser (false, true) == denoise::Denoiser::Oidn
-               && denoise::selectDenoiser (false, false) == denoise::Denoiser::NativeFilter,
-           "OptiX AI comes first, then OIDN, then the native filter");
-    check (denoise::kBuildDenoiser == denoise::Denoiser::NativeFilter,
-           "this build has only the native filter and never claims another");
 
     check (closeTo (denoise::halfToFloat (pt::halfBits (0.25f)), 0.25f)
                && closeTo (denoise::halfToFloat (pt::halfBits (-3.5f)), -3.5f)
@@ -1181,6 +1185,9 @@ void denoiseEngineTests()
 {
     const auto scene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (videohelper::fixture3d::makeScene());
     std::string error;
+    // These frames trace on the CPU, so Auto asks for OIDN. Without its library
+    // Auto falls back to the native filter and says why; the tests pin that case.
+    denoise::setOidnLibraryForTests ("/nonexistent/libOpenImageDenoise.so.2");
 
     // Each sequence runs on a fresh engine. The second draw moves time, which
     // puts the tracer on its fixed-sample playback frame.
@@ -1302,6 +1309,11 @@ void denoiseEngineTests()
         check (tracing.renderPreview (scene, { 8, 6 }, fixture::kNativeGpuCapability, frame, error)
                    && std::string (fixture::pathTraceDenoiserRanOnThisThread()) == "native-filter",
                "the renderer reports the native filter for a denoised draw");
+        const auto traced = fixture::lastPathTraceStats (fixture::RenderUse::Preview);
+        check (traced.has_value() && std::string (traced->denoiserRequested) == "auto"
+                   && traced->denoiserReason != nullptr
+                   && traced->denoiserReason->find ("OIDN did not run: the OIDN library is not installed") != std::string::npos,
+               "the native filter is a named fallback with the reason OIDN did not run");
         selection.denoise = false;
         tracing.selectEngine (selection);
         check (tracing.renderPreview (scene, { 8, 6 }, fixture::kNativeGpuCapability, frame, error)
@@ -1325,6 +1337,7 @@ void denoiseEngineTests()
                "Raster ignores the selection's switch and reports no denoiser");
         fixture::setPathTraceSceneEngineFactory (&ptfixture::makeEngine);
     }
+    denoise::setOidnLibraryForTests (nullptr);
 }
 
 // Plan 3, Path Trace and Playback: what the viewport does, and says it does, on
@@ -1513,6 +1526,33 @@ void causticDrawTests()
     check (! draw (plain, grating, HarmonicMIDI::grid::SceneObjectId { 999 }, error)
                && error == "Path Trace diffraction material names no scene object",
            "a diffraction material on a missing object is refused by name");
+
+    // A masked foil whose object carries only the foil's diffraction program, as the
+    // Holographic Trading Card does: the foil traces as the grating and the mask
+    // shows the object's scene material, instead of refusing the frame.
+    auto foilProgram = std::make_shared<Program>();
+    foilProgram->backend = arbitgpu::NativeFixtureMaterialBackend::Metal;
+    foilProgram->kind = arbitgpu::NativeFixtureMaterialKind::DiffractionReflective;
+    foilProgram->object = videohelper::fixture3d::kCubeObjectId;
+    const auto engine = ptfixture::makeEngine();
+    fixture::SceneEngineDraw masked;
+    masked.snapshot = scene;
+    masked.material = foilProgram;
+    masked.inputs = &plain;
+    masked.dimensions = { 8, 6 };
+    masked.use = fixture::RenderUse::Export;
+    masked.exportSamples = 2;
+    masked.backend = "metal";
+    masked.diffractionObject = videohelper::fixture3d::kCubeObjectId;
+    masked.diffractionMaterial = grating;
+    masked.diffractionField = std::array<std::array<float, 4>, 4> { { { 1.0f, 0.0f, 720.0f, 0.15f },
+                                                                      { 0.0f, 1.0f, 980.0f, 0.45f },
+                                                                      { 0.7f, 0.7f, 1260.0f, 0.7f },
+                                                                      { 0.7f, -0.7f, 1540.0f, 0.95f } } };
+    fixture::RenderedFrame maskedFrame;
+    error.clear();
+    check (engine != nullptr && ! engine->render (masked, maskedFrame, error) && error == traced,
+           "a masked foil on an object with only its diffraction program traces without a refusal");
 }
 
 // ---------------------------------------------------------------- imported scene routes
@@ -1988,6 +2028,9 @@ void importedRouteTests()
 
 } // namespace
 
+// holographic_card_pathtrace_tests.cpp: the card's committed request in the real engine.
+int holographicCardPathTraceTests();
+
 int main()
 {
     glassMappingTests();
@@ -2002,6 +2045,7 @@ int main()
     viewportConvergenceTests();
     causticDrawTests();
     importedRouteTests();
+    const int cardFailures = holographicCardPathTraceTests();
     std::printf ("%d checks, %d failures\n", checks, failures);
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return failures == 0 && cardFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

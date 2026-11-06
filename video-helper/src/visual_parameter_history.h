@@ -65,7 +65,8 @@ private:
         {
             const bool audio=source.type==arbitmod::SourceType::AudioRms
                 || source.type==arbitmod::SourceType::AudioPeak || source.type==arbitmod::SourceType::AudioOnset
-                || source.type==arbitmod::SourceType::AudioBand;
+                || source.type==arbitmod::SourceType::AudioBand
+                || source.type==arbitmod::SourceType::AudioEnvelope;
             needsAudio_=needsAudio_ || audio;
             if (!audio) return true;
             if (source.type==arbitmod::SourceType::AudioBand && (source.band<0 || source.band>=64))

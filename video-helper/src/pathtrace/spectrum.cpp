@@ -294,7 +294,7 @@ const Tables& tables() noexcept
 // Device code reads the same values from the buffers the host uploads.
 using TableRow = float[3];
 
-PT_SHARED_ENTRY const TableRow* basisTable() noexcept
+PT_SHARED_ENTRY const PT_TABLE_SPACE TableRow* basisTable() noexcept
 {
 #if defined(__CUDACC__)
     return device::deviceLookupTables().spectrumBasis;
@@ -303,7 +303,7 @@ PT_SHARED_ENTRY const TableRow* basisTable() noexcept
 #endif
 }
 
-PT_SHARED_ENTRY const TableRow* weightTable() noexcept
+PT_SHARED_ENTRY const PT_TABLE_SPACE TableRow* weightTable() noexcept
 {
 #if defined(__CUDACC__)
     return device::deviceLookupTables().spectrumWeight;
@@ -312,7 +312,7 @@ PT_SHARED_ENTRY const TableRow* weightTable() noexcept
 #endif
 }
 
-PT_SHARED_ENTRY Vec3 lookup (const TableRow* table, float nm) noexcept
+PT_SHARED_ENTRY Vec3 lookup (const PT_TABLE_SPACE TableRow* table, float nm) noexcept
 {
     const float position = std::min (std::max ((nm - kWavelengthMinNm) / kTableStepNm, 0.0f),
                                      static_cast<float> (kTableSize - 1));

@@ -353,6 +353,7 @@ struct LayerDesc
 
 #include "gl_loader.h"
 #include "color_transform_gl.h"
+#include "gpu_yuv_convert_gl.h"
 #include "volume_visual_cache.h"
 #include "node_preview_presentation.h"
 #include "render_pass_output_publication.h"
@@ -808,6 +809,30 @@ public:
                               int numOverlays = 0);
     bool drainAsyncReadback (std::vector<uint8_t>& rgbaOut);
 
+    // The GPU encode path: composites this frame and converts it, on the GPU,
+    // into an RGBA8 texture the renderer owns (top row first, the bytes
+    // renderToPixelsAsync would read back). Returns that texture, or 0 with the
+    // reason in error. The texture is the same every frame until the output size
+    // changes, so an interop registration of it stays valid.
+    unsigned renderToExportTexture (const LayerDesc* layers, int numLayers, std::string& error,
+                                    const ImageLayerDesc* overlays = nullptr, int numOverlays = 0);
+
+    // The same in the encoder's YUV: composites this frame and converts it on the
+    // GPU into NV12 or P010 planes with the matrix, transfer and range the
+    // stream's tags declare (yuv_encode_math.h). An HDR conversion reads the
+    // linear float composite, so HDR image capture must be on. Returns false with
+    // the reason. luma and chroma name the target planes, such as a VA-API
+    // surface's imported planes; zero for both renders into the renderer's own
+    // planes and returns them, stable until the output size or bit depth changes.
+    bool renderToExportYuv (const LayerDesc* layers, int numLayers,
+                            const videohelper::yuvencode::Conversion& conversion,
+                            unsigned& luma, unsigned& chroma, std::string& error,
+                            const ImageLayerDesc* overlays = nullptr, int numOverlays = 0);
+    // Converts the composite just rendered into planes the caller owns, such as a
+    // VA-API surface imported through DRM-PRIME.
+    bool convertLastCompositeYuv (const videohelper::yuvencode::Conversion& conversion,
+                                  unsigned luma, unsigned chroma, std::string& error);
+
     // Exact current final RGBA16F compositor result, before 8-bit presentation.
     // Synchronous, top row first. Does not draw or advance temporal state.
     bool readLastCompositeFloat(std::vector<float>& rgba, std::string& error);
@@ -1019,6 +1044,7 @@ private:
     std::string compositorBackend_ = "opengl";
     std::string lastError_;
     ColorTransformGl colorTransformGl_;
+    YuvPlanesGl yuvPlanesGl_;
 
 #if defined(__APPLE__) && ARBIT_HAVE_METAL_BACKEND
     // Production macOS compositor. Backend selection is whole-session: this
@@ -1040,6 +1066,8 @@ private:
     int hashBytes_ = 0;
 
     unsigned exportPbo_[2] = { 0, 0 };
+    unsigned exportRgba8Tex_ = 0;
+    int exportRgba8W_ = 0, exportRgba8H_ = 0;
     bool exportPending_[2] = { false, false };
     int exportIdx_ = 0;
     int exportPboBytes_ = 0;

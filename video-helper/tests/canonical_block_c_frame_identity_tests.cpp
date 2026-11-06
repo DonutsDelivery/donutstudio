@@ -127,9 +127,9 @@ void requireProjectedIdentities(const std::shared_ptr<const CanonicalBlockCFrame
 
 void requireResidentReferences(const CanonicalBlockCFrame& frame, const arbitmod::Score& score)
 {
-    require(frame.noteRowCount <= arbitblockc::kMaxNotes
-                && frame.linkRowCount <= arbitblockc::kMaxLinks,
-            "long score exceeded resident texture capacity");
+    require(frame.noteRowCount <= static_cast<int>(score.notes.size())
+                && frame.linkRowCount <= static_cast<int>(score.links.size()),
+            "resident rows exceeded the score's notes or links");
     for (int row = 0; row < frame.noteRowCount; ++row)
     {
         const auto id = frame.noteIdentities[static_cast<std::size_t>(row)];
@@ -311,17 +311,16 @@ void testScoreDropCounts()
         return frame;
     };
 
-    const auto fits = frameOf(scoreOf(arbitblockc::kMaxNotes, arbitblockc::kMaxLinks));
+    // The textures are sized from the score, so the former 128-note and
+    // 256-link limits no longer drop anything.
+    const auto fits = frameOf(scoreOf(128 + 3, 256 + 5));
     require(fits->droppedNotes == 0 && fits->droppedLinks == 0,
-            "a score the textures hold counted a drop");
+            "a score past the former texture limits counted a drop");
+    require(fits->noteRowCount >= 131 && fits->linkRowCount == 261,
+            "a score past the former texture limits lost rows");
     require(arbitblockc::scoreDropWarning(fits->droppedNotes, fits->droppedLinks).empty(),
             "a score the textures hold raised the warning");
-
-    const auto over = frameOf(scoreOf(arbitblockc::kMaxNotes + 3, arbitblockc::kMaxLinks + 5));
-    require(over->droppedNotes == 3 && over->droppedLinks == 5,
-            "notes and links past the textures were not counted");
-    const auto warning = arbitblockc::scoreDropWarning(over->droppedNotes, over->droppedLinks);
-    require(warning.find("3 notes and 5 links") != std::string::npos,
+    require(arbitblockc::scoreDropWarning(3, 5).find("3 notes and 5 links") != std::string::npos,
             "the warning does not name what was left out");
 
     // A note outside the window is not a drop, and neither is its link.
@@ -331,13 +330,6 @@ void testScoreDropCounts()
     require(outside->droppedNotes == 0 && outside->droppedLinks == 0,
             "a note outside the window counted as a drop");
 
-    // A link that lost an endpoint to the note limit is left out too.
-    auto cut = scoreOf(arbitblockc::kMaxNotes + 1, 0);
-    const int lastId = cut->notes.back().id;
-    cut->links.push_back({-1000, lastId, -1, 3, 2, 0});
-    const auto cutFrame = frameOf(cut);
-    require(cutFrame->droppedNotes == 1 && cutFrame->droppedLinks == 1,
-            "a link cut with its note was not counted");
     require(arbitblockc::scoreDropWarning(1, 1).find("1 note and 1 link") != std::string::npos,
             "the warning's singular forms are wrong");
 }
@@ -783,7 +775,7 @@ std::map<std::int64_t, float> appearanceById(const std::shared_ptr<const Canonic
     mapping.appearanceSource = visualnoteinstancing::AppearanceSource::StableNoteIdentity;
     inputs.noteInstanceMapping = mapping;
     const auto batch = arbitgpu::prepareNativeNoteInstances(inputs);
-    require(batch.admitted && batch.count <= visualnoteinstancing::kMaximumInstances,
+    require(batch.admitted && batch.count == batch.identities.size(),
             "note appearance batch was not admitted");
     std::map<std::int64_t, float> result;
     for (std::size_t index = 0; index < batch.count; ++index)
@@ -818,7 +810,8 @@ void testNoteIdentityAcrossEvictionLoopSeekAndExport()
     auto score = projectedLoopScore();
     score->notes.clear();
     score->links.clear();
-    score->historyBeats = 1000.0f;
+    // Rows are content sized, so the history window, not a row limit, evicts note -6 at beat 60.
+    score->historyBeats = 20.0f;
     score->lookaheadBeats = 0.0f;
     for (int index = 0; index < 200; ++index)
     {
@@ -827,8 +820,8 @@ void testNoteIdentityAcrossEvictionLoopSeekAndExport()
         value.lengthBeats = 0.25f;
         score->notes.push_back(value);
     }
-    require(score->notes.size() > static_cast<std::size_t>(arbitblockc::kMaxNotes),
-            "per-note fixture no longer exceeds resident capacity");
+    // More notes than the former 128-row texture held.
+    require(score->notes.size() > 128u, "per-note fixture no longer exceeds the former row limit");
 
     struct Request final
     {
@@ -872,8 +865,8 @@ void testNoteIdentityAcrossEvictionLoopSeekAndExport()
     const auto& atTen = snapshots[0];
     const auto& evicted = snapshots[1];
     const auto& reentered = snapshots[2];
-    require(evicted.texels.size() == static_cast<std::size_t>(arbitblockc::kMaxNotes),
-            "beat 60 did not fill the resident rows");
+    require(!evicted.texels.empty() && evicted.texels.size() < score->notes.size(),
+            "beat 60 did not hold a windowed subset of the notes");
     require(atTen.texels.count(-6) == 1 && evicted.texels.count(-6) == 0
                 && reentered.texels.count(-6) == 1,
             "note -6 was not evicted at beat 60 and re-admitted at beat 10");
@@ -1314,7 +1307,7 @@ int main()
             require(reference.offsets[0]==std::array<float,3>{1,2,3},
                     "vector Prime Lattice fixture no longer has its default prime components");
             for (std::uint8_t choice=scorefield::kFirstSamplePrimeLatticeChoice;
-                 choice<scorefield::kSampleFieldModeCount;++choice) {
+                 choice<scorefield::kSamplePrimeLatticeChoiceEnd;++choice) {
                 OperationRecord latticeSample; latticeSample.stableId=11; latticeSample.inputStableId=12;
                 latticeSample.field.mode=choice; latticeSample.field.values={2,1,0,1,13,0,0,0};
                 FieldData latticeSampled;
@@ -1333,7 +1326,7 @@ int main()
                 require(scaledReference.offsets[0]==std::array<float,3>{3.25f,5.75f,8.25f},
                         "scaled vector Prime Lattice components did not apply gain and bias");
                 for (std::uint8_t choice=scorefield::kFirstSamplePrimeLatticeChoice;
-                     choice<scorefield::kSampleFieldModeCount;++choice) {
+                     choice<scorefield::kSamplePrimeLatticeChoiceEnd;++choice) {
                     OperationRecord scaledSample; scaledSample.stableId=11; scaledSample.inputStableId=12;
                     scaledSample.field.mode=choice; scaledSample.field.values={2,2.5,0.75,1,13,0,0,0};
                     FieldData scaledSampled;
@@ -1361,10 +1354,14 @@ int main()
                 && error.find("no resident harmonic links")!=std::string::npos,
                 "link-distance field silently accepted absent links");
         binding.mode=scorefield::Mode::velocityInfluence;
-        binding.positions.resize(scorefield::kMaximumElements+1);
-        binding.elementIds.resize(binding.positions.size());
-        require(!scorefield::validate(binding,binding.positions.size(),error),
-                "Score Field sample bound was not enforced");
+        binding.positions.clear(); binding.elementIds.clear();
+        for (std::uint64_t sample=0;sample<10000;++sample) {
+            binding.positions.push_back({static_cast<float>(sample%100)*0.01f,1,static_cast<float>(sample/100)*0.01f});
+            binding.elementIds.push_back(sample+1);
+        }
+        require(videohelper::scorefield::evaluate(binding,frame,evaluated,error)
+                && evaluated.offsets.size()==10000 && evaluated.closestNoteIds.size()==10000,
+                "Score Field refused or truncated a 10000-sample input");
     }
     {
         using namespace videowire::geometry;
@@ -1635,7 +1632,7 @@ int main()
                         == ordered[static_cast<std::size_t>(row * 16 + channel)],
                         "canonical residency row reuse changed particle endpoints");
         springScore->links.clear();
-        for (int link = 0; link < arbitblockc::kMaxLinks; ++link)
+        for (int link = 0; link < 256; ++link)
             springScore->links.push_back({-link - 1, -102, -1, 100, 1, 0});
         FrameProducer capacityProducer;
         const auto capacity = videorender::particleNoteUpload(

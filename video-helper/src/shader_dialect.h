@@ -922,8 +922,8 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
     p += "uniform float uOnsetAge;\n";
     p += "uniform sampler1D uAudioBands;\n";
     p += "uniform sampler2D uAudioBands2D;   // 64x1 alias for ISF audioFFT / Shadertoy iChannel0\n";
-    p += "uniform sampler2D uNotes;          // 128 rows x 4 RGBA32F texels\n";
-    p += "uniform sampler2D uLinks;          // 256 x 1\n";
+    p += "uniform sampler2D uNotes;          // uNoteCount rows x 4 RGBA32F texels\n";
+    p += "uniform sampler2D uLinks;          // link i at (i % width, i / width)\n";
     p += "uniform int   uNoteCount;\n";
     p += "uniform int   uLinkCount;\n";
     p += "uniform float uRootFreq;          // Block C: song root frequency in Hz\n";
@@ -967,8 +967,9 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
     p += "vec4 arbitDisplayFragCoord(){ return vec4(gl_FragCoord.x,uResolution.y-gl_FragCoord.y,gl_FragCoord.zw); }\n";
     p += "vec2 arbitTextureCoord(vec2 q){ return vec2(q.x/uResolution.x,1.0-q.y/uResolution.y); }\n";
     // Block C symbolic accessors (M5): read the packed score. uNotes is a
-    // 4-texel x 128-row RGBA32F texture (texelFetch by [texel,row]); uLinks is
-    // 256x1. Loop `for(int i=0;i<uNoteCount;i++)` — holes (freed rows) read back
+    // 4-texel x uNoteCount-row RGBA32F texture (texelFetch by [texel,row]);
+    // uLinks wraps edges into rows of textureSize(uLinks,0).x texels. Both are
+    // sized from the score. Loop `for(int i=0;i<uNoteCount;i++)` — holes (freed rows) read back
     // velocity 0 and gate to nothing via arbitNoteActive.
     p += "vec4  arbitNoteTexel(int row,int texel){ return texelFetch(uNotes, ivec2(texel,row), 0); }\n";
     p += "float arbitNoteMidi(int row){ return arbitNoteTexel(row,0).r; }\n";        // authored MIDI note (float)
@@ -988,7 +989,7 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
     p += "float arbitNoteBend(int row){ return arbitNoteTexel(row,3).a; }\n";        // frame-resolved pitch bend in semitones
     p += "float arbitNotePitch(int row){ return 69.0+12.0*log2(max(arbitNoteFreq(row),0.001)/440.0); }\n";
     p += "float arbitNoteActive(int row){ return (arbitNoteVel(row)>0.0 && arbitNoteAge(row)>=0.0 && arbitNoteRemain(row)>0.0) ? 1.0 : 0.0; }\n";
-    p += "vec4  arbitLinkTexel(int edge){ return texelFetch(uLinks, ivec2(edge,0), 0); }\n";   // (slaveRow, masterRow, num, den)
+    p += "vec4  arbitLinkTexel(int edge){ int w=textureSize(uLinks,0).x; return texelFetch(uLinks, ivec2(edge%w,edge/w), 0); }\n";   // (slaveRow, masterRow, num, den)
     p += "float arbitLinkRatio(int edge){ vec4 l=arbitLinkTexel(edge); return l.w!=0.0 ? l.z/l.w : 1.0; }\n";
     // Struct view (M5 house shaders — Harmonic Strings / lattice_orbit / etc.):
     // wrap the packed texels so a shader reads note.t0.x directly. Field map
@@ -997,10 +998,10 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
     // t3=primesHi(11,13,masterRow,bendSemitones); link.t0=(slaveRow,masterRow,num,den).
     p += "struct ArbitNote { vec4 t0; vec4 t1; vec4 t2; vec4 t3; };\n";
     p += "struct ArbitLink { vec4 t0; };\n";
-    p += "ArbitNote arbitNote(int row){ int r=clamp(row,0,127); ArbitNote n;"
+    p += "ArbitNote arbitNote(int row){ int r=max(row,0); ArbitNote n;"
          " n.t0=arbitNoteTexel(r,0); n.t1=arbitNoteTexel(r,1);"
          " n.t2=arbitNoteTexel(r,2); n.t3=arbitNoteTexel(r,3); return n; }\n";
-    p += "ArbitLink arbitLink(int edge){ ArbitLink l; l.t0=arbitLinkTexel(clamp(edge,0,255)); return l; }\n";
+    p += "ArbitLink arbitLink(int edge){ ArbitLink l; l.t0=arbitLinkTexel(max(edge,0)); return l; }\n";
     // Harmony and structure accessors. Quality classes: 1 major, 2 minor,
     // 3 diminished, 4 augmented, 5 suspended, 6 dominant 7th, 7 major 7th,
     // 8 minor 7th, 9 other (clusters, dyads, unnamed sets). Modes: 1 Ionian,

@@ -18,8 +18,10 @@ namespace videorender {
 // these limits do not bound elapsed time or all process memory.
 struct ParticleBodyCallerLimits final
 {
-    std::size_t maxLogicalBytes=256u*1024u*1024u;
-    std::size_t maxWork=1000000000000ULL;
+    // Bytes and work count from the scene; only a sum past size_t refuses,
+    // and a failed allocation stops the frame.
+    std::size_t maxLogicalBytes=std::numeric_limits<std::size_t>::max();
+    std::size_t maxWork=std::numeric_limits<std::size_t>::max();
 };
 struct ParticleBodyCallerUsage final
 {
@@ -139,9 +141,13 @@ inline std::shared_ptr<ParticleBodyCallerLedger> makeParticleBodyCallerLedger(
 // ends the epoch; escaped payloads keep the ledger and storage leases alive.
 // No global or cross-thread work allowance is claimed. Destruction may refund
 // storage on another thread, but replay/validation must use the original thread.
+// The render thread lives for the whole session, so its epoch sets no work or
+// storage ceiling: a fixed count would refuse every frame once a long session
+// used it up. Callers still count work, and a failed allocation still refuses.
 inline std::shared_ptr<ParticleBodyCallerLedger> particleBodyRenderThreadCaller(std::string& error)
 {
-    thread_local const auto ledger=makeParticleBodyCallerLedger({},error);
+    thread_local const auto ledger=makeParticleBodyCallerLedger(
+        {std::numeric_limits<std::size_t>::max(),std::numeric_limits<std::size_t>::max()},error);
     return ledger;
 }
 // Declare the lease before its payload: refund follows payload destruction.

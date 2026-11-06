@@ -232,7 +232,7 @@ bool produceMetalRestrictedCompleteBaseForFixture(const std::shared_ptr<const Na
     const std::shared_ptr<const MetalFiniteGratingReceiverResult>&,
     std::shared_ptr<const MetalRestrictedCompleteBaseResult>&,std::string&,int stop=-1,
     std::shared_ptr<const MetalRestrictedCompleteBaseResult>* escaped=nullptr,
-    std::uint64_t limit=renderpassoutput::kMaximumTotalBytes);
+    std::uint64_t limit=renderpassoutput::kRepresentableTotalBytes);
 bool inspectMetalRestrictedCompleteBaseForFixture(const std::shared_ptr<const NativeFixtureSceneFrame>&,
     const std::shared_ptr<const MetalRestrictedCompleteBaseResult>&,std::string&);
 bool inspectMetalRestrictedCompleteBaseRefusalsForFixture(const std::shared_ptr<const NativeFixtureSceneFrame>&,
@@ -248,7 +248,7 @@ class MetalFiniteGratingRadianceResult;
 bool produceMetalFiniteGratingRadianceForFixture(const std::shared_ptr<const NativeFixtureSceneFrame>&,
     const std::shared_ptr<const MetalFiniteGratingReceiverResult>&,const std::shared_ptr<const MetalRestrictedCompleteBaseResult>&,
     std::shared_ptr<const MetalFiniteGratingRadianceResult>&,std::string&,int stop=-1,
-    std::shared_ptr<const MetalFiniteGratingRadianceResult>* escaped=nullptr,std::uint64_t limit=renderpassoutput::kMaximumTotalBytes);
+    std::shared_ptr<const MetalFiniteGratingRadianceResult>* escaped=nullptr,std::uint64_t limit=renderpassoutput::kRepresentableTotalBytes);
 bool inspectMetalFiniteGratingRadianceForFixture(const std::shared_ptr<const NativeFixtureSceneFrame>&,
     const std::shared_ptr<const MetalFiniteGratingRadianceResult>&,std::string&);
 bool readMetalFiniteGratingRadianceForFixture(const std::shared_ptr<const NativeFixtureSceneFrame>&,
@@ -268,14 +268,14 @@ class MetalFiniteGratingRgbResult;
 bool produceMetalFiniteGratingRgb(const std::shared_ptr<const NativeFixtureSceneFrame>&,
     const std::shared_ptr<const MetalFiniteGratingRadianceResult>&,
     std::shared_ptr<const MetalFiniteGratingRgbResult>&,std::string&,
-    std::uint64_t limit=renderpassoutput::kMaximumTotalBytes);
+    std::uint64_t limit=renderpassoutput::kRepresentableTotalBytes);
 bool inspectMetalFiniteGratingRgb(const std::shared_ptr<const NativeFixtureSceneFrame>&,
     const std::shared_ptr<const MetalFiniteGratingRgbResult>&,std::string&);
 // Fault selectors are private fixture phases, never production inputs.
 bool produceMetalFiniteGratingRgbForFixture(const std::shared_ptr<const NativeFixtureSceneFrame>&,
     const std::shared_ptr<const MetalFiniteGratingRadianceResult>&,
     std::shared_ptr<const MetalFiniteGratingRgbResult>&,std::string&,int stop=-1,
-    std::shared_ptr<const MetalFiniteGratingRgbResult>* escaped=nullptr,std::uint64_t limit=renderpassoutput::kMaximumTotalBytes);
+    std::shared_ptr<const MetalFiniteGratingRgbResult>* escaped=nullptr,std::uint64_t limit=renderpassoutput::kRepresentableTotalBytes);
 bool readMetalFiniteGratingRgbForFixture(const std::shared_ptr<const NativeFixtureSceneFrame>&,
     const std::shared_ptr<const MetalFiniteGratingRgbResult>&,std::array<float,4>&,std::string&);
 // factories, attempts, ledger/live bytes, whole parent, live owners,
@@ -951,9 +951,10 @@ struct Deposit {
     std::uint32_t work, historyLow, historyHigh, interfaces, visible, projected, x, y;
     float fraction, incident, outgoing, absorbed, area, depth, rasterDepth;
     std::uint32_t object, material, instance, triangle;
+    std::uint32_t historyWideLow, historyWideHigh; // interfaces 64..127, glass_caustic_history.h
     Hit receiver, camera, pixel;
 };
-static_assert(sizeof(Hit)==56 && sizeof(Path)==256 && sizeof(Deposit)==244);
+static_assert(sizeof(Hit)==56 && sizeof(Path)==256 && sizeof(Deposit)==252);
 static_assert(offsetof(Path,masked)==15*16);
 static_assert(sizeof(Path)<=glasscaustics::kPathReceiptStride*16
     && sizeof(Deposit)<=glasscaustics::kDepositReceiptStride*16);
@@ -967,13 +968,13 @@ struct MultipleScatterPath {
 };
 struct MultipleScatterDeposit { Deposit value; std::uint8_t ancestry[32]; };
 struct CoupledDeposit { Deposit value; std::uint8_t ancestry[32]; std::uint32_t extension[4]; };
-static_assert(sizeof(CoupledDeposit)==292 && offsetof(CoupledDeposit,ancestry)==244
-    && offsetof(CoupledDeposit,extension)==276 && sizeof(CoupledDeposit)<=glasscaustics::kDepositReceiptStride*16);
+static_assert(sizeof(CoupledDeposit)==300 && offsetof(CoupledDeposit,ancestry)==252
+    && offsetof(CoupledDeposit,extension)==284 && sizeof(CoupledDeposit)<=glasscaustics::kDepositReceiptStride*16);
 
 static_assert(sizeof(MultipleScatterPath)==256 && offsetof(MultipleScatterPath,source)==44
     && offsetof(MultipleScatterPath,entry)==100 && offsetof(MultipleScatterPath,microEvents)==224
     && offsetof(MultipleScatterPath,masked)==240 && offsetof(MultipleScatterPath,reserved)==252);
-static_assert(sizeof(MultipleScatterDeposit)==276 && offsetof(MultipleScatterDeposit,ancestry)==244
+static_assert(sizeof(MultipleScatterDeposit)==284 && offsetof(MultipleScatterDeposit,ancestry)==252
     && sizeof(MultipleScatterDeposit)<=glasscaustics::kDepositReceiptStride*16);
 // MSL float3 alignment gives CBranch64 and the v2 branch96. The shared
 // admission reserves48 extra bytes per pending branch and320 for exit arrays.
@@ -1162,6 +1163,7 @@ struct CDeposit {
     uint work, historyLow, historyHigh, interfaces, visible, projected, x, y;
     float fraction, incident, outgoing, absorbed, area, depth, rasterDepth;
     uint object, material, instance, triangle;
+    uint historyWideLow, historyWideHigh;
     CHit receiver, camera, pixel;
 };
 struct CParams {
@@ -1187,6 +1189,11 @@ int ctriangle(SceneClosestHit h,device const float4* triangles,uint count) {
     }return -1;
 }
 struct CBranch {float3 origin,direction;float fraction;ulong history;uint interfaces;bool inside;};
+// A pending branch and its history interfaces 64..127 (glass_caustic_history.h).
+// They live in the paths buffer after the branch history blocks, policy.z entries
+// of CAUSTIC_BRANCH_TEXELS texels per path, so maximumPending sizes the stack.
+struct CPending {CBranch branch;ulong wide;};
+static_assert(sizeof(CPending)<=CAUSTIC_BRANCH_TEXELS*16,"pending branch storage");
 // Each invocation owns one path, its bounded branch stack and deposit slots.
 kernel void causticTrace(constant CParams& u [[buffer(0)]],
     device const float4* work [[buffer(1)]],device const float4* triangles [[buffer(2)]],
@@ -1216,10 +1223,27 @@ kernel void causticTrace(constant CParams& u [[buffer(0)]],
         receipt.entry=cstore(entry);receipt.queries+=entry.causticWork;
         if(entry.status!=1||!entry.entering||entry.objectId!=cid(ids.xy)||entry.materialId!=cid(ids.zw)
             ||entry.instanceId!=uint(index.x)||entry.triangleId!=uint(index.y)) {atomic_store_explicit((device atomic_uint*)diagnostic,3u,memory_order_relaxed);return;}
-        CBranch pending[CAUSTIC_MAX_PENDING];uint size=1u;
-        pending[0]={origin,incoming,1.0f,0ul,0u,false};
+        uint size=1u;
+        // Interfaces 128 and up: historyExtra uint words per branch, sized from the
+        // interface policy, in the paths buffer after the path receipts. One block per
+        // deposit slot, then policy.z+1 branch blocks per path, the last
+        // holding the walked branch. ResourceBounds::historyTexels sizes the tail.
+        const uint historyExtra=(u.policy.x+31u)/32u>4u?(u.policy.x+31u)/32u-4u:0u;
+        // Multiple-scatter ancestry tokens for interfaces 32 and up follow, four per word.
+        const uint ancestryExtra=0u;
+        const uint historyBlock=historyExtra+ancestryExtra;
+        device uint* historyTail=(device uint*)(paths+u.extent.z);
+        device uint* branchBlocks=historyTail+(ulong(u.extent.z)*u.policy.y+ulong(w)*(u.policy.z+1u))*historyBlock;
+        device uint* walked=branchBlocks+ulong(u.policy.z)*historyBlock;
+        // The host reserves each history block as (words+1)/2 texels, as on GL.
+        device CPending* pending=(device CPending*)((device uchar*)historyTail
+            +(ulong(u.extent.z)*(u.policy.y+u.policy.z+1u)*((historyBlock+1u)/2u)+ulong(w)*u.policy.z*CAUSTIC_BRANCH_TEXELS)*16ul);
+        for(uint k=0u;k<historyBlock;++k)branchBlocks[k]=0u;
+        pending[0].branch={origin,incoming,1.0f,0ul,0u,false};pending[0].wide=0ul;
         while(size>0u&&receipt.visits<u.policy.y) {
-            CBranch branch=pending[--size];++receipt.visits;
+            CBranch branch=pending[--size].branch;ulong branchWide=pending[size].wide;++receipt.visits;
+            // A child push reuses this slot, so the walked branch keeps its own copy.
+            for(uint k=0u;k<historyBlock;++k)walked[k]=branchBlocks[ulong(size)*historyBlock+k];
             SceneClosestHit hit;
             if(branch.interfaces==0u)hit=entry;
             else {hit=sceneClosestHit(branch.origin,branch.direction,1e-5f,u.source.w,u.query,opaqueTexture);receipt.queries+=hit.causticWork;}
@@ -1239,7 +1263,9 @@ kernel void causticTrace(constant CParams& u [[buffer(0)]],
             }
             if(hit.objectId!=u.policy.w) {
                 if(branch.inside||!hit.entering||branch.interfaces==0u||receipt.count>=u.policy.y) {atomic_store_explicit((device atomic_uint*)diagnostic,7u,memory_order_relaxed);return;}
+                for(uint k=0u;k<historyBlock;++k)historyTail[(ulong(w)*u.policy.y+receipt.count)*historyBlock+k]=walked[k];
                 CDeposit d={};d.work=w;d.historyLow=uint(branch.history);d.historyHigh=uint(branch.history>>32u);
+                d.historyWideLow=uint(branchWide);d.historyWideHigh=uint(branchWide>>32u);
                 d.interfaces=branch.interfaces;d.fraction=branch.fraction;d.incident=power*branch.fraction;
                 float rho=triangles[uint(triangle)*8u+6u+band/4u][band%4u];
                 float2 split=causticReceiverPower(d.incident,rho);d.outgoing=split.x;d.absorbed=split.y;
@@ -1298,13 +1324,17 @@ kernel void causticTrace(constant CParams& u [[buffer(0)]],
                 float fraction=child==0u?r:t;if(fraction==0.0f)continue;
                 if(fraction<u.tail.x||size>=u.policy.z) {receipt.unresolved+=power*fraction;continue;}
                 bool reflection=child==0u;
-                pending[size++]={hit.position+n*(reflection?cbias(hit.position):-cbias(hit.position)),
+                pending[size].wide=branchWide|((reflection&&branch.interfaces>=64u&&branch.interfaces<128u)?(1ul<<(branch.interfaces-64u)):0ul);
+                for(uint k=0u;k<historyBlock;++k)branchBlocks[ulong(size)*historyBlock+k]=walked[k];
+                if(reflection&&branch.interfaces>=128u&&branch.interfaces-128u<32u*historyExtra)
+                    branchBlocks[ulong(size)*historyBlock+(branch.interfaces-128u)/32u]|=1u<<((branch.interfaces-128u)%32u);
+                pending[size++].branch={hit.position+n*(reflection?cbias(hit.position):-cbias(hit.position)),
                     reflection?reflected:transmitted,fraction,
-                    branch.history|(reflection?(1ul<<branch.interfaces):0ul),branch.interfaces+1u,
+                    branch.history|((reflection&&branch.interfaces<64u)?(1ul<<branch.interfaces):0ul),branch.interfaces+1u,
                     reflection?branch.inside:!branch.inside};
             }
         }
-        for(uint p=0;p<size;++p)receipt.unresolved+=power*pending[p].fraction;
+        for(uint p=0;p<size;++p)receipt.unresolved+=power*pending[p].branch.fraction;
         if(receipt.masked+receipt.unresolved>receipt.launched*u.tail.y*(1.0f+2e-4f)) {atomic_store_explicit((device atomic_uint*)diagnostic,13u,memory_order_relaxed);return;}
         receipt.complete=1u;paths[w]=receipt;
     }
@@ -1638,12 +1668,18 @@ struct CTVisit {uint4 lanes[16];};
 struct CTResult {CTInput input;float4 originMinimum,directionMaximum;uint4 control,work,parameters,padding;};
 struct CTParams {float4 query,camera,rotation,projection,ior[2],wavelength[2];uint4 extent,glass;};
 struct CTWitness {uint4 primitive;float4 geometry[4];};
-struct CTBranch {float3 origin,direction;float fraction;uint parent,token,interfaces,history;bool inside;uint ancestry[8];};
-static_assert(sizeof(CTInput)==64&&sizeof(CTVisit)==256&&sizeof(CTResult)==160&&sizeof(CTParams)==160,"camera trace ABI");
+// The ulong history holds interfaces below 64; the visit writer copies words 2
+// and up from the parent's record. ancestry holds the first 32 tokens; later
+// ones follow from the history. u.glass.z is the visits per band (each
+// 16 lanes plus history words 2 and up, four per lane) and u.glass.w the
+// interface setting.
+struct CTBranch {float3 origin,direction;float fraction;uint parent,token,interfaces;ulong history;bool inside;uint ancestry[8];};
+static_assert(sizeof(CTInput)==64&&sizeof(CTVisit)==256&&sizeof(CTResult)==160&&sizeof(CTParams)==160&&sizeof(CTBranch)==96,"camera trace ABI");
 float ctBias(float3 p){return max(1e-5f,2e-6f*max(max(abs(p.x),abs(p.y)),abs(p.z)));}
 kernel void glassCameraGratingTrace(constant CTParams& u [[buffer(0)]],device const CTInput* inputs [[buffer(1)]],
     device const CTWitness* witnesses [[buffer(2)]],device CTResult* results [[buffer(3)]],
-    device CTVisit* visits [[buffer(4)]],texture2d<float> query [[texture(0)]],uint index [[thread_position_in_grid]]) {
+    device uint4* visits [[buffer(4)]],device CTBranch* pendingStacks [[buffer(5)]],
+    texture2d<float> query [[texture(0)]],uint index [[thread_position_in_grid]]) {
     if(index>=u.extent.z*8u)return;
     uint sample=index/8u,band=index%8u;CTResult result={};result.input=inputs[sample];
     result.control=uint4(1u,sample,band,0u);float ior=u.ior[band/4u][band%4u];
@@ -1653,17 +1689,22 @@ kernel void glassCameraGratingTrace(constant CTParams& u [[buffer(0)]],device co
         :location==3u?float2(1.0f):float2(0.0f,1.0f);
     float3 initial=causticCameraRay(float2(pixel)+offset,u.rotation,u.projection,float2(u.extent.xy));
     result.originMinimum=float4(u.camera.xyz,1e-5f);result.directionMaximum=float4(initial,u.projection.w);
-    if(location>4u||any(pixel>=u.extent.xy)||result.input.pixel.w!=1u||u.glass.z!=1u
+    const uint visitCap=u.glass.z,visitLanes=16u+(max(2u,(visitCap+31u)/32u)-2u+3u)/4u;
+    device uint4* bandVisits=visits+ulong(index)*visitCap*visitLanes;
+    if(location>4u||any(pixel>=u.extent.xy)||result.input.pixel.w!=1u||visitCap==0u
         ||any(result.input.control!=uint4(u.extent.xy,0u,0u))||!sceneFinite(ior)||ior<1.0f) {
         result.work.y=2u;result.parameters.z=as_type<uint>(1.0f);results[index]=result;return;
     }
-    CTBranch pending[16];uint size=1u,count=0u;CTBranch root={};
+    // visits+1 pending branches per band, the most a depth-first walk of
+    // visitCap visits holds, so the stack is sized from the setting and never fills.
+    device CTBranch* pending=pendingStacks+ulong(index)*(ulong(visitCap)+1ul);uint size=1u,count=0u;CTBranch root={};
     root.origin=u.camera.xyz;root.direction=initial;root.fraction=1.0f;root.parent=0xffffffffu;pending[0]=root;
     uint reasons=0u;float unresolved=0.0f;
-    while(size>0u&&count<64u) {
+    while(size>0u&&count<visitCap) {
         CTBranch branch=pending[--size];CTVisit v={};uint id=count++;
         v.lanes[0]=uint4(id,branch.parent,branch.token,branch.interfaces);
-        v.lanes[1]=uint4(branch.inside?1u:0u,branch.history,0u,0u);
+        v.lanes[1]=uint4(branch.inside?1u:0u,uint(branch.history),0u,0u);
+        v.lanes[15]=uint4(uint(branch.history>>32),0u,0u,0u);
         v.lanes[2]=as_type<uint4>(float4(branch.origin,1e-5f));
         v.lanes[3]=as_type<uint4>(float4(branch.direction,branch.fraction));
         v.lanes[11]=as_type<uint4>(float4(0.0f,0.0f,0.0f,ior));
@@ -1691,8 +1732,8 @@ kernel void glassCameraGratingTrace(constant CTParams& u [[buffer(0)]],device co
                     v.lanes[1].z=strict?1u:4u;if(!strict)reasons=2u;
                 }
             }
-        } else if(h.materialId!=u.glass.y||branch.inside==h.entering||branch.interfaces>=32u) {
-            v.lanes[1].z=4u;reasons=branch.interfaces>=32u?4u:2u;
+        } else if(h.materialId!=u.glass.y||branch.inside==h.entering||branch.interfaces>=u.glass.w) {
+            v.lanes[1].z=4u;reasons=branch.interfaces>=u.glass.w?4u:2u;
         } else {
             float3 n=branch.inside?-h.outwardNormal:h.outwardNormal,transmitted,reflected;bool tir=false;
             float from=branch.inside?ior:1.0f,to=branch.inside?1.0f:ior;
@@ -1708,17 +1749,19 @@ kernel void glassCameraGratingTrace(constant CTParams& u [[buffer(0)]],device co
             }
             else {
                 uint children=(reflectedFraction>0.0f?1u:0u)+(transmittedFraction>0.0f?1u:0u);
-                if(size+children>16u)reasons=8u;
+                if(size+children>visitCap+1u)reasons=8u;
                 else for(uint child=0u;child<2u;++child) {
                     bool transmission=child==1u;float fraction=transmission?transmittedFraction:reflectedFraction;
                     if(fraction==0.0f)continue;
                     CTBranch next=branch;next.parent=id;next.token=transmission?65u:1u;next.fraction=fraction;
-                    next.interfaces=branch.interfaces+1u;next.history=branch.history|(transmission?0u:(1u<<branch.interfaces));
+                    next.interfaces=branch.interfaces+1u;
+                    next.history=branch.history|(transmission||branch.interfaces>=64u?0ul:(1ul<<branch.interfaces));
                     next.direction=transmission?transmitted:reflected;
                     next.origin=h.position+n*(transmission?-ctBias(h.position):ctBias(h.position));
                     next.inside=transmission?!branch.inside:branch.inside;
                     uint word=branch.interfaces/4u,shift=(branch.interfaces%4u)*8u;
-                    next.ancestry[word]=(next.ancestry[word]&~(255u<<shift))|(next.token<<shift);pending[size++]=next;
+                    if(word<8u)next.ancestry[word]=(next.ancestry[word]&~(255u<<shift))|(next.token<<shift);
+                    pending[size++]=next;
                 }
             }
         }
@@ -1726,10 +1769,19 @@ kernel void glassCameraGratingTrace(constant CTParams& u [[buffer(0)]],device co
             v.lanes[1].w=0u;v.lanes[8]=v.lanes[9]=v.lanes[10]=v.lanes[14]=uint4(0u);
             v.lanes[11]=as_type<uint4>(float4(0.0f,0.0f,0.0f,ior));
         }
-        visits[index*64u+id]=v;
+        device uint4* out=bandVisits+ulong(id)*visitLanes;
+        for(uint lane=0u;lane<16u;++lane)out[lane]=v.lanes[lane];
+        // History words 2 and up: the parent's words plus this branch's reflection.
+        for(uint lane=16u;lane<visitLanes;++lane) {
+            uint4 words=branch.parent==0xffffffffu?uint4(0u):bandVisits[ulong(branch.parent)*visitLanes+lane];
+            uint reflected=branch.interfaces-1u,extra=reflected/32u-2u;
+            if(branch.parent!=0xffffffffu&&branch.token==1u&&reflected>=64u&&extra/4u==lane-16u)
+                words[extra%4u]|=1u<<(reflected%32u);
+            out[lane]=words;
+        }
         if(reasons){unresolved=branch.fraction;break;}
     }
-    if(size>0u&&count==64u&&!reasons)reasons=16u;
+    if(size>0u&&count==visitCap&&!reasons)reasons=16u;
     for(uint at=0u;at<size;++at)unresolved+=pending[at].fraction;
     result.control.w=count;result.work.x=reasons?0u:1u;result.work.y=reasons;
     result.parameters.z=as_type<uint>(unresolved);results[index]=result;
@@ -1765,7 +1817,7 @@ inline std::string multipleScatterShader() {
     replace("struct CBranch {float3 origin,direction;float fraction;ulong history;uint interfaces;bool inside;};",
         "struct CBranch {float3 origin,direction;float fraction;ulong history;uint interfaces;bool inside;uint ancestry[8];uint samplingHistory;};\n"
         "static_assert(sizeof(CBranch)==96,\"caustic v2 pending ABI\");\n"
-        "static_assert(sizeof(CPath)==256 && sizeof(CDeposit)==276,\"caustic v2 storage ABI\");");
+        "static_assert(sizeof(CPath)==256 && sizeof(CDeposit)==284,\"caustic v2 storage ABI\");");
     replace("receipt.roughTransportVersion=rough?1u:0u;receipt.interfaceSample=(w/8u)%interfaceSamples;",
         "receipt.roughTransportVersion=1u;receipt.interfaceSample=(w/8u)%interfaceSamples;receipt.reserved=2u;");
     replace("uint band=uint(index.w);float power=normal.w;",R"METAL(uint band=uint(index.w);float power=normal.w;
@@ -1774,8 +1826,10 @@ inline std::string multipleScatterShader() {
         if(!rough||u.deposition.w!=2u||u.allowance.y==0u||u.allowance.y>32u||u.allowance.z==0u||u.allowance.z>16u) {
             atomic_store_explicit((device atomic_uint*)diagnostic,17u,memory_order_relaxed);return;
         })METAL");
-    replace("pending[0]={origin,incoming,1.0f,0ul,0u,false};",R"METAL(pending[0]={};pending[0].origin=origin;pending[0].direction=incoming;pending[0].fraction=1.0f;
-        pending[0].samplingHistory=2166136261u;)METAL");
+    replace("pending[0].branch={origin,incoming,1.0f,0ul,0u,false};",R"METAL(pending[0].branch={};pending[0].branch.origin=origin;pending[0].branch.direction=incoming;pending[0].branch.fraction=1.0f;
+        pending[0].branch.samplingHistory=2166136261u;)METAL");
+    // ResourceBounds::ancestryExtraWords: tokens for interfaces 32 and up, four per word.
+    replace("const uint ancestryExtra=0u;","const uint ancestryExtra=u.policy.x>32u?(u.policy.x-32u+3u)/4u:0u;");
     replace("d.interfaces=branch.interfaces;d.fraction=branch.fraction;d.incident=power*branch.fraction;",R"METAL(d.interfaces=branch.interfaces;d.fraction=branch.fraction;d.incident=power*branch.fraction;
                 for(uint a=0u;a<32u;++a)d.ancestry[a]=uchar((branch.ancestry[a/4u]>>(8u*(a%4u)))&255u);)METAL");
     const auto begin=source.find("            float3 n=branch.inside?-hit.outwardNormal:hit.outwardNormal,transmitted,reflected;bool tir;");
@@ -1806,12 +1860,21 @@ inline std::string multipleScatterShader() {
                 CBranch child=branch;
                 child.origin=hit.position+n*(transmitted?-cbias(hit.position):cbias(hit.position));
                 child.direction=exits[exit].xyz;child.fraction=fraction;
-                child.history=branch.history|(transmitted?0ul:(1ul<<branch.interfaces));
+                child.history=branch.history|((transmitted||branch.interfaces>=64u)?0ul:(1ul<<branch.interfaces));
+                ulong childWide=branchWide|((!transmitted&&branch.interfaces>=64u&&branch.interfaces<128u)?(1ul<<(branch.interfaces-64u)):0ul);
                 uint token=orders[exit]|(transmitted?64u:0u),word=branch.interfaces/4u,shift=8u*(branch.interfaces%4u);
-                child.ancestry[word]=(child.ancestry[word]&~(255u<<shift))|(token<<shift);
+                if(word<8u)child.ancestry[word]=(child.ancestry[word]&~(255u<<shift))|(token<<shift);
+                // Interfaces 32 and up keep their tokens, and 128 and up their history, in the tail.
+                device uint* childBlock=branchBlocks+ulong(size)*historyBlock;
+                for(uint k=0u;k<historyBlock;++k)childBlock[k]=walked[k];
+                if(!transmitted&&branch.interfaces>=128u&&branch.interfaces-128u<32u*historyExtra)
+                    childBlock[(branch.interfaces-128u)/32u]|=1u<<((branch.interfaces-128u)%32u);
+                if(branch.interfaces>=32u&&branch.interfaces-32u<4u*ancestryExtra)
+                    childBlock[historyExtra+(branch.interfaces-32u)/4u]|=token<<(8u*((branch.interfaces-32u)%4u));
+                pending[size].wide=childWide;
                 child.samplingHistory=causticMsChildHistory(branch.samplingHistory,orders[exit],transmitted);
                 child.interfaces=branch.interfaces+1u;child.inside=transmitted?!branch.inside:branch.inside;
-                pending[size++]=child;
+                pending[size++].branch=child;
             }
 )METAL");
     replace("receipt.complete=1u;paths[w]=receipt;\n    }",R"METAL(if(float(receipt.queries)+receipt.microEvents+receipt.microDraws>float(u.allowance.w)) {
@@ -1829,9 +1892,12 @@ inline bool decodeGratingIncident(const glasscaustics::Texel* p,const glasscaust
     const auto zero=[](const Texel& input){return input==Texel{};};
     for(unsigned t=0;t<kGratingIncidentStride;++t)for(float f:p[t])if(!std::isfinite(f))return false;
     if(!integer(p[0][0],std::uint32_t(kMaximumEntrySamples*8-1),value.work)
-        ||!integer(p[0][1],7,value.band)||!integer(p[0][2],32,value.interfaces)
+        ||!integer(p[0][1],7,value.band)||!integer(p[0][2],std::uint32_t(kMaximumInterfaces),value.interfaces)
         ||!integer(p[0][3],3,value.orderCount))return false;
-    for(unsigned a=0;a<4;++a) {std::uint32_t word;if(!integer(p[1][a],65535,word)){return false;}value.reflectionHistory|=std::uint64_t(word)<<(16*a);}
+    // Words 2 and up follow from the incident tail (decodeGratingIncidentHistoryTail).
+    std::uint64_t history=0;
+    for(unsigned a=0;a<4;++a) {std::uint32_t word;if(!integer(p[1][a],65535,word)){return false;}history|=std::uint64_t(word)<<(16*a);}
+    value.reflectionHistory=CausticHistory(history);
     for(unsigned a=0;a<32;++a) {std::uint32_t token;if(!integer(p[2+a/4][a%4],127,token)){return false;}value.ancestry[a]=std::uint8_t(token);}
     for(unsigned a=0;a<3;++a) {value.origin[a]=p[10][a];value.direction[a]=p[11][a];value.hit.position[a]=p[12][a];
         value.hit.outwardNormal[a]=p[15][a];value.barycentric[a]=p[16][a];value.tangent[a]=p[18][a];value.bitangent[a]=p[19][a];value.normal[a]=p[20][a];}
@@ -1854,7 +1920,7 @@ inline bool decodeGratingIncident(const glasscaustics::Texel* p,const glasscaust
         const auto* q=orders+o*kGratingOrderStride;
         if(o>=value.orderCount) {for(unsigned t=0;t<4;++t){if(!zero(q[t]))return false;}continue;}
         std::uint32_t owner,encoded;
-        if(!integer(q[0][0],std::uint32_t(kMaximumEntrySamples*8*kMaximumBranchVisits-1),owner)||owner!=locator
+        if(!integer(q[0][0],kMaximumExactReceiptCount-1,owner)||owner!=locator
             ||!integer(q[0][1],2,encoded)||q[0][2]!=0||q[0][3]!=0||!zero(q[2])||!zero(q[3]))return false;
         value.orders[o].order=std::int32_t(encoded)-1;
         for(unsigned a=0;a<3;++a)value.orders[o].direction[a]=q[1][a];
@@ -2068,12 +2134,25 @@ kernel void gratingCellUpload(device const float4* cells [[buffer(19)]],device f
     constant uint4& limits [[buffer(22)]],uint i [[thread_position_in_grid]]) {
     if(i<limits.z*7u)echo[i]=cells[i];
 }
+// Interface tokens: 32 inline bytes, then the incident's reflection history
+// (texel 1 words 0-1, then the per-incident tail starting at history.x texels,
+// history.y words per incident as 16-bit halves).
+uint gratingCellToken(device const float4* incidents,uint point,uint slot,uint depth,uint interfaces,uint2 history) {
+    if(depth>=interfaces)return 0u;
+    if(depth<32u)return uint(incidents[point+2u+depth/4u][depth%4u]);
+    uint w=depth/32u;float4 t;bool low;
+    if(w<2u) {t=incidents[point+1u];low=w==0u;}
+    else {uint j=w-2u;t=incidents[ulong(history.x)+ulong(slot)*((history.y+1u)/2u)+j/2u];low=(j%2u)==0u;}
+    uint word=low?cid(t.xy):cid(t.zw);
+    return ((word>>(depth%32u))&1u)!=0u?1u:65u;
+}
 // Center replay first establishes actual interface ownership. Each exact corner
 // then follows the same1/65 branch ancestry using its own nearest hits and bias.
 kernel void gratingCellTransport(constant CParams& u [[buffer(0)]],device const float4* work [[buffer(1)]],
     device const float4* incidents [[buffer(9)]],device const float4* cells [[buffer(19)]],
     device float4* output [[buffer(21)]],constant uint4& limits [[buffer(22)]],
     device uint* diagnostic [[buffer(23)]],device const uint* locators [[buffer(24)]],
+    constant uint2& history [[buffer(25)]],
     texture2d<float> query [[texture(0)]],uint index [[thread_position_in_grid]]) {
     if(index>=limits.y)return;
     uint stepCount=limits.x+1u,stride=4u+4u*stepCount*7u,row=index*stride,point=locators[index]*24u;
@@ -2096,7 +2175,7 @@ kernel void gratingCellTransport(constant CParams& u [[buffer(0)]],device const 
         float3 origin=position+u.source.xyz*(2.0f*cbias(position)),direction=-u.source.xyz;
         bool inside=false,pathComplete=false;float fraction=1.0f;
         for(uint depth=0u;depth<=interfaces;++depth) {
-            uint token=depth==interfaces?0u:uint(incidents[point+2u+depth/4u][depth%4u]);
+            uint token=gratingCellToken(incidents,point,locators[index],depth,interfaces,history);
             SceneClosestHit hit=sceneClosestHit(origin,direction,depth==0u?0.0f:1e-5f,u.source.w,u.query,query);
             if(hit.status<0) {atomic_store_explicit((device atomic_uint*)diagnostic,53u,memory_order_relaxed);return;}
             queries+=hit.causticWork;uint at=row+4u+(path*stepCount+depth)*7u;
@@ -2374,7 +2453,12 @@ struct CBranch {float3 origin,direction;float fraction;ulong history;uint interf
 static_assert(sizeof(CBranch)==128,"grating pending ABI");
 struct GParams {uint4 control;float4 diffractionGeometry,diffractionMicrostructure,diffractionRoughness;float4 diffractionSpectral[8];};
 )METAL"+nativeOrderMath+R"METAL(
-bool gratingEmit(constant CParams& u,constant GParams& g,thread const CBranch& branch,SceneClosestHit hit,uint w,uint band,float power,float3 entryE1,float3 entryE2,float entryArea,
+// branchWide holds history interfaces 64..127 and walked words 4 and up
+// (historyBlock words, no ancestry tail on grating frames). Incident history
+// words 2 and up follow all incident records as 16-bit halves like texel 1,
+// gratingIncidentHistoryTailWords of them per incident.
+bool gratingEmit(constant CParams& u,constant GParams& g,thread const CBranch& branch,ulong branchWide,device const uint* walked,
+    device uint* historyTail,uint historyBlock,SceneClosestHit hit,uint w,uint band,float power,float3 entryE1,float3 entryE2,float entryArea,
     device const float4* witnesses,device float4* incidents,device float4* orders,
     thread float4 (&counts)[2],thread CPath& receipt,texture2d<float> queryTexture) {
     int found=-1;
@@ -2421,6 +2505,14 @@ bool gratingEmit(constant CParams& u,constant GParams& g,thread const CBranch& b
     incidents[base]=float4(float(w),float(band),float(branch.interfaces),float(count));
     incidents[base+1u]=float4(float(branch.history&65535ul),float((branch.history>>16u)&65535ul),float((branch.history>>32u)&65535ul),float(branch.history>>48u));
     for(uint q=0u;q<8u;++q) {uint word=branch.ancestry[q];incidents[base+2u+q]=float4(float(word&255u),float((word>>8u)&255u),float((word>>16u)&255u),float(word>>24u));}
+    const uint tailWords=u.policy.x>64u?max(4u,(u.policy.x+31u)/32u)-2u:0u,tailTexels=(tailWords+1u)/2u;
+    device float4* tail=incidents+ulong(u.extent.z)*g.control.w*24u+ulong(slot)*tailTexels;
+    for(uint q=0u;q<tailTexels;++q)tail[q]=float4(0.0f);
+    for(uint j=0u;j<tailWords;++j) {
+        uint word=j==0u?uint(branchWide):(j==1u?uint(branchWide>>32u):(j-2u<historyBlock?walked[j-2u]:0u));
+        float2 halves=float2(float(word&65535u),float(word>>16u));
+        if((j%2u)==0u)tail[j/2u].xy=halves;else tail[j/2u].zw=halves;
+    }
     incidents[base+10u]=float4(branch.origin,branch.fraction);incidents[base+11u]=float4(branch.direction,P);
     incidents[base+12u]=float4(hit.position,hit.distance);
     incidents[base+13u]=float4(float(hit.objectId&65535u),float(hit.objectId>>16u),float(hit.materialId&65535u),float(hit.materialId>>16u));
@@ -2435,7 +2527,7 @@ bool gratingEmit(constant CParams& u,constant GParams& g,thread const CBranch& b
     replace("device uint* diagnostic [[buffer(6)]],\n    texture2d<float> opaqueTexture","device uint* diagnostic [[buffer(6)]],device const float4* witnesses [[buffer(8)]],device float4* incidents [[buffer(9)]],device float4* orders [[buffer(10)]],device float4* batchCounts [[buffer(11)]],constant GParams& g [[buffer(12)]],\n    texture2d<float> opaqueTexture");
     replace("CPath receipt={};receipt.work=w;","CPath receipt={};receipt.work=w;float4 counts[2]={float4(0.0f),float4(0.0f)};");
     replace("receipt.blocked=1u;receipt.complete=1u;paths[w]=receipt;return;","receipt.blocked=1u;receipt.complete=1u;paths[w]=receipt;counts[1].z=1.0f;batchCounts[w*2u]=counts[0];batchCounts[w*2u+1u]=counts[1];return;");
-    replace("pending[0]={origin,incoming,1.0f,0ul,0u,false};",R"METAL(
+    replace("pending[0].branch={origin,incoming,1.0f,0ul,0u,false};",R"METAL(
         int sourceTriangle=ctriangle(entry,triangles,u.extent.w);float dbu,dbv;
         if(sourceTriangle<0) {atomic_store_explicit((device atomic_uint*)diagnostic,31u,memory_order_relaxed);return;}
         uint sourcePlane=uint(sourceTriangle)*8u;
@@ -2444,8 +2536,8 @@ bool gratingEmit(constant CParams& u,constant GParams& g,thread const CBranch& b
             ||!gratingBiasDerivative(position.xyz,entryE1,dbu)||!gratingBiasDerivative(position.xyz,entryE2,dbv)) {
             atomic_store_explicit((device atomic_uint*)diagnostic,31u,memory_order_relaxed);return;
         }
-        pending[0]={};pending[0].origin=origin;pending[0].direction=incoming;pending[0].fraction=1.0f;
-        pending[0].du=entryE1+2.0f*u.source.xyz*dbu;pending[0].dv=entryE2+2.0f*u.source.xyz*dbv;
+        pending[0].branch={};pending[0].branch.origin=origin;pending[0].branch.direction=incoming;pending[0].branch.fraction=1.0f;
+        pending[0].branch.du=entryE1+2.0f*u.source.xyz*dbu;pending[0].branch.dv=entryE2+2.0f*u.source.xyz*dbv;
 )METAL");
     replace("            if(hit.objectId!=u.policy.w) {",R"METAL(            uint plane=uint(triangle)*8u;float3 hitDu,hitDv;
             if(!gratingStrictHit(triangles[plane].xyz,triangles[plane+1u].xyz,triangles[plane+2u].xyz,hit.position,hit.outwardNormal)
@@ -2457,13 +2549,13 @@ bool gratingEmit(constant CParams& u,constant GParams& g,thread const CBranch& b
             if(hit.objectId!=u.policy.w) {)METAL");
     replace("            if(hit.objectId!=u.policy.w) {",R"METAL(            if(hit.objectId==g.control.y&&hit.materialId==g.control.z) {
                 CBranch measured=branch;measured.du=hitDu;measured.dv=hitDv;
-                if(!gratingEmit(u,g,measured,hit,w,band,power,entryE1,entryE2,position.w,witnesses,incidents,orders,counts,receipt,opaqueTexture)) {
+                if(!gratingEmit(u,g,measured,branchWide,walked,historyTail,historyBlock,hit,w,band,power,entryE1,entryE2,position.w,witnesses,incidents,orders,counts,receipt,opaqueTexture)) {
                     atomic_store_explicit((device atomic_uint*)diagnostic,30u,memory_order_relaxed);return;
                 }
                 continue;
             }
             if(hit.objectId!=u.policy.w) {)METAL");
-    const auto begin=source.find("                pending[size++]={hit.position+n*(reflection?cbias(hit.position):-cbias(hit.position)),");
+    const auto begin=source.find("                pending[size++].branch={hit.position+n*(reflection?cbias(hit.position):-cbias(hit.position)),");
     const auto end=source.find("            }\n        }\n        for(uint p=0;p<size;++p)",begin);
     if(begin==std::string::npos||end==std::string::npos)valid=false;
     else source.replace(begin,end-begin,R"METAL(                float dbu,dbv;
@@ -2473,10 +2565,11 @@ bool gratingEmit(constant CParams& u,constant GParams& g,thread const CBranch& b
                 CBranch next=branch;next.origin=hit.position+n*(reflection?cbias(hit.position):-cbias(hit.position));
                 float side=reflection?1.0f:-1.0f;next.du=hitDu+side*n*dbu;next.dv=hitDv+side*n*dbv;
                 next.direction=reflection?reflected:transmitted;next.fraction=fraction;
-                next.history=branch.history|(reflection?(1ul<<branch.interfaces):0ul);
+                next.history=branch.history|((reflection&&branch.interfaces<64u)?(1ul<<branch.interfaces):0ul);
+                // Inline ancestry keeps the first 32 tokens; later ones follow from the history.
                 uint word=branch.interfaces/4u,shift=8u*(branch.interfaces%4u);
-                next.ancestry[word]=(next.ancestry[word]&~(255u<<shift))|((reflection?1u:65u)<<shift);
-                next.interfaces=branch.interfaces+1u;next.inside=reflection?branch.inside:!branch.inside;pending[size++]=next;
+                if(word<8u)next.ancestry[word]=(next.ancestry[word]&~(255u<<shift))|((reflection?1u:65u)<<shift);
+                next.interfaces=branch.interfaces+1u;next.inside=reflection?branch.inside:!branch.inside;pending[size++].branch=next;
 )METAL");
     replace("receipt.complete=1u;paths[w]=receipt;\n    }","receipt.complete=1u;paths[w]=receipt;counts[1].z=1.0f;batchCounts[w*2u]=counts[0];batchCounts[w*2u+1u]=counts[1];\n    }");
     return valid?source:std::string{};
@@ -2491,7 +2584,7 @@ inline bool decodeGratingChild(const glasscaustics::Texel* p,std::uint32_t locat
         if(!exactReceiptInteger(low,65535,l)||!exactReceiptInteger(high,65535,h))return false;
         out=l|(h<<16);return true;};
     std::uint32_t encoded,complete,disposition,low,status,entering,hitWork;
-    if(!exactReceiptInteger(p[0][0],kMaximumEntrySamples*8*kMaximumBranchVisits,value.incident)||value.incident!=locator
+    if(!exactReceiptInteger(p[0][0],kMaximumExactReceiptCount,value.incident)||value.incident!=locator
         ||!exactReceiptInteger(p[0][1],2,encoded)||!exactReceiptInteger(p[0][2],1,complete)||complete!=1
         ||!exactReceiptInteger(p[0][3],2,disposition)||!split(p[1][2],p[1][3],low)
         ||!exactReceiptInteger(p[2][0],1,status)||!exactReceiptInteger(p[2][2],1,entering)
@@ -2507,7 +2600,7 @@ inline bool decodeGratingChild(const glasscaustics::Texel* p,std::uint32_t locat
 inline bool decodeCoupledDeposit(const CoupledDeposit& stored,glasscaustics::NativeDeposit& output) {
     using namespace glasscaustics;NativeDeposit value;const auto& n=stored.value;
     if(n.visible>1||n.projected>1||stored.extension[3]!=0||stored.extension[0]>kGratingIncidentVersion)return false;
-    value.work=n.work;value.reflectionHistory=std::uint64_t(n.historyLow)|(std::uint64_t(n.historyHigh)<<32);
+    value.work=n.work;value.reflectionHistory=CausticHistory::fromWords(n.historyLow,n.historyHigh,n.historyWideLow,n.historyWideHigh);
     value.interfaces=n.interfaces;value.fraction=n.fraction;value.incidentPower=n.incident;value.outgoingPower=n.outgoing;value.absorbedPower=n.absorbed;
     value.receiver=decode(n.receiver);value.cameraHit=decode(n.camera);value.pixelHit=decode(n.pixel);
     value.footprint.projected=n.projected!=0;value.footprint.x=n.x;value.footprint.y=n.y;
@@ -2525,7 +2618,7 @@ inline std::string gratingTerminalShader(const std::string& nativeOrderMath) {
         if(at==std::string::npos||source.find(before,at+before.size())!=std::string::npos){valid=false;return;}
         source.replace(at,before.size(),after);
     };
-    replace("    CHit receiver, camera, pixel;\n};","    CHit receiver, camera, pixel;uint ancestry[8],extension[4];\n};\nstatic_assert(sizeof(CDeposit)==292,\"coupled deposit ABI\");");
+    replace("    CHit receiver, camera, pixel;\n};","    CHit receiver, camera, pixel;uint ancestry[8],extension[4];\n};\nstatic_assert(sizeof(CDeposit)==300,\"coupled deposit ABI\");");
     // Reuse the released receiver camera/deposit body. The physical order
     // changes its incident fraction and adds exact parent/order provenance.
     const auto original=shader(false);
@@ -2533,17 +2626,20 @@ inline std::string gratingTerminalShader(const std::string& nativeOrderMath) {
     if(begin==std::string::npos||end==std::string::npos)return {};
     auto receiver=original.substr(begin,end-begin);
     smoothglass::replace(receiver,"return;","return false;");
+    // The receiver keeps its wide words; gratingTerminalChild copies the walked tail.
     const auto fraction=receiver.find("d.fraction=branch.fraction;d.incident=power*branch.fraction;");
     if(fraction==std::string::npos)return {};
     receiver.replace(fraction,std::strlen("d.fraction=branch.fraction;d.incident=power*branch.fraction;"),
         "d.fraction=emitted/power;d.incident=emitted;for(uint a=0u;a<8u;++a)d.ancestry[a]=branch.ancestry[a];d.extension[0]=CAUSTIC_GRATING_VERSION;d.extension[1]=slot;d.extension[2]=uint(order+1);");
     const std::string helper=R"METAL(
-bool gratingTerminalChild(constant CParams& u,constant GParams& g,thread const CBranch& branch,SceneClosestHit hit,
+bool gratingTerminalChild(constant CParams& u,constant GParams& g,thread const CBranch& branch,ulong branchWide,device const uint* walked,
+    device uint* historyTail,uint historyBlock,SceneClosestHit hit,
     uint w,uint band,float power,float emitted,uint slot,int order,
     device const float4* triangles,device CDeposit* deposits,thread CPath& receipt,device uint* diagnostic,
     texture2d<float> opaqueTexture,texture2d<uint> raster,texture2d<float> rasterDepth) {
     int triangle=ctriangle(hit,triangles,u.extent.w);
     if(triangle<0||hit.objectId==u.policy.w||hit.objectId==g.control.y||!hit.entering||receipt.count>=u.policy.y)return false;
+    for(uint k=0u;k<historyBlock;++k)historyTail[(ulong(w)*u.policy.y+receipt.count)*historyBlock+k]=walked[k];
 )METAL"+receiver+R"METAL(
     deposits[w*u.policy.y+receipt.count++]=d;return true;
 }
@@ -2555,7 +2651,7 @@ bool gratingTerminalChild(constant CParams& u,constant GParams& g,thread const C
         if(child.status<0)return false;receipt.queries+=child.causticWork;
         uint before=receipt.queries,disposition=0u;float escaped=0.0f;
         if(child.status==0){escaped=emitted;receipt.escaped+=emitted;}
-        else {disposition=1u;if(!gratingTerminalChild(u,g,branch,child,w,band,power,emitted,slot,order,triangles,deposits,receipt,diagnostic,queryTexture,raster,rasterDepth))return false;}
+        else {disposition=1u;if(!gratingTerminalChild(u,g,branch,branchWide,walked,historyTail,historyBlock,child,w,band,power,emitted,slot,order,triangles,deposits,receipt,diagnostic,queryTexture,raster,rasterDepth))return false;}
         uint childWork=child.causticWork+receipt.queries-before,childBase=(slot*3u+count)*8u;
         children[childBase]=float4(float(slot),float(order+1),1.0f,float(disposition));
         children[childBase+1u]=float4(escaped,0.0f,float(childWork&65535u),float(childWork>>16u));

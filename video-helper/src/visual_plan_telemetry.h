@@ -14,10 +14,11 @@
 
 namespace videowire
 {
-inline constexpr size_t kMaxTelemetryPlans = 256;
-inline constexpr size_t kMaxCompiledNodesPerGraph = 256;
-inline constexpr size_t kMaxIntermediateImagesPerGraph = 32;
-inline constexpr size_t kMaxTelemetryNodes = kMaxTelemetryPlans * kMaxCompiledNodesPerGraph;
+// Telemetry follows every admitted plan, node and intermediate image; its
+// tables are sized at admission from the plans themselves.
+inline constexpr size_t kMaxTelemetryPlans = std::numeric_limits<size_t>::max();
+inline constexpr size_t kMaxCompiledNodesPerGraph = std::numeric_limits<size_t>::max();
+inline constexpr size_t kMaxIntermediateImagesPerGraph = std::numeric_limits<size_t>::max();
 inline constexpr uint64_t kPlanLoweringBudgetNs = 2'000'000;
 // A caustic degradation reason is one short sentence. Longer text is cut.
 inline constexpr size_t kMaxCausticDegradationBytes = 512;
@@ -34,7 +35,7 @@ struct VisualTelemetryPlanAdmission
 {
     int clipId = -1;
     uint64_t structuralRevision = 0;
-    std::array<int, kMaxCompiledNodesPerGraph> stableNodeIds {};
+    std::vector<int> stableNodeIds;
     size_t nodeCount = 0;
     size_t intermediateImageCount = 0;
     size_t executableNodeTotal = 0;
@@ -315,7 +316,7 @@ public:
         if (diagnostic != nullptr)
             diagnostic->clear();
         std::lock_guard<std::mutex> lock (mutex_);
-        std::vector<Slot> next(kMaxTelemetryPlans);
+        std::vector<Slot> next(requested.size());
         size_t count = 0;
         uint64_t rejected = 0;
         for (const auto& candidate : requested)
@@ -326,11 +327,6 @@ public:
             {
                 if (candidate.structuralRevision <= duplicate->revision) continue;
                 *duplicate = makeSlot(candidate);
-                continue;
-            }
-            if (count >= kMaxTelemetryPlans)
-            {
-                ++rejected;
                 continue;
             }
             next[count++] = makeSlot(candidate);
@@ -347,7 +343,8 @@ public:
         requestReset();
         appliedGeneration_ = resetGeneration_.load(std::memory_order_acquire);
         resetUnlocked();
-        std::copy_n(next.begin(), count, slots_.begin());
+        next.resize(count);
+        slots_ = std::move(next);
         slotCount_ = count;
         return true;
     }
@@ -456,7 +453,7 @@ public:
         out.rejectedPlans = rejectedPlans_;
         out.failedLowerings = failedLowerings_;
         out.lastLoweringError = lastLoweringError_;
-        out.layers.reserve(slotCount_); out.nodes.reserve(slotCount_ * kMaxCompiledNodesPerGraph);
+        out.layers.reserve(slotCount_);
         for (size_t s = 0; s < slotCount_; ++s)
         {
             const auto& slot = slots_[s];
@@ -525,11 +522,11 @@ private:
     {
         int clipId = -1;
         uint64_t revision = 0;
-        std::array<int, kMaxCompiledNodesPerGraph> nodeIds {};
-        std::array<bool, kMaxCompiledNodesPerGraph> nodeAvailable {};
-        std::array<uint64_t, kMaxCompiledNodesPerGraph> nodeEvaluations {};
-        std::array<uint64_t, kMaxCompiledNodesPerGraph> nodeMeasuredTotalNs {};
-        std::array<double, kMaxCompiledNodesPerGraph> nodeMeasuredMovingNs {};
+        std::vector<int> nodeIds;
+        std::vector<bool> nodeAvailable;
+        std::vector<uint64_t> nodeEvaluations;
+        std::vector<uint64_t> nodeMeasuredTotalNs;
+        std::vector<double> nodeMeasuredMovingNs;
         size_t nodeCount = 0;
         size_t executableNodeTotal = 0;
         bool nodesTruncated = false;
@@ -542,7 +539,14 @@ private:
         slot.nodeCount = value.nodeCount;
         slot.executableNodeTotal = value.executableNodeTotal;
         slot.nodesTruncated = value.nodesTruncated;
-        std::copy_n(value.stableNodeIds.begin(), value.nodeCount, slot.nodeIds.begin());
+        // At least one entry, so the aggregate test hook can write node 0.
+        const auto entries = std::max<size_t>(value.nodeCount, 1);
+        slot.nodeIds.assign(entries, 0);
+        slot.nodeAvailable.assign(entries, false);
+        slot.nodeEvaluations.assign(entries, 0);
+        slot.nodeMeasuredTotalNs.assign(entries, 0);
+        slot.nodeMeasuredMovingNs.assign(entries, 0.0);
+        std::copy_n(value.stableNodeIds.begin(), std::min(value.nodeCount, value.stableNodeIds.size()), slot.nodeIds.begin());
         std::sort(slot.nodeIds.begin(), slot.nodeIds.begin() + (ptrdiff_t) slot.nodeCount);
         slot.nodeCount = (size_t) std::distance(slot.nodeIds.begin(),
             std::unique(slot.nodeIds.begin(), slot.nodeIds.begin() + (ptrdiff_t) slot.nodeCount));
@@ -585,10 +589,10 @@ private:
         {
             slots_[i].evaluations = slots_[i].measuredTotalNs = 0;
             slots_[i].measuredMovingNs = 0.0;
-            slots_[i].nodeAvailable.fill(false);
-            slots_[i].nodeEvaluations.fill(0);
-            slots_[i].nodeMeasuredTotalNs.fill(0);
-            slots_[i].nodeMeasuredMovingNs.fill(0.0);
+            std::fill(slots_[i].nodeAvailable.begin(), slots_[i].nodeAvailable.end(), false);
+            std::fill(slots_[i].nodeEvaluations.begin(), slots_[i].nodeEvaluations.end(), 0);
+            std::fill(slots_[i].nodeMeasuredTotalNs.begin(), slots_[i].nodeMeasuredTotalNs.end(), 0);
+            std::fill(slots_[i].nodeMeasuredMovingNs.begin(), slots_[i].nodeMeasuredMovingNs.end(), 0.0);
         }
     }
     void applyResetAndPending()
@@ -649,7 +653,7 @@ private:
     }
 
     mutable std::mutex mutex_;
-    std::vector<Slot> slots_ = std::vector<Slot>(kMaxTelemetryPlans);
+    std::vector<Slot> slots_;
     size_t slotCount_ = 0;
     uint64_t graphEvaluations_ = 0, graphMeasuredTotalNs_ = 0;
     double graphMeasuredMovingNs_ = 0.0;

@@ -977,20 +977,21 @@ void overdrawProbeLine()
         && !go::shouldLog(0), "overdraw probe logs the first and every 30th measured frame");
 }
 
-// ARBIT_GL_GLASS_PREVIEW_VISITS: only a whole number from 1 to 64 sets the Fast
-// Preview walk cap, and the cap reaches the Preview text's define.
+// ARBIT_GL_GLASS_PREVIEW_VISITS: only a whole number from 1 to 16777215 sets the
+// Fast Preview walk cap, and the cap reaches the Preview text's define. The Export
+// walk loop reads GLASS_CAMERA_VISITS from the visit setting, not a literal 64.
 void previewVisitsOverride()
 {
-    for (const char* ignored : { (const char*) nullptr, "", "0", "65", "-3", "+8", "8x", " 8", "8 ", "1.5", "abc", "99999999999" })
+    for (const char* ignored : { (const char*) nullptr, "", "0", "16777216", "-3", "+8", "8x", " 8", "8 ", "1.5", "abc", "99999999999" })
         check(!sg::parsePreviewCameraVisitsOverride(ignored).has_value(),
               std::string("preview visits text is ignored: ") + (ignored ? ignored : "(unset)"));
-    const std::pair<const char*, std::uint32_t> accepted[] { {"1", 1u}, {"12", 12u}, {"24", 24u}, {"64", 64u} };
+    const std::pair<const char*, std::uint32_t> accepted[] { {"1", 1u}, {"12", 12u}, {"24", 24u}, {"64", 64u}, {"65", 65u}, {"300", 300u}, {"16777215", 16777215u} };
     for (const auto& [text, value] : accepted)
     {
         const auto parsed = sg::parsePreviewCameraVisitsOverride(text);
         check(parsed && *parsed == value, std::string("preview visits text parses: ") + text);
     }
-    const std::string anchor = "        for(int visit=0;visit<64;++visit) {\n";
+    const std::string anchor = "        for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {\n";
     const std::string text = "    for(int channel=0;channel<3;++channel) {\n        float wavelength=channel==0?0.6563:channel==1?0.5461:0.4358;\n"
         "        float ior=max(1.0,uSurfaceCoating.y+uGlassTransport.y*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));\n"
         "        // backs: where retry 3 looks (seamSpawnBack), -direction for the seed.\n"
@@ -1000,6 +1001,17 @@ void previewVisitsOverride()
         + "radiance[channel]+=weight*glassEnvironment(direction GX_PASS)[channel];continue;"
         + "radiance[channel]+=weight*receiver[channel];continue;";
     const auto standard = sg::previewCameraTransportShader(text);
+    for (const bool metal : {false, true})
+    {
+        const auto released = sg::transportShader(metal), wide = sg::transportShader(metal, false, false, false, 300);
+        check(released.find("#define GLASS_CAMERA_VISITS 64\n") != std::string::npos
+                  && released.find("for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {") != std::string::npos
+                  && released.find("visit<64;") == std::string::npos,
+              "the Export camera walk loop reads the default visit setting");
+        check(wide.find("#define GLASS_CAMERA_VISITS 300\n") != std::string::npos
+                  && wide.find("#define GLASS_CAMERA_VISITS 64\n") == std::string::npos,
+              "a 300-visit setting reaches the camera walk define");
+    }
     const auto overridden = sg::previewCameraTransportShader(text, 24);
     check(standard.find("#define GLASS_PREVIEW_VISITS 6\n") != std::string::npos, "the default Preview cap stays 6");
     check(overridden.find("#define GLASS_PREVIEW_VISITS 24\n") != std::string::npos

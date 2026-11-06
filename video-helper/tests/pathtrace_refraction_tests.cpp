@@ -412,7 +412,7 @@ void spectrumTests()
         for (int i = 0; i < n; ++i)
         {
             const pt::Wavelengths wl = pt::sampleHeroWavelengths ((static_cast<float> (i) + 0.5f) / static_cast<float> (n));
-            sum = sum + pt::channelsToRgb (pt::Spectrum::constant (1.0f), wl);
+            sum = sum + pt::channelsToRgb (pt::Spectrum::filled (1.0f), wl);
         }
         sum = sum * (1.0f / static_cast<float> (n));
         check (std::fabs (sum.x - 1.0f) < 2.0e-3f && std::fabs (sum.y - 1.0f) < 2.0e-3f && std::fabs (sum.z - 1.0f) < 2.0e-3f,
@@ -3153,7 +3153,7 @@ void spectralQualityTests()
     pt::Wavelengths pure;
     pure.spectral = true;
     pure.nm.fill (515.0f);
-    const Vec3 green = pt::channelsToRgb (pt::Spectrum::constant (1.0f), pure);
+    const Vec3 green = pt::channelsToRgb (pt::Spectrum::filled (1.0f), pure);
     const Vec3 expected = pt::rgbMatchingWeightAt (515.0f) * 400.0f;
     check (closeRelative (green.y, expected.y, 1.0e-3) && green.y > 3.0f && green.x < -1.5f,
            "515 nm converts to a saturated green with negative red: " + describe (green.x) + ", " + describe (green.y));

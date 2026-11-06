@@ -15,15 +15,6 @@ namespace
 
 constexpr std::uint32_t kMaxBins = 32;
 
-// Widens a box's far distance so float rounding in the slab test never culls a
-// box the ray touches: 1 + 2 * gamma(3) with gamma(n) = n u / (1 - n u).
-constexpr float kSlabRobustness = 1.0f + 2.0f * (3.0f * 5.9604645e-8f) / (1.0f - 3.0f * 5.9604645e-8f);
-
-int largestAxis (Vec3 e) noexcept
-{
-    return e.x >= e.y && e.x >= e.z ? 0 : e.y >= e.z ? 1 : 2;
-}
-
 struct BuildTask
 {
     std::uint32_t node;
@@ -41,7 +32,7 @@ struct Bin
 class Builder
 {
 public:
-    Builder (const Vec3* positions, std::size_t triangleCount, const BvhBuildOptions& options,
+    Builder (const Vec3* positions, const Vec3* close, std::size_t triangleCount, const BvhBuildOptions& options,
              std::vector<BvhNode>& nodes, std::vector<std::uint32_t>& order, BvhStats& stats)
         : options_ (options), nodes_ (nodes), order_ (order), stats_ (stats)
     {
@@ -50,10 +41,7 @@ public:
         order_.resize (triangleCount);
         for (std::size_t i = 0; i < triangleCount; ++i)
         {
-            Bounds b;
-            b.grow (positions[3 * i]);
-            b.grow (positions[3 * i + 1]);
-            b.grow (positions[3 * i + 2]);
+            const Bounds b = motionTriangleBounds (positions + 3 * i, close != nullptr ? close + 3 * i : nullptr);
             triangleBounds_[i] = b;
             centroids_[i] = b.centre();
             order_[i] = static_cast<std::uint32_t> (i);
@@ -242,120 +230,7 @@ private:
 };
 
 // Slab test against [tMin, tMax]. Writes the entry distance on a hit.
-inline bool hitBox (const BvhNode& node, const PreparedRay& ray, float tMin, float tMax, float& entry) noexcept
-{
-    float nearT = tMin;
-    float farT = tMax;
-    for (int axis = 0; axis < 3; ++axis)
-    {
-        const float o = ray.origin[axis];
-        const float inv = ray.inverseDirection[axis];
-        float t0 = (node.boundsMin[axis] - o) * inv;
-        float t1 = (node.boundsMax[axis] - o) * inv;
-        if (t0 > t1)
-            std::swap (t0, t1);
-        nearT = t0 > nearT ? t0 : nearT;
-        t1 *= kSlabRobustness;
-        farT = t1 < farT ? t1 : farT;
-    }
-    entry = nearT;
-    return nearT <= farT;
-}
-
-struct StackEntry
-{
-    std::uint32_t node;
-    float entry;
-};
-
 } // namespace
-
-bool prepareRay (const Ray& ray, PreparedRay& prepared) noexcept
-{
-    if (! isFinite (ray.origin) || ! isFinite (ray.direction) || std::isnan (ray.tMin) || std::isnan (ray.tMax))
-        return false;
-    const Vec3 d = ray.direction;
-    const Vec3 a { std::fabs (d.x), std::fabs (d.y), std::fabs (d.z) };
-    const int kz = largestAxis (a);
-    if (! (a[kz] > 0.0f))
-        return false;
-    int kx = kz == 2 ? 0 : kz + 1;
-    int ky = kx == 2 ? 0 : kx + 1;
-    // Keep the winding of the projected triangle when the major axis is negative.
-    if (d[kz] < 0.0f)
-        std::swap (kx, ky);
-    prepared.origin = ray.origin;
-    prepared.direction = d;
-    prepared.kx = kx;
-    prepared.ky = ky;
-    prepared.kz = kz;
-    prepared.shearX = d[kx] / d[kz];
-    prepared.shearY = d[ky] / d[kz];
-    prepared.shearZ = 1.0f / d[kz];
-    // A zero component becomes a tiny one, so the slab test never forms 0 * inf.
-    constexpr float tiny = 1.0e-30f;
-    for (int axis = 0; axis < 3; ++axis)
-    {
-        const float c = d[axis];
-        prepared.inverseDirection[axis] = 1.0f / (std::fabs (c) < tiny ? std::copysign (tiny, c) : c);
-    }
-    return true;
-}
-
-bool intersectTriangle (const PreparedRay& ray, Vec3 p0, Vec3 p1, Vec3 p2,
-                        float tMin, float tMax, Hit& hit) noexcept
-{
-    // Vertices relative to the origin, sheared so the ray runs along +z.
-    const Vec3 a = p0 - ray.origin;
-    const Vec3 b = p1 - ray.origin;
-    const Vec3 c = p2 - ray.origin;
-    const int kx = ray.kx, ky = ray.ky, kz = ray.kz;
-    const float ax = a[kx] - ray.shearX * a[kz];
-    const float ay = a[ky] - ray.shearY * a[kz];
-    const float bx = b[kx] - ray.shearX * b[kz];
-    const float by = b[ky] - ray.shearY * b[kz];
-    const float cx = c[kx] - ray.shearX * c[kz];
-    const float cy = c[ky] - ray.shearY * c[kz];
-
-    // 2D edge functions. Each is the weight of the opposite vertex.
-    float e0 = cx * by - cy * bx;
-    float e1 = ax * cy - ay * cx;
-    float e2 = bx * ay - by * ax;
-    // A float zero may be a rounding artefact on an edge; decide it in double.
-    if (e0 == 0.0f || e1 == 0.0f || e2 == 0.0f)
-    {
-        e0 = static_cast<float> (static_cast<double> (cx) * by - static_cast<double> (cy) * bx);
-        e1 = static_cast<float> (static_cast<double> (ax) * cy - static_cast<double> (ay) * cx);
-        e2 = static_cast<float> (static_cast<double> (bx) * ay - static_cast<double> (by) * ax);
-    }
-    if ((e0 < 0.0f || e1 < 0.0f || e2 < 0.0f) && (e0 > 0.0f || e1 > 0.0f || e2 > 0.0f))
-        return false;
-    float det = e0 + e1 + e2;
-    if (det == 0.0f || ! std::isfinite (det))
-        return false;
-
-    const float az = ray.shearZ * a[kz];
-    const float bz = ray.shearZ * b[kz];
-    const float cz = ray.shearZ * c[kz];
-    float scaledT = e0 * az + e1 * bz + e2 * cz;
-    // Compare t against the interval before dividing.
-    if (det < 0.0f)
-    {
-        det = -det;
-        scaledT = -scaledT;
-        e0 = -e0; e1 = -e1; e2 = -e2;
-    }
-    if (! (scaledT > tMin * det) || ! (scaledT < tMax * det))
-        return false;
-    const float inv = 1.0f / det;
-    const float t = scaledT * inv;
-    if (! (t > tMin) || ! (t < tMax))
-        return false;
-    hit.t = t;
-    hit.u = e1 * inv;
-    hit.v = e2 * inv;
-    return true;
-}
 
 void Bvh::build (const std::vector<Vec3>& positions, const BvhBuildOptions& options)
 {
@@ -364,23 +239,36 @@ void Bvh::build (const std::vector<Vec3>& positions, const BvhBuildOptions& opti
 
 void Bvh::build (const Vec3* positions, std::size_t triangleCount, const BvhBuildOptions& options)
 {
+    buildMotion (positions, nullptr, triangleCount, options);
+}
+
+void Bvh::buildMotion (const Vec3* open, const Vec3* close, std::size_t triangleCount, const BvhBuildOptions& options)
+{
     clear();
-    if (positions == nullptr || triangleCount == 0)
+    if (open == nullptr || triangleCount == 0)
         return;
     std::vector<std::uint32_t> order;
-    Builder builder (positions, triangleCount, options, nodes_, order, stats_);
+    Builder builder (open, close, triangleCount, options, nodes_, order, stats_);
     builder.run();
     triangleIndices_ = std::move (order);
     orderedPositions_.resize (triangleIndices_.size() * 3);
+    if (close != nullptr)
+        orderedClose_.resize (triangleIndices_.size() * 3);
     for (std::size_t i = 0; i < triangleIndices_.size(); ++i)
         for (std::size_t k = 0; k < 3; ++k)
-            orderedPositions_[3 * i + k] = positions[3 * std::size_t { triangleIndices_[i] } + k];
+        {
+            const std::size_t source = 3 * std::size_t { triangleIndices_[i] } + k;
+            orderedPositions_[3 * i + k] = open[source];
+            if (close != nullptr)
+                orderedClose_[3 * i + k] = close[source];
+        }
 }
 
 void Bvh::clear() noexcept
 {
     nodes_.clear();
     orderedPositions_.clear();
+    orderedClose_.clear();
     triangleIndices_.clear();
     stats_ = {};
 }
@@ -399,135 +287,12 @@ Bounds Bvh::bounds() const noexcept
 
 bool Bvh::intersect (const Ray& ray, Hit& hit) const noexcept
 {
-    PreparedRay prepared;
-    if (nodes_.empty() || ! prepareRay (ray, prepared))
-        return false;
-    const float tMin = ray.tMin;
-    float tMax = ray.tMax;
-    float entry = 0.0f;
-    if (! hitBox (nodes_[0], prepared, tMin, tMax, entry))
-        return false;
-
-    std::array<StackEntry, Bvh::kMaxDepth + 1> stack {};
-    std::size_t depth = 0;
-    std::uint32_t current = 0;
-    Hit best;
-    for (;;)
-    {
-        const BvhNode& node = nodes_[current];
-        if (node.count != 0)
-        {
-            const std::uint32_t end = node.firstOrLeft + node.count;
-            for (std::uint32_t i = node.firstOrLeft; i < end; ++i)
-            {
-                const std::uint32_t triangle = triangleIndices_[i];
-                if (triangle == ray.ignoreTriangle)
-                    continue;
-                Hit candidate;
-                if (intersectTriangle (prepared, orderedPositions_[3 * std::size_t { i }],
-                        orderedPositions_[3 * std::size_t { i } + 1],
-                        orderedPositions_[3 * std::size_t { i } + 2], tMin, tMax, candidate))
-                {
-                    tMax = candidate.t;
-                    best = candidate;
-                    best.triangle = triangle;
-                }
-            }
-        }
-        else
-        {
-            const std::uint32_t left = node.firstOrLeft;
-            float leftEntry = 0.0f;
-            float rightEntry = 0.0f;
-            const bool hitLeft = hitBox (nodes_[left], prepared, tMin, tMax, leftEntry);
-            const bool hitRight = hitBox (nodes_[left + 1], prepared, tMin, tMax, rightEntry);
-            if (hitLeft && hitRight)
-            {
-                // Visit the nearer child first and keep the other for later.
-                const bool leftFirst = leftEntry <= rightEntry;
-                stack[depth++] = leftFirst ? StackEntry { left + 1, rightEntry } : StackEntry { left, leftEntry };
-                current = leftFirst ? left : left + 1;
-                continue;
-            }
-            if (hitLeft || hitRight)
-            {
-                current = hitLeft ? left : left + 1;
-                continue;
-            }
-        }
-        // Pop the next subtree that can still beat the closest hit.
-        bool resumed = false;
-        while (depth > 0)
-        {
-            const StackEntry next = stack[--depth];
-            if (next.entry <= tMax)
-            {
-                current = next.node;
-                resumed = true;
-                break;
-            }
-        }
-        if (! resumed)
-            break;
-    }
-    if (! best.valid())
-        return false;
-    hit = best;
-    return true;
+    return traverseClosest (view(), ray, hit);
 }
 
 bool Bvh::occluded (const Ray& ray) const noexcept
 {
-    PreparedRay prepared;
-    if (nodes_.empty() || ! prepareRay (ray, prepared))
-        return false;
-    const float tMin = ray.tMin;
-    const float tMax = ray.tMax;
-    float entry = 0.0f;
-    if (! hitBox (nodes_[0], prepared, tMin, tMax, entry))
-        return false;
-
-    std::array<std::uint32_t, Bvh::kMaxDepth + 1> stack {};
-    std::size_t depth = 0;
-    std::uint32_t current = 0;
-    for (;;)
-    {
-        const BvhNode& node = nodes_[current];
-        if (node.count != 0)
-        {
-            const std::uint32_t end = node.firstOrLeft + node.count;
-            for (std::uint32_t i = node.firstOrLeft; i < end; ++i)
-            {
-                if (triangleIndices_[i] == ray.ignoreTriangle)
-                    continue;
-                Hit candidate;
-                if (intersectTriangle (prepared, orderedPositions_[3 * std::size_t { i }],
-                        orderedPositions_[3 * std::size_t { i } + 1],
-                        orderedPositions_[3 * std::size_t { i } + 2], tMin, tMax, candidate))
-                    return true;
-            }
-        }
-        else
-        {
-            const std::uint32_t left = node.firstOrLeft;
-            const bool hitLeft = hitBox (nodes_[left], prepared, tMin, tMax, entry);
-            const bool hitRight = hitBox (nodes_[left + 1], prepared, tMin, tMax, entry);
-            if (hitLeft && hitRight)
-            {
-                stack[depth++] = left + 1;
-                current = left;
-                continue;
-            }
-            if (hitLeft || hitRight)
-            {
-                current = hitLeft ? left : left + 1;
-                continue;
-            }
-        }
-        if (depth == 0)
-            return false;
-        current = stack[--depth];
-    }
+    return traverseAny (view(), ray);
 }
 
 } // namespace videohelper::pathtrace

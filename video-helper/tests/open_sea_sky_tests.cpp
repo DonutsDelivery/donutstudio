@@ -1,4 +1,5 @@
-// Open-sea sky: the C++ twin of the cloud recipe, and the sun glint path.
+// Open-sea sky: the C++ twin of the cloud recipe, the volumetric cloud layer,
+// and the sun glint path.
 //
 // Render-level cloud checks live in support/analytic_sky_cases.h. These cases
 // need no GPU. Thresholds come from evaluating the same formulas offline.
@@ -206,11 +207,66 @@ void glintPath()
     check(measureGlint(flat,0).pathRows<measureGlint(sea,0).pathRows/2,
           "wave slopes, not the sun cap alone, stretch the highlight into a path");
 }
+// The volumetric layer: transmittance stays in [0, 1], scattered light is finite
+// and non-negative, thicker clouds pass less, and no thickness keeps the flat sky.
+void volumetricClouds()
+{
+    namespace volume=videohelper::pathtrace::cloudvolume;
+    namespace sky=arbitgpu::analyticsky;
+    auto light=sunOverDarkSky(30,40);
+    light.sky.zenith={.1f,.2f,.5f}; light.sky.horizon={.4f,.5f,.7f};
+    light.sky.cloudCoverage=.6f; light.sky.cloudType=.2f;
+    const auto flatU=sky::uniforms(light);
+    const std::array<float,3> up{.3f,.8f,.2f};
+    const auto flat=sky::background(up,flatU), reflected=sky::radiance(up,flatU);
+    check(flat==reflected,"no cloud thickness draws the flat layer the reflections see");
+
+    volume::Layer thin; thin.coverage=.6f; thin.kind=.2f; thin.thickness=.1f;
+    auto thick=thin; thick.thickness=1;
+    double thinSum=0, thickSum=0;
+    bool bounded=true;
+    int samples=0;
+    for(int i=0;i<24;++i) for(int j=1;j<12;++j)
+    {
+        const double azimuth=i*15*kDegrees, elevation=j*7.5*kDegrees;
+        const float dx=float(std::sin(azimuth)*std::cos(elevation)),dy=float(std::sin(elevation)),dz=float(std::cos(azimuth)*std::cos(elevation));
+        const auto a=volume::march(thin,dx,dy,dz,0,.6f,.8f,5,5,5,.5f);
+        const auto b=volume::march(thick,dx,dy,dz,0,.6f,.8f,5,5,5,.5f);
+        for(const auto& r:{a,b})
+            bounded=bounded && r.transmittance>=0 && r.transmittance<=1 && std::isfinite(r.r) && r.r>=0
+                && std::isfinite(r.g) && r.g>=0 && std::isfinite(r.b) && r.b>=0;
+        thinSum+=a.transmittance; thickSum+=b.transmittance; ++samples;
+    }
+    check(bounded,"cloud transmittance stays in [0, 1] and scattered light stays finite");
+    check(thickSum<thinSum && thickSum/samples<.95,"a thicker layer passes less light");
+    check(volume::march(thick,0,-1,0,0,.6f,.8f,5,5,5,.5f).transmittance==1,"no clouds below the horizon");
+    volume::Layer clear=thick; clear.coverage=0;
+    check(volume::march(clear,0,1,0,0,.6f,.8f,5,5,5,.5f).transmittance==1,"no coverage draws no clouds");
+
+    light.sky.cloudThickness=1;
+    check(HarmonicMIDI::grid::validSceneAnalyticSky(light),"a thickness of one is valid");
+    const auto deepU=sky::uniforms(light);
+    check(deepU[0][3]>1 && deepU[0][3]<1.5f,"the thickness packs below the image field's slot value");
+    int dimmed=0;
+    for(int i=0;i<24;++i)
+    {
+        const double azimuth=i*15*kDegrees, elevation=40*kDegrees;
+        const std::array<float,3> d{float(std::sin(azimuth)*std::cos(elevation)),float(std::sin(elevation)),
+            float(std::cos(azimuth)*std::cos(elevation))};
+        const auto v=sky::background(d,deepU);
+        check(std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]),"the volumetric sky is finite");
+        dimmed+=v!=sky::radiance(d,deepU);
+    }
+    check(dimmed>0,"the camera sees the volumetric layer");
+    light.sky.cloudThickness=1.5f;
+    check(!HarmonicMIDI::grid::validSceneAnalyticSky(light),"a thickness past one is refused");
+}
 } // namespace
 
 int main()
 {
     cloudTwin();
+    volumetricClouds();
     sunWithoutLimit();
     skyWithoutLimit();
     glintPath();

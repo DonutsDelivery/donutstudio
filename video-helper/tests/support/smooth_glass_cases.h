@@ -739,8 +739,9 @@ inline bool roughTileCases(const arbitgpu::smoothglass::Prepared& prepared,std::
             ||!check(memory.requestedBytes>=plan->pixels()*64+plan->maximumTilePixels()*120
                 && memory.requestedBytes<renderpassoutput::kMaximumTotalBytes
                 && plan->scratchBytes()<=9708*48,"rough tile/full-frame memory charge was not bounded"))return false;
-        if(!check(!admitMemory(*plan,renderpassoutput::kMaximumTotalBytes,0,memory,error)
-            && memory.failure!=FrameMemoryAdmissionFailure::none,"over-budget full-frame attachments admitted"))return false;
+        if(!check(admitMemory(*plan,renderpassoutput::kMaximumTotalBytes,0,memory,error)
+            && memory.requestedBytes>renderpassoutput::kMaximumTotalBytes,
+            "full-frame attachments past the old 2 GiB total are admitted for the device to allocate"))return false;
         if(!check(!admitMemory(*plan,64,std::numeric_limits<std::uint64_t>::max(),memory,error),
                   "overflowing retained memory charge admitted"))return false;
     }

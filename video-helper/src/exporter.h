@@ -167,7 +167,7 @@ struct ExportJob
     std::string hdrImageProfile = "off"; // float image sidecar + SDR reference video
     bool hasHdrVideoOutput = false;
     hdrvideo::Output hdrVideoOutput;
-    std::string encoder = "auto";        // auto | software | nvenc | videotoolbox
+    std::string encoder = "auto";        // auto | software | nvenc | videotoolbox | vaapi | amf
     std::string interpolation = "none";  // none | minterpolate | rife | auto
     std::string audioPath;               // master mix WAV ("" = no audio track)
     std::string projectSpectrumAnalysisPath; // full-project mix for range-stable spectrum and vertex audio

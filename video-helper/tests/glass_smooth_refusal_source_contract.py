@@ -122,7 +122,7 @@ for line in exits:
 # Every early return in the thin water path sets a status. Receiver refusals
 # are forwarded through the out status, so their caller returns only after the
 # receiver has named the reason.
-receiver = function_body("vec3 thinInterfaceReceiver(vec3 origin,vec3 direction,uint water,out bool complete,out int status GX_ARGS) {")
+receiver = function_body("vec3 thinInterfaceReceiver(vec3 origin,vec3 direction,uint water,bool medium,out bool complete,out int status GX_ARGS) {")
 assert "complete=false;status=GLASS_SMOOTH_STATUS_UNCLASSIFIED;" in receiver
 receiver_exits = [line for line in receiver.splitlines() if "return vec3(0.0);" in line]
 assert len(receiver_exits) == 2, receiver_exits
@@ -198,14 +198,16 @@ assert (
     "out.rawNormal.w = complete && representable ? (glassStatus == GLASS_SMOOTH_STATUS_TRAPPED ? 2.0f : 1.0f) : representable ? float(glassStatus) : -2.0f;"
     in sokol
 )
-assert "glassTransport(uCameraTranslation,vWorldPosition,complete,glassStatus);" in opengl
+# The walk starts at the viewer: the camera, or for an orthographic camera
+# the point on the view plane above this pixel (ce6103471c).
+assert "glassTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,complete,glassStatus);" in opengl
 assert (
-    "glassTransport(u.cameraTranslation.xyz,in.worldPosition,complete,glassStatus,u,opaqueTexture,glassTexture,environmentTexture);"
+    "glassTransport(fixtureViewerPosition(in.worldPosition,u),in.worldPosition,complete,glassStatus,u,opaqueTexture,glassTexture,environmentTexture);"
     in sokol
 )
-assert "thinInterfaceTransport(uCameraTranslation,vWorldPosition,normal,complete,glassStatus);" in opengl
+assert "thinInterfaceTransport(fixtureViewerPosition(vWorldPosition),vWorldPosition,normal,complete,glassStatus);" in opengl
 assert (
-    "thinInterfaceTransport(u.cameraTranslation.xyz,in.worldPosition,normal,complete,glassStatus,u,opaqueTexture,glassTexture,environmentTexture)"
+    "thinInterfaceTransport(fixtureViewerPosition(in.worldPosition,u),in.worldPosition,normal,complete,glassStatus,u,opaqueTexture,glassTexture,environmentTexture)"
     in sokol
 )
 assert opengl.count("glassStatus = glassRoughReason(status);") == 2
@@ -231,7 +233,8 @@ assert "if (count == 0) return fixtureHalfRange(value.color);" in sokol
 assert "uPassProgramControl.z > 0.5 ? fixtureHalfRange(value) : clamp(value, 0.0, 1.0);" in opengl
 assert "u.passProgramControl.z > 0.5f ? fixtureHalfRange(result) : clamp(result, 0.0f, 1.0f);" in sokol
 assert "kMaximumClosedGlassFrameRayQueries = 2048ull * 1024ull * 1024ull" in header
-assert ": kMaximumClosedGlassFrameRayQueries/(3*kMaximumRayVisits+1);" in header
+# The closed-glass pixel count follows the scene's own camera visits (ad33f612b5).
+assert ": kMaximumClosedGlassFrameRayQueries/(3*std::uint64_t(std::max<std::uint32_t>(1u, prepared.cameraVisits))+1);" in header
 
 # Smooth Dispersive Glass shades its receivers with the analytic sky. A GGX
 # sample on the view direction rounds v.h above one, and pow() of the negative

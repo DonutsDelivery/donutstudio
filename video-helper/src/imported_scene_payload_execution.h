@@ -50,6 +50,8 @@ struct ImportedSceneRequest final
     std::uint32_t objectNodeStableId = 0;
     std::uint32_t objectMeshStableId = 0;
     visualimportedobjectlocal::ObjectLocalTransformV1 objectLocalTransform;
+    // The other moved objects, each on its own node, beside a version 1 primary.
+    std::vector<visualimportedobjectlocal::ObjectLocalTransformV1> additionalObjectLocalTransforms;
     importedlightcontrol::Controls importedLights;
     videorender::fixture3d::RenderDimensions dimensions;
     std::optional<visualanimationimport::Request> deformation;
@@ -80,15 +82,28 @@ struct ImportedSceneRequest final
     // The 3D Render node's engine (V27/V28 wire) and the Path Trace preview
     // accumulation target.
     visualimportedscenerender::RenderEngine renderEngine = visualimportedscenerender::RenderEngine::Raster;
-    // The same node's quality mode. Preview and export both read it from this
-    // request; no consumer branches on it yet.
+    // The same node's quality mode. Fast makes the Path Trace and Realtime
+    // previews and exports cheaper (render_mode_policy.h).
     visualimportedscenerender::RenderMode renderMode = visualimportedscenerender::RenderMode::Accurate;
-    // The same node's Path Trace denoise switch (V30 wire).
-    bool pathTraceDenoise = false;
+    // The same node's Path Trace denoiser (V30 wire for Auto, V39 for one by name).
+    visualimportedscenerender::PathTraceDenoise pathTraceDenoise {};
+    // Material and texture ID scheme of a multi-leaf Scene Compose (V41 wire).
+    // One byte in the padding before the sample counts.
+    HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme leafIdScheme =
+        HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme::Narrow;
     std::uint16_t pathTraceExportSamples = visualimportedscenerender::kDefaultPathTraceExportSamples;
     std::uint16_t pathTracePreviewSamples = visualimportedscenerender::kDefaultPathTracePreviewSamples;
     // No padding is left in this run, so this one grows the request charge by 8 bytes.
     std::uint16_t pathTraceMaxBounces = visualimportedscenerender::kDefaultPathTraceMaxBounces;
+    // The volume bounce limit and media camera visibility (V35 wire), in the padding after it.
+    std::uint8_t pathTraceVolume = visualimportedscenerender::kDefaultPathTraceVolume;
+    // The Render node's light paths (V36 wire).
+    visualimportedscenerender::PathTraceLightPaths pathTraceLightPaths {};
+    // Scene fog from the Render input's Environment Light (V37 wire).
+    std::optional<HarmonicMIDI::grid::SceneVolume> worldVolume {};
+    // The node's motion blur (V38 wire).
+    std::uint16_t motionBlurShutter = 0;
+    visualimportedscenerender::MotionBlurPosition motionBlurPosition = visualimportedscenerender::MotionBlurPosition::Centre;
     // Vertices whose positions that history keeps. Zero keeps every vertex.
     // Appended solid bodies past it take Motion from their own prior transforms.
     std::size_t retainedMotionVertexCount = 0;

@@ -23,8 +23,7 @@ struct GpuBudget final
     static std::shared_ptr<GpuBudget> acquire(std::uint64_t requested,std::uint64_t mipBytes=0)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (count>=visualenvironmentimagepayload::kMaxResidentPayloads
-            || requested>visualenvironmentimagepayload::kMaxResidentDecodedBytes-bytes) return {};
+        // Leases only tally residency; a scene uses as many environment images as it binds.
         auto lease=std::make_shared<GpuBudget>(); lease->ownedBytes=requested+mipBytes; lease->limitedBytes=requested;
         lease->residencyCharge=residency::ResidencyCharge(residency::BackingClass::environmentImage,requested+mipBytes);
         bytes+=requested; ++count; return lease;

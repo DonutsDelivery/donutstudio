@@ -149,7 +149,8 @@ inline bool isAdmittedVertexModifierKind (const std::string& kind) noexcept
         "visual.vertex.component.y", "visual.vertex.component.z",
         "visual.vertex.scalar.remap", "visual.vertex.vec3.remap",
         "visual.vertex.scalar.noise-3d", "visual.vertex.vec3.noise-3d",
-        "visual.vertex.bounded-displacement"
+        "visual.vertex.bounded-displacement", "visual.vertex.scalar.sin",
+        "visual.vertex.scalar.cos", "visual.vertex.ocean-waves"
     };
     return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
 }

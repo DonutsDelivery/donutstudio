@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../shared/ParticleGeometryContract.h"
+#include <limits>
 #include <new>
 #include <vector>
 
@@ -47,12 +48,16 @@ struct ParticleBodyGeometryRecipe final
 
 struct ParticleBodyGeometryLimits final
 {
-    std::size_t maxReplayBoundaries=100000;
+    // Replay boundaries size from the schedule; checked products refuse overflow.
+    std::size_t maxReplayBoundaries=std::numeric_limits<std::size_t>::max();
     std::size_t maxRetainedLogicalBytes=videowire::geometry::kMaximumBufferBytes;
     std::size_t maxFactoryAttemptLogicalBytes=videowire::geometry::kMaximumBufferBytes;
     std::size_t maxReplayAttemptLogicalBytes=videowire::geometry::kMaximumBufferBytes;
-    std::size_t maxCensusVisits=100000, maxFactoryVisits=1000000;
-    std::size_t maxReplayVisits=1000000000;
+    // Visits size from the mesh and schedule; only checked-sum overflow refuses.
+    // Callers and tests may still set a smaller explicit limit.
+    std::size_t maxCensusVisits=std::numeric_limits<std::size_t>::max();
+    std::size_t maxFactoryVisits=std::numeric_limits<std::size_t>::max();
+    std::size_t maxReplayVisits=std::numeric_limits<std::size_t>::max();
 };
 
 // Failure preserves this receipt and the caller's original source. A reservation
@@ -430,8 +435,8 @@ inline bool derive(const ValueDescriptor& value,std::size_t boundaries,ParticleB
         case OperationCode::retainedMesh:
             if (!op.retainedMesh) return unsupported("Body geometry retained source is missing");
             out.vertices=op.retainedMesh->geometry.positions.size(); out.indices=op.retainedMesh->geometry.indices.size();
-            if (out.vertices==0 || out.vertices>256 || out.indices==0 || out.indices>384 || out.indices%3!=0)
-                return unsupported("Body geometry retained source exceeds its released mesh limits");
+            if (out.vertices==0 || out.indices==0 || out.indices%3!=0)
+                return unsupported("Body geometry retained source needs vertices and whole triangles");
             if (!meshBytes(out.vertices,out.indices,bytes) || !add(sourcePayload,bytes+sizeof(RetainedMeshData)-sizeof(GeometryData))) return false;
             if (!add(sourcePayload,1) || !add(r.sourceLogicalBytes,sizeof(RetainedMeshData))
                 || !addArrayBytes(op.retainedMesh->geometry.positions.capacity(),sizeof(Vec3),r.sourceLogicalBytes)
@@ -524,9 +529,9 @@ inline bool derive(const ValueDescriptor& value,std::size_t boundaries,ParticleB
             return unsupported("Body geometry operation has no independently derived replay source-work schedule");
         }
         if (out.vertices) {
-            if (out.vertices>256 || out.indices>384 || out.indices==0 || out.indices%3!=0
-                || !meshBytes(out.vertices,out.indices,bytes) || !add(meshPayload,bytes))
-                return unsupported("Body geometry intermediate exceeds its released mesh limits");
+            if (out.indices==0 || out.indices%3!=0)
+                return unsupported("Body geometry intermediate needs whole triangles");
+            if (!meshBytes(out.vertices,out.indices,bytes) || !add(meshPayload,bytes)) return false;
             ++geometryCount;
             // Every materialized mesh writes its positions/IDs/indices. TRS copies
             // before its position loop; displacement's retainedData copy is its output.
@@ -534,7 +539,7 @@ inline bool derive(const ValueDescriptor& value,std::size_t boundaries,ParticleB
                 || !add(r.replayEvaluation.identityElements,out.vertices) || !add(r.replayEvaluation.indexElements,out.indices))) return false;
         } else {
             bytes=sizeof(FieldData);
-            if (out.fields==0 || out.fields>256 || !addArrayBytes(out.fields,sizeof(FieldElement),bytes)
+            if (out.fields==0 || !addArrayBytes(out.fields,sizeof(FieldElement),bytes)
                 || !add(fieldPayload,bytes)) return false;
             temporaryField=std::max(temporaryField,bytes); ++fieldCount;
         }
@@ -664,8 +669,7 @@ inline bool ParticleBodyGeometryAdmission::deriveScalarCost(
     const auto unsupported=[&] { refusal=ParticleBodyGeometryCostRefusal::unsupported; return false; };
     const auto overflow=[&] { refusal=ParticleBodyGeometryCostRefusal::arithmetic; return false; };
     if (!boundaries || !scalar.operationCount || scalar.operationCount>scalar.operations.size()
-        || !scalar.terminalVertices || scalar.terminalVertices>256
-        || !scalar.terminalIndices || scalar.terminalIndices>384 || scalar.terminalIndices%3
+        || !scalar.terminalVertices || !scalar.terminalIndices || scalar.terminalIndices%3
         || (proxy!=ParticleBodyGeometryProxy::sphere && proxy!=ParticleBodyGeometryProxy::fixedBox)) return unsupported();
     auto& r=result;
     r.operationCount=scalar.operationCount;
@@ -690,8 +694,7 @@ inline bool ParticleBodyGeometryAdmission::deriveScalarCost(
         if (!op.emptyPayloads) return unsupported();
         switch (op.code) {
         case OperationCode::retainedMesh: {
-            if (!op.retainedVertices || op.retainedVertices>256 || !op.retainedIndices
-                || op.retainedIndices>384 || op.retainedIndices%3
+            if (!op.retainedVertices || !op.retainedIndices || op.retainedIndices%3
                 || op.vertices!=op.retainedVertices || op.indices!=op.retainedIndices) return unsupported();
             std::size_t mesh=0;
             if (!particlebodygeometrydetail::meshBytes(op.retainedVertices,op.retainedIndices,mesh)
@@ -714,8 +717,8 @@ inline bool ParticleBodyGeometryAdmission::deriveScalarCost(
         default: return unsupported();
         }
         if (op.vertices) {
-            if (op.vertices>256 || !op.indices || op.indices>384 || op.indices%3 || op.fields) return unsupported();
-        } else if (!op.fields || op.fields>256 || op.indices) return unsupported();
+            if (!op.indices || op.indices%3 || op.fields) return unsupported();
+        } else if (!op.fields || op.indices) return unsupported();
         if (op.code!=OperationCode::retainedMesh && (op.retainedVertices || op.retainedIndices)) return unsupported();
     }
     if (roots!=1 || !timeline) return unsupported();
@@ -855,8 +858,8 @@ inline std::shared_ptr<const ParticleBodyGeometryAdmission> admitParticleBodyGeo
         || !boundaries || boundaries>limits.maxReplayBoundaries) return refuse("Body geometry admission requires an exact source, proxy and bounded replay boundary count");
     const auto& value=source->descriptor(); const auto* mesh=std::get_if<GeometryData>(&value.data);
     if (value.carrier!=CarrierKind::geometry3D || !mesh || value.operations.empty()
-        || mesh->positions.empty() || mesh->positions.size()>256 || mesh->indices.empty() || mesh->indices.size()>384)
-        return refuse("Body geometry admission requires the released Geometry3D source limits");
+        || mesh->positions.empty() || mesh->indices.empty() || mesh->indices.size()%3)
+        return refuse("Body geometry admission requires a Geometry3D source with vertices and whole triangles");
     if (!value.spectrumFields.empty()) return refuse("Body geometry has no spectrum/history replay source-work schedule");
     if (!value.scoreFields.empty()) return refuse("Body geometry has no canonical Score Field replay source-work schedule");
     auto& r=attempt.recipe;

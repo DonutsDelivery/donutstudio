@@ -97,10 +97,10 @@ void appendPolarCap (pt::RenderScene& scene, float radius, std::uint32_t segment
 
 // A 180 x 90 image, black but for a white lobe about a direction, in the
 // convention of pathtrace_environment_tests: +Z at u = 0.5, row 0 at +Y.
-pt::EnvironmentPixels lobePixels (Vec3 axis, float radiance, Vec3 tint, std::uint64_t version)
+pt::EnvironmentPixels lobePixels (Vec3 axis, float radiance, Vec3 tint, std::uint64_t version, float radiusDegrees = 4.0f)
 {
     constexpr std::uint32_t width = 180, height = 90;
-    const float cosRadius = std::cos (4.0f * pt::kPi / 180.0f);
+    const float cosRadius = std::cos (radiusDegrees * pt::kPi / 180.0f);
     std::vector<float> rgb;
     rgb.reserve (static_cast<std::size_t> (width) * height * 3);
     for (std::uint32_t y = 0; y < height; ++y)
@@ -1478,6 +1478,103 @@ void orderSpreadTests()
                                     + std::to_string (fan));
 }
 
+// The card's glossy floor: a near-mirror receiver shows the grating's coloured lobes.
+// The light tracer finds such a reflection only when a light path lands on the mirror
+// point, so on its own it leaves the reflection dark with specks. The camera path's
+// light sample at the grating takes it instead, weighed against the light tracer.
+// A camera at z 0.5 looks up at a mirror patch at z 1, which shows the disc below lit
+// by the order-one source; light tracing off is the reference.
+void mirrorReceiverCase (const std::string& name, const pt::Material& mirror, const pt::EnvironmentPixels& pixels, bool coloured)
+{
+    auto disc = makeDiscGeometry (false, 0.02f);
+    if (disc == nullptr)
+        return;
+    disc->materials.push_back (mirror);
+    appendReceiver (*disc, -0.25f, 0.25f, -0.25f, 0.25f, 1.0f, static_cast<std::uint32_t> (disc->materials.size() - 1));
+    disc->lightRecords = { imageRecord (pixels) };
+    disc->environmentImage = pixels;
+    disc->commit();
+
+    constexpr std::uint32_t size = 48;
+    pt::PinholeCamera camera;
+    camera.position = { 0.0f, 0.0f, 0.5f };
+    camera.rotation = { 0.0f, 1.0f, 0.0f, 0.0f };  // looking up +Z, as underCamera
+    camera.tanHalfFov = 0.3f;
+    camera.width = size;
+    camera.height = size;
+    const auto trace = [&] (bool lightPaths) {
+        pt::PathTracer tracer (4);
+        tracer.settings.maxDepth = 8;
+        tracer.settings.causticLightPaths = lightPaths;
+        const pt::CancellationToken cancel {};
+        Rendered out;
+        out.size = size;
+        out.stats = tracer.renderFixed (*disc, camera, size, size, 16, 23, cancel);
+        for (std::uint32_t y = 0; y < size; ++y)
+            for (std::uint32_t x = 0; x < size; ++x)
+            {
+                const pt::Rgb v = tracer.accumulator().mean (x, y);
+                out.pixels.push_back ({ v.r, v.g, v.b });
+            }
+        return out;
+    };
+    const Rendered shared = trace (true);
+    const Rendered reference = trace (false);
+    check (shared.stats.nonFiniteSamples == 0 && reference.stats.nonFiniteSamples == 0, name + ": the reflection renders finite");
+
+    // The band the reference lights, and how the shared render fills it.
+    double brightest = 0.0;
+    for (const Vec3 c : reference.pixels)
+        brightest = std::max (brightest, luminance (c));
+    std::vector<double> sharedBand, referenceBand;
+    int saturated = 0;
+    for (std::size_t i = 0; i < reference.pixels.size(); ++i)
+    {
+        if (! (luminance (reference.pixels[i]) > 0.25 * brightest))
+            continue;
+        const Vec3 c = shared.pixels[i];
+        sharedBand.push_back (luminance (c));
+        referenceBand.push_back (luminance (reference.pixels[i]));
+        const float high = std::max ({ c.x, c.y, c.z });
+        const float low = std::min ({ c.x, c.y, c.z });
+        saturated += high > 0.0f && (high - low) / high > 0.3f ? 1 : 0;
+    }
+    const auto median = [] (std::vector<double> values) {
+        std::sort (values.begin(), values.end());
+        return values.empty() ? 0.0 : values[values.size() / 2];
+    };
+    const double sharedMedian = median (sharedBand);
+    const double referenceMedian = median (referenceBand);
+    std::cout << name << ": band of " << referenceBand.size() << " pixels, median luminance " << sharedMedian
+              << " against " << referenceMedian << " without light paths, " << saturated << " saturated\n";
+    check (referenceBand.size() >= 20 && brightest > 0.05, name + ": the reference shows the disc's lit band, " + std::to_string (referenceBand.size()) + " pixels");
+    check (sharedMedian > 0.6 * referenceMedian && sharedMedian < 1.6 * referenceMedian,
+           name + ": with light paths the reflection is not dark, median " + std::to_string (sharedMedian) + " against "
+               + std::to_string (referenceMedian));
+    check (! coloured || saturated * 2 >= static_cast<int> (sharedBand.size()),
+           name + ": the reflection is coloured: " + std::to_string (saturated) + " of " + std::to_string (sharedBand.size()) + " pixels saturated");
+}
+
+void mirrorReceiverTests()
+{
+    pt::Material mirror;
+    mirror.baseColor = { 0.9f, 0.9f, 0.9f };
+    mirror.metallic = 1.0f;
+    mirror.roughness = 0.1f;
+    mirrorReceiverCase ("metal mirror", mirror, lobePixels (kOrderOneSource, 400.0f, { 1.0f, 1.0f, 1.0f }, 1), true);
+
+    // The card starter's black glossy floor under a sky 60 degrees wide, as its HDRI is.
+    // A light sample then rarely lands in a lobe 2 degrees wide, and the camera path's
+    // scatter at the grating carries the reflection; left to the light tracer it was dark.
+    // A source that wide lights every wavelength's lobe, so the band is not coloured.
+    pt::Material floor;
+    floor.baseColor = { 0.012f, 0.012f, 0.014f };
+    floor.metallic = 0.0f;
+    floor.roughness = 0.04f;
+    floor.ior = 1.5f;
+    mirrorReceiverCase ("card floor under a wide sky", floor, lobePixels (kOrderOneSource, 20.0f, { 1.0f, 1.0f, 1.0f }, 2, 60.0f), false);
+}
+
 int main()
 {
     boundImageChangesOutputTests();
@@ -1498,6 +1595,7 @@ int main()
     zeroOrderSpreadTests();
     darkSectorTests();
     orderSpreadTests();
+    mirrorReceiverTests();
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

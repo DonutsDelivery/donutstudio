@@ -19,9 +19,12 @@ namespace videohelper::modelpayload
 class NativeCompositionRetentionBudget;
 class ImportedSceneParentReceiptStaging;
 // Joins two or more admitted leaf scenes into leaf ID ranges over the procedural scene.
+// scheme sets the material and texture ID stride of leaves 1+.
 std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> composeImportedLeafScenes(
     const HarmonicMIDI::grid::Visual3DScene& procedural,
-    const std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>>& leaves, std::string& error);
+    const std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>>& leaves, std::string& error,
+    HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme scheme
+        = HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme::Narrow);
 
 // Defined only by tests that inspect composition leaf admission.
 struct ImportedAnimatedSceneCompositionProbe;
@@ -95,6 +98,9 @@ struct ImportedAnimatedSceneRequest final
     const visualimportedscenerender::ImportedParentIntentV1* parentIntent = nullptr;
     visualanimationimport::Request operation;
     visualimportedobjectlocal::ObjectLocalTransformV1 objectLocalTransform;
+    // The other moved objects, each with its own node. Every frame each one's
+    // correction is taken from that node's animated world.
+    std::vector<visualimportedobjectlocal::ObjectLocalTransformV1> additionalObjectLocalTransforms;
     std::optional<std::uint32_t> sourceCameraNodeId {};
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> proceduralScene;
     geometrysurfacematerial::ObjectPrograms surfacePrograms;
@@ -102,6 +108,10 @@ struct ImportedAnimatedSceneRequest final
     visualdeformation::RationalFrameTime frame;
     std::uint64_t structuralRevision = 0;
     int renderClipId = 0;
+    // Material and texture ID scheme of a multi-leaf composition. One byte in
+    // the padding after renderClipId, so the request charge keeps its size.
+    HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme leafIdScheme =
+        HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme::Narrow;
     std::uint64_t projectGeneration = 0, helperGeneration = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -269,7 +279,10 @@ private:
         const CompositionLeafInput& input, CompositionLeaf& output, std::string& error);
     // Admits two to eight leaves together, or keeps every previous state.
     // Success replaces any admitted single leaf; admit() success clears these.
-    bool admitCompositionLeaves(const std::vector<CompositionLeafInput>& inputs, std::string& error);
+    // scheme bounds each leaf's material and texture counts; nodes keep 2048.
+    bool admitCompositionLeaves(const std::vector<CompositionLeafInput>& inputs, std::string& error,
+        HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme scheme
+            = HarmonicMIDI::grid::scenecomposition::ImportedLeafIdScheme::Narrow);
     // Drops the admitted single-leaf state, as reset() does, without touching
     // the composition leaves or the shared ledgers.
     void clearSingleLeafState() noexcept;

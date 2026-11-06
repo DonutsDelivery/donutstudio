@@ -10,10 +10,10 @@
 // binds these from the scene. Metal has not been converted yet: its shaders still
 // index these arrays by scene record, so this guard stops a scene that would write
 // past them and names what did not fit. Path Trace takes the scene whole on Metal.
+// Vertices and indices are not among them: they reach the shaders through vertex and
+// index buffers sized from the scene, so no vertex or index count is refused.
 namespace metalbinding
 {
-inline constexpr std::size_t kVertices = 4096;
-inline constexpr std::size_t kIndices = 12288;
 inline constexpr std::size_t kObjects = 64;
 inline constexpr std::size_t kMaterials = 32;
 inline constexpr std::size_t kTextures = 16;
@@ -37,9 +37,7 @@ inline bool sceneIsBound (const HarmonicMIDI::grid::Visual3DScene& scene, std::s
             + ". Path Trace renders this scene; the Metal shader conversion is its own slice.";
         return false;
     };
-    if (! check ("vertices", scene.vertexCount, kVertices)
-        || ! check ("indices", scene.indexCount, kIndices)
-        || ! check ("objects", scene.objectCount, kObjects)
+    if (! check ("objects", scene.objectCount, kObjects)
         || ! check ("materials", scene.materialCount, kMaterials)
         || ! check ("textures", scene.textureCount, kTextures)
         || ! check ("texture texels", scene.textureTexelCount, kTextureTexels)

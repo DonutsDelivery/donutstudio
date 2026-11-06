@@ -7,6 +7,7 @@
 #include "particle_rotating_plane_response.h"
 #include "../../shared/ParticleSolidBoxExtents.h"
 #include <limits>
+#include <memory>
 #include <cfenv>
 
 namespace videorender
@@ -26,7 +27,7 @@ struct ParticleSolidState
 {
     // An escaped publication keeps its caller output storage reserved.
     std::shared_ptr<const ParticleBodyCallerLease> callerLease;
-    std::array<ParticleRigidBody,kParticleSolidMaxBodies> bodies {};
+    ParticleSizedList<ParticleRigidBody> bodies;
     int count=0;
     ParticleGeometryFrame colliders;
     std::shared_ptr<const ParticleBodyGeometrySample> terminalBodySample;
@@ -627,9 +628,10 @@ struct SolidRotationTestIssuer;
 
 // Request-local issuer for rotating coordinate-plane sweeps. In production
 // only ParticleBodyReplayState constructs one, inline, so the sizeof-based caller
-// scratch and prepare charges include it. Layout: 128 captures 8,192 bytes,
-// per-body guard states 1,024, interval descriptor 16, generation 8 and the
-// one scoped view 32. Guards move unissued -> recorded -> issued -> consumed.
+// scratch and prepare charges include it. Layout: one 64-byte capture and one
+// 8-byte guard per body on the heap, sized at prepare, plus the interval
+// descriptor 16, generation 8 and the one scoped view 32 inline. Guards move
+// unissued -> recorded -> issued -> consumed.
 class SolidRotationLedger
 {
     friend class ParticleBodyReplayState;
@@ -640,22 +642,33 @@ class SolidRotationLedger
     SolidRotationLedger()=default;
     SolidRotationLedger(const SolidRotationLedger&)=delete;
     SolidRotationLedger& operator=(const SolidRotationLedger&)=delete;
-    SolidRotationCapture record[kParticleSolidMaxBodies];
-    Guard guard[kParticleSolidMaxBodies];
+    // Captures are not copyable, so both lists are owned arrays of slots entries.
+    std::unique_ptr<SolidRotationCapture[]> record;
+    std::unique_ptr<Guard[]> guard;
+    std::size_t slots=0;
     std::int64_t startTick=0,endTick=0;
     std::uint64_t generation=0;
     SolidRotationView view;
 
+    // Prepare sizes the per-body storage once, so intervals never allocate.
+    void size(std::size_t bodies)
+    {
+        if (bodies==slots) return;
+        record.reset(new SolidRotationCapture[bodies]); guard.reset(new Guard[bodies]); slots=bodies;
+    }
     // Clear every issuance before the interval writes any capture.
     void begin(std::int64_t start,std::int64_t end)
     {
-        for (auto& state:guard) state=Guard{};
+        for (std::size_t slot=0;slot<slots;++slot) guard[slot]=Guard{};
         startTick=start; endTick=end; ++generation;
         retire();
     }
     // The capture is written inside the actual solidRotate call.
     void rotate(ParticleRigidBody& body,std::size_t slot,float dt,float drag)
     {
+        // Prepare sized every body slot. An unsized slot still rotates but
+        // records nothing, so its view refuses to consume.
+        if (slot>=slots) { solidRotate(body,dt,drag); return; }
         auto& entry=record[slot];
         const bool stepped=solidRotate(body,dt,drag,&entry.raw);
         entry.angular=body.angular; entry.dt=dt;
@@ -667,7 +680,7 @@ class SolidRotationLedger
     // to consume. The view lives until retire().
     const SolidRotationView* issue(std::size_t slot,const ParticleRigidBody& previous,const ParticleRigidBody& scheduled)
     {
-        if (slot<static_cast<std::size_t>(kParticleSolidMaxBodies) && guard[slot].state==recorded) guard[slot].state=issued;
+        if (slot<slots && guard[slot].state==recorded) guard[slot].state=issued;
         view.ledger=this; view.previous=&previous; view.scheduled=&scheduled;
         view.slot=static_cast<std::uint32_t>(slot);
         view.generation=static_cast<std::uint32_t>(generation);
@@ -679,14 +692,12 @@ class SolidRotationLedger
         view.slot=0; view.generation=0;
     }
 };
-static_assert(kParticleSolidMaxBodies==128 && (sizeof(void*)!=8 || sizeof(SolidRotationLedger)==9272),
-    "rotating capture storage is 8,192 + 1,024 + 16 + 8 + 32 bytes");
 
 inline bool SolidRotationView::consume(const ParticleRigidBody& candidate,const ParticleRigidBody& previousBody,
     float dt,std::array<float,4>& raw,SolidVector& angular) const
 {
     // A request has at most 1,712 intervals, so 32 generation bits cannot wrap.
-    if (!ledger || !previous || !scheduled || slot>=static_cast<std::uint32_t>(kParticleSolidMaxBodies)
+    if (!ledger || !previous || !scheduled || slot>=ledger->slots
         || generation!=static_cast<std::uint32_t>(ledger->generation)) return false;
     auto& state=ledger->guard[slot].state;
     if (state!=SolidRotationLedger::issued) return false;
@@ -801,27 +812,29 @@ inline void solidSphereSweep(ParticleRigidBody& a,ParticleRigidBody* b,
     solidImpulse(a,b,normal,surface,p);
 }
 
-// The interim guard bounds the entire replay, including every solver pass.
-// It is a source work limit, not a measured device performance policy.
+// Checked work units for the entire replay, including every solver pass. The
+// default limit is the uint64 range, so only work that cannot be counted
+// refuses; callers and tests may still set a smaller explicit limit.
 struct SolidTriangleWorkBudget
 {
-    static constexpr std::uint64_t maximum=100000000;
+    static constexpr std::uint64_t maximum=std::numeric_limits<std::uint64_t>::max();
     static constexpr std::uint64_t queriesPerSweep=64;
     std::uint64_t used=0,limit=maximum;
     bool charge(std::uint64_t count=1)
     { if (used>limit || count>limit-used) return false; used+=count; return true; }
+    // Callers pass the frame's point collider count; nothing bounds it.
     bool preflight(std::uint64_t steps,std::uint64_t bodies,std::uint64_t vertices,std::uint64_t triangles,
-                   std::uint64_t pointColliders=64,std::uint64_t queryCost=1) const
+                   std::uint64_t pointColliders,std::uint64_t queryCost=1) const
     {
-        if (bodies>static_cast<std::uint64_t>(kParticleSolidMaxBodies) || vertices>256 || triangles>128 || pointColliders>64
-            || queryCost==0 || queryCost>96) return false;
+        if (queryCost==0 || queryCost>96) return false;
         const auto multiply=[](std::uint64_t a,std::uint64_t b,std::uint64_t& result)
         { if (b && a>maximum/b) return false; result=a*b; return true; };
         std::uint64_t samples=0,passes=0,queries=0;
         // Original motion, response projection, remaining motion, every point
         // correction and three wall corrections; motion guard and two queries.
-        if (!multiply((6+2*pointColliders)*queriesPerSweep+3,triangles,queries)
-            || !multiply(queries,queryCost,queries)) return false;
+        std::uint64_t perSweep=0;
+        if (pointColliders>(maximum-6)/2 || !multiply(6+2*pointColliders,queriesPerSweep,perSweep) || perSweep>maximum-3
+            || !multiply(perSweep+3,triangles,queries) || !multiply(queries,queryCost,queries)) return false;
         const auto validation=2*(vertices+triangles);
         if (queries>maximum-validation) return false;
         const auto perPass=validation+queries;
@@ -1044,7 +1057,7 @@ inline bool sweep(const SolidVector& from,const SolidVector& to,
     }
     double time=0;
     for (std::uint64_t iteration=0;iteration<SolidTriangleWorkBudget::queriesPerSweep;++iteration) {
-        if (!work.charge()) { error="Triangle contact replay exceeds 100M checked work units"; return false; }
+        if (!work.charge()) { error="Triangle contact replay exceeds its checked work limit"; return false; }
         Query at;
         if (!query(from,to,old,current,time,at,motionTime(time,meshStart,meshEnd))) { error="Triangle contact distance is numerically uncertifiable"; return false; }
         // For a linear sphere path and linear vertices, endpoint support
@@ -1294,7 +1307,7 @@ inline bool boxSweep(const SolidVector& from,const SolidVector& to,const SolidBo
     for (std::uint64_t iteration=0;iteration<SolidTriangleWorkBudget::queriesPerSweep;++iteration) {
         Query at;
         if (!boxQuery(from,to,box,triangle,time,at,work))
-        { error=work.used>=work.limit ? "Triangle contact replay exceeds 100M checked work units":"Box triangle distance is numerically uncertifiable"; return false; }
+        { error=work.used>=work.limit ? "Triangle contact replay exceeds its checked work limit":"Box triangle distance is numerically uncertifiable"; return false; }
         if (time==0 && at.lower>=reach-at.tolerance) {
             double initial=0,final=0,length=0;
             if (!boxSeparation(interpolate(from,to,0),box,triangle,at.normal,initial,length)
@@ -1340,7 +1353,7 @@ inline bool movingBoxSweep(const SolidVector& from,const SolidVector& to,const S
     for (std::uint64_t iteration=0;iteration<SolidTriangleWorkBudget::queriesPerSweep;++iteration) {
         Query at;
         if (!boxQuery(from,to,box,meshTriangle(old,current,motionTime(time,meshStart,meshEnd)),time,at,work))
-        { error=work.used>=work.limit ? "Triangle contact replay exceeds 100M checked work units":"Box triangle distance is numerically uncertifiable"; return false; }
+        { error=work.used>=work.limit ? "Triangle contact replay exceeds its checked work limit":"Box triangle distance is numerically uncertifiable"; return false; }
         if (time==0 && at.lower>=reach-at.tolerance) {
             double initial=0,final=0,length=0;
             if (!boxSeparation(interpolate(from,to,0),box,meshTriangle(old,current,exact(meshStart)),at.normal,initial,length)
@@ -1371,25 +1384,29 @@ inline bool validateSolidTriangleFrame(const ParticleGeometryFrame& frame,SolidT
         error="Triangle vertices require their stable mesh owner"; return false;
     }
     if (!solidtriangle::arithmeticSupported()) { error="Triangle contacts require IEEE binary64 nearest-rounding arithmetic without fast math"; return false; }
-    if (frame.meshVertexCount==0 || frame.meshVertexCount>256 || frame.meshTriangleCount==0 || frame.meshTriangleCount>128)
-    { error="Triangle surface exceeds 256 vertices or 128 triangles"; return false; }
-    std::array<std::uint64_t,256> identities;
+    if (frame.meshVertexCount==0 || frame.meshTriangleCount==0)
+    { error="Triangle surface lost its vertices or triangles"; return false; }
+    // Up to 256 identities sort in a stack copy; a larger mesh sorts a heap copy.
+    std::array<std::uint64_t,256> stackIdentities;
+    std::vector<std::uint64_t> heapIdentities;
+    if (frame.meshVertexCount>stackIdentities.size()) heapIdentities.resize(frame.meshVertexCount);
+    std::uint64_t* const identities=heapIdentities.empty() ? stackIdentities.data():heapIdentities.data();
     for (std::uint32_t vertex=0;vertex<frame.meshVertexCount;++vertex) {
-        if (!work.charge()) { error="Triangle contact replay exceeds 100M checked work units"; return false; }
+        if (!work.charge()) { error="Triangle contact replay exceeds its checked work limit"; return false; }
         if (!frame.meshVertexIdentities[vertex]
             || !std::all_of(frame.meshVertices[vertex].begin(),frame.meshVertices[vertex].end(),[](float v) {
                 return std::isfinite(v) && std::abs(v)<=32 && (v==0 || std::abs(v)>=std::numeric_limits<float>::min()); }))
         { error="Triangle surface lost its finite vertices or stable identities"; return false; }
         identities[vertex]=frame.meshVertexIdentities[vertex];
     }
-    // Sort only this stack copy; source vertex and triangle order stays intact.
-    const auto end=identities.begin()+frame.meshVertexCount;
-    std::make_heap(identities.begin(),end);
-    std::sort_heap(identities.begin(),end);
-    if (std::adjacent_find(identities.begin(),end)!=end)
+    // Sort only this copy; source vertex and triangle order stays intact.
+    const auto end=identities+frame.meshVertexCount;
+    std::make_heap(identities,end);
+    std::sort_heap(identities,end);
+    if (std::adjacent_find(identities,end)!=end)
     { error="Triangle surface lost its finite vertices or stable identities"; return false; }
     for (std::uint32_t triangle=0;triangle<frame.meshTriangleCount;++triangle) {
-        if (!work.charge()) { error="Triangle contact replay exceeds 100M checked work units"; return false; }
+        if (!work.charge()) { error="Triangle contact replay exceeds its checked work limit"; return false; }
         std::array<SolidVector,3> vertices;
         for (int corner=0;corner<3;++corner) {
             const auto index=frame.meshTriangles[triangle][corner];
@@ -1458,8 +1475,10 @@ inline bool solidRotatingBoxTriangleContact(ParticleRigidBody& candidate,const P
     // Every source coefficient and all six produced response floats must sit
     // on its grid; the certificate and response refuse atomically otherwise.
     const unsigned n=rotating->limbs;
-    static_assert(sizeof(ParticleGeometryFrame::meshVertices)==256*3*sizeof(float)
-        && sizeof(ParticleGeometryFrame::meshTriangles)==128*3*sizeof(std::uint32_t));
+    // An array of arrays is contiguous, so the mesh reads the lists as flat
+    // floats and indices. Both must hold every counted entry.
+    if (frame.meshVertices.size()<frame.meshVertexCount || frame.meshTriangles.size()<frame.meshTriangleCount)
+    { error="Rotating triangle contact lost its mesh storage"; return false; }
     const rotatingplane::Mesh mesh{frame.meshVertices[0].data(),frame.meshTriangles[0].data(),
         frame.meshVertexCount,frame.meshTriangleCount};
     const rotatingplane::ResponseInput state{solidVelocity(candidate),candidate.angular,scheduledAngular,
@@ -1472,7 +1491,7 @@ inline bool solidRotatingBoxTriangleContact(ParticleRigidBody& candidate,const P
     } work{budget};
     rotatingplane::Response result;
     if (!rotatingplane::response(input,mesh,state,n,*rotating->workspace,work,result)) {
-        error=work.exhausted ? "Triangle contact replay exceeds 100M checked work units"
+        error=work.exhausted ? "Triangle contact replay exceeds its checked work limit"
             :"Rotating box triangle sweep cannot certify its exact plane contact; the replay interval is refused";
         return false;
     }
@@ -1526,7 +1545,7 @@ inline bool solidMovingBoxTriangleContact(ParticleRigidBody& candidate,const Par
         std::array<SolidVector,3> before,current;
         const bool moving=endpoints(triangle,before,current);
         if (moving) {
-            if (!budget.charge()) { error="Triangle contact replay exceeds 100M checked work units"; return false; }
+            if (!budget.charge()) { error="Triangle contact replay exceeds its checked work limit"; return false; }
             if (!solidtriangle::nondegenerateMotion(before,current))
             { error="Moving triangle may degenerate during its retained linear interval; this frame is unsupported"; return false; }
         }
@@ -1576,7 +1595,7 @@ inline bool solidMovingBoxTriangleContact(ParticleRigidBody& candidate,const Par
         if (!solidtriangle::boxQuery(solidPosition(candidate),solidPosition(candidate),box,
                 solidtriangle::meshTriangle(before,current,impactTime),0,final,budget)
             || final.lower<reach-final.tolerance)
-        { error=budget.used>=budget.limit ? "Triangle contact replay exceeds 100M checked work units":
+        { error=budget.used>=budget.limit ? "Triangle contact replay exceeds its checked work limit":
             "Box triangle response cannot certify separation from every surface"; return false; }
     }
     SolidVector surface{};
@@ -1608,7 +1627,7 @@ inline bool solidMovingBoxTriangleContact(ParticleRigidBody& candidate,const Par
         solidtriangle::Query final;
         if (!solidtriangle::boxQuery(solidPosition(candidate),solidPosition(candidate),box,current,0,final,budget)
             || final.lower<reach-final.tolerance)
-        { error=budget.used>=budget.limit ? "Triangle contact replay exceeds 100M checked work units":
+        { error=budget.used>=budget.limit ? "Triangle contact replay exceeds its checked work limit":
             "Moving triangle response cannot certify final separation from every surface"; return false; }
     }
     if (impulse) {
@@ -1700,7 +1719,7 @@ inline bool solidBoxTriangleContact(ParticleRigidBody& candidate,const ParticleR
         solidtriangle::Query final;
         if (!solidtriangle::boxQuery(solidPosition(candidate),solidPosition(candidate),box,vertices(triangle),0,final,budget)
             || final.lower<reach-final.tolerance)
-        { error=budget.used>=budget.limit ? "Triangle contact replay exceeds 100M checked work units":
+        { error=budget.used>=budget.limit ? "Triangle contact replay exceeds its checked work limit":
             "Box triangle response cannot certify separation from every surface"; return false; }
     }
     const auto velocityBefore=solidVelocity(candidate);
@@ -1767,7 +1786,7 @@ inline bool solidGeometryContact(ParticleRigidBody& body,const ParticleRigidBody
                     // Existing sampled endpoint geometry defines linear vertex motion
                     // across this exact replay interval, including event-split steps.
                     movingMesh=true;
-                    if (!budget.charge()) { error="Triangle contact replay exceeds 100M checked work units"; return false; }
+                    if (!budget.charge()) { error="Triangle contact replay exceeds its checked work limit"; return false; }
                     if (!solidtriangle::nondegenerateMotion(before,current))
                     { error="Moving triangle may degenerate during its retained linear interval; this frame is unsupported"; return false; }
                 }
@@ -1800,7 +1819,7 @@ inline bool solidGeometryContact(ParticleRigidBody& body,const ParticleRigidBody
                             first.time,first.time)) return false;
                         if (hit) { error="Triangle response projection may cross another surface; this frame is unsupported"; return false; }
                     }
-                    if (!budget.charge()) { error="Triangle contact replay exceeds 100M checked work units"; return false; }
+                    if (!budget.charge()) { error="Triangle contact replay exceeds its checked work limit"; return false; }
                     solidtriangle::Query final;
                     if (!solidtriangle::query(solidPosition(candidate),solidPosition(candidate),before,vertices,0,final,
                             solidtriangle::exact(first.time)) || final.lower<reach-final.tolerance)
@@ -1856,7 +1875,7 @@ inline bool solidGeometryContact(ParticleRigidBody& body,const ParticleRigidBody
                         if (!solidtriangle::sweep(remainingFrom,solidPosition(candidate),before,vertices,reach,budget,
                             remainingContact,hit,error,first.time,1)) return false;
                         if (hit) { error="Moving triangle remaining response may cross a surface; this frame is unsupported"; return false; }
-                        if (!budget.charge()) { error="Triangle contact replay exceeds 100M checked work units"; return false; }
+                        if (!budget.charge()) { error="Triangle contact replay exceeds its checked work limit"; return false; }
                         solidtriangle::Query final;
                         if (!solidtriangle::query(solidPosition(candidate),solidPosition(candidate),vertices,vertices,0,final)
                             || final.lower<reach-final.tolerance)
@@ -1887,15 +1906,17 @@ inline bool solidGeometryContact(ParticleRigidBody& body,const ParticleRigidBody
     };
     for (int i=0;i<frame.pointCount;++i) {
         const auto beforeCorrection=solidPosition(candidate);
+        // A point the prior frame did not have starts at rest where it is.
+        const auto& oldPoint=static_cast<std::size_t>(i)<old.solidPoints.size() ? old.solidPoints[i]:frame.solidPoints[static_cast<std::size_t>(i)];
         SolidVector surface;
         for (int axis=0;axis<3;++axis) surface[axis]=std::clamp(
-            (frame.solidPoints[i][axis]-old.solidPoints[i][axis])/dt,-32.0f,32.0f);
+            (frame.solidPoints[i][axis]-oldPoint[axis])/dt,-32.0f,32.0f);
         if (boxHalf) {
             solidBoxSphereContact(candidate,*boxHalf,frame.solidPoints[i],p.colliderThickness,surface,p);
             if (!verifyCorrection(beforeCorrection)) return false;
             continue;
         }
-        if (sweep) solidSphereSweep(candidate,nullptr,solidPosition(previous),old.solidPoints[i],
+        if (sweep) solidSphereSweep(candidate,nullptr,solidPosition(previous),oldPoint,
             frame.solidPoints[i],p.colliderThickness,surface,p);
         if (!verifyCorrection(beforeCorrection)) return false;
         const auto beforeDiscrete=solidPosition(candidate);

@@ -154,25 +154,29 @@ struct NormalMatrix
     }
 };
 
+// Element (row, col) of t's linear part.
+PT_SHARED_FN float linearElement (const Mat4& t, int row, int col) noexcept
+{
+    return t.m[static_cast<std::size_t> (col * 4 + row)];
+}
+
 PT_SHARED_FN NormalMatrix normalMatrixOf (const Mat4& t) noexcept
 {
-    // a(row, col) of the linear part.
-    const auto a = [&t] (int row, int col) { return t.m[static_cast<std::size_t> (col * 4 + row)]; };
     const float det = determinant3x3 (t);
     NormalMatrix out;
     if (! std::isfinite (det) || det == 0.0f)
         return out;
     const float inv = 1.0f / det;
     // The inverse transpose equals the cofactor matrix divided by the determinant.
-    out.r[0] = (a (1, 1) * a (2, 2) - a (1, 2) * a (2, 1)) * inv;
-    out.r[1] = (a (1, 2) * a (2, 0) - a (1, 0) * a (2, 2)) * inv;
-    out.r[2] = (a (1, 0) * a (2, 1) - a (1, 1) * a (2, 0)) * inv;
-    out.r[3] = (a (0, 2) * a (2, 1) - a (0, 1) * a (2, 2)) * inv;
-    out.r[4] = (a (0, 0) * a (2, 2) - a (0, 2) * a (2, 0)) * inv;
-    out.r[5] = (a (0, 1) * a (2, 0) - a (0, 0) * a (2, 1)) * inv;
-    out.r[6] = (a (0, 1) * a (1, 2) - a (0, 2) * a (1, 1)) * inv;
-    out.r[7] = (a (0, 2) * a (1, 0) - a (0, 0) * a (1, 2)) * inv;
-    out.r[8] = (a (0, 0) * a (1, 1) - a (0, 1) * a (1, 0)) * inv;
+    out.r[0] = (linearElement (t, 1, 1) * linearElement (t, 2, 2) - linearElement (t, 1, 2) * linearElement (t, 2, 1)) * inv;
+    out.r[1] = (linearElement (t, 1, 2) * linearElement (t, 2, 0) - linearElement (t, 1, 0) * linearElement (t, 2, 2)) * inv;
+    out.r[2] = (linearElement (t, 1, 0) * linearElement (t, 2, 1) - linearElement (t, 1, 1) * linearElement (t, 2, 0)) * inv;
+    out.r[3] = (linearElement (t, 0, 2) * linearElement (t, 2, 1) - linearElement (t, 0, 1) * linearElement (t, 2, 2)) * inv;
+    out.r[4] = (linearElement (t, 0, 0) * linearElement (t, 2, 2) - linearElement (t, 0, 2) * linearElement (t, 2, 0)) * inv;
+    out.r[5] = (linearElement (t, 0, 1) * linearElement (t, 2, 0) - linearElement (t, 0, 0) * linearElement (t, 2, 1)) * inv;
+    out.r[6] = (linearElement (t, 0, 1) * linearElement (t, 1, 2) - linearElement (t, 0, 2) * linearElement (t, 1, 1)) * inv;
+    out.r[7] = (linearElement (t, 0, 2) * linearElement (t, 1, 0) - linearElement (t, 0, 0) * linearElement (t, 1, 2)) * inv;
+    out.r[8] = (linearElement (t, 0, 0) * linearElement (t, 1, 1) - linearElement (t, 0, 1) * linearElement (t, 1, 0)) * inv;
     return out;
 }
 
@@ -220,7 +224,7 @@ PT_SHARED_FN float bitsToFloat (std::uint32_t bits) noexcept
 
 // std::upper_bound over floats: the index of the first value greater than
 // `value`, or count. Device code cannot call the standard one under C++17.
-PT_SHARED_FN std::size_t upperBoundIndex (const float* values, std::size_t count, float value) noexcept
+PT_SHARED_FN std::size_t upperBoundIndex (const PT_GLOBAL float* values, std::size_t count, float value) noexcept
 {
     std::size_t first = 0;
     while (count > 0)

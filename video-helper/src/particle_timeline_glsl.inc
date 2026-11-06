@@ -7,8 +7,14 @@ uniform float uAttraction;
 uniform vec4 uAudioMotion; // RMS force, onset impulse, onset age, link spring strength
 uniform vec3 uCollision; // mode, body radius, restitution
 uniform int uGeometryCount;
-uniform vec4 uGeometryAnchors[64];
-uniform vec4 uBodyReplay[64];
+uniform int uBodyCount;
+// Anchors then bodies, 1024 float4 entries per row (particle_timeline_data.h).
+uniform sampler2D uTimelineData;
+
+vec4 timelineEntry(int index)
+{
+    return texelFetch(uTimelineData, ivec2(index % 1024, index / 1024), 0);
+}
 
 float timelineHash(uint n)
 {
@@ -42,10 +48,10 @@ vec2 motionResponse(float t, float attraction)
 
 vec4 timelineParticle(uint i)
 {
-    if (uMotionMode == 2) return i < 64U ? uBodyReplay[i] : vec4(-10.0, -10.0, 0.0, 0.0);
+    if (uMotionMode == 2) return int(i) < uBodyCount ? timelineEntry(uGeometryCount + int(i)) : vec4(-10.0, -10.0, 0.0, 0.0);
     if (uElapsed < 0.0) return vec4(-10.0, -10.0, 0.0, 0.0);
     int matches = 0;
-    for (int r = 0; r < min(uNoteCount, 128); ++r)
+    for (int r = 0; r < uNoteCount; ++r)
     {
         vec4 t0 = texelFetch(uNotes, ivec2(0, r), 0);
         vec4 t1 = texelFetch(uNotes, ivec2(1, r), 0);
@@ -57,7 +63,7 @@ vec4 timelineParticle(uint i)
     int pick = min(int(timelineHash(i * 747U + seed) * float(matches)), matches - 1);
     vec4 note = vec4(60.0, 1.0, 0.0, 1.0);
     vec4 links = vec4(0.0);
-    for (int r = 0; r < min(uNoteCount, 128); ++r)
+    for (int r = 0; r < uNoteCount; ++r)
     {
         vec4 t0 = texelFetch(uNotes, ivec2(0, r), 0);
         vec4 t1 = texelFetch(uNotes, ivec2(1, r), 0);
@@ -75,7 +81,8 @@ vec4 timelineParticle(uint i)
     vec2 target = anchor;
     if (uGeometryCount>0) {
         int point=min(int(timelineHash(i*193U+seed)*float(uGeometryCount)),uGeometryCount-1);
-        anchor=uGeometryAnchors[point].xy; target=uGeometryAnchors[point].zw;
+        vec4 entry=timelineEntry(point);
+        anchor=entry.xy; target=entry.zw;
     }
     vec2 position = anchor
         + velocity * response.x

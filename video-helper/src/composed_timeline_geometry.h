@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "geometry_core_admission.h"
+#include "geometry_score_field.h"
 #include "water_surface_replay.h"
 #include "water_replay_source_budget.h"
 #include "timeline_coupled_water_replay.h"
@@ -38,7 +39,8 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
     double projectSeconds = std::numeric_limits<double>::quiet_NaN(),
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalFrame = {},
     const videorender::WaterCoupledFrame* coupledWater = nullptr,
-    const std::shared_ptr<const void>& planPublication = {}) {
+    const std::shared_ptr<const void>& planPublication = {},
+    videowire::geometry::SpectrumFrameBinder spectrumFrame = {}) {
   if (!authored) {
     error = "Timeline Scene3D requires an authored scene";
     return {};
@@ -51,8 +53,10 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
     error = "Timeline Scene3D requires a finite frame time";
     return {};
   }
-  if (coupledWater && (seconds!=projectSeconds || coupledWater->projectSeconds!=projectSeconds)) {
-    error = "Coupled Timeline Scene3D requires the completed frame at its exact project-zero time";
+  // The coupled simulation runs in project time. A clip-local scene time maps onto
+  // it through the water frame evaluation, so only the completed frame must match.
+  if (coupledWater && coupledWater->projectSeconds!=projectSeconds) {
+    error = "Coupled Timeline Scene3D requires the completed frame at its exact project time";
     return {};
   }
   // The first frame of an authored scene checks the whole plan and mesh. Later frames
@@ -65,7 +69,9 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
   // Coupled water reads a per-frame body solve that these inputs do not name.
   const auto inputs = timelineSceneEvaluationInputs(seconds, projectSeconds, waterHistory != nullptr,
       canonicalFrame ? &canonicalFrame->key : nullptr);
-  if (verified && !coupledWater)
+  // Live spectrum bands are not among these inputs, so an Audio Deformer plan evaluates
+  // every frame.
+  if (verified && !coupledWater && admitted->plan->value().descriptor().spectrumFields.empty())
     if (auto held = runtime.reuseEvaluatedTimelineScene(owner, inputs)) return held;
   if (!verified) {
     const auto value = videowire::geometry::decodeTimelineScenePlan(binding, error);
@@ -89,7 +95,17 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
   auto result = std::make_shared<OwnedScene>();
   result->scene = *authored;
   result->lease = admitted->ownerLease;
+  const auto scoreFrame = canonicalFrame;
   auto evaluation = videorender::waterSurfaceFrameEvaluation(waterHistory, projectSeconds, seconds, std::move(canonicalFrame), coupledWater);
+  // Score Sample Fields read the same canonical frame that keys the evaluated-scene memo.
+  evaluation.scoreAt = [scoreFrame](const auto& operation, const auto& positions, auto& result, auto& diagnostic) {
+    return videohelper::scorefield::evaluateSampleField(operation, positions, scoreFrame, result, diagnostic);
+  };
+  if (!admitted->plan->value().descriptor().spectrumFields.empty()
+      && (!spectrumFrame || !spectrumFrame(evaluation, admitted->plan->value().descriptor(), error))) {
+    if (error.empty()) error = "Composed audio spectrum requires the shared audio feature frame";
+    return {};
+  }
   if (!videowire::geometry::replaceTimelineSceneMesh(binding,
           admitted->plan->value(), seconds, result->scene, error, &evaluation, verified)) return {};
   if (!verified) runtime.markTimelinePlanVerified(owner, binding, authored);
@@ -151,12 +167,16 @@ inline bool add(std::size_t count,std::size_t passes,std::size_t& out) noexcept 
 // No decoder, mesh copy, validator or replay runs during this schedule census.
 // The table holds one record per operation and each lookup scans only prior records.
 inline bool childSchedule(const TimelineSceneChildAdmission& child,Envelope& out,
-    std::size_t& peakReplay,std::string& error,bool allowCoupled=false) {
+    std::size_t& peakReplay,std::string& error,bool allowCoupled=false,bool audioDeformers=false) {
   struct Count final { StableId id=0; std::size_t vertices=0,indices=0,fields=0; };
   const auto& value=child.plan().value().descriptor();
   const auto operations=value.operations.size();
+  // Score Sample Fields need no binding: the replay reads the family's canonical frame.
+  // Audio Deformer, Audio Spectrum Field and Set Position spectrum bindings need the
+  // caller's frame spectrum hook.
   if (operations==0 || !value.attributes.empty()
-      || !value.spectrumFields.empty() || !value.scoreFields.empty()) {
+      || (!value.spectrumFields.empty() && !(audioDeformers && composableSpectrumBindings(value)))
+      || !value.scoreFields.empty()) {
     error="Timeline family evaluation has no incremental attribute/reactive-source schedule"; return false;
   }
   std::vector<Count> counts(operations);
@@ -218,7 +238,7 @@ inline bool childSchedule(const TimelineSceneChildAdmission& child,Envelope& out
       if (!add(count.fields,3,out.fieldInitializations)
           || (op.code==OperationCode::fieldConstant && !add(4,3,out.fieldComponentVisits))) return false;
     } else if (op.code==OperationCode::fieldTimeline || op.code==OperationCode::fieldVectorMeasure
-        || op.code==OperationCode::fieldComposeVector) {
+        || op.code==OperationCode::fieldComposeVector || op.code==OperationCode::fieldScoreSample) {
       // This bounded lane uses one input; binary/broadcast composition follows
       // with its own exact cardinalities rather than an assumed field capacity.
       if (op.secondaryInputStableId) {
@@ -230,7 +250,34 @@ inline bool childSchedule(const TimelineSceneChildAdmission& child,Envelope& out
           || !add(count.fields,3,out.fieldElementVisits)
           // Input/output validFieldElement each reads all four components.
           // VectorMeasure also always runs its three-axis source loop.
-          || !add(count.fields,3*(8+(op.code==OperationCode::fieldVectorMeasure ? 3 : 0)),out.fieldComponentVisits)) return false;
+          || !add(count.fields,3*(8+(op.code==OperationCode::fieldVectorMeasure ? 3 : 0)),out.fieldComponentVisits)
+          // The score callback writes and validates each sample once more per replay.
+          || (op.code==OperationCode::fieldScoreSample && (!add(count.fields,3*2,out.fieldElementVisits)
+              || !add(count.fields,3*4,out.fieldComponentVisits)))) return false;
+    } else if (op.code==OperationCode::audioDeformer) {
+      if (!lookup(op.inputStableId,source) || !source.vertices) return false;
+      count.vertices=source.vertices; count.indices=source.indices;
+      // retainedData copies the mesh. Each of the op's bindings reads and moves every
+      // vertex once through the frame hook.
+      const auto bindings=static_cast<std::size_t>(std::count_if(value.spectrumFields.begin(),
+          value.spectrumFields.end(),[&](const auto& binding) { return binding.consumerGeometryStableId==op.outputStableId; }));
+      if (!add(count.vertices,2*3,out.meshCopyElements)
+          || !add(count.indices,3,out.meshCopyElements)
+          || !add(count.vertices,2*3*std::max<std::size_t>(bindings,1),out.displacementVisits)) return false;
+    } else if (op.code==OperationCode::fieldAudioSpectrum) {
+      const auto binding=std::find_if(value.spectrumFields.begin(),value.spectrumFields.end(),
+          [&](const auto& b) { return b.fieldStableId==op.stableId; });
+      if (binding==value.spectrumFields.end() || !lookup(op.inputStableId,source) || !source.vertices) return false;
+      count.fields=source.vertices;
+      // retainedData copies the source mesh and spectrumCoordinates visits each vertex.
+      // The frame hook follows the bands once, or reads every history row, then each
+      // element samples them and is validated on its way into the field.
+      const std::size_t rows=binding->history.enabled ? std::max<std::size_t>(binding->history.depth,1) : 1;
+      if (!add(source.vertices,2*3,out.meshCopyElements)
+          || !add(source.indices,3,out.meshCopyElements)
+          || !add(count.fields,3*rows,out.fieldInitializations)
+          || !add(count.fields,3*2,out.fieldElementVisits)
+          || !add(count.fields,3*8,out.fieldComponentVisits)) return false;
     } else if (op.code==OperationCode::vectorDisplacement) {
       Count field; ++displacements;
       if (!lookup(op.inputStableId,source) || !source.vertices
@@ -286,6 +333,15 @@ inline bool childSchedule(const TimelineSceneChildAdmission& child,Envelope& out
   Count terminal;
   if (!lookup(value.stableId,terminal) || !terminal.vertices
       || terminal.vertices!=child.object().vertexCount || terminal.indices!=child.object().indexCount) return false;
+  // Set Position spectrum displacements without their own field operation move the
+  // terminal mesh after the replay: one sample and one position write per vertex for
+  // each binding, with every history row read once.
+  for (const auto& binding : value.spectrumFields) {
+    if (!adapterSpectrumDisplacement(value,binding)) continue;
+    const std::size_t rows=binding.history.enabled ? std::max<std::size_t>(binding.history.depth,1) : 1;
+    if (!add(terminal.vertices,2*3,out.displacementVisits)
+        || !add(terminal.vertices,3*rows,out.fieldElementVisits)) return false;
+  }
   // Replay compares IDs and indices twice with runtime and a complete mesh
   // once without runtime; replace compares IDs once more and scene indices once.
   if (!add(terminal.vertices,4,out.topologyComparisons)
@@ -353,14 +409,25 @@ inline bool waterChild(const TimelineSceneChildAdmission& child,WaterChild& out,
     return op.code==OperationCode::fieldWaterHeight;
   });
   if (found==ops.end()) return true;
-  if (ops.size()!=4 || ops[0].code!=OperationCode::grid || found!=ops.begin()+1
+  // Audio spectrum operations may follow the released lowering. They keep the grid's
+  // layout, so the water columns still match the rest mesh.
+  const auto spectrumTail=[&](const OperationRecord& op) {
+    return op.code==OperationCode::audioDeformer || op.code==OperationCode::fieldAudioSpectrum
+        || op.code==OperationCode::vectorDisplacement || op.code==OperationCode::fieldComposeVector
+        || op.code==OperationCode::fieldTimeline || op.code==OperationCode::fieldVectorMeasure
+        || op.code==OperationCode::fieldConstant || op.code==OperationCode::constantVectorField;
+  };
+  if (ops.size()<4 || ops[0].code!=OperationCode::grid || found!=ops.begin()+1
+      || (ops.size()>4 && (value.spectrumFields.empty() || ops.back().outputStableId!=value.stableId
+          || !std::all_of(ops.begin()+4,ops.end(),spectrumTail)))
       || ops[2].code!=OperationCode::fieldComposeVector || ops[3].code!=OperationCode::vectorDisplacement
       || found->inputStableId!=ops[0].outputStableId || found->secondaryInputStableId
       || ops[2].inputStableId!=found->outputStableId || ops[2].secondaryInputStableId
       || ops[2].field.mode!=1 || ops[2].field.valueType!=ValueType::vector
       || ops[2].field.values!=std::array<double,8>{0,0,1,0,0,0,0,0}
       || ops[3].inputStableId!=ops[0].outputStableId || ops[3].secondaryInputStableId!=ops[2].outputStableId
-      || ops[3].parameters!=std::array<float,4>{1,0,0,0} || ops[3].outputStableId!=value.stableId
+      || ops[3].parameters!=std::array<float,4>{1,0,0,0}
+      || (ops.size()==4 && ops[3].outputStableId!=value.stableId)
       || !std::holds_alternative<GeometryData>(value.data)) {
     error="Timeline family Water requires its exact static grid and released Z-displacement lowering"; return false;
   }
@@ -535,7 +602,8 @@ public:
       double projectSeconds=std::numeric_limits<double>::quiet_NaN(),
       const videorender::WaterCoupledFrame* coupledWater=nullptr,
       const videorender::ParticleHistorySource* waterHistory=nullptr,
-      std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalFrame={}) {
+      std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalFrame={},
+      videowire::geometry::SpectrumFrameBinder spectrumFrame={}) {
     using namespace timelineevaluation;
     error.clear(); if (receipt) *receipt={};
     if (!family || !authored || !owner.valid() || !(owner==family->owner()) || !std::isfinite(sourceSeconds)) {
@@ -565,7 +633,7 @@ public:
     envelope.timeAnchorWrites=2; envelope.receiptTransfers=receipt ? 1 : 0;
     if (!sceneSchedule(family->scene(),family->children().size(),envelope,sceneBytes,error)) return {};
     for (const auto& child : family->children()) {
-      if (!childSchedule(child,envelope,peakReplay,error)) {
+      if (!childSchedule(child,envelope,peakReplay,error,false,static_cast<bool>(spectrumFrame))) {
         if (error.empty()) error="Timeline family incremental operation/cardinality schedule overflow or mismatch";
         return {};
       }
@@ -691,7 +759,17 @@ public:
       result->sourceSeconds=sourceSeconds; result->projectSeconds=projectSeconds;
       ledger_->retainedBytes.fetch_add(result->reservation.bytes,std::memory_order_relaxed);
       result->scene=family->scene();
-      result->canonicalFrame=envelope.waterChildren ? canonicalFrame : nullptr;
+      const auto sampled=[](const auto& child) {
+        const auto& operations=child.plan().value().descriptor().operations;
+        return std::any_of(operations.begin(),operations.end(),[](const auto& op) {
+          return op.code==videowire::geometry::OperationCode::fieldScoreSample;
+        });
+      };
+      const bool scoreChildren=std::any_of(family->children().begin(),family->children().end(),sampled);
+      if (scoreChildren && !canonicalFrame) {
+        error="Timeline family Score Sample Fields require the current canonical frame"; return {};
+      }
+      result->canonicalFrame=envelope.waterChildren || scoreChildren ? canonicalFrame : nullptr;
       result->waterSamples.reserve(envelope.waterChildren);
       childIndex=0;
       for (const auto& child : family->children()) {
@@ -723,10 +801,19 @@ public:
             heights=result->waterSamples.back().heights; diagnostic.clear(); return true;
           };
         }
+        const bool scored=sampled(child);
+        const bool deformed=!child.plan().value().descriptor().spectrumFields.empty();
+        if (deformed && !spectrumFrame(evaluation,child.plan().value().descriptor(),error)) return {};
+        if (scored) {
+          evaluation.timelineSeconds=sourceSeconds;
+          evaluation.scoreAt=[frame=result->canonicalFrame](const auto& operation,const auto& positions,auto& values,auto& diagnostic) {
+            return videohelper::scorefield::evaluateSampleField(operation,positions,frame,values,diagnostic);
+          };
+        }
         // Each replacement starts from its own exclusive authored range. Its
         // released local Water memo can never be lent to another child.
         if (!videowire::geometry::replaceTimelineSceneMesh(child.binding(),child.plan().value(),
-                sourceSeconds,result->scene,error,water.operation ? &evaluation : nullptr)) return {};
+                sourceSeconds,result->scene,error,water.operation || scored || deformed ? &evaluation : nullptr)) return {};
         if (water.operation && !waterIssued) {
           error="Timeline family Water replacement did not issue its authenticated child sample"; return {};
         }
@@ -749,16 +836,18 @@ public:
       const videorender::ParticleParams& parameters,double sourceSeconds,double bodySeconds,double projectSeconds,
       float aspect,const std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame>& frame,
       const timelineevaluation::Limits& limits,const coupledwaterbudget::Limits& coupledLimits,
-      std::string& error,timelineevaluation::Envelope* receipt=nullptr,coupledwaterbudget::Recipe* coupledReceipt=nullptr) {
+      std::string& error,timelineevaluation::Envelope* receipt=nullptr,coupledwaterbudget::Recipe* coupledReceipt=nullptr,
+      videowire::geometry::SpectrumFrameBinder spectrumFrame={}) {
     using namespace timelineevaluation;
     using namespace videowire::geometry;
+    const bool audio=static_cast<bool>(spectrumFrame);
     error.clear(); if (receipt) *receipt={}; if (coupledReceipt) *coupledReceipt={};
     if (!family || family.use_count()==0 || !authored || !owner.valid() || !(owner==family->owner()) || !parameters.history
         || !parameters.history->score || !frame || !parameters.geometryBinding || !parameters.geometryBinding->mesh
-        || !std::isfinite(sourceSeconds) || sourceSeconds<0 || sourceSeconds>10 || sourceSeconds!=bodySeconds
-        || sourceSeconds!=projectSeconds || parameters.historyProjectSeconds!=projectSeconds
+        || !std::isfinite(sourceSeconds) || sourceSeconds<0 || bodySeconds!=projectSeconds
+        || parameters.historyProjectSeconds!=projectSeconds
         || !std::isfinite(aspect) || aspect<=0 || family->children().size()<2) {
-      error="Coupled family requires exact admitted ownership, one Water child, authored siblings and equal finite clocks"; return {};
+      error="Coupled family requires exact admitted ownership, one Water child, authored siblings and a project-time body clock"; return {};
     }
     std::lock_guard<std::mutex> lock(mutex_);
     auto caller=videorender::particleBodyRenderThreadCaller(error);
@@ -778,7 +867,7 @@ public:
     if (!sceneSchedule(family->scene(),family->children().size(),e,sceneBytes,error)) return {};
     for (const auto& child:family->children()) {
       WaterChild candidate;
-      if (!childSchedule(child,e,peakReplay,error,true) || !waterChild(child,candidate,e,error)) return {};
+      if (!childSchedule(child,e,peakReplay,error,true,audio) || !waterChild(child,candidate,e,error)) return {};
       if (candidate.operation) {
         ++waterCount;
         if (!(candidate.operation->field.values[4]>0) || waterCount!=1) {
@@ -831,15 +920,16 @@ public:
     const auto& descriptor=child.plan().value().descriptor();
     const auto& mesh=*parameters.geometryBinding->mesh;
     if (!std::holds_alternative<GeometryData>(mesh.data) || !mesh.attributes.empty()
-        || !mesh.spectrumFields.empty() || !mesh.scoreFields.empty() || mesh.operations.size()!=4) {
-      error="Coupled family actual source is outside its complete four-operation domain"; return {};
+        || (!mesh.spectrumFields.empty() && !(audio && composableSpectrumBindings(mesh)))
+        || !mesh.scoreFields.empty() || mesh.operations.size()<4) {
+      error="Coupled family actual source is outside its Water and audio spectrum domain"; return {};
     }
     std::size_t descriptorBytes=0,actualDescriptorBytes=0;
     if (!coupledwaterbudget::descriptorBytes(descriptor,descriptorBytes)
         || !coupledwaterbudget::descriptorBytes(mesh,actualDescriptorBytes)) return {};
     descriptorBytes=std::max(descriptorBytes,actualDescriptorBytes);
     Envelope geometryEnvelope; std::size_t geometryScratch=0,geometryWork=0;
-    if (!childSchedule(child,geometryEnvelope,geometryScratch,error,true) || !scheduleWork(geometryEnvelope,geometryWork)) return {};
+    if (!childSchedule(child,geometryEnvelope,geometryScratch,error,true,audio) || !scheduleWork(geometryEnvelope,geometryWork)) return {};
     // Reserve the later exact sphere append's bounded source/memo/output and
     // inspector envelopes. This prerequisite publishes the family and pair;
     // production append/native association is still a separate owner handoff.
@@ -930,7 +1020,7 @@ public:
     const auto pairLease=caller->reserve(e.retainedBytes,e.retainedBytes);
     if (!pairLease) { error="Coupled family retained pair/publication admission is short"; return {}; }
     try {
-      // Independent source equality precedes replay. The four-operation plan
+      // Independent source equality precedes replay. The Water plan
       // comparator replaces decoder work only within this restricted domain.
       if (!coupledwaterdetail::sameDescriptor(*parameters.geometryBinding->mesh,descriptor)
           || !timelinefamily::sameScene(*authored,family->scene())) {
@@ -947,8 +1037,10 @@ public:
       auto reservation=std::make_shared<Reservation>(); reservation->ledger=ledger_; reservation->bytes=e.retainedBytes;
       ledger_->retainedBytes.fetch_add(e.retainedBytes,std::memory_order_relaxed);
       auto pair=TimelineCoupledWaterReplay::issue(pairLease,reservation,owner,family,waterIndex,parameters,aspect,frame,recipe,error);
+      // The pair simulates water and bodies in project time; the scene samples it at
+      // its own clip-local time below.
       if (!pair || !pair->matchesReserved(runtime_,owner,family,waterIndex,authored,parameters,
-          sourceSeconds,bodySeconds,projectSeconds,aspect,frame,comparisonLease,error)) return {};
+          projectSeconds,bodySeconds,projectSeconds,aspect,frame,comparisonLease,error)) return {};
       auto result=std::make_shared<CoupledOwnedScene>(); result->reservation=reservation; result->pair=pair; result->scene=family->scene();
       std::size_t actualSceneBytes=sizeof(Scene);
       if (!addArrayBytes(result->scene.textureTexels.capacity(),sizeof(HarmonicMIDI::grid::SceneTexelRgba8),actualSceneBytes)) return {};
@@ -964,10 +1056,13 @@ public:
         RuntimeFieldEvaluation evaluation; evaluation.timelineSeconds=sourceSeconds;
         if (index==waterIndex) evaluation.waterHeightAt=[&](const auto& operation,const auto& rest,const auto& grid,
             double seconds,auto& heights,auto& diagnostic) {
-          return pair->water_.sample(operation,rest,grid,seconds,heights,diagnostic);
+          return pair->water_.sample(operation,rest,grid,projectSeconds+(seconds-sourceSeconds),heights,diagnostic);
         };
+        // Audio Deformer siblings read the same frame spectrum hook as the uncoupled family.
+        const bool deformed=!sibling.plan().value().descriptor().spectrumFields.empty();
+        if (deformed && !spectrumFrame(evaluation,sibling.plan().value().descriptor(),error)) return {};
         if (!replaceTimelineSceneMesh(sibling.binding(),sibling.plan().value(),sourceSeconds,result->scene,error,
-            index==waterIndex ? &evaluation:nullptr)) return {};
+            index==waterIndex || deformed ? &evaluation:nullptr)) return {};
         ++index;
       }
       error.clear(); return {{result,&result->scene},std::move(pair)};

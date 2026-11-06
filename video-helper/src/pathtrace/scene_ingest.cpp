@@ -132,8 +132,18 @@ std::vector<Vec3> smoothGrooveTangents (const Visual3DScene& scene, const SceneO
     return directions;
 }
 
+// The earlier frame of one draw while motion blur is on.
+struct DrawMotion
+{
+    Mat4 previousWorld;
+    const SceneVec3* previousPositions = nullptr;  // scene vertices, a prefix
+    std::size_t previousPositionCount = 0;
+    float open = 0.0f;
+    float close = 0.0f;
+};
+
 void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Mat4& world,
-                   std::uint32_t instanceIndex, IngestedScene& out)
+                   std::uint32_t instanceIndex, IngestedScene& out, const DrawMotion* motion = nullptr)
 {
     const SceneObjectRecord& object = scene.objects[objectIndex];
     const std::size_t sceneVertices = scene.vertexCount;
@@ -195,6 +205,7 @@ void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Ma
         attributes.instanceIndex = instanceIndex;
         attributes.primitiveIndex = static_cast<std::uint32_t> (tri / 3);
         attributes.mirrored = mirrored;
+        attributes.visibility = object.visibility;
         attributes.geometricNormal = ng;
         bool allNormals = true;
         for (std::size_t k = 0; k < 3; ++k)
@@ -209,6 +220,8 @@ void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Ma
             const float w = vertex.tangent[3] < 0.0f ? -1.0f : 1.0f;
             attributes.tangents[k] = { t.x, t.y, t.z, w * tangentSign };
             attributes.grooveTangents[k] = grooveTangents[local[k]];
+            attributes.colors[k] = vertex.color;
+            attributes.roughness[k] = vertex.roughness;
         }
         attributes.hasShadingNormals = allNormals;
         attributes.authoredShading = allNormals && object.authoredShading;
@@ -220,6 +233,20 @@ void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Ma
             out.positions.push_back (vertex);
             out.bounds.grow (vertex);
         }
+        if (motion != nullptr)
+            for (std::size_t k = 0; k < 3; ++k)
+            {
+                const std::size_t sceneVertex = firstVertex + local[k];
+                const Vec3 before = transformPoint (motion->previousWorld, sceneVertex < motion->previousPositionCount
+                    ? toVec3 (motion->previousPositions[sceneVertex]) : toVec3 (scene.vertices[sceneVertex].position));
+                // A non-finite earlier vertex holds the triangle still.
+                const Vec3 open = isFinite (before) ? pointAtFrame (before, p[k], motion->open) : p[k];
+                const Vec3 close = isFinite (before) ? pointAtFrame (before, p[k], motion->close) : p[k];
+                out.motionOpen.push_back (isFinite (open) ? open : p[k]);
+                out.motionClose.push_back (isFinite (close) ? close : p[k]);
+                out.bounds.grow (out.motionOpen.back());
+                out.bounds.grow (out.motionClose.back());
+            }
         out.triangles.push_back (attributes);
     }
 }
@@ -229,6 +256,8 @@ void appendObject (const Visual3DScene& scene, std::size_t objectIndex, const Ma
 void IngestedScene::clear() noexcept
 {
     positions.clear();
+    motionOpen.clear();
+    motionClose.clear();
     triangles.clear();
     bounds = {};
     stats = {};
@@ -276,6 +305,18 @@ void ingestScene (const Visual3DScene& scene, IngestedScene& out, const IngestOp
     const std::size_t objectCount = scene.objectCount;
     const bool overrides = options.objectWorlds != nullptr && options.objectWorldCount == scene.objectCount;
     const std::size_t instanceCount = scene.objectInstanceCount;
+    const bool shutter = options.shutterClose > options.shutterOpen
+        && std::isfinite (options.shutterOpen) && std::isfinite (options.shutterClose);
+    const bool previousWorlds = options.previousObjectWorlds != nullptr
+        && options.previousObjectWorldCount == scene.objectCount;
+    const bool previousInstances = options.previousInstances != nullptr
+        && options.previousInstanceCount == instanceCount;
+    DrawMotion motion;
+    motion.previousPositions = options.previousPositions;
+    motion.previousPositionCount = options.previousPositions != nullptr
+        ? std::min (options.previousPositionCount, scene.vertexCount) : 0;
+    motion.open = options.shutterOpen;
+    motion.close = options.shutterClose;
     for (std::size_t objectIndex = 0; objectIndex < objectCount; ++objectIndex)
     {
         const SceneObjectRecord& object = scene.objects[objectIndex];
@@ -283,18 +324,57 @@ void ingestScene (const Visual3DScene& scene, IngestedScene& out, const IngestOp
             continue;
         ++out.stats.objectsWithGeometry;
         const Mat4 world = overrides ? options.objectWorlds[objectIndex] : objectWorldMatrix (scene, objectIndex);
+        const Mat4 previous = previousWorlds ? options.previousObjectWorlds[objectIndex] : world;
         if (scene.instancedObject.isValid() && object.id == scene.instancedObject)
         {
             for (std::size_t instance = 0; instance < instanceCount; ++instance)
             {
+                motion.previousWorld = previous * transformMatrix (previousInstances
+                    ? options.previousInstances[instance] : scene.objectInstances[instance]);
                 appendObject (scene, objectIndex, world * transformMatrix (scene.objectInstances[instance]),
-                              static_cast<std::uint32_t> (instance), out);
+                              static_cast<std::uint32_t> (instance), out, shutter ? &motion : nullptr);
                 ++out.stats.instancesExpanded;
             }
             continue;
         }
-        appendObject (scene, objectIndex, world, kNoInstance, out);
+        motion.previousWorld = previous;
+        appendObject (scene, objectIndex, world, kNoInstance, out, shutter ? &motion : nullptr);
     }
+    // Nothing moved over the shutter: trace the still scene.
+    bool moved = false;
+    for (std::size_t i = 0; i < out.motionOpen.size() && ! moved; ++i)
+        moved = out.motionOpen[i].x != out.motionClose[i].x || out.motionOpen[i].y != out.motionClose[i].y
+             || out.motionOpen[i].z != out.motionClose[i].z;
+    if (! moved)
+    {
+        out.motionOpen.clear();
+        out.motionClose.clear();
+    }
+}
+
+void setCameraShutter (PinholeCamera& camera, const SceneCameraRecord& previous, float open, float close) noexcept
+{
+    camera.moving = false;
+    if (! (close > open) || ! std::isfinite (open) || ! std::isfinite (close))
+        return;
+    const auto& q = previous.transform.rotation;
+    const float norm = std::sqrt (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    const Vec3 before = toVec3 (previous.transform.translation);
+    if (! isFinite (before) || ! std::isfinite (norm) || ! (norm > 0.0f))
+        return;
+    const Quat rotationBefore { q.x / norm, q.y / norm, q.z / norm, q.w / norm };
+    const Vec3 now = camera.position;
+    const Quat rotationNow = camera.rotation;
+    const bool still = before.x == now.x && before.y == now.y && before.z == now.z
+        && rotationBefore.x == rotationNow.x && rotationBefore.y == rotationNow.y
+        && rotationBefore.z == rotationNow.z && rotationBefore.w == rotationNow.w;
+    if (still)
+        return;
+    camera.position = pointAtFrame (before, now, open);
+    camera.closePosition = pointAtFrame (before, now, close);
+    camera.rotation = nlerpRotation (rotationBefore, rotationNow, 1.0f + open);
+    camera.closeRotation = nlerpRotation (rotationBefore, rotationNow, 1.0f + close);
+    camera.moving = true;
 }
 
 bool makePinholeCamera (const SceneCameraRecord& record, std::uint32_t width, std::uint32_t height,
@@ -307,9 +387,11 @@ bool makePinholeCamera (const SceneCameraRecord& record, std::uint32_t width, st
         || ! std::isfinite (record.verticalFovRadians) || ! (record.verticalFovRadians > 0.0f)
         || ! (record.verticalFovRadians < 3.1415926535f)
         || ! std::isfinite (record.nearPlane) || ! std::isfinite (record.farPlane)
-        || ! (record.nearPlane > 0.0f) || ! (record.farPlane > record.nearPlane))
+        || ! (record.nearPlane > 0.0f) || ! (record.farPlane > record.nearPlane)
+        || ! std::isfinite (record.orthographicHeight) || record.orthographicHeight < 0.0f)
         return false;
     camera.position = position;
+    camera.orthographicHalfHeight = record.orthographicHeight * 0.5f;
     camera.rotation = { q.x / norm, q.y / norm, q.z / norm, q.w / norm };
     camera.tanHalfFov = std::tan (record.verticalFovRadians * 0.5f);
     camera.aspect = static_cast<float> (width) / static_cast<float> (height);
@@ -317,6 +399,13 @@ bool makePinholeCamera (const SceneCameraRecord& record, std::uint32_t width, st
     camera.farPlane = record.farPlane;
     camera.width = width;
     camera.height = height;
+    if (! HarmonicMIDI::grid::validSceneCameraLens (record))
+        return false;
+    camera.apertureRadius = HarmonicMIDI::grid::sceneCameraApertureRadius (record);
+    camera.apertureRatio = record.apertureRatio;
+    camera.focusDistance = record.focusDistance;
+    camera.apertureBlades = record.apertureBlades;
+    camera.bladeRotation = record.bladeRotationRadians;
     return true;
 }
 
@@ -326,7 +415,9 @@ bool resolveActiveCamera (const Visual3DScene& scene, std::uint32_t width, std::
     const std::size_t slot = indexOfId (scene.cameras, scene.cameraCount, scene.activeCamera);
     if (slot >= std::min (scene.cameraCount, scene.cameras.size()))
         return false;
-    return makePinholeCamera (scene.cameras[slot], width, height, camera);
+    HarmonicMIDI::grid::SceneCameraRecord record = scene.cameras[slot];
+    HarmonicMIDI::grid::resolveSceneCameraFocus (scene, record);
+    return makePinholeCamera (record, width, height, camera);
 }
 
 } // namespace videohelper::pathtrace

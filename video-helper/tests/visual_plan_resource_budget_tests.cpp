@@ -587,12 +587,14 @@ int main()
     glCapabilities.maximumImageDimensionQuery = "OpenGL.GL_MAX_TEXTURE_SIZE";
     const auto glLimits = videowire::VisualBackendResourceLimits::fromCapabilities(
         1280, 720, glCapabilities);
-    check(glLimits.maximumImageDimension == 16384 && glLimits.frameSlots == 32
+    check(glLimits.maximumImageDimension == 16384
+              && glLimits.frameSlots == std::numeric_limits<size_t>::max()
+              && glLimits.descriptors == std::numeric_limits<size_t>::max()
+              && glLimits.allocatedFrameBytes == std::numeric_limits<uint64_t>::max()
               && glLimits.observedCombinedTextureImageUnits == 192
-              && glLimits.frameSlotSource == "conservative-default-no-safe-capability-mapping"
-              && glLimits.allocatedFrameBytesSource
-                    == "conservative-canvas-default-no-safe-byte-capability",
-          "OpenGL profile uses queried dimensions without treating binding counts as memory limits");
+              && glLimits.frameSlotSource == "unbounded-allocation-failure-only"
+              && glLimits.allocatedFrameBytesSource == "unbounded-allocation-failure-only",
+          "OpenGL profile uses queried dimensions and sets no scene budget");
 
     videowire::VisualBackendResourceLimits::Capabilities metalCapabilities;
     metalCapabilities.backendProfile = "metal-renderer-device";
@@ -605,24 +607,16 @@ int main()
     metalCapabilities.recommendedWorkingSetQuery = "Metal.MTLDevice.recommendedMaxWorkingSetSize";
     const auto metalLimits = videowire::VisualBackendResourceLimits::fromCapabilities(
         1280, 720, metalCapabilities);
-    check(metalLimits.allocatedFrameBytes == 36ull * 1024ull * 1024ull
+    check(metalLimits.allocatedFrameBytes == std::numeric_limits<uint64_t>::max()
               && metalLimits.backendDeviceIdentity == "Apple M3 Max@0x1234"
               && metalLimits.maximumImageDimension == 16384
               && metalLimits.maximumImageDimensionSource
                     == "Sokol.sg_query_limits.max_image_size_2d"
-              && metalLimits.allocatedFrameBytesSource
-                    == "Metal.MTLDevice.recommendedMaxWorkingSetSize*0.75-plan-budget"
               && metalLimits.observedRecommendedWorkingSetBytes
                     == 48ull * 1024ull * 1024ull
               && metalLimits.observedMaximumBufferLengthBytes
                     == 256ull * 1024ull * 1024ull,
-          "Metal profile reserves renderer headroom and records exact device provenance");
-
-    metalCapabilities.recommendedWorkingSetBytes = 600ull * 1024ull * 1024ull;
-    const auto largeMetalLimits = videowire::VisualBackendResourceLimits::fromCapabilities(
-        8192, 8192, metalCapabilities);
-    check(largeMetalLimits.allocatedFrameBytes == 450ull * 1024ull * 1024ull,
-          "Metal headroom reserve applies before the conservative global ceiling");
+          "Metal profile records device provenance and leaves allocation as the only limit");
 
     if (failures != 0) return EXIT_FAILURE;
     std::cout << "Visual plan resource budget checks passed\n";

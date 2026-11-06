@@ -2677,9 +2677,15 @@ void staticLocalObjectMotionWorldHelpers()
     priorInputs.objectWorlds = std::make_shared<NativeImportedObjectWorlds>(stretchedList);
     auto motionSheared = motionCurrent;
     motionSheared.previousMotion = arbitgpu::sceneMotionSample(priorInputs);
-    check(!arbitgpu::nativeObjectWorldMotionSupported(*scene, motionSheared, error)
-        && error.find("rotation, uniform scale") != std::string::npos,
-        "a changed world without a similarity is refused by name");
+    check(arbitgpu::nativeObjectWorldMotionSupported(*scene, motionSheared, error),
+        "a changed world without a similarity passes the Motion gate");
+    const std::array<float, 16> identityMatrix {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    check(arbitgpu::nativePreviousObjectMatrix(*scene, 0, motionSheared, identityMatrix, movedList[0].world)
+            == stretched,
+        "a changed world without a similarity carries its full prior world");
+    check(arbitgpu::nativePreviousObjectMatrix(*scene, 0, motionMoved, identityMatrix, movedList[0].world)
+            == movedList[0].world,
+        "a similarity step keeps the current matrix and travels in the uniforms");
     // A scene prior transform on the same object builds on the authored chain the worlds replace.
     scene->previousObjectTransformCount = scene->objectCount;
     scene->previousObjectTransforms[0].translation.x = 5.0f;
@@ -3613,7 +3619,8 @@ int main()
         invalidNotes->identities[0] = 0;
         check(!arbitgpu::validFixtureRuntimeInputs(inputs), "zero prior note identity is refused");
         *invalidNotes = *retained;
-        invalidNotes->count = 2; invalidNotes->identities[1] = invalidNotes->identities[0];
+        invalidNotes->count = 2; invalidNotes->identities.resize(2); invalidNotes->transforms.resize(2, invalidNotes->transforms[0]);
+        invalidNotes->identities[1] = invalidNotes->identities[0];
         check(!arbitgpu::validFixtureRuntimeInputs(inputs), "duplicate prior note identity is refused");
         *invalidNotes = *retained;
         invalidNotes->transforms[0][0] = std::numeric_limits<float>::infinity();

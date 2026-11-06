@@ -155,7 +155,7 @@ NoteSnapshot snapshotOf(const std::shared_ptr<const CanonicalBlockCFrame>& frame
     mapping.appearanceSource = visualnoteinstancing::AppearanceSource::StableNoteIdentity;
     inputs.noteInstanceMapping = mapping;
     const auto batch = arbitgpu::prepareNativeNoteInstances(inputs);
-    require(batch.admitted && batch.count <= visualnoteinstancing::kMaximumInstances,
+    require(batch.admitted && batch.count == batch.identities.size(),
             "note instance batch was not admitted");
     NoteSnapshot result {identityTexels(*frame), {}, {}};
     for (std::size_t index = 0; index < batch.count; ++index)

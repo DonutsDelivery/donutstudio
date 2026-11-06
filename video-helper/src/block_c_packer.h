@@ -1,7 +1,9 @@
 // block_c_packer.h — Block C voice allocator + texture packer (pre-work A2)
 //
 // Turns the note/link timeline into the two RGBA32F textures the shader contract
-// (§4.3) reads: uNotes (128 rows x 4 texels) and uLinks (256 rows x 1 texel).
+// (§4.3) reads: uNotes (one row of 4 texels per resident note) and uLinks
+// (one texel per link, kLinkTextureWidth texels per texture row). Both are
+// sized from the score; the row counts reach shaders as uNoteCount/uLinkCount.
 //
 // The differentiator vs. an FFT visualiser is that row assignment is a STATEFUL
 // VOICE ALLOCATOR, not a per-frame sort: a note gets a row when it enters the
@@ -30,7 +32,9 @@
 
 #include "mod_defs.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -44,32 +48,59 @@ using arbitmod::Link;
 using arbitmod::Note;
 using arbitmod::Score;
 
-constexpr int kMaxNotes  = 128;
-constexpr int kMaxLinks  = 256;
 constexpr int kTexelsPerNote = 4;
+// Layout width of the links texture, not a limit: link i sits at texel
+// (i % kLinkTextureWidth, i / kLinkTextureWidth). Shaders read the width back
+// with textureSize, so any layout width works.
+constexpr int kLinkTextureWidth = 1024;
+
+// Texture heights for a row count. A texture never has zero rows, so an empty
+// score still binds a valid 1-row texture.
+inline int noteTextureRows (int noteRows) noexcept { return std::max (1, noteRows); }
+inline int linkTextureRows (int linkRows) noexcept
+{
+    return std::max (1, (std::max (0, linkRows) + kLinkTextureWidth - 1) / kLinkTextureWidth);
+}
+inline std::size_t noteTextureValues (int noteRows) noexcept
+{
+    return static_cast<std::size_t> (noteTextureRows (noteRows)) * kTexelsPerNote * 4u;
+}
+inline std::size_t linkTextureValues (int linkRows) noexcept
+{
+    return static_cast<std::size_t> (linkTextureRows (linkRows)) * kLinkTextureWidth * 4u;
+}
+// Upper bound on both textures' float count for a source of the given size,
+// for work estimates that run before packing. Saturates instead of wrapping.
+inline std::uint64_t textureValueBound (std::uint64_t notes, std::uint64_t links) noexcept
+{
+    constexpr auto cap = std::numeric_limits<std::uint64_t>::max() / 64u;
+    notes = std::min (std::max<std::uint64_t> (1, notes), cap);
+    links = std::min (links, cap);
+    const auto linkRows = std::max<std::uint64_t> (1, (links + kLinkTextureWidth - 1) / kLinkTextureWidth);
+    return notes * kTexelsPerNote * 4u + linkRows * kLinkTextureWidth * 4u;
+}
 
 struct PackResult
 {
-    // 128 * 4 texels * 4 channels, row-major (row, texel, channel).
+    // noteTextureRows(noteCount) * 4 texels * 4 channels, row-major (row, texel, channel).
     std::vector<float> notesTex;
-    // 256 * 4 channels (one texel per link edge).
+    // linkTextureRows(linkCount) * kLinkTextureWidth texels * 4 channels.
     std::vector<float> linksTex;
     // Stable source identities for occupied texture rows. Zero marks a hole.
-    // Link identities align with linksTex rows.
-    std::array<std::int64_t, kMaxNotes> noteIds {};
-    std::array<std::int64_t, kMaxLinks> linkIds {};
+    // noteIds has noteCount entries; linkIds has linkCount entries.
+    std::vector<std::int64_t> noteIds;
+    std::vector<std::int64_t> linkIds;
     std::uint64_t scoreRevision = 0;
     float beat = std::numeric_limits<float>::quiet_NaN();
     int noteCount = 0;   // highest occupied row + 1 (loop bound, see header note)
     int linkCount = 0;   // edges with both endpoints resident
-    // Left out because the textures are full, not because they are out of the
-    // history and lookahead window. A link counts when it lost an endpoint to
-    // the note limit too.
+    // The textures grow with the score, so the packer leaves nothing out. Kept
+    // so export progress and the HUD keep their fields; always zero.
     int droppedNotes = 0;
     int droppedLinks = 0;
 };
 
-// Goes when the texture limits go: storage buffers remove both.
+// Empty unless a producer reports dropped rows; the content-sized packer never does.
 inline std::string scoreDropWarning (int droppedNotes, int droppedLinks)
 {
     if (droppedNotes <= 0 && droppedLinks <= 0)
@@ -80,8 +111,7 @@ inline std::string scoreDropWarning (int droppedNotes, int droppedLinks)
     if (droppedLinks > 0)
         left += (left.empty() ? "" : " and ") + std::to_string (droppedLinks)
               + (droppedLinks == 1 ? " link" : " links");
-    return "Score visuals hold " + std::to_string (kMaxNotes) + " notes and "
-         + std::to_string (kMaxLinks) + " links at a time, so they left out " + left + ".";
+    return "Score visuals left out " + left + ".";
 }
 
 class BlockCPacker
@@ -93,7 +123,7 @@ public:
     {
         // Projected clip-loop identities are negative. Zero is the only invalid
         // projected identity and is therefore the allocator's hole sentinel.
-        rowToNote_.fill (0);
+        rowToNote_.clear();
         noteToRow_.clear();
         packCount_ = 0;
     }
@@ -166,14 +196,6 @@ public:
                            return a.note->startBeat < b.note->startBeat;
                        return a.note->id < b.note->id;
                    });
-        std::unordered_set<int> cutIds;
-        if (candidates.size() > static_cast<size_t> (kMaxNotes))
-        {
-            for (size_t index = kMaxNotes; index < candidates.size(); ++index)
-                cutIds.insert (candidates[index].note->id);
-            candidates.resize (kMaxNotes);
-        }
-
         std::unordered_set<int> selectedIds;
         selectedIds.reserve (candidates.size());
         for (const auto& candidate : candidates)
@@ -181,28 +203,29 @@ public:
 
         // 2. Free rows outside the selected set. This is the capacity-aware
         // eviction step: active/upcoming entrants can displace older history.
-        for (int row = 0; row < kMaxNotes; ++row)
+        for (auto& id : rowToNote_)
         {
-            const int id = rowToNote_[row];
             if (id == 0) continue;
             if (selectedIds.find (id) == selectedIds.end())
             {
-                rowToNote_[row] = 0;
                 noteToRow_.erase (id);
+                id = 0;
             }
         }
 
         // 3. Assign the selected entrants to the lowest free rows. Notes that
         // survived selection keep their old rows, preserving motion continuity.
+        std::size_t nextFree = 0;
         for (const auto& candidate : candidates)
         {
             if (noteToRow_.find (candidate.note->id) != noteToRow_.end())
                 continue;
-            int freeRow = -1;
-            for (int row = 0; row < kMaxNotes; ++row)
-                if (rowToNote_[row] == 0) { freeRow = row; break; }
-            if (freeRow < 0) break;
-            rowToNote_[freeRow] = candidate.note->id;
+            // Lowest free row, or a new row past the end. The search resumes
+            // where the last one stopped, since earlier rows are now taken.
+            while (nextFree < rowToNote_.size() && rowToNote_[nextFree] != 0) ++nextFree;
+            if (nextFree == rowToNote_.size()) rowToNote_.push_back (0);
+            const int freeRow = static_cast<int> (nextFree);
+            rowToNote_[nextFree] = candidate.note->id;
             noteToRow_[candidate.note->id] = freeRow;
         }
 
@@ -210,39 +233,46 @@ public:
         PackResult out;
         out.scoreRevision = score.scoreRevision;
         out.beat = beat;
-        out.notesTex.assign (static_cast<size_t> (kMaxNotes) * kTexelsPerNote * 4u, 0.0f);
-        out.linksTex.assign (static_cast<size_t> (kMaxLinks) * 4u, 0.0f);
-
-        int maxRow = -1;
-        for (int row = 0; row < kMaxNotes; ++row)
+        // Trailing free rows go, so the row count is the highest occupied row + 1.
+        while (! rowToNote_.empty() && rowToNote_.back() == 0) rowToNote_.pop_back();
+        out.noteCount = static_cast<int> (rowToNote_.size());
+        out.notesTex.assign (noteTextureValues (out.noteCount), 0.0f);
+        out.noteIds.assign (static_cast<std::size_t> (out.noteCount), 0);
+        for (int row = 0; row < out.noteCount; ++row)
         {
-            const int id = rowToNote_[row];
+            const int id = rowToNote_[static_cast<std::size_t> (row)];
             if (id == 0) continue;
             const Note* n = score.noteById (id);
             if (n == nullptr) continue;
-            maxRow = row;
             out.noteIds[static_cast<std::size_t> (row)] = n->id;
             writeNote (out.notesTex, row, *n, score, beat);
         }
-        out.noteCount = maxRow + 1;
-        out.droppedNotes = static_cast<int> (cutIds.size());
+        // A selected note may no longer be in the score; its row reads as a hole.
+        while (out.noteCount > 0 && out.noteIds[static_cast<std::size_t> (out.noteCount - 1)] == 0)
+            --out.noteCount;
+        out.noteIds.resize (static_cast<std::size_t> (out.noteCount));
+        out.notesTex.resize (noteTextureValues (out.noteCount));
 
         // 5. Link edges: both endpoints must be resident.
+        out.linkIds.reserve (score.links.size());
         for (const auto& l : score.links)
         {
             const int sRow = rowOf (l.slaveNoteId);
             const int mRow = rowOf (l.masterNoteId);
-            if (sRow < 0 || mRow < 0)
-            {
-                const bool sCut = cutIds.count (l.slaveNoteId) != 0;
-                const bool mCut = cutIds.count (l.masterNoteId) != 0;
-                if ((sCut && (mCut || mRow >= 0)) || (mCut && sRow >= 0))
-                    ++out.droppedLinks;
+            if (sRow < 0 || mRow < 0 || sRow >= out.noteCount || mRow >= out.noteCount)
                 continue;
-            }
-            if (out.linkCount >= kMaxLinks) { ++out.droppedLinks; continue; }
-            const size_t off = static_cast<size_t> (out.linkCount++) * 4u;
-            out.linkIds[static_cast<std::size_t> (out.linkCount - 1)] = l.id;
+            out.linkIds.push_back (l.id);
+        }
+        out.linkCount = static_cast<int> (out.linkIds.size());
+        out.linksTex.assign (linkTextureValues (out.linkCount), 0.0f);
+        int edge = 0;
+        for (const auto& l : score.links)
+        {
+            const int sRow = rowOf (l.slaveNoteId);
+            const int mRow = rowOf (l.masterNoteId);
+            if (sRow < 0 || mRow < 0 || sRow >= out.noteCount || mRow >= out.noteCount)
+                continue;
+            const size_t off = static_cast<size_t> (edge++) * 4u;
             out.linksTex[off + 0] = static_cast<float> (sRow);
             out.linksTex[off + 1] = static_cast<float> (mRow);
             out.linksTex[off + 2] = static_cast<float> (l.slaveHarmonic);   // num
@@ -261,7 +291,7 @@ private:
                    tex.begin() + static_cast<std::ptrdiff_t> (row) * kTexelsPerNote * 4);
     }
 
-    std::array<int, kMaxNotes> rowToNote_ {};
+    std::vector<int> rowToNote_;
     std::unordered_map<int, int> noteToRow_;
     std::uint64_t packCount_ = 0;
 };

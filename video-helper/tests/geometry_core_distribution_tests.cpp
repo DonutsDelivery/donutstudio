@@ -186,9 +186,9 @@ void densityLowersWithExactCount() {
         "a density that overflows the maximum is rejected at lowering");
 }
 
-// A geometryDeformation (Audio Deformer) binding is accepted by the count operation but refused by
-// density, whose realized count changes with the per-frame area.
-void densityRefusesAudioDeformerBindings() {
+// A geometryDeformation (Audio Deformer) binding is accepted by the count operation and by
+// density, whose realized count the helper re-samples on each frame's deformed area.
+void densityKeepsAudioDeformerBindings() {
   std::string error;
   const auto cube = lowerMeshGenerator(7321, 7321, 1, OperationCode::cube, {2, 2, 1, 0}, meshContract(), error);
   check(cube.has_value(), "a cube lowers for the binding refusal check");
@@ -204,9 +204,9 @@ void densityRefusesAudioDeformerBindings() {
   check(lowerPointDistribution(bound, 7324, OperationCode::pointsOnFaces, 8, 7, pointsContract(), error).has_value(),
         "the count operation still lowers under an Audio Deformer binding");
   error.clear();
-  check(!lowerPointDensityDistribution(bound, 7325, 64, 3, 0.25f, pointsContract(), error).has_value()
-            && error == "Density point distribution does not support Audio Deformer bindings",
-        "the density operation refuses an Audio Deformer binding by name");
+  const auto density = lowerPointDensityDistribution(bound, 7325, 64, 3, 0.25f, pointsContract(), error);
+  check(density.has_value() && density->spectrumFields.size() == 1,
+        "the density operation lowers and keeps the Audio Deformer binding");
 }
 
 // The density operation is written at version 18, roundtrips, and a version 17 header refuses it.
@@ -225,10 +225,10 @@ void densityTransportVersionAndRoundTrip() {
   check(bytes.size() > 5 && bytes[4] == kPointDensityTransportVersion && bytes[5] == 0,
         "a density distribution is written at transport version 18");
   check(kPointDensityTransportVersion < kShadeTransportVersion
-            && kShadeTransportVersion == kTransportVersion
-            && kSubdivisionTransportVersion == kTransportVersion
+            && kShadeTransportVersion == kSubdivisionTransportVersion
+            && kShadeTransportVersion < kTransportVersion
             && kPointDensityTransportVersion > kCullTransportVersion,
-        "the density version follows the cull version and precedes shade and subdivision at the current transport version");  auto reopened = decodeRuntimeValue(bytes, pointsContract(), {}, {}, error);
+        "the density version follows the cull version and precedes shade and subdivision");  auto reopened = decodeRuntimeValue(bytes, pointsContract(), {}, {}, error);
   check(reopened.has_value() && encodeRuntimeValue(*reopened) == bytes,
         "a version 18 density distribution roundtrips");
 
@@ -258,7 +258,7 @@ int main() {
   densityIsSeededAndInsideSurface();
   densityLowersWithExactCount();
   densityTransportVersionAndRoundTrip();
-  densityRefusesAudioDeformerBindings();
+  densityKeepsAudioDeformerBindings();
   if (failures != 0) {
     std::fprintf(stderr, "%d geometry core distribution check(s) failed\n", failures);
     return 1;

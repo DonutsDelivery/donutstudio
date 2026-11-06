@@ -12,6 +12,8 @@ SceneView makeSceneView (const RenderScene& scene, BufferView<GratingBinding> gr
 {
     SceneView view;
     view.positions = { scene.geometry.positions.data(), static_cast<std::uint32_t> (scene.geometry.positions.size()) };
+    view.motionOpen = { scene.geometry.motionOpen.data(), static_cast<std::uint32_t> (scene.geometry.motionOpen.size()) };
+    view.motionClose = { scene.geometry.motionClose.data(), static_cast<std::uint32_t> (scene.geometry.motionClose.size()) };
     view.triangles = { scene.geometry.triangles.data(), static_cast<std::uint32_t> (scene.geometry.triangles.size()) };
     view.materials = { scene.materials.data(), static_cast<std::uint32_t> (scene.materials.size()) };
     view.fallbackMaterial = &scene.fallbackMaterial;
@@ -24,6 +26,10 @@ SceneView makeSceneView (const RenderScene& scene, BufferView<GratingBinding> gr
     view.anyThinSheet = scene.anyThinSheet;
     view.anyDispersive = scene.anyDispersive;
     view.anyMediumBoundary = scene.anyMediumBoundary;
+    view.anyVolume = scene.anyVolume;
+    view.worldMedium = scene.hasWorldVolume ? &scene.worldVolume : nullptr;
+    view.worldVolumeRadius = scene.worldVolumeExtent;
+    view.anyHiddenObjects = scene.anyHiddenObjects;
     view.boundsCentre = scene.boundsCentre;
     view.boundsRadius = scene.boundsRadius;
     return view;

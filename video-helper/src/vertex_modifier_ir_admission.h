@@ -172,6 +172,17 @@ inline bool validateParameters(const videowire::VertexModifierRecord& record,
                 || p[0] > limits.maxDeclaredDisplacement)
                 return fail("requires a positive admitted displacement bound");
             break;
+        // Wind 0.1 to 60 m/s, heading within a turn either way, a wave band
+        // inside 0 to 100 km, an integral seed and choppiness 0 to 10: the
+        // Ocean node's own bounds.
+        case Operation::oceanWaves:
+            if (! (p[0] >= 0.1 && p[0] <= 60) || ! (std::abs(p[1]) <= 360)
+                || ! (p[2] > 0 && p[3] > p[2] && p[3] <= 100000)
+                || ! isIntegralIndex(p[4], 1048575) || ! (p[5] >= 0 && p[5] <= 10))
+                return fail("requires Ocean wind, heading, wave band, seed and choppiness within their bounds");
+            break;
+        case Operation::scalarSin:
+        case Operation::scalarCos:
         case Operation::invalid:
         case Operation::importedPosition:
         case Operation::importedNormal:
@@ -254,7 +265,7 @@ inline std::optional<AdmittedVertexModifierIr> admitVertexModifierIr(
         const auto schema = videowire::vertexModifierOperationSchema(record.operation);
         if (! schema.valid || record.resultType != schema.resultType
             || record.inputCount != schema.inputCount
-            || record.parameterCount != schema.parameterCount)
+            || !videowire::vertexModifierParameterCountAdmitted(record.operation, record.parameterCount))
         {
             error = "vertex modifier record " + std::to_string(record.stableId)
                 + " has an invalid typed operation shape";

@@ -72,6 +72,28 @@ struct DiffractionOrderDistribution
     float reliefAcrossDeviation = 0.0f;
 };
 
+// Every member but the orders back to its default, in place. Keep it in step with
+// the struct above.
+PT_SHARED_FN void clearAllButOrders(DiffractionOrderDistribution& distribution) noexcept
+{
+    distribution.orderCount = 0;
+    distribution.substrateReflectedPower = 0.0f;
+    distribution.resolvedReflectedPower = 0.0f;
+    distribution.unresolvedReflectedPower = 0.0f;
+    distribution.pitScatterPower = 0.0f;
+    distribution.pitAcrossWidth = 0.0f;
+    distribution.pitAlongWidth = 0.0f;
+    distribution.pitAcrossAxis = {};
+    distribution.pitAlongAxis = {};
+    distribution.acrossGrooveDeviation = 0.0f;
+    distribution.grooveFamilyCount = 0;
+    distribution.grooveFamilyAxes = {};
+    distribution.reliefScatterBound = 0.0f;
+    distribution.reliefLeavingPower = 0.0f;
+    distribution.reliefReach = 0.0f;
+    distribution.reliefAcrossDeviation = 0.0f;
+}
+
 struct DiffractionOrderSample
 {
     DiffractionOrder order;
@@ -367,20 +389,41 @@ PT_SHARED_FN bool admittedOrder(int order, const SpectralSampling& spectrum) noe
                           && magnitude <= spectrum.lastOrder);
 }
 
+// A uv direction turned by the angle whose cosine and sine are given.
+PT_SHARED_FN std::array<float, 2> rotateUv(const std::array<float, 2>& direction, float cosine, float sine) noexcept
+{
+    return std::array<float, 2> { cosine * direction[0] - sine * direction[1],
+                                  sine * direction[0] + cosine * direction[1] };
+}
+
+// Adds the groove family whose direction in the local frame's tangent plane is (x, y),
+// unit length; a zero direction adds none.
+PT_SHARED_FN void addGrooveFamily(DiffractionOrderDistribution& candidate, const DiffractionLocalFrame& frame,
+                                  float x, float y) noexcept
+{
+    const float size = std::hypot(x, y);
+    if (!(size > 0.0f))
+        return;
+    auto& axis = candidate.grooveFamilyAxes[candidate.grooveFamilyCount++];
+    for (std::size_t i = 0; i < 3; ++i)
+        axis[i] = (x * frame.tangent[i] + y * frame.bitangent[i]) / size;
+}
 } // namespace ordercore
 
 // The share of a relief family's bound that leaves: the mean of cos wi over its sampling,
 // 0 past the horizon. parallel and perpendicular are the mirror's tangent along and across
 // the axis. Along the axis the integral of sqrt(c^2 - x^2) is exact. Across it a three-point
 // Gauss-Hermite rule takes the Gaussian, which is narrow against the unit disc.
+// The integral of sqrt(c^2 - x^2) dx, from 0 to x.
+PT_SHARED_FN float discChordAntiderivative(float x, float c) noexcept
+{
+    const float ratio = std::min(1.0f, std::max(-1.0f, x / c));
+    return 0.5f * (x * std::sqrt(std::max(0.0f, c * c - x * x)) + c * c * std::asin(ratio));
+}
+
 PT_SHARED_FN float reliefFamilyLeavingShare(float parallel, float perpendicular, float reach,
                                             float deviation) noexcept
 {
-    const auto antiderivative = [] (float x, float c)
-    {
-        const float ratio = std::min(1.0f, std::max(-1.0f, x / c));
-        return 0.5f * (x * std::sqrt(std::max(0.0f, c * c - x * x)) + c * c * std::asin(ratio));
-    };
     const float nodes[3] = { 0.0f, 1.7320508f * deviation, -1.7320508f * deviation };
     const float weights[3] = { 2.0f / 3.0f, 1.0f / 6.0f, 1.0f / 6.0f };
     float share = 0.0f;
@@ -394,7 +437,7 @@ PT_SHARED_FN float reliefFamilyLeavingShare(float parallel, float perpendicular,
         const float low = std::max(-c, parallel - reach);
         const float high = std::min(c, parallel + reach);
         if (high > low)
-            share += weights[i] * (antiderivative(high, c) - antiderivative(low, c)) / (2.0f * reach);
+            share += weights[i] * (discChordAntiderivative(high, c) - discChordAntiderivative(low, c)) / (2.0f * reach);
     }
     return share;
 }
@@ -491,9 +534,12 @@ PT_SHARED_FN DiffractionOrderProblem evaluateDiffractionOrdersCore (const Descri
     using namespace ordercore;
     // The host keeps result untouched on a refusal. Device code has no stack for a
     // second distribution, and no caller there reads result after a refusal.
+    // Assigning {} built an 8 KB temporary on the GPU stack, so the reset leaves the
+    // orders as they are: no reader goes past orderCount, and the loop below writes
+    // each entry before it counts it.
 #if defined(__CUDACC__)
     DiffractionOrderDistribution& candidate = result;
-    candidate = {};
+    clearAllButOrders(candidate);
 #else
     DiffractionOrderDistribution candidate;
 #endif
@@ -553,15 +599,9 @@ PT_SHARED_FN DiffractionOrderProblem evaluateDiffractionOrdersCore (const Descri
         * pi / 180.0f;
     const float cosine = std::cos(angle);
     const float sine = std::sin(angle);
-    const auto rotate = [cosine, sine] (const std::array<float, 2>& direction)
-    {
-        return std::array<float, 2> {
-            cosine * direction[0] - sine * direction[1],
-            sine * direction[0] + cosine * direction[1]
-        };
-    };
-    const auto primaryDirection = local != nullptr ? local->directionUv : rotate(description.geometry.directionUv);
-    const auto secondaryDirection = rotate(description.geometry.secondaryDirectionUv);
+    const auto primaryDirection = local != nullptr ? local->directionUv
+        : ordercore::rotateUv(description.geometry.directionUv, cosine, sine);
+    const auto secondaryDirection = ordercore::rotateUv(description.geometry.secondaryDirectionUv, cosine, sine);
     const float primaryPeriod = local != nullptr ? local->periodNanometres
         : description.geometry.grooveSpacingNanometres
             + coordinate * description.grooveField.grooveSpacingDeltaNanometresPerUnit;
@@ -676,23 +716,15 @@ PT_SHARED_FN DiffractionOrderProblem evaluateDiffractionOrdersCore (const Descri
     if (description.roughness.acrossGrooveSlope > 0.0f || description.roughness.reliefRmsHeightNanometres > 0.0f)
     {
         candidate.acrossGrooveDeviation = 2.0f * description.roughness.acrossGrooveSlope;
-        const auto addFamily = [&] (float x, float y)
-        {
-            const float size = std::hypot(x, y);
-            if (!(size > 0.0f))
-                return;
-            auto& axis = candidate.grooveFamilyAxes[candidate.grooveFamilyCount++];
-            for (std::size_t i = 0; i < 3; ++i)
-                axis[i] = (x * frame.tangent[i] + y * frame.bitangent[i]) / size;
-        };
-        addFamily(primaryDirection[0], primaryDirection[1]);
+        ordercore::addGrooveFamily(candidate, frame, primaryDirection[0], primaryDirection[1]);
         if (crossed)
         {
-            addFamily(secondaryDirection[0], secondaryDirection[1]);
+            ordercore::addGrooveFamily(candidate, frame, secondaryDirection[0], secondaryDirection[1]);
             // The third family's reciprocal vector is g1/d1 - g2/d2.
             if (description.geometry.thirdGrooveFamily)
-                addFamily(primaryDirection[0] / primaryPeriod - secondaryDirection[0] / secondaryPeriod,
-                          primaryDirection[1] / primaryPeriod - secondaryDirection[1] / secondaryPeriod);
+                ordercore::addGrooveFamily(candidate, frame,
+                                           primaryDirection[0] / primaryPeriod - secondaryDirection[0] / secondaryPeriod,
+                                           primaryDirection[1] / primaryPeriod - secondaryDirection[1] / secondaryPeriod);
         }
     }
     if (description.roughness.reliefRmsHeightNanometres > 0.0f && candidate.grooveFamilyCount > 0)
@@ -784,7 +816,9 @@ PT_SHARED_FN DiffractionOrderProblem evaluateDiffractionOrdersCore (const Descri
             return DiffractionOrderProblem::InvalidDistribution;
     }
 
+#if !defined(__CUDACC__)
     result = candidate;
+#endif
     return DiffractionOrderProblem::None;
 }
 

@@ -1,9 +1,11 @@
 #pragma once
 
+#include "../../shared/VertexControlBank.h"
 #include "imported_animation_playback_clock.h"
 #include "note_reactive_light.h"
 #include "geometry_score_field.h"
 #include "composed_timeline_geometry.h"
+#include "composed_audio_deformer.h"
 
 #include "baked_target_modulation.h"
 #include "imported_animation_visual_plan_execution.h"
@@ -15,6 +17,8 @@
 #include "loop_step_probe.h"
 #include "preview_render_extent.h"
 #include "published_plan_memo.h"
+#include "render_input_generation.h"
+#include "runtime_camera_parameters.h"
 
 #include <algorithm>
 #include <array>
@@ -25,7 +29,9 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <new>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -112,7 +118,7 @@ inline constexpr float kMaximumLightValue=std::numeric_limits<float>::max();
 inline auto analyticSkyRuntimeParameters(HarmonicMIDI::grid::SceneLightRecord& light)
 {
     auto& s=light.sky;
-    return std::array<AnalyticSkyRuntimeParameter,25> {{
+    return std::array<AnalyticSkyRuntimeParameter,27> {{
         {"red",&light.color.x,0,kMaximumLightValue},{"green",&light.color.y,0,kMaximumLightValue},{"blue",&light.color.z,0,kMaximumLightValue},
         {"intensity",&light.intensity,0,kMaximumLightValue},
         {"skyZenithRed",&s.zenith.x,0,kMaximumLightValue},{"skyZenithGreen",&s.zenith.y,0,kMaximumLightValue},{"skyZenithBlue",&s.zenith.z,0,kMaximumLightValue},
@@ -123,7 +129,8 @@ inline auto analyticSkyRuntimeParameters(HarmonicMIDI::grid::SceneLightRecord& l
         {"sunElevationDegrees",&s.sunElevationDegrees,-90,90},{"sunRadiusDegrees",&s.sunRadiusDegrees,.25,30},
         {"skyOrientationDegrees",&s.orientationDegrees,-360,360},
         {"cloudCoverage",&s.cloudCoverage,0,1},{"cloudType",&s.cloudType,0,1},
-        {"cloudDrift",&s.cloudDrift,-1000000,1000000},{"cloudHeadingDegrees",&s.cloudHeadingDegrees,-360,360}
+        {"cloudDrift",&s.cloudDrift,-1000000,1000000},{"cloudHeadingDegrees",&s.cloudHeadingDegrees,-360,360},
+        {"skySunHalo",&s.sunHalo,0,1},{"cloudThickness",&s.cloudThickness,0,1}
     }};
 }
 inline bool authoredAnalyticSkyLight(const videowire::CompiledVisualLayerPlan& plan,
@@ -174,14 +181,28 @@ inline bool evaluateAnalyticSkyRuntime(const videowire::CompiledVisualLayerPlan&
     return HarmonicMIDI::grid::validSceneAnalyticSky(light);
 }
 
-// Directional and point lights. Colour and intensity are absolute values clamped to the
-// node ranges. A point light takes position offsets and a directional light takes rotation
-// offsets in degrees, composed in world space over the authored transform. The renderer
-// reads these as per-frame light records, so no scene is derived for a changed value.
+// Directional, point, spot and area lights. Colour and intensity are absolute values
+// clamped to the node ranges. Point, spot and area lights take position offsets;
+// directional, spot and area lights take rotation offsets in degrees, composed in world
+// space over the authored transform. The renderer reads these as per-frame light records,
+// so no scene is derived for a changed value.
 inline bool directionalOrPointLight(const HarmonicMIDI::grid::SceneLightRecord& light) noexcept
 {
-    return light.kind == HarmonicMIDI::grid::SceneLightKind::Directional
-        || light.kind == HarmonicMIDI::grid::SceneLightKind::Point;
+    using HarmonicMIDI::grid::SceneLightKind;
+    return light.kind == SceneLightKind::Directional || light.kind == SceneLightKind::Point
+        || light.kind == SceneLightKind::Spot || light.kind == SceneLightKind::Area;
+}
+
+inline bool positionedLight(const HarmonicMIDI::grid::SceneLightRecord& light) noexcept
+{
+    using HarmonicMIDI::grid::SceneLightKind;
+    return light.kind == SceneLightKind::Point || light.kind == SceneLightKind::Spot || light.kind == SceneLightKind::Area;
+}
+
+inline bool orientedLight(const HarmonicMIDI::grid::SceneLightRecord& light) noexcept
+{
+    using HarmonicMIDI::grid::SceneLightKind;
+    return light.kind == SceneLightKind::Directional || light.kind == SceneLightKind::Spot || light.kind == SceneLightKind::Area;
 }
 
 inline void seedDirectionalOrPointLight(const HarmonicMIDI::grid::SceneLightRecord& light,
@@ -193,10 +214,10 @@ inline void seedDirectionalOrPointLight(const HarmonicMIDI::grid::SceneLightReco
     parameters.emplace(prefix + "green", light.color.y);
     parameters.emplace(prefix + "blue", light.color.z);
     parameters.emplace(prefix + "intensity", light.intensity);
-    const std::array<const char*, 3> offsets = light.kind == HarmonicMIDI::grid::SceneLightKind::Point
-        ? std::array<const char*, 3> { "positionX", "positionY", "positionZ" }
-        : std::array<const char*, 3> { "rotationX", "rotationY", "rotationZ" };
-    for (const char* name : offsets) parameters.emplace(prefix + name, 0.0);
+    if (positionedLight(light))
+        for (const char* name : { "positionX", "positionY", "positionZ" }) parameters.emplace(prefix + name, 0.0);
+    if (orientedLight(light))
+        for (const char* name : { "rotationX", "rotationY", "rotationZ" }) parameters.emplace(prefix + name, 0.0);
 }
 
 inline bool sameLightControls(const HarmonicMIDI::grid::SceneLightRecord& a,
@@ -232,10 +253,12 @@ inline bool evaluateDirectionalOrPointLight(const std::map<std::string, double>&
         || !apply("blue", light.color.z, 0.0, kMaximumLightValue, false)
         || !apply("intensity", light.intensity, 0.0, kMaximumLightValue, false))
         return false;
-    if (light.kind == HarmonicMIDI::grid::SceneLightKind::Point)
-        return apply("positionX", light.transform.translation.x, -1000000.0, 1000000.0, true)
-            && apply("positionY", light.transform.translation.y, -1000000.0, 1000000.0, true)
-            && apply("positionZ", light.transform.translation.z, -1000000.0, 1000000.0, true);
+    if (positionedLight(light)
+        && !(apply("positionX", light.transform.translation.x, -1000000.0, 1000000.0, true)
+             && apply("positionY", light.transform.translation.y, -1000000.0, 1000000.0, true)
+             && apply("positionZ", light.transform.translation.z, -1000000.0, 1000000.0, true)))
+        return false;
+    if (!orientedLight(light)) return true;
     // Euler XYZ degrees to a quaternion, with the same half-angle convention as the plugin's
     // Transform 3D lowering.
     const std::array<const char*, 3> names { "rotationX", "rotationY", "rotationZ" };
@@ -317,15 +340,15 @@ inline bool directionalOrPointOverride(const std::map<std::string, double>& para
     out.color = color;
     out.hasIntensity = intensity != base.intensity;
     out.intensity = intensity;
-    if (base.kind == SceneLightKind::Point)
+    if (positionedLight(base))
     {
         SceneVec3 position {};
         if (!offset("positionX", position.x) || !offset("positionY", position.y) || !offset("positionZ", position.z))
             return false;
         out.hasPositionOffset = position.x != 0.0f || position.y != 0.0f || position.z != 0.0f;
         out.positionOffset = position;
-        return true;
     }
+    if (!orientedLight(base)) return true;
     // Euler XYZ degrees to the offset quaternion, with the same half-angle convention as the
     // plugin's Transform 3D lowering. The executor composes it as offset * sampled rotation.
     const std::array<const char*, 3> names { "rotationX", "rotationY", "rotationZ" };
@@ -348,6 +371,35 @@ inline bool directionalOrPointOverride(const std::map<std::string, double>& para
                            static_cast<float>(cx * cy * sz - sx * sy * cz),
                            static_cast<float>(cx * cy * cz + sx * sy * sz) };
     return true;
+}
+
+// Runtime parameter prefixes of the foil a render request draws. A standalone
+// plan names its material operation. A Scene Compose plan keeps only the
+// retained scene and the Render, so its leaf foil is named by the foil node of
+// its Material Field; a composed foil without one keeps its authored values.
+inline std::vector<std::string> diffractionParameterPrefixes(
+    const videowire::CompiledVisualLayerPlan& plan, const visualimportedscenerender::Request& render)
+{
+    std::vector<std::string> prefixes;
+    if (render.importedScene)
+    {
+        const auto& field = render.importedScene->materialField;
+        if (render.importedScene->diffractionMaterial && field && field->materialNode >= 0)
+            prefixes.push_back("visual" + std::to_string(static_cast<std::uint64_t>(field->materialNode) + 1u) + "/");
+        return prefixes;
+    }
+    if (render.diffractionMaterial)
+        for (const auto& operation : plan.operations)
+            if (operation.kind == "visual.material.diffraction-grating"
+                || operation.kind == "visual.material.diffractive-foil")
+                prefixes.push_back("visual" + std::to_string(static_cast<std::uint64_t>(operation.nodeId) + 1u) + "/");
+    return prefixes;
+}
+
+inline const std::optional<diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest>&
+renderedDiffractionMaterial(const visualimportedscenerender::Request& render)
+{
+    return render.importedScene ? render.importedScene->diffractionMaterial : render.diffractionMaterial;
 }
 
 inline void seedImportedSceneRuntimeParameters(
@@ -411,18 +463,22 @@ inline void seedImportedSceneRuntimeParameters(
         parameters.emplace(renderPrefix + parameter, 0.0);
     // Zero is the authored vertical field of view.
     parameters.emplace(renderPrefix + "cameraFovDegrees", 0.0);
+    // Zero keeps the authored lens value; blade rotation adds degrees.
+    for (const auto* parameter : { "cameraFocusDistance", "cameraFStop",
+                                  "cameraBladeRotation", "cameraApertureRatio" })
+        parameters.emplace(renderPrefix + parameter, 0.0);
+    // Above zero, an orthographic camera with this full view height in world units.
+    parameters.emplace(renderPrefix + "cameraOrthographicHeight", 0.0);
     parameters.emplace(renderPrefix + "objectScale", 1.0);
     parameters.emplace(renderPrefix + "emissionGain", 1.0);
-    if (compiled.importedSceneRender->diffractionMaterial)
-        for (const auto& operation : plan.operations)
-            if (operation.kind == "visual.material.diffraction-grating"
-                || operation.kind == "visual.material.diffractive-foil")
-            {
-                const auto prefix = "visual" + std::to_string(static_cast<std::uint64_t>(operation.nodeId) + 1u) + "/";
-                for (const auto& [name, value] : diffractionmaterialbinding::runtimeParameterValues(
-                        *compiled.importedSceneRender->diffractionMaterial))
-                    parameters.emplace(prefix + name, value);
-            }
+    // Preview-only solid viewport shading; the renderer clears it for export.
+    for (const auto* parameter : { "viewportSolid", "viewportSolidLighting", "viewportSolidMatcap",
+                                  "viewportSolidColor", "viewportSolidCavity", "viewportSolidXray" })
+        parameters.emplace(renderPrefix + parameter, 0.0);
+    if (const auto& foil = renderedDiffractionMaterial(*compiled.importedSceneRender))
+        for (const auto& prefix : diffractionParameterPrefixes(plan, *compiled.importedSceneRender))
+            for (const auto& [name, value] : diffractionmaterialbinding::runtimeParameterValues(*foil))
+                parameters.emplace(prefix + name, value);
     bakedtarget::seed(plan, compiled, parameters);
 }
 
@@ -645,6 +701,52 @@ private:
     std::uint64_t planCompiles_ = 0;
 };
 
+// The spectrum frame binder for composed timeline geometry. It reads the layer's shared
+// spectrum analysis at project time, or at the frame time when no project time is given.
+template <typename Layer>
+videowire::geometry::SpectrumFrameBinder
+composedSpectrumHook(const Layer& layer, double projectSeconds, double frameSeconds, bool exporting)
+{
+    videowire::geometry::SpectrumFrameBinder hook;
+    if constexpr (videowire::HasGeometrySpectrumInput<Layer>::value)
+    {
+        auto spectrumFrame = std::make_shared<geometry::SpectrumEvaluation>();
+        spectrumFrame->timeSeconds = std::isfinite(projectSeconds) ? projectSeconds : frameSeconds;
+        spectrumFrame->liveFrameAvailable = layer.audioPresent;
+        if (layer.audioPresent)
+            std::copy_n(layer.audioFeatures.bands.begin(),
+                        std::min(layer.audioFeatures.bands.size(), spectrumFrame->bands.size()),
+                        spectrumFrame->bands.begin());
+        spectrumFrame->featuresAt = layer.spectrumFeaturesAt;
+        if constexpr (videowire::HasGeometrySpectrumHistoryInput<Layer>::value)
+            spectrumFrame->historyFeaturesAt = layer.spectrumHistoryFeaturesAt;
+        if constexpr (videowire::HasGeometrySpectrumSourceInput<Layer>::value)
+            spectrumFrame->sourceFeaturesAt = layer.spectrumSourceFeaturesAt;
+        if constexpr (videowire::HasGeometrySpectrumScalarInput<Layer>::value)
+        {
+            if (layer.audioPresent)
+            {
+                spectrumFrame->scalars.rms = layer.audioFeatures.rms;
+                spectrumFrame->scalars.peak = layer.audioFeatures.peak;
+                spectrumFrame->scalars.onset = layer.audioFeatures.onset;
+            }
+            spectrumFrame->scalarFeaturesAt = layer.spectrumScalarFeaturesAt;
+            if constexpr (videowire::HasGeometrySpectrumHistoryScalarInput<Layer>::value)
+                spectrumFrame->historyScalarFeaturesAt = layer.spectrumHistoryScalarFeaturesAt;
+            if constexpr (videowire::HasGeometrySpectrumSourceScalarInput<Layer>::value)
+                spectrumFrame->sourceScalarFeaturesAt = layer.spectrumSourceScalarFeaturesAt;
+        }
+        if constexpr (videowire::HasGeometryParticleInput<Layer>::value)
+            spectrumFrame->beatDelay = videowire::effectorBeatDelay(layer.particleHistory);
+        hook = geometry::composedSpectrumFrame(std::move(spectrumFrame), exporting);
+    }
+    else
+    {
+        (void) layer; (void) projectSeconds; (void) frameSeconds; (void) exporting;
+    }
+    return hook;
+}
+
 inline double importedTimelineEvaluationSeconds(double sourceSeconds,
     const visualdeformation::RationalFrameTime& frame, bool solidOverlay)
 {
@@ -679,6 +781,8 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     previewextent::Extent* renderedExtent = nullptr,
     std::string* causticDegradation = nullptr)
 {
+    // A Path Trace preview drawn for this layer watches this clip's edits.
+    const videohelper::renderinput::ClipScope clipScope(clipId);
     const auto* plan = videowire::findVisualLayerPlan(plans, clipId);
     // Refuse before resetting the layer or publishing source/cache retirement.
     // Canonical V26 carries several imported leaves. The Render node draws
@@ -887,6 +991,7 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     request.objectNodeStableId = importedSource.objectNodeStableId;
     request.objectMeshStableId = importedSource.objectMeshStableId;
     request.objectLocalTransform = importedSource.objectLocalTransform;
+    request.additionalObjectLocalTransforms = importedSource.additionalObjectLocalTransforms;
     request.dimensions = {renderExtent.width, renderExtent.height};
     request.deformation = importedSource.deformation;
     // The engine belongs to the outer render request; composed leaves are Raster.
@@ -896,7 +1001,15 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     request.pathTracePreviewSamples = compiled->importedSceneRender->pathTracePreviewSamples;
     request.pathTraceDenoise = compiled->importedSceneRender->pathTraceDenoise;
     request.pathTraceMaxBounces = compiled->importedSceneRender->pathTraceMaxBounces;
+    request.pathTraceVolume = compiled->importedSceneRender->pathTraceVolume;
+    request.pathTraceLightPaths = compiled->importedSceneRender->pathTraceLightPaths;
+    request.worldVolume = compiled->importedSceneRender->worldVolume;
+    request.motionBlurShutter = compiled->importedSceneRender->motionBlurShutter;
+    request.motionBlurPosition = compiled->importedSceneRender->motionBlurPosition;
     request.runtimeInputs.imageOutput = compiled->importedSceneRender->imageOutput;
+    // The shutter keeps the previous frame's motion for every engine.
+    request.runtimeInputs.motionBlur = visualimportedscenerender::shutterInterval(
+        request.motionBlurShutter, request.motionBlurPosition);
     request.runtimeInputs.linearColor = linearColor;
     if (linearColor && request.runtimeInputs.imageOutput != renderpassoutput::Output::Color
         && request.runtimeInputs.imageOutput != renderpassoutput::Output::Emission)
@@ -983,17 +1096,24 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         // Per-key deltas come from the runtime morph<i>Weight parameters. An absent or zero
         // key adds nothing, and a nonfinite value is refused rather than dropped.
         pose.morphWeightDeltas.clear();
-        for (std::size_t key = 0; key < visualanimation::kMaximumMorphWeightDeltas; ++key)
+        const auto morphPrefix = prefix + "morph";
+        for (auto found = runtimeParameters->lower_bound(morphPrefix);
+             found != runtimeParameters->end() && found->first.compare(0, morphPrefix.size(), morphPrefix) == 0;
+             ++found)
         {
-            const auto found = runtimeParameters->find(
-                prefix + visualanimation::morphWeightDeltaParameter(key));
-            if (found == runtimeParameters->end()) continue;
+            std::size_t key = 0;
+            if (!visualanimation::parseMorphWeightDeltaParameter(
+                    std::string_view(found->first).substr(prefix.size()), key))
+                continue;
             if (!std::isfinite(found->second))
                 return rejectBool("Imported animation morph weight delta is nonfinite");
             const auto delta = std::clamp(static_cast<double>(found->second), -16.0, 16.0);
             if (delta != 0.0)
                 pose.morphWeightDeltas.emplace_back(static_cast<std::uint32_t>(key), delta);
         }
+        // Map order is by name ("morph10" before "morph2"); the pose wants key order.
+        std::sort(pose.morphWeightDeltas.begin(), pose.morphWeightDeltas.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
         const char* translationIds[] { "boneTranslateX", "boneTranslateY", "boneTranslateZ" };
         const char* rotationIds[] { "boneRotateX", "boneRotateY", "boneRotateZ" };
         const char* scaleIds[] { "boneScaleX", "boneScaleY", "boneScaleZ" };
@@ -1042,22 +1162,40 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             value("objectRotationZ", 0.0, -360.0, 360.0)
         };
         request.runtimeInputs.objectScale = value("objectScale", 1.0, 0.01, 100.0);
-        request.runtimeInputs.cameraTranslationOffset = std::array<float, 3> {
-            value("cameraX", 0.0, -1000000.0, 1000000.0),
-            value("cameraY", 0.0, -1000000.0, 1000000.0),
-            value("cameraZ", 0.0, -1000000.0, 1000000.0)
+        // Translation, rotation, field of view and orthographic height, which the
+        // runtime record carries as a negative field of view.
+        static_assert(runtimecamera::kMaximumOrthographicHeight == arbitgpu::kMaximumRuntimeOrthographicHeight);
+        const auto camera = runtimecamera::read(*runtimeParameters, prefix);
+        request.runtimeInputs.cameraTranslationOffset = camera.translationOffset;
+        request.runtimeInputs.cameraRotationDegrees = camera.rotationDegrees;
+        request.runtimeInputs.cameraVerticalFovDegrees = camera.verticalFovDegrees;
+        // The camera one frame earlier, from the clip's own parameter evaluator,
+        // so a frame with no adjacent predecessor still shows the camera move.
+        if (const auto earlier = runtimecamera::previous(layer, prefix, projectSeconds, framesPerSecond))
+            request.runtimeInputs.previousCamera = arbitgpu::NativeRuntimeCameraHistory {
+                earlier->translationOffset, earlier->rotationDegrees, earlier->verticalFovDegrees };
+        // Live lens values. Zero keeps the authored value; positive values below the
+        // lowest the camera admits round up to it, as the field of view does.
+        const auto atLeast = [](float candidate, float minimum)
+        { return candidate > 0.0f ? std::max(candidate, minimum) : 0.0f; };
+        request.runtimeInputs.cameraLens = {
+            atLeast(value("cameraFocusDistance", 0.0, 0.0, 1000000.0), 0.001f),
+            atLeast(value("cameraFStop", 0.0, 0.0, 128.0), 0.1f),
+            value("cameraBladeRotation", 0.0, -360.0, 360.0),
+            atLeast(value("cameraApertureRatio", 0.0, 0.0, 100.0), 0.01f)
         };
-        request.runtimeInputs.cameraRotationDegrees = std::array<float, 3> {
-            value("cameraRotateX", 0.0, -360.0, 360.0),
-            value("cameraRotateY", 0.0, -360.0, 360.0),
-            value("cameraRotateZ", 0.0, -360.0, 360.0)
-        };
-        // Positive values under the narrowest lens round up to it. Zero or negative
-        // values keep the authored field of view.
-        const auto fieldOfView = value("cameraFovDegrees", 0.0, 0.0, 179.0);
-        request.runtimeInputs.cameraVerticalFovDegrees = fieldOfView > 0.0f
-            ? std::max(fieldOfView, HarmonicMIDI::grid::kMinimumCameraVerticalFovDegrees) : 0.0f;
         request.runtimeInputs.emissionGain = value("emissionGain", 1.0, 0.0, kMaximumLightValue);
+        if (value("viewportSolid", 0.0, 0.0, 1.0) > 0.5f)
+        {
+            request.runtimeInputs.viewportSolid = {
+                1.0f,
+                std::round(value("viewportSolidLighting", 0.0, 0.0, 1.0)),
+                std::round(value("viewportSolidMatcap", 0.0, 0.0, 3.0)),
+                std::round(value("viewportSolidColor", 0.0, 0.0, 3.0)) };
+            request.runtimeInputs.viewportSolidEffects = {
+                value("viewportSolidCavity", 0.0, 0.0, 1.0) > 0.5f ? 1.0f : 0.0f,
+                value("viewportSolidXray", 0.0, 0.0, 1.0) > 0.5f ? 1.0f : 0.0f, 0.0f, 0.0f };
+        }
     }
     if (!importedanimation::importedAnimationFrameIdentity(
             sourceSeconds, framesPerSecond, request.frame, error))
@@ -1078,26 +1216,27 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     request.surfacePrograms = compiled->importedSceneRender->surfacePrograms;
     request.glassCaustic = compiled->importedSceneRender->glassCaustic;
     if (!request.surfacePrograms.empty()) request.runtimeInputs.canonicalBlockCFrame = canonicalBlockCFrame;
-    request.diffractionMaterial = compiled->importedSceneRender->diffractionMaterial;
+    // A Scene Compose leaf foil rides on its leaf; the payload execution
+    // checks that this copy matches it and binds it to the composed scene.
+    request.diffractionMaterial = renderedDiffractionMaterial(*compiled->importedSceneRender);
     if (request.diffractionMaterial && runtimeParameters)
-        for (const auto& operation : plan->operations)
-            if (operation.kind == "visual.material.diffraction-grating"
-                || operation.kind == "visual.material.diffractive-foil")
-            {
-                const auto prefix = "visual" + std::to_string(static_cast<std::uint64_t>(operation.nodeId) + 1u) + "/";
-                const auto baseline = diffractionmaterialbinding::runtimeParameterValues(*request.diffractionMaterial);
-                for (const auto& [key, value] : *runtimeParameters)
-                    if (key.compare(0, prefix.size(), prefix) == 0)
-                    {
-                        const auto name = key.substr(prefix.size());
-                        const auto original = baseline.find(name);
-                        if (original == baseline.end() || !std::isfinite(value))
-                            return reject("Diffraction modulation targets an unavailable or nonfinite parameter");
-                        if (value != original->second) request.runtimeInputs.diffractionParameters.emplace(name, value);
-                    }
-            }
+        for (const auto& prefix : diffractionParameterPrefixes(*plan, *compiled->importedSceneRender))
+        {
+            const auto baseline = diffractionmaterialbinding::runtimeParameterValues(*request.diffractionMaterial);
+            for (const auto& [key, value] : *runtimeParameters)
+                if (key.compare(0, prefix.size(), prefix) == 0)
+                {
+                    const auto name = key.substr(prefix.size());
+                    const auto original = baseline.find(name);
+                    if (original == baseline.end() || !std::isfinite(value))
+                        return reject("Diffraction modulation targets an unavailable or nonfinite parameter");
+                    if (value != original->second) request.runtimeInputs.diffractionParameters.emplace(name, value);
+                }
+        }
     request.camera = compiled->importedSceneRender->camera;
-    if (compiled->importedSceneRender->materialField)
+    const auto& materialField = request.importedScene
+        ? request.importedScene->materialField : compiled->importedSceneRender->materialField;
+    if (materialField)
     {
         if (!request.diffractionMaterial) return reject("Material Field requires an authored diffraction material");
         videowire::geometry::RuntimeFieldEvaluation evaluation;
@@ -1107,7 +1246,7 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         {
             return scorefield::evaluateSampleField(operation, positions, canonicalBlockCFrame, result, diagnostic);
         };
-        if (!materialfield::evaluate(*compiled->importedSceneRender->materialField, evaluation,
+        if (!materialfield::evaluate(*materialField, evaluation,
                 *request.diffractionMaterial, request.runtimeInputs.diffractionParameters, error))
             return VisualImportedScenePreparation::rejected;
         request.runtimeInputs.canonicalBlockCFrame = canonicalBlockCFrame;
@@ -1134,6 +1273,7 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             return reject("note-reactive light requires the canonical score frame for this preview or export time");
     }
     request.sceneSnapshot = compiled->importedSceneRender->sceneSnapshot;
+    request.leafIdScheme = compiled->importedSceneRender->leafIdScheme;
     // PBR numbers and the bounded displacement limit are baked into the plan.
     // A modulated value derives a scene or material once per quantized change.
     auto* baked = planCache->bakedTargetSlot(plan->clipId);
@@ -1228,10 +1368,10 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             videorender::ParticleBodyState bodies;
             if (videorender::hasBodyCoupledWater(parameters))
             {
-                if (sourceSeconds!=projectSeconds || seconds!=projectSeconds)
-                    return reject("Imported water coupling requires the same project-zero source, body and scene clock");
+                // Water and bodies simulate together in project time, from project zero,
+                // whatever the clip's own offset; the scene samples the water there.
                 videorender::WaterCoupledFrame water;
-                if (!videorender::replayWaterCoupledBodies(parameters,seconds,float(width)/height,
+                if (!videorender::replayWaterCoupledBodies(parameters,projectSeconds,float(width)/height,
                     canonicalBlockCFrame.get(),bodies,*solids,nullptr,error,nullptr,&water))
                     return VisualImportedScenePreparation::rejected;
                 preparedCoupledWater=std::make_shared<const videorender::WaterCoupledFrame>(std::move(water));
@@ -1306,9 +1446,22 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             waterHistory = inputLayer.particleHistory.get();
         // Solid replay sampled each child at sourceSeconds, so the scene must too.
         const double frameSeconds = importedTimelineEvaluationSeconds(sourceSeconds, request.frame, solidOverlay);
-        request.sceneSnapshot = cache.familyEvaluator.evaluate(owner, family, request.sceneSnapshot,
-            frameSeconds, cache.familyEvaluationLimits, error, nullptr, projectSeconds,
-            nullptr, waterHistory, canonicalBlockCFrame);
+        auto spectrumFrame = composedSpectrumHook(inputLayer, projectSeconds, frameSeconds,
+                                                  use == NativeImportedSceneRenderUse::Export);
+        if (preparedCoupledWater && preparedSolidParameters)
+        {
+            // A body-coupled Water child solves with its bodies inside the family, and
+            // spectrum children read the same frame hook as the uncoupled family.
+            auto coupled = cache.familyEvaluator.evaluateCoupled(owner, family, request.sceneSnapshot,
+                *preparedSolidParameters, frameSeconds, projectSeconds, projectSeconds,
+                float(width) / height, canonicalBlockCFrame, cache.familyEvaluationLimits, {}, error,
+                nullptr, nullptr, std::move(spectrumFrame));
+            request.sceneSnapshot = std::move(coupled.scene);
+        }
+        else
+            request.sceneSnapshot = cache.familyEvaluator.evaluate(owner, family, request.sceneSnapshot,
+                frameSeconds, cache.familyEvaluationLimits, error, nullptr, projectSeconds,
+                nullptr, waterHistory, canonicalBlockCFrame, std::move(spectrumFrame));
         if (!request.sceneSnapshot) return VisualImportedScenePreparation::rejected;
         if (request.material && !request.importedScene) request.material->sceneSnapshot = request.sceneSnapshot;
         for (auto& program : request.surfacePrograms)
@@ -1330,9 +1483,12 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         const videorender::ParticleHistorySource* waterHistory = nullptr;
         if constexpr (videowire::HasGeometryParticleInput<Layer>::value)
             waterHistory = inputLayer.particleHistory.get();
+        auto spectrumFrame = composedSpectrumHook(inputLayer, projectSeconds, frameSeconds,
+                                                  use == NativeImportedSceneRenderUse::Export);
         request.sceneSnapshot = geometry::evaluateComposedTimelineGeometry(cache.runtime, owner,
             *compiled->importedSceneRender->timelineGeometry, request.sceneSnapshot, frameSeconds, error,
-            waterHistory, projectSeconds, canonicalBlockCFrame, preparedCoupledWater.get(), staticIdentity.planPublication);
+            waterHistory, projectSeconds, canonicalBlockCFrame, preparedCoupledWater.get(), staticIdentity.planPublication,
+            std::move(spectrumFrame));
         if (!request.sceneSnapshot) return VisualImportedScenePreparation::rejected;
         if (request.material && !request.importedScene) request.material->sceneSnapshot = request.sceneSnapshot;
         for (auto& program : request.surfacePrograms)
@@ -1414,6 +1570,12 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             }
             else return reject("Imported vertex deformation requires the shared audio frame");
         }
+        // Vertex Control Parameter reads: the authored values, replaced by this
+        // frame's published controls and modulation.
+        std::string controlError;
+        if (!videowire::vertexcontrol::bank(*request.material->vertexModifier, runtimeParameters,
+                request.runtimeInputs.vertexControls, controlError))
+            return reject(controlError.c_str());
         // The native draw runs the program again at the prior frame's time,
         // spectrum and prior skinned or timeline position. Inputs other than
         // position come from the current vertex, so refuse programs needing them.
@@ -1473,9 +1635,18 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     // Preview only. The caller reports this to the HUD, since the graph timer starts
     // after prepare and never sees the scene render. Export timing is not touched.
     const auto previewRenderStart = std::chrono::steady_clock::now();
-    const bool executed = use == NativeImportedSceneRenderUse::Preview
-        ? execution->executePreview(request, receipt, error)
-        : execution->executeExport(request, receipt, error);
+    // An allocation that fails inside the render refuses this frame with its
+    // message. Some callers above this one are noexcept (the export probe
+    // aborted the helper on 6 Nov), so the throw stops here.
+    bool executed = false;
+    try
+    {
+        executed = use == NativeImportedSceneRenderUse::Preview
+            ? execution->executePreview(request, receipt, error)
+            : execution->executeExport(request, receipt, error);
+    }
+    catch (const std::bad_alloc&) { error = "Imported scene render could not allocate memory for this frame"; executed = false; }
+    catch (const std::length_error&) { error = "Imported scene render could not allocate memory for this frame"; executed = false; }
     const auto previewRenderElapsed = std::chrono::steady_clock::now() - previewRenderStart;
     if (!executed) return VisualImportedScenePreparation::rejected;
     if constexpr (HasImportedPendingReceipt<typename Execution::Receipt>::value)

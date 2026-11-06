@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <vector>
 
 namespace videohelper
 {
@@ -18,8 +19,8 @@ inline bool applyNoteReactiveLight(
 {
     if (!canonicalblockc::valid(frame)) return false;
     const auto& data = frame->noteTextureValues;
-    std::array<int, arbitblockc::kMaxNotes> rows {};
     const int count = frame->noteRows();
+    std::vector<int> rows(static_cast<std::size_t>(std::max(count, 0)));
     for (int i = 0; i < count; ++i) rows[static_cast<std::size_t>(i)] = i;
     std::sort(rows.begin(), rows.begin() + count, [&frame](int a, int b)
         { return frame->noteIdentities[static_cast<std::size_t>(a)]

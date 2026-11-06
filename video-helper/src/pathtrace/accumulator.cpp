@@ -13,6 +13,7 @@ void Accumulator::resize (std::uint32_t width, std::uint32_t height)
     width_ = width;
     height_ = height;
     pixels_.assign (static_cast<std::size_t> (width) * height, Pixel {});
+    guides_.assign (pixels_.size(), GuidePixel {});
     rejected_.store (0, std::memory_order_relaxed);
     {
         const std::lock_guard<std::mutex> lock (splatsMutex_);
@@ -27,6 +28,8 @@ void Accumulator::reset (std::uint64_t generation) noexcept
     generation_ = generation;
     for (auto& pixel : pixels_)
         pixel = Pixel {};
+    for (auto& guide : guides_)
+        guide = GuidePixel {};
     rejected_.store (0, std::memory_order_relaxed);
     if (splatsReady_.load (std::memory_order_acquire))
         for (std::size_t i = 0, n = pixels_.size() * 3; i < n; ++i)
@@ -115,6 +118,38 @@ void Accumulator::addSample (std::uint32_t x, std::uint32_t y, Rgb radiance) noe
     pixel.g += (radiance.g - pixel.g) * weight;
     pixel.b += (radiance.b - pixel.b) * weight;
     pixel.samples = n;
+}
+
+void Accumulator::addGuideSum (std::uint32_t x, std::uint32_t y, Rgb albedo, Rgb normal, std::uint32_t count) noexcept
+{
+    if (x >= width_ || y >= height_ || count == 0)
+        return;
+    GuidePixel& guide = guides_[static_cast<std::size_t> (y) * width_ + x];
+    const float values[6] { albedo.r, albedo.g, albedo.b, normal.r, normal.g, normal.b };
+    for (int channel = 0; channel < 6; ++channel)
+    {
+        float& sum = channel < 3 ? guide.albedo[channel] : guide.normal[channel - 3];
+        if (std::isfinite (values[channel]))
+            sum += values[channel];
+    }
+    guide.samples += count;
+}
+
+void Accumulator::guideMean (std::uint32_t x, std::uint32_t y, Rgb& albedo, Rgb& normal) const noexcept
+{
+    albedo = {};
+    normal = {};
+    if (x >= width_ || y >= height_)
+        return;
+    const GuidePixel& guide = guides_[static_cast<std::size_t> (y) * width_ + x];
+    if (guide.samples == 0)
+        return;
+    const float scale = 1.0f / static_cast<float> (guide.samples);
+    albedo = { guide.albedo[0] * scale, guide.albedo[1] * scale, guide.albedo[2] * scale };
+    const float length = std::sqrt (guide.normal[0] * guide.normal[0] + guide.normal[1] * guide.normal[1]
+                                    + guide.normal[2] * guide.normal[2]);
+    if (length > 0.0f)
+        normal = { guide.normal[0] / length, guide.normal[1] / length, guide.normal[2] / length };
 }
 
 void Accumulator::addSampleSum (std::uint32_t x, std::uint32_t y, Rgb radiance, std::uint32_t count) noexcept

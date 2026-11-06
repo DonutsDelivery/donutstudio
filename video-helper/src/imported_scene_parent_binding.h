@@ -221,7 +221,8 @@ public:
             return x.size()==y.size() && (x.empty() || std::memcmp(x.data(),y.data(),x.size()*sizeof(Record))==0);
         };
         if (basis.schemaVersion!=scene.schemaVersion || basis.id!=scene.id || basis.activeCamera!=scene.activeCamera
-            || !same(basis.ambientColor,scene.ambientColor) || basis.vertexCount!=scene.vertexCount
+            || !same(basis.ambientColor,scene.ambientColor)
+            || !HarmonicMIDI::grid::sameSceneVolume(basis.worldVolume,scene.worldVolume) || basis.vertexCount!=scene.vertexCount
             || basis.indexCount!=scene.indexCount || basis.objectCount!=scene.objectCount
             || basis.materialCount!=scene.materialCount || basis.textureCount!=scene.textureCount
             || basis.textureTexelCount!=scene.textureTexelCount || basis.lightCount!=scene.lightCount
@@ -253,7 +254,8 @@ public:
                 || !same(a.opacity,b.opacity) || !same(a.metallic,b.metallic) || !same(a.roughness,b.roughness)
                 || !same(a.emissive,b.emissive) || !same(a.normalScale,b.normalScale)
                 || !same(a.occlusionStrength,b.occlusionStrength) || a.alphaMode!=b.alphaMode
-                || !same(a.alphaCutoff,b.alphaCutoff) || a.doubleSided!=b.doubleSided) return false;
+                || !same(a.alphaCutoff,b.alphaCutoff) || a.doubleSided!=b.doubleSided
+                || !HarmonicMIDI::grid::sameSceneVolume(a.volume,b.volume)) return false;
         }
         for (std::size_t x=0;x<basis.lights.size();++x)
             if (!HarmonicMIDI::grid::scenecomposition::sameLightRecord(basis.lights[x],scene.lights[x])) return false;
@@ -382,7 +384,9 @@ public:
             && runtime.objectTranslationOffset==translation_ && runtime.objectRotationDegrees==rotation_
             && runtime.objectScale==scale_ && runtime.cameraTranslationOffset==cameraTranslation_
             && runtime.cameraRotationDegrees==cameraRotation_ && runtime.cameraVerticalFovDegrees==cameraFov_
+            && runtime.cameraLens==cameraLens_
             && runtime.morphWeight==morphWeight_ && runtime.emissionGain==emissionGain_
+            && runtime.viewportSolid==viewportSolid_ && runtime.viewportSolidEffects==viewportSolidEffects_
             && sameLightOverride && arbitgpu::sameNativeImportedLightOverrides(runtime.lightOverrides,overrides_)
             && sameLights && !runtime.noteInstanceMapping;
     }
@@ -399,6 +403,7 @@ public:
             && a->cameraVerticalFovDegrees==b->cameraVerticalFovDegrees
             && a->morphWeight==b->morphWeight && a->cameraOverride.has_value()==b->cameraOverride.has_value()
             && a->timeSeconds==b->timeSeconds && a->vertexSpectrum==b->vertexSpectrum
+            && a->vertexControls==b->vertexControls
             && a->scenePositions==b->scenePositions
             && (!a->cameraOverride || sameCameraRecord(*a->cameraOverride,*b->cameraOverride))));
     }
@@ -461,7 +466,10 @@ public:
             || runtime->objectRotationDegrees!=rotation_ || runtime->objectScale!=scale_
             || runtime->cameraTranslationOffset!=cameraTranslation_ || runtime->emissionGain!=emissionGain_
             || runtime->cameraRotationDegrees!=cameraRotation_
-            || runtime->cameraVerticalFovDegrees!=cameraFov_)) return false;
+            || runtime->cameraVerticalFovDegrees!=cameraFov_
+            || runtime->cameraLens!=cameraLens_
+            || runtime->viewportSolid!=viewportSolid_
+            || runtime->viewportSolidEffects!=viewportSolidEffects_)) return false;
         return owner_ && owner_->inspect(expected) && owner_->budget_->consumeWork(1,10)
             && time==time_ && structural==owner_->structural_ && evaluation==owner_->evaluation_
             && project==owner_->project_ && helper==owner_->helper_ && clip==owner_->renderClip_
@@ -496,6 +504,8 @@ private:
     std::uint64_t node_=0;
     std::array<float,3> translation_ {},rotation_ {},cameraTranslation_ {},cameraRotation_ {};
     float scale_=1,morphWeight_=1,emissionGain_=1,cameraFov_=0;
+    std::array<float,4> cameraLens_ {};
+    std::array<float,4> viewportSolid_{},viewportSolidEffects_{};
     float timeSeconds_=0;
     bool linearColor_=false;
 };

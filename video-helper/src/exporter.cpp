@@ -4,6 +4,8 @@
 #include "block_c_frame_owner.h"
 #include "particle_history.h"
 #include "export_encoder_fallback.h"
+#include "export_encoder_route.h"
+#include "yuv_encode_math.h"
 #include "software_h264_encoder.h"
 #if ARBIT_HAVE_KVAZAAR10_EXPORT
 #include "kvazaar10_encoder.h"
@@ -43,7 +45,11 @@
 #include "helper_glfw.h"
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
+#else
+#include "gpu_encode_cuda_gl.h"
+#include "gpu_encode_vaapi_drm.h"
 #endif
 #endif
 
@@ -58,6 +64,7 @@ extern "C"
 {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
@@ -255,15 +262,14 @@ MonoPcm decodeWavToMonoFloat (const std::string& wavPath)
 
 // ---------------------------------------------------------------- encoders
 
-const char* hwEncoderName (const std::string& codec, const std::string& backend)
+// The format CPU frames are painted in for this encoder. A hardware encoder
+// with a frame pool takes the pool's software format, and encodeAndWrite
+// uploads into the pool; every other encoder takes its own pix_fmt.
+AVPixelFormat inputPixelFormat (const AVCodecContext* enc)
 {
-    if (codec != "h264" && codec != "h265")
-        return nullptr; // vp9/prores have no hw encode path here
-    if (backend == "nvenc")
-        return codec == "h265" ? "hevc_nvenc" : "h264_nvenc";
-    if (backend == "videotoolbox")
-        return codec == "h265" ? "hevc_videotoolbox" : "h264_videotoolbox";
-    return nullptr;
+    if (enc->hw_frames_ctx != nullptr)
+        return reinterpret_cast<const AVHWFramesContext*> (enc->hw_frames_ctx->data)->sw_format;
+    return enc->pix_fmt;
 }
 
 const char* softwareEncoderName (const std::string& codec)
@@ -276,34 +282,65 @@ const char* softwareEncoderName (const std::string& codec)
     return videohelper::softwareH264EncoderName();
 }
 
-const AVCodec* pickVideoEncoder (const ExportJob& job, std::string& nameOut)
+// An explicit hardware request gets that encoder or an error naming why
+// (choice.error); Auto names each hardware encoder it passed over.
+const AVCodec* pickVideoEncoder (const ExportJob& job, std::string& nameOut,
+                                 videohelper::exportroute::Choice& choice)
 {
-    // Explicit hardware request: that encoder or nothing.
-    if (job.encoder == "nvenc" || job.encoder == "videotoolbox")
+    choice = videohelper::exportroute::choose (
+        job.encoder, job.codec, videohelper::exportroute::currentPlatform(), job.hasHdrVideoOutput,
+        [] (const char* name) { return avcodec_find_encoder_by_name (name) != nullptr; });
+    if (! choice.ok)
     {
-        if (const char* n = hwEncoderName (job.codec, job.encoder))
-            if (const AVCodec* c = avcodec_find_encoder_by_name (n))
-            {
-                nameOut = n;
-                return c;
-            }
+        nameOut = job.encoder;
         return nullptr;
     }
+    nameOut = choice.encoderName.empty() ? softwareEncoderName (job.codec) : choice.encoderName;
+    return avcodec_find_encoder_by_name (nameOut.c_str());
+}
 
-    if (job.encoder == "auto" && (job.codec == "h264" || job.codec == "h265"))
+const AVCodec* pickVideoEncoder (const ExportJob& job, std::string& nameOut)
+{
+    videohelper::exportroute::Choice choice;
+    return pickVideoEncoder (job, nameOut, choice);
+}
+
+// A hardware frame pool for the encoder, so frames go to it in GPU memory.
+// Returns the reason when the device does not open; the encoder then takes
+// CPU frames where it can (NVENC, VideoToolbox) and fails where it cannot
+// (VA-API), and the export record names which.
+std::string attachHardwareFrames (AVCodecContext* encoder, AVHWDeviceType deviceType,
+                                  AVPixelFormat hardwareFormat, AVPixelFormat softwareFormat)
+{
+    AVBufferRef* device = nullptr;
+    if (int code = av_hwdevice_ctx_create (&device, deviceType, nullptr, nullptr, 0); code < 0)
     {
-        for (const char* backend : { "nvenc", "videotoolbox" })
-            if (const char* n = hwEncoderName (job.codec, backend))
-                if (const AVCodec* c = avcodec_find_encoder_by_name (n))
-                {
-                    nameOut = n;
-                    return c;
-                }
+        char text[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror (code, text, sizeof (text));
+        return std::string (av_hwdevice_get_type_name (deviceType)) + " device did not open: " + text;
     }
-
-    const char* n = softwareEncoderName (job.codec);
-    nameOut = n;
-    return avcodec_find_encoder_by_name (n);
+    AVBufferRef* frames = av_hwframe_ctx_alloc (device);
+    av_buffer_unref (&device);
+    if (frames == nullptr)
+        return std::string (av_hwdevice_get_type_name (deviceType)) + " frame pool did not allocate";
+    auto* context = reinterpret_cast<AVHWFramesContext*> (frames->data);
+    context->format = hardwareFormat;
+    context->sw_format = softwareFormat;
+    context->width = encoder->width;
+    context->height = encoder->height;
+    // The one-frame lag holds two frames; the encoder's lookahead holds more.
+    context->initial_pool_size = deviceType == AV_HWDEVICE_TYPE_VAAPI ? 32 : 0;
+    if (int code = av_hwframe_ctx_init (frames); code < 0)
+    {
+        av_buffer_unref (&frames);
+        char text[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror (code, text, sizeof (text));
+        return std::string (av_hwdevice_get_type_name (deviceType)) + " frame pool did not start: " + text;
+    }
+    encoder->pix_fmt = hardwareFormat;
+    encoder->sw_pix_fmt = softwareFormat;
+    encoder->hw_frames_ctx = frames;
+    return {};
 }
 
 // ---------------------------------------------------------------- progress
@@ -361,10 +398,14 @@ static void tagColorRec2020Hdr (AVCodecContext* enc, const std::string& transfer
 
 // Input is top-row-first, opaque, transfer-coded Rec.2020 PQ or HLG RGB. Chroma is
 // horizontally cosited and vertically centred, matching AVCHROMA_LOC_LEFT.
+// Planar yuv420p10le for software encoders; P010 (codes in the top ten bits,
+// Cb and Cr interleaved) for NVENC when its GPU route did not start.
 static std::string paintHdr420(const std::vector<float>& rgba, AVFrame* frame)
 {
     const int width = frame->width, height = frame->height;
-    if (frame->format != AV_PIX_FMT_YUV420P10LE || width <= 0 || height <= 0
+    const bool p010 = frame->format == AV_PIX_FMT_P010;
+    const int shift = p010 ? 6 : 0;
+    if ((frame->format != AV_PIX_FMT_YUV420P10LE && ! p010) || width <= 0 || height <= 0
         || (width & 1) || (height & 1)
         || rgba.size() != static_cast<size_t>(width) * height * 4)
         return "HDR movie pixel buffer has invalid dimensions or format";
@@ -383,13 +424,14 @@ static std::string paintHdr420(const std::vector<float>& rgba, AVFrame* frame)
                 || !std::isfinite(rgba[i + 3]) || rgba[i + 3] != 1.0f
                 || r < 0 || r > 1 || g < 0 || g > 1 || b < 0 || b > 1)
                 return "HDR movie contains invalid final pixels";
-            dstY[x] = code(kr * r + kg * g + kb * b, 64, 876);
+            dstY[x] = static_cast<uint16_t>(code(kr * r + kg * g + kb * b, 64, 876) << shift);
         }
     }
     for (int y = 0; y < height; y += 2)
     {
         auto* dstU = reinterpret_cast<uint16_t*>(frame->data[1] + (y / 2) * frame->linesize[1]);
-        auto* dstV = reinterpret_cast<uint16_t*>(frame->data[2] + (y / 2) * frame->linesize[2]);
+        auto* dstV = p010 ? dstU + 1 : reinterpret_cast<uint16_t*>(frame->data[2] + (y / 2) * frame->linesize[2]);
+        const int step = p010 ? 2 : 1;
         for (int x = 0; x < width; x += 2)
         {
             double cb = 0, cr = 0;
@@ -401,8 +443,8 @@ static std::string paintHdr420(const std::vector<float>& rgba, AVFrame* frame)
                 cb += (b - luma) / (2 * (1 - kb));
                 cr += (r - luma) / (2 * (1 - kr));
             }
-            dstU[x / 2] = code(cb / 2, 512, 896);
-            dstV[x / 2] = code(cr / 2, 512, 896);
+            dstU[x / 2 * step] = static_cast<uint16_t>(code(cb / 2, 512, 896) << shift);
+            dstV[x / 2 * step] = static_cast<uint16_t>(code(cr / 2, 512, 896) << shift);
         }
     }
     return {};
@@ -422,8 +464,23 @@ static bool usePrivateHdrMovieEncoder(const ExportJob& job)
 
 static std::string admitHdrMovieEncoder(const ExportJob& job)
 {
-    if (job.codec != "h265" || job.encoder != "software")
-        return "HDR movie output requires an explicit software HEVC encoder";
+    if (job.codec != "h265")
+        return "HDR movie output requires HEVC";
+    // NVENC and VA-API encode HDR as Main10 from P010 frames the GPU converts.
+    // Auto takes either where the FFmpeg build has it, and the software encoder
+    // otherwise.
+    const bool nvencHevc = avcodec_find_encoder_by_name("hevc_nvenc") != nullptr;
+    const bool onLinux = videohelper::exportroute::currentPlatform() == videohelper::exportroute::Platform::Linux;
+    const bool vaapiHevc = onLinux && avcodec_find_encoder_by_name("hevc_vaapi") != nullptr;
+    if (job.encoder == "nvenc")
+        return nvencHevc ? std::string() : "HDR movie output with NVENC needs hevc_nvenc, which this FFmpeg build lacks";
+    if (job.encoder == "vaapi")
+        return vaapiHevc ? std::string() : "HDR movie output with VA-API needs hevc_vaapi on Linux, which this build lacks";
+    if (job.encoder == "auto" && (vaapiHevc || (nvencHevc
+        && videohelper::exportroute::currentPlatform() != videohelper::exportroute::Platform::Apple)))
+        return {};
+    if (job.encoder != "software" && job.encoder != "auto")
+        return "HDR movie output takes the software, NVENC or VA-API HEVC encoder";
     if (usePrivateHdrMovieEncoder(job)) return {};
     const AVCodec* codec = avcodec_find_encoder_by_name("libx265");
     if (codec == nullptr)
@@ -519,7 +576,22 @@ std::string paintFrame (const DecodedFrame& src, AVFrame* dst, SwsContext*& sws,
 std::string encodeAndWrite (AVFormatContext* fmt, AVStream* stream,
                             AVCodecContext* enc, AVFrame* frame)
 {
+    // A hardware encoder with a frame pool takes CPU frames through an upload
+    // into the pool (VA-API always; NVENC and VideoToolbox on a fallback).
+    AVFrame* uploaded = nullptr;
+    if (frame != nullptr && enc->hw_frames_ctx != nullptr && frame->format != enc->pix_fmt)
+    {
+        uploaded = av_frame_alloc();
+        if (uploaded == nullptr || av_hwframe_get_buffer (enc->hw_frames_ctx, uploaded, 0) < 0
+            || av_hwframe_transfer_data (uploaded, frame, 0) < 0 || av_frame_copy_props (uploaded, frame) < 0)
+        {
+            av_frame_free (&uploaded);
+            return "uploading the frame to the hardware encoder failed";
+        }
+        frame = uploaded;
+    }
     int ret = avcodec_send_frame (enc, frame);
+    av_frame_free (&uploaded);
     if (ret < 0)
         return "avcodec_send_frame failed";
 
@@ -944,7 +1016,186 @@ struct GlExportContext
     std::string hdrTransfer;
     std::vector<float> pendingHdrMovie;
 
+    // GPU encode (Plan 3, export and encoders). gpuFrames is the encoder's
+    // hardware frame pool, borrowed. While it is set, renderNext renders into a
+    // frame from that pool instead of reading back RGBA, and the loop encodes
+    // gpuReady. Frames lag one call, as the readback does.
+    AVBufferRef* gpuFrames = nullptr;
+    AVFrame* gpuPending = nullptr;
+    AVFrame* gpuReady = nullptr;
+    std::string gpuProblem;  // why the GPU route did not run, for the export record
+    int64_t gpuFramesRendered = 0;
+    // The YUV the GPU writes for a CUDA or VA-API pool, read from the
+    // encoder's colour tags.
+    videohelper::yuvencode::Conversion gpuConversion;
+#if ! (defined(__APPLE__) && ARBIT_HAVE_IOSURFACE)
+    videohelper::CudaGlFrameBridge cudaBridge;
+    videohelper::VaapiDrmFrameBridge vaapiBridge;
+    // Why init asked for an EGL context for VA-API and did not get one.
+    std::string eglContextProblem;
+#endif
+
     ~GlExportContext() { shutdown(); }
+
+    // Starts the GPU route for a loop, or records why it cannot run and leaves
+    // the readback route in place.
+    void beginGpuEncode (const AVCodecContext* encoder, const char* declined)
+    {
+        endGpuEncode();
+        AVBufferRef* const encoderFrames = encoder != nullptr ? encoder->hw_frames_ctx : nullptr;
+        if (encoderFrames == nullptr)
+            return;
+        if (declined != nullptr)
+        {
+            gpuProblem = declined;
+            return;
+        }
+        if (hdrProfile != nullptr)
+        {
+            gpuProblem = "an HDR image profile paints its frames on the CPU";
+            return;
+        }
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        if (hdrMovie)
+        {
+            gpuProblem = "an HDR movie paints its frames on the CPU on macOS";
+            return;
+        }
+        // The VideoToolbox pool hands out IOSurface-backed pixel buffers; check
+        // one before the loop relies on it.
+        AVFrame* probe = av_frame_alloc();
+        const bool pooled = probe != nullptr && av_hwframe_get_buffer (encoderFrames, probe, 0) >= 0
+            && CVPixelBufferGetIOSurface (reinterpret_cast<CVPixelBufferRef> (probe->data[3])) != nullptr;
+        av_frame_free (&probe);
+        if (! pooled)
+        {
+            gpuProblem = "the VideoToolbox frame pool has no IOSurface-backed buffers";
+            return;
+        }
+#else
+        // The planes take the stream's own matrix, transfer and range.
+        const auto softwareFormat = reinterpret_cast<const AVHWFramesContext*> (encoderFrames->data)->sw_format;
+        const auto conversion = videohelper::yuvencode::fromStreamTags (
+            static_cast<int> (encoder->color_primaries), static_cast<int> (encoder->color_trc),
+            static_cast<int> (encoder->colorspace), static_cast<int> (encoder->color_range),
+            softwareFormat == AV_PIX_FMT_P010 ? 10 : 8, hdrPeakNits, gpuProblem);
+        if (! conversion.has_value())
+            return;
+        if (softwareFormat != AV_PIX_FMT_NV12 && softwareFormat != AV_PIX_FMT_P010)
+        {
+            gpuProblem = "the encoder's frame pool takes neither NV12 nor P010";
+            return;
+        }
+        if (reinterpret_cast<const AVHWFramesContext*> (encoderFrames->data)->format == AV_PIX_FMT_VAAPI)
+        {
+            if (! eglContextProblem.empty())
+            {
+                gpuProblem = eglContextProblem;
+                return;
+            }
+            if (! vaapiBridge.open (encoderFrames, conversion->bits, gpuProblem))
+            {
+                vaapiBridge.close();
+                return;
+            }
+        }
+        else if (! cudaBridge.open (encoderFrames, gpuProblem) || ! probeCudaInterop())
+        {
+            cudaBridge.close();
+            return;
+        }
+        gpuConversion = *conversion;
+#endif
+        gpuFrames = encoderFrames;
+    }
+
+    void endGpuEncode()
+    {
+        av_frame_free (&gpuPending);
+        av_frame_free (&gpuReady);
+        gpuFrames = nullptr;
+        gpuFramesRendered = 0;
+        gpuProblem.clear();
+#if ! (defined(__APPLE__) && ARBIT_HAVE_IOSURFACE)
+        cudaBridge.close();
+        vaapiBridge.close();  // deletes the imported plane textures while GL is current
+#endif
+    }
+
+#if ! (defined(__APPLE__) && ARBIT_HAVE_IOSURFACE)
+    // CUDA-GL interop fails when GL runs on another GPU than CUDA, as on a
+    // hybrid laptop. A 2 x 2 texture finds that out before the first frame.
+    bool probeCudaInterop()
+    {
+        GLuint texture = 0;
+        glGenTextures (1, &texture);
+        glBindTexture (GL_TEXTURE_2D, texture);
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindTexture (GL_TEXTURE_2D, 0);
+        AVFrame* frame = cudaBridge.capture (texture, 2, 2, gpuProblem);
+        const bool ok = frame != nullptr;
+        av_frame_free (&frame);
+        cudaBridge.release (texture);
+        glDeleteTextures (1, &texture);
+        return ok;
+    }
+#endif
+
+    bool renderNextGpu (const videorender::LayerDesc* layers, int numLayers, bool& haveOutput,
+                        std::string& errorOut, const videorender::ImageLayerDesc* overlays, int numOverlays)
+    {
+        haveOutput = false;
+        av_frame_free (&gpuReady);  // the loop encoded it last call
+#if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        AVFrame* captured = av_frame_alloc();
+        if (captured == nullptr || av_hwframe_get_buffer (gpuFrames, captured, 0) < 0)
+        {
+            av_frame_free (&captured);
+            errorOut = "the VideoToolbox frame pool is out of frames";
+            return false;
+        }
+        IOSurfaceRef target = CVPixelBufferGetIOSurface (reinterpret_cast<CVPixelBufferRef> (captured->data[3]));
+        if (target == nullptr || ! renderer.renderCompositeToIOSurface (
+                target, width, height, layers, numLayers, overlays, numOverlays))
+        {
+            av_frame_free (&captured);
+            errorOut = "native Metal export render failed: " + renderer.compositorBackend()
+                + (renderer.lastError().empty() ? std::string() : ": " + renderer.lastError());
+            return false;
+        }
+#else
+        unsigned luma = 0, chroma = 0;
+        AVFrame* captured = nullptr;
+        if (vaapiBridge.isOpen())
+        {
+            // The pass renders into the VA-API surface's own planes.
+            captured = vaapiBridge.acquire (luma, chroma, errorOut);
+            if (captured == nullptr)
+                return false;
+            if (! renderer.renderToExportYuv (layers, numLayers, gpuConversion, luma, chroma, errorOut, overlays,
+                                              numOverlays))
+            {
+                av_frame_free (&captured);
+                return false;
+            }
+            vaapiBridge.finish();
+        }
+        else if (! renderer.renderToExportYuv (layers, numLayers, gpuConversion, luma, chroma, errorOut, overlays,
+                                               numOverlays))
+            return false;
+        else
+            captured = cudaBridge.capturePlanes (luma, chroma, renderer.outputWidth(), renderer.outputHeight(),
+                                                 videohelper::yuvencode::bytesPerSample (gpuConversion.bits),
+                                                 errorOut);
+        if (captured == nullptr)
+            return false;
+#endif
+        ++gpuFramesRendered;
+        gpuReady = gpuPending;
+        gpuPending = captured;
+        haveOutput = gpuReady != nullptr;
+        return true;
+    }
 
     bool resourceCapabilities (
         videowire::VisualBackendResourceLimits::Capabilities& capabilities,
@@ -980,9 +1231,12 @@ struct GlExportContext
 #endif
     }
 
+    // eglContext asks for an EGL-backed context, which VA-API surfaces import
+    // into. When EGL does not open, the context is the default one and the
+    // export record names why VA-API frames are uploaded.
     bool init (int outW, int outH,
                const std::vector<videowire::CompiledVisualLayerPlan>& plans,
-               std::string& errorOut)
+               std::string& errorOut, bool eglContext = false)
     {
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
         pendingRgba.clear();
@@ -1028,11 +1282,30 @@ struct GlExportContext
 #else
         glfwWindowHint (GLFW_CONTEXT_VERSION_MAJOR, 4);
         glfwWindowHint (GLFW_CONTEXT_VERSION_MINOR, 3);
+        // A GPU reset or a killed channel (NVIDIA Xid 109) then reports through
+        // glGetGraphicsResetStatus, so a frame it cut short is refused, not published
+        // empty. A driver without the robustness extension creates the plain context.
+        glfwWindowHint (GLFW_CONTEXT_ROBUSTNESS, GLFW_LOSE_CONTEXT_ON_RESET);
 #endif
         glfwWindowHint (GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
         glfwWindowHint (GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
         glfwWindowHint (GLFW_VISIBLE, GLFW_FALSE); // offscreen: never mapped
-        win = glfwCreateWindow (64, 64, "Arbit Export", nullptr, nullptr);
+        eglContextProblem.clear();
+#if ARBIT_HAVE_DMABUF
+        if (eglContext)
+        {
+            glfwWindowHint (GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
+            win = glfwCreateWindow (64, 64, "Arbit Export", nullptr, nullptr);
+            glfwWindowHint (GLFW_CONTEXT_CREATION_API, GLFW_NATIVE_CONTEXT_API);
+            if (win == nullptr)
+                eglContextProblem = "the export's GL context did not open on EGL, so VA-API frames are uploaded";
+        }
+#else
+        if (eglContext)
+            eglContextProblem = "this build has no EGL, so VA-API frames are uploaded";
+#endif
+        if (win == nullptr)
+            win = glfwCreateWindow (64, 64, "Arbit Export", nullptr, nullptr);
         glfwDefaultWindowHints(); // don't leak VISIBLE=false to a later viewport_open
         if (win == nullptr)
         {
@@ -1066,6 +1339,9 @@ struct GlExportContext
                      const videorender::ImageLayerDesc* overlays, int numOverlays,
                      std::vector<float>* hdrMovieOutput = nullptr)
     {
+        // An HDR movie on the GPU route converts to P010 on the GPU.
+        if (hdrMovie && gpuFrames != nullptr)
+            return renderNextGpu (layers, numLayers, haveOutput, errorOut, overlays, numOverlays);
         if (hdrMovie)
         {
             if (hdrMovieOutput == nullptr || !renderWarmup(layers, numLayers, overlays, numOverlays))
@@ -1100,11 +1376,14 @@ struct GlExportContext
             return true;
         }
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        if (gpuFrames != nullptr)
+            return renderNextGpu (layers, numLayers, haveOutput, errorOut, overlays, numOverlays);
         haveOutput = false;
         if (surface == nullptr || ! renderer.renderCompositeToIOSurface (
                 surface, width, height, layers, numLayers, overlays, numOverlays))
         {
-            errorOut = "native Metal export render failed: " + renderer.compositorBackend();
+            errorOut = "native Metal export render failed: " + renderer.compositorBackend()
+                + (renderer.lastError().empty() ? std::string() : ": " + renderer.lastError());
             return false;
         }
         videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::readbackBegin);
@@ -1131,6 +1410,8 @@ struct GlExportContext
         pendingRgba = std::move (captured);
         return true;
 #else
+        if (gpuFrames != nullptr)
+            return renderNextGpu (layers, numLayers, haveOutput, errorOut, overlays, numOverlays);
         return renderer.renderToPixelsAsync (layers, numLayers, rgba, haveOutput,
                                              errorOut, overlays, numOverlays);
 #endif
@@ -1149,6 +1430,13 @@ struct GlExportContext
 
     bool drain (std::vector<uint8_t>& rgba, std::vector<float>* hdrMovieOutput = nullptr)
     {
+        if (hdrMovie && gpuFrames != nullptr)
+        {
+            av_frame_free (&gpuReady);
+            gpuReady = gpuPending;
+            gpuPending = nullptr;
+            return gpuReady != nullptr;
+        }
         if (hdrMovie)
         {
             if (hdrMovieOutput == nullptr) return false;
@@ -1162,6 +1450,13 @@ struct GlExportContext
             pendingHdrPreview.clear();
             return !rgba.empty();
         }
+        if (gpuFrames != nullptr)
+        {
+            av_frame_free (&gpuReady);
+            gpuReady = gpuPending;
+            gpuPending = nullptr;
+            return gpuReady != nullptr;
+        }
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
         rgba = std::move (pendingRgba);
         pendingRgba.clear();
@@ -1174,6 +1469,7 @@ struct GlExportContext
     void shutdown()
     {
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+        endGpuEncode();
         pendingRgba.clear();
         if (renderer.ready())
             renderer.shutdown();
@@ -1185,6 +1481,7 @@ struct GlExportContext
         {
             if (glfwGetCurrentContext() != win)
                 glfwMakeContextCurrent (win);
+            endGpuEncode();  // unregisters the interop textures while GL is current
             if (renderer.ready())
                 renderer.shutdown();
             videohelper::geometry::releaseGeometryExecutionCache();
@@ -1980,7 +2277,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             && (operation.source.type == arbitmod::SourceType::AudioRms
                 || operation.source.type == arbitmod::SourceType::AudioPeak
                 || operation.source.type == arbitmod::SourceType::AudioOnset
-                || operation.source.type == arbitmod::SourceType::AudioBand))
+                || operation.source.type == arbitmod::SourceType::AudioBand
+                || operation.source.type == arbitmod::SourceType::AudioEnvelope))
             return "track/group audio source export requires a deterministic feature stream; "
                    "live transport features cannot be substituted";
     if (job.controlPlan.signalWindow.present()
@@ -2162,6 +2460,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             if (execution != nullptr)
                 videohelper::importedscene::seedImportedSceneRuntimeParameters(*plan, *execution, s.visualParams);
             videowire::seedFlatShaderRuntimeParameters(execution, s.visualParams);
+            videowire::seedDepthEffectRuntimeParameters(execution, s.visualParams);
         }
         if (const auto it = bakedByClip.find (clipId); it != bakedByClip.end())
             for (const auto& tr : it->second)
@@ -2708,14 +3007,14 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         if (!glctx.hdrMovie)
         {
             sws = sws_getContext (vEnc->width, vEnc->height, AV_PIX_FMT_RGBA,
-                                  vEnc->width, vEnc->height, vEnc->pix_fmt,
+                                  vEnc->width, vEnc->height, inputPixelFormat (vEnc),
                                   SWS_BILINEAR, nullptr, nullptr, nullptr);
             if (sws == nullptr)
                 return "sws_getContext (RGBA->encoder) failed";
             setSws709 (sws);
         }
         frame = av_frame_alloc();
-        frame->format = vEnc->pix_fmt;
+        frame->format = inputPixelFormat (vEnc);
         frame->width = vEnc->width;
         frame->height = vEnc->height;
         av_frame_get_buffer (frame, 0);
@@ -2777,6 +3076,30 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             return handoffError.empty();
         });
         return handoffError;
+    };
+    // The GPU route skips the readback: the frame is already in the encoder's
+    // pool. A loop that needs the RGBA bytes keeps the readback, by name.
+    glctx.beginGpuEncode (vEnc,
+                          capturedPixels != nullptr || frame == nullptr ? "the frames are captured as RGBA"
+                          : job.traceRgbaFrameIndex >= 0 ? "an RGBA trace reads the frames back"
+                                                          : nullptr);
+    // An HDR movie hands float pixels to its CPU painter unless the GPU route
+    // converted it to P010 already.
+    const auto hdrPixels = [&] { return glctx.hdrMovie && glctx.gpuFrames == nullptr; };
+    const auto deliveredBytes = [&]() -> size_t
+    {
+        return glctx.gpuReady != nullptr ? static_cast<size_t> (vEnc->width) * vEnc->height * 4 : rgba.size();
+    };
+    // The frame the encoder takes: the GPU route's frame, or the readback
+    // converted into the encoder's input format.
+    const auto frameToEncode = [&]() -> AVFrame*
+    {
+        if (glctx.gpuReady != nullptr)
+            return glctx.gpuReady;
+        const uint8_t* srcData[1] = { rgba.data() };
+        const int srcStride[1] = { vEnc->width * 4 };
+        sws_scale (sws, srcData, srcStride, 0, vEnc->height, frame->data, frame->linesize);
+        return frame;
     };
     std::optional<videowire::TemporalSamplingCommitTransaction> pendingReadbackTransaction;
     bool traceWritten = false;
@@ -3696,8 +4019,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         if (havePrev && telemetryOwner != nullptr
             && ! telemetryOwner->observeFrame(vEnc->width, vEnc->height,
                                                static_cast<uint64_t>(vEnc->width) *
-                                                   (glctx.hdrMovie ? 4 * sizeof(float) : 4),
-                                               glctx.hdrMovie ? hdrMoviePixels.size() * sizeof(float) : rgba.size()))
+                                                   (hdrPixels() ? 4 * sizeof(float) : 4),
+                                               hdrPixels() ? hdrMoviePixels.size() * sizeof(float) : deliveredBytes()))
         {
             error = telemetryOwner->lastFrameFailure() == videowire::VisualDropReason::dimensionMismatch
                 ? "native compositor output dimension mismatch"
@@ -3715,7 +4038,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             }
             *capturedPixels = rgba;
         }
-        else if (havePrev && glctx.hdrMovie)
+        else if (havePrev && hdrPixels())
         {
             if (videowire::consumeTemporalPublicationFailure(
                     videowire::TemporalPublicationFailurePoint::exportEncoder))
@@ -3732,22 +4055,19 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 error = "frame not writable";
                 break;
             }
-            const uint8_t* srcData[1] = { rgba.data() };
-            const int srcStride[1] = { vEnc->width * 4 };
-            sws_scale (sws, srcData, srcStride, 0, vEnc->height, frame->data, frame->linesize);
-
-            frame->pts = encodedFrames++;
+            AVFrame* const encoded = frameToEncode();
+            encoded->pts = encodedFrames++;
             if (telemetryOwner != nullptr)
             {
                 std::string handoffError;
-                telemetryOwner->encodedHandoff(rgba.size(), [&] {
+                telemetryOwner->encodedHandoff(deliveredBytes(), [&] {
                     if (videowire::consumeTemporalPublicationFailure(
                             videowire::TemporalPublicationFailurePoint::exportEncoder))
                     {
                         handoffError = "injected temporal export encoder failure";
                         return false;
                     }
-                    handoffError = encodeAndWrite(fmt, vStream, vEnc, frame);
+                    handoffError = encodeAndWrite(fmt, vStream, vEnc, encoded);
                     return handoffError.empty();
                 });
                 error = handoffError;
@@ -3756,7 +4076,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                          videowire::TemporalPublicationFailurePoint::exportEncoder))
                 error = "injected temporal export encoder failure";
             else
-                error = encodeAndWrite (fmt, vStream, vEnc, frame);
+                error = encodeAndWrite (fmt, vStream, vEnc, encoded);
         }
         if (! error.empty()) break;
         if (havePrev)
@@ -3794,8 +4114,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             if (telemetryOwner != nullptr
                 && ! telemetryOwner->observeFrame(vEnc->width, vEnc->height,
                                                    static_cast<uint64_t>(vEnc->width) *
-                                                       (glctx.hdrMovie ? 4 * sizeof(float) : 4),
-                                                   glctx.hdrMovie ? hdrMoviePixels.size() * sizeof(float) : rgba.size()))
+                                                       (hdrPixels() ? 4 * sizeof(float) : 4),
+                                                   hdrPixels() ? hdrMoviePixels.size() * sizeof(float) : deliveredBytes()))
                 return telemetryOwner->lastFrameFailure() == videowire::VisualDropReason::dimensionMismatch
                     ? "native compositor output dimension mismatch"
                     : "native compositor readback byte mismatch";
@@ -3803,7 +4123,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 && videowire::consumeTemporalPublicationFailure(
                     videowire::TemporalPublicationFailurePoint::exportCapture))
                 return "injected temporal export capture failure";
-            if (glctx.hdrMovie)
+            if (hdrPixels())
             {
                 if (videowire::consumeTemporalPublicationFailure(
                         videowire::TemporalPublicationFailurePoint::exportEncoder))
@@ -3819,21 +4139,19 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                     return traceError;
                 if (av_frame_make_writable (frame) < 0)
                     return "frame not writable";
-            const uint8_t* srcData[1] = { rgba.data() };
-            const int srcStride[1] = { vEnc->width * 4 };
-            sws_scale (sws, srcData, srcStride, 0, vEnc->height, frame->data, frame->linesize);
-            frame->pts = encodedFrames++;
+            AVFrame* const encoded = frameToEncode();
+            encoded->pts = encodedFrames++;
             if (telemetryOwner != nullptr)
             {
                 std::string handoffError;
-                telemetryOwner->encodedHandoff(rgba.size(), [&] {
+                telemetryOwner->encodedHandoff(deliveredBytes(), [&] {
                     if (videowire::consumeTemporalPublicationFailure(
                             videowire::TemporalPublicationFailurePoint::exportEncoder))
                     {
                         handoffError = "injected temporal export encoder failure";
                         return false;
                     }
-                    handoffError = encodeAndWrite(fmt, vStream, vEnc, frame);
+                    handoffError = encodeAndWrite(fmt, vStream, vEnc, encoded);
                     return handoffError.empty();
                 });
                 if (! handoffError.empty())
@@ -3844,7 +4162,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                     if (videowire::consumeTemporalPublicationFailure(
                             videowire::TemporalPublicationFailurePoint::exportEncoder))
                         return "injected temporal export encoder failure";
-                    const auto encodeError = encodeAndWrite (fmt, vStream, vEnc, frame);
+                    const auto encodeError = encodeAndWrite (fmt, vStream, vEnc, encoded);
                     if (! encodeError.empty())
                         return encodeError;
                 }
@@ -4029,8 +4347,12 @@ std::string renderCompositeFrame (const ExportJob& input, double timelineSec,
     result.height = job.height;
     result.compositorBackend = context.renderer.compositorBackend();
 #if defined(__APPLE__) && ARBIT_HAVE_IOSURFACE
+    // A frame the loop refused never reaches the compositor, so keep the loop's own
+    // reason: replacing it hid every native render failure behind this one line.
     if (result.compositorBackend.rfind ("metal", 0) != 0)
-        error = "strict Metal composite probe did not use the native Metal compositor";
+        error = "strict Metal composite probe did not use the native Metal compositor ("
+            + (result.compositorBackend.empty() ? std::string ("no backend") : result.compositorBackend) + ")"
+            + (error.empty() ? std::string() : ": " + error);
     result.presentationBackend = "metal-iosurface-cpu-readback";
 #else
     result.presentationBackend = "opengl-offscreen-async-readback";
@@ -4208,10 +4530,14 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
 #endif
     }
 
+    namespace route = videohelper::exportroute;
     std::string encName;
+    route::Choice encoderChoice;
     const bool privateHdrMovie = usePrivateHdrMovieEncoder(job);
-    const AVCodec* vCodec = privateHdrMovie ? nullptr : pickVideoEncoder (job, encName);
+    const AVCodec* vCodec = privateHdrMovie ? nullptr : pickVideoEncoder (job, encName, encoderChoice);
     if (privateHdrMovie) encName = "donut-kvazaar10";
+    if (!privateHdrMovie && !encoderChoice.ok)
+        return encoderChoice.error;
     if (vCodec == nullptr && !privateHdrMovie)
         return "video encoder unavailable: " + encName;
 
@@ -4237,8 +4563,11 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
 
     const AVRational fpsQ = av_d2q (job.fps, 100000);
     std::string encoderConfigurationError;
-    auto openEncoder = [&] (const AVCodec* codec, const std::string& encoderName)
-        -> AVCodecContext*
+    // Why a hardware encoder did not get its GPU frame pool, kept across the
+    // software retry so the export record names it.
+    std::string hardwareFramesProblem;
+    auto openEncoder = [&] (const AVCodec* codec, const std::string& encoderName,
+                            bool hardwareFrames) -> AVCodecContext*
     {
         encoderConfigurationError.clear();
         AVCodecContext* encoder = avcodec_alloc_context3 (codec);
@@ -4291,8 +4620,43 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
             encoder->bit_rate = (int64_t) renderWidth * renderHeight * 8;
         if (job.hasHdrVideoOutput) tagColorRec2020Hdr(encoder, job.hdrVideoOutput.transfer);
         else tagColorBt709 (encoder);
+        // NVENC takes NV12, or P010 for an HDR movie, in CUDA memory, converted
+        // on the GPU with the tags above; VideoToolbox takes BGRA pixel buffers;
+        // VA-API takes NV12 surfaces, or P010 ones for an HDR movie.
+        const auto backend = route::backendOfEncoder (encoderName);
+        if (backend == route::Backend::Nvenc && job.hasHdrVideoOutput)
+        {
+            encoder->pix_fmt = AV_PIX_FMT_P010;  // the CPU fallback paints P010 too
+            av_opt_set (encoder->priv_data, "profile", "main10", 0);
+        }
+        if (backend == route::Backend::Vaapi && job.hasHdrVideoOutput)
+            av_opt_set (encoder->priv_data, "profile", "main10", 0);  // the pool's P010 is the CPU fallback's format too
+        std::string framesProblem;
+        if (hardwareFrames && backend == route::Backend::Vaapi)
+            framesProblem = attachHardwareFrames (encoder, AV_HWDEVICE_TYPE_VAAPI, AV_PIX_FMT_VAAPI,
+                                                  job.hasHdrVideoOutput ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12);
+        else if (hardwareFrames && backend == route::Backend::Nvenc)
+            framesProblem = attachHardwareFrames (encoder, AV_HWDEVICE_TYPE_CUDA, AV_PIX_FMT_CUDA,
+                                                  job.hasHdrVideoOutput ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12);
+#if defined(__APPLE__)
+        else if (hardwareFrames && ! job.hasHdrVideoOutput && backend == route::Backend::VideoToolbox)
+            framesProblem = attachHardwareFrames (encoder, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, AV_PIX_FMT_VIDEOTOOLBOX,
+                                                  AV_PIX_FMT_BGRA);
+#endif
+        if (! framesProblem.empty())
+        {
+            hardwareFramesProblem = framesProblem;
+            if (backend == route::Backend::Vaapi)  // VA-API encodes only from its own surfaces
+            {
+                encoderConfigurationError = encoderName + ": " + framesProblem;
+                avcodec_free_context (&encoder);
+                return nullptr;
+            }
+        }
         if (avcodec_open2 (encoder, codec, nullptr) < 0)
         {
+            if (encoder->hw_frames_ctx != nullptr && backend != route::Backend::Vaapi)
+                hardwareFramesProblem = encoderName + " did not open with GPU frames";
             avcodec_free_context (&encoder);
             return nullptr;
         }
@@ -4309,6 +4673,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
 #if ARBIT_HAVE_KVAZAAR10_EXPORT
     videohelper::Kvazaar10Encoder privateHdrEncoder;
 #endif
+    std::string encoderOpenFallback;
     AVCodecContext* vEnc = videohelper::openEncoderBeforeGpuOwners(
         encName, job.encoder == "auto", softwareEncoderName (job.codec),
         [&] (const std::string& candidateName) -> AVCodecContext*
@@ -4348,7 +4713,16 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
             }
 #endif
             vCodec = avcodec_find_encoder_by_name (candidateName.c_str());
-            return vCodec != nullptr ? openEncoder (vCodec, candidateName) : nullptr;
+            if (vCodec == nullptr)
+                return nullptr;
+            AVCodecContext* opened = openEncoder (vCodec, candidateName, true);
+            // NVENC and VideoToolbox also take CPU frames: a GPU frame pool that
+            // does not open costs the zero-copy route, not the encoder.
+            const auto backend = route::backendOfEncoder (candidateName);
+            if (opened == nullptr && ! hardwareFramesProblem.empty()
+                && (backend == route::Backend::Nvenc || backend == route::Backend::VideoToolbox))
+                opened = openEncoder (vCodec, candidateName, false);
+            return opened;
         },
         [&] () -> std::string
         {
@@ -4374,8 +4748,10 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
 
             exportGpuContext = std::make_unique<GlExportContext>();
             std::string gpuError;
+            // VA-API surfaces import into an EGL context only.
+            const bool vaapiEncoder = ! privateHdrMovie && route::backendOfEncoder (encName) == route::Backend::Vaapi;
             if (! exportGpuContext->init(
-                    renderWidth, renderHeight, executionJob.visualLayerPlans, gpuError))
+                    renderWidth, renderHeight, executionJob.visualLayerPlans, gpuError, vaapiEncoder))
             {
                 exportGpuContext.reset();
                 return job.visualLayerPlans.empty() && !hdrimage::enabled(job.hdrImageProfile)
@@ -4400,7 +4776,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
                 return diagnostic;
 #endif
             return {};
-        }, gpuOwnerError);
+        }, gpuOwnerError, &encoderOpenFallback);
     if (vEnc == nullptr)
     {
         avformat_free_context (fmt);
@@ -4415,6 +4791,20 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         return gpuOwnerError;
     }
     usedEncoderOut = privateHdrMovie ? encName : vEnc->codec->name;
+    // The export record: which encoder ran, how frames reach it, and every
+    // fallback by name.
+    route::Route encoderRoute;
+    encoderRoute.encoder = usedEncoderOut;
+    encoderRoute.backend = privateHdrMovie ? route::Backend::Software : route::backendOfEncoder (usedEncoderOut);
+    encoderRoute.frames = route::uploadRoute (encoderRoute.backend);
+    if (vEnc->hw_frames_ctx != nullptr)
+        encoderRoute.frames = route::plannedRoute (encoderRoute.backend, job.hasHdrVideoOutput);
+    encoderRoute.addFallback (encoderChoice.fallback);
+    encoderRoute.addFallback (encoderOpenFallback);
+    encoderRoute.addFallback (hardwareFramesProblem);
+    if (job.hasHdrVideoOutput && encoderRoute.backend != route::Backend::Software)
+        encoderRoute.addFallback ("an HDR movie is painted as 10-bit YUV on the CPU");
+    route::setLastRoute (encoderRoute);
     videohelper::tagSoftwareH264Encoder(fmt, vEnc);
 
     AVStream* vStream = avformat_new_stream (fmt, nullptr);
@@ -4483,7 +4873,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
 
     // ---- video frames: sample the display timeline at the output fps ----
     AVFrame* frame = av_frame_alloc();
-    frame->format = vEnc->pix_fmt;
+    frame->format = inputPixelFormat (vEnc);
     frame->width = vEnc->width;
     frame->height = vEnc->height;
     av_frame_get_buffer (frame, 0);
@@ -4493,7 +4883,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
     // yuv420p staging frame that encodeAt converts; otherwise work == frame.
     AVFrame* work = frame;
     SwsContext* workCvt = nullptr;
-    if (vEnc->pix_fmt != AV_PIX_FMT_YUV420P && !job.hasHdrVideoOutput)
+    if (inputPixelFormat (vEnc) != AV_PIX_FMT_YUV420P && !job.hasHdrVideoOutput)
     {
         work = av_frame_alloc();
         work->format = AV_PIX_FMT_YUV420P;
@@ -4501,7 +4891,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         work->height = vEnc->height;
         av_frame_get_buffer (work, 0);
         workCvt = sws_getContext (vEnc->width, vEnc->height, AV_PIX_FMT_YUV420P,
-                                  vEnc->width, vEnc->height, vEnc->pix_fmt,
+                                  vEnc->width, vEnc->height, inputPixelFormat (vEnc),
                                   SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (workCvt == nullptr && error.empty())
             error = "sws_getContext (yuv420p->encoder) failed";
@@ -4589,6 +4979,23 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
         }
     }
 #endif
+
+    // A GPU route holds only when the GPU compositor loop rendered into the
+    // encoder's frame pool; otherwise the frames were uploaded, and the record
+    // says why.
+    if (route::framesStayOnGpu (encoderRoute.frames))
+    {
+        std::string why = "the export ran on the CPU compositor path";
+#if ARBIT_HAVE_VIEWPORT
+        if (exportGpuContext != nullptr && exportGpuContext->gpuFramesRendered > 0)
+            why.clear();
+        else if (exportGpuContext != nullptr && ! exportGpuContext->gpuProblem.empty())
+            why = exportGpuContext->gpuProblem;
+#endif
+        if (! why.empty())
+            encoderRoute.fallBack (route::uploadRoute (encoderRoute.backend), why);
+        route::setLastRoute (encoderRoute);
+    }
 
     if (error.empty() && job.traceRgbaFrameIndex >= 0 && !glDone)
         error = "export RGBA trace requires native GPU compositing";
@@ -4949,6 +5356,10 @@ std::string RecorderSession::open (const std::string& outPath, int width, int he
         enc->bit_rate = (int64_t) width * height * 8; // ~16 Mbps at 1080p, same as export
 
     tagColorBt709 (enc);
+    // VA-API encodes only from its own surfaces; pushFrame's NV12 frames
+    // upload in encodeAndWrite.
+    if (videohelper::exportroute::backendOfEncoder (encName) == videohelper::exportroute::Backend::Vaapi)
+        attachHardwareFrames (enc, AV_HWDEVICE_TYPE_VAAPI, AV_PIX_FMT_VAAPI, AV_PIX_FMT_NV12);
 
     if (avcodec_open2 (enc, vCodec, nullptr) < 0)
     {
@@ -4985,7 +5396,7 @@ std::string RecorderSession::open (const std::string& outPath, int width, int he
     }
 
     AVFrame* yuvFrame = av_frame_alloc();
-    yuvFrame->format = enc->pix_fmt;
+    yuvFrame->format = inputPixelFormat (enc);
     yuvFrame->width = enc->width;
     yuvFrame->height = enc->height;
     av_frame_get_buffer (yuvFrame, 0);
@@ -5017,7 +5428,7 @@ std::string RecorderSession::pushFrame (const uint8_t* pixels, int strideBytes, 
     {
         if (impl_->sws != nullptr) sws_freeContext (impl_->sws);
         impl_->sws = sws_getContext (impl_->width, impl_->height, srcFmt,
-                                     impl_->width, impl_->height, AV_PIX_FMT_YUV420P,
+                                     impl_->width, impl_->height, inputPixelFormat (impl_->enc),
                                      SWS_BILINEAR, nullptr, nullptr, nullptr);
         impl_->srcPixFmt = (int) srcFmt;
         if (impl_->sws == nullptr)

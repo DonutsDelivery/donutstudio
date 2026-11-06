@@ -58,8 +58,8 @@ private:
 struct ParticleSolidMotionPrior final
 {
     const ParticleSolidState& previous;
-    const std::array<double,kParticleSolidMaxBodies>& previousBirths;
-    const std::array<double,kParticleSolidMaxBodies>& currentBirths;
+    const ParticleSizedList<double>& previousBirths;
+    const ParticleSizedList<double>& currentBirths;
     float previousBodyRadius=0;
 };
 
@@ -83,7 +83,7 @@ inline const ParticleRigidBody* particleSolidPriorBody(const ParticleSolidMotion
 struct ParticleSolidMotionFrame final
 {
     ParticleSolidState previous;
-    std::array<double,kParticleSolidMaxBodies> previousBirths {}, currentBirths {};
+    ParticleSizedList<double> previousBirths {}, currentBirths {};
     float previousBodyRadius=0;
 };
 
@@ -194,11 +194,11 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
     }
     // All bodies draw as one instanced scene object. Each collider is one more.
     const int contacts=(state.colliders.meshIdentity ? 1:0)+state.colliders.pointCount;
-    // kParticleSolidMaxBodies and the 64 collider points size the solver's fixed
-    // state arrays. The scene itself grows to hold whatever they produce.
-    if (state.count<0 || state.count>kParticleSolidMaxBodies || contacts<0 || state.colliders.pointCount>64 || nodeId==0) {
-        error="Solid 3D solver state holds "+std::to_string(kParticleSolidMaxBodies)+" bodies and 64 collider points; this draw has "
-            +std::to_string(state.count)+" bodies and "+std::to_string(state.colliders.pointCount)+" points";
+    // Bodies and collider points are sized from the replay, and the scene
+    // grows to hold both.
+    if (state.count<0 || contacts<0 || nodeId==0) {
+        error="Solid 3D draw has an invalid body count "+std::to_string(state.count)+" or collider count "
+            +std::to_string(state.colliders.pointCount);
         return {};
     }
     if (prior) {
@@ -210,7 +210,7 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
             error="Motion output for Solid 3D bodies over moving colliders is unavailable: prior collider positions are not retained";
             return {};
         }
-        if (prior->previous.count<0 || prior->previous.count>kParticleSolidMaxBodies
+        if (prior->previous.count<0
             || !std::isfinite(prior->previousBodyRadius) || prior->previousBodyRadius<=0) {
             error="Solid 3D Motion prior frame has an invalid body count or radius"; return {};
         }
@@ -218,7 +218,7 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
     std::shared_ptr<const ParticleBodyCallerLease> sceneLease;
     if (dynamicBody) {
         sceneLease=p.bodyReplayContext->caller->reserve(sizeof(ParticleBodyCallerPayload<Visual3DScene>),
-            4*sizeof(Visual3DScene)+sizeof(ParticleSolidState));
+            4*sizeof(Visual3DScene)+sizeof(ParticleSolidState)+particleGeometryFrameHeapBytes(state.colliders));
         if (!sceneLease) { error="Dynamic body scene prospective caller admission is short"; return {}; }
     }
     auto scene=dynamicBody ? retainParticleBodyCallerPayload<Visual3DScene>(std::move(sceneLease))
@@ -235,8 +235,8 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> particleSolidSce
     if (p.geometryBinding && p.geometryBinding->body && (!dynamicBody || state.terminalBodySample)) {
         const auto& geometry=dynamicBody ? state.terminalBodySample->prototype()
             : std::get<videowire::geometry::GeometryData>(p.geometryBinding->body->data);
-        if (geometry.positions.empty() || geometry.positions.size()>256 || geometry.indices.empty() || geometry.indices.size()>384) {
-            error="Rigid body appearance requires 1 to 256 vertices and 1 to 128 triangles"; return {};
+        if (geometry.positions.empty() || geometry.indices.empty() || geometry.indices.size()%3) {
+            error="Rigid body appearance requires vertices and whole triangles"; return {};
         }
         SceneVec3 center{};
         float radius=1;
@@ -415,7 +415,7 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> appendParticleSo
     using namespace HarmonicMIDI::grid;
     const auto refuse=[&](const char* reason)->std::shared_ptr<const Visual3DScene> { error=reason; return {}; };
     const auto& binding=*p.geometryBinding;
-    if (prior && (prior->previous.count<0 || prior->previous.count>kParticleSolidMaxBodies
+    if (prior && (prior->previous.count<0
         || !std::isfinite(prior->previousBodyRadius) || prior->previousBodyRadius<=0))
         return refuse("Solid 3D Motion prior frame has an invalid body count or radius");
     // Use the released solid mesh builder, including exact selected rigid
@@ -525,8 +525,6 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> appendParticleSo
     using namespace HarmonicMIDI::grid;
     using namespace videowire::geometry;
     const auto refuse=[&](const char* reason)->std::shared_ptr<const Visual3DScene> { error=reason; return {}; };
-    if (state.count>kParticleImportedSolidMaxBodies)
-        return refuse("Imported Solid 3D supports at most 64 bodies because each body is its own composed scene object; set Count to 64 or less");
     if (!source || !validateVisual3DScene(*source).valid() || !p.geometryBinding || !p.geometryBinding->mesh
         || p.simulationSpace!=1 || (p.bodyShape!=0 && p.bodyShape!=2) || state.count<0 || nodeId==0
         || !std::isfinite(p.bodyRadius) || p.bodyRadius<=0 || p.bodyRadius>.1f
@@ -590,8 +588,6 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> appendParticleSo
     using namespace HarmonicMIDI::grid;
     using namespace videowire::geometry;
     const auto refuse=[&](const char* reason)->std::shared_ptr<const Visual3DScene> { error=reason; return {}; };
-    if (state.count>kParticleImportedSolidMaxBodies)
-        return refuse("Imported Solid 3D supports at most 64 bodies because each body is its own composed scene object; set Count to 64 or less");
     if (!source || !validateVisual3DScene(*source).valid() || !p.geometryBinding || !p.geometryBinding->mesh
         || p.simulationSpace!=1 || (p.bodyShape!=0 && p.bodyShape!=2) || state.count<0 || nodeId==0
         || !std::isfinite(p.bodyRadius) || p.bodyRadius<=0 || p.bodyRadius>.1f

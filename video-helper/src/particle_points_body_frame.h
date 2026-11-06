@@ -45,11 +45,13 @@ public:
         if (!source.source || !source.reference || payload.size()>131072 || bodyPlan.size()>65536) return false;
         const auto& value=source.source->descriptor();
         const auto* mesh=std::get_if<GeometryData>(&value.data);
-        if (!mesh || mesh->positions.size()>256 || mesh->indices.size()>384 || mesh->vertexIds.size()>256
-            || value.operations.empty() || !value.attributes.empty()
-            || !value.spectrumFields.empty() || !value.scoreFields.empty()
-            || source.reference->positions.size()>256 || source.reference->vertexIds.size()>256
-            || source.reference->indices.size()>384) return false;
+        if (!mesh || value.operations.empty() || !value.attributes.empty()
+            || !value.spectrumFields.empty() || !value.scoreFields.empty()) return false;
+        // Every body schedule has one root mesh, so its intermediates are no
+        // larger than the largest of the source, reference and retained meshes.
+        std::size_t largestVertices=std::max({mesh->positions.size(),mesh->vertexIds.size(),
+            source.reference->positions.size(),source.reference->vertexIds.size()});
+        std::size_t largestIndices=std::max(mesh->indices.size(),source.reference->indices.size());
         std::size_t copies=sizeof(ValueDescriptor), capacities=sizeof(AdmittedValue);
         if (!addArrayBytes(mesh->positions.size(),sizeof(Vec3),copies)
             || !addArrayBytes(mesh->vertexIds.size(),sizeof(StableId),copies)
@@ -64,9 +66,9 @@ public:
             if (!checkedAdd(capacities,op.field.attributeName.capacity()+1,capacities)) return false;
             if (op.retainedMesh) {
                 const auto& retained=*op.retainedMesh;
-                if (!retained.attributes.empty() || !retained.importedAnimation.empty()
-                    || retained.geometry.positions.size()>256 || retained.geometry.vertexIds.size()>256
-                    || retained.geometry.indices.size()>384) return false;
+                if (!retained.attributes.empty() || !retained.importedAnimation.empty()) return false;
+                largestVertices=std::max({largestVertices,retained.geometry.positions.size(),retained.geometry.vertexIds.size()});
+                largestIndices=std::max(largestIndices,retained.geometry.indices.size());
                 if (!checkedAdd(copies,sizeof(RetainedMeshData),copies)
                     || !addArrayBytes(retained.geometry.positions.size(),sizeof(Vec3),copies)
                     || !addArrayBytes(retained.geometry.vertexIds.size(),sizeof(StableId),copies)
@@ -81,12 +83,13 @@ public:
         // Eight descriptor owners cover decoder/admit copies, its compatibility
         // descriptor, the body factory snapshot/reference and concurrent scratch.
         // A body schedule of n records visits at most n*n shapes and n bounded
-        // 256-vertex/384-index mesh or vertex-field intermediates per pass.
+        // mesh or vertex-field intermediates of the largest mesh's size per pass.
         // Decode, validation, comparison and publication have eight passes.
         const auto records=value.operations.size();
-        std::size_t census=0,perRecord=0;
+        std::size_t census=0,perRecord=0,vertexWork=0,indexWork=0;
         if (!particlebodygeometrydetail::censusBytes(records,census)
-            || !checkedAdd(records,std::size_t{256u*16u+384u*4u},perRecord)
+            || !checkedMul(largestVertices,std::size_t{16},vertexWork) || !checkedMul(largestIndices,std::size_t{4},indexWork)
+            || !checkedAdd(vertexWork,indexWork,perRecord) || !checkedAdd(records,perRecord,perRecord)
             || !checkedMul(records,perRecord,envelope.work) || !checkedMul(envelope.work,8,envelope.work)) return false;
         envelope.bytes=sizeof(ParticlePointsBodySourceAdmission)+sizeof(ParticleParams)
             +sizeof(ParticleGeometryBinding)+census;
@@ -224,12 +227,14 @@ public:
         const auto& input=request.parameters();
         const auto& binding=request.source()->declaration().points;
         if (!hasDynamicParticleBody(input) || input.motionMode!=2 || !input.historicalReplay || input.simulationSpace!=1
-            || input.count<1 || input.count>kParticleSolidMaxBodies || binding.capacity!=static_cast<std::size_t>(input.count)) {
+            || input.count<1 || binding.capacity!=static_cast<std::size_t>(input.count)) {
             error="Paired particle replay requires the admitted dynamic Solid 3D Coupled body route"; return false;
         }
         conversion.bytes=sizeof(ParticlePointsBodyFrame)+sizeof(ParticlePointReplayTimes)+sizeof(ValueDescriptor)
             +2*sizeof(ParticleParams)+sizeof(ParticleSolidState);
-        if (!addArrayBytes(binding.capacity,sizeof(PointRecord)+3*sizeof(FieldElement)+sizeof(StableId)+4*sizeof(void*),conversion.bytes)
+        // The converted Solid bodies, bodies and times are sized from the capacity.
+        if (!addArrayBytes(binding.capacity,sizeof(ParticleRigidBody)+sizeof(std::array<float,4>)+2*sizeof(double),conversion.bytes)
+            || !addArrayBytes(binding.capacity,sizeof(PointRecord)+3*sizeof(FieldElement)+sizeof(StableId)+4*sizeof(void*),conversion.bytes)
             || !addArrayBytes(3,sizeof(AttributeData)+kMaximumNameBytes+1,conversion.bytes)
             || !checkedMul(binding.capacity,64+32,conversion.work)
             || !checkedAdd(conversion.work,conversion.bytes,conversion.work)) {
@@ -274,7 +279,8 @@ public:
         // of its two sequential receipt comparisons holds a validation lease.
         std::size_t validation=ParticleBodyReplayReceipt::retainedLogicalBytes()
             +sizeof(ParticleParams)+ParticleBodyReplayReceipt::validationLogicalBytes()+3*sizeof(ParticleBodyCallerLease);
-        callerPeak=std::max(ParticleBodyReplayState::callerFreshPeakLogicalBytes(true,true),validation);
+        callerPeak=std::max(ParticleBodyReplayState::callerFreshPeakLogicalBytes(true,true,binding.capacity,
+            ParticleBodyReplayState::particleAnchorCount(input)),validation);
         if (!checkedAdd(callerPeak,conversion.bytes,callerPeak)
             || !checkedAdd(callerPeak,sizeof(ParticleBodyCallerLease),callerPeak)) {
             error="Paired particle caller peak resource arithmetic overflow"; return false;
@@ -292,7 +298,7 @@ public:
         const auto& input=request->parameters();
         const auto& binding=request->source()->declaration().points;
         if (!hasDynamicParticleBody(input) || input.motionMode!=2 || !input.historicalReplay || input.simulationSpace!=1
-            || input.count<1 || input.count>kParticleSolidMaxBodies || binding.capacity!=static_cast<std::size_t>(input.count)) {
+            || input.count<1 || binding.capacity!=static_cast<std::size_t>(input.count)) {
             error="Paired particle replay requires the admitted dynamic Solid 3D Coupled body route"; return {};
         }
         ParticlePointsBodyEnvelope conversion;

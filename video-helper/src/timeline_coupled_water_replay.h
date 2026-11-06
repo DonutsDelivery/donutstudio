@@ -13,7 +13,7 @@ inline bool sameOperation(const OperationRecord& a,const OperationRecord& b) {
       && a.parameters==b.parameters && a.field==b.field && equal(a.transform,b.transform)
       && a.retainedMesh==b.retainedMesh && a.sdfSurface==b.sdfSurface;
 }
-// Complete comparison for the admitted four-operation Water and literal points
+// Complete comparison for the admitted Water (with any audio spectrum tail) and literal points
 // domains. No digest or stable ID can stand in for this source equality.
 inline bool sameDescriptor(const ValueDescriptor& a,const ValueDescriptor& b) {
   if (a.schemaVersion!=b.schemaVersion || a.carrier!=b.carrier || a.stableId!=b.stableId
@@ -21,8 +21,10 @@ inline bool sameDescriptor(const ValueDescriptor& a,const ValueDescriptor& b) {
       || a.fieldDomain!=b.fieldDomain || a.fieldValueType!=b.fieldValueType
       || a.fieldInterpolation!=b.fieldInterpolation || a.fieldDomainCardinality!=b.fieldDomainCardinality
       || a.dispatchCount!=b.dispatchCount || a.data.index()!=b.data.index()
-      || !a.attributes.empty() || !b.attributes.empty() || !a.spectrumFields.empty() || !b.spectrumFields.empty()
+      || !a.attributes.empty() || !b.attributes.empty() || a.spectrumFields.size()!=b.spectrumFields.size()
       || !a.scoreFields.empty() || !b.scoreFields.empty() || a.operations.size()!=b.operations.size()) return false;
+  for (std::size_t i=0;i<a.spectrumFields.size();++i)
+    if (!spectrum::sameBinding(a.spectrumFields[i],b.spectrumFields[i])) return false;
   for (std::size_t i=0;i<a.operations.size();++i) if (!sameOperation(a.operations[i],b.operations[i])) return false;
   if (std::holds_alternative<GeometryData>(a.data)) return equal(std::get<GeometryData>(a.data),std::get<GeometryData>(b.data));
   if (!std::holds_alternative<PointsData>(a.data)) return false;

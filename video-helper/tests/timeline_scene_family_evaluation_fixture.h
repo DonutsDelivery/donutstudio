@@ -308,9 +308,13 @@ void verifyCoupled(Check check) {
   foreignBinding->mesh=changedMesh; changed.geometryBinding=foreignBinding;
   check(!matching.evaluateCoupled(owner,family,authored->scene,changed,2*dt,2*dt,2*dt,aspect,frame,{},{},error).scene,
       "same stable IDs with different complete Water operation bytes refuse before replay");
-  check(!matching.evaluateCoupled(owner,family,authored->scene,p,dt,2*dt,2*dt,aspect,frame,{},{},error).scene
+  // The pair simulates in project time; a clip-local scene time samples it there.
+  const auto offset=matching.evaluateCoupled(owner,family,authored->scene,p,dt,2*dt,2*dt,aspect,frame,{},{},error);
+  check(offset.scene && offset.replay && offset.replay->water()->heights==accepted.replay->water()->heights,
+      "a clip-local scene time samples the same project-time water: "+error);
+  check(!matching.evaluateCoupled(owner,family,authored->scene,p,2*dt,dt,2*dt,aspect,frame,{},{},error).scene
       && !accepted.replay->matches(runtime,owner,family,0,authored->scene,p,2*dt,dt,2*dt,aspect,frame,error),
-      "separate source/body/project clocks remain refused only in the new coupled domain");
+      "a body clock apart from project time stays refused");
   auto differentScore=std::make_shared<arbitmod::Score>(*history->score);
   differentScore->notes.push_back(waterreplayfixture::note(82,0,65));
   auto alteredHistory=*history; alteredHistory.score=differentScore;

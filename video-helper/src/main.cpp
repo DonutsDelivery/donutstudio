@@ -16,6 +16,8 @@
 #include "capture_device.h"
 #include "block_c_packer.h"
 #include "exporter.h"
+#include "export_encoder_route.h"
+#include "render_input_generation.h"
 #include "pathtrace_fixture_engine.h"
 
 #include "composite_probe_contract.h"
@@ -548,6 +550,22 @@ MediaContext* findMedia (const json& params, std::string& error)
     return it->second.get();
 }
 
+// The export record's encoder fields (Plan 3, export and encoders): the
+// backend, how frames reached the encoder, whether they stayed on the GPU, and
+// every fallback by name. encoderRoute is the one-line form the dialog shows.
+void appendEncoderRoute (json& result)
+{
+    namespace route = videohelper::exportroute;
+    if (! route::haveLastRoute())
+        return;
+    const auto last = route::lastRoute();
+    result["encoderBackend"] = route::backendSetting (last.backend);
+    result["frameRoute"] = route::frameRouteName (last.frames);
+    result["framesOnGpu"] = route::framesStayOnGpu (last.frames);
+    result["encoderFallback"] = last.fallback;
+    result["encoderRoute"] = route::describe (last);
+}
+
 json stabilizationPolicies()
 {
     return json { {"algorithm","donutstudio-native-rigid-v1"},
@@ -639,9 +657,10 @@ void handleStabilizationAsync (const json& idVal, const std::string& method, con
 //   outPath: string (codec "prores" requires a .mov path)
 //   fps, width, height: numbers
 //   codec: "h264" | "h265" | "vp9" | "prores" | "ffv1"
-//   encoder: "auto" | "software" | "nvenc" | "videotoolbox"
-//     (auto = try hardware encode, fall back to software; prores/vp9 are
-//     always software: prores_ks / libvpx-vp9)
+//   encoder: "auto" | "software" | "nvenc" | "videotoolbox" | "vaapi" | "amf"
+//     (auto = try hardware encode, fall back to software by name; prores/vp9
+//     are always software: prores_ks / libvpx-vp9. The result names the
+//     encoder, its frame route and whether frames stayed on the GPU.)
 //   interpolation: "none" | "minterpolate" | "rife" | "auto"
 //     ("rife"/"auto" = RIFE optical-flow interpolation for segments
 //     that under-deliver frames: source_fps * rate < target_fps.
@@ -673,7 +692,8 @@ void handleStabilizationAsync (const json& idVal, const std::string& method, con
 //     octaveTranspose}]} — Block C (M5): packed per frame into uNotes/uLinks
 //     for shader generators (PROTOCOL.md §Shader generators → Block C)
 //   modMatrix: [{source:{type, trackId?, pitchLo?, pitchHi?, primeIndex?,
-//     axis?, linkId?, band?, lissajousK?, triggerDecayBeats?, adsr?{a,d,s,r,
+//     axis?, linkId?, band?, lissajousK?, triggerDecayBeats?, envAttack?,
+//     envRelease?, adsr?{a,d,s,r,
 //     bend}, lfo?{shape,periodBeats,phase0,seed,hz,rateHz,retrigger}},
 //     destination:"clip<id>/<node>/<param>", depth?, curve?(Linear|Exp|Log|
 //     SCurve), smoothingBeats?, mode?(Add|Multiply|Replace), enabled?}]
@@ -726,6 +746,8 @@ static void parseRoutingsJson (const json& arr, std::vector<arbitmod::Routing>& 
             ms.band       = sj.value ("band", 0);
             ms.lissajousK = sj.value ("lissajousK", 7);
             ms.triggerDecayBeats = sj.value ("triggerDecayBeats", 0.5f);
+            ms.envAttack  = sj.value ("envAttack", 0.01f);
+            ms.envRelease = sj.value ("envRelease", 0.2f);
             if (sj.contains ("adsr") && sj["adsr"].is_object())
             {
                 const auto& a = sj["adsr"];
@@ -901,8 +923,7 @@ std::string parseExportJob (const json& params, ExportJob& job)
     // Process-owned launch capability; jobSpec can neither supply nor override it.
     job.depthCacheRoot = g_trustedDepthCacheRoot.string();
     const std::string encoder = params.value ("encoder", "auto");
-    if (encoder != "auto" && encoder != "software" && encoder != "nvenc"
-        && encoder != "videotoolbox")
+    if (! videohelper::exportroute::isEncoderSetting (encoder))
         return "unknown encoder: " + encoder;
     const std::string interpolation = params.value ("interpolation", "none");
     if (interpolation != "none" && interpolation != "minterpolate"
@@ -1264,6 +1285,9 @@ void handleExportAsync (const json& idVal, const json& params)
 #if ARBIT_HAVE_VIEWPORT
         ViewportInterpSuspendGuard interpGuard; // restores on scope exit (exception-safe)
 #endif
+        // The result records the Path Trace device the export's last traced frame ran on.
+        videorender::fixture3d::clearPathTraceExportStats();
+        videohelper::exportroute::clearLastRoute();
         const std::string error = runExportNamingAllocationFailure (*job, usedEncoder, glCompositing,
                                                                     interpolationBackend,
                                                                     &g_export.progress);
@@ -1275,6 +1299,11 @@ void handleExportAsync (const json& idVal, const json& params)
                        { "scoreDropWarning", arbitblockc::scoreDropWarning (
                              g_export.progress.droppedNotesPeak.load(),
                              g_export.progress.droppedLinksPeak.load()) } };
+        if (error.empty())
+            videorender::fixture3d::appendPathTraceStats (
+                result, videorender::fixture3d::lastPathTraceStats (videorender::fixture3d::RenderUse::Export));
+        if (error.empty())
+            appendEncoderRoute (result);
 #if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
         if (error.empty() && (! job->luaScript.empty() || ! job->jsScript.empty()))
             result["testScriptLimitsAtOperation"] = {
@@ -1438,6 +1467,7 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
 #if ARBIT_HAVE_VIEWPORT
         g_viewport.setInterpolationSuspended (true);   // free the GPU for the cache build
 #endif
+        videohelper::exportroute::clearLastRoute();
         std::string error = runExportNamingAllocationFailure (*job, usedEncoder, glCompositing,
                                                               interpolationBackend,
                                                               &g_renderCache.progress);
@@ -1454,6 +1484,8 @@ void handleRenderCacheAsync (const json& idVal, const json& params)
         if (error.empty())
             result = { { "outPath", job->outPath }, { "encoder", usedEncoder },
                        { "frames", (int64_t) g_renderCache.progress.frame.load() } };
+        if (error.empty())
+            appendEncoderRoute (result);
 #if defined(ARBIT_PROGRAMMABLE_TEST_MODE)
         if (error.empty() && (! job->luaScript.empty() || ! job->jsScript.empty()))
             result["testScriptLimitsAtOperation"] = {
@@ -1641,10 +1673,10 @@ json handle (const std::string& method, const json& params, std::string& error)
         if ((params.contains("objectScope") && !readUnsignedInteger(params["objectScope"],objectScope))
             || objectScope>2
             || (params.contains("objectNodeId") && !readUnsignedInteger(params["objectNodeId"],objectNodeId))
-            || objectNodeId>65536 || (objectScope==2 ? objectNodeId==0 : objectNodeId!=0))
+            || objectNodeId>std::numeric_limits<std::uint32_t>::max() || (objectScope==2 ? objectNodeId==0 : objectNodeId!=0))
         { error="Imported geometry object scope or exact node selection is invalid"; return {}; }
         if (!params.contains("meshId") || !readUnsignedInteger(params["meshId"],meshId)
-            || (meshId==0 && objectScope==0) || meshId>4096 || !params.contains("geometryId")
+            || (meshId==0 && objectScope==0) || meshId>std::numeric_limits<std::uint32_t>::max() || !params.contains("geometryId")
             || !readUnsignedInteger(params["geometryId"],geometryId)
             || !videowire::geometry::validStableId(geometryId) || !params.contains("sourceId")
             || !readUnsignedInteger(params["sourceId"],sourceId)
@@ -2357,10 +2389,22 @@ json handle (const std::string& method, const json& params, std::string& error)
         if (! videohelper::validateSnapshotClipIdentities (
                 job.visualLayerPlans, identityRecords, error))
             return {};
+        // measureFrames renders that many consecutive frames from timelineSec and
+        // reports each one's timings. Absent, the reply keeps its single-frame shape.
+        int measureFrames = 0;
+        if (params.contains ("measureFrames"))
+        {
+            const auto& value = params["measureFrames"];
+            if (! value.is_number_integer() || value.get<int64_t>() < 1 || value.get<int64_t>() > 600)
+            { error = "measureFrames must be an integer from 1 to 600"; return {}; }
+            measureFrames = value.get<int>();
+        }
         videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::snapshotAdmitted);
         CompositeFrameResult frame;
         videorender::fixture3d::clearPathTraceExportStats();
+        const auto firstFrameStart = std::chrono::steady_clock::now();
         error = renderCompositeFrame (job, timelineSec, frame, &g_modelPayloads);
+        const auto firstFrameEnd = std::chrono::steady_clock::now();
         if (! error.empty()) return {};
         frame.harmonicProbe.scoreObjectPresent = params.contains("score") && params["score"].is_object();
         json result {
@@ -2424,6 +2468,33 @@ json handle (const std::string& method, const json& params, std::string& error)
             result, videorender::fixture3d::lastPathTraceStats (videorender::fixture3d::RenderUse::Export));
         videorender::fixture3d::appendRealtimeStats (
             result, videorender::fixture3d::lastRealtimeStats (videorender::fixture3d::RenderUse::Export));
+        if (measureFrames > 0)
+        {
+            // Frame 0 is the one above. Each later frame advances one frame period; its
+            // wall time covers the whole composite call, the GPU context it makes per
+            // frame included, and the engine stats split out the 3D layer's own time.
+            json records = json::array();
+            records.push_back (videorender::speedstats::measuredFrameRecord (
+                result, timelineSec, std::chrono::duration<double, std::milli> (firstFrameEnd - firstFrameStart).count()));
+            for (int index = 1; index < measureFrames; ++index)
+            {
+                const double sec = timelineSec + index / job.fps;
+                CompositeFrameResult measured;
+                videorender::fixture3d::clearPathTraceExportStats();
+                const auto start = std::chrono::steady_clock::now();
+                error = renderCompositeFrame (job, sec, measured, &g_modelPayloads);
+                if (! error.empty())
+                {
+                    error = "measureFrames frame " + std::to_string (index) + ": " + error;
+                    return {};
+                }
+                const double wallMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - start).count();
+                json stats;
+                videorender::fixture3d::appendLastExportStats (stats);
+                records.push_back (videorender::speedstats::measuredFrameRecord (stats, sec, wallMs));
+            }
+            result["measure"] = videorender::speedstats::measuredFramesReply (std::move (records));
+        }
         if (params.value("artifact", false))
         {
             if (frame.width != compositeartifact::width || frame.height != compositeartifact::height)
@@ -3314,6 +3385,16 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "ok", true } };
     }
 
+    // The machine's Path Trace device setting, sent by the host when Preferences
+    // changes it. The reply carries the selection's error, so the host can say it.
+    if (method == "pathtrace_device")
+    {
+        const std::string device = params.value ("device", std::string());
+        if (device.empty()) { error = "pathtrace_device: missing device"; return {}; }
+        const std::string problem = videorender::fixture3d::pathtracefixture::setDevicePreference (device);
+        return json { { "device", videorender::fixture3d::pathtracefixture::devicePreference() }, { "error", problem } };
+    }
+
     if (method == "renderer_preparation")
     {
         const std::string action = params.value ("action", std::string());
@@ -3539,6 +3620,7 @@ int main (int argc, char** argv)
 #endif
 #endif
     std::filesystem::path requestedMatteRoot, requestedDepthRoot;
+    std::string requestedPathTraceDevice;
     for (int i = 1; i < argc; ++i)
     {
         const std::string argument (argv[i]);
@@ -3546,9 +3628,11 @@ int main (int argc, char** argv)
             requestedMatteRoot = std::filesystem::path(argv[i]);
         else if (argument == "--depth-cache-root" && ++i < argc && requestedDepthRoot.empty())
             requestedDepthRoot = std::filesystem::path(argv[i]);
+        else if (argument == "--pathtrace-device" && ++i < argc && requestedPathTraceDevice.empty())
+            requestedPathTraceDevice = argv[i];
         else
         {
-            std::fprintf(stderr, "usage: %s --matte-cache-root <dir> --depth-cache-root <dir>\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --matte-cache-root <dir> --depth-cache-root <dir> [--pathtrace-device <device>]\n", argv[0]);
             return 2;
         }
     }
@@ -3681,6 +3765,21 @@ int main (int argc, char** argv)
         {
             error = "Helper could not allocate memory for " + method;
         }
+        // The edit has landed: preview passes still rendering the old inputs are
+        // obsolete and stop at their next sample-loop poll.
+        if (error.empty() && videohelper::renderinput::changesFrameInputs (method))
+        {
+            std::string paramId;
+            std::optional<int> editedClip;
+            if (params.is_object())
+            {
+                if (params.contains ("paramId") && params["paramId"].is_string())
+                    paramId = params["paramId"].get<std::string>();
+                if (params.contains ("clipId") && params["clipId"].is_number_integer())
+                    editedClip = params["clipId"].get<int>();
+            }
+            videohelper::renderinput::bump (videohelper::renderinput::editScope (method, paramId, editedClip));
+        }
         if (method == "viewport_set_timeline")
             std::fprintf (stderr, "[diagnostic] viewport_set_timeline request bytes=%zu parseMs=%.1f handleMs=%.1f\n",
                           lineSize, diagnosticMilliseconds (requestStarted, requestParsed),
@@ -3699,7 +3798,10 @@ int main (int argc, char** argv)
     {
         replyError (nullptr, "could not allocate " + std::to_string (bytes) + " bytes for a helper request line");
     };
-    videorender::fixture3d::pathtracefixture::prepareDeviceAtStartup();
+    if (! requestedPathTraceDevice.empty())
+        videorender::fixture3d::pathtracefixture::setDevicePreference (requestedPathTraceDevice);
+    else
+        videorender::fixture3d::pathtracefixture::prepareDeviceAtStartup();
     videohelper::RequestLineAssembler<> requestLines;
 #if defined(__APPLE__) && ARBIT_HAVE_VIEWPORT
     // Keep AppKit event routing on the process main thread while stdin remains

@@ -469,6 +469,26 @@ void gratingAreaDifferentials()
     const auto metal=arbitgpu::metalcaustic::gratingIncidentShader("/*fixture compiler-owned order bodies supplied by native owner*/");
     const auto metalTerminal=arbitgpu::metalcaustic::gratingTerminalShader("/*fixture compiler-owned order bodies supplied by native owner*/");
     check(!gl.empty()&&!glTerminal.empty()&&!metal.empty()&&!metalTerminal.empty(),"both additive incident and terminal generator substitutions remain complete");
+    {
+        // Every deposition walk keeps its pending stack in policy-sized device
+        // storage: no fixed CAUSTIC_MAX_PENDING array survives any variant.
+        const auto glMultiple=gc::opengl::multipleScatterComputeSource();
+        for(const auto* source:{&legacyGl,&gl,&glTerminal,&glMultiple})
+            check(!source->empty()&&source->find("CAUSTIC_MAX_PENDING")==std::string::npos&&source->find("Branch stack[")==std::string::npos
+                &&source->find("Branch branch=pendingLoad(pendingBlock(w,--pending),branchHigh);")!=std::string::npos
+                &&source->find("historyBranchBlock(w,uPending)")!=std::string::npos,
+                "GL deposition walks push and pop branches through the policy-sized path tail");
+        check(glMultiple.find("b.samplingHistory=id(paths[at+4].zw);")!=std::string::npos
+            &&gl.find("b.du=paths[at+5].xyz;b.dv=paths[at+6].xyz;")!=std::string::npos
+            &&glMultiple.find("1.0,uvec2(0u),0,false,uvec4(0u),uvec4(0u),2166136261u),uvec2(0u));")!=std::string::npos,
+            "GL variants store their extra branch fields in the pending entry");
+        for(const auto* source:{&legacyMetal,&metal,&metalTerminal})
+            check(source->find("CAUSTIC_MAX_PENDING")==std::string::npos&&source->find("pendingWide")==std::string::npos
+                &&source->find("CBranch branch=pending[--size].branch;ulong branchWide=pending[size].wide;")!=std::string::npos
+                &&source->find("sizeof(CPending)<=CAUSTIC_BRANCH_TEXELS*16")!=std::string::npos,
+                "Metal deposition walks keep the pending stack in the policy-sized path tail");
+        check(gc::kPendingBranchTexels*16>=128+8,"a pending entry holds the largest 128-byte Metal branch and its wide history");
+    }
     check(gl.find("hitDu.xy")!=std::string::npos&&metal.find("branch.du.xy")!=std::string::npos
         &&metal.find("sizeof(CBranch)==128")!=std::string::npos,"native generators emit exact derivative packing and account aligned pending ABI");
     check(legacyGl.find("gratingPlaneDerivative")==std::string::npos&&legacyMetal.find("gratingPlaneDerivative")==std::string::npos,
@@ -619,18 +639,27 @@ void gratingIncidentContract()
     check(!gc::validateTables(mixedPrepared,mixedFrame,error),"mixed staging cannot enter default Color table gate");
     check(mixedPrepared.branchPolicy->description().maximumInterfaces==32,"the staging frame above was admitted at policy 32");
     {
-        // Grating staging keeps 32-interface ancestry, so a policy of 33 is refused.
-        auto description=fixture.policy->description();description.maximumInterfaces=33;
+        // Grating staging carries the whole history past 32 interfaces: policy
+        // 200 builds, and each incident reserves history words 2..6 in its tail.
+        auto description=fixture.policy->description();description.maximumInterfaces=200;
         const auto deeper=gc::AdmittedBranchPolicy::admit(description,error);
-        check(bool(deeper),"a policy of 33 interfaces is admissible on its own: "+error);
+        check(bool(deeper),"a policy of 200 interfaces is admissible on its own: "+error);
         gc::Prepared deeperPrepared;gc::Frame deeperFrame;
         if(deeper)
         {
-            const bool refused=gc::prepare(mixedGlass,fixture.ordinaryLight,*deeper,deeperPrepared,error)
-                &&!gc::buildGratingStagingFrame(deeperPrepared,fixture.frame.instances,nullptr,32,32,{},deeperFrame,error)
-                &&error.find("admit at most 32 interfaces")!=std::string::npos;
-            check(refused,"a grating staging frame at policy 33 is refused before its 32-byte ancestry overflows: "+error);
+            const bool built=gc::prepare(mixedGlass,fixture.ordinaryLight,*deeper,deeperPrepared,error)
+                &&gc::buildGratingStagingFrame(deeperPrepared,fixture.frame.instances,nullptr,32,32,{},deeperFrame,error);
+            check(built,"a grating staging frame at policy 200 builds: "+error);
+            check(!built||deeperFrame.bounds.policyInterfaces==200,"the staging frame records the policy that sizes incident tails");
+            gc::GratingIncidentBounds deepBounds,shallowBounds;
+            check(built&&gc::calculateGratingIncidentBounds(deeperFrame,2,deepBounds,error)
+                &&gc::calculateGratingIncidentBounds(mixedFrame,2,shallowBounds,error)
+                &&deepBounds.historyTailWords==5&&shallowBounds.historyTailWords==0&&deepBounds.bytes>shallowBounds.bytes,
+                "incident tails hold words 2..6 at policy 200 and nothing at 32: "+error);
         }
+        check(gc::gratingIncidentHistoryTailWords(64)==0&&gc::gratingIncidentHistoryTailWords(65)==2
+            &&gc::gratingIncidentHistoryTailWords(129)==3&&gc::gratingIncidentHistoryTailTexels(129)==2,
+            "incident tails start past 64 interfaces and round words up to texels");
     }
     std::shared_ptr<const gc::GratingIncidentBinding> mixedBinding;
     check(gc::prepareGratingIncidentBinding(mixedPrepared,mixedFrame,compiledGrating,material,.25,mixedBinding,error),
@@ -708,6 +737,28 @@ void gratingIncidentContract()
     changed=event;changed.bitangent=gc::Point{};reject(changed,"invalid handed grating frame refused");
     changed=event;changed.ancestry[0]=1;reject(changed,"exact ancestry and reflection history must agree");
     changed=event;changed.ancestry[31]=65;reject(changed,"unused ancestry suffix must remain zero");
+    {
+        // Past 32 interfaces the inline tokens stop and the history carries the
+        // rest: two transmissions, then reflections at interfaces 2..139.
+        auto description=fixture.policy->description();description.maximumInterfaces=200;
+        const auto deep=gc::AdmittedBranchPolicy::admit(description,error);
+        check(bool(deep),"policy 200 admits for the deep incident: "+error);
+        if(deep) {
+            auto deepBinding=*binding;deepBinding.prepared.branchPolicy=std::make_shared<const gc::AdmittedBranchPolicy>(*deep);
+            auto deepEvent=event;deepEvent.interfaces=140;gc::CausticHistory history;
+            for(unsigned depth=2;depth<140;++depth)history=history.with(depth);
+            deepEvent.reflectionHistory=history;for(unsigned depth=2;depth<32;++depth)deepEvent.ancestry[depth]=1;
+            check(gc::validateGratingIncident(deepBinding,deepEvent,submission,submission,error),
+                "a 140-interface incident validates against its full history: "+error);
+            check(!gc::validateGratingIncident(*binding,deepEvent,submission,submission,error),"policy 32 refuses a 140-interface incident");
+            auto bad=deepEvent;bad.reflectionHistory=history.with(140);
+            check(!gc::validateGratingIncident(deepBinding,bad,submission,submission,error),"a history bit past the interface count is refused");
+            bad=deepEvent;bad.reflectionHistory=gc::CausticHistory{};
+            for(unsigned depth=2;depth<140;++depth)if(depth!=100)bad.reflectionHistory=bad.reflectionHistory.with(depth);
+            check(!gc::validateGratingIncident(deepBinding,bad,submission,submission,error),
+                "a transmission at interface 100 leaves the path inside and is refused");
+        }
+    }
     changed=event;changed.orders[0].power*=2;reject(changed,"resolved reflected flux cannot be renormalized");
     changed=event;changed.orders[0].order=1;reject(changed,"signed order must satisfy existing spectral tangential equation");
     changed=event;changed.orderCount=2;changed.orders[1]=changed.orders[0];reject(changed,"duplicate signed order refused");
@@ -794,7 +845,7 @@ void gratingIncidentContract()
             incident.band=fixture.frame.work[w].band;incident.interfaces=std::uint32_t(branch.interfaces);
             incident.reflectionHistory=branch.reflectionHistory;incident.fraction=float(branch.fraction);
             incident.power=fixture.frame.work[w].incidentPower*incident.fraction;incident.hit=branch.receiver;
-            for(unsigned depth=0;depth<incident.interfaces;++depth)incident.ancestry[depth]=(incident.reflectionHistory>>depth)&1?1:65;
+            for(unsigned depth=0;depth<std::min(incident.interfaces,32u);++depth)incident.ancestry[depth]=incident.reflectionHistory.test(depth)?1:65;
             const auto witness=std::find_if(binding->triangles.begin(),binding->triangles.end(),[&](const auto& t){return t.triangle==incident.hit.triangleId;});
             if(witness==binding->triangles.end()){check(false,"synthetic grating triangle has frozen witness");continue;}
             incident.normal=witness->normal;incident.tangent=witness->tangent;incident.bitangent=witness->bitangent;
@@ -849,7 +900,7 @@ void gratingIncidentContract()
     terminal.gratingIncidents=full;auto broken=terminal;broken.paths[0].absorbedPower=0;
     check(!gc::validateNativeReadback(fixture.prepared,marked,broken,ledger,error,&submission,true),"substrate absorption is included exactly once in the original path");
     check(!gc::validateNativeReadback(fixture.prepared,marked,terminal,ledger,error,&submission),"full typed diagnostic still cannot bypass production Color guard");
-    gc::GratingIncidentBounds sentinel;sentinel.bytes=123;auto huge=fixture.frame;huge.bounds.transientBytes=renderpassoutput::kMaximumTotalBytes;
+    gc::GratingIncidentBounds sentinel;sentinel.bytes=123;auto huge=fixture.frame;huge.bounds.transientBytes=renderpassoutput::kRepresentableTotalBytes;
     check(!gc::calculateGratingIncidentBounds(huge,2,sentinel,error)&&sentinel.bytes==123,"additional storage overflow refuses atomically");
     auto wrongOwner=std::make_shared<gt::Program>(*owner);wrongOwner->materialRevision++;
     auto preserved=binding;
@@ -1356,7 +1407,7 @@ void directGratingTerminalOrderContract(PreparedDirectGratingCohort& common,
     rejects(edited,common.sealed,.25,"terminal actual source copy capacity beyond admission refuses atomically");
     for(unsigned mode=0;mode<5;++mode) {
         const auto budget=common.terminalBudget;
-        if(mode==0)common.terminalBudget.retainedBytes=renderpassoutput::kMaximumTotalBytes;
+        if(mode==0)common.terminalBudget.retainedBytes=renderpassoutput::kRepresentableTotalBytes;
         if(mode==1)common.terminalBudget.combinedWork=gc::kMaximumQueryWork;
         if(mode==2)common.terminalBudget.depositionWork=gc::kMaximumDepositionWork;
         if(mode==3)common.terminalBudget.retainedBytes=std::numeric_limits<std::uint64_t>::max();
@@ -1433,7 +1484,7 @@ void directGratingTerminalReceiverContract(PreparedDirectGratingCohort& common,c
         "later receiver admission reconstructs incumbent and failed-work charges: "+error);
     for(unsigned fault=0;fault<6;++fault) {
         auto invalid=common.receiverBudget;
-        if(fault==0)invalid.retainedBytes=renderpassoutput::kMaximumTotalBytes;
+        if(fault==0)invalid.retainedBytes=renderpassoutput::kRepresentableTotalBytes;
         if(fault==1)invalid.combinedWork=gc::kMaximumQueryWork;
         if(fault==2)invalid.nativeInputBytesPerRow=UINT64_MAX;
         if(fault==3)invalid.nativeOutputBytesPerRow=UINT64_MAX;
@@ -1642,7 +1693,7 @@ void cameraCellCoverageContract(PreparedDirectGratingCohort& original)
         "camera bounds derive from every frozen triangle and pair rather than source-cell leaf limits");
     for(unsigned mode=0;mode<2;++mode) {
         auto invalid=candidateBudget;
-        if(mode==0)invalid.retainedBytes=renderpassoutput::kMaximumTotalBytes;
+        if(mode==0)invalid.retainedBytes=renderpassoutput::kRepresentableTotalBytes;
         if(mode==1)invalid.combinedWork=gc::kMaximumQueryWork;
         auto sentinel=bounds;
         check(!gc::calculateCameraCellCoverageBounds(*parent.nativeResult,frozen,invalid,{},sentinel,error)
@@ -1909,11 +1960,11 @@ void directGratingContributionContract()
         "direct native endpoint/source legs and bands share original frame caps");
     bounds.bytes=123;check(!gc::calculateDirectGratingContributionBounds(binding,gc::kMaximumEntrySamples+1,0,0,bounds,error)
         &&bounds.bytes==123,"endpoint cap refusal preserves bounds output");
-    auto exhausted=binding;exhausted.bounds.bytes=renderpassoutput::kMaximumTotalBytes-exhausted.frame.bounds.transientBytes;
+    auto exhausted=binding;exhausted.bounds.bytes=renderpassoutput::kRepresentableTotalBytes-exhausted.frame.bounds.transientBytes;
     check(!gc::calculateDirectGratingContributionBounds(exhausted,1,0,0,bounds,error)&&bounds.bytes==123,"whole-frame storage exhaustion refuses before allocation");
     exhausted=binding;exhausted.bounds.combinedWork=gc::kMaximumQueryWork;
     check(!gc::calculateDirectGratingContributionBounds(exhausted,1,0,0,bounds,error),"changed or exhausted whole-frame work refuses");
-    check(!gc::calculateDirectGratingContributionBounds(binding,1,renderpassoutput::kMaximumTotalBytes,0,bounds,error)
+    check(!gc::calculateDirectGratingContributionBounds(binding,1,renderpassoutput::kRepresentableTotalBytes,0,bounds,error)
         &&!gc::calculateDirectGratingContributionBounds(binding,1,0,gc::kMaximumQueryWork,bounds,error),
         "all other live adjunct storage and work must fit the same frame caps");
 
@@ -2095,7 +2146,7 @@ void directGratingContributionContract()
                 &&gc::calculateDirectGratingTerminalOrderBounds(*trialCommon.cohort,trialReceipts,trialCommon.terminalBudget,alias,aliasBounds,error)
                 &&foreignBounds.bytes-aliasBounds.bytes==cohort->bounds().bytes,"distinct retained terminal incumbent charges all frozen source/material owners");
             const auto budget=trialCommon.terminalBudget;
-            trialCommon.terminalBudget.retainedBytes+=renderpassoutput::kMaximumTotalBytes-aliasBounds.bytes;
+            trialCommon.terminalBudget.retainedBytes=renderpassoutput::kRepresentableTotalBytes-(aliasBounds.bytes-trialCommon.terminalBudget.retainedBytes);
             check(!gc::evaluateDirectGratingTerminalOrders(trialCommon.cohort,trialCommon,trialCommon.sealed,.25,trialReceipts,incumbent,error)
                 &&sameTerminalLedger(incumbent,terminalIncumbent),"foreign incumbent owner exceeding remaining authenticated headroom refuses atomically");
             trialCommon.terminalBudget=budget;
@@ -2207,10 +2258,55 @@ void glassCameraGratingTraceContract()
         &&bounds.maximumBands==8&&bounds.maximumVisits==8*64&&bounds.nativeInputBytes==64
         &&bounds.nativeOutputBytes==8*(160+64*256)&&bounds.queryWork>0,
         "all eight bands and worst-case64 native query visits are reserved together: "+error);
+    check(bounds.visitsPerBand==64&&bounds.pendingBytes==8*(64+3)*gc::kGlassCameraTracePendingBytes,
+        "each band reserves visits+1 pending branches plus the popped and child copies");
+    if(binding.prepared.branchPolicy) {
+        // Past the old 64-visit cap: storage, history lanes and the pending
+        // stack all follow the setting, with no 16-branch stack to overflow.
+        auto description=binding.prepared.branchPolicy->description();description.maximumVisits=300;
+        const auto wide=gc::AdmittedBranchPolicy::admit(description,error);
+        check(bool(wide),"a 300-visit branch policy admits: "+error);
+        if(wide) {
+            auto wideBinding=binding;wideBinding.prepared.branchPolicy=std::make_shared<const gc::AdmittedBranchPolicy>(*wide);
+            gc::GlassCameraGratingTraceBounds wideBounds;
+            check(gc::calculateGlassCameraGratingTraceBounds(wideBinding,1,0,0,wideBounds,error)
+                &&wideBounds.visitsPerBand==300&&wideBounds.maximumVisits==8*300
+                &&gc::glassCameraTraceHistoryWords(300)==10&&gc::glassCameraTraceVisitLanes(300)==18
+                &&wideBounds.nativeOutputBytes==8*(10+300*18)*16
+                &&wideBounds.pendingBytes==8*(300+3)*gc::kGlassCameraTracePendingBytes,
+                "a 300-visit camera trace sizes visits, history lanes and pending stacks from the setting: "+error);
+        }
+    }
+    {
+        visualimportedscenerender::GlassCausticBranchPolicy authored{1,1.0e-4f,1.0e-6f,32,300,16};
+        check(authored.valid(),"an imported scene may author 300 caustic visits");
+        authored.maximumVisits=16777216u;check(!authored.valid(),"a visit count past the exact-float bound is refused");
+    }
+    {
+        // The deposition walks keep their pending stacks in the path tail, sized
+        // from the policy: 40 pending branches admit and grow the tail by exactly
+        // 40 entries of kPendingBranchTexels per path, with no 16-branch array.
+        visualimportedscenerender::GlassCausticBranchPolicy authored{1,1.0e-4f,1.0e-6f,32,300,40};
+        check(authored.valid(),"an imported scene may author 40 pending caustic branches");
+        authored.maximumPending=16777216u;check(!authored.valid(),"a pending count past the exact-float bound is refused");
+        gc::BranchPolicyDescription description;description.version=gc::kBranchPolicyVersion;
+        description.maximumUnresolvedFraction=1.0e-4f;description.minimumBranchFraction=1.0e-6f;description.maximumPending=40;
+        check(bool(gc::AdmittedBranchPolicy::admit(description,error)),"a 40-pending branch policy admits: "+error);
+        description.maximumPending=gc::kMaximumPendingBranches+1;
+        check(!gc::AdmittedBranchPolicy::admit(description,error),"a pending count past the visit bound is refused");
+        std::uint64_t texels=0,wide=0;
+        check(gc::historyTailTexels(10,640,0,40,texels)&&texels==10*40*gc::kPendingBranchTexels,
+            "without extra history words the tail holds only the 40-entry pending stacks");
+        check(gc::historyTailTexels(10,640,3,40,wide)&&wide==(640+10*41)*2+10*40*gc::kPendingBranchTexels,
+            "history blocks follow maximumPending+1 branch slots per path");
+        texels=7;
+        check(!gc::historyTailTexels(std::numeric_limits<std::uint64_t>::max()/4,0,0,16,texels)&&texels==7,
+            "a tail past 64 bits refuses without replacing the count");
+    }
     bounds.bytes=123;
     check(!gc::calculateGlassCameraGratingTraceBounds(binding,gc::kMaximumEntrySamples+1,0,0,bounds,error)&&bounds.bytes==123,
         "sample bound refuses without replacing bounds");
-    check(!gc::calculateGlassCameraGratingTraceBounds(binding,1,renderpassoutput::kMaximumTotalBytes,0,bounds,error)
+    check(!gc::calculateGlassCameraGratingTraceBounds(binding,1,renderpassoutput::kRepresentableTotalBytes,0,bounds,error)
         &&!gc::calculateGlassCameraGratingTraceBounds(binding,1,0,gc::kMaximumQueryWork,bounds,error),
         "camera trace shares original cumulative storage and query budget");
     native.inputUpload.backend=program->backend;native.inputUpload.submission={binding.identity,1,3,3,4,6,3};
@@ -2274,7 +2370,7 @@ void glassCameraGratingTraceContract()
         if(mode==21)++visit.parent;
         if(mode==22)++visit.token;
         if(mode==23)++visit.interfaces;
-        if(mode==24)++visit.history;
+        if(mode==24)visit.history=visit.history.with(5);
         if(mode==25)visit.inside=true;
         if(mode==26)visit.tir=true;
         if(mode==27)visit.ancestry[0]=1;
@@ -2405,6 +2501,14 @@ void glassCameraGratingTraceContract()
     check(gc::decodeGlassCameraGratingTraceBand(header,packed.data(),packed.size(),decoded,error)&&!decoded.unresolvedFractionKnown,
         "native uint unknown flag is explicit and survives decode");
     header[8][3]=2;check(!gc::decodeGlassCameraGratingTraceBand(header,packed.data(),packed.size(),decoded,error),"nonboolean native known flag refuses");header[8][3]=1;
+    {
+        // Lane 1.y and lane 15.x hold the low and high words of the 64-bit history.
+        auto deepPacked=packed;deepPacked[0][1][1]=5;deepPacked[0][15][0]=0x80000001u;
+        check(gc::decodeGlassCameraGratingTraceBand(header,deepPacked.data(),deepPacked.size(),decoded,error)
+            &&decoded.visits[0].history==((std::uint64_t(0x80000001u)<<32)|5u),"camera trace history decodes all 64 bits: "+error);
+        deepPacked[0][15][1]=1;
+        check(!gc::decodeGlassCameraGratingTraceBand(header,deepPacked.data(),deepPacked.size(),decoded,error),"camera trace lane 15 padding stays zero");
+    }
     header[9][0]=1;check(!gc::decodeGlassCameraGratingTraceBand(header,packed.data(),packed.size(),decoded,error),"nonzero native reserved header refuses");
     header[9]={};header[6][3]=65;check(!gc::decodeGlassCameraGratingTraceBand(header,packed.data(),packed.size(),decoded,error),"native visit count cannot exceed64 or available storage");
 }
@@ -2670,7 +2774,7 @@ void gratingCameraReceipts()
     check(gc::calculateGratingCameraBounds(*p->binding,bounds,error)
         &&bounds.maximumOrders==p->binding->bounds.maximumOrders &&bounds.combinedWork<=gc::kMaximumQueryWork,
         "optional camera storage and queries share the existing whole-frame caps");
-    auto exhausted=*p->binding;exhausted.bounds.bytes=renderpassoutput::kMaximumTotalBytes-exhausted.frame.bounds.transientBytes;
+    auto exhausted=*p->binding;exhausted.bounds.bytes=renderpassoutput::kRepresentableTotalBytes-exhausted.frame.bounds.transientBytes;
     bounds.bytes=123;
     check(!gc::calculateGratingCameraBounds(exhausted,bounds,error)&&bounds.bytes==123,
         "optional camera resource overflow refuses without narrowing terminal-only admission or mutating output");
@@ -2966,7 +3070,7 @@ void multipleScatterPhysics()
         "microfacet event and draw work consumes the existing query-work authority");
     check(!gc::multipleScatterWorkWithinBounds(gc::kMaximumQueryWork-159,1,policy,combined)
         && !gc::multipleScatterWorkWithinBounds(0,std::numeric_limits<std::uint64_t>::max(),policy,combined),
-        "extra optical work refuses before overflow or the unchanged 128 Mi cap");
+        "extra optical work refuses only at the overflow bound");
     for(unsigned dimension=0;dimension<128;++dimension) {
         const auto u=gc::multipleScatterRandom(gc::multipleScatterSeed(3,5,7,11),dimension);
         check(u>0 && u<1,"stable path samples avoid singular CDF endpoints");
@@ -3130,6 +3234,23 @@ void multipleScatterReceipts()
     check(gc::validMacroAncestry(deposit,policy,false,minimum),"exact reflection tokens cross-check the original bitset");
     deposit.reflectionHistory=0;
     check(!gc::validMacroAncestry(deposit,policy,false,minimum),"sampling hashes cannot replace macro reflection evidence");
+    {
+        // Interfaces 32 and up read their tokens from the native ancestry tail.
+        gc::NativeDeposit deep;deep.interfaces=42;deep.ancestry.fill(65);
+        deep.ancestryTail.assign(4*gc::ancestryTailWords(42),0);
+        for(unsigned i=32;i<42;++i)deep.ancestryTail[i-32]=65;
+        check(gc::ancestryTailWords(42)==3&&gc::ancestryTailWords(32)==0&&gc::ancestryTailWords(33)==1,
+            "ancestry tail words count four tokens per word past 32");
+        unsigned deepMinimum=0;
+        check(gc::validMacroAncestry(deep,policy,false,deepMinimum)&&deepMinimum==42,
+            "a 42-interface transmitted chain validates through its tail tokens");
+        auto padded=deep;padded.ancestryTail.back()=65;
+        check(!gc::validMacroAncestry(padded,policy,false,deepMinimum),"a nonzero tail token past the interface count is refused");
+        auto missing=deep;missing.ancestryTail.clear();
+        check(!gc::validMacroAncestry(missing,policy,false,deepMinimum),"a deposit past 32 interfaces without its tail is refused");
+        auto odd=deep;odd.ancestryTail[41-32]=0;odd.interfaces=41;
+        check(!gc::validMacroAncestry(odd,policy,false,deepMinimum),"an odd transmitted chain ending inside the glass is refused");
+    }
     auto ancestry=gc::macroAncestryTexels(deposit.ancestry);std::array<std::uint8_t,32> tokens{};
     check(gc::decodeMacroAncestry(ancestry,2,tokens) && tokens==deposit.ancestry,
         "deposit texels22..29 preserve all32 exact one-byte tokens");
@@ -3255,10 +3376,15 @@ void branches()
     const auto policy=gc::AdmittedBranchPolicy::admit(description,error);
     check(bool(policy),error);if(!policy)return;
     check(!gc::AdmittedBranchPolicy::admit({},error),"absent explicit error policy cannot silently enable reflected caustics");
-    check(description.maximumInterfaces==32&&gc::kMaximumInterfaces==48&&gc::kMaximumAncestryInterfaces==32,
-        "the default policy keeps 32 interfaces below the smooth 48 ceiling");
+    check(description.maximumInterfaces==32&&gc::kMaximumInterfaces==16777215&&gc::kMaximumAncestryInterfaces==32,
+        "the default policy keeps 32 interfaces; smooth paths go to the exact-float bound");
     {auto deep=description;deep.maximumInterfaces=gc::kMaximumInterfaces;
-     check(bool(gc::AdmittedBranchPolicy::admit(deep,error)),"a smooth policy may reach the 48 interface ceiling: "+error);}
+     check(bool(gc::AdmittedBranchPolicy::admit(deep,error)),"a smooth policy may reach the exact-float interface bound: "+error);}
+    {auto deep=description;deep.maximumInterfaces=300;
+     check(bool(gc::AdmittedBranchPolicy::admit(deep,error)),"a smooth policy may take 300 interfaces: "+error);}
+    {visualimportedscenerender::GlassCausticBranchPolicy authored{1,1.0e-4f,1.0e-6f,300,64,16};
+     check(authored.valid(),"an imported scene may author 300 caustic interfaces");
+     authored.maximumInterfaces=16777216u;check(!authored.valid(),"an interface count past the exact-float bound is refused");}
     for(unsigned mode=0;mode<5;++mode)
     {
         auto invalid=description;
@@ -3270,21 +3396,25 @@ void branches()
         check(!gc::AdmittedBranchPolicy::admit(invalid,error),"unbounded or invalid policy cannot admit discarded branch power");
     }
     {
-        // Rough paths store one ancestry byte per interface in 32 bytes, so frame
-        // admission refuses a policy above 32 on them. Smooth paths take 33 to 48.
+        // Rough paths keep interfaces past 32 in the history tail, so frame
+        // admission takes them past 32 like smooth paths.
         const auto policyWith=[&](std::size_t interfaces) {
             auto limited=description;limited.maximumInterfaces=interfaces;
             const auto admitted=gc::AdmittedBranchPolicy::admit(limited,error);
             return admitted?std::make_shared<const gc::AdmittedBranchPolicy>(*admitted):nullptr;
         };
         const arbitgpu::smoothglass::RoughNativeConsumer consumer{arbitgpu::NativeFixtureMaterialBackend::OpenGl,true,true,true};
-        for(const std::size_t interfaces:{std::size_t(32),std::size_t(33)})
+        for(const std::size_t interfaces:{std::size_t(32),std::size_t(33),std::size_t(200)})
         {
             auto rough=gt::roughFixture();rough.policy=policyWith(interfaces);
             const bool admitted=rough.prepare(error,consumer);
-            if(interfaces==32)check(admitted,"a rough frame at policy 32 is admitted: "+error);
-            else check(!admitted&&error.find("admit at most 32 interfaces")!=std::string::npos,
-                "a rough frame at policy 33 is refused before its 32-byte ancestry overflows: "+error);
+            check(admitted,"a rough frame is admitted at policy "+std::to_string(interfaces)+": "+error);
+            std::uint64_t tail=0;
+            if(admitted&&interfaces==200)
+                check(rough.frame.bounds.historyExtraWords==3&&rough.frame.bounds.ancestryExtraWords==0
+                    &&gc::historyTailTexels(rough.frame.work.size(),rough.frame.bounds.maximumDeposits,3,rough.policy->description().maximumPending,tail)
+                    &&rough.frame.bounds.historyTexels==tail,
+                    "a 200-interface rough frame sizes three history tail words and no ancestry words");
             auto smooth=gt::roughFixture(0);smooth.policy=policyWith(interfaces);
             const bool smoothAdmitted=smooth.prepare(error);
             check(smoothAdmitted,"a smooth frame is admitted at policy "+std::to_string(interfaces)+": "+error);
@@ -3589,8 +3719,11 @@ void schedulesAndPower()
     check(fixture.frame.bounds.queryWork<=gc::kMaximumQueryWork,"source, branch and camera queries fit one checked work bound");
     std::uint64_t bytes=0;check(gc::admitFrameMemory(fixture.frame,4096,bytes,error)
         && bytes==4096+fixture.frame.bounds.transientBytes,"retained resources and caustic scratch are charged once by the caller");
-    bytes=123;check(!gc::admitFrameMemory(fixture.frame,renderpassoutput::kMaximumTotalBytes,bytes,error)
-        && bytes==123,"whole-frame memory overflow refuses atomically before allocating");
+    bytes=123;check(gc::admitFrameMemory(fixture.frame,renderpassoutput::kMaximumTotalBytes,bytes,error)
+        && bytes==renderpassoutput::kMaximumTotalBytes+fixture.frame.bounds.transientBytes,
+        "a frame past the old 2 GiB total is admitted; the device refuses only an allocation it cannot hold");
+    bytes=123;check(!gc::admitFrameMemory(fixture.frame,UINT64_MAX,bytes,error)
+        && bytes==123,"a frame total past 64 bits refuses atomically before allocating");
     const auto compare=[&](const gt::Fixture& f) {
         gc::EnergyLedger actual;const bool complete=gc::referencePower(f.prepared,f.frame,actual,error);check(complete,error);
         const auto expected=gt::powerOracle(f);check(expected.complete,"independent binary64 branch-power oracle completes");
@@ -4160,7 +4293,7 @@ void gratingEntryCells()
         check(cells->identity!=oldIdentity&&cells->identity!=previousIdentity,"private cell identity includes schedule and encoding");previousIdentity=cells->identity;
         check(cells->bounds.nativeUploadBytes==cells->cellTexels.size()*sizeof(gc::Texel)
             &&cells->bounds.bytes==cells->bounds.hostBytes+cells->bounds.nativeUploadBytes
-            &&cells->bounds.bytes<=renderpassoutput::kMaximumTotalBytes-parent->bounds.bytes-frame.bounds.transientBytes,
+            &&cells->bounds.bytes<=renderpassoutput::kRepresentableTotalBytes-parent->bounds.bytes-frame.bounds.transientBytes,
             "cell host and dedicated native upload bytes share the whole-frame cap");
         std::size_t index=0;
         for(const auto& triangle:frame.triangles) {
@@ -4230,9 +4363,9 @@ void gratingEntryCells()
         bad=std::make_shared<gc::GratingIncidentBinding>(*parent);bad->identity+="foreign";
         check(!gc::prepareGratingEntryCellBinding(bad,preserved,error)&&preserved==cells,"changed incident identity cannot mint a retained source domain");
         gc::GratingEntryCellBounds sentinel;sentinel.bytes=42;
-        auto capped=*parent;capped.bounds.bytes=renderpassoutput::kMaximumTotalBytes-frame.bounds.transientBytes;
+        auto capped=*parent;capped.bounds.bytes=renderpassoutput::kRepresentableTotalBytes-frame.bounds.transientBytes;
         check(!gc::calculateGratingEntryCellBounds(capped,sentinel,error)&&sentinel.bytes==42,"optional cell upload cannot exceed remaining frame storage");
-        capped=*parent;capped.bounds.bytes=renderpassoutput::kMaximumTotalBytes-frame.bounds.transientBytes-cells->bounds.bytes;
+        capped=*parent;capped.bounds.bytes=renderpassoutput::kRepresentableTotalBytes-frame.bounds.transientBytes-cells->bounds.bytes;
         check(gc::calculateGratingEntryCellBounds(capped,sentinel,error)&&sentinel.bytes==cells->bounds.bytes,"exact whole-frame cell storage boundary admits");
         ++capped.bounds.bytes;
         check(!gc::calculateGratingEntryCellBounds(capped,sentinel,error),"one byte beyond cell storage boundary refuses");
@@ -4352,7 +4485,7 @@ void gratingCellTransport()
     check(binding->bounds.maximumQueries==point->incidents.size()*4*(binding->bounds.maximumInterfaces+1)
         &&binding->bounds.queryWork==binding->bounds.maximumQueries*gc::gratingCellQueryAllowance(frame),"extra reservation charges all center and corner replay queries");
     check(parent->bounds.combinedWork+binding->bounds.queryWork<=gc::kMaximumQueryWork
-        &&frame.bounds.transientBytes+parent->bounds.bytes+cells->bounds.bytes+binding->bounds.bytes<=renderpassoutput::kMaximumTotalBytes,
+        &&frame.bounds.transientBytes+parent->bounds.bytes+cells->bounds.bytes+binding->bounds.bytes<=renderpassoutput::kRepresentableTotalBytes,
         "supplementary boundary work and storage stay inside existing whole-frame caps");
     auto bad=readback;
     bad.records[0].paths[1].back().hit.triangleId=1;bad.records[0].disposition=gc::GratingCellTransportDisposition::Unsupported;
@@ -4446,8 +4579,8 @@ void gratingCellTransport()
     oversizedParent->bounds.combinedWork=gc::kMaximumQueryWork;
     check(!gc::calculateGratingCellTransportBounds(oversizedCells,1,sentinel,error)&&sentinel.bytes==42,"replay budget cannot raise the whole-frame query cap");
     oversizedParent->bounds.combinedWork=parent->bounds.combinedWork;
-    oversizedParent->bounds.bytes=renderpassoutput::kMaximumTotalBytes-frame.bounds.transientBytes-cells->bounds.bytes;
-    check(!gc::calculateGratingCellTransportBounds(oversizedCells,1,sentinel,error)&&sentinel.bytes==42,"transport output cannot raise the whole-frame byte cap");
+    oversizedParent->bounds.bytes=renderpassoutput::kRepresentableTotalBytes-frame.bounds.transientBytes-cells->bounds.bytes;
+    check(!gc::calculateGratingCellTransportBounds(oversizedCells,1,sentinel,error)&&sentinel.bytes==42,"transport output cannot overflow the representable frame total");
     check(gc::kGratingIncidentStride==24&&gc::kGratingOrderStride==4&&gc::kGratingChildReceiptStride==8
         &&point->queryWork==event.orderCount&&point->submission.submissionSerial==7,
         "optional transport preserves released point strides, original query counters and original fence");
@@ -4651,8 +4784,8 @@ void gratingBoundaryPacketV2(const std::shared_ptr<const gc::GratingCellTranspor
         "v2 copied parent identity capacity cannot evade the existing reservation or mutate candidate output");
     gc::GratingBoundaryBoundsV2 sentinel;sentinel.bytes=42;auto capped=*binding;capped.bounds.queryWork=gc::kMaximumQueryWork;
     check(!gc::calculateGratingBoundaryBoundsV2(capped,2,1,sentinel,error)&&sentinel.bytes==42,"v2 preserves the original hard query cap atomically");
-    capped=*binding;capped.bounds.bytes=renderpassoutput::kMaximumTotalBytes;
-    check(!gc::calculateGratingBoundaryBoundsV2(capped,2,1,sentinel,error)&&sentinel.bytes==42,"v2 preserves the original whole-frame byte cap atomically");
+    capped=*binding;capped.bounds.bytes=renderpassoutput::kRepresentableTotalBytes;
+    check(!gc::calculateGratingBoundaryBoundsV2(capped,2,1,sentinel,error)&&sentinel.bytes==42,"v2 refuses an unrepresentable frame total atomically");
 }
 void gratingCellCoverageCases(const std::shared_ptr<const gc::GratingCellTransportBinding>& boundaryBinding,
     const gc::NativeGratingCellTransportReadback& boundaryValue,const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& nativeOwner)
@@ -4765,8 +4898,8 @@ void gratingCellCoverageCases(const std::shared_ptr<const gc::GratingCellTranspo
     auto capped=*boundaryBinding;capped.bounds.queryWork=gc::kMaximumQueryWork;
     gc::GratingCellCoverageBounds sentinel;sentinel.bytes=42;
     check(!gc::calculateGratingCellCoverageBounds(capped,4,sentinel,error)&&sentinel.bytes==42,"coverage cannot raise the hard whole-frame query cap");
-    capped=*boundaryBinding;capped.bounds.bytes=renderpassoutput::kMaximumTotalBytes;
-    check(!gc::calculateGratingCellCoverageBounds(capped,4,sentinel,error)&&sentinel.bytes==42,"coverage cannot raise the hard whole-frame memory cap");
+    capped=*boundaryBinding;capped.bounds.bytes=renderpassoutput::kRepresentableTotalBytes;
+    check(!gc::calculateGratingCellCoverageBounds(capped,4,sentinel,error)&&sentinel.bytes==42,"coverage refuses an unrepresentable frame total");
 }
 
 // float32 mirror of causticProjectReceiver in nativeMathSource (GLSL, and the
@@ -5184,7 +5317,7 @@ void splatDeposition()
             bigDeposit(1,1000.5f,600.5f),bigDeposit(1,1400.5f,1000.5f)};
         gc::SplatReference wide4k;
         check(gc::buildSplatReference(big,spread,bigWall,wide4k,error)&&wide4k.pixelQueries>=4*gc::kSplatWindow*gc::kSplatWindow
-            &&wide4k.queryWork>gc::kMaximumQueryWork,
+            &&wide4k.queryWork>128ull*1024*1024,
             "4K splat validation passes past 128 Mi of CPU query work: "+error);
         check(std::uint64_t(3400000)<=gc::kMaximumSplatCpuPixelQueries,
             "the 4K faceted lens estimate of 3.4 Mi pixels fits the CPU splat pixel map");
@@ -5512,15 +5645,16 @@ void facetedLensAdmission()
         "the lens splat scratch fits the frame memory budget and the scratch index range: "+error);
     check(gc::validateTables(fixture.prepared,splat,error),"the lens splat frame passes the native table validation: "+error);
     // The lighthouse lens sits in a bigger scene BVH, 514 to 624 work per query.
-    // Its native bound passes while the CPU diagnostic trace of the same frame
-    // stays under kMaximumQueryWork and refuses on its own.
+    // Its native bound passes, and so does the CPU diagnostic trace of the same
+    // frame: both share the overflow bound instead of the old 128 Mi cap.
     auto lighthouse=full;auto& allowance=lighthouse.query.texels[std::size_t(lighthouse.query.control[0])-1];
     allowance[0]=624;allowance[1]=0;
     gc::ResourceBounds bounds;
     check(gc::calculateResourceBounds(fixture.prepared,lighthouse,bounds,error)&&bounds.queryWork==paths*194*624
-        &&bounds.queryWork>gc::kMaximumQueryWork,"lighthouse BVH work over the CPU diagnostic cap passes frame admission: "+error);
-    check(!gc::diagnosticQueryWorkWithinBudget(lighthouse,paths*(2*(gc::kDefaultPolicyInterfaces+3)+64),error)
-        &&error.find("CPU diagnostic")!=std::string::npos,"the CPU diagnostic trace of that frame keeps its own cap: "+error);
+        &&bounds.queryWork>128ull*1024*1024,"lighthouse BVH work past the old 128 Mi cap passes frame admission: "+error);
+    check(gc::diagnosticQueryWorkWithinBudget(lighthouse,paths*(2*(gc::kDefaultPolicyInterfaces+3)+64),error)
+        &&!gc::diagnosticQueryWorkWithinBudget(lighthouse,gc::kMaximumQueryWork,error)
+        &&error.find("CPU diagnostic")!=std::string::npos,"the CPU diagnostic trace of that frame refuses only past the overflow bound: "+error);
     // A 12000-triangle glass BVH allows about 20000 work per query, 11 Gi for
     // this frame and past the old 1 Gi frame cap. The largest allowance the query
     // encoding holds still fits 64 bits.
@@ -5671,8 +5805,8 @@ void previewCameraWalkBudget()
         check(!previewText.empty(),"every Preview anchor is present exactly once");
         check(previewText.find("#define GLASS_PREVIEW_VISITS 6")!=std::string::npos
             &&previewText.find("for(int visit=0;visit<GLASS_PREVIEW_VISITS;++visit) {")!=std::string::npos
-            &&previewText.find("for(int visit=0;visit<64;++visit) {")==std::string::npos,"the preview single walk is capped");
-        check(exported.find("GLASS_PREVIEW")==std::string::npos&&exported.find("for(int visit=0;visit<64;++visit) {")!=std::string::npos,
+            &&previewText.find("for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {")==std::string::npos,"the preview single walk is capped");
+        check(exported.find("GLASS_PREVIEW")==std::string::npos&&exported.find("for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {")!=std::string::npos,
             "the export text carries no preview define");
         if(paired)check(previewText.find("int walks=1,visits=GLASS_PREVIEW_VISITS;")!=std::string::npos
             &&exported.find("int walks=sharedPaths?1:3,visits=sharedPaths?48:16;")!=std::string::npos,
@@ -5745,6 +5879,29 @@ void causticLimitAdmission()
     auto texture=limits(mib(2048),65535);texture.maximumTextureSize=1024;
     check(go::openGlCausticLimitFailure(texture,planned)=="texture extent 1920 exceeds max texture size 1024",
         "a texture size limit is named");
+    {
+        // A path tail past the GLSL int index refuses by name even when the device
+        // block size would hold it; one texel less fits.
+        auto huge=planned;auto wide=limits(std::uint64_t(1)<<40,65535);
+        huge.bytes[0]=(go::kOpenGlCausticMaximumPathTexels+1)*16;
+        check(go::openGlCausticLimitFailure(wide,huge).find("a GLSL int index reaches")!=std::string::npos,
+            "a path tail past the int index range is named");
+        huge.bytes[0]=go::kOpenGlCausticMaximumPathTexels*16;
+        check(go::openGlCausticLimitFailure(wide,huge).empty(),"a path tail at the int index range fits");
+        const auto source=go::glasscaustics::opengl::computeSource();
+        check(source.find("int pathTailIndex(uint value)")!=std::string::npos
+            &&source.find("uint(uWorkCount)*(uint(uVisits)+uint(uPending)+1u)")!=std::string::npos,
+            "GL path-tail offsets sum in uint so work times pending cannot wrap");
+    }
+    {
+        // The camera walk loop and the program key follow the scene's visit count.
+        namespace sg=arbitgpu::smoothglass;
+        check(sg::cameraVisitsFor(HarmonicMIDI::grid::Visual3DScene{})==sg::kMaximumRayVisits,"an unauthored scene walks the default visits");
+        check(sg::transportShader(false,true,false,false,32).find("#define GLASS_CAMERA_VISITS 32\n")!=std::string::npos,
+            "a 32-visit scene writes its visits into the transport text");
+        check(sg::transportShader(false,true,false,false,0).find("#define GLASS_CAMERA_VISITS 1\n")!=std::string::npos,
+            "a zero visit count still walks once");
+    }
     auto splatLimits=limits(mib(2048),65535);splatLimits.maximumWorkGroupsY=65535;splatLimits.maximumLocalSizeY=1024;
     const go::OpenGlCausticSplatDemand splatDemand{1024,4096,4096,4096,14,8};
     check(go::openGlCausticSplatLimitFailure(splatLimits,splatDemand).empty(),"a splat frame inside every limit fits");

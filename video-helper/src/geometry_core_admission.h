@@ -2,6 +2,7 @@
 #include "../../shared/GeometrySurfaceMaterial.h"
 
 #include "../../shared/GeometryCoreTransport.h"
+#include "../../shared/GeometryCoreSlotMedia.h"
 #include "timeline_scene_family_budget.h"
 #include "published_plan_memo.h"
 #include "timeline_scene_evaluation_inputs.h"
@@ -410,6 +411,8 @@ public:
   };
   std::shared_ptr<NativeResources> nativeResources;
   std::string surfaceMaterial;
+  // Encoded media of the material table's slots (GeometryCoreSlotMedia.h).
+  std::string slotMedia;
   videowire::geometry::AdmissionContext sourceContext;
   std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission> bodySource;
   std::shared_ptr<const videorender::ParticleBodyCallerLease> bodyAdmissionLease;
@@ -635,6 +638,7 @@ public:
     ++verifiedTimelineReuses_;
     RuntimeAdmission result{owner.use,owner,found->second.plan,found->second.ownerLease,
         found->second.nativeResources,found->second.surfaceMaterial,context,found->second.bodySource,{}};
+    result.slotMedia=found->second.slotMedia;
     result.issueResidency(residency_,std::move(copy)); return result;
   }
   void markTimelinePlanVerified(const PlanOwnerIdentity& owner,
@@ -707,7 +711,8 @@ private:
     if (!lowered)
       return std::nullopt;
     return admit(lowered->runtimeValue, lowered->contract, limits, context,
-                 PlanOwnerIdentity{1, 1, 1, 1, 1, use}, error, lowered->surfaceMaterial);
+                 PlanOwnerIdentity{1, 1, 1, 1, 1, use}, error, lowered->surfaceMaterial, {}, {},
+                 lowered->slotMedia);
   } catch (const std::bad_alloc&) {
     error = "Geometry Core plan could not allocate its geometry";
     return std::nullopt;
@@ -731,7 +736,7 @@ private:
     if (!lowered)
       return std::nullopt;
     return admit(lowered->runtimeValue, lowered->contract, limits, context,
-                 owner, error, lowered->surfaceMaterial, bodySource, bodyLease);
+                 owner, error, lowered->surfaceMaterial, bodySource, bodyLease, lowered->slotMedia);
   } catch (const std::bad_alloc&) {
     error = "Geometry Core plan could not allocate its geometry";
     return std::nullopt;
@@ -747,7 +752,8 @@ private:
         const PlanOwnerIdentity &owner,
         std::string &error, const std::string& surfaceMaterial = {},
         const std::shared_ptr<const videorender::ParticlePointsBodySourceAdmission>& bodySource = {},
-        const std::shared_ptr<const videorender::ParticleBodyCallerLease>& bodyLease = {}) {
+        const std::shared_ptr<const videorender::ParticleBodyCallerLease>& bodyLease = {},
+        const std::string& slotMedia = {}) {
     if (!context.evaluatedBodyGeometry.empty() || (!context.deferredBodyGeometry.empty() && (!bodySource || !bodyLease))) {
       error="Immutable body Geometry3D admission requires a private source and no frame samples"; return std::nullopt;
     }
@@ -790,6 +796,14 @@ private:
         }
       }
     }
+    if (!slotMedia.empty()) {
+      const auto media=videowire::geometry::decodeSlotMedia(slotMedia,error);
+      if (!media) return std::nullopt;
+      // Slot 0 is a Surface override's medium, so it needs geometry without a table.
+      if (!videowire::geometry::slotMediaOwned(*media,decoded->descriptor().operations)) {
+        error="Geometry Core slot medium has no exact material-table owner"; return std::nullopt;
+      }
+    }
     // Export rebuilds Subdivision Surface at its render level; preview keeps the viewport level.
     std::optional<videowire::geometry::ValueDescriptor> levelSelected;
     if (std::any_of(decoded->descriptor().operations.begin(),decoded->descriptor().operations.end(),[](const auto& op) {
@@ -821,6 +835,10 @@ private:
       key ^= byte;
       key *= 1099511628211ull;
     }
+    for (const unsigned char byte : slotMedia) {
+      key ^= byte;
+      key *= 1099511628211ull;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (activeProjectGeneration_ != 0
         && (owner.projectGeneration != activeProjectGeneration_
@@ -842,6 +860,7 @@ private:
       RuntimeAdmission result{owner.use, owner, found->second.plan,
                               found->second.ownerLease,
                               found->second.nativeResources, found->second.surfaceMaterial, context, found->second.bodySource, bodyLease};
+      result.slotMedia=found->second.slotMedia;
       result.issueResidency(residency_,std::move(copy)); return result;
     }
     auto victim=cache_.end();
@@ -874,11 +893,13 @@ private:
     auto copy=bodySource ? std::shared_ptr<const void>{}:admitRuntimeCopy(context,surfaceMaterial,
         shared->receipt().effectiveLimits.maxBufferBytes,error);
     if (!bodySource && !copy) return std::nullopt;
-    cache_.emplace(owner, Entry{key, ++clock_, shared, ownerLease, nativeResources, surfaceMaterial, {}, bodySource, bodyLease});
+    cache_.emplace(owner, Entry{key, ++clock_, shared, ownerLease, nativeResources, surfaceMaterial, {}, bodySource, bodyLease})
+        .first->second.slotMedia=slotMedia;
     if (victim!=cache_.end()) cache_.erase(victim);
     ++admissionsInGeneration_;
     RuntimeAdmission result{owner.use, owner, std::move(shared),
                             std::move(ownerLease), std::move(nativeResources), surfaceMaterial, context, bodySource, bodyLease};
+    result.slotMedia=slotMedia;
     result.issueResidency(residency_,std::move(copy)); return result;
   }
   std::shared_ptr<const void> admitRuntimeCopy(const videowire::geometry::AdmissionContext& context,
@@ -1172,6 +1193,7 @@ private:
     HarmonicMIDI::grid::SceneObjectId verifiedObject {};
     std::uint64_t verifiedPlan = 0;
     PublishedPlanMemo verifiedPlanText {};
+    std::string slotMedia {};
   };
   static std::uint64_t timelinePlanDigest(const videowire::geometry::TimelineSceneBinding& binding) noexcept {
     std::uint64_t digest=14695981039346656037ull;

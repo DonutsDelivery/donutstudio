@@ -14,6 +14,7 @@ inline arbitmod::SourceType parseSourceType (const std::string& s)
     if (s == "NoteTrigger")     return ST::NoteTrigger;
     if (s == "NoteCount")       return ST::NoteCount;
     if (s == "NoteAge")         return ST::NoteAge;
+    if (s == "NoteCounter")    return ST::NoteCounter;
     if (s == "CentsFromRoot")   return ST::CentsFromRoot;
     if (s == "PrimeEnergy")     return ST::PrimeEnergy;
     if (s == "RootTrigger")     return ST::RootTrigger;
@@ -34,6 +35,7 @@ inline arbitmod::SourceType parseSourceType (const std::string& s)
     if (s == "AudioPeak")       return ST::AudioPeak;
     if (s == "AudioOnset")      return ST::AudioOnset;
     if (s == "AudioBand")       return ST::AudioBand;
+    if (s == "AudioEnvelope")   return ST::AudioEnvelope;
     return ST::ClockBeatPhase;
 }
 inline arbitmod::Curve parseCurve (const std::string& s)
@@ -83,11 +85,6 @@ inline bool parsePlanJson(const nlohmann::json& value, videocontrol::Plan& desti
         if (!value.contains("operations") || !value["operations"].is_array())
         {
             error = "controlPlan.operations must be an array";
-            return false;
-        }
-        if (value["operations"].size() > videocontrol::kMaxOperations)
-        {
-            error = "video control plan operation count exceeds capacity";
             return false;
         }
 
@@ -198,6 +195,10 @@ inline bool parsePlanJson(const nlohmann::json& value, videocontrol::Plan& desti
                 operation.source.lfo.hz = parameter(18, 0.0f) >= 0.5f;
                 operation.source.lfo.rateHz = parameter(19, 1.0f);
                 operation.source.lfo.retrigger = parameter(20, 0.0f) >= 0.5f;
+                // The follower's two knobs are declared straight after the shared 21
+                // canonical params, in the same slots the node reads them from.
+                operation.source.envAttack = parameter(21, 0.01f);
+                operation.source.envRelease = parameter(22, 0.2f);
             }
             plan.operations.push_back(std::move(operation));
         }

@@ -353,13 +353,7 @@ public:
                || nextResidentBytes > visualmodelassetpayload::kMaxResidentBytes)
         {
             if (! evictOneUnreferenced())
-            {
-                if (resident_.size() >= visualmodelassetpayload::kMaxResidentPayloads)
-                    return { { Failure::ResidentPayloadLimitExceeded,
-                               received.receivedBytes }, {} };
-                return { { Failure::ResidentByteLimitExceeded,
-                           received.receivedBytes }, {} };
-            }
+                break;
         }
 
         try
@@ -370,7 +364,9 @@ public:
         {
             return { { Failure::AllocationFailed, received.receivedBytes }, {} };
         }
-        residentBytes_ = nextResidentBytes;
+        residentBytes_ = detail::checkedAdd(residentBytes_, received.payload->bytes().size(),
+                                            nextResidentBytes)
+            ? nextResidentBytes : std::numeric_limits<std::uint64_t>::max();
         return received;
     }
 

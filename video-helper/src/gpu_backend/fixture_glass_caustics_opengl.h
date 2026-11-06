@@ -250,7 +250,8 @@ inline bool sameCausticRefusalLight(const HarmonicMIDI::grid::SceneLightRecord& 
         &&bits(a.transform.rotation,b.transform.rotation)&&bits(a.transform.scale,b.transform.scale)
         &&bits(a.color,b.color)&&bits(a.intensity,b.intensity)&&bits(a.range,b.range)
         &&bits(a.innerConeAngle,b.innerConeAngle)&&bits(a.outerConeAngle,b.outerConeAngle)
-        &&sameSpectralSource(a.spectralSource,b.spectralSource);
+        &&sameSpectralSource(a.spectralSource,b.spectralSource)
+        &&HarmonicMIDI::grid::sameLightShapeAndVisibility(a,b);
 }
 inline bool sameCausticRefusalInstances(const std::vector<opaquevisibility::Instance>& a,
     const std::vector<opaquevisibility::Instance>& b)
@@ -299,6 +300,7 @@ struct OpenGlCausticStorageDemand
 };
 inline constexpr std::array<const char*,7> kOpenGlCausticStorageNames{
     "path receipts","deposit receipts","spectrum","work texels","triangle texels","deposition keys","resolve spectrum"};
+inline constexpr std::uint64_t kOpenGlCausticMaximumPathTexels=2147483647u;
 inline OpenGlCausticStorageDemand openGlCausticStorageDemand(const glasscaustics::Frame& frame,std::uint64_t keyCount)
 {
     namespace gc=glasscaustics;
@@ -307,7 +309,7 @@ inline OpenGlCausticStorageDemand openGlCausticStorageDemand(const glasscaustics
     demand.workCount=frame.work.size();demand.depositionKeys=frame.bounds.deposition.paddedKeyCount;
     demand.textureExtent=std::max({std::uint64_t(frame.width),std::uint64_t(frame.height),
         std::uint64_t(opaquevisibility::kTextureWidth),std::uint64_t(frame.query.height)});
-    demand.bytes={frame.work.size()*gc::kPathReceiptStride*sizeof(gc::Texel),
+    demand.bytes={(frame.work.size()*gc::kPathReceiptStride+frame.bounds.historyTexels)*sizeof(gc::Texel),
         frame.bounds.maximumDeposits*gc::kDepositReceiptStride*sizeof(gc::Texel),pixels*4*sizeof(float),
         frame.workTexels.size()*sizeof(gc::Texel),frame.triangleTexels.size()*sizeof(gc::Texel),
         keyCount*sizeof(gc::DepositionKey),pixels*4*sizeof(float)};
@@ -332,6 +334,11 @@ inline std::string openGlCausticLimitFailure(const OpenGlCausticDeviceLimits& li
         if(demand.bytes[i]>limits.maximumStorageBlockBytes)
             return std::string(kOpenGlCausticStorageNames[i])+" need "+openGlCausticMebibytes(demand.bytes[i])
                 +", max SSBO "+openGlCausticMebibytes(limits.maximumStorageBlockBytes);
+    // The walk indexes path texels with a GLSL int, a representability bound
+    // of the shading language rather than of the scene.
+    if(demand.bytes[0]/sizeof(glasscaustics::Texel)>kOpenGlCausticMaximumPathTexels)
+        return "path receipts need "+count(demand.bytes[0]/sizeof(glasscaustics::Texel))+" texels, past the "
+            +count(kOpenGlCausticMaximumPathTexels)+" a GLSL int index reaches";
     const auto keyBytes=demand.depositionKeys*sizeof(glasscaustics::DepositionKey);
     if(keyBytes>limits.maximumStorageBlockBytes)
         return "deposition keys need "+openGlCausticMebibytes(keyBytes)+", max SSBO "+openGlCausticMebibytes(limits.maximumStorageBlockBytes);
@@ -824,18 +831,19 @@ inline bool causticDecodePath(const glasscaustics::Texel* p,const glasscaustics:
 inline bool causticDecodeDeposit(const glasscaustics::Texel* p,std::uint32_t owningMultipleScatterVersion,
     glasscaustics::NativeDeposit& output)
 {
-    glasscaustics::NativeDeposit r;std::uint32_t low=0,high=0;
+    glasscaustics::NativeDeposit r;std::uint32_t low=0,high=0,wideLow=0,wideHigh=0;
     for(unsigned t=0;t<glasscaustics::kDepositReceiptStride;++t)
         for(float value:p[t])if(!std::isfinite(value))return false;
-    if(p[4][2]!=0||p[4][3]!=0||p[30]!=glasscaustics::Texel{}||p[31]!=glasscaustics::Texel{})return false;
+    if(p[4][2]!=0||p[4][3]!=0||p[31]!=glasscaustics::Texel{})return false;
     std::array<glasscaustics::Texel,8> ancestry;
     std::copy_n(p+22,ancestry.size(),ancestry.begin());
     if(!glasscaustics::decodeMacroAncestry(ancestry,owningMultipleScatterVersion,r.ancestry))return false;
     if(!causticId(p[0][0],p[0][1],r.work)||!causticWord(p[0][2],glasscaustics::kMaximumInterfaces,r.interfaces)
         ||(p[0][3]!=0&&p[0][3]!=1)||!causticId(p[1][0],p[1][1],low)||!causticId(p[1][2],p[1][3],high)
-        ||(p[3][0]!=0&&p[3][0]!=1)||!causticWord(p[3][1],kMaximumNativeFixtureExtent,r.footprint.x)
+        ||!causticId(p[30][0],p[30][1],wideLow)||!causticId(p[30][2],p[30][3],wideHigh)||(p[3][0]!=0&&p[3][0]!=1)||!causticWord(p[3][1],kMaximumNativeFixtureExtent,r.footprint.x)
         ||!causticWord(p[3][2],kMaximumNativeFixtureExtent,r.footprint.y))return false;
-    r.reflectionHistory=low|(std::uint64_t(high)<<32);r.cameraVisible=p[0][3]==1;
+    r.reflectionHistory=glasscaustics::CausticHistory::fromWords(low,high,wideLow,wideHigh);r.cameraVisible=p[0][3]==1;
+    if(!r.reflectionHistory.clearFrom(r.interfaces))return false;
     r.fraction=p[2][0];r.incidentPower=p[2][1];r.outgoingPower=p[2][2];r.absorbedPower=p[2][3];
     r.footprint.projected=p[3][0]==1;r.footprint.linearDepth=p[3][3];r.footprint.worldArea=p[4][0];r.raster.linearDepth=p[4][1];
     if(!causticId(p[5][0],p[5][1],r.raster.object)||!causticId(p[5][2],p[5][3],r.raster.material)
@@ -882,7 +890,7 @@ bool cameraTraceInterface(vec3 direction,bool inside,SceneClosestHit hit,float i
         &&cameraTraceFinite3(transmitted)&&(tir||abs(dot(transmitted,transmitted)-1.0)<=1e-4);
 }
 struct CameraTraceNativeBranch {
-    vec3 origin,direction;float fraction;uint parent,token,interfaces,history;bool inside;uvec4 ancestry[2];
+    vec3 origin,direction;float fraction;uint parent,token,interfaces;uvec2 history;bool inside;uvec4 ancestry[2];
 };
 struct CameraTraceNativeVisit {
     CameraTraceNativeBranch path;SceneClosestHit hit;uint work,kind;
@@ -914,17 +922,36 @@ bool cameraTraceOutside(vec3 origin,uint glassObject,uint glassMaterial) {
         if(double(lower[axis])-double(origin[axis])>margin||double(origin[axis])-double(upper[axis])>margin)return true;
     return false;
 }
+// The pending stack lives in CameraPending, uCameraPending branches of six
+// lanes per invocation. A depth-first walk holds at most visits+1 branches,
+// so the backend sizes it from the visit setting and it never fills.
+void cameraPendingStore(int base,int at,CameraTraceNativeBranch b) {
+    int lane=(base+at)*6;
+    cameraPending[lane]=uvec4(floatBitsToUint(b.origin),floatBitsToUint(b.fraction));
+    cameraPending[lane+1]=uvec4(floatBitsToUint(b.direction),b.parent);
+    cameraPending[lane+2]=uvec4(b.token,b.interfaces,b.history);
+    cameraPending[lane+3]=b.ancestry[0];cameraPending[lane+4]=b.ancestry[1];
+    cameraPending[lane+5]=uvec4(b.inside?1u:0u,0u,0u,0u);
+}
+CameraTraceNativeBranch cameraPendingLoad(int base,int at) {
+    int lane=(base+at)*6;CameraTraceNativeBranch b;
+    b.origin=uintBitsToFloat(cameraPending[lane].xyz);b.fraction=uintBitsToFloat(cameraPending[lane].w);
+    b.direction=uintBitsToFloat(cameraPending[lane+1].xyz);b.parent=cameraPending[lane+1].w;
+    b.token=cameraPending[lane+2].x;b.interfaces=cameraPending[lane+2].y;b.history=cameraPending[lane+2].zw;
+    b.ancestry[0]=cameraPending[lane+3];b.ancestry[1]=cameraPending[lane+4];b.inside=cameraPending[lane+5].x!=0u;
+    return b;
+}
 void cameraTraceBranches(int invocation,vec3 origin,vec3 direction,float minimum,float maximum,float ior,
     uint glassObject,uint glassMaterial,out int count,out uint work,out uint reasons,out float unresolved) {
-    CameraTraceNativeBranch stack[CAUSTIC_MAX_PENDING];int pending=1;
+    int stackBase=invocation*uCameraPending,pending=1;
     CameraTraceNativeBranch root;root.origin=origin;root.direction=direction;root.fraction=1.0;
-    root.parent=0xffffffffu;root.token=0u;root.interfaces=0u;root.history=0u;root.inside=false;
-    root.ancestry[0]=root.ancestry[1]=uvec4(0);stack[0]=root;
+    root.parent=0xffffffffu;root.token=0u;root.interfaces=0u;root.history=uvec2(0u);root.inside=false;
+    root.ancestry[0]=root.ancestry[1]=uvec4(0);cameraPendingStore(stackBase,0,root);
     count=0;work=0u;reasons=0u;unresolved=0.0;
     if(!cameraTraceOutside(origin,glassObject,glassMaterial)) {reasons=2u;unresolved=1.0;return;}
     while(pending>0) {
-        if(count>=CAUSTIC_MAX_VISITS) {reasons=16u;break;}
-        CameraTraceNativeBranch branch=stack[--pending];
+        if(count>=uCameraVisits) {reasons=16u;break;}
+        CameraTraceNativeBranch branch=cameraPendingLoad(stackBase,--pending);
         causticLastWork=0u;
         SceneClosestHit hit=sceneClosestHit(branch.origin,branch.direction,minimum,maximum,uOpaqueControl);
         work+=causticLastWork;
@@ -944,7 +971,7 @@ void cameraTraceBranches(int invocation,vec3 origin,vec3 direction,float minimum
             valid=sceneTriangle>=0;
             if(valid)valid=length(hit.outwardNormal-sceneTriangles[sceneTriangle+3].xyz)<=2e-4;
             if(valid&&hit.objectId==glassObject) {
-                if(branch.interfaces>=uint(CAUSTIC_MAX_ANCESTRY_INTERFACES)) {valid=false;reasons=4u;}
+                if(branch.interfaces>=uint(uCameraInterfaces)) {valid=false;reasons=4u;}
                 else {
                     valid=hit.materialId==glassMaterial&&cameraTraceInterface(branch.direction,branch.inside,hit,ior,
                         visit.normal,visit.transmitted,visit.reflected,visit.fresnel,visit.tir);
@@ -982,27 +1009,36 @@ void cameraTraceBranches(int invocation,vec3 origin,vec3 direction,float minimum
         if(reasons!=0u) {unresolved+=branch.fraction;break;}
         if(visit.kind!=0u)continue;
         int children=(visit.reflectedFraction>0.0?1:0)+(!visit.tir&&visit.transmittedFraction>0.0?1:0);
-        if(pending+children>CAUSTIC_MAX_PENDING) {reasons=8u;unresolved+=visit.reflectedFraction+visit.transmittedFraction;break;}
+        if(pending+children>uCameraPending) {reasons=8u;unresolved+=visit.reflectedFraction+visit.transmittedFraction;break;}
         float offset=cameraTraceBias(hit.position);
         CameraTraceNativeBranch child=branch;child.parent=parent;child.interfaces=branch.interfaces+1u;
-        int ancestryRow=int(branch.interfaces/16u),ancestryLane=int((branch.interfaces%16u)/4u);
+        // The uvec2 history holds interfaces below 64; the visit writer copies
+        // words 2 and up from the parent's record. Inline ancestry keeps the
+        // first 32 tokens; later ones follow from the history.
+        bool inlineToken=branch.interfaces<32u;
+        int ancestryRow=int(min(branch.interfaces,31u)/16u),ancestryLane=int((min(branch.interfaces,31u)%16u)/4u);
         uint ancestryShift=(branch.interfaces%4u)*8u;
+        uvec2 reflectedHistory=branch.history;
+        if(branch.interfaces<32u)reflectedHistory.x|=1u<<branch.interfaces;
+        else if(branch.interfaces<64u)reflectedHistory.y|=1u<<(branch.interfaces-32u);
         // Push reflection first so transmission is visited first. Only exact
         // zero factors are omitted; every positive optical branch is retained.
         if(visit.reflectedFraction>0.0) {
             child.origin=hit.position+visit.normal*offset;child.direction=visit.reflected;
-            child.fraction=visit.reflectedFraction;child.token=1u;child.history=branch.history|(1u<<branch.interfaces);
-            child.inside=branch.inside;child.ancestry[ancestryRow][ancestryLane]=branch.ancestry[ancestryRow][ancestryLane]|(1u<<ancestryShift);
-            stack[pending++]=child;
+            child.fraction=visit.reflectedFraction;child.token=1u;child.history=reflectedHistory;
+            child.inside=branch.inside;child.ancestry=branch.ancestry;
+            if(inlineToken)child.ancestry[ancestryRow][ancestryLane]|=1u<<ancestryShift;
+            cameraPendingStore(stackBase,pending++,child);
         }
         if(!visit.tir&&visit.transmittedFraction>0.0) {
             child.origin=hit.position-visit.normal*offset;child.direction=visit.transmitted;
             child.fraction=visit.transmittedFraction;child.token=65u;child.history=branch.history;
-            child.inside=!branch.inside;child.ancestry[ancestryRow][ancestryLane]=branch.ancestry[ancestryRow][ancestryLane]|(65u<<ancestryShift);
-            stack[pending++]=child;
+            child.inside=!branch.inside;child.ancestry=branch.ancestry;
+            if(inlineToken)child.ancestry[ancestryRow][ancestryLane]|=65u<<ancestryShift;
+            cameraPendingStore(stackBase,pending++,child);
         }
     }
-    for(int branch=0;branch<pending;++branch)unresolved+=stack[branch].fraction;
+    for(int branch=0;branch<pending;++branch)unresolved+=uintBitsToFloat(cameraPending[(stackBase+branch)*6].w);
 }
 )GLSL";
 }
@@ -1013,19 +1049,35 @@ inline std::string cameraGlassGratingComputeSource()
 layout(local_size_x=32) in;
 struct CameraTraceInput {uvec4 pixel,control;vec4 originMinimum,directionMaximum;};
 layout(std430,binding=0) readonly buffer Inputs {CameraTraceInput inputs[];};
-layout(std430,binding=1) writeonly buffer Traces {uvec4 result[];};
+layout(std430,binding=1) buffer Traces {uvec4 result[];};
 layout(std430,binding=2) readonly buffer SceneTriangles {vec4 sceneTriangles[];};
 layout(std430,binding=3) readonly buffer Grating {vec4 witness[];};
 uniform int uSampleCount,uSceneTriangleCount,uGratingCount;
+// The branch policy's interface count; a branch at it is unresolved (reason 4).
+uniform int uCameraInterfaces;
+// The branch policy's visits per band and lanes per visit (16 plus history
+// words 2 and up, four per lane; glassCameraTraceVisitLanes).
+uniform int uCameraVisits,uCameraVisitLanes;
+// Pending branches per invocation, visits+1; six lanes each.
+layout(std430,binding=4) buffer CameraPending {uvec4 cameraPending[];};
+uniform int uCameraPending;
 uniform vec4 uGlass;
 uniform vec4 uCamera,uRotation,uProjection,uIor[2],uWavelength[2];
 uniform vec2 uExtent;
 )GLSL"+cameraGlassGratingMathSource()+R"GLSL(
 void cameraTraceWriteVisit(int invocation,int ordinal,CameraTraceNativeVisit visit) {
-    int base=invocation*(10+CAUSTIC_MAX_VISITS*16)+10+ordinal*16;
+    int band=invocation*(10+uCameraVisits*uCameraVisitLanes)+10,base=band+ordinal*uCameraVisitLanes;
     CameraTraceNativeBranch path=visit.path;SceneClosestHit hit=visit.hit;
+    // History words 2 and up: the parent's words plus this branch's reflection.
+    for(int lane=16;lane<uCameraVisitLanes;++lane) {
+        uvec4 words=path.parent==0xffffffffu?uvec4(0u):result[band+int(path.parent)*uCameraVisitLanes+lane];
+        uint reflected=path.interfaces-1u,extra=reflected/32u-2u;
+        if(path.parent!=0xffffffffu&&path.token==1u&&reflected>=64u&&int(extra/4u)==lane-16)
+            words[extra%4u]|=1u<<(reflected%32u);
+        result[base+lane]=words;
+    }
     result[base]=uvec4(uint(ordinal),path.parent,path.token,path.interfaces);
-    result[base+1]=uvec4(uint(path.inside),path.history,visit.kind,uint(visit.tir));
+    result[base+1]=uvec4(uint(path.inside),path.history.x,visit.kind,uint(visit.tir));
     result[base+2]=floatBitsToUint(vec4(path.origin,1e-5));
     result[base+3]=floatBitsToUint(vec4(path.direction,path.fraction));
     result[base+4]=uvec4(uint(hit.status),hit.objectId,hit.materialId,hit.instanceId);
@@ -1038,33 +1090,29 @@ void cameraTraceWriteVisit(int invocation,int ordinal,CameraTraceNativeVisit vis
     result[base+11]=floatBitsToUint(vec4(visit.barycentric,visit.ior));
     result[base+12]=path.ancestry[0];result[base+13]=path.ancestry[1];
     result[base+14]=visit.kind==0u?floatBitsToUint(vec4(path.inside?visit.ior:1.0,path.inside?1.0:visit.ior,0,0)):uvec4(0);
+    result[base+15]=uvec4(path.history.y,0u,0u,0u);
 }
 void main() {
     uint invocation=gl_GlobalInvocationID.x;if(invocation>=uint(uSampleCount)*8u)return;
-    int sampleIndex=int(invocation/8u),band=int(invocation%8u),base=int(invocation)*(10+CAUSTIC_MAX_VISITS*16);
-    for(int lane=0;lane<10+CAUSTIC_MAX_VISITS*16;++lane)result[base+lane]=uvec4(0);
+    int sampleIndex=int(invocation/8u),band=int(invocation%8u),base=int(invocation)*(10+uCameraVisits*uCameraVisitLanes);
+    for(int lane=0;lane<10+uCameraVisits*uCameraVisitLanes;++lane)result[base+lane]=uvec4(0);
     CameraTraceInput cameraInput=inputs[sampleIndex];
     float dx=cameraInput.pixel.z==0u?0.5:(cameraInput.pixel.z==2u||cameraInput.pixel.z==3u?1.0:0.0);
     float dy=cameraInput.pixel.z==0u?0.5:(cameraInput.pixel.z==3u||cameraInput.pixel.z==4u?1.0:0.0);
     vec3 ray=causticCameraRay(vec2(cameraInput.pixel.xy)+vec2(dx,dy),uRotation,uProjection,uExtent);
+    vec3 cameraOrigin=causticCameraOrigin(vec2(cameraInput.pixel.xy)+vec2(dx,dy),uCamera.xyz,uRotation,uProjection,uExtent);
     float ior=uIor[band/4][band%4];
     result[base]=cameraInput.pixel;result[base+1]=cameraInput.control;
     result[base+2]=floatBitsToUint(cameraInput.originMinimum);result[base+3]=floatBitsToUint(cameraInput.directionMaximum);
-    result[base+4]=floatBitsToUint(vec4(uCamera.xyz,1e-5));result[base+5]=floatBitsToUint(vec4(ray,uProjection.w));
+    result[base+4]=floatBitsToUint(vec4(cameraOrigin,1e-5));result[base+5]=floatBitsToUint(vec4(ray,uProjection.w));
     int count;uint work,reasons;float unresolved;
-    cameraTraceBranches(int(invocation),uCamera.xyz,ray,1e-5,uProjection.w,ior,cameraTraceId(uGlass.xy),cameraTraceId(uGlass.zw),count,work,reasons,unresolved);
+    cameraTraceBranches(int(invocation),cameraOrigin,ray,1e-5,uProjection.w,ior,cameraTraceId(uGlass.xy),cameraTraceId(uGlass.zw),count,work,reasons,unresolved);
     result[base+6]=uvec4(1u,uint(sampleIndex),uint(band),uint(count));
     result[base+7]=uvec4(reasons==0u?1u:0u,reasons,work,0u);
     result[base+8]=uvec4(floatBitsToUint(ior),floatBitsToUint(uWavelength[band/4][band%4]),floatBitsToUint(unresolved),1u);
 }
 )GLSL";
 }
-struct CameraGlassGratingPacked
-{
-    NativeGlassCameraGratingTracePackedHeader header{};
-    std::array<NativeGlassCameraGratingTracePackedVisit,kMaximumBranchVisits> visits{};
-};
-static_assert(sizeof(CameraGlassGratingPacked)==kGlassCameraTraceHeaderBytes+kMaximumBranchVisits*kGlassCameraTraceVisitBytes);
 inline std::string directGratingComputeSource()
 {
     return std::string("#version 430 core\n")+querySource()+R"GLSL(
@@ -1183,6 +1231,38 @@ uniform sampler2D uRasterOwners,uRasterTriangle;
 uniform int uWorkCount,uTriangleCount,uVisits,uInterfaces,uPending;
 uniform vec4 uSource,uCamera,uRotation,uProjection,uIor[2],uLi[2];
 uniform vec2 uExtent,uPolicy;
+// Reflection history words 4 and up (interfaces 128 and up), uHistoryExtra words
+// per branch as 16-bit halves like deposit texel 1. They sit in the Paths buffer
+// after the path receipts: one block per deposit slot, then uPending+1
+// branch blocks per path, the last holding the branch being walked. Zero extra
+// words make every helper a no-op. ResourceBounds::historyTexels sizes the tail.
+// Multiple-scatter ancestry tokens for interfaces 32 and up follow in the same
+// block, uAncestryExtra words of four tokens.
+uniform int uHistoryExtra,uAncestryExtra;
+int historyTexels() {return (uHistoryExtra+uAncestryExtra+1)/2;}
+// Tail offsets are summed in uint, so no product of the work, visit and pending
+// counts wraps. The host admits a path buffer only when every texel index fits
+// an int (openGlCausticLimitFailure), so the final offset converts exactly.
+int pathTailIndex(uint value) {return int(value);}
+int historyDepositBlock(int w,int slot) {
+    return pathTailIndex(uint(uWorkCount)*uint(CAUSTIC_PATH_RECEIPT_STRIDE)+(uint(w)*uint(uVisits)+uint(slot))*uint(historyTexels()));
+}
+int historyBranchBlock(int w,int slot) {
+    return pathTailIndex(uint(uWorkCount)*uint(CAUSTIC_PATH_RECEIPT_STRIDE)
+        +(uint(uWorkCount)*uint(uVisits)+uint(w)*uint(uPending+1)+uint(slot))*uint(historyTexels()));
+}
+void historyCopy(int from,int to) {for(int i=0;i<historyTexels();++i)paths[to+i]=paths[from+i];}
+void historyClear(int at) {for(int i=0;i<historyTexels();++i)paths[at+i]=vec4(0.0);}
+void historySet(int at,int interfaces) {
+    int bit=interfaces-128;if(bit<0||bit>=32*uHistoryExtra)return;
+    int word=bit/32,component=(word%2)*2+(bit%32)/16;
+    paths[at+word/2][component]=float(uint(paths[at+word/2][component])|(1u<<uint(bit%16)));
+}
+void ancestrySet(int at,int interfaces,uint token) {
+    int b=interfaces-32;if(b<0||b>=4*uAncestryExtra)return;
+    int word=uHistoryExtra+b/4,component=(word%2)*2+(b%4)/2;
+    paths[at+word/2][component]=float(uint(paths[at+word/2][component])|(token<<uint(8*(b%2))));
+}
 uint queryWork=0u;
 // First failed walk condition, a CausticWalkRefusal code. Written to texel 4.z
 // of an incomplete path receipt only; complete receipts keep that word zero.
@@ -1238,6 +1318,25 @@ bool causticRasterOwns(vec4 raster,SceneClosestHit hit,SceneClosestHit pixelHit)
     return false;
 }
 struct Branch {vec3 origin,direction;float fraction;uvec2 history;int interfaces;bool inside;};
+// Pending branches live in the Paths tail after the branch history blocks, uPending
+// entries of CAUSTIC_BRANCH_TEXELS per path, so the policy's maximumPending sizes
+// the stack. Words are stored as exact 16-bit halves.
+int pendingBlock(int w,int slot) {
+    return pathTailIndex(uint(uWorkCount)*uint(CAUSTIC_PATH_RECEIPT_STRIDE)
+        +uint(uWorkCount)*(uint(uVisits)+uint(uPending)+1u)*uint(historyTexels())
+        +(uint(w)*uint(uPending)+uint(slot))*uint(CAUSTIC_BRANCH_TEXELS));
+}
+void pendingStore(int at,Branch b,uvec2 high) {
+    paths[at]=vec4(b.origin,b.fraction);paths[at+1]=vec4(b.direction,b.inside?1.0:0.0);
+    paths[at+2]=vec4(words(b.history.x),words(b.history.y));paths[at+3]=vec4(words(high.x),words(high.y));
+    paths[at+4].xy=words(uint(b.interfaces));
+}
+Branch pendingLoad(int at,out uvec2 high) {
+    Branch b;b.origin=paths[at].xyz;b.fraction=paths[at].w;b.direction=paths[at+1].xyz;b.inside=paths[at+1].w!=0.0;
+    b.history=uvec2(id(paths[at+2].xy),id(paths[at+2].zw));high=uvec2(id(paths[at+3].xy),id(paths[at+3].zw));
+    b.interfaces=int(id(paths[at+4].xy));
+    return b;
+}
 void main() {
     uint invocation=gl_GlobalInvocationID.x;if(invocation>=uint(uWorkCount)) return;
     int w=int(invocation),base=w*CAUSTIC_PATH_RECEIPT_STRIDE;
@@ -1254,7 +1353,7 @@ void main() {
     bool blocked=source.status==1;complete=source.status>=0;
     if(!complete)causticFailReason=1u;
     SceneClosestHit entryHit=sceneEmptyHit(-1,0.0);uint entryWork=0u;
-    Branch stack[CAUSTIC_MAX_PENDING];
+    // pendingStore keeps interfaces 64..127 of each branch's reflection history (glass_caustic_history.h).
     float thinAbsorbed=0.0;
     if(complete&&!blocked) {
         float offset=rayBias(entry.xyz);
@@ -1262,11 +1361,14 @@ void main() {
         complete=entryHit.status==1&&entryHit.entering&&entryHit.objectId==id(entryOwners.xy)
             &&entryHit.materialId==id(entryOwners.zw)&&entryHit.instanceId==uint(entryIndices.x)&&entryHit.triangleId==uint(entryIndices.y);
         if(!complete)causticFailReason=2u;
-        if(complete)stack[pending++]=Branch(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,1.0,uvec2(0u),0,false);
+        if(complete)pendingStore(pendingBlock(w,pending++),Branch(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,1.0,uvec2(0u),0,false),uvec2(0u));
+        historyClear(historyBranchBlock(w,0));
     }
     pathHit(base+10,entryHit,entryWork);
     while(complete&&pending>0&&visits<uVisits) {
-        Branch branch=stack[--pending];++visits;
+        uvec2 branchHigh;Branch branch=pendingLoad(pendingBlock(w,--pending),branchHigh);++visits;
+        // A child push reuses this slot, so the walked branch keeps its own copy.
+        historyCopy(historyBranchBlock(w,pending),historyBranchBlock(w,uPending));
         SceneClosestHit hit=query(branch.origin,branch.direction,branch.interfaces==0?0.0:1e-5,uSource.w);uint hitWork=causticLastWork;
         if(hit.status<0) {causticFailReason=3u;complete=false;break;}
         if(hit.status==0) {
@@ -1290,9 +1392,10 @@ void main() {
             SceneClosestHit cameraHit=sceneEmptyHit(0,0.0),pixelHit=sceneEmptyHit(0,0.0);
             uint cameraWork=0u,pixelWork=0u;bool visible=false;vec4 rasterOwners=vec4(0.0),raster=vec4(0.0);
             if(projected>0) {
-                vec3 delta=hit.position-uCamera.xyz;float distance=length(delta);
-                cameraHit=query(uCamera.xyz,delta,0.0,distance+8.0*rayBias(hit.position));cameraWork=causticLastWork;
-                pixelHit=query(uCamera.xyz,causticCameraRay(footprint.xy+vec2(0.5),uRotation,uProjection,uExtent),0.0,uProjection.w);pixelWork=causticLastWork;
+                vec3 endpointOrigin=causticEndpointOrigin(hit.position,uCamera.xyz,uRotation,uProjection);
+                vec3 delta=hit.position-endpointOrigin;float distance=length(delta);
+                cameraHit=query(endpointOrigin,delta,0.0,distance+8.0*rayBias(hit.position));cameraWork=causticLastWork;
+                pixelHit=query(causticCameraOrigin(footprint.xy+vec2(0.5),uCamera.xyz,uRotation,uProjection,uExtent),causticCameraRay(footprint.xy+vec2(0.5),uRotation,uProjection,uExtent),0.0,uProjection.w);pixelWork=causticLastWork;
                 if(cameraHit.status!=1||pixelHit.status<0) {causticFailReason=9u;complete=false;break;}
                 visible=sameTriangle(hit,cameraHit)&&abs(cameraHit.distance-distance)<=8.0*rayBias(hit.position)
                     &&length(cameraHit.position-hit.position)<=8.0*rayBias(hit.position)&&pixelHit.status==1&&sameTriangle(hit,pixelHit);
@@ -1310,6 +1413,8 @@ void main() {
             int d=depositBase+count*CAUSTIC_DEPOSIT_RECEIPT_STRIDE;
             deposits[d]=vec4(words(invocation),float(branch.interfaces),float(visible));
             deposits[d+1]=vec4(words(branch.history.x),words(branch.history.y));
+            deposits[d+30]=vec4(words(branchHigh.x),words(branchHigh.y));
+            historyCopy(historyBranchBlock(w,uPending),historyDepositBlock(w,count));
             deposits[d+2]=vec4(branch.fraction,incident,power);
             deposits[d+3]=vec4(float(projected>0),footprint.xy,footprint.z);
             deposits[d+4]=vec4(footprint.w,raster.z,0.0,0.0);
@@ -1330,13 +1435,20 @@ void main() {
             bool reflect=child==0;float fraction=reflect?reflectedFraction:transmittedFraction;
             if(fraction==0.0||(tir&&!reflect))continue;
             if(fraction<uPolicy.y||pending>=uPending) {tail+=potential*fraction;continue;}
-            uvec2 history=branch.history;
-            if(reflect) {if(branch.interfaces<32)history.x|=1u<<uint(branch.interfaces);else history.y|=1u<<uint(branch.interfaces-32);}
-            stack[pending++]=Branch(hit.position+normal*(reflect?rayBias(hit.position):-rayBias(hit.position)),
-                reflect?reflected:transmitted,fraction,history,branch.interfaces+1,reflect?branch.inside:!branch.inside);
+            uvec2 history=branch.history,high=branchHigh;
+            if(reflect) {
+                if(branch.interfaces<32)history.x|=1u<<uint(branch.interfaces);
+                else if(branch.interfaces<64)history.y|=1u<<uint(branch.interfaces-32);
+                else if(branch.interfaces<96)high.x|=1u<<uint(branch.interfaces-64);
+                else if(branch.interfaces<128)high.y|=1u<<uint(branch.interfaces-96);
+            }
+            historyCopy(historyBranchBlock(w,uPending),historyBranchBlock(w,pending));
+            if(reflect)historySet(historyBranchBlock(w,pending),branch.interfaces);
+            pendingStore(pendingBlock(w,pending++),Branch(hit.position+normal*(reflect?rayBias(hit.position):-rayBias(hit.position)),
+                reflect?reflected:transmitted,fraction,history,branch.interfaces+1,reflect?branch.inside:!branch.inside),high);
         }
     }
-    for(int i=0;i<pending;++i)tail+=potential*stack[i].fraction;
+    for(int i=0;i<pending;++i)tail+=potential*paths[pendingBlock(w,i)].w;
     float launched=blocked?0.0:potential;
     bool walked=complete;
     complete=complete&&tail<=launched*uPolicy.x*(1.0+2e-4);
@@ -1403,8 +1515,8 @@ uniform float uRoughness;
 }
 // V2 emits every physical Smith-height exit through the same macro traversal.
 // The released smooth and single-interface generators retain their bytes.
-// Reserve the complete fixed16 pending array plus popped/pushed branch
-// copies, not just the ancestry delta for the admitted pending limit. A branch
+// The pending stack lives in the path tail. Reserve the popped/pushed branch
+// copies. A branch
 // storage model occupies96 bytes at16-byte alignment; reserve112 per
 // branch for conservative native padding. Both exit/order argument
 // copies consume320 bytes each. Reserve2048 for retained hit/entry values and
@@ -1422,9 +1534,9 @@ static_assert(sizeof(MultipleScatterBranchStorageShape)==96);
 inline constexpr std::uint64_t kMultipleScatterBranchBytes=112;
 static_assert(sizeof(MultipleScatterBranchStorageShape)<=kMultipleScatterBranchBytes);
 inline constexpr std::uint64_t kMultipleScatterNativeTemporaryBytesPerWork=
-    (kMaximumPendingBranches+2)*kMultipleScatterBranchBytes+2*16*(16+4)+3*16+8+2048;
+    2*kMultipleScatterBranchBytes+2*16*(16+4)+3*16+8+2048;
 static_assert(kMultipleScatterPendingExtensionBytes>=48);
-static_assert(smoothglass::kMaximumMicrofacetExits==16&&kMaximumPendingBranches==16);
+static_assert(smoothglass::kMaximumMicrofacetExits==16);
 inline std::string multipleScatterComputeSource()
 {
     auto source=computeSource();
@@ -1433,14 +1545,22 @@ inline std::string multipleScatterComputeSource()
         "uniform int uWorkCount,uTriangleCount,uVisits,uInterfaces,uPending,uInterfaceSamples,uMicroEvents,uMicroExits;\nuniform float uRoughness,uMicroResidual;");
     smoothglass::replace(source,"struct Branch {vec3 origin,direction;float fraction;uvec2 history;int interfaces;bool inside;};",
         "struct Branch {vec3 origin,direction;float fraction;uvec2 history;int interfaces;bool inside;uvec4 ancestryLow,ancestryHigh;uint samplingHistory;};");
+    smoothglass::replace(source,"    paths[at+4].xy=words(uint(b.interfaces));\n",
+        "    paths[at+4]=vec4(words(uint(b.interfaces)),words(b.samplingHistory));\n"
+        "    for(int i=0;i<2;++i)paths[at+5+i]=vec4(words(b.ancestryLow[2*i]),words(b.ancestryLow[2*i+1]));\n"
+        "    for(int i=0;i<2;++i)paths[at+7+i]=vec4(words(b.ancestryHigh[2*i]),words(b.ancestryHigh[2*i+1]));\n");
+    smoothglass::replace(source,"    b.interfaces=int(id(paths[at+4].xy));\n",
+        "    b.interfaces=int(id(paths[at+4].xy));b.samplingHistory=id(paths[at+4].zw);\n"
+        "    for(int i=0;i<2;++i) {vec4 t=paths[at+5+i];b.ancestryLow[2*i]=id(t.xy);b.ancestryLow[2*i+1]=id(t.zw);}\n"
+        "    for(int i=0;i<2;++i) {vec4 t=paths[at+7+i];b.ancestryHigh[2*i]=id(t.xy);b.ancestryHigh[2*i+1]=id(t.zw);}\n");
     smoothglass::replace(source,"int band=int(entryIndices.w);float potential=causticEntryPower(uLi[band/4][band%4],normalPower.xyz,uSource.xyz,entry.w);",
         "int band=int(entryIndices.w);uint interfaceSample=(invocation/8u)%uint(uInterfaceSamples);\n"
         "    uint entryKey=causticMsEntryKey(id(entryOwners.xy),uint(entryIndices.x),uint(entryIndices.y),uint(entryIndices.z));\n"
         "    float potential=causticEntryPower(uLi[band/4][band%4],normalPower.xyz,uSource.xyz,entry.w)/float(uInterfaceSamples);");
     smoothglass::replace(source,"float outgoing=0.0,absorbed=0.0,escaped=0.0,tail=0.0;",
         "float outgoing=0.0,absorbed=0.0,escaped=0.0,tail=0.0,microResidualPower=0.0;uint microEvents=0u,microDraws=0u;");
-    smoothglass::replace(source,"1.0,uvec2(0u),0,false);",
-        "1.0,uvec2(0u),0,false,uvec4(0u),uvec4(0u),2166136261u);");
+    smoothglass::replace(source,"1.0,uvec2(0u),0,false),",
+        "1.0,uvec2(0u),0,false,uvec4(0u),uvec4(0u),2166136261u),");
     smoothglass::replace(source,"            ++count;continue;",R"GLSL(            for(int token=0;token<32;++token) {
                 uint ancestryWord=token<16?branch.ancestryLow[token/4]:branch.ancestryHigh[(token-16)/4];
                 deposits[d+22+token/4][token%4]=float((ancestryWord>>uint(8*(token%4)))&255u);
@@ -1472,15 +1592,24 @@ inline std::string multipleScatterComputeSource()
                 ||(transmitted?dot(emitted.xyz,normal)>=0.0:dot(emitted.xyz,normal)<=0.0)) {complete=false;break;}
             // Cutoffs and pending overflow account for each omitted exit once.
             if(fraction<uPolicy.y||pending>=uPending) {tail+=potential*fraction;continue;}
-            uvec2 history=branch.history;
-            if(!transmitted)history.x|=1u<<uint(branch.interfaces);
+            uvec2 history=branch.history,high=branchHigh;
+            if(!transmitted) {
+                if(branch.interfaces<32)history.x|=1u<<uint(branch.interfaces);
+                else if(branch.interfaces<64)history.y|=1u<<uint(branch.interfaces-32);
+                else if(branch.interfaces<96)high.x|=1u<<uint(branch.interfaces-64);
+                else if(branch.interfaces<128)high.y|=1u<<uint(branch.interfaces-96);
+            }
             uvec4 ancestryLow=branch.ancestryLow,ancestryHigh=branch.ancestryHigh;
             uint token=orders[child]|(transmitted?64u:0u),word=uint(branch.interfaces)/4u;
             if(word<4u)ancestryLow[word]|=token<<uint(8*(branch.interfaces%4));
-            else ancestryHigh[word-4u]|=token<<uint(8*(branch.interfaces%4));
-            stack[pending++]=Branch(hit.position+normal*(transmitted?-rayBias(hit.position):rayBias(hit.position)),
+            else if(word<8u)ancestryHigh[word-4u]|=token<<uint(8*(branch.interfaces%4));
+            // Interfaces 32 and up keep their tokens, and 128 and up their history, in the tail.
+            historyCopy(historyBranchBlock(w,uPending),historyBranchBlock(w,pending));
+            if(!transmitted)historySet(historyBranchBlock(w,pending),branch.interfaces);
+            ancestrySet(historyBranchBlock(w,pending),branch.interfaces,token);
+            pendingStore(pendingBlock(w,pending++),Branch(hit.position+normal*(transmitted?-rayBias(hit.position):rayBias(hit.position)),
                 emitted.xyz,fraction,history,branch.interfaces+1,transmitted?!branch.inside:branch.inside,
-                ancestryLow,ancestryHigh,causticMsChildHistory(branch.samplingHistory,orders[child],transmitted));
+                ancestryLow,ancestryHigh,causticMsChildHistory(branch.samplingHistory,orders[child],transmitted)),high);
         })GLSL");
     smoothglass::replace(source,"    paths[base+3]=vec4(launched,outgoing,absorbed,escaped);paths[base+4]=vec4(tail,0.0,0.0,0.0);",
         "    paths[base+3]=vec4(launched,outgoing,absorbed,escaped);paths[base+4]=vec4(tail,0.0,0.0,0.0);\n"
@@ -1497,7 +1626,7 @@ inline bool decodeGratingIncident(const Texel* p,NativeGratingIncident& output)
     if(p[17][2]!=0||p[17][3]!=0||p[22][1]!=1)return false;
     std::uint32_t low=0,high=0,entering=0;
     if(!causticWord(p[0][0],kMaximumEntrySamples*8-1,result.work)||!causticWord(p[0][1],7,result.band)
-        ||!causticWord(p[0][2],kMaximumAncestryInterfaces,result.interfaces)
+        ||!causticWord(p[0][2],std::uint32_t(kMaximumInterfaces),result.interfaces)
         ||!causticWord(p[0][3],kGratingOrdersPerIncident,result.orderCount)
         ||!causticId(p[1][0],p[1][1],low)||!causticId(p[1][2],p[1][3],high)
         ||!causticId(p[13][0],p[13][1],result.hit.objectId)||!causticId(p[13][2],p[13][3],result.hit.materialId)
@@ -1506,7 +1635,8 @@ inline bool decodeGratingIncident(const Texel* p,NativeGratingIncident& output)
         ||!causticWord(p[14][1],std::uint32_t(opaquevisibility::kExactFloatIndexRange-1),result.hit.triangleId)
         ||!causticId(p[14][2],p[14][3],result.hit.work)||!causticWord(p[15][3],1,entering)
         ||!causticWord(p[22][0],kGratingIncidentVersion,result.version)||result.version!=kGratingIncidentVersion)return false;
-    result.reflectionHistory=low|(std::uint64_t(high)<<32);
+    // Words 2 and up follow from the incident tail (decodeGratingIncidentHistoryTail).
+    result.reflectionHistory=CausticHistory(low|(std::uint64_t(high)<<32));
     for(unsigned index=0;index<32;++index) {
         std::uint32_t token=0;if(!causticWord(p[2+index/4][index%4],127,token))return false;
         result.ancestry[index]=std::uint8_t(token);
@@ -1525,7 +1655,7 @@ inline bool decodeGratingOrder(const Texel* p,std::uint32_t incident,NativeGrati
     for(unsigned lane=0;lane<kGratingOrderStride;++lane)
         for(float value:p[lane])if(!std::isfinite(value))return false;
     std::uint32_t locator=0,signedWord=0;
-    if(!causticWord(p[0][0],kMaximumEntrySamples*8*kMaximumBranchVisits-1,locator)||locator!=incident
+    if(!causticWord(p[0][0],kMaximumExactReceiptCount-1,locator)||locator!=incident
         ||!causticWord(p[0][1],2,signedWord)||p[0][2]!=0||p[0][3]!=0||p[2]!=Texel{}||p[3]!=Texel{})return false;
     NativeGratingOrder result;result.order=std::int32_t(signedWord)-1;
     result.direction={p[1][0],p[1][1],p[1][2]};result.power=p[1][3];output=result;return true;
@@ -1539,6 +1669,9 @@ inline std::string gratingIncidentComputeSource(const std::string& materialMath,
     smoothglass::replace(source,"layout(std430,binding=1) buffer Deposits {vec4 deposits[];};",
         "layout(std430,binding=1) buffer Incidents {vec4 incidents[];};\nlayout(std430,binding=2) buffer Orders {vec4 orders[];};\n"
         "layout(std430,binding=5) readonly buffer Witness {vec4 witness[];};\nuniform int uWitnessCount;\n"
+        // History words 2 and up per incident (gratingIncidentHistoryTailWords)
+        // start at incident texel uGratingHistoryBase, as 16-bit halves.
+        "uniform int uGratingHistoryBase,uGratingHistoryWords;\n"
         "uniform vec4 uDiffractionGeometry,uDiffractionMicrostructure,uDiffractionControl,uDiffractionCoating,uDiffractionRoughness,uDiffractionSpectral[8];\n");
     const auto helpers=source.find("uint queryWork=0u;");
     if(helpers==std::string::npos)return {};
@@ -1549,22 +1682,28 @@ inline std::string gratingIncidentComputeSource(const std::string& materialMath,
     smoothglass::replace(source,"    int depositBase=w*uVisits*CAUSTIC_DEPOSIT_RECEIPT_STRIDE;\n","");
     smoothglass::replace(source,"    for(int i=0;i<uVisits*CAUSTIC_DEPOSIT_RECEIPT_STRIDE;++i)deposits[depositBase+i]=vec4(0.0);",
         "    for(int i=0;i<uVisits*24;++i)incidents[w*uVisits*24+i]=vec4(0.0);\n"
+        "    for(int i=0;i<uVisits*((uGratingHistoryWords+1)/2);++i)incidents[uGratingHistoryBase+w*uVisits*((uGratingHistoryWords+1)/2)+i]=vec4(0.0);\n"
         "    for(int i=0;i<uVisits*3*4;++i)orders[w*uVisits*3*4+i]=vec4(0.0);");
     smoothglass::replace(source,"float outgoing=0.0,absorbed=0.0,escaped=0.0,tail=0.0;",
         "float outgoing=0.0,absorbed=0.0,escaped=0.0,tail=0.0;uint extraQueryWork=0u,orderWork=0u;");
     smoothglass::replace(source,"struct Branch {vec3 origin,direction;float fraction;uvec2 history;int interfaces;bool inside;};",
         "struct Branch {vec3 origin,direction;float fraction;uvec2 history;int interfaces;bool inside;vec3 du,dv;};\n"+nativeGratingDifferentialMathSource());
-    smoothglass::replace(source,"    Branch stack[CAUSTIC_MAX_PENDING];",
-        "    Branch stack[CAUSTIC_MAX_PENDING];vec3 entryE1=vec3(0.0),entryE2=vec3(0.0);");
-    smoothglass::replace(source,"        if(complete)stack[pending++]=Branch(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,1.0,uvec2(0u),0,false);",R"GLSL(        if(complete) {
+    smoothglass::replace(source,"    paths[at+4].xy=words(uint(b.interfaces));\n",
+        "    paths[at+4].xy=words(uint(b.interfaces));paths[at+5]=vec4(b.du,0.0);paths[at+6]=vec4(b.dv,0.0);\n");
+    smoothglass::replace(source,"    b.interfaces=int(id(paths[at+4].xy));\n",
+        "    b.interfaces=int(id(paths[at+4].xy));b.du=paths[at+5].xyz;b.dv=paths[at+6].xyz;\n");
+    smoothglass::replace(source,"    // pendingStore keeps interfaces 64..127 of each branch's reflection history (glass_caustic_history.h).\n",
+        "    // pendingStore keeps interfaces 64..127 of each branch's reflection history (glass_caustic_history.h).\n"
+        "    vec3 entryE1=vec3(0.0),entryE2=vec3(0.0);\n");
+    smoothglass::replace(source,"        if(complete)pendingStore(pendingBlock(w,pending++),Branch(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,1.0,uvec2(0u),0,false),uvec2(0u));",R"GLSL(        if(complete) {
             int sourceTriangle=findTriangle(entryHit);float dbu,dbv;
             if(sourceTriangle<0) {complete=false;}
             else {
                 int t=sourceTriangle*8;entryE1=triangles[t+1].xyz-triangles[t].xyz;entryE2=triangles[t+2].xyz-triangles[t].xyz;
                 complete=triangles[t+5].z==1.0&&gratingStrictHit(triangles[t].xyz,triangles[t+1].xyz,triangles[t+2].xyz,entryHit.position,entryHit.outwardNormal)
                     &&gratingBiasDerivative(entry.xyz,entryE1,dbu)&&gratingBiasDerivative(entry.xyz,entryE2,dbv);
-                if(complete)stack[pending++]=Branch(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,1.0,uvec2(0u),0,false,
-                    entryE1+2.0*uSource.xyz*dbu,entryE2+2.0*uSource.xyz*dbv);
+                if(complete)pendingStore(pendingBlock(w,pending++),Branch(entry.xyz+uSource.xyz*(2.0*offset),-uSource.xyz,1.0,uvec2(0u),0,false,
+                    entryE1+2.0*uSource.xyz*dbu,entryE2+2.0*uSource.xyz*dbv),uvec2(0u));
             }
         })GLSL");
     smoothglass::replace(source,"        vec4 shape=triangles[triangle*8+5];",R"GLSL(        vec4 shape=triangles[triangle*8+5];vec3 hitDu,hitDv;
@@ -1573,12 +1712,12 @@ inline std::string gratingIncidentComputeSource(const std::string& materialMath,
             ||!gratingPlaneDerivative(branch.du,branch.direction,hit.outwardNormal,hitDu)
             ||!gratingPlaneDerivative(branch.dv,branch.direction,hit.outwardNormal,hitDv)
             ||!gratingArea(entryE1,entryE2,entry.w,hitDu,hitDv)) {complete=false;break;})GLSL");
-    smoothglass::replace(source,"            stack[pending++]=Branch(hit.position+normal*(reflect?rayBias(hit.position):-rayBias(hit.position)),\n                reflect?reflected:transmitted,fraction,history,branch.interfaces+1,reflect?branch.inside:!branch.inside);",R"GLSL(            float dbu,dbv;
+    smoothglass::replace(source,"            pendingStore(pendingBlock(w,pending++),Branch(hit.position+normal*(reflect?rayBias(hit.position):-rayBias(hit.position)),\n                reflect?reflected:transmitted,fraction,history,branch.interfaces+1,reflect?branch.inside:!branch.inside),high);",R"GLSL(            float dbu,dbv;
             if(!gratingBiasDerivative(hit.position,hitDu,dbu)||!gratingBiasDerivative(hit.position,hitDv,dbv)) {complete=false;break;}
             float side=reflect?1.0:-1.0;
-            stack[pending++]=Branch(hit.position+normal*(reflect?rayBias(hit.position):-rayBias(hit.position)),
+            pendingStore(pendingBlock(w,pending++),Branch(hit.position+normal*(reflect?rayBias(hit.position):-rayBias(hit.position)),
                 reflect?reflected:transmitted,fraction,history,branch.interfaces+1,reflect?branch.inside:!branch.inside,
-                hitDu+side*normal*dbu,hitDv+side*normal*dbv);)GLSL");
+                hitDu+side*normal*dbu,hitDv+side*normal*dbv),high);)GLSL");
     const auto receiverBegin=source.find("        if(shape.z==0.0) {");
     const auto receiverEnd=source.find("        if(branch.inside==hit.entering)",receiverBegin);
     if(receiverBegin==std::string::npos||receiverEnd==std::string::npos)return {};
@@ -1632,8 +1771,16 @@ inline std::string gratingIncidentComputeSource(const std::string& materialMath,
             if(!complete||!causticFinite(efficiencySum)||efficiencySum>1.0002) {complete=false;break;}
             incidents[d]=vec4(float(w),float(band),float(branch.interfaces),float(orderCount));
             incidents[d+1]=vec4(words(branch.history.x),words(branch.history.y));
-            for(int depth=0;depth<branch.interfaces;++depth)
+            // Inline tokens cover the first 32 interfaces; the tail holds the rest of the history.
+            for(int depth=0;depth<min(branch.interfaces,32);++depth)
                 incidents[d+2+depth/4][depth%4]=((branch.history.x>>uint(depth))&1u)!=0u?1.0:65.0;
+            int historyAt=uGratingHistoryBase+locator*((uGratingHistoryWords+1)/2);
+            for(int j=0;j<uGratingHistoryWords;++j) {
+                vec2 halves;
+                if(j<2)halves=words(j==0?branchHigh.x:branchHigh.y);
+                else {int k=j-2,at=historyBranchBlock(w,uPending)+k/2;halves=(k%2)==0?paths[at].xy:paths[at].zw;}
+                if((j%2)==0)incidents[historyAt+j/2].xy=halves;else incidents[historyAt+j/2].zw=halves;
+            }
             incidents[d+10]=vec4(branch.origin,branch.fraction);incidents[d+11]=vec4(branch.direction,incidentPower);
             incidents[d+12]=vec4(hit.position,hit.distance);incidents[d+13]=owners(hit);
             incidents[d+14]=vec4(float(hit.instanceId),float(hit.triangleId),words(hitWork));
@@ -1701,7 +1848,7 @@ inline bool decodeGratingWork(const Texel* p,NativeGratingReadback::WorkReceipt&
     NativeGratingReadback::WorkReceipt r;std::uint32_t queries=0;
     for(unsigned t=0;t<kGratingWorkReceiptStride;++t)for(float value:p[t])if(!std::isfinite(value))return false;
     if(!causticWord(p[0][0],kMaximumBranchVisits,r.incidentCount)
-        ||!causticWord(p[0][1],kMaximumBranchVisits*3,r.orderWork)||r.orderWork!=r.incidentCount*3
+        ||!causticWord(p[0][1],kMaximumExactReceiptCount,r.orderWork)||r.orderWork!=r.incidentCount*3
         ||!causticId(p[0][2],p[0][3],queries)||p[1][0]<0||p[1][1]<0||p[1][2]!=1||p[1][3]!=0)return false;
     r.queryWork=queries;r.absorbedPower=p[1][0];r.unresolvedPower=p[1][1];r.complete=true;output=r;return true;
 }
@@ -1709,7 +1856,7 @@ inline bool decodeGratingChild(const Texel* p,NativeGratingReadback::ChildReceip
 {
     NativeGratingReadback::ChildReceipt r;std::uint32_t order=0,disposition=0,queries=0;
     for(unsigned t=0;t<kGratingChildReceiptStride;++t)for(float value:p[t])if(!std::isfinite(value))return false;
-    if(!causticWord(p[0][0],kMaximumEntrySamples*8*kMaximumBranchVisits-1,r.incident)
+    if(!causticWord(p[0][0],kMaximumExactReceiptCount-1,r.incident)
         ||!causticWord(p[0][1],2,order)||p[0][2]!=1||!causticWord(p[0][3],2,disposition)
         ||p[1][0]<0||p[1][1]<0||!causticId(p[1][2],p[1][3],queries)||p[7]!=Texel{}||!causticHit(p+2,r.hit))return false;
     r.order=int(order)-1;r.disposition=NativeGratingReadback::Disposition(disposition);r.queryWork=queries;
@@ -1719,7 +1866,13 @@ inline bool decodeGratingDeposit(const Texel* p,NativeDeposit& output)
 {
     std::array<Texel,kDepositReceiptStride> legacy;std::copy_n(p,legacy.size(),legacy.begin());
     std::fill(legacy.begin()+22,legacy.end(),Texel{});NativeDeposit r;
-    if(!causticDecodeDeposit(legacy.data(),0,r)||!decodeGratingDepositExtension(p[30],p[31],r))return false;
+    // Texel 31 holds history words 2 and 3 for every grating terminal deposit;
+    // texel 30 is the grating extension. Words 4 and up are the Paths tail.
+    std::uint32_t wideLow=0,wideHigh=0;
+    if(!causticDecodeDeposit(legacy.data(),0,r)||!causticId(p[31][0],p[31][1],wideLow)||!causticId(p[31][2],p[31][3],wideHigh)
+        ||!decodeGratingDepositExtension(p[30],Texel{},r))return false;
+    r.reflectionHistory=CausticHistory::fromWords(r.reflectionHistory.word(0),r.reflectionHistory.word(1),wideLow,wideHigh);
+    if(!r.reflectionHistory.clearFrom(r.interfaces))return false;
     std::array<Texel,8> ancestry;std::copy_n(p+22,ancestry.size(),ancestry.begin());
     if(r.gratingVersion) {if(!decodeGratingDepositAncestry(ancestry,r.ancestry))return false;}
     else if(!decodeMacroAncestry(ancestry,0,r.ancestry))return false;
@@ -1735,15 +1888,19 @@ inline std::string gratingTerminalComputeSource(const std::string& materialMath,
     if(receiverBegin==std::string::npos||receiverEnd==std::string::npos||hitBegin==std::string::npos||hitEnd==std::string::npos)return {};
     auto receiver=original.substr(receiverBegin,receiverEnd-receiverBegin);
     smoothglass::replace(receiver,"        if(shape.z==0.0) {",R"GLSL(bool gratingReceiver(int w,int band,float potential,Branch branch,SceneClosestHit hit,uint hitWork,int triangle,
-    bool coupled,int locator,int signedOrder,inout int depositCount,inout float outgoing,inout float absorbed,out uint cameraQueries) {
+    uvec2 branchHigh,bool coupled,int locator,int signedOrder,inout int depositCount,inout float outgoing,inout float absorbed,out uint cameraQueries) {
     cameraQueries=0u;vec4 shape=triangles[triangle*8+5];
     if(depositCount>=uVisits)return false;
 )GLSL");
     smoothglass::replace(receiver,"complete=false;break;","return false;");
     smoothglass::replace(receiver,"int d=depositBase+count*CAUSTIC_DEPOSIT_RECEIPT_STRIDE;","int d=(w*uVisits+depositCount)*CAUSTIC_DEPOSIT_RECEIPT_STRIDE;");
     smoothglass::replace(receiver,"words(invocation)","words(uint(w))");
+    // Texel 30 is the grating extension here, so history words 2 and 3 move to 31.
+    smoothglass::replace(receiver,"deposits[d+30]=vec4(words(branchHigh.x),words(branchHigh.y));",
+        "deposits[d+31]=vec4(words(branchHigh.x),words(branchHigh.y));");
+    smoothglass::replace(receiver,"historyDepositBlock(w,count)","historyDepositBlock(w,depositCount)");
     smoothglass::replace(receiver,"++count;continue;",R"GLSL(if(coupled) {
-                for(int depth=0;depth<branch.interfaces;++depth)
+                for(int depth=0;depth<min(branch.interfaces,32);++depth)
                     deposits[d+22+depth/4][depth%4]=((branch.history.x>>uint(depth))&1u)!=0u?1.0:65.0;
                 deposits[d+30]=vec4(float(CAUSTIC_GRATING_VERSION),float(locator),float(signedOrder+1),0.0);
             }
@@ -1765,7 +1922,7 @@ void gratingChildHit(int offset,SceneClosestHit hit,uint work) {
 )GLSL");
     smoothglass::replace(source,"            if(target<0)continue;",R"GLSL(            if(target<0) {
                 uint cameraQueries;
-                if(!gratingReceiver(w,band,potential,branch,hit,hitWork,triangle,false,0,0,depositCount,outgoing,absorbed,cameraQueries)) {complete=false;break;}
+                if(!gratingReceiver(w,band,potential,branch,hit,hitWork,triangle,branchHigh,false,0,0,depositCount,outgoing,absorbed,cameraQueries)) {complete=false;break;}
                 continue;
             })GLSL");
     smoothglass::replace(source,"                if(power==0.0)continue;",R"GLSL(                if(power==0.0) {
@@ -1789,7 +1946,7 @@ void gratingChildHit(int offset,SceneClosestHit hit,uint work) {
                     float fraction=power/potential;
                     if(!causticFinite(fraction)||fraction<=0.0) {complete=false;break;}
                     Branch child=branch;child.origin=hit.position+normal*rayBias(hit.position);child.direction=direction;child.fraction=fraction;child.inside=false;
-                    if(!gratingReceiver(w,band,potential,child,childHit,childWork,childTriangle,true,locator,primary,
+                    if(!gratingReceiver(w,band,potential,child,childHit,childWork,childTriangle,branchHigh,true,locator,primary,
                         depositCount,outgoing,absorbed,cameraQueries)) {complete=false;break;}
                     extraQueryWork+=cameraQueries;
                     orders[childBase]=vec4(float(locator),float(primary+1),1.0,1.0);
@@ -2026,7 +2183,8 @@ bool causticSplatDepositAt(uint index,out CausticSplatDeposit deposit) {
     deposit.band=int(workTable[work*4u+3u].w);
     deposit.radius=causticSplatRadiusFromScale(workTable[work*4u].w,
         causticSplatPixelScale(deposit.pixel,deposit.position,deposit.normal,uCamera.xyz,uRotation,uProjection,uExtent));
-    deposit.spread=causticSplatSpread(deposit.position,deposit.normal,uCamera.xyz);
+    deposit.spread=causticSplatSpread(deposit.position,deposit.normal,
+        causticEndpointOrigin(deposit.position,uCamera.xyz,uRotation,uProjection));
     return causticFinite(deposit.radius)&&deposit.radius>0.0&&causticFinite(deposit.spread)&&deposit.band>=0&&deposit.band<8;
 }
 // Inclusive window (x0,y0,x1,y1) of a deposit pixel, clipped to the image.
@@ -2162,8 +2320,11 @@ void main() {
     vec3 world=triangles[uTriangle*8+gl_VertexID].xyz;
     vec3 local=causticRotate(vec4(-uRotation.xyz,uRotation.w),world-uCamera.xyz);
     float depth=-local.z,n=uProjection.z,f=uProjection.w;linearDepth=depth;
-    gl_Position=vec4(local.x/(uProjection.x*uProjection.y),local.y/uProjection.x,
-        ((f+n)/(f-n))*depth-2.0*f*n/(f-n),depth);
+    // uProjection.x below zero is an orthographic camera, minus half its view height.
+    gl_Position=uProjection.x<0.0
+        ? vec4(local.x/(-uProjection.x*uProjection.y),local.y/-uProjection.x,(2.0*depth-f-n)/(f-n),1.0)
+        : vec4(local.x/(uProjection.x*uProjection.y),local.y/uProjection.x,
+            ((f+n)/(f-n))*depth-2.0*f*n/(f-n),depth);
 }
 )GLSL";
 }
@@ -2252,8 +2413,9 @@ void main() {
     vec3 local=causticRotate(vec4(-uRotation.xyz,uRotation.w),hit.position-uCamera.xyz);
     float depth=-local.z;rows[index].data[5].z=depth;
     if(!causticFinite(depth)||depth<uProjection.z||depth>uProjection.w)return;
-    vec2 projected=vec2((local.x/(depth*uProjection.x*uProjection.y)+1.0)*.5*uExtent.x,
-        (1.0-local.y/(depth*uProjection.x))*.5*uExtent.y);
+    float spread=uProjection.x<0.0?-uProjection.x:depth*uProjection.x;
+    vec2 projected=vec2((local.x/(spread*uProjection.y)+1.0)*.5*uExtent.x,
+        (1.0-local.y/spread)*.5*uExtent.y);
     if(any(isnan(projected))||any(isinf(projected))) {rows[index].data[0].x=-1.0;return;}
     if(any(lessThan(projected,vec2(0)))||any(greaterThanEqual(projected,uExtent)))return;
     uvec2 pixel=uvec2(projected);rows[index].data[5].xy=vec2(pixel);
@@ -2307,7 +2469,8 @@ void main() {
     receipts[dst+1]=vec4(-1,-1,0,0);receipts[dst+3].x=-1.0;
     vec3 ray=-outgoing,local=causticRotate(vec4(-uRotation.xyz,uRotation.w),ray);
     float backward=-local.z,halfY=uProjection.x,halfX=halfY*uProjection.y;
-    if(backward<=0.0||local.x < -halfX*backward||local.x>=halfX*backward
+    // A parallel (orthographic) camera receives no discrete order direction.
+    if(uProjection.x<0.0||backward<=0.0||local.x < -halfX*backward||local.x>=halfX*backward
         ||local.y>halfY*backward||local.y<=-halfY*backward) {
         receipts[dst].w=2.0;receipts[dst+1].w=1.0;return;
     }
@@ -2438,8 +2601,20 @@ layout(std430,binding=3) readonly buffer Work {vec4 workTable[];};
 layout(std430,binding=4) readonly buffer Triangles {vec4 triangles[];};
 layout(std430,binding=5) readonly buffer Locators {uint locators[];};
 uniform int uRecordCount,uMaximumInterfaces,uRecordStride,uEntryCount,uTriangleCount;
+uniform int uGratingHistoryBase,uGratingHistoryWords;
 uniform vec4 uSource,uIor[2];
 uint id(vec2 v) {return uint(v.x)|(uint(v.y)<<16u);}
+// Interface tokens: 32 inline bytes, then the incident's reflection history
+// (texel 1 words 0-1, then the per-incident tail at uGratingHistoryBase).
+int cellToken(int event,int locator,int depth,int interfaces) {
+    if(depth>=interfaces)return 0;
+    if(depth<32)return int(incidents[event+2+depth/4][depth%4]);
+    int w=depth/32;vec4 t;bool low;
+    if(w<2) {t=incidents[event+1];low=w==0;}
+    else {int j=w-2;t=incidents[uGratingHistoryBase+locator*((uGratingHistoryWords+1)/2)+j/2];low=(j%2)==0;}
+    uint word=low?id(t.xy):id(t.zw);
+    return ((word>>uint(depth%32))&1u)!=0u?1:65;
+}
 vec2 words(uint v) {return vec2(v&65535u,v>>16u);}
 float rayBias(vec3 p) {return max(1e-5,2e-6*max(max(abs(p.x),abs(p.y)),abs(p.z)));}
 void stepHit(int at,SceneClosestHit hit,uint work) {
@@ -2461,7 +2636,7 @@ bool glassHit(SceneClosestHit hit) {
 }
 void main() {
     uint invocation=gl_GlobalInvocationID.x;if(invocation>=uint(uRecordCount))return;
-    int base=int(invocation)*uRecordStride,event=int(locators[invocation])*24;
+    int locator=int(locators[invocation]),base=int(invocation)*uRecordStride,event=locator*24;
     for(int i=0;i<uRecordStride;++i)traces[base+i]=vec4(0);
     int work=int(incidents[event].x),band=int(incidents[event].y),interfaces=int(incidents[event].z);
     vec4 entry=workTable[work*4],entryOwners=workTable[work*4+2],entryIndices=workTable[work*4+3];
@@ -2478,7 +2653,7 @@ void main() {
         bool inside=false,pathSupported=true;
         for(int depth=0;depth<=interfaces;++depth) {
             int at=base+4+(path*(uMaximumInterfaces+1)+depth)*7;
-            int token=depth<interfaces?int(incidents[event+2+depth/4][depth%4]):0;
+            int token=cellToken(event,locator,depth,interfaces);
             causticLastWork=0u;
             SceneClosestHit hit=sceneClosestHit(origin,direction,depth==0?0.0:1e-5,uSource.w,uOpaqueControl);
             uint workUnits=causticLastWork;totalWork+=workUnits;

@@ -4,6 +4,9 @@
 #include "water_surface_replay.h"
 #include "geometry_score_field.h"
 #include "../../shared/GeometryAudioDeformer.h"
+#include <algorithm>
+#include <limits>
+#include <vector>
 
 namespace videorender {
 // One child of a timeline Geometry3D family collider. Its mesh evaluates in
@@ -179,24 +182,40 @@ inline bool hasDynamicParticleBody(const ParticleParams& p)
             && videowire::geometry::particleGeometryRequiresHistory(p.geometryBinding->bodySource->descriptor()))));
 }
 
+template<class T>
+using ParticleColliderList=ParticleSizedList<T>;
+
 struct ParticleGeometryFrame
 {
     // Mesh triangle edges are thin projected barriers, not filled solids.
     // A degenerate segment is a point collider. Ordering follows source IDs.
-    std::array<std::array<float, 4>, 448> segments {};
+    // Every vector below is sized from the collider geometry, and each count
+    // equals its vector's size.
+    ParticleColliderList<std::array<float, 4>> segments;
     int count = 0;
     // Solid mesh contacts are authored two-sided triangle surfaces. Bounds
     // are only broad-phase metadata, never a filled collider.
     std::array<float,3> minimum {}, maximum {};
     std::uint64_t meshIdentity = 0;
-    std::array<std::array<float,3>,256> meshVertices {};
-    std::array<std::uint64_t,256> meshVertexIdentities {};
-    std::array<std::array<std::uint32_t,3>,128> meshTriangles {};
+    ParticleColliderList<std::array<float,3>> meshVertices;
+    ParticleColliderList<std::uint64_t> meshVertexIdentities;
+    ParticleColliderList<std::array<std::uint32_t,3>> meshTriangles;
     std::uint32_t meshVertexCount = 0, meshTriangleCount = 0;
-    std::array<std::array<float,3>,64> solidPoints {};
-    std::array<std::uint64_t,64> pointIdentities {};
+    ParticleColliderList<std::array<float,3>> solidPoints;
+    ParticleColliderList<std::uint64_t> pointIdentities;
     int pointCount = 0;
 };
+
+// Heap bytes a frame's collider vectors hold, beside sizeof(ParticleGeometryFrame).
+inline std::uint64_t particleGeometryFrameHeapBytes(const ParticleGeometryFrame& frame) noexcept
+{
+    return std::uint64_t(frame.segments.capacity())*sizeof(std::array<float,4>)
+        + std::uint64_t(frame.meshVertices.capacity())*sizeof(std::array<float,3>)
+        + std::uint64_t(frame.meshVertexIdentities.capacity())*sizeof(std::uint64_t)
+        + std::uint64_t(frame.meshTriangles.capacity())*sizeof(std::array<std::uint32_t,3>)
+        + std::uint64_t(frame.solidPoints.capacity())*sizeof(std::array<float,3>)
+        + std::uint64_t(frame.pointIdentities.capacity())*sizeof(std::uint64_t);
+}
 
 // Exact completed water endpoints over one global 120 Hz interval.
 // The caller owns these immutable inputs and gives each new view a request-local
@@ -341,11 +360,15 @@ inline bool sampleParticleGeometry(ParticleParams& p, std::int64_t tick,
     };
     // The live scalars at this time plus the matching reader for delayed and
     // history samples. The caller keeps `current` alive for the evaluation.
-    const auto scalarInputFor=[&scalarsAt](const spectrum::Binding& field,const spectrum::Scalars& current)
+    const auto scalarInputFor=[&scalarsAt,&p](const spectrum::Binding& field,const spectrum::Scalars& current)
     {
         spectrum::ScalarInput input;
         input.current=&current;
         input.at=[&scalarsAt,field](double at,spectrum::Scalars& scalars) { return scalarsAt(field,at,scalars); };
+        if (p.history)
+            input.beatDelay=[history=p.history](double seconds,double beats) {
+                return history->timeline.secondsBeforeBeats(seconds,beats);
+            };
         return input;
     };
     std::map<std::string, std::shared_ptr<const RetainedMeshData>> imported;
@@ -515,9 +538,11 @@ inline bool sampleParticleGeometry(ParticleParams& p, std::int64_t tick,
         auto attractors = binding.attractors ? std::get<PointsData>(attraction.data).points : emitters;
         const auto byIdentity = [](const auto& a, const auto& b) { return a.stableId < b.stableId; };
         std::sort(emitters.begin(), emitters.end(), byIdentity); std::sort(attractors.begin(), attractors.end(), byIdentity);
-        if (emitters.size() > p.geometryAnchors.size())
-        { error="Geometry particle emitters support at most 64 points; reduce emitter points"; return false; }
+        if (emitters.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        { error="Geometry particle emitters overflow the anchor count"; return false; }
         p.geometryCount = static_cast<int>(emitters.size());
+        p.geometryAnchors.resize(emitters.size()); p.geometryIdentities.resize(emitters.size());
+        if (p.simulationSpace==1) p.geometryDepths.resize(emitters.size());
         for (std::size_t i = 0; i < emitters.size(); ++i)
         {
             const auto a = project(emitters[i].position), b = project(attractors[i % attractors.size()].position);
@@ -530,8 +555,10 @@ inline bool sampleParticleGeometry(ParticleParams& p, std::int64_t tick,
             }
         }
     }
-    frame.count = 0;
+    frame.count = 0; frame.segments.clear();
     frame.meshIdentity=0; frame.pointCount=0; frame.meshVertexCount=frame.meshTriangleCount=0;
+    frame.meshVertices.clear(); frame.meshVertexIdentities.clear(); frame.meshTriangles.clear();
+    frame.solidPoints.clear(); frame.pointIdentities.clear();
     if (!binding.meshFamily.empty())
     {
         // One frame holds every child, in family order, so the replay's
@@ -547,9 +574,12 @@ inline bool sampleParticleGeometry(ParticleParams& p, std::int64_t tick,
             const auto firstVertex=frame.meshVertexCount;
             if (geometry.positions.empty() || geometry.vertexIds.size()!=geometry.positions.size()
                 || geometry.indices.empty() || geometry.indices.size()%3!=0
-                || geometry.positions.size()>frame.meshVertices.size()-firstVertex
-                || geometry.indices.size()/3>frame.meshTriangles.size()-frame.meshTriangleCount)
-            { error="Collider family meshes exceed 256 vertices and 128 triangles together"; return false; }
+                || geometry.positions.size()>std::numeric_limits<std::uint32_t>::max()-firstVertex
+                || geometry.indices.size()/3>std::numeric_limits<std::uint32_t>::max()-frame.meshTriangleCount)
+            { error="A collider family child has no indexed triangle surface"; return false; }
+            frame.meshVertices.resize(firstVertex+geometry.positions.size());
+            frame.meshVertexIdentities.resize(firstVertex+geometry.positions.size());
+            frame.meshTriangles.resize(frame.meshTriangleCount+geometry.indices.size()/3);
             for (std::size_t vertex=0;vertex<geometry.positions.size();++vertex) {
                 const auto v=particleFamilyColliderPoint(binding,child,geometry.positions[vertex]);
                 frame.meshVertices[firstVertex+vertex]=v;
@@ -575,10 +605,15 @@ inline bool sampleParticleGeometry(ParticleParams& p, std::int64_t tick,
     {
         const auto& geometry = std::get<GeometryData>(mesh.data);
         if (p.simulationSpace==1) {
-            if (geometry.positions.empty() || geometry.positions.size()>frame.meshVertices.size() || geometry.vertexIds.size()!=geometry.positions.size()
-                || geometry.indices.empty() || geometry.indices.size()%3!=0 || geometry.indices.size()/3>frame.meshTriangles.size())
-            { error="Solid triangle surfaces exceed their admitted indexed topology bounds"; return false; }
+            if (geometry.positions.empty() || geometry.positions.size()>std::numeric_limits<std::uint32_t>::max()
+                || geometry.vertexIds.size()!=geometry.positions.size()
+                || geometry.indices.empty() || geometry.indices.size()%3!=0
+                || geometry.indices.size()/3>std::numeric_limits<std::uint32_t>::max())
+            { error="Solid triangle surfaces need an indexed triangle mesh with one identity per vertex"; return false; }
             frame.meshIdentity=mesh.stableId;
+            frame.meshVertices.resize(geometry.positions.size());
+            frame.meshVertexIdentities.resize(geometry.positions.size());
+            frame.meshTriangles.resize(geometry.indices.size()/3);
             frame.meshVertexCount=static_cast<std::uint32_t>(geometry.positions.size());
             frame.meshTriangleCount=static_cast<std::uint32_t>(geometry.indices.size()/3);
             for (std::size_t vertex=0;vertex<geometry.positions.size();++vertex) {
@@ -608,7 +643,7 @@ inline bool sampleParticleGeometry(ParticleParams& p, std::int64_t tick,
                 if (geometry.vertexIds[a] > geometry.vertexIds[b]) std::swap(a, b);
                 if (!seen.emplace(geometry.vertexIds[a], geometry.vertexIds[b]).second) continue;
                 const auto x = project(geometry.positions[a]), y = project(geometry.positions[b]);
-                frame.segments[static_cast<std::size_t>(frame.count++)] = {x[0], x[1], y[0], y[1]};
+                frame.segments.push_back({x[0], x[1], y[0], y[1]}); ++frame.count;
             }
     }
     if (binding.points)
@@ -616,9 +651,9 @@ inline bool sampleParticleGeometry(ParticleParams& p, std::int64_t tick,
         auto colliders = std::get<PointsData>(points.data).points;
         std::sort(colliders.begin(), colliders.end(), [](const auto& a, const auto& b) { return a.stableId < b.stableId; });
         for (const auto& collider : colliders) {
-            const auto x = project(collider.position); frame.segments[static_cast<std::size_t>(frame.count++)] = {x[0], x[1], x[0], x[1]};
-            frame.solidPoints[frame.pointCount]=world(collider.position);
-            frame.pointIdentities[frame.pointCount++]=collider.stableId;
+            const auto x = project(collider.position); frame.segments.push_back({x[0], x[1], x[0], x[1]}); ++frame.count;
+            frame.solidPoints.push_back(world(collider.position));
+            frame.pointIdentities.push_back(collider.stableId); ++frame.pointCount;
         }
     }
     const auto bounded=[](const auto& values)

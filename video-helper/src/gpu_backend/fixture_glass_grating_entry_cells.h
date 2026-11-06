@@ -117,7 +117,7 @@ inline bool calculateGratingEntryCellBounds(const GratingIncidentBinding& parent
     GratingEntryCellBounds& output,std::string& error)
 {
     const auto count=parent.frame.entries.size();
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;
     if(parent.identity.size()>maximum||!validScheduling(parent.frame.scheduling)||!count||count>kMaximumEntrySamples||parent.identity.empty())
     {error="Grating source cell retained extent is invalid";return false;}
     GratingEntryCellBounds bounds;bounds.nativeUploadBytes=count*kGratingEntryCellStride*sizeof(Texel);
@@ -128,7 +128,7 @@ inline bool calculateGratingEntryCellBounds(const GratingIncidentBinding& parent
     bounds.bytes=bounds.hostBytes+bounds.nativeUploadBytes;
     if(parent.frame.bounds.transientBytes>maximum||parent.bounds.bytes>maximum-parent.frame.bounds.transientBytes
         ||bounds.bytes>maximum-parent.frame.bounds.transientBytes-parent.bounds.bytes)
-    {error="Grating source cell storage exceeds the existing whole-frame bound";return false;}
+    {error="Grating source cell storage is not representable";return false;}
     output=bounds;error.clear();return true;
 }
 // Validate the existing parent tables and the parent's own identity encoding.

@@ -26,8 +26,10 @@ def before(text, first, second, message):
 
 
 # OpenGL: the scene clear and the diffraction resolve clear share one choice.
-gl_scan = "!lightAt(i).environmentCameraVisible"
-gl_black = "const float hiddenBackdrop[4] { 0, 0, 0, 1 };"
+gl_scan = "light.kind==SceneLightKind::Environment && !light.environmentCameraVisible"
+# The hidden backdrop is opaque black unless the camera background sets a
+# colour or transparency (SceneCameraBackground).
+gl_black = "transparentBackdrop ? 0.0f : 1.0f };"
 gl_choice = "const float* background = cameraHiddenBackdrop ? hiddenBackdrop : stageBackground;"
 gl_scene = ("gl.ClearBufferfv(GL_COLOR, 0, diffractionFrame ? emptyPass\n"
             "            : runtimeInputs.imageOutput == renderpassoutput::Output::Color\n"
@@ -43,8 +45,7 @@ before(opengl, gl_choice, "gl.ClearBufferfv(GL_COLOR, 0, diffractionFrame", "Ope
 
 # Metal: the black clear comes after the stage colour and before the resolve captures it.
 mtl_scan = "light.kind == SceneLightKind::Environment && !light.environmentCameraVisible"
-mtl_black = ("if (cameraHiddenBackdrop)\n"
-             "                pass.action.colors[0].clear_value = { 0.0f, 0.0f, 0.0f, 1.0f };")
+mtl_black = "channel (cameraBackground.color.z), cameraBackground.mode == BackgroundMode::Transparent ? 0.0f : 1.0f };"
 check(mtl_black in sokol, "Metal clears a hidden environment's backdrop to opaque black")
 before(sokol, mtl_scan, mtl_black, "Metal reads the hidden flag before the clear")
 before(sokol, "if (runtimeInputs.imageOutput != renderpassoutput::Output::Color || runtimeInputs.passComposite)",

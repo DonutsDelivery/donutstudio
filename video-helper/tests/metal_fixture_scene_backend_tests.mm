@@ -1194,9 +1194,11 @@ bool metalLambertianNativeCases(const std::shared_ptr<const arbitgpu::NativeFixt
         return fail("Metal Lambertian owning scene did not retain its large texture identity");
     // Independent record-write census and actual owning-frame identity length.
     // Counter deltas include storage probes and every nested registry journal.
-    constexpr auto cap=arbitgpu::glasscaustics::kMaximumEntrySamples;
-    constexpr auto scanCopies=3*sizeof(lr::Result)+(8*cap+20)*sizeof(nt::Costs)+512;
-    constexpr auto inspectionCopies=scanCopies+2*sizeof(lr::Result);
+    // Scan records follow the scene's admitted entry samples, fixed at admission.
+    const auto cap=prior.entryBound;
+    if(!cap||cap>arbitgpu::glasscaustics::kMaximumEntrySamples)return fail("Metal Lambertian scene lost its admitted entry bound");
+    const auto scanCopies=3*sizeof(lr::Result)+(8*cap+20)*sizeof(nt::Costs)+512;
+    const auto inspectionCopies=scanCopies+2*sizeof(lr::Result);
     const auto attemptCopies=scanCopies+1104+6*nt::kSourceCapacity
         +8*(sizeof(lr::Request)+sizeof(lr::Result))+2000+2*(prior.identityBytes+1);
     const auto produce=[&](int stop=-1,std::shared_ptr<const arbitgpu::MetalLambertianArithmeticResult>* escaped=nullptr){
@@ -1444,20 +1446,13 @@ bool metalFiniteGratingReceiverCases(std::string& error)
                 arbitgpu::lambertian::Request q{};q[0]=1;q[1]=arbitgpu::lambertian::kP32Bits;q[2]=128;q[3]=640;q[5]=1;
                 arbitgpu::lambertian::putBudgets(q,arbitgpu::lambertian::kNativeCeilings);
                 arbitgpu::lambertian::Result sentinel{};std::shared_ptr<const arbitgpu::MetalLambertianArithmeticResult> numeric;
+                // The journal grows with the attempts: the old 2048-slot array
+                // no longer refuses attempt 2049.
                 if(!wrapperStorage(false))return false;
-                for(auto count=radianceBefore[5];count<gc::kMaximumEntrySamples-7;++count)
+                for(auto count=radianceBefore[5];count<gc::kMaximumEntrySamples+1;++count)
                     if(arbitgpu::produceMetalLambertianArithmeticForFixture(frame,q,sentinel,numeric,error,3)||numeric)return false;
-                if(!wrapperStorage(false)||radianceBefore[5]!=gc::kMaximumEntrySamples-7
-                    ||arbitgpu::produceMetalFiniteGratingRadianceForFixture(frame,receiver,baseOwner,refused,error)
-                    ||refused||!wrapperStorage(true)||radianceAfter[5]!=radianceBefore[5]||radianceAfter[1]||radianceAfter[4])
-                    return fail("Finite radiance eight-slot preflight ignored actual previously failed native attempts");
-                for(unsigned remaining=0;remaining<7;++remaining)
-                    if(arbitgpu::produceMetalLambertianArithmeticForFixture(frame,q,sentinel,numeric,error,3)||numeric)return false;
-                if(!wrapperStorage(false)||radianceBefore[5]!=gc::kMaximumEntrySamples
-                    ||arbitgpu::produceMetalLambertianArithmeticForFixture(frame,q,sentinel,numeric,error,3)
-                    ||arbitgpu::produceMetalFiniteGratingRadianceForFixture(frame,receiver,baseOwner,refused,error)
-                    ||!wrapperStorage(true)||radianceAfter[5]!=gc::kMaximumEntrySamples)
-                    return fail("Finite radiance or numerical child enlarged the 2048-attempt cap");
+                if(!wrapperStorage(true)||radianceAfter[5]!=gc::kMaximumEntrySamples+1)
+                    return fail("Metal Lambertian attempt journal stopped at the old 2048-slot array");
             }else {
                 for(unsigned retry=0;retry<2;++retry){
                     if(!wrapperStorage(false)||arbitgpu::produceMetalFiniteGratingRadianceForFixture(frame,receiver,baseOwner,refused,error)
@@ -1944,7 +1939,7 @@ bool metalDirectionalIrradianceCohortCases(std::string& error)
         if(gc::prepareDirectGratingIrradianceCohort(malformed,endpoints,0,0,retained,error))return fail("Metal cohort preparation accepted reordered scene sources");
         malformed=bindings;malformed.pop_back();
         if(gc::prepareDirectGratingIrradianceCohort(malformed,endpoints,0,0,retained,error))return fail("Metal cohort preparation accepted a source prefix");
-        if(gc::prepareDirectGratingIrradianceCohort(bindings,endpoints,renderpassoutput::kMaximumTotalBytes,0,retained,error)
+        if(gc::prepareDirectGratingIrradianceCohort(bindings,endpoints,renderpassoutput::kRepresentableTotalBytes,0,retained,error)
             ||gc::prepareDirectGratingIrradianceCohort(bindings,endpoints,0,gc::kMaximumQueryWork,retained,error)||retained!=cohort)
             return fail("Metal cohort preparation exceeded original complete byte or work bounds");
         auto excessive=endpoints;excessive.resize(gc::kMaximumEntrySamples+1,endpoints[0]);

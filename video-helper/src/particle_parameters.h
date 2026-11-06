@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 #include "canonical_block_c_frame.h"
+#include "particle_sized_list.h"
 
 namespace videorender
 {
@@ -13,21 +15,11 @@ struct ParticleImportedSolidFrame;
 struct ParticleSolidMotionFrame;
 struct ParticleBodyReplayContext;
 class ParticleBodyReplayReceipt;
-// Planar coupled bodies feed fixed 64-entry shader arrays. Solid 3D bodies
-// draw as one instanced scene object, so their bound is the score's note
-// capacity: one body per sounding row is the most a replay can ever spawn.
-inline constexpr int kParticlePlanarMaxBodies = 64;
-inline constexpr int kParticleSolidMaxBodies = 128;
-// Imported Solid 3D composition appends one scene object per body, not one
-// instanced object, so it keeps a 64-body cap.
-inline constexpr int kParticleImportedSolidMaxBodies = 64;
-static_assert(kParticleSolidMaxBodies == arbitblockc::kMaxNotes,
-              "Solid 3D body bound follows the score note capacity");
-inline constexpr int particleMaxBodies(int simulationSpace) noexcept
-{
-    return simulationSpace == 1 ? kParticleSolidMaxBodies : kParticlePlanarMaxBodies;
-}
-using ParticleBodyState = std::array<std::array<float, 4>, kParticleSolidMaxBodies>;
+// Coupled bodies are sized from the node's count. Planar shaders read the
+// bodies and emitter anchors from a texture sized to them; Solid 3D bodies
+// draw as one instanced scene object, and imported Solid 3D composition
+// appends one scene object per body.
+using ParticleBodyState = ParticleSizedList<std::array<float, 4>, ParticleDeadBodyFill>;
 struct ParticleParams
 {
     int count = 512, spawnTrack = 0, seed = 0;
@@ -40,8 +32,8 @@ struct ParticleParams
     float linkSpring = 0.0f, linkRatioInfluence = 1.0f;
     int collisionMode = 0;
     float bodyRadius = 0.015f, restitution = 0.7f;
-    // Coupled replay is bounded to 64 planar or 128 Solid 3D bodies. Existing documents
-    // retain snapshot inputs; historicalReplay reads canonical project inputs.
+    // Coupled replay holds count bodies. Existing documents retain snapshot
+    // inputs; historicalReplay reads canonical project inputs.
     int bodyShape = 0, linkConstraint = 0, resetMode = 0;
     float bodyMass = 1.0f, friction = 0.0f, linkRestScale = 1.0f;
     float impulseX = 0.0f, impulseY = 0.0f;
@@ -85,27 +77,27 @@ struct ParticleParams
     // XY emitter/attractor coordinates, projected only in planar mode. Solid
     // mode retains both world Z coordinates separately. Not score rows.
     int geometryCount = 0;
-    std::array<std::array<float,4>,64> geometryAnchors {};
-    std::array<std::uint64_t,64> geometryIdentities {};
-    std::array<std::array<float,2>,64> geometryDepths {};
+    ParticleSizedList<std::array<float,4>> geometryAnchors;
+    ParticleSizedList<std::uint64_t> geometryIdentities;
+    ParticleSizedList<std::array<float,2>> geometryDepths;
 };
 
-inline std::array<float, canonicalblockc::kNoteTextureValues> particleNoteUpload(
+inline std::vector<float> particleNoteUpload(
     const canonicalblockc::CanonicalBlockCFrame* notes, bool timelineMotion,
     float linkRatioInfluence = 1.0f)
 {
-    std::array<float, canonicalblockc::kNoteTextureValues> data {};
-    if (notes == nullptr) return data;
+    if (notes == nullptr) return std::vector<float>(arbitblockc::noteTextureValues(0), 0.0f);
     if (!timelineMotion) return notes->noteTextureValues;
+    std::vector<float> data(notes->noteTextureValues.size(), 0.0f);
     // Residency rows can differ after a seek. Order this private GPU upload by
     // the canonical signed note IDs so a frame does not depend on prior packing.
-    std::array<int, arbitblockc::kMaxNotes> rows {};
-    const int count = std::clamp(notes->noteRows(), 0, arbitblockc::kMaxNotes);
+    const int count = std::max(notes->noteRows(), 0);
+    std::vector<int> rows(static_cast<std::size_t>(count));
     for (int i = 0; i < count; ++i) rows[static_cast<std::size_t>(i)] = i;
     std::sort(rows.begin(), rows.begin() + count, [notes](int a, int b)
     { return notes->noteIdentities[static_cast<std::size_t>(a)]
            < notes->noteIdentities[static_cast<std::size_t>(b)]; });
-    std::array<int, arbitblockc::kMaxNotes> sortedRows {};
+    std::vector<int> sortedRows(static_cast<std::size_t>(count));
     for (int i = 0; i < count; ++i)
     {
         std::copy_n(notes->noteTextureValues.begin() + rows[static_cast<std::size_t>(i)] * 16,
@@ -115,8 +107,8 @@ inline std::array<float, canonicalblockc::kNoteTextureValues> particleNoteUpload
         // remains immutable; its prime exponents are not used by this shader.
         std::fill_n(data.begin() + i * 16 + 8, 4, 0.0f);
     }
-    std::array<int, arbitblockc::kMaxLinks> links {};
-    const int linkCount = std::clamp(notes->linkRows(), 0, arbitblockc::kMaxLinks);
+    const int linkCount = std::max(notes->linkRows(), 0);
+    std::vector<int> links(static_cast<std::size_t>(linkCount));
     for (int i = 0; i < linkCount; ++i) links[static_cast<std::size_t>(i)] = i;
     std::sort(links.begin(), links.begin() + linkCount, [notes](int a, int b)
     { return notes->linkIdentities[static_cast<std::size_t>(a)]

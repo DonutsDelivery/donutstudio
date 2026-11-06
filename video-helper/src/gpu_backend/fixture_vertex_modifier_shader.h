@@ -2,7 +2,11 @@
 
 #include "../material_program_compiler.h"
 #include "fixture_surface_source_admission.h"
+#include "../../../shared/GeometryCore.h"
+#include "../../../shared/VertexControlBank.h"
+#include "../../../shared/VertexNoise.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -10,6 +14,8 @@
 #include <locale>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace arbitgpu
 {
@@ -61,6 +67,72 @@ inline std::array<float, kVertexDisplacementLimitCapacity> fixtureVertexDisplace
     return limits;
 }
 
+// The OpenGL Ocean Waves wave table, one RGBA32F row per Ocean Waves instruction
+// in program order. Texel 0 holds (wave count, choppiness), and each wave takes
+// two texels: (kx, ky, amplitude, omega) and (phase, 1 / k). The shader text
+// names only the row, so new wave settings upload new texels without a new
+// program. Metal binds the same texels as a vertex-stage texture
+// (kFixtureVertexWavesMetalTexture).
+// The Metal vertex texture index and Sokol view slot of the wave table. The
+// fragment stage uses views 0 to 11.
+inline constexpr int kFixtureVertexWavesMetalTexture = 0;
+inline constexpr int kFixtureVertexWavesMetalView = 12;
+// The control bank's Metal vertex texture index and Sokol view slot.
+inline constexpr int kFixtureVertexControlsMetalTexture = 1;
+inline constexpr int kFixtureVertexControlsMetalView = 13;
+struct FixtureVertexWaveTable final
+{
+    std::uint32_t width = 0, rows = 0;
+    std::vector<std::array<float, 4>> texels;
+};
+
+inline bool fixtureVertexWaveTable (const videohelper::materialprogram::MaterialProgramRecord* program,
+                                    FixtureVertexWaveTable& table, std::string& error)
+{
+    table = {};
+    if (program == nullptr) return true;
+    std::vector<std::vector<videowire::geometry::WindSpectrumWave>> rows;
+    std::vector<double> choppiness;
+    for (const auto& instruction : program->vertexInstructions())
+    {
+        if (instruction.operation != videowire::VertexModifierOperation::oceanWaves) continue;
+        const auto& p = instruction.parameters;
+        videowire::geometry::OceanSettings settings;
+        settings.windSpeed = p[0]; settings.headingDegrees = p[1];
+        settings.smallestWave = p[2]; settings.size = p[3];
+        settings.seed = static_cast<std::uint32_t> (p[4]);
+        std::string oceanError;
+        rows.emplace_back();
+        if (! videowire::geometry::oceanWaves (settings, rows.back(), oceanError))
+        {
+            error = "Native vertex Ocean Waves refused: " + oceanError;
+            return false;
+        }
+        choppiness.push_back (p[5]);
+    }
+    if (rows.empty()) return true;
+    std::size_t widest = 0;
+    for (const auto& row : rows) widest = std::max (widest, row.size());
+    table.width = static_cast<std::uint32_t> (1 + 2 * widest);
+    table.rows = static_cast<std::uint32_t> (rows.size());
+    table.texels.assign (static_cast<std::size_t> (table.width) * table.rows, {});
+    for (std::size_t row = 0; row < rows.size(); ++row)
+    {
+        auto* texel = table.texels.data() + row * table.width;
+        texel[0] = { static_cast<float> (rows[row].size()), static_cast<float> (choppiness[row]), 0.0f, 0.0f };
+        for (std::size_t wave = 0; wave < rows[row].size(); ++wave)
+        {
+            const auto& w = rows[row][wave];
+            const auto k = std::hypot (w.kx, w.ky);
+            texel[1 + 2 * wave] = { static_cast<float> (w.kx), static_cast<float> (w.ky),
+                                    static_cast<float> (w.amplitude), static_cast<float> (w.omega) };
+            texel[2 + 2 * wave] = { static_cast<float> (w.phase), static_cast<float> (k > 0 ? 1.0 / k : 0.0), 0.0f, 0.0f };
+        }
+    }
+    error.clear();
+    return true;
+}
+
 inline std::string fixtureVertexModifierShader (
     const char* source, const videohelper::materialprogram::MaterialProgramRecord* program,
     videohelper::materialprogram::BackendTarget target, std::string& error)
@@ -88,10 +160,11 @@ inline std::string fixtureVertexModifierShader (
         };
         const auto emit = [&] (const std::string& prefix, const std::string& time,
                                const std::string& spectrum, const std::string& position,
-                               const std::string& output)
+                               const std::string& output, const std::string& controlRow)
         {
             const auto value = [&prefix] (std::uint32_t slot) { return prefix + std::to_string (slot); };
             const std::string limitUniform = metal ? "u.vertexDisplacementLimits[0][0]" : "uVertexDisplacementLimits[0][0]";
+            std::uint32_t oceanRow = 0;
             for (const auto& instruction : program->vertexInstructions())
             {
                 using Operation = videowire::VertexModifierOperation;
@@ -142,8 +215,74 @@ inline std::string fixtureVertexModifierShader (
                         expression = a + " + " + b + " * min(1.0, " + limitUniform
                             + " / max(length(" + b + "), 0.000001))";
                         break;
+                    case Operation::scalarSin: expression = "sin(" + a + ")"; break;
+                    case Operation::scalarCos: expression = "cos(" + a + ")"; break;
+                    case Operation::oceanWaves:
+                    {
+                        // The same waves the CPU Ocean sums, read from the per-draw
+                        // table (fixtureVertexWaveTable). Validation stays here so a
+                        // refused setting names itself before any draw.
+                        videowire::geometry::OceanSettings settings;
+                        settings.windSpeed = p[0]; settings.headingDegrees = p[1];
+                        settings.smallestWave = p[2]; settings.size = p[3];
+                        settings.seed = static_cast<std::uint32_t> (p[4]);
+                        std::vector<videowire::geometry::WindSpectrumWave> waves;
+                        std::string oceanError;
+                        if (! videowire::geometry::validOceanSettings (settings, oceanError)
+                            || ! videowire::geometry::oceanWaves (settings, waves, oceanError))
+                        {
+                            error = "Native vertex Ocean Waves refused: " + oceanError;
+                            return false;
+                        }
+                        const auto name = value (instruction.resultSlot) + "Ocean";
+                        const auto row = std::to_string (oceanRow++);
+                        // Both backends read the per-draw table: OpenGL through
+                        // texelFetch, Metal through a vertex-stage texture read.
+                        const auto texel = [&] (const std::string& column)
+                        {
+                            return metal ? "vertexWaves.read(uint2(" + column + ", " + row + "))"
+                                         : "texelFetch(uVertexWaves, ivec2(" + column + ", " + row + "), 0)";
+                        };
+                        const std::string vec4 = metal ? "float4" : "vec4";
+                        body += vector + " " + name + " = " + vector + "(0.0);\n{\n"
+                            + vec4 + " header = " + texel ("0") + ";\n"
+                            "int count = int(header.x + 0.5);\n"
+                            "for (int wave = 0; wave < count; ++wave) {\n"
+                            + vec4 + " w = " + texel ("1 + 2 * wave") + ";\n"
+                            + vec4 + " q = " + texel ("2 + 2 * wave") + ";\n"
+                            "float phi = w.x * " + a + ".x + w.y * " + a + ".y - w.w * " + b + " + q.x;\n"
+                            "float c = w.z * cos(phi) * q.y * header.y;\n"
+                            + name + " += " + vector + "(w.x * c, w.y * c, w.z * sin(phi));\n}\n}\n";
+                        expression = name;
+                        break;
+                    }
+                    // Value noise from shared/VertexNoise.h, the same steps Path Trace runs.
+                    case Operation::scalarNoise3d:
+                    case Operation::vec3Noise3d:
+                    {
+                        const auto name = value (instruction.resultSlot) + "Noise";
+                        const auto seed = static_cast<std::uint32_t> (p[1]);
+                        body += videowire::vertexnoise::source (metal, name + "0", a, number (p[0]), seed);
+                        if (instruction.operation == Operation::scalarNoise3d) { expression = name + "0"; break; }
+                        body += videowire::vertexnoise::source (metal, name + "1", a, number (p[0]), seed + 1)
+                            + videowire::vertexnoise::source (metal, name + "2", a, number (p[0]), seed + 2);
+                        expression = vector + "(" + name + "0, " + name + "1, " + name + "2)";
+                        break;
+                    }
+                    // The control bank (shared/VertexControlBank.h): slot i is lane
+                    // i % 4 of texel i / 4 in the per-draw control texture, row 0
+                    // for this frame and row 1 for the prior frame.
+                    case Operation::controlParameter:
+                    {
+                        const auto slot = static_cast<unsigned> (p[0]);
+                        const auto column = std::to_string (slot / 4u);
+                        expression = (metal ? "vertexControls.read(uint2(" + column + ", " + controlRow + "))"
+                                            : "texelFetch(uVertexControls, ivec2(" + column + ", " + controlRow + "), 0)")
+                            + "[" + std::to_string (slot % 4u) + "]";
+                        break;
+                    }
                     default:
-                        error = "Native vertex execution does not support external control banks or noise yet";
+                        error = "Native vertex program has an operation Raster cannot write";
                         return false;
                 }
                 const bool scalar = instruction.resultType == videowire::VertexModifierValueType::scalar;
@@ -154,13 +293,30 @@ inline std::string fixtureVertexModifierShader (
             return true;
         };
         if (! emit ("vertexValue", metal ? "u.vertexTime.x" : "uVertexTime.x",
-                    metal ? "u.vertexSpectrum" : "uVertexSpectrum", currentPosition, "modifiedPosition")
+                    metal ? "u.vertexSpectrum" : "uVertexSpectrum", currentPosition, "modifiedPosition", "0")
             || ! emit ("previousVertexValue", metal ? "u.vertexTime.y" : "uVertexTime.y",
                        metal ? "u.previousVertexSpectrum" : "uPreviousVertexSpectrum",
-                       "previousSourcePosition", "previousModifiedPosition"))
+                       "previousSourcePosition", "previousModifiedPosition", "1"))
             return {};
     }
     std::string result (source);
+    // Metal reads the wave table and the control bank as vertex-stage texture
+    // arguments, added after the uniforms only when the program reads them.
+    for (const auto& [name, texture] : { std::pair<const char*, int> { "vertexWaves", kFixtureVertexWavesMetalTexture },
+                                         std::pair<const char*, int> { "vertexControls", kFixtureVertexControlsMetalTexture } })
+    {
+        if (! metal || body.find (std::string (name) + ".read") == std::string::npos) continue;
+        constexpr const char* uniforms = "constant Uniforms& u [[buffer(0)]],";
+        const auto at = result.find (uniforms);
+        if (at == std::string::npos || result.find (uniforms, at + 1) != std::string::npos)
+        {
+            error = "Native fixture shader has no unique vertex uniform argument for its vertex tables";
+            return {};
+        }
+        result.insert (at + std::char_traits<char>::length (uniforms),
+                       "\n                       texture2d<float, access::read> " + std::string (name) + " [[texture("
+                           + std::to_string (texture) + ")]],");
+    }
     constexpr const char* marker = "// ARBIT_VERTEX_MODIFIER";
     const auto offset = result.find (marker);
     if (offset == std::string::npos)

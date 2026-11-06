@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <unordered_set>
+#include <vector>
 
 
 namespace canonicalblockc
@@ -36,10 +37,6 @@ inline bool normalizeLinkMasterIdentity(int schemaVersion, int wireIdentity,
     normalizedIdentity = 0;
     return false;
 }
-inline constexpr std::size_t kNoteTextureValues
-    = static_cast<std::size_t>(arbitblockc::kMaxNotes * arbitblockc::kTexelsPerNote * 4);
-inline constexpr std::size_t kLinkTextureValues
-    = static_cast<std::size_t>(arbitblockc::kMaxLinks * 4);
 
 struct FrameKey final
 {
@@ -102,11 +99,14 @@ class CanonicalBlockCFrame final
 public:
     const std::uint32_t version;
     const FrameKey key;
-    const std::array<float, kNoteTextureValues> noteTextureValues;
-    const std::array<float, kLinkTextureValues> linkTextureValues;
-    const std::array<std::int64_t, arbitblockc::kMaxNotes> noteIdentities;
-    const std::array<std::int64_t, arbitblockc::kMaxLinks> linkIdentities;
-    const std::array<FrozenNotationNote, arbitblockc::kMaxNotes> notationRows;
+    // Sized from the score: arbitblockc::noteTextureValues(noteRowCount) and
+    // linkTextureValues(linkRowCount) floats; one identity and notation row per
+    // note row, one identity per link row.
+    const std::vector<float> noteTextureValues;
+    const std::vector<float> linkTextureValues;
+    const std::vector<std::int64_t> noteIdentities;
+    const std::vector<std::int64_t> linkIdentities;
+    const std::vector<FrozenNotationNote> notationRows;
     const int noteRowCount;
     const int linkRowCount;
     const int droppedNotes;
@@ -116,15 +116,16 @@ public:
     const float scoreHistoryBeats;
     const float scoreLookaheadBeats;
     const std::array<float, 6> primeBasis;
-    // The whole score this frame was packed from. The rows above hold the 128
-    // notes and 256 links the shader textures have room for; a consumer that
-    // needs no texture reads every resident note here.
+    // The whole score this frame was packed from. The rows above hold every
+    // note and link resident in the history and lookahead window.
     const std::shared_ptr<const arbitmod::Score> sourceScore;
 
     const auto& noteTexture() const noexcept { return noteTextureValues; }
     const auto& linkTexture() const noexcept { return linkTextureValues; }
     int noteRows() const noexcept { return noteRowCount; }
     int linkRows() const noexcept { return linkRowCount; }
+    int noteTextureHeight() const noexcept { return arbitblockc::noteTextureRows(noteRowCount); }
+    int linkTextureHeight() const noexcept { return arbitblockc::linkTextureRows(linkRowCount); }
     float historyBeats() const noexcept { return scoreHistoryBeats; }
     float lookaheadBeats() const noexcept { return scoreLookaheadBeats; }
     const FrozenNotationNote* noteAtRow (int row) const noexcept
@@ -139,11 +140,11 @@ private:
     CanonicalBlockCFrame (
         FrameKey keyIn, int noteCount, int linkCount, int notesDropped, int linksDropped, float beat,
         float rootFrequency, float history, float lookahead,
-        std::array<float, kNoteTextureValues> notes,
-        std::array<float, kLinkTextureValues> links,
-        std::array<std::int64_t, arbitblockc::kMaxNotes> noteIds,
-        std::array<std::int64_t, arbitblockc::kMaxLinks> linkIds,
-        std::array<FrozenNotationNote, arbitblockc::kMaxNotes> notation,
+        std::vector<float> notes,
+        std::vector<float> links,
+        std::vector<std::int64_t> noteIds,
+        std::vector<std::int64_t> linkIds,
+        std::vector<FrozenNotationNote> notation,
         std::shared_ptr<const arbitmod::Score> source)
         : version(kCanonicalBlockCFrameVersion), key(keyIn),
           noteTextureValues(std::move(notes)), linkTextureValues(std::move(links)),
@@ -197,8 +198,7 @@ public:
             || !std::isfinite(score->historyBeats) || score->historyBeats < 0.0f
             || !std::isfinite(score->lookaheadBeats) || score->lookaheadBeats < 0.0f)
             return reject("Block C frame metadata or score header is invalid");
-        // Validate the complete projected score. The 128/256 texture limits
-        // apply to the resident rows selected by BlockCPacker, not source data.
+        // Validate the complete projected score.
         // Index identities once so long scores do not require pairwise scans.
         std::unordered_set<int> noteIds;
         noteIds.reserve(score->notes.size());
@@ -263,30 +263,17 @@ public:
         if (last_ == nullptr || !sameLifecycle(key, last_->key) || key.frame < lastFrame_)
             packer_.reset();
 
-        constexpr std::size_t expectedNoteValues = kNoteTextureValues;
-        constexpr std::size_t expectedLinkValues = kLinkTextureValues;
-        const auto packed = packer_.pack(*score, beat);
+        auto packed = packer_.pack(*score, beat);
         ++evaluatedPackCount_;
 
-        if (packed.noteCount < 0 || packed.noteCount > arbitblockc::kMaxNotes
-            || packed.linkCount < 0 || packed.linkCount > arbitblockc::kMaxLinks
-            || packed.notesTex.size() != expectedNoteValues
-            || packed.linksTex.size() != expectedLinkValues)
-            return reject();
-        const auto usedNoteValues = static_cast<std::size_t>(packed.noteCount)
-            * static_cast<std::size_t>(arbitblockc::kTexelsPerNote) * 4u;
-        const auto usedLinkValues = static_cast<std::size_t>(packed.linkCount) * 4u;
-        const auto trailingNoteValues = expectedNoteValues - usedNoteValues;
-        const auto trailingLinkValues = expectedLinkValues - usedLinkValues;
-        if (usedNoteValues + trailingNoteValues != expectedNoteValues
-            || usedLinkValues + trailingLinkValues != expectedLinkValues)
+        if (packed.noteCount < 0 || packed.linkCount < 0
+            || packed.notesTex.size() != arbitblockc::noteTextureValues(packed.noteCount)
+            || packed.linksTex.size() != arbitblockc::linkTextureValues(packed.linkCount)
+            || packed.noteIds.size() != static_cast<std::size_t>(packed.noteCount)
+            || packed.linkIds.size() != static_cast<std::size_t>(packed.linkCount))
             return reject();
 
-        std::array<float, kNoteTextureValues> notes {};
-        std::array<float, kLinkTextureValues> links {};
-        std::copy(packed.notesTex.begin(), packed.notesTex.end(), notes.begin());
-        std::copy(packed.linksTex.begin(), packed.linksTex.end(), links.begin());
-        std::array<FrozenNotationNote, arbitblockc::kMaxNotes> notation {};
+        std::vector<FrozenNotationNote> notation(static_cast<std::size_t>(packed.noteCount));
         for (int row = 0; row < packed.noteCount; ++row)
         {
             const auto identity = packed.noteIds[static_cast<std::size_t>(row)];
@@ -318,8 +305,8 @@ public:
         last_ = std::shared_ptr<const CanonicalBlockCFrame>(new CanonicalBlockCFrame(
             key, packed.noteCount, packed.linkCount, packed.droppedNotes, packed.droppedLinks,
             packed.beat, score->rootFreq,
-            score->historyBeats, score->lookaheadBeats, std::move(notes), std::move(links),
-            packed.noteIds, packed.linkIds, std::move(notation), score));
+            score->historyBeats, score->lookaheadBeats, std::move(packed.notesTex), std::move(packed.linksTex),
+            std::move(packed.noteIds), std::move(packed.linkIds), std::move(notation), score));
         return valid(last_) ? last_ : reject();
     }
 
@@ -438,8 +425,12 @@ inline bool valid(const std::shared_ptr<const CanonicalBlockCFrame>& frame) noex
         || frame->key.seekGeneration == 0 || frame->key.frame < 0
         || !std::isfinite(frame->key.beat) || !std::isfinite(frame->key.fps)
         || frame->key.fps <= 0.0 || frame->packedBeat != static_cast<float>(frame->key.beat)
-        || frame->noteRowCount < 0 || frame->noteRowCount > arbitblockc::kMaxNotes
-        || frame->linkRowCount < 0 || frame->linkRowCount > arbitblockc::kMaxLinks
+        || frame->noteRowCount < 0 || frame->linkRowCount < 0
+        || frame->noteTextureValues.size() != arbitblockc::noteTextureValues(frame->noteRowCount)
+        || frame->linkTextureValues.size() != arbitblockc::linkTextureValues(frame->linkRowCount)
+        || frame->noteIdentities.size() != static_cast<std::size_t>(frame->noteRowCount)
+        || frame->notationRows.size() != static_cast<std::size_t>(frame->noteRowCount)
+        || frame->linkIdentities.size() != static_cast<std::size_t>(frame->linkRowCount)
         || !std::isfinite(frame->rootFrequencyHz) || frame->rootFrequencyHz <= 0.0f
         || !std::isfinite(frame->scoreHistoryBeats) || frame->scoreHistoryBeats < 0.0f
         || !std::isfinite(frame->scoreLookaheadBeats) || frame->scoreLookaheadBeats < 0.0f)
@@ -448,19 +439,8 @@ inline bool valid(const std::shared_ptr<const CanonicalBlockCFrame>& frame) noex
                      [](float value) { return std::isfinite(value); })
         || !std::all_of(frame->linkTextureValues.begin(), frame->linkTextureValues.end(),
                         [](float value) { return std::isfinite(value); })) return false;
-    for (int row = 0; row < arbitblockc::kMaxNotes; ++row)
-    {
-        const auto identity = frame->noteIdentities[static_cast<std::size_t>(row)];
-        const bool hole = identity == 0;
-        if ((row >= frame->noteRowCount && !hole)
-            || frame->notationRows[static_cast<std::size_t>(row)].identity != identity) return false;
-
-    }
-    for (int row = frame->linkRowCount; row < arbitblockc::kMaxLinks; ++row)
-    {
-        if (frame->linkIdentities[static_cast<std::size_t>(row)] != 0) return false;
-
-    }
+    for (std::size_t row = 0; row < frame->noteIdentities.size(); ++row)
+        if (frame->notationRows[row].identity != frame->noteIdentities[row]) return false;
     return true;
 }
 } // namespace canonicalblockc

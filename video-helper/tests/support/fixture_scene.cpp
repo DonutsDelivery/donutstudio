@@ -154,7 +154,7 @@ loadHolographicTradingCardScene(std::string& error)
         || binding->evaluationRevision != holographiccardcompiledfixture::kEvaluationRevision
         || binding->materialRevision != holographiccardcompiledfixture::kMaterialRevision
         || !binding->spatialFoil
-        || binding->spatialFoil->physicalBsdf.roughness.rmsSlope != 0.08f
+        || binding->spatialFoil->physicalBsdf.roughness.rmsSlope != 0.02f
         || binding->spatialFoil->workBudget.maximumEvaluations
             != holographiccardcompiledfixture::kMaximumEvaluations
         || operation.asset.id != result.assetId

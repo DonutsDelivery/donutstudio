@@ -1975,7 +1975,7 @@ void spectralHistoryRetainsTimelineAndBounds() {
       && rows[1][8]==0,"canonical seek generation resets even a small forward seek");
   for (int frame=0;frame<1800;++frame)
     spectrum::evaluateHistory(binding,pulse,frame/60.0,{},true,false,state,rows,error);
-  check(state.history.size()<=spectrum::kMaximumLiveHistoryFrames,"live presentation history has bounded storage");
+  check(state.history.size()<=spectrum::liveHistoryFrames(binding.history),"live history keeps only its own span");
 }
 
 void spectralHistoryRetainedFieldsReplayTypedValues() {
@@ -3774,8 +3774,6 @@ void surfaceTableAndFieldTransport() {
   check(geometrysurfacematerial::encodeSet(invalid).empty(),"duplicate Surface table source IDs fail closed");
   invalid=programs; std::reverse(invalid.begin(),invalid.end());
   check(geometrysurfacematerial::encodeSet(invalid).empty(),"noncanonical Surface program order fails closed");
-  invalid=programs; invalid[0].fields.resize(surfacematerialfield::kMaximumBindings+1,*field);
-  check(geometrysurfacematerial::encodeSet(invalid).empty(),"Surface Field count is bounded before serialization");
   check(!geometrysurfacematerial::decodeSet(wire+" ",error),"trailing Surface table bytes fail closed");
   const auto value=instanceMaterialFieldsFixture("materialIndex",true,false,error);
   check(value.has_value(),"Surface table fixture retains exact native material indices");
@@ -4792,12 +4790,13 @@ void scoreSampleFieldMeasures() {
   if (!canonicalblockc::valid(frame)) return;
   const auto positions=scoreSampleMeasurePositions();
   // Expected measures are written out here, not read back from the helper table.
-  const std::array<scorefield::Mode,14> expected {
+  const std::array<scorefield::Mode,15> expected {
     scorefield::Mode::closestNoteDistance, scorefield::Mode::velocityInfluence, scorefield::Mode::pitchSpacing,
     scorefield::Mode::harmonicLinkDistance, scorefield::Mode::pitchBendSemitones, scorefield::Mode::noteAgeBeats,
     scorefield::Mode::remainingDurationBeats, scorefield::Mode::rootFlag, scorefield::Mode::midiNoteNumber,
     scorefield::Mode::resolvedFrequencyHz, scorefield::Mode::harmonicLinkRatio,
-    scorefield::Mode::primeLattice, scorefield::Mode::primeLattice, scorefield::Mode::primeLattice
+    scorefield::Mode::primeLattice, scorefield::Mode::primeLattice, scorefield::Mode::primeLattice,
+    scorefield::Mode::midiLane
   };
   static_assert(std::tuple_size<decltype(expected)>::value==scorefield::kSampleFieldModeCount,
                 "expected measures must list every Score Sample Field choice");
@@ -4809,6 +4808,7 @@ void scoreSampleFieldMeasures() {
     // The sampled values must equal the canonical Score Field evaluator for the same measure.
     // Prime Lattice choices compare against the vector component on their own axis.
     const std::size_t component=choice>=scorefield::kFirstSamplePrimeLatticeChoice
+        && choice<scorefield::kSamplePrimeLatticeChoiceEnd
         ? choice-scorefield::kFirstSamplePrimeLatticeChoice : 0;
     scorefield::Binding binding;
     binding.fieldStableId=op.stableId; binding.sourceGeometryStableId=op.inputStableId;
@@ -5001,9 +5001,9 @@ void instanceScoreFieldsRetainCanonicalOwnership() {
       "instance field transport cannot borrow a larger vertex budget");
   scorefield::Binding oversized=binding;
   oversized.fieldStableId=9957; oversized.sourceGeometryStableId=source->stableId;
-  oversized.positions.resize(2049); oversized.elementIds.resize(2049);
+  oversized.positions.resize(10000); oversized.elementIds.resize(10000);
   for (std::size_t i=0;i<oversized.elementIds.size();++i) oversized.elementIds[i]=i+1;
-  check(!scorefield::validate(oversized,2049,error),"instance Score Field retains the 2048-sample hard cap");
+  check(scorefield::validate(oversized,10000,error),"instance Score Field accepts a 10000-sample input");
   const auto dynamic=spectrumInstancerLayoutFixture(5,error);
   check(dynamic && lowerInstanceScoreField(*dynamic,9958,binding,vectorContract,error),
       "fixed Spectrum placements retain authored Score Field anchors for ordered frame replay");
@@ -5229,9 +5229,9 @@ void scoreDeformedPrototypeInstancesRetainCanonicalFrame() {
   auto hostile=*value; hostile.scoreFields[0].positions.pop_back();
   check(!admitValue(hostile,contract,error),"missing prototype samples fail before publication");
   hostile=*value;
-  hostile.scoreFields[0].positions.resize(scorefield::kMaximumElements+1);
-  hostile.scoreFields[0].elementIds.resize(scorefield::kMaximumElements+1);
-  check(!admitValue(hostile,contract,error),"over-cap prototype Score samples refuse before publication");
+  hostile.scoreFields[0].positions.push_back({0,0,0});
+  hostile.scoreFields[0].elementIds.push_back(99999);
+  check(!admitValue(hostile,contract,error),"prototype Score samples beyond the source vertices refuse before publication");
   hostile=*value; hostile.scoreFields[0].elementIds[0]=99;
   check(!admitValue(hostile,contract,error),"forged ordered prototype vertex identity refuses admission");
   hostile=*value; hostile.scoreFields[0].consumerGeometryStableId=12010;

@@ -388,12 +388,14 @@ void contractTests()
     auto refused = traced;
     refused.pathTraceExportSamples = 0;
     check (render::encode (refused).empty(), "zero export samples are refused");
-    refused = traced;
-    refused.imageOutput = renderpassoutput::Output::Depth;
-    check (render::encode (refused).empty(), "Path Trace refuses a non-Color image output");
-    refused = traced;
-    refused.rawExportMask = 1u << static_cast<unsigned> (renderpassoutput::Output::Depth);
-    check (render::encode (refused).empty(), "Path Trace refuses raw data exports");
+    auto outputs = traced;
+    outputs.imageOutput = renderpassoutput::Output::Depth;
+    outputs.rawExportMask = 1u << static_cast<unsigned> (renderpassoutput::Output::Motion);
+    render::Request decodedOutputs;
+    check (render::decode (render::encode (outputs), decodedOutputs)
+               && decodedOutputs.imageOutput == renderpassoutput::Output::Depth
+               && decodedOutputs.rawExportMask == outputs.rawExportMask,
+           "Path Trace keeps an Image view and raw data exports");
     refused = raster;
     refused.pathTraceExportSamples = 32;
     check (render::encode (refused).empty(), "Raster keeps the default export samples");

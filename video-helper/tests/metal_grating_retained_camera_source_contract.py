@@ -37,9 +37,10 @@ def camera_bytes(camera_pass, retained):
 
 
 # The producer feeds this sum to both preflight and actual-allocation checks.
-assert "+cameraHost" in metal.split("const auto extra=", 1)[1].split(";", 1)[0]
-assert "extra>renderpassoutput::kMaximumTotalBytes-retained-2*confirmed->bounds.bytes" in metal
-assert "alignedExtra>renderpassoutput::kMaximumTotalBytes-retained-2*confirmed->bounds.bytes-extra" in metal
+# Anchor on the camera producer: other functions also name a local extra.
+assert "+cameraHost" in metal.split("const auto cameraHost=", 1)[1].split("const auto extra=", 1)[1].split(";", 1)[0]
+assert "extra>renderpassoutput::kRepresentableTotalBytes-retained-2*confirmed->bounds.bytes" in metal
+assert "alignedExtra>renderpassoutput::kRepresentableTotalBytes-retained-2*confirmed->bounds.bytes-extra" in metal
 
 retained = 64 * 1024 * 1024
 assert camera_bytes(False, 0) == 0

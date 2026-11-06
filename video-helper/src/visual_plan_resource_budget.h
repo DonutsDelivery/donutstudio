@@ -21,19 +21,22 @@ namespace videowire
 {
 struct VisualBackendResourceLimits
 {
-    size_t descriptors = 256;
-    size_t operations = 256;
-    size_t sceneRecords = 128;
-    size_t frameOutputs = 256;
-    size_t liveFrames = 32;
-    size_t frameSlots = 32;
-    uint64_t allocatedFrameBytes = 512ull * 1024ull * 1024ull;
+    // No scene budget: every count and byte total is the type limit, and only a
+    // real allocation failure stops a frame. The image dimension comes from the
+    // device query. Callers may still pass tighter limits for one admission.
+    size_t descriptors = std::numeric_limits<size_t>::max();
+    size_t operations = std::numeric_limits<size_t>::max();
+    size_t sceneRecords = std::numeric_limits<size_t>::max();
+    size_t frameOutputs = std::numeric_limits<size_t>::max();
+    size_t liveFrames = std::numeric_limits<size_t>::max();
+    size_t frameSlots = std::numeric_limits<size_t>::max();
+    uint64_t allocatedFrameBytes = std::numeric_limits<uint64_t>::max();
     int maximumImageDimension = 8192;
     std::string backendProfile = "unqueried";
     std::string backendDeviceIdentity;
     std::string maximumImageDimensionSource = "conservative-default";
-    std::string frameSlotSource = "conservative-default-no-safe-capability-mapping";
-    std::string allocatedFrameBytesSource = "conservative-default-no-safe-byte-capability";
+    std::string frameSlotSource = "unbounded-allocation-failure-only";
+    std::string allocatedFrameBytesSource = "unbounded-allocation-failure-only";
     int observedCombinedTextureImageUnits = 0;
     uint64_t observedMaximumBufferLengthBytes = 0;
     uint64_t observedRecommendedWorkingSetBytes = 0;
@@ -50,10 +53,9 @@ struct VisualBackendResourceLimits
         std::string recommendedWorkingSetQuery;
     };
 
-    static VisualBackendResourceLimits fromCapabilities (int width, int height,
+    static VisualBackendResourceLimits fromCapabilities (int, int,
                                                          const Capabilities& capabilities)
     {
-        constexpr uint64_t conservativeFrameByteBudget = 512ull * 1024ull * 1024ull;
         VisualBackendResourceLimits limits;
         limits.backendProfile = capabilities.backendProfile.empty()
             ? "unqueried" : capabilities.backendProfile;
@@ -67,46 +69,23 @@ struct VisualBackendResourceLimits
             limits.maximumImageDimensionSource = capabilities.maximumImageDimensionQuery.empty()
                 ? "backend-query" : capabilities.maximumImageDimensionQuery;
         }
-        if (capabilities.recommendedWorkingSetBytes > 0)
-        {
-            // Reserve 25% for drawables, persistent renderer buffers, encoder
-            // surfaces, and textures that visual-plan admission does not own.
-            const auto planBudget = capabilities.recommendedWorkingSetBytes / 4 * 3;
-            if (planBudget < conservativeFrameByteBudget)
-            {
-                limits.allocatedFrameBytes = planBudget;
-                limits.allocatedFrameBytesSource = capabilities.recommendedWorkingSetQuery.empty()
-                    ? "backend-recommended-working-set*0.75-plan-budget"
-                    : capabilities.recommendedWorkingSetQuery + "*0.75-plan-budget";
-            }
-        }
-        if (width > 0 && height > 0)
-        {
-            const auto pixels = static_cast<uint64_t> (width) * static_cast<uint64_t> (height);
-            const uint64_t thirtyTwoRgba16fFrames = pixels > std::numeric_limits<uint64_t>::max() / 256ull
-                ? std::numeric_limits<uint64_t>::max() : pixels * 256ull;
-            const auto canvasBudget = std::max<uint64_t>(64ull * 1024ull * 1024ull,
-                std::min<uint64_t>(thirtyTwoRgba16fFrames, conservativeFrameByteBudget));
-            if (canvasBudget < limits.allocatedFrameBytes)
-            {
-                limits.allocatedFrameBytes = canvasBudget;
-                limits.allocatedFrameBytesSource = "conservative-canvas-default-no-safe-byte-capability";
-            }
-        }
         return limits;
     }
 
     static VisualBackendResourceLimits forCanvas (int width, int height,
                                                    int backendMaximumImageDimension = 8192,
-                                                   size_t backendFrameSlots = 32)
+                                                   size_t backendFrameSlots = std::numeric_limits<size_t>::max())
     {
         Capabilities capabilities;
         capabilities.maximumImageDimension = std::max (1, backendMaximumImageDimension);
         capabilities.maximumImageDimensionQuery = "caller-supplied-capability";
         auto limits = fromCapabilities(width, height, capabilities);
-        limits.frameSlots = std::clamp (backendFrameSlots, size_t { 1 }, size_t { 32 });
-        limits.liveFrames = limits.frameSlots;
-        limits.frameSlotSource = "caller-supplied-capability-clamped-to-scheduler-capacity";
+        if (backendFrameSlots != std::numeric_limits<size_t>::max())
+        {
+            limits.frameSlots = std::max (backendFrameSlots, size_t { 1 });
+            limits.liveFrames = limits.frameSlots;
+            limits.frameSlotSource = "caller-supplied-capability";
+        }
         return limits;
     }
 };

@@ -169,6 +169,7 @@ struct MetalShaderGenerator::Impl
     std::unordered_map<std::string, id<MTLTexture>> images;
     id<MTLTexture> black1D = nil, black2D = nil, bands1D = nil, bands2D = nil;
     id<MTLTexture> notesTexture = nil, linksTexture = nil;
+    int notesHeight = 0, linksHeight = 0;
     int bandsCount = 0;
 
     void releasePipeline()
@@ -552,18 +553,31 @@ uint32_t MetalShaderGenerator::renderViewUnlocked (
     const bool haveNotes = notes != nullptr && ! notes->noteTexture().empty();
     if (haveNotes)
     {
-        if (impl_->notesTexture == nil)
+        // Same layout as the GL generator: uNotes is 4 x noteRows, uLinks is
+        // kLinkTextureWidth x ceil(links / width). Recreate when a height changes.
+        const int noteHeight = notes->noteTextureHeight();
+        const int linkHeight = notes->linkTextureHeight();
+        constexpr int linkWidth = arbitblockc::kLinkTextureWidth;
+        if (impl_->notesTexture == nil || impl_->notesHeight != noteHeight)
+        {
+            impl_->releaseTexture (impl_->notesTexture);
             impl_->notesTexture = makeTexture (impl_->device, MTLPixelFormatRGBA32Float,
-                                                MTLTextureType2D, 4, 128);
-        if (impl_->linksTexture == nil)
+                                                MTLTextureType2D, 4, noteHeight);
+            impl_->notesHeight = noteHeight;
+        }
+        if (impl_->linksTexture == nil || impl_->linksHeight != linkHeight)
+        {
+            impl_->releaseTexture (impl_->linksTexture);
             impl_->linksTexture = makeTexture (impl_->device, MTLPixelFormatRGBA32Float,
-                                                MTLTextureType2D, 256, 1);
-        if (notes->noteTexture().size() >= 4u * 128u * 4u)
-            [impl_->notesTexture replaceRegion:MTLRegionMake2D (0, 0, 4, 128) mipmapLevel:0
+                                                MTLTextureType2D, linkWidth, linkHeight);
+            impl_->linksHeight = linkHeight;
+        }
+        if (notes->noteTexture().size() >= 4u * 4u * static_cast<std::size_t> (noteHeight))
+            [impl_->notesTexture replaceRegion:MTLRegionMake2D (0, 0, 4, noteHeight) mipmapLevel:0
                                        withBytes:notes->noteTexture().data() bytesPerRow:4 * 4 * sizeof (float)];
-        if (notes->linkTexture().size() >= 256u * 4u)
-            [impl_->linksTexture replaceRegion:MTLRegionMake2D (0, 0, 256, 1) mipmapLevel:0
-                                       withBytes:notes->linkTexture().data() bytesPerRow:256 * 4 * sizeof (float)];
+        if (notes->linkTexture().size() >= 4u * static_cast<std::size_t> (linkWidth) * static_cast<std::size_t> (linkHeight))
+            [impl_->linksTexture replaceRegion:MTLRegionMake2D (0, 0, linkWidth, linkHeight) mipmapLevel:0
+                                       withBytes:notes->linkTexture().data() bytesPerRow:linkWidth * 4 * sizeof (float)];
     }
 
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) sg_mtl_command_queue();
@@ -637,6 +651,7 @@ void MetalShaderGenerator::shutdownUnlocked()
     impl_->releaseTexture (impl_->black1D); impl_->releaseTexture (impl_->black2D);
     impl_->releaseTexture (impl_->bands1D); impl_->releaseTexture (impl_->bands2D);
     impl_->releaseTexture (impl_->notesTexture); impl_->releaseTexture (impl_->linksTexture);
+    impl_->notesHeight = impl_->linksHeight = 0;
 #if ! __has_feature(objc_arc)
     [impl_->sampler release];
 #endif

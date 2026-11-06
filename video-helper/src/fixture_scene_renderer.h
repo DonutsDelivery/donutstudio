@@ -7,6 +7,10 @@
 #include "../../shared/SurfaceMaterialBindingContract.h"
 #include "../../shared/SurfaceMaterialProgramBinding.h"
 #include "../../shared/DiffractionProductPlans.h"
+#include "pathtrace_denoiser_choice.h"
+#include "pathtrace/phase_times.h"
+#include "frame_time_window.h"
+#include "../../shared/PathTraceLightPaths.h"
 
 #include <array>
 #include <cstdint>
@@ -332,13 +336,20 @@ enum class SceneEngineKind : std::uint8_t
 // Quality mode the 3D Render node selected (visualimportedscenerender::RenderMode),
 // shared by the viewport and by output. Accurate Preview draws take the export
 // budgets (gpu_backend/fixture_preview_budget.h) and the Path Trace export sample
-// streams; Fast Preview draws keep the Preview budgets. Export does not read it
-// until tier K S4.
+// streams; Fast Preview draws keep the Preview budgets and take the cheaper
+// Path Trace and Realtime previews of render_mode_policy.h. A Fast export
+// traces the same limits at the preview sample count and skips Realtime's
+// reflections.
 enum class SceneEngineMode : std::uint8_t
 {
     Accurate = 0,
     Fast = 1
 };
+
+// Same value as the path tracer's kUnlimitedBounces: no volume bounce limit.
+inline constexpr std::uint32_t kUnlimitedVolumeBounces = 0xffffffffu;
+// The Render node's motion blur shutter (visualimportedscenerender::ShutterInterval).
+using SceneShutterInterval = visualimportedscenerender::ShutterInterval;
 
 struct SceneEngineSelection
 {
@@ -349,6 +360,17 @@ struct SceneEngineSelection
     SceneEngineMode mode = SceneEngineMode::Accurate;
     bool denoise = false;
     std::uint32_t maxBounces = 128;
+    // Which denoiser denoise asks for (Plan 3, Denoising). Read only while denoise is set.
+    pathtracedenoise::DenoiserChoice denoiser = pathtracedenoise::DenoiserChoice::Auto;
+    // Scatter events inside media, and whether camera rays see media.
+    std::uint32_t maxVolumeBounces = kUnlimitedVolumeBounces;
+    bool volumesVisibleToCamera = true;
+    // The Render node's light paths (kind limits, clamps, Filter Glossy, caustics).
+    visualimportedscenerender::PathTraceLightPaths lightPaths {};
+    // Scene fog that replaces the snapshot's own, from an imported scene's
+    // Environment Light. Absent keeps the snapshot's fog.
+    std::optional<HarmonicMIDI::grid::SceneVolume> worldVolume {};
+    SceneShutterInterval motionBlur {};
 };
 
 // One admitted draw handed to a non-raster engine. Everything here has passed
@@ -376,13 +398,31 @@ struct SceneEngineDraw
     std::optional<diffractionmaterial::LightingDescription> diffractionLighting;
     // A spatial foil's corners, each reciprocal direction u, v, period in nm and coverage.
     std::optional<std::array<std::array<float, 4>, 4>> diffractionField;
-    // Denoise the resolved frame before upload, on both preview and export.
+    // Denoise the resolved frame before upload, on both preview and export, with
+    // the denoiser this asks for.
     bool denoise = false;
+    pathtracedenoise::DenoiserChoice denoiser = pathtracedenoise::DenoiserChoice::Auto;
     // Bounces after the camera hit.
     std::uint32_t maxBounces = 128;
+    std::uint32_t maxVolumeBounces = kUnlimitedVolumeBounces;
+    bool volumesVisibleToCamera = true;
+    // The Render node's light paths (kind limits, clamps, Filter Glossy, caustics).
+    visualimportedscenerender::PathTraceLightPaths lightPaths {};
+    // Scene fog that replaces the snapshot's own, from an imported scene's
+    // Environment Light. Absent keeps the snapshot's fog.
+    std::optional<HarmonicMIDI::grid::SceneVolume> worldVolume {};
+    // The Render node's motion blur shutter; closed when off.
+    SceneShutterInterval motionBlur {};
     // A Preview draw while the transport plays stays on the fixed playback budget,
     // even when the time did not move. Export draws never set it.
     bool transportPlaying = false;
+    // The render-input generation read with this draw's inputs. A Preview pass
+    // stops inside its sample loop once it moves, because an edit made the frame
+    // obsolete (render_input_generation.h). Unset on export and playback draws:
+    // an export renders its snapshot, and a playback frame is superseded by time.
+    std::optional<std::uint64_t> inputGeneration;
+    // The clip whose generation inputGeneration was read from; 0 for the shared one.
+    int inputClip = 0;
 };
 
 // What the tracer did for one image. A Preview covers its whole accumulation, so
@@ -399,6 +439,10 @@ struct PathTraceFrameStats
     std::uint64_t limitEndedPaths = 0;
     std::uint64_t lightPaths = 0;
     std::uint64_t causticSplats = 0;
+    // The GPU's free and total memory after the last pass; zero on the CPU and
+    // on a driver that cannot tell.
+    std::uint64_t deviceMemoryFreeBytes = 0;
+    std::uint64_t deviceMemoryTotalBytes = 0;
     // The film this image was traced at.
     std::uint32_t filmWidth = 0;
     std::uint32_t filmHeight = 0;
@@ -410,14 +454,38 @@ struct PathTraceFrameStats
     // The samples per pixel that activity aims for: the viewport target, the
     // playback budget or the export count.
     std::uint32_t sampleTarget = 0;
-    // The denoiser that ran on this image.
+    // The bounce limit the image was traced with: the node's, or Fast's lower one.
+    std::uint32_t maxBounces = 0;
+    // The denoiser that ran on this image (pathtrace_denoiser.h denoiserLabel), the
+    // choice that asked for it, and why they differ. The reason is null when the
+    // choice got what it names, so a fallback is never silent.
     const char* denoiser = "none";
+    const char* denoiserRequested = "off";
+    std::shared_ptr<const std::string> denoiserReason;
     // The device that traced this image and the setting that chose it.
     const char* device = "CPU";
     const char* deviceRequested = "Auto";
     // Why Auto is not on a GPU device, for the Render panel. Null when it is, or
     // when the device was asked for by name.
     std::shared_ptr<const std::string> deviceReason;
+    // Set only when Auto ran on a GPU device that then failed and Path Trace moved
+    // to the CPU: the same text as deviceReason, so the header can say the GPU
+    // failed rather than that Auto never found one.
+    std::shared_ptr<const std::string> fallbackReason;
+    // Preview passes this engine stopped because an edit made their frame
+    // obsolete, since it was created.
+    std::uint64_t obsoletePasses = 0;
+    // Wall-clock phases of the render call that last traced or restarted
+    // (pathtrace/phase_times.h). An Export frame of several Path Trace layers sums them.
+    videohelper::pathtrace::FramePhaseTimes phases {};
+    // The samples that call's trace phase added, for samplesPerSecond.
+    std::uint64_t phaseSamples = 0;
+    // Preview only: milliseconds from the call that restarted the accumulation to
+    // its first sample, and to sampleTarget, each in the compositor's texture.
+    // convergenceAbsent names why one of them is missing.
+    std::optional<double> firstSampleMs;
+    std::optional<double> targetMs;
+    const char* convergenceAbsent = nullptr;
 };
 
 class SceneRenderEngine
@@ -465,8 +533,17 @@ struct RealtimeFrameStats
     // so the reply never calls those pixels Realtime.
     bool realtimeProgram = false;
     bool causticsNeedPathTrace = false;
+    // Render Mode Fast skipped the screen-space reflection pass.
+    bool reflectionsSkipped = false;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    // The preview asked for solid viewport shading, and whether the backend drew it.
+    bool viewportSolidRequested = false;
+    bool viewportSolidApplied = false;
+    // gpuMs: GL timestamps around the frame's submission. cpuMs: host wall time from
+    // the start of that submission to its end, waits the path does itself included.
+    // A Preview's window is the last 120 GPU times at this size.
+    videorender::speedstats::RealtimeFrameTimes times {};
 };
 std::optional<RealtimeFrameStats> lastRealtimeStats (RenderUse use);
 
@@ -601,6 +678,8 @@ public:
         // from a caustic selection of the same volume.
         HarmonicMIDI::grid::SceneObjectId causticVolume {};
         bool realtime = false;
+        // Whether the program was built with the world fog march (Metal composes it).
+        bool worldFog = false;
         bool cameraVolumeOnly = false;
         // Set by a Preview structural hit. The resources then hold refreshed water
         // vertices that only the Preview resident query path reads, so any other

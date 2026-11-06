@@ -59,7 +59,20 @@ videorender::fixture3d::SceneEngineSelection sceneEngineSelection(const Imported
     selection.exportSamples = request.pathTraceExportSamples;
     selection.previewSamples = request.pathTracePreviewSamples;
     selection.denoise = request.pathTraceDenoise;
+    static_assert (static_cast<int> (videorender::fixture3d::pathtracedenoise::DenoiserChoice::Oidn)
+                       == static_cast<int> (visualimportedscenerender::PathTraceDenoiser::Oidn)
+                   && static_cast<int> (videorender::fixture3d::pathtracedenoise::DenoiserChoice::OptiX)
+                       == static_cast<int> (visualimportedscenerender::PathTraceDenoiser::OptiX),
+                   "the helper's choice keeps the wire's values");
+    selection.denoiser = static_cast<videorender::fixture3d::pathtracedenoise::DenoiserChoice> (request.pathTraceDenoise.denoiser);
     selection.maxBounces = request.pathTraceMaxBounces;
+    const auto volumeBounces = visualimportedscenerender::pathTraceVolumeBounces(request.pathTraceVolume);
+    selection.maxVolumeBounces = volumeBounces ? *volumeBounces : videorender::fixture3d::kUnlimitedVolumeBounces;
+    selection.volumesVisibleToCamera = visualimportedscenerender::pathTraceVolumesVisibleToCamera(request.pathTraceVolume);
+    selection.lightPaths = request.pathTraceLightPaths;
+    selection.worldVolume = request.worldVolume;
+    selection.motionBlur = visualimportedscenerender::shutterInterval(request.motionBlurShutter,
+        request.motionBlurPosition);
     return selection;
 }
 
@@ -444,7 +457,9 @@ bool ImportedScenePayloadExecution::inspectParentReceipt(const Receipt& receipt,
 static const char* staticLocalRefusal(const ImportedSceneRequest& request)
 {
     if (!visualimportedobjectlocal::valid(request.objectLocalTransform)
-        || request.objectLocalTransform.version != 1 || request.deformation || request.parentIntent
+        || request.objectLocalTransform.version != 1
+        || !visualimportedobjectlocal::validList(request.objectLocalTransform, request.additionalObjectLocalTransforms)
+        || request.deformation || request.parentIntent
         || !request.sourceStableId || !request.renderStableId
         || request.sourceStableId == request.renderStableId)
         return "Imported object local transforms require a native evaluation owner";
@@ -502,6 +517,8 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
             return reject(error, "Static local camera rotation is invalid");
     if (!arbitgpu::validRuntimeCameraFov(request.runtimeInputs.cameraVerticalFovDegrees))
         return reject(error, "Static local camera field of view is invalid");
+    if (!arbitgpu::validRuntimeCameraLens(request.runtimeInputs.cameraLens))
+        return reject(error, "Static local camera lens is invalid");
     if (request.importedScene)
     {
         const auto& leaf = *request.importedScene;
@@ -512,6 +529,8 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
             || leaf.objectNodeStableId != request.objectNodeStableId
             || leaf.objectMeshStableId != request.objectMeshStableId
             || !visualimportedobjectlocal::same(leaf.objectLocalTransform, local)
+            || !visualimportedobjectlocal::sameList(leaf.additionalObjectLocalTransforms,
+                request.additionalObjectLocalTransforms)
             || request.light || !request.importedLights.empty())
             return reject(error, "Static local composition leaf is foreign");
     }
@@ -558,12 +577,19 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
     const auto& document = *admission.document;
     if (document.nodes.size() > 88 || document.selectedScene >= document.scenes.size())
         return reject(error, "Static local admitted source scene is invalid");
-    if (!local.nodeStableId || local.nodeStableId > document.nodes.size())
-        return reject(error, "Static local target node is outside the admitted original document");
-    const auto selectedNode = local.nodeStableId - 1u;
-    const auto& node = document.nodes[selectedNode];
-    if ((node.mesh ? *node.mesh + 1u : 0u) != local.meshStableId)
-        return reject(error, "Static local target mesh does not match its exact original node");
+    // Every moved object: the primary first, then the others in stored order.
+    std::vector<visualimportedobjectlocal::ObjectLocalTransformV1> moved;
+    moved.reserve(1 + request.additionalObjectLocalTransforms.size());
+    moved.push_back(local);
+    moved.insert(moved.end(), request.additionalObjectLocalTransforms.begin(), request.additionalObjectLocalTransforms.end());
+    for (const auto& entry : moved)
+    {
+        if (!entry.nodeStableId || entry.nodeStableId > document.nodes.size())
+            return reject(error, "Static local target node is outside the admitted original document");
+        const auto& entryNode = document.nodes[entry.nodeStableId - 1u];
+        if ((entryNode.mesh ? *entryNode.mesh + 1u : 0u) != entry.meshStableId)
+            return reject(error, "Static local target mesh does not match its exact original node");
+    }
     const auto imported = admission.sourceScene ? admission.sourceScene : admission.scene;
     if (!imported || imported->objectCount > imported->objects.size())
         return reject(error, "Static local retained source draw count is invalid");
@@ -584,34 +610,39 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
                 return object.indexCount && (object.id.value-1u)/visualimportedsceneidentity::kObjectPrimitiveStride+1u==request.objectNodeStableId;
             })) return reject(error, "Static local old overlay target is outside the exact retained source scene");
     }
-    if (!budget->work(n*n + o*n, Frame::kVisit, error)
-        || !budget->work(6, Frame::kProduct, error) || !budget->work(1, Frame::kInverse, error)) return false;
-    // Membership follows original parents to the selected-scene roots.
-    auto root = std::size_t(selectedNode);
-    for (std::size_t depth=0; document.nodes[root].parent; ++depth)
+    if (!budget->work(moved.size()*(n*n + o*n), Frame::kVisit, error)
+        || !budget->work(6*moved.size(), Frame::kProduct, error)
+        || !budget->work(moved.size(), Frame::kInverse, error)) return false;
+    for (const auto& entry : moved)
     {
-        if (depth >= n || *document.nodes[root].parent >= n)
-            return reject(error, "Static local target original ancestry is invalid");
-        root = *document.nodes[root].parent;
-    }
-    const auto& roots = document.scenes[document.selectedScene].rootNodes;
-    if (std::find(roots.begin(), roots.end(), root) == roots.end())
-        return reject(error, "Static local target is outside the exact selected scene");
-    bool retainedDescendant = false;
-    for (std::size_t i=0; i<o; ++i)
-    {
-        const auto& object = imported->objects[i];
-        if (!object.indexCount || (object.id.value & 0x80000000u)) continue;
-        auto sourceNode = std::size_t((object.id.value-1u) / visualimportedsceneidentity::kObjectPrimitiveStride);
-        for (std::size_t depth=0; depth<n && sourceNode<n; ++depth)
+        const auto selectedNode = std::size_t(entry.nodeStableId - 1u);
+        // Membership follows original parents to the selected-scene roots.
+        auto root = selectedNode;
+        for (std::size_t depth=0; document.nodes[root].parent; ++depth)
         {
-            if (sourceNode == selectedNode) { retainedDescendant = true; break; }
-            if (!document.nodes[sourceNode].parent) break;
-            sourceNode = *document.nodes[sourceNode].parent;
+            if (depth >= n || *document.nodes[root].parent >= n)
+                return reject(error, "Static local target original ancestry is invalid");
+            root = *document.nodes[root].parent;
         }
+        const auto& roots = document.scenes[document.selectedScene].rootNodes;
+        if (std::find(roots.begin(), roots.end(), root) == roots.end())
+            return reject(error, "Static local target is outside the exact selected scene");
+        bool retainedDescendant = false;
+        for (std::size_t i=0; i<o && !retainedDescendant; ++i)
+        {
+            const auto& object = imported->objects[i];
+            if (!object.indexCount || (object.id.value & 0x80000000u)) continue;
+            auto sourceNode = std::size_t((object.id.value-1u) / visualimportedsceneidentity::kObjectPrimitiveStride);
+            for (std::size_t depth=0; depth<n && sourceNode<n; ++depth)
+            {
+                if (sourceNode == selectedNode) { retainedDescendant = true; break; }
+                if (!document.nodes[sourceNode].parent) break;
+                sourceNode = *document.nodes[sourceNode].parent;
+            }
+        }
+        if (!retainedDescendant)
+            return reject(error, "Static local target has no retained draw descendant");
     }
-    if (!retainedDescendant)
-        return reject(error, "Static local target has no retained draw descendant");
 
     // Candidate-local input census. Aggregate incumbent/caller/history charges
     // remain an activation prerequisite; escaped candidate aliases hold this charge.
@@ -736,6 +767,7 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
 #endif
     auto frame = std::shared_ptr<Frame>(new Frame(*this));
     frame->charge_ = charge; frame->owner_ = authority; frame->localTransform_ = local;
+    frame->additionalLocalTransforms_ = request.additionalObjectLocalTransforms;
     frame->callerBudget_=staticLocalCallerBudget_;
     frame->callerMaximumBytes_=NativeCompositionRetentionBudget::kCallerMaximumBytes;
     frame->reserveCaller_=[](const std::shared_ptr<const void>& opaque,std::size_t bytes,std::string& diagnostic)->std::shared_ptr<const void> {
@@ -747,6 +779,9 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
     frame->cameraTranslation_=request.runtimeInputs.cameraTranslationOffset;
     frame->cameraRotation_=request.runtimeInputs.cameraRotationDegrees;
     frame->cameraFov_=request.runtimeInputs.cameraVerticalFovDegrees;
+    frame->cameraLens_=request.runtimeInputs.cameraLens;
+    frame->viewportSolid_=request.runtimeInputs.viewportSolid;
+    frame->viewportSolidEffects_=request.runtimeInputs.viewportSolidEffects;
     frame->use_ =use == ImportedSceneUse::Preview ? ImportedAnimationEvaluationOwner::Preview : ImportedAnimationEvaluationOwner::Export;
     frame->time_ = request.frame; frame->width_ = request.dimensions.width; frame->height_ = request.dimensions.height;
     frame->sourceCameraNodeId_ = request.sourceCameraNodeId;
@@ -755,15 +790,21 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
     frame->overlayRotation_ = request.runtimeInputs.objectRotationDegrees; frame->overlayScale_ = request.runtimeInputs.objectScale;
     frame->timeSeconds_ = request.runtimeInputs.timeSeconds; frame->imageOutput_ = request.runtimeInputs.imageOutput;
     frame->rawExportMask_ = request.runtimeInputs.rawExportMask; frame->linearColor_ = request.runtimeInputs.linearColor;
-    SceneTransform3D offset;
-    offset.translation = {float(local.translation[0]), float(local.translation[1]), float(local.translation[2])};
-    offset.rotation = arbitgpu::runtimeEulerQuaternion({float(local.rotationDegrees[0]), float(local.rotationDegrees[1]), float(local.rotationDegrees[2])});
-    offset.scale = {float(local.scale[0]), float(local.scale[1]), float(local.scale[2])};
-    Frame::Matrix inverse;
-    if (!Frame::inverseAffine(node.worldTransform, inverse))
-        return reject(error, "Static local selected original world is singular or nonfinite");
-    frame->correction_ = Frame::multiply(Frame::multiply(node.worldTransform, Frame::compose(offset)), inverse);
-    if (!budget->work(4, Frame::kProduct, error)) return false;
+    frame->corrections_.reserve(moved.size());
+    for (const auto& entry : moved)
+    {
+        const auto& entryNode = document.nodes[entry.nodeStableId - 1u];
+        SceneTransform3D offset;
+        offset.translation = {float(entry.translation[0]), float(entry.translation[1]), float(entry.translation[2])};
+        offset.rotation = arbitgpu::runtimeEulerQuaternion({float(entry.rotationDegrees[0]), float(entry.rotationDegrees[1]), float(entry.rotationDegrees[2])});
+        offset.scale = {float(entry.scale[0]), float(entry.scale[1]), float(entry.scale[2])};
+        Frame::Matrix inverse;
+        if (!Frame::inverseAffine(entryNode.worldTransform, inverse))
+            return reject(error, "Static local selected original world is singular or nonfinite");
+        frame->corrections_.emplace_back(entry.nodeStableId,
+            Frame::multiply(Frame::multiply(entryNode.worldTransform, Frame::compose(offset)), inverse));
+    }
+    if (!budget->work(4*moved.size(), Frame::kProduct, error)) return false;
     SceneTransform3D overlay;
     overlay.translation = {frame->overlayTranslation_[0], frame->overlayTranslation_[1], frame->overlayTranslation_[2]};
     overlay.rotation = arbitgpu::runtimeEulerQuaternion(frame->overlayRotation_);
@@ -804,15 +845,17 @@ bool ImportedScenePayloadExecution::stageStaticLocalFrame(
         if (!budget->work(n, Frame::kVisit, error) || !budget->work(1, Frame::kProduct, error)
             || !budget->work(3, Frame::kInverse, error) || !budget->work(sizeof(value), 4, error)) return false;
         bool affected = false;
-        if (!frame->descendant(nodeId-1u, affected)) return false;
+        Frame::Matrix correction;
+        if (!frame->correctionFor(nodeId-1u, correction, affected)) return false;
         if (!affected) return true;
-        const auto world = Frame::multiply(frame->correction_, original.worldTransform);
+        const auto world = Frame::multiply(correction, original.worldTransform);
         if (!Frame::decompose(world, value.transform))
             return reject(error, "Static local camera or light world is not representable");
         if (camera)
         {
-            if (local.scale != std::array<double,3>{1,1,1}
-                || !rigid(original.worldTransform) || !rigid(frame->correction_) || !rigid(world))
+            const bool unscaled = std::all_of(moved.begin(), moved.end(), [](const auto& entry) {
+                return entry.scale == std::array<double,3>{1,1,1}; });
+            if (!unscaled || !rigid(original.worldTransform) || !rigid(correction) || !rigid(world))
                 return reject(error, "Static local camera world is not representable as an unscaled rigid transform");
             // Unit scale follows the exact authored offset and proved rigid
             // source/correction. Decomposition length drift is not authored scale.
@@ -1356,6 +1399,8 @@ bool ImportedScenePayloadExecution::execute(
         if (!request.sceneSnapshot || !visualanimationimport::sameAsset(request.asset, leaf.asset)
             || request.sceneIndex != leaf.sceneIndex
             || !visualimportedobjectlocal::same(request.objectLocalTransform, leaf.objectLocalTransform)
+            || !visualimportedobjectlocal::sameList(request.additionalObjectLocalTransforms,
+                leaf.additionalObjectLocalTransforms)
             || request.objectNodeStableId != leaf.objectNodeStableId
             || request.objectMeshStableId != leaf.objectMeshStableId
             || request.sourceCameraNodeId != leaf.sourceCameraNodeId
@@ -1379,9 +1424,15 @@ bool ImportedScenePayloadExecution::execute(
                 || request.deformation->pose.meshStableId != leaf.deformation->pose.meshStableId
                 || request.deformation->pose.boneStableId != leaf.deformation->pose.boneStableId
                 || request.deformation->pose.morphTargetStableId != leaf.deformation->pose.morphTargetStableId))
-            || request.light || request.diffractionMaterial || request.glassCaustic
+            || request.diffractionMaterial.has_value() != leaf.diffractionMaterial.has_value()
+            || (request.diffractionMaterial && !visualimportedscenerender::detail::sameDiffractionMaterial(
+                *request.diffractionMaterial, *leaf.diffractionMaterial))
+            || request.light || request.glassCaustic
             || !request.importedLights.intensityMultipliers.empty())
             return reject(error, "Scene Compose imported request or explicit lighting replacement is invalid");
+        // A diffraction foil stays on its one imported leaf.
+        if (request.diffractionMaterial && !request.additionalImportedScenes.empty())
+            return reject(error, "Scene Compose refused: a diffraction foil with multiple imported leaves is not rendered yet");
         visualimportedscenerender::Request operation;
         operation.sourceStableId = request.sceneSnapshot->id.value;
         operation.renderStableId = leaf.renderStableId;
@@ -1422,6 +1473,8 @@ bool ImportedScenePayloadExecution::execute(
                 error = "Scene Compose refused: imported leaf " + leafNumber + " light controls are not rendered yet";
                 return false;
             }
+            if (compiled.diffractionMaterial)
+                return reject(error, "Scene Compose refused: a diffraction foil with multiple imported leaves is not rendered yet");
             animatedLeaf = animatedLeaf || entry.deformation.has_value();
             operation.additionalImportedScenes.push_back(entry.scene);
         }
@@ -1521,15 +1574,13 @@ bool ImportedScenePayloadExecution::execute(
         if (expectedObjectNode == 0)
             expectedObjectNode = entry.deformation ? entry.deformation->pose.nodeStableId : entry.scene->objectNodeStableId;
     if ((request.objectNodeStableId == 0) != (request.objectMeshStableId == 0)
-        || request.objectNodeStableId > 16384 || request.objectMeshStableId > 4096
         || (request.objectNodeStableId != 0 && (composedScene || !request.sceneIndex
             || (request.deformation && (request.deformation->pose.nodeStableId != request.objectNodeStableId
                 || request.deformation->pose.meshStableId != request.objectMeshStableId))))
         || (request.runtimeInputs.objectNodeStableId != 0
             && request.runtimeInputs.objectNodeStableId != expectedObjectNode))
         return reject(error, "imported object modulation requires the exact source node and mesh selection");
-    if (request.sourceCameraNodeId && (!request.sceneIndex || *request.sourceCameraNodeId == 0
-        || *request.sourceCameraNodeId > 16384))
+    if (request.sourceCameraNodeId && (!request.sceneIndex || *request.sourceCameraNodeId == 0))
         return reject(error, "imported source camera selector is malformed");
     if (request.camera.has_value()
         && !visualimportedscenerender::detail::validCamera(*request.camera))
@@ -1617,6 +1668,7 @@ bool ImportedScenePayloadExecution::execute(
             }
         }
         deformationRequest.objectLocalTransform = request.objectLocalTransform;
+        deformationRequest.additionalObjectLocalTransforms = request.additionalObjectLocalTransforms;
         deformationRequest.sourceCameraNodeId = request.sourceCameraNodeId;
         deformationRequest.importedLights = request.importedLights;
         deformationRequest.frame = request.frame;
@@ -1629,13 +1681,15 @@ bool ImportedScenePayloadExecution::execute(
         deformationRequest.height = request.dimensions.height;
         deformationRequest.material = request.material;
         deformationRequest.proceduralScene = importedComposition ? request.sceneSnapshot : nullptr;
+        deformationRequest.leafIdScheme = request.leafIdScheme;
         deformationRequest.surfacePrograms = request.surfacePrograms;
         deformationRequest.runtimeInputs = sceneInputs;
         if (!request.surfacePrograms.empty())
             deformationRequest.runtimeInputs.canonicalBlockCFrame = request.runtimeInputs.canonicalBlockCFrame;
         // The node's engine choice, as on the static route below. The animated
-        // execution draws Path Trace where the fixture renderer draws and
-        // refuses it where the deformation renderer draws; it never draws Raster.
+        // execution draws Path Trace and Realtime through the fixture renderer,
+        // with a bound mesh's vertices baked for the frame, and refuses either by
+        // name where it cannot bake. It never draws them as Raster.
         deformationExecution_->selectEngine(sceneEngineSelection(request));
         ImportedAnimatedSceneReceipt deformationFrame;
         // The animated route admits, samples, skins and draws inside this call.
@@ -1901,7 +1955,7 @@ bool ImportedScenePayloadExecution::execute(
                 }
                 std::vector<std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>> leaves {owner.admission.scene};
                 leaves.insert(leaves.end(), owner.additionalScenes.begin(), owner.additionalScenes.end());
-                composed = composeImportedLeafScenes(*request.sceneSnapshot, leaves, error);
+                composed = composeImportedLeafScenes(*request.sceneSnapshot, leaves, error, request.leafIdScheme);
             }
             if (!composed) { staticOwners_.erase(inserted); return false; }
             owner.proceduralScene = request.sceneSnapshot;
@@ -1955,6 +2009,13 @@ bool ImportedScenePayloadExecution::execute(
 
     bool usedLastGoodMaterial = false;
     std::string materialDiagnostic;
+    // A Scene Compose leaf foil names its own imported scene, as a leaf
+    // material does. Its object keeps its ID in the composed scene, so only the
+    // scene identity moves to the composed admission.
+    auto diffraction = request.diffractionMaterial;
+    if (importedComposition && diffraction)
+        diffraction = visualimportedscenerender::composedLeafDiffractionMaterial(
+            *diffraction, admission.scene->id, request.structuralRevision);
     const bool staticLeafMaterial = std::any_of(request.additionalImportedScenes.begin(),
         request.additionalImportedScenes.end(), [](const auto& entry) { return entry.scene->material.has_value(); });
     if (!request.surfacePrograms.empty() || staticLeafMaterial)
@@ -2009,7 +2070,7 @@ bool ImportedScenePayloadExecution::execute(
         const auto materialInputs = geometry::timelineSceneEvaluationInputs(evaluation.timelineSeconds, 0.0, false,
             materialFrame ? &materialFrame->key : nullptr);
         if (!seam.publishSurfacePrograms(admission, programs, evaluation, error,
-                request.diffractionMaterial ? &*request.diffractionMaterial : nullptr,
+                diffraction ? &*diffraction : nullptr,
                 request.glassCaustic ? &*request.glassCaustic : nullptr, &materialInputs)) return false;
     }
     else if (request.material)
@@ -2034,10 +2095,10 @@ bool ImportedScenePayloadExecution::execute(
             materialDiagnostic = error;
         }
     }
-    else if (request.diffractionMaterial)
+    else if (diffraction)
     {
         if (!seam.publishDiffractionMaterial(
-                admission, *request.diffractionMaterial, error))
+                admission, *diffraction, error, importedComposition))
         {
             if (request.glassCaustic || hasMaterialFrame || use != ImportedSceneUse::Preview
                 || seam.lastGoodMaterialRevision() == 0)

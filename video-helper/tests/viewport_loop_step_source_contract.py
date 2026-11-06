@@ -205,7 +205,12 @@ for label in ("metal:fixture-scene-shader-compile", "metal:fixture-scene-pipelin
 
 # A frame-work step that does not return is reported as a stall in viewport_info,
 # and the last slow step, the last slow scope and the last close wait stay named.
-for needle in ("isFrameWorkPhase (phase) && vi.loopStepAgeMs >= kViewportStallReportMs",
+# The age test is kernelcompile::judgeStep since aa96cfd8f8: the same report age,
+# measured after the step's own compile time is subtracted.
+for needle in ("vi.open && isFrameWorkPhase (phase) && stepNs > 0",
+               "kernelcompile::judgeStep (stepNs, nowNs(), kernelcompile::processState().read(),\n"
+               "                                                           kViewportStallReportMs);",
+               "verdict == kernelcompile::StepVerdict::Stalled",
                "vi.stalledStep = vi.loopStep;", "viewport render stalled: ",
                "vi.lastSlowStep = impl_->lastSlowStep.load", "vi.lastSlowScope = impl_->lastSlowScope.load",
                "vi.lastCloseWaitStep = lastCloseWaitStep_;"):

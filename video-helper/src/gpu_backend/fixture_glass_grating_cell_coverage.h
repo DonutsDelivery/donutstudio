@@ -136,7 +136,7 @@ inline bool calculateGratingCellCoverageBounds(const GratingCellTransportBinding
     const auto& parent=*boundary.sourceCells->incidentBinding;const auto& frame=parent.frame;
     if(!frame.triangles.size()||frame.triangles.size()>opaquevisibility::kMaximumClosestHitWork
         ||boundary.bounds.maximumRecords>kMaximumEntrySamples*8*kMaximumBranchVisits
-        ||boundary.bounds.maximumRecords>parent.bounds.maximumIncidents||!boundary.bounds.maximumInterfaces||boundary.bounds.maximumInterfaces>kMaximumAncestryInterfaces)
+        ||boundary.bounds.maximumRecords>parent.bounds.maximumIncidents||!boundary.bounds.maximumInterfaces||boundary.bounds.maximumInterfaces>kMaximumInterfaces)
         return refuse("Cell coverage retained triangle or interface extent is invalid");
     GratingCellCoverageBounds bounds;bounds.maximumLeaves=maximumLeaves;
     const auto leaves=boundary.bounds.maximumRecords*maximumLeaves;
@@ -157,10 +157,10 @@ inline bool calculateGratingCellCoverageBounds(const GratingCellTransportBinding
         +bounds.maximumSweeps*(sizeof(GratingCellSweepEvidence)+bounds.maximumBlockers*sizeof(GratingCellBlockerSeparation))
         +rawBytes+maximumLeaves*sizeof(GratingCellDyadicTriangle)+2*boundary.identity.size()+8*parent.identity.size()+640;
     bounds.bytes=bounds.hostBytes+bounds.nativeBytes;
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;
     std::uint64_t owned=frame.bounds.transientBytes;
     for(auto bytes:{parent.bounds.bytes,boundary.sourceCells->bounds.bytes,boundary.bounds.bytes,bounds.bytes}) {
-        if(owned>maximum||bytes>maximum-owned)return refuse("Cell coverage exceeds the original whole-frame byte cap");
+        if(owned>maximum||bytes>maximum-owned)return refuse("Cell coverage storage total is not representable");
         owned+=bytes;
     }
     output=bounds;error.clear();return true;
@@ -492,13 +492,13 @@ inline bool calculateGratingBoundaryBoundsV2(const GratingCellTransportBinding& 
         ||!regions||regions>kGratingBoundaryRegionsV2||!paths
         ||paths>boundary.sourceCells->incidentBinding->prepared.branchPolicy->description().maximumVisits)return refuse();
     const auto& parent=*boundary.sourceCells->incidentBinding;const auto& frame=parent.frame;
-    const auto maximum=renderpassoutput::kMaximumTotalBytes;
+    const auto maximum=renderpassoutput::kRepresentableTotalBytes;
     GratingBoundaryBoundsV2 bounds;bounds.regions=regions;bounds.paths=paths;bounds.interfaces=boundary.bounds.maximumInterfaces;
     // In a convex tiling, only the three source corners can have degree
     // two. Euler plus 2E>=3V-3 and E=V+R-1 gives E<=3R.
     bounds.seams=3*regions;
     bounds.transitions=paths*(bounds.interfaces+1);bounds.adjacent=3*frame.triangles.size();
-    if(!bounds.interfaces||bounds.interfaces>kMaximumAncestryInterfaces||frame.triangles.empty()||bounds.adjacent>3*opaquevisibility::kMaximumClosestHitWork
+    if(!bounds.interfaces||bounds.interfaces>kMaximumInterfaces||frame.triangles.empty()||bounds.adjacent>3*opaquevisibility::kMaximumClosestHitWork
         ||frame.work.size()>kMaximumEntrySamples*8||paths>kMaximumBranchVisits)return refuse();
     const auto vertices=regions*kGratingBoundaryVerticesV2;
     // Work includes partition SAT/normalization, retained topology lookup and
@@ -556,7 +556,6 @@ inline bool gratingBoundaryParentStorageV2(const NativeGratingCellTransportReadb
 {
     if(!boundary.binding) {error="Boundary v2 retained binding is missing";return false;}
     const auto& binding=*boundary.binding;const auto limit=binding.bounds.hostBytes;
-    if(limit>renderpassoutput::kMaximumTotalBytes) {error="Boundary v2 retained host reservation exceeds the whole-frame cap";return false;}
     std::uint64_t bytes=sizeof(binding)+sizeof(boundary);
     const auto charge=[&](std::size_t count,std::size_t stride) {
         if(!limit||bytes>limit||count>limit/stride||std::uint64_t(count)*stride>limit-bytes)return false;

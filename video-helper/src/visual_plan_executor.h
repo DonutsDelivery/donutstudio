@@ -18,6 +18,7 @@
 #include "../../shared/VisualImportedAnimationOperationContract.h"
 #include "../../shared/VisualImportedSceneRenderOperationContract.h"
 #include "../../shared/VisualAnimationDeformationEvaluation.h"
+#include "../../shared/VertexControlBank.h"
 #include "../../shared/OpticalFlowOperationContract.h"
 #include "../../shared/RenderPassCompositeContract.h"
 #include "../../shared/RenderPassOutputContract.h"
@@ -89,7 +90,8 @@ inline bool requiresBakedSpectrumAnalysis(const CompiledVisualLayerPlan& plan)
     }
     return false;
 }
-inline constexpr int kMaxVisualParticles = 4096;
+// Free particle Count spans the float-exact integer range; the pool is sized from it.
+inline constexpr int kMaxVisualParticles = 1 << 24;
 
 inline std::set<std::string> simulationAutomationDestinations(const std::vector<CompiledVisualLayerPlan>& plans)
 {
@@ -434,6 +436,8 @@ struct VisualLayerExecution
     float fogNear = 0.0f, fogFar = 1.0f, fogDensity = 1.0f;
     float fogRed = 1.0f, fogGreen = 1.0f, fogBlue = 1.0f, fogAlpha = 1.0f;
     float depthParam0 = 0.0f, depthParam1 = 0.0f, depthParam2 = 0.0f;
+    // Graph node of the depth effect, which owns its live runtime parameters.
+    int depthNodeId = 0;
     float depthColorRed = 1.0f, depthColorGreen = 1.0f, depthColorBlue = 1.0f;
     float feedbackDecay = 0.92f, feedbackZoom = 0.99f, feedbackSwirl = 0.0f;
     float shapeCx = 0.5f, shapeCy = 0.5f, shapeW = 1.0f, shapeH = 1.0f;
@@ -555,7 +559,7 @@ inline bool admitParticleParameters(const std::string& xml,
         return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
     };
     p.seed = static_cast<int>(legacy("seed", 1.0f, 0.0f, 65535.0f));
-    p.count = static_cast<int>(legacy("count", 512.0f, 1.0f, 4096.0f));
+    p.count = static_cast<int>(legacy("count", 512.0f, 1.0f, static_cast<float>(kMaxVisualParticles)));
     p.lifetime = legacy("lifetime", 1.8f, 0.1f, 10.0f);
     p.size = legacy("size", 4.0f, 1.0f, 32.0f);
     p.force = legacy("speed", 1.0f, 0.0f, 4.0f);
@@ -634,8 +638,8 @@ inline bool admitParticleParameters(const std::string& xml,
     { error="Particle Motion output requires Solid 3D"; return false; }
     p.preparedSolidMotion.reset();
     p.geometryCount=0;
-    p.geometryAnchors={};
-    p.geometryDepths={}; p.geometryIdentities={};
+    p.geometryAnchors.clear();
+    p.geometryDepths.clear(); p.geometryIdentities.clear();
     p.geometryBinding.reset();
     p.preparedBodies.reset();
     p.preparedSolids.reset();
@@ -713,8 +717,9 @@ inline bool admitParticleParameters(const std::string& xml,
             }
             if (binding->meshFamily.size()<2)
                 return refuseFamily("A collider family needs at least two timeline Geometry3D children");
-            if (vertices>256 || triangles>128)
-                return refuseFamily("Collider family meshes exceed 256 vertices and 128 triangles together");
+            // The family shares one triangle surface indexed by 32-bit vertex numbers.
+            if (vertices>std::numeric_limits<std::uint32_t>::max() || triangles>std::numeric_limits<std::uint32_t>::max())
+                return refuseFamily("Collider family meshes exceed 32-bit vertex indices together");
             binding->mesh=binding->meshFamily.front().mesh;
         }
         if (!bodyPayload.empty()) {
@@ -760,9 +765,10 @@ inline bool admitParticleParameters(const std::string& xml,
             auto attractors=binding->attractors ? std::get<PointsData>(binding->attractors->data).points : emitters;
             const auto order=[](const auto& a,const auto& b) { return a.stableId<b.stableId; };
             std::sort(emitters.begin(),emitters.end(),order); std::sort(attractors.begin(),attractors.end(),order);
-            if (emitters.size()>p.geometryAnchors.size())
-            { error="Geometry particle emitters support at most 64 points; reduce emitter points"; return false; }
+            if (emitters.size()>static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            { error="Geometry particle emitters overflow the anchor count"; return false; }
             p.geometryCount=static_cast<int>(emitters.size());
+            p.geometryAnchors.resize(emitters.size()); p.geometryIdentities.resize(emitters.size());
             for (std::size_t i=0;i<emitters.size();++i) {
                 const auto emission=project(emitters[i].position),target=project(attractors[i%attractors.size()].position);
                 p.geometryAnchors[i]={emission[0],emission[1],target[0],target[1]};
@@ -773,12 +779,6 @@ inline bool admitParticleParameters(const std::string& xml,
             if (projection!=0) { error="Solid 3D uses XYZ world coordinates; Geometry projection must be XY"; return false; }
             if (binding->mesh && std::get<GeometryData>(binding->mesh->data).indices.empty())
             { error="Solid mesh collision bounds require triangle Geometry"; return false; }
-            const auto contacts=(binding->mesh ? 1u:0u)+(binding->points ? std::get<PointsData>(binding->points->data).points.size():0u);
-            // Bodies draw as one instanced scene object; each collider is one more.
-            if (p.count>videorender::kParticleSolidMaxBodies)
-            { error="Solid 3D supports at most 128 bodies; set Count to 128 or less"; return false; }
-            if (contacts>63)
-            { error="Solid 3D supports at most 63 collider objects beside its bodies; reduce collider points"; return false; }
         }
         if (p.motionMode==2 && p.historicalReplay) p.geometryBinding=std::move(binding);
     }
@@ -793,14 +793,12 @@ inline bool admitParticleParameters(const std::string& xml,
         return false;
     }
     float springCount = 0.0f;
+    // Count is stored as a float, so its whole numbers are exact up to 2^24.
     if (p.motionMode == 2
-        && (!visualBoundedPayloadFloat(xml, "count", 512, 1,
-                static_cast<float>(videorender::particleMaxBodies(p.simulationSpace)), springCount)
+        && (!visualBoundedPayloadFloat(xml, "count", 512, 1, 16777216.0f, springCount)
             || std::floor(springCount) != springCount))
     {
-        error = p.simulationSpace == 1
-            ? "Solid 3D coupled replay supports 1 to 128 bodies; set Count to 128 or less"
-            : "coupled replay supports 1 to 64 bodies; set Count to 64 or less";
+        error = "coupled replay needs a whole Count of at least 1";
         return false;
     }
     if (p.motionMode != 2 && (p.collisionMode == 2 || p.bodyShape != 0
@@ -996,7 +994,8 @@ inline bool consumeTemporalPublicationFailure(TemporalPublicationFailurePoint po
 class VisualPlanExecutionState
 {
 public:
-    static constexpr size_t kMaxAdmittedPlans = 256;
+    // The slot table is sized from the admitted plans; this is the type limit.
+    static constexpr size_t kMaxAdmittedPlans = std::numeric_limits<size_t>::max();
     static constexpr size_t kMaxInjectedVolumeBytes = 512u * 1024u * 1024u;
     struct VolumeProduct
     {
@@ -1038,7 +1037,7 @@ public:
         // layer failures (see containLayerLoweringFailures).
         std::string loweringError;
     };
-    using SlotTable = std::array<Slot, kMaxAdmittedPlans>;
+    using SlotTable = std::vector<Slot>;
 
     VisualPlanExecutionState()
         : slots_(std::make_unique<SlotTable>()),
@@ -1755,12 +1754,11 @@ inline VisualTelemetryPlanAdmission makeVisualTelemetryAdmission (const Compiled
             || operation.backendCapability == "source-decode")
         {
             ++admission.executableNodeTotal;
-            if (admission.nodeCount < kMaxCompiledNodesPerGraph)
-                admission.stableNodeIds[admission.nodeCount++] = operation.nodeId;
+            admission.stableNodeIds.push_back(operation.nodeId);
+            ++admission.nodeCount;
         }
     admission.nodesTruncated = admission.executableNodeTotal > admission.nodeCount;
-    admission.intermediateImageCount = std::min(
-        countVisualPlanIntermediateImages(plan), kMaxIntermediateImagesPerGraph);
+    admission.intermediateImageCount = countVisualPlanIntermediateImages(plan);
     return admission;
 }
 
@@ -1775,14 +1773,13 @@ inline bool particlePointsProvider(const CompiledVisualLayerPlan& plan,
                 || visualPayloadString(operation.payloadXml,"pointsRevision")!=std::to_string(plan.structuralRevision))
             { error="Particle Points3D provider does not match its exact compiled owner"; return false; }
             float count=0;
-            if (!visualBoundedPayloadFloat(operation.payloadXml,"count",512,1,
-                    static_cast<float>(videorender::kParticleSolidMaxBodies),count) || std::floor(count)!=count) {
-                error="Particle Points3D requires an exact integer capacity from 1 to 128"; return false;
+            if (!visualBoundedPayloadFloat(operation.payloadXml,"count",512,1,16777216.0f,count) || std::floor(count)!=count) {
+                error="Particle Points3D requires a whole capacity of at least 1"; return false;
             }
             if (!admitParticleParameters(operation.payloadXml,execution.particleParameters,error)) return false;
             const auto& p=execution.particleParameters;
-            if (p.motionMode!=2 || !p.historicalReplay || p.count<1 || p.count>videorender::particleMaxBodies(p.simulationSpace))
-            { error="Particle Points3D supports Coupled bodies with owned project history, at most 64 planar or 128 Solid 3D"; return false; }
+            if (p.motionMode!=2 || !p.historicalReplay || p.count<1)
+            { error="Particle Points3D supports Coupled bodies with owned project history"; return false; }
             execution.particlePoints=true; execution.particleNodeId=operation.nodeId;
             const auto id=static_cast<geometry::StableId>(operation.nodeId)+1;
             context.deferredPoints.emplace(id,geometry::DeferredPointsSource{id,plan.structuralRevision,
@@ -2365,9 +2362,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 }
                 execution.particleParameters.geometryBinding=std::move(binding);
             }
-            // Composition appends one scene object per body, not an instanced object.
-            if (execution.particleParameters.count>videorender::kParticleImportedSolidMaxBodies)
-            { error="Imported Solid 3D supports at most 64 bodies because each body is its own composed scene object; set Count to 64 or less"; return false; }
+            // Composition appends one scene object per body; scene buffers grow to the Count.
         }
         if (execution.particleParameters.motionMode == 0)
         { error = "Imported particle rig requires a deterministic timeline motion mode"; return false; }
@@ -2906,8 +2901,8 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                     return edge.fromNodeId == sceneProducer->nodeId && edge.fromPort == 4
                         && edge.toNodeId == importedSceneRender->nodeId && edge.toPort == 0;
                 });
-            const std::array<const char*, 8> kinds {
-                "visual.3d.transform", "visual.3d.material.pbr",
+            const std::array<const char*, 9> kinds {
+                "visual.3d.transform", "visual.3d.material.pbr", "visual.3d.material.volume",
                 "visual.3d.light.directional", "visual.3d.light.environment",
                 "visual.3d.camera.perspective", "visual.3d.scene.primitive",
                 "visual.3d.scene.compose", "visual.3d.render" };
@@ -2956,7 +2951,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 if (kind == "visual.3d.transform")
                     return nodePortCount(operation.nodeId) == 1
                         && exactControlPort(operation.nodeId, 0, "out", "transform3D");
-                if (kind == "visual.3d.material.pbr")
+                if (kind == "visual.3d.material.pbr" || kind == "visual.3d.material.volume")
                     return nodePortCount(operation.nodeId) == 1
                         && exactControlPort(operation.nodeId, 0, "out", "material");
                 if (kind == "visual.3d.light.environment")
@@ -3010,7 +3005,8 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                             || toKind == "visual.3d.camera.perspective"
                             || toKind == "visual.3d.scene.primitive")
                         && edge.toPort == 0;
-                if (fromKind == "visual.3d.material.pbr" && edge.fromPort == 0)
+                if ((fromKind == "visual.3d.material.pbr" || fromKind == "visual.3d.material.volume")
+                    && edge.fromPort == 0)
                     return toKind == "visual.3d.scene.primitive" && edge.toPort == 1;
                 if (((fromKind == "visual.3d.light.directional" && edge.fromPort == 1)
                      || (fromKind == "visual.3d.light.environment" && edge.fromPort == 0)))
@@ -4977,6 +4973,7 @@ inline bool compileVisualLayerExecutionOrdered (const CompiledVisualLayerPlan& p
                 execution.fogGreen = std::clamp(visualPayloadFloat(fogPayload, "green", 1.0f), 0.0f, 1.0f);
                 execution.fogBlue = std::clamp(visualPayloadFloat(fogPayload, "blue", 1.0f), 0.0f, 1.0f);
                 execution.fogAlpha = std::clamp(visualPayloadFloat(fogPayload, "alpha", 1.0f), 0.0f, 1.0f);
+                execution.depthNodeId = ids[(size_t) fog];
                 if (execution.depthEffect == 2) {
                     execution.depthParam0 = std::clamp(visualPayloadFloat(fogPayload, "radius", 4.0f), 0.0f, 32.0f);
                     execution.depthParam1 = std::clamp(visualPayloadFloat(fogPayload, "focus", 0.5f), 0.0f, 1.0f);
@@ -6281,13 +6278,6 @@ inline bool VisualPlanExecutionState::admitPlans (
     int canvasWidth, int canvasHeight, const VisualBackendResourceLimits* backendLimits)
 {
     const auto normalizedPlanIndices = normalizedVisualLayerPlanIndices(plans);
-    if (normalizedPlanIndices.size() > kMaxAdmittedPlans)
-    {
-        const std::string reason = "visual execution admission exceeds fixed plan capacity";
-        telemetry().recordFailedLowering(reason);
-        if (diagnostic != nullptr) *diagnostic = reason;
-        return false;
-    }
     const auto derivedLimits = VisualBackendResourceLimits::forCanvas(canvasWidth, canvasHeight);
     const auto& limits = backendLimits != nullptr ? *backendLimits : derivedLimits;
     admittedResources_.clear();
@@ -6441,7 +6431,7 @@ inline bool VisualPlanExecutionState::admitPlans (
         if (diagnostic != nullptr) *diagnostic = reason;
         return false;
     }
-    auto next = std::make_unique<SlotTable>();
+    auto next = std::make_unique<SlotTable>(normalizedPlanIndices.size());
     struct LoweringSample { uint64_t durationNs = 0; bool installed = false; };
     std::vector<LoweringSample> loweringSamples;
     loweringSamples.reserve(normalizedPlanIndices.size());
@@ -6457,14 +6447,6 @@ inline bool VisualPlanExecutionState::admitPlans (
             continue;
         if (duplicate == next->begin() + (ptrdiff_t) count)
         {
-            if (count == kMaxAdmittedPlans)
-            {
-                complete = false;
-                telemetry().recordFailedLowering("visual execution admission exceeds fixed plan capacity");
-                if (diagnostic != nullptr && diagnostic->empty())
-                    *diagnostic = "visual execution admission exceeds fixed plan capacity";
-                continue;
-            }
             duplicate = next->begin() + (ptrdiff_t) count++;
         }
         Slot slot;
@@ -6723,6 +6705,13 @@ inline bool validateVisualInspectionTarget (
     return true;
 }
 
+// "visual<node>/<parameter>", or empty for an unset node.
+inline std::string depthEffectRuntimeParameterId(int nodeId, const char* parameter)
+{
+    const auto alias = shadercatalog::runtimeNodeAlias(nodeId);
+    return alias.empty() ? std::string {} : alias + "/" + parameter;
+}
+
 inline ImmutableShaderOperationPlan scheduledShaderPlan(const VisualLayerExecution* execution)
 {
     return execution == nullptr ? ImmutableShaderOperationPlan{}
@@ -6742,6 +6731,16 @@ inline void seedFlatShaderRuntimeParameters(
         for (const auto& [componentId, value] : operation.generatedParameters)
             parameters.emplace(alias + "/" + componentId, value);
     }
+}
+
+// Live parameters of the depth effect: Depth Blur Focus, keyed like a flat shader's.
+inline void seedDepthEffectRuntimeParameters(
+    const VisualLayerExecution* execution,
+    std::map<std::string, double>& parameters)
+{
+    if (execution == nullptr || execution->depthEffect != 2) return;
+    const auto id = depthEffectRuntimeParameterId(execution->depthNodeId, "focus");
+    if (!id.empty()) parameters.emplace(id, execution->depthParam1);
 }
 
 inline std::uint64_t runtimeDeviceGeneration (
@@ -6871,6 +6870,14 @@ struct HasGeometryParticleInput<Layer,std::void_t<decltype(std::declval<Layer>()
     decltype(std::declval<Layer>().particleProjectSeconds),decltype(std::declval<Layer>().shaderClock.timeSec),
     decltype(std::declval<Layer>().canonicalBlockCFrame)>> : std::true_type {};
 
+// The tempo map an Audio Effector delayed in beats reads.
+template <typename History>
+inline videowire::geometry::spectrum::BeatDelay effectorBeatDelay(const std::shared_ptr<History>& history)
+{
+    if (!history) return {};
+    return [history](double seconds, double beats) { return history->timeline.secondsBeforeBeats(seconds, beats); };
+}
+
 template <typename LayerDesc>
 inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                                         videohelper::geometry::PlanUse use,
@@ -6878,7 +6885,8 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                                         int width, int height, LayerDesc& layer,
                                         std::string& error, double evaluationTimeSec = 0.0,
                                         bool linearColor = false,
-                                        const videorender::WaterCoupledFrame* coupledWater = nullptr)
+                                        const videorender::WaterCoupledFrame* coupledWater = nullptr,
+                                        const std::map<std::string, double>* runtimeParameters = nullptr)
 {
     const CompiledVisualOperation* geometryOperation = nullptr;
     for(const auto& operation:plan.operations)
@@ -7046,11 +7054,43 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                 admitted->plan->value().descriptor().operations.end(),[](const auto& operation) {
                     return operation.retainedMesh && !operation.retainedMesh->importedAnimation.empty();
                 });
+            // A modulated Vertex Control Parameter changes the draw every frame.
+            const bool dynamicControls=geometrySurface
+                && videohelper::geometry::geometryControlsModulated(*geometrySurface,runtimeParameters);
             const bool dynamicGeometry=sourceExecution.particlePoints || dynamicSpectrum || dynamicScore || dynamicImported || hasFrame
+                || dynamicControls
                 || videowire::geometry::hasRuntimeFields(admitted->plan->value().descriptor())
                 || (geometrySurface && geometrysurfacematerial::timeDependent(*geometrySurface));
             arbitgpu::NativeFixtureSceneRuntimeInputs scoreInputs;
             scoreInputs.linearColor = linearColor;
+            // Render 3D's Image Output picks the pass the draw shows.
+            float imageOutput=0;
+            if (!visualBoundedPayloadFloat(geometryOperation->payloadXml,"imageOutput",0,0,
+                    static_cast<float>(static_cast<int>(renderpassoutput::Output::Count)-1),imageOutput)
+                || std::floor(imageOutput)!=imageOutput)
+            { error="Render 3D Image Output must be a whole selection"; return false; }
+            scoreInputs.imageOutput=static_cast<renderpassoutput::Output>(static_cast<int>(imageOutput));
+            if (linearColor && scoreInputs.imageOutput!=renderpassoutput::Output::Color
+                && scoreInputs.imageOutput!=renderpassoutput::Output::Emission)
+            { error="HDR Geometry3D requires Image/Color or Emission, not a data-pass visualization"; return false; }
+            // Motion reads the previous presentation frame's draw of this owner.
+            std::optional<visualdeformation::RationalFrameTime> motionFrame;
+            std::optional<videohelper::geometry::GeometryMotionRecord> motionPredecessor;
+            if (arbitgpu::sceneUsesMotionPass(scoreInputs))
+            {
+                visualdeformation::RationalFrameTime frame;
+                if (!evaluationContext->materialFrameClock
+                    || !evaluationContext->materialFrameClock(evaluationTimeSec,frame,error))
+                { if (error.empty()) error="Geometry3D Motion requires the project timeline clock"; return false; }
+                motionFrame=frame;
+                std::lock_guard<std::mutex> lock(retained.mutex);
+                const auto previous=retained.owners.find(owner);
+                if (previous!=retained.owners.end() && previous->second.execution)
+                    motionPredecessor=videohelper::geometry::geometryMotionPredecessorRecord(
+                        previous->second.execution->motion,frame,static_cast<std::uint32_t>(width),
+                        static_cast<std::uint32_t>(height));
+                if (motionPredecessor) scoreInputs.previousMotion=motionPredecessor->sample;
+            }
             for (const auto endpoint : frameEndpoints)
             {
                 visualdeformation::RationalFrameTime frame;
@@ -7109,6 +7149,8 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                     if constexpr (HasGeometrySpectrumSourceScalarInput<LayerDesc>::value)
                         spectrumEvaluation.sourceScalarFeaturesAt=layer.spectrumSourceScalarFeaturesAt;
                 }
+                if constexpr (HasGeometryParticleInput<LayerDesc>::value)
+                    spectrumEvaluation.beatDelay=effectorBeatDelay(layer.particleHistory);
             }
             else if (dynamicSpectrum)
             {
@@ -7202,7 +7244,8 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                     return evaluationContext->importedGeometry(sourceGeometry,evaluationTimeSec,
                         plan.structuralRevision,use==videohelper::geometry::PlanUse::exportRender,diagnostic);
                 },evaluationTimeSec,pointsEvaluator,waterHistory,waterProjectSeconds,coupledWater,
-                {},{},evaluationContext->geometryPrepareUse);
+                {},{},evaluationContext->geometryPrepareUse,runtimeParameters,
+                motionFrame ? &*motionFrame : nullptr, motionPredecessor ? &*motionPredecessor : nullptr);
             if(!execution)
             {
                 const bool previewDeferred=
@@ -7385,7 +7428,7 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     if (! admitGeometryCoreOperations(*plan, geometryUse, evaluationContext, geometryWidth,
                                       geometryHeight, layer, error, evaluationTimeSec, linearColor,
                                       importedSolidParameters ? importedSolidParameters->preparedImportedSolids->water.get()
-                                          : coupledWater ? &*coupledWater:nullptr)) return false;
+                                          : coupledWater ? &*coupledWater:nullptr, runtimeParameters)) return false;
     if (execution->opticalFlow)
     {
         error = "Optical Flow MotionVectors requires its native source-pair worker";
@@ -7624,6 +7667,11 @@ inline bool executeVisualLayerPlan (const std::vector<CompiledVisualLayerPlan>& 
     layer.fogBlue = execution->fogBlue; layer.fogAlpha = execution->fogAlpha;
     layer.depthParam0 = execution->depthParam0; layer.depthParam1 = execution->depthParam1;
     layer.depthParam2 = execution->depthParam2; layer.depthColorRed = execution->depthColorRed;
+    // Depth Blur Focus follows its live value; the saved focus is the seed.
+    if (execution->depthEffect == 2 && runtimeParameters != nullptr)
+        if (const auto found = runtimeParameters->find(depthEffectRuntimeParameterId(execution->depthNodeId, "focus"));
+            found != runtimeParameters->end() && std::isfinite(found->second))
+            layer.depthParam1 = static_cast<float>(std::clamp(found->second, 0.0, 1.0));
     layer.depthColorGreen = execution->depthColorGreen; layer.depthColorBlue = execution->depthColorBlue;
     layer.particleSource = execution->particles && !importedSolidParameters;
     layer.importedParticleOverlay = execution->importedParticleOverlay && !importedSolidParameters;

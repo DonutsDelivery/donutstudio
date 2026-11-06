@@ -43,6 +43,8 @@ PT_SHARED_ENTRY Vec3 mix (Vec3 a, Vec3 b, float t) noexcept { return a * (1.0f -
 
 } // namespace
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 bool EnvironmentPixels::valid() const noexcept
 {
     return width > 0 && height > 0 && texels != nullptr
@@ -317,10 +319,11 @@ bool EnvironmentMap::build (const EnvironmentPixels& pixels, Vec3 tint, float or
     refreshView();
     return true;
 }
+#endif
 
 PT_SHARED_ENTRY Vec3 EnvironmentMapView::texel (std::uint32_t x, std::uint32_t y) const noexcept
 {
-    const auto& t = texels_[static_cast<std::size_t> (y) * width_ + x];
+    const PT_GLOBAL auto& t = texels_[static_cast<std::size_t> (y) * width_ + x];
     return { t[0], t[1], t[2] };
 }
 
@@ -401,7 +404,7 @@ PT_SHARED_ENTRY float EnvironmentMapView::pdf (Vec3 direction) const noexcept
     const std::uint32_t row = rowOf (d);
     const std::uint32_t column = columnOf (directionToUv (d).x);
     const float rowProbability = marginal_[row + 1] - marginal_[row];
-    const float* cdf = &conditional_[static_cast<std::size_t> (row) * (static_cast<std::size_t> (width_) + 1)];
+    const PT_GLOBAL float* cdf = &conditional_[static_cast<std::size_t> (row) * (static_cast<std::size_t> (width_) + 1)];
     const float columnProbability = cdf[column + 1] - cdf[column];
     const float solidAngle = cellSolidAngle_[row];
     if (! (rowProbability > 0.0f) || ! (columnProbability > 0.0f) || ! (solidAngle > 0.0f))
@@ -426,7 +429,7 @@ PT_SHARED_ENTRY Vec3 EnvironmentMapView::sample (Vec2 u, float& pdfOut) const no
         return {};
     const float dv = clampEnvironmentUnit ((uRow - r0) / rowProbability);
 
-    const float* cdf = &conditional_[static_cast<std::size_t> (row) * (static_cast<std::size_t> (width_) + 1)];
+    const PT_GLOBAL float* cdf = &conditional_[static_cast<std::size_t> (row) * (static_cast<std::size_t> (width_) + 1)];
     const auto columnEnd = static_cast<std::ptrdiff_t> (upperBoundIndex (cdf, static_cast<std::size_t> (width_) + 1, uColumn));
     const auto column = static_cast<std::uint32_t> (std::min<std::ptrdiff_t> (std::max<std::ptrdiff_t> (columnEnd - 1, 0), width_ - 1));
     const float c0 = cdf[column];

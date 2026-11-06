@@ -67,7 +67,9 @@ private:
 };
 
 // Running per-pixel mean of linear RGB radiance with a per-pixel sample count.
-// Storage is 16 bytes per pixel. A tile scheduler that gives each pixel to one
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
+// Storage is 16 bytes per pixel, plus 28 for the guides below. A tile scheduler that gives each pixel to one
 // thread per pass may call addSample concurrently for different pixels.
 //
 // Light paths (caustics) land on whatever pixel they project to, so they add
@@ -78,6 +80,10 @@ private:
 // light-tracing estimator over the whole image. Its 24 bytes per pixel are
 // allocated on the first splat, so a scene without caustics pays nothing and
 // resolves exactly as before.
+//
+// Each pixel also keeps the denoiser's guides (Plan 3, Denoising): the albedo and
+// the world-space shading normal of the surface the camera ray hit first, summed
+// over the pixel's samples. addGuide follows the same tile ownership as addSample.
 class Accumulator
 {
 public:
@@ -102,6 +108,14 @@ public:
     void addSampleSum (std::uint32_t x, std::uint32_t y, Rgb radiance, std::uint32_t count) noexcept;
     void addLightPaths (std::uint64_t count) noexcept { lightPaths_.fetch_add (count, std::memory_order_relaxed); }
     std::uint64_t lightPaths() const noexcept { return lightPaths_.load (std::memory_order_relaxed); }
+    // One sample's first-hit albedo and normal. A miss adds zeros, so the mean of a
+    // pixel that saw the sky half the time is half its surface albedo.
+    void addGuide (std::uint32_t x, std::uint32_t y, Rgb albedo, Rgb normal) noexcept { addGuideSum (x, y, albedo, normal, 1); }
+    // A device pass's guides: count samples of this pixel, summing to albedo and normal.
+    void addGuideSum (std::uint32_t x, std::uint32_t y, Rgb albedo, Rgb normal, std::uint32_t count) noexcept;
+    // The mean albedo and the normalized mean normal of the pixel's samples. Zeros
+    // for a pixel without guide samples.
+    void guideMean (std::uint32_t x, std::uint32_t y, Rgb& albedo, Rgb& normal) const noexcept;
 
     std::uint32_t width() const noexcept { return width_; }
     std::uint32_t height() const noexcept { return height_; }
@@ -138,7 +152,15 @@ private:
     std::atomic<std::int64_t>* splats() noexcept;
     Rgb splatMean (std::size_t index) const noexcept;
 
+    struct GuidePixel
+    {
+        float albedo[3] {};
+        float normal[3] {};
+        std::uint32_t samples = 0;
+    };
+
     std::vector<Pixel> pixels_;
+    std::vector<GuidePixel> guides_;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
     std::uint64_t generation_ = 0;
@@ -190,8 +212,17 @@ public:
     }
 
 private:
+    struct GuidePixel
+    {
+        float albedo[3] {};
+        float normal[3] {};
+        std::uint32_t samples = 0;
+    };
+
     std::vector<Pixel> pixels_;
+    std::vector<GuidePixel> guides_;
     std::uint32_t width_ = 0;
 };
+#endif
 
 } // namespace videohelper::pathtrace

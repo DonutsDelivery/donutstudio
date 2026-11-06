@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <mutex>
+#include <utility>
+#include <vector>
 #include "glb_native_render_seam.h"
 #include "../../shared/VisualImportedObjectLocalTransform.h"
 #include "../../shared/VisualImportedSceneIdentity.h"
@@ -239,6 +241,7 @@ public:
     ImportedAnimationEvaluationOwner use() const noexcept { return use_; }
     using Matrix = std::array<float, 16>;
     const auto& localTransform() const noexcept { return localTransform_; }
+    const auto& additionalLocalTransforms() const noexcept { return additionalLocalTransforms_; }
     // Checked worlds of the drawn objects, without this frame's overlay. Null
     // unless a single-leaf candidate built them during staging.
     const auto& objectWorlds() const noexcept { return objectWorlds_; }
@@ -270,9 +273,10 @@ public:
             const auto node = (object.value - 1u)
                 / HarmonicMIDI::grid::visualimportedsceneidentity::kObjectPrimitiveStride;
             bool affected = false;
-            if (!descendant(node, affected))
+            Matrix correction;
+            if (!correctionFor(node, correction, affected))
             { error = "static local draw source ancestry is invalid"; return false; }
-            if (affected) world = multiply(correction_, world);
+            if (affected) world = multiply(correction, world);
         }
         Matrix inverse;
         if (!inverseAffine(world, inverse))
@@ -328,6 +332,8 @@ public:
             && runtime.objectRotationDegrees == overlayRotation_ && runtime.objectScale == overlayScale_
             && runtime.cameraTranslationOffset == cameraTranslation_
             && runtime.cameraRotationDegrees == cameraRotation_ && runtime.cameraVerticalFovDegrees == cameraFov_
+            && runtime.cameraLens == cameraLens_
+            && runtime.viewportSolid == viewportSolid_ && runtime.viewportSolidEffects == viewportSolidEffects_
             && runtime.timeSeconds == timeSeconds_ && runtime.imageOutput == imageOutput_
             && runtime.rawExportMask == rawExportMask_ && runtime.linearColor == linearColor_
             && camera(runtime.animatedCamera, camera_) && camera(runtime.cameraOverride, cameraOverride_)
@@ -584,21 +590,34 @@ private:
     }
     bool descendant(std::size_t node, bool& affected) const noexcept
     {
+        Matrix unused;
+        return correctionFor(node, unused, affected);
+    }
+    // The product of every moved node's correction on the path from `node` to its
+    // root. Walking up meets the innermost first, and each outer one multiplies on
+    // the left: a moved child inside a moved parent gets C_parent * C_child.
+    bool correctionFor(std::size_t node, Matrix& output, bool& affected) const noexcept
+    {
         const auto& nodes = owner_->document()->nodes;
         affected = false;
+        output = {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
         for (std::size_t depth=0; depth<nodes.size(); ++depth)
         {
             if (node >= nodes.size()) return false;
-            if (node + 1u == localTransform_.nodeStableId) { affected = true; return true; }
+            for (const auto& entry : corrections_)
+                if (node + 1u == entry.first)
+                { output = affected ? multiply(entry.second, output) : entry.second; affected = true; }
             if (!nodes[node].parent) return true;
             node = *nodes[node].parent;
         }
         return false;
     }
     std::shared_ptr<const NativeSceneAnimationCompositionBudget::Charge> charge_;
-    Matrix correction_ {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+    // One correction W L W^-1 per moved node, keyed by its one-based node id.
+    std::vector<std::pair<std::uint32_t, Matrix>> corrections_;
     Matrix overlay_ {1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
     visualimportedobjectlocal::ObjectLocalTransformV1 localTransform_;
+    std::vector<visualimportedobjectlocal::ObjectLocalTransformV1> additionalLocalTransforms_;
     std::shared_ptr<const arbitgpu::NativeImportedObjectWorlds> objectWorlds_;
     std::uint64_t overlayNodeStableId_ = 0;
     std::array<float,3> overlayTranslation_ {}, overlayRotation_ {};
@@ -609,6 +628,8 @@ private:
     std::array<float,3> cameraTranslation_ {};
     std::array<float,3> cameraRotation_ {};
     float cameraFov_ = 0;
+    std::array<float,4> cameraLens_ {};
+    std::array<float,4> viewportSolid_ {}, viewportSolidEffects_ {};
     std::weak_ptr<const arbitgpu::NativeFixtureSceneFrame> staticNativeFrame_;
     std::shared_ptr<const NativeSceneAnimationCompositionOwner> owner_;
     std::shared_ptr<const visualanimation::Sample> sample_;

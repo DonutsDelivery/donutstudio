@@ -22,8 +22,9 @@
 // - Emissive triangles: Material::emission times coverage is the radiance
 //   leaving both faces, as the raster adds emissive to the shaded colour.
 //
-// Sizes. SceneLightRecord has no size field, so a caller passes one
-// LightShape per record (all 0 by default, the delta lights above):
+// Sizes. SceneLightRecord::radius and angularRadius size a record's light; a
+// caller may also pass one LightShape per record, which wins where it is set
+// (all 0 by default, the delta lights above):
 // - Point and Spot with radius r > 0 become uniformly emitting spheres. Their
 //   radiance is chosen so that a surface at distance d receives the same
 //   irradiance as from the point light, falloff, range window and spot cone
@@ -32,12 +33,23 @@
 // - Directional with angular radius a > 0 becomes a uniform sun disk of
 //   radiance E / (pi sin^2 a), which gives the same irradiance E at normal
 //   incidence.
-// AreaLightRecord adds rect and disk lights, which have no scene record kind.
-// Their radiance is color * intensity, along rotated local -Z (one-sided by
-// default, as the spot axis).
+// AreaLightRecord adds rect, disk and ellipse lights. Their radiance is
+// color * intensity, along rotated local -Z (one-sided by default, as the spot
+// axis). A scene record of kind Area becomes one of them with radiance
+// color * intensity / area, so intensity is the radiant intensity along the
+// axis, as a point light's is. Spread below pi narrows the emission as a
+// softbox grid does: radiance times max(0, tan(s/2) - tan(theta)) * N, with N
+// chosen so the emitted power stays pi L A (N tends to 3 / (s/2)^3 for a
+// narrow spread). Sampling still covers the whole light; the attenuation is in
+// the radiance, so sample() and pdf stay consistent.
 //
-// Sized lights have no geometry: they never block rays and camera rays do not
-// see them. Bounce rays reach them through analyticHit and combine with light
+// Ray visibility (SceneLightRecord::visibility) is copied to Light::visibility.
+// The integrator reads it: Camera lets camera rays see a sized light (suns
+// never: an infinitely far disk stays off the backdrop, as in Cycles), Shadow
+// off lets the light through every blocker, and Diffuse, Glossy and
+// Transmission mask what a scatter of that kind receives from the light.
+//
+// Sized lights have no geometry: they never block rays. Bounce rays reach them through analyticHit and combine with light
 // sampling by MIS. Spheres and suns are sampled uniformly in the cone they
 // subtend, rects by solid angle (Urena, Fajardo and King, "An Area-Preserving
 // Parametrization for Spherical Rectangles", EGSR 2013) with an area-sampling
@@ -60,9 +72,13 @@
 #include "environment_map.h"
 #include "scene_ingest.h"
 #include "vec_math.h"
+#if ! defined(PATHTRACE_DEVICE_METAL)
 #include "../../../shared/DiffractionLightingPlan.h"
+#endif
 #include "devices/device_interface.h"
+#if ! defined(PATHTRACE_DEVICE_METAL)
 #include "../../../shared/Visual3DScene.h"
+#endif
 
 #include <array>
 #include <cstddef>
@@ -106,18 +122,28 @@ struct LightShape
 // 150 nm wide: narrow enough to stay coloured.
 inline constexpr float kGratingSourceAngularRadius = 0.05235988f;
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 // The Direct path of an authored spectral lighting plan (version 3) as a
 // Directional record and its shape. Each band is a beam integral in W / (m^2 nm),
 // the unit a Directional Light's irradiance already has. False for other plans
 // and for a source with no energy.
 PT_SHARED_ENTRY bool authoredSpectralSourceLight (const diffractionmaterial::LightingDescription& lighting,
                                                   HarmonicMIDI::grid::SceneLightRecord& record, LightShape& shape) noexcept;
+#endif
 
 enum class AreaLightShape : std::uint8_t
 {
     Rect = 0,
-    Disk = 1
+    Disk = 1,
+    // Disk and Ellipse both read sizeX and sizeY as diameters and sample the same
+    // way; the scene's Disk shape passes equal sizes (sceneAreaLightExtent).
+    Ellipse = 2
 };
+
+// Spread attenuation of a planar light, see above (N is
+// HarmonicMIDI::grid::sceneAreaSpreadNormalization). 1 when N is 0.
+PT_SHARED_ENTRY float areaSpreadAttenuation (float tanHalfSpread, float normalization, float cosAtLight) noexcept;
 
 // A planar light that has no scene record kind.
 struct AreaLightRecord
@@ -126,12 +152,17 @@ struct AreaLightRecord
     Vec3 position {};  // centre
     // Local X and Y span the light. It emits along rotated local -Z.
     Quat rotation {};
-    // Rect: full width along X and height along Y. Disk: diameters.
+    // Rect: full width along X and height along Y. Disk and Ellipse: diameters.
     float sizeX = 1.0f;
     float sizeY = 1.0f;
     Vec3 color { 1.0f, 1.0f, 1.0f };
     float intensity = 1.0f;  // color * intensity is the emitted radiance
     bool twoSided = false;
+    // Full spread angle in radians; pi emits as a Lambertian surface.
+    float spread = 3.14159265f;
+    // HarmonicMIDI::grid::sceneRayVisibility bits. LightSet::build clears the
+    // camera bit of records passed in its areaLights list.
+    std::uint8_t visibility = 0x3fu;
 };
 
 struct Light
@@ -164,12 +195,18 @@ struct Light
     // Rect: vertex0 is a corner, edge1 and edge2 the full sides. Disk:
     // position is the centre, edge1 and edge2 the half axes.
     bool twoSided = false;
+    // Rect and Disk: tan of half the spread and its normalization N; N = 0
+    // leaves the emission Lambertian.
+    float tanHalfSpread = 0.0f;
+    float spreadNormalization = 0.0f;
+    // HarmonicMIDI::grid::sceneRayVisibility bits.
+    std::uint8_t visibility = 0x3fu;
 };
 
 // Radiance arriving from infinitely far away, by direction.
 struct EnvironmentField
 {
-    Vec3 constant {};
+    Vec3 uniformRadiance {};
     bool analytic = false;
     Vec3 zenith {};
     Vec3 horizon {};
@@ -184,10 +221,14 @@ struct EnvironmentField
     float cloudKind = 0.0f;
     float cloudHeadingRadians = 0.0f;
     float cloudDrift = 0.0f;
+    // The sun halo share and the volumetric cloud thickness, in 63rds as the raster
+    // reads them. Zero draws no halo and keeps the flat cloud layer.
+    float sunHalo = 0.0f;
+    float cloudThickness = 0.0f;
     // When set, the image replaces the analytic gradient and sun, and
     // constant still adds to it.
     // Owned by the LightSet that built this field.
-    const EnvironmentMapView* image = nullptr;
+    const PT_GLOBAL EnvironmentMapView* image = nullptr;
     float imageSampleProbability = 0.0f;  // share of samples drawn from the image
 
     PT_SHARED_ENTRY bool active() const noexcept;
@@ -196,6 +237,14 @@ struct EnvironmentField
     PT_SHARED_ENTRY float pdf (Vec3 direction) const noexcept;
     PT_SHARED_ENTRY Vec3 sample (Vec2 u, float& pdfOut) const noexcept;
 };
+
+// The map an EnvironmentField points at. Metal calls its member functions on a
+// copy in the kernel's own memory; everywhere else this is the map itself.
+#if defined(PATHTRACE_DEVICE_METAL)
+PT_SHARED_FN EnvironmentMapView environmentMapAt (const PT_GLOBAL EnvironmentMapView* image) noexcept { return *image; }
+#else
+PT_SHARED_FN const EnvironmentMapView& environmentMapAt (const EnvironmentMapView* image) noexcept { return *image; }
+#endif
 
 struct LightSample
 {
@@ -245,8 +294,8 @@ struct LightSetStats
     std::uint32_t environmentImages = 0;      // image records lighting the scene (at most 1)
     std::uint32_t supersededEnvironments = 0; // constant and analytic records an image replaced
     std::uint32_t emissiveTriangles = 0;
-    std::uint32_t sizedLights = 0;            // spheres and sun disks from LightShape
-    std::uint32_t areaLights = 0;             // rects and disks
+    std::uint32_t sizedLights = 0;            // spheres and sun disks
+    std::uint32_t areaLights = 0;             // rects, disks and ellipses
     // Image records without matching valid pixels, with an invalid binding, a
     // black image, or after the first usable image. They light nothing.
     std::uint32_t ignoredEnvironmentImages = 0;
@@ -301,6 +350,31 @@ public:
     // for a sun).
     PT_SHARED_ENTRY bool analyticHit (std::size_t index, Vec3 origin, Vec3 direction, float tMax, Vec3& radiance,
                       float& pdf, float& distance) const noexcept;
+    // The ray visibility bits of light `light` (an index into lights()).
+    PT_SHARED_FN std::uint8_t visibility (std::uint32_t light) const noexcept
+    {
+        return light < lights_.size() ? lights_[light].visibility : std::uint8_t { 0x3fu };
+    }
+    // Whether light `light` lies at infinity with a size: the environment, or a sun
+    // with a disk. A light sample reaches it by density, not as a delta.
+    PT_SHARED_FN bool distantSized (std::uint32_t light) const noexcept
+    {
+        if (light >= lights_.size())
+            return false;
+        const PT_GLOBAL Light& record = lights_[light];
+        return record.type == LightType::Environment || (record.type == LightType::Directional && record.coneOneMinusCos > 0.0f);
+    }
+    PT_SHARED_FN bool isEnvironment (std::uint32_t light) const noexcept
+    {
+        return light < lights_.size() && lights_[light].type == LightType::Environment;
+    }
+    // Whether a ray of kind rayKind (one sceneRayVisibility bit) sees analytic
+    // light `index`. A sun is never in the camera's backdrop.
+    PT_SHARED_FN bool analyticSeenBy (std::size_t index, std::uint8_t rayKind) const noexcept
+    {
+        const PT_GLOBAL Light& light = lights_[analytic_[index]];
+        return (light.visibility & rayKind) != 0 && ! (rayKind == 1u && light.type == LightType::Directional);
+    }
 
 #if ! defined(__CUDACC__)
     // This view with each buffer replaced by what upload returns for it.
@@ -332,6 +406,8 @@ protected:
     std::int32_t environmentLight_ = -1;
 };
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 class LightSet : public LightSetView
 {
 public:
@@ -369,5 +445,6 @@ private:
     std::shared_ptr<const EnvironmentMap> ownedImage_;
     LightSetStats stats_ {};
 };
+#endif
 
 } // namespace videohelper::pathtrace

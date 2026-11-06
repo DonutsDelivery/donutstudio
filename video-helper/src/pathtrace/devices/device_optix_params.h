@@ -4,6 +4,7 @@
 // device_optix_host.cpp. Every pointer in here is a device address.
 
 #include "device_tables.h"
+#include "gpu_film.h"
 #include "scene_view.h"
 #include "../scene_ingest.h"
 
@@ -14,37 +15,11 @@
 namespace videohelper::pathtrace::device::optix
 {
 
-struct FilmPixel
-{
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    float w = 0.0f;
-};
-
-// Film: one FilmPixel per pixel (rgb sum, sample count), added with atomics
-// because a launch may give several threads the same pixel. Light paths add
-// to splats (rgb sum) and count themselves in lightPaths; the resolve divides
-// the splat sum by that count. Float atomics make the splat sum depend on
-// thread order, unlike the CPU film's fixed point.
-struct OptixFilm
-{
-    FilmPixel* pixels = nullptr;
-    FilmPixel* splats = nullptr;
-    unsigned long long* lightPaths = nullptr;
-    std::uint32_t width = 0;
-};
-
-// One launch's tallies, summed over its threads with atomics.
-inline constexpr std::size_t kPathCounterWords = sizeof (PathCounters) / sizeof (std::uint64_t);
-static_assert (sizeof (PathCounters) % sizeof (std::uint64_t) == 0);
-
-struct LaunchTotals
-{
-    unsigned long long counters[kPathCounterWords] {};
-    unsigned long long samplesAdded = 0;
-    unsigned long long nonFinite = 0;
-};
+// The film and tallies every GPU device fills (gpu_film.h).
+using FilmPixel = gpu::FilmPixel;
+using OptixFilm = gpu::Film;
+using LaunchTotals = gpu::LaunchTotals;
+using gpu::kPathCounterWords;
 
 using SceneViewForLaunch = device::SceneView<OptixTraversableHandle>;
 

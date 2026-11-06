@@ -334,16 +334,12 @@ void checkParticlePointsCompiledProvider()
     auto fractional=plan;
     fractional.operations[1].payloadXml="<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"2.5\" pointsRevision=\"3\"/>";
     check(!compileVisualLayerExecution(fractional,execution,error),"point capacity must not inherit Image count truncation");
-    auto solidExcess=plan;
-    solidExcess.operations[1].payloadXml="<NodeParams motionMode=\"2\" historicalReplay=\"1\" simulationSpace=\"1\" count=\"129\" pointsRevision=\"3\"/>";
-    check(!compileVisualLayerExecution(solidExcess,execution,error)
-        && error.find("capacity from 1 to 128")!=std::string::npos,
-        "Solid 3D point capacity refuses 129 bodies with the exact bound");
-    auto planarExcess=plan;
-    planarExcess.operations[1].payloadXml="<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"65\" pointsRevision=\"3\"/>";
-    check(!compileVisualLayerExecution(planarExcess,execution,error)
-        && error.find("1 to 64 bodies")!=std::string::npos,
-        "planar point capacity keeps its 64-body bound");
+    auto solidMany=plan;
+    solidMany.operations[1].payloadXml="<NodeParams motionMode=\"2\" historicalReplay=\"1\" simulationSpace=\"1\" count=\"300\" pointsRevision=\"3\"/>";
+    check(compileVisualLayerExecution(solidMany,execution,error),"Solid 3D point capacity admits 300 bodies");
+    auto planarMany=plan;
+    planarMany.operations[1].payloadXml="<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"300\" pointsRevision=\"3\"/>";
+    check(compileVisualLayerExecution(planarMany,execution,error),"planar point capacity admits 300 bodies");
     auto missing=plan; missing.operations.pop_back(); missing.nodeIds.pop_back(); missing.nodeKinds.pop_back();
     missing.ports.resize(1); missing.edges.clear();
     check(!compileVisualLayerExecution(missing,execution,error),"standalone GCRV cannot recreate an undeclared particle provider");
@@ -1276,22 +1272,21 @@ void checkSolidBodyInstancingBound()
     const auto fullScene=particleSolidScene(full,fullState,9,error);
     check(error.empty() && fullState.count==128 && fullScene && fullScene->objectCount==1
         && fullScene->objectInstanceCount==128,"128 sounding notes replay and draw 128 Solid 3D bodies");
-    auto excess=manySolidBodyFixture(129);
-    check(sampleSolidBodyFixture(excess,0.5,error).count==128 && error.empty(),
-        "a 129th sounding note stays within the 128-body replay bound");
+    auto more=manySolidBodyFixture(129);
+    more.count=129;
+    check(sampleSolidBodyFixture(more,0.5,error).count==129 && error.empty(),
+        "a 129th sounding note replays as a 129th body");
 
     ParticleParams admitted;
     check(videowire::admitParticleParameters(
             "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"128\" simulationSpace=\"1\"/>",admitted,error)
         && admitted.count==128,"Solid 3D admission accepts 128 bodies");
-    check(!videowire::admitParticleParameters(
-            "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"129\" simulationSpace=\"1\"/>",admitted,error)
-        && error=="Solid 3D coupled replay supports 1 to 128 bodies; set Count to 128 or less",
-        "Solid 3D admission refuses 129 bodies with the exact bound");
-    check(!videowire::admitParticleParameters(
-            "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"65\"/>",admitted,error)
-        && error=="coupled replay supports 1 to 64 bodies; set Count to 64 or less",
-        "planar coupled bodies keep their 64-body bound");
+    check(videowire::admitParticleParameters(
+            "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"300\" simulationSpace=\"1\"/>",admitted,error)
+        && admitted.count==300,"Solid 3D admission accepts 300 bodies");
+    check(videowire::admitParticleParameters(
+            "<NodeParams motionMode=\"2\" historicalReplay=\"1\" count=\"300\"/>",admitted,error)
+        && admitted.count==300,"planar coupled admission accepts 300 bodies");
 
     if (!fullScene) return;
     auto broken=std::make_shared<HarmonicMIDI::grid::Visual3DScene>(*fullScene);
@@ -1814,7 +1809,7 @@ void checkDynamicBodyProductionJoin()
         "five dynamic bodies are instances of one five-vertex eighteen-index prototype");
     if (!scene) return;
     {
-        const std::array<double,kParticleSolidMaxBodies> births {};
+        const ParticleSizedList<double> births;
         const ParticleSolidMotionPrior prior{*current.preparedSolids,births,births,current.bodyRadius};
         check(!particleSolidScene(current,*current.preparedSolids,7,error,&prior)
             && error=="Motion output for Solid 3D bodies with timeline body appearance is unavailable: the prior body mesh is not retained",
@@ -2057,9 +2052,11 @@ void checkDynamicBodyProductionJoin()
     check(refuses(substituted) && !substitutedReplay.prepare(substituted,.75,1,nullptr,error,true)
         && !substitutedReplay.receipt(),
         "another ledger's admitted context cannot substitute the completed context in direct replay");
-    const auto scratchBytes=ParticleBodyReplayState::callerScratchLogicalBytes()+leaseBytes;
+    const auto authoredBodies=ParticleBodyReplayState::particleBodyCapacity(authored);
+    const auto scratchBytes=ParticleBodyReplayState::callerScratchLogicalBytes(authoredBodies,
+        ParticleBodyReplayState::particleAnchorCount(authored))+leaseBytes;
     const auto retainedBytes=ParticleBodyReplayReceipt::retainedLogicalBytes()+leaseBytes;
-    const auto outputBytes=ParticleBodyReplayState::callerOutputLogicalBytes(true,false)+leaseBytes;
+    const auto outputBytes=ParticleBodyReplayState::callerOutputLogicalBytes(true,false,authoredBodies)+leaseBytes;
     const auto exactPeak=sizeof(ParticleBodyCallerLedger)+contextBytes+scratchBytes+retainedBytes+outputBytes;
     const auto makeBoundedRequest=[&](const std::shared_ptr<ParticleBodyCallerLedger>& ledger) {
         auto request=authored;
@@ -2114,8 +2111,8 @@ void checkDynamicBodyProductionJoin()
         && !prepareCopyShortage.geometrySampler() && prepareCopyCaller->usage().work==prepareCopyLimits.maxWork,
         "initial parameter-copy allowance one short refuses before caller parameter copies");
     const auto initialWork=sizeof(ParticleBodyReplayContext)+3*sizeof(ParticleParams)
-        +ParticleBodyReplayState::callerPrepareWork()+ParticleBodyReplayState::callerReceiptWork()
-        +ParticleBodyReplayState::callerOutputLogicalBytes(true,false);
+        +ParticleBodyReplayState::callerPrepareWork()+ParticleBodyReplayState::callerReceiptWork(authoredBodies)
+        +ParticleBodyReplayState::callerOutputLogicalBytes(true,false,authoredBodies);
     ParticleBodyCallerLimits parameterLimits;
     parameterLimits.maxWork=initialWork+ParticleBodyReplayState::callerScheduleCopyWork(91)-1;
     auto parameterCaller=makeParticleBodyCallerLedger(parameterLimits,error);
@@ -2620,9 +2617,12 @@ void checkRotatingPlaneSweepCaller()
         && rotatingplane::ResponseCost::interval(87,3,1,0)==20219416
         && rotatingplane::Cost::grid(50)==65);
     SolidTriangleWorkBudget admission;
+    check(admission.rotatingWidth(12,1,3,1,0)==87 && admission.rotatingWidth(40,1,3,1,0)==87,
+        "the default budget has no fixed work ceiling, so rotating preflight takes the widest class");
+    admission.limit=100000000;
     check(admission.rotatingWidth(12,1,3,1,0)==50 && admission.rotatingWidth(4,1,3,1,0)==87
         && admission.rotatingWidth(40,1,3,1,0)==0 && admission.preflight(40,1,3,1,0,96),
-        "rotating preflight picks the largest width that fits 100M and leaves fixed-axis admission alone");
+        "rotating preflight picks the largest width that fits an explicit limit and leaves fixed-axis admission alone");
     admission.limit=30133564;
     const bool smallest=admission.rotatingWidth(12,1,3,1,0)==22;
     admission.limit=30133563;
@@ -2746,7 +2746,7 @@ void checkRotatingPlaneSweepCaller()
         "a center moved after the issued solidRotate no longer matches its capture and refuses");
     body=scheduled(previous,.0625f,1.0f/128);
     golden=body; work={}; work.limit=8+4320677;
-    check(!contact(body,previous,1.0f/128) && error=="Triangle contact replay exceeds 100M checked work units"
+    check(!contact(body,previous,1.0f/128) && error=="Triangle contact replay exceeds its checked work limit"
         && work.used==8+160696 && !receipt.valid && unchanged(body,golden),
         "a rotating sweep short of its rate phase keeps the certificate charge and the caller body");
     checkRotatingPlaneReplayRoute();
@@ -2950,8 +2950,8 @@ void checkTriangleSurfaceContacts()
     check(!contact(body,previous,surface,surface,&exhausted) && error.find("work units")!=std::string::npos,
         "the hard triangle work limit refuses before a partial response");
     SolidTriangleWorkBudget admitted;
-    check(admitted.preflight(120,1,3,1) && !admitted.preflight(1712,63,256,128),
-        "whole replay preflight includes all four passes and every bounded sweep branch");
+    check(admitted.preflight(120,1,3,1,64) && admitted.preflight(1712,63,256,128,64),
+        "whole replay preflight counts all four passes and every sweep branch without a ceiling");
     // Four passes: two validations, six sweep branches, a motion guard and
     // impact/final queries per triangle. Include initial and interval samples.
     admitted.limit=121*4+120*4*(2*4+6*64+3);
@@ -3470,9 +3470,11 @@ void checkConnectedWaterBodies()
     check(!replayWaterCoupledBodies(invalid,.5,1,cycleFrame.get(),unchanged,retained,nullptr,error)
         && !error.empty() && unchanged==poses && sameSolidBodies(retained,state),
         "cycled body clock refuses before replacing either published water or body result");
-    invalid=p; invalid.count=64;
-    check(!replayWaterCoupledBodies(invalid,at,1,frame.get(),unchanged,retained,nullptr,error),
-        "coupled water preserves the existing combined 64-object scene bound");
+    {
+        auto many=p; many.count=64; ParticleBodyState manyPoses; ParticleSolidState manySolids;
+        check(replayWaterCoupledBodies(many,at,1,frame.get(),manyPoses,manySolids,nullptr,error),
+            "coupled water sizes its contact list from Count, past the old 63 bodies");
+    }
     invalid=p; invalid.history.reset();
     check(!replayWaterCoupledBodies(invalid,at,1,frame.get(),unchanged,retained,nullptr,error),
         "missing history cannot publish a silently uncoupled water collider");

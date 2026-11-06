@@ -65,8 +65,14 @@ glass_fields = fields(glass)
 diffraction_fields = fields(diffraction)
 layer_fields = fields(layer)
 
-if not {"glassTexture", "glassControl", "glassReceivers", "glassEmission"} <= glass_fields:
-    errors.append("the smooth-glass group must require glassTexture, glassControl, glassReceivers and glassEmission")
+# Glass receivers and emission live in the scene table texture (8bf84d1613), read
+# through sceneTable and sceneTableObjects (fixture_smooth_glass.h GLASS_RECEIVER).
+if not {"glassTexture", "glassControl", "sceneTable", "sceneTableObjects"} <= glass_fields:
+    errors.append("the smooth-glass group must require glassTexture, glassControl, sceneTable and sceneTableObjects")
+smooth_glass = (root / "src/gpu_backend/fixture_smooth_glass.h").read_text(encoding="utf-8")
+if "#define GLASS_RECEIVER(o) sceneTableRead(4*uLightCount+uSceneTableObjects+(o))" not in smooth_glass \
+        or "#define GLASS_EMISSION(o) sceneTableRead(4*uLightCount+2*uSceneTableObjects+(o))" not in smooth_glass:
+    errors.append("the OpenGL glass transport must read receivers and emission from the scene table")
 if "glassTransport" in glass_fields:
     errors.append("glassTransport is read by the ungated tail and belongs to the common group")
 if "materialKind" not in diffraction_fields or "diffractionQueryTexture" not in diffraction_fields:

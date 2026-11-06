@@ -22,7 +22,7 @@ assert "if(ARBIT_OPTIX_SDK_DIR)" in block
 assert "device_optix_host.cpp" in block and "ARBIT_HAVE_OPTIX=1" in block
 assert 'option(ARBIT_OPTIX_KERNEL_ENABLED "Compile the OptiX integrator kernel when the SDK and nvcc are found" ON)' in block
 assert block.count("src/pathtrace/devices/device_optix.cu\" -o") == 1
-assert block.count("arbit_add_optix_device(") == 2, "the helper and the route tests"
+assert block.count("arbit_add_optix_device(") == 3, "the helper, the route tests and the preview sequence test"
 # Outside the block nothing names the SDK sources.
 assert "device_optix_host.cpp" not in cmake.replace(block, "")
 
@@ -87,9 +87,16 @@ assert "autoDeviceLatch().noteEngine(request.clipId, request.renderStableId" in 
 # The shim implements the whole device interface, and honours ignoreTriangle like the BVH.
 shim = (root / "src/pathtrace/devices/device_optix.cu").read_text()
 for member in ("using Accel", "using Film", "using Sampler", "makeSampler", "intersect", "occluded",
-               "filmAdd", "filmSplat", "filmCountLightPath"):
+               "filmAdd", "filmSplat", "filmCountLightPath", "filmGuide"):
     assert member in shim, member
 assert "ray.ignoreTriangle" in shim and shim.count("__anyhit__") == 2 and "optixIgnoreIntersection" in shim
+
+# The pipeline's stack is reserved before the first launch. A first launch that has
+# to grow local memory on a full GPU faults it (Xid 13) instead of failing.
+assert "stackBytesPerThread_ = continuation;" in host
+launch_body = host[host.index("bool launch (PathTracer::DevicePass& pass)"):host.index("public:\n    // The OptiX AI denoiser")]
+assert launch_body.index("reserveStack (error)") < launch_body.index("optixLaunch ("), "the stack is reserved before the first launch"
+assert "cu_.cuCtxSetLimit (0x00 /* CU_LIMIT_STACK_SIZE */, bytesPerThread)" in host
 
 # The denoiser stays OIDN, and the device code has no size cap.
 assert "optixDenoiser" not in shim and "optixDenoiser" not in registry

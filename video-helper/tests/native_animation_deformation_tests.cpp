@@ -1419,6 +1419,108 @@ void testUnavailableBackendHasNoFallback()
 }
 } // namespace
 
+// The native path used to refuse more than 64 joints or 8 morph targets. The palette and
+// weights now follow the skin and mesh, so 100 joints and 12 targets prepare in full.
+void testWideSkinAndMorphFrame()
+{
+    constexpr std::size_t jointCount = 100, targetCount = 12, vertices = 24;
+    auto sceneValue = videohelper::fixture3d::makeScene();
+    sceneValue.materials[0].baseColorTexture = {};
+    sceneValue.textureCount = 0;
+    sceneValue.textureTexelCount = 0;
+    sceneValue.textureTexels.clear();
+    sceneValue.objects[0].transform = {};
+    const auto scene = std::make_shared<const HarmonicMIDI::grid::Visual3DScene> (sceneValue);
+
+    std::vector<JointView> joints;
+    std::vector<float> inverseBind;
+    for (std::size_t joint = 0; joint < jointCount; ++joint)
+    {
+        joints.push_back (JointView { JointId { 3000 + joint }, {} });
+        const auto identity = identityMatrix();
+        inverseBind.insert (inverseBind.end(), identity.begin(), identity.end());
+    }
+    std::vector<std::uint32_t> jointIndices (vertices * 4, 0);
+    std::vector<float> jointWeights (vertices * 4, 0.0f);
+    for (std::size_t vertex = 0; vertex < vertices; ++vertex)
+    {
+        jointIndices[vertex * 4] = static_cast<std::uint32_t> (jointCount - 1 - vertex);
+        jointWeights[vertex * 4] = 1.0f;
+    }
+    std::vector<std::vector<float>> positions (targetCount, std::vector<float> (vertices * 3, 0.0f));
+    std::vector<std::vector<float>> normals (targetCount, std::vector<float> (vertices * 3, 0.0f));
+    std::vector<MorphTargetView> targets;
+    std::vector<MorphTargetId> targetIds;
+    for (std::size_t target = 0; target < targetCount; ++target)
+    {
+        positions[target][0] = 1.0f;
+        targetIds.push_back (MorphTargetId { 6000 + target });
+        targets.push_back (MorphTargetView { targetIds.back(), positions[target].data(), positions[target].size(),
+                                             normals[target].data(), normals[target].size(), nullptr, 0 });
+    }
+    const JointWeightSetView weightSet { jointIndices.data(), jointIndices.size(),
+                                         jointWeights.data(), jointWeights.size() };
+    const SkinView skinView { SkinId { 4001 }, joints.data(), joints.size(), inverseBind.data(), inverseBind.size() };
+    const MeshView meshView { MeshId { 5001 }, vertices, skinView.id, &weightSet, 1, targets.data(), targets.size() };
+    const AssetView assetView { &skinView, 1, &meshView, 1 };
+    std::string error;
+    const auto asset = DeformationAsset::create (assetView, {}, error);
+    check (asset != nullptr, "100-joint, 12-target deformation asset is admitted");
+    if (! asset) return;
+
+    const std::array<double, 2> keyTimes { 0.0, 1.0 };
+    std::vector<float> morphValues (2 * targetCount, 0.0f);
+    for (std::size_t target = 0; target < targetCount; ++target) morphValues[targetCount + target] = 0.5f;
+    const std::array<float, 6> translation { 0, 0, 0, 1, 0, 0 };
+    const std::array<animation::TrackView, 2> tracks {
+        animation::TrackView { animation::TrackId { 21 }, animation::TargetId { 2001 },
+            animation::Channel::Translation, animation::Interpolation::Linear,
+            keyTimes.data(), translation.data(), keyTimes.size(), translation.size(), 0 },
+        animation::TrackView { animation::TrackId { 22 }, animation::TargetId { 2002 },
+            animation::Channel::MorphWeights, animation::Interpolation::Linear,
+            keyTimes.data(), morphValues.data(), keyTimes.size(), morphValues.size(), targetCount } };
+    const animation::ClipView clipView { animation::ClipId { 702 }, 1.0, tracks.data(), tracks.size() };
+    const auto clip = animation::Clip::create (clipView, {}, error);
+    check (clip != nullptr, "wide fixture clip is admitted");
+    if (! clip) return;
+    const std::array<JointAnimationBindingView, 1> jointBindings {
+        JointAnimationBindingView { animation::TargetId { 2001 }, skinView.id, joints.back().id } };
+    const std::array<MorphAnimationBindingView, 1> morphBindings {
+        MorphAnimationBindingView { animation::TargetId { 2002 }, meshView.id, targetIds.data(), targetIds.size() } };
+    const AnimationDeformationBindingView bindings { jointBindings.data(), jointBindings.size(),
+                                                     morphBindings.data(), morphBindings.size() };
+    const AnimationDeformationRequest request { RationalFrameTime { 15, 30, 1 }, 78,
+                                                animation::Playback::Clamp, std::nullopt };
+    const auto snapshot = evaluateAnimationDeformation (*asset, *clip, bindings, request, {}, error);
+    check (snapshot != nullptr, "wide fixture snapshot evaluates");
+    if (! snapshot) return;
+
+    arbitgpu::NativeDeformationScene source;
+    source.sourceStableId = 811;
+    source.deformationStableId = 812;
+    source.structuralRevision = 78;
+    source.clip = animation::ClipId { 702 };
+    source.mesh = meshView.id;
+    source.object = videohelper::fixture3d::kCubeObjectId;
+    source.scene = scene;
+    source.deformation = asset;
+    for (const auto& joint : joints)
+        source.jointBaseTransforms.push_back (arbitgpu::NativeDeformationJointBaseTransform {
+            skinView.id, joint.id, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f } });
+    source.morphBaseWeights.assign (targetCount, 0.0f);
+
+    arbitgpu::NativeDeformationFrameData frame;
+    const bool prepared = arbitgpu::prepareNativeDeformationFrame (source, *snapshot, frame, error);
+    check (prepared, "100 joints and 12 morph targets prepare without the old 64/8 refusal");
+    if (! prepared) { std::fprintf (stderr, "  %s\n", error.c_str()); return; }
+    check (frame.jointCount == jointCount && frame.jointPalette.size() == jointCount * 16,
+           "joint palette is sized from the skin");
+    check (frame.morphTargetCount == targetCount && frame.morphWeights.size() == targetCount,
+           "morph weights are sized from the mesh");
+    check (near (frame.morphWeights[targetCount - 1], 0.25f), "the twelfth morph weight evaluates");
+    check (near (frame.jointPalette[(jointCount - 1) * 16 + 12], 0.5f), "the hundredth joint is posed");
+}
+
 int main()
 {
     static_assert (std::is_same_v<decltype (
@@ -1431,6 +1533,7 @@ int main()
         "published skin and morph storage must have immutable pointee ownership");
 
     testFramePreparation();
+    testWideSkinAndMorphFrame();
     testRestPoseBake();
     testCompositionCapabilities();
     testMultiLeafComposition();

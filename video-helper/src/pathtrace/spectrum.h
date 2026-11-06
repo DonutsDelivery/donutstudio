@@ -71,7 +71,7 @@ struct Spectrum
 {
     std::array<float, kSpectrumChannels> v {};
 
-    PT_SHARED_FN static Spectrum constant (float x) noexcept
+    PT_SHARED_FN static Spectrum filled (float x) noexcept
     {
         Spectrum s;
         for (int i = 0; i < kSpectrumChannels; ++i)

@@ -18,6 +18,9 @@
 
 namespace arbitgpu::smoothglass
 {
+// The default visits of one camera smooth-glass channel walk. The walk loop
+// reads GLASS_CAMERA_VISITS, written from CameraWalkBudget::singleVisits, so this
+// is the default setting, not a bound of the shader text.
 inline constexpr std::size_t kMaximumRayVisits = 64;
 inline constexpr std::size_t kMaximumInterfaceDepth = 32;
 // A camera smooth-glass walk that reaches the interface depth limit or runs out
@@ -139,7 +142,8 @@ inline constexpr std::uint64_t kMaximumPixelRayQueries = 512ull * 1024ull * 1024
 // 3840x2160 canvas (8,294,400 pixels, 1.60e9 queries) refused. This separate
 // frame cap admits 11,126,858 pixels, 34% more than 4K. A 4096x4096 frame
 // still refuses. The bound assumes every pixel is covered and every channel
-// spends all 64 visits, while a real walk stops when its pending branches end.
+// spends all kMaximumRayVisits visits, the default walk setting, while a real
+// walk stops when its pending branches end.
 // Rough, thin, paired-caustic and tiled frames keep kMaximumPixelRayQueries.
 inline constexpr std::uint64_t kMaximumClosedGlassFrameRayQueries = 2048ull * 1024ull * 1024ull;
 // The frame cap above bounds work, not time. Drawn as one submission, a
@@ -171,7 +175,7 @@ inline constexpr double kPreviewGlassSlowFrameMilliseconds = 50;
 struct CameraWalkBudget
 {
     bool sharedDispersionWalk = false;
-    std::uint32_t pairVisits = 48, dispersivePairVisits = 16, singleVisits = 64, singleChannelWalks = 3;
+    std::uint32_t pairVisits = 48, dispersivePairVisits = 16, singleVisits = std::uint32_t(kMaximumRayVisits), singleChannelWalks = 3;
     std::uint32_t roughSamples = static_cast<std::uint32_t>(kRoughInterfaceSamples);
     bool bandFinish = true;
 };
@@ -187,10 +191,11 @@ inline CameraWalkBudget cameraWalkBudget(bool preview, std::uint32_t width, std:
     return budget;
 }
 // ARBIT_GL_GLASS_PREVIEW_VISITS, a diagnostic that sets the Fast Preview walk cap
-// to time the walk at other visit counts. Only a whole decimal number from 1 to 64
-// parses; 64 is the longest walk loop in the Export text. Anything else returns
-// nothing and Preview keeps kPreviewCameraVisits.
-inline constexpr std::uint32_t kMaximumPreviewCameraVisitsOverride = 64;
+// to time the walk at other visit counts. The walk loop reads its visit count
+// from the text's define, so any whole decimal number from 1 up to the largest
+// count a float holds exactly parses. Anything else returns nothing and Preview
+// keeps kPreviewCameraVisits.
+inline constexpr std::uint32_t kMaximumPreviewCameraVisitsOverride = 16777215;
 inline std::optional<std::uint32_t> parsePreviewCameraVisitsOverride(const char* text)
 {
     if (!text || !*text) return std::nullopt;
@@ -253,10 +258,13 @@ inline std::string previewCameraTransportShader(std::string text, std::uint32_t 
          "int seams[GLASS_PREVIEW_PENDING];\n"},
         {"if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}",
          "if(pending>=GLASS_PREVIEW_PENDING) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}", 2},
-        {"        for(int visit=0;visit<64;++visit) {\n", "        for(int visit=0;visit<GLASS_PREVIEW_VISITS;++visit) {\n"},
+        {"        for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {\n", "        for(int visit=0;visit<GLASS_PREVIEW_VISITS;++visit) {\n"},
         {"radiance[channel]+=weight*glassEnvironment(direction GX_PASS)[channel];continue;",
          "radiance+=weight*glassEnvironment(direction GX_PASS);continue;"},
-        {"radiance[channel]+=weight*receiver[channel];continue;", "radiance+=weight*receiver;continue;"}};
+        {"radiance[channel]+=weight*receiver[channel];continue;", "radiance+=weight*receiver;continue;"},
+        // One walk carries all three channels, so the medium hook takes their mean.
+        {"            if(inside) weight*=GLASS_MEDIUM_TINT(hit.distance)[channel];\n",
+         "            if(inside) weight*=dot(GLASS_MEDIUM_TINT(hit.distance),vec3(1.0/3.0));\n"}};
     // The paired walk and its leftover (the first five edits) exist only in the
     // Lighthouse paired-volume text, which defines this.
     const bool paired = text.find("#define GLASS_PAIR_TRUNCATED") != std::string::npos;
@@ -377,7 +385,6 @@ inline int pairWalkChannelStatus(float truncated, bool spilled) noexcept
     if (!(truncated > kPairTruncatedEnergyTolerance)) return 0;
     return int(spilled ? SmoothTransportStatus::PendingBranches : SmoothTransportStatus::Trapped);
 }
-static_assert(kMaximumRayVisits == 64, "glassTransport hard-codes 64 visits per channel");
 static_assert(kMaximumPairRayVisits == 16, "glassPairWalk hard-codes 16 visits per channel and 48 for one shared walk");
 // Seam retries in glassTransport. The walk knows whether a branch is inside
 // the glass only from the hits it has met, and the float32 closest-hit query
@@ -724,7 +731,19 @@ struct Prepared final
     RoughNativeConsumer roughConsumer {};
     std::shared_ptr<const DistinctGratingAdmission> distinctGrating;
     CausticVolume causticVolume {};
+    // Visits of each camera channel walk, written into GLASS_CAMERA_VISITS and
+    // sizing the closed-glass pixel work (cameraVisitsFor).
+    std::uint32_t cameraVisits = std::uint32_t(kMaximumRayVisits);
 };
+// The camera walk visits of a scene's glass, authored on the Render 3D node and
+// carried on scene wire extension 19. Every program-text builder and program
+// key reads this one value, so text, key and work bounds agree. A scene that
+// sets no count walks the default kMaximumRayVisits.
+inline constexpr std::uint32_t kDefaultCameraVisits = std::uint32_t(kMaximumRayVisits);
+inline std::uint32_t cameraVisitsFor(const HarmonicMIDI::grid::Visual3DScene& scene) noexcept
+{
+    return scene.smoothGlassCameraVisits != 0 ? scene.smoothGlassCameraVisits : kDefaultCameraVisits;
+}
 // The dielectric a caustic pass traces: the volume slot when present, else the
 // single camera dielectric.
 inline HarmonicMIDI::grid::SceneObjectId causticObject(const Prepared& prepared) noexcept
@@ -764,7 +783,8 @@ inline bool cameraOnlyDisplayEncode(const Prepared& prepared, bool linearColor,
 }
 // True when any scene object draws with alpha blending. It mirrors the per-draw
 // blend test of both fixture backends: a blending native surface program, a
-// translucent instance appearance, or a Blend authored material.
+// translucent instance appearance, or a Blend authored material. A Volume
+// Material blends its OpenGL march; Metal keeps the conservative answer.
 template <typename Appearances>
 inline bool frameHasBlendedDraw(const HarmonicMIDI::grid::Visual3DScene& scene,
                                 const NativeFixtureSurfaceMaterialProgram* root,
@@ -779,7 +799,9 @@ inline bool frameHasBlendedDraw(const HarmonicMIDI::grid::Visual3DScene& scene,
         if (nativeSurfaceRequiresBlend(nativeSurfaceForObject(root, object.id))
             || (!instanceAppearances.empty() && o < instanceAppearances.size()
                 && instanceAppearances[o].color[3] < 1.0f)
-            || (material && material->alphaMode == HarmonicMIDI::grid::SceneAlphaMode::Blend))
+            || (material && material->alphaMode == HarmonicMIDI::grid::SceneAlphaMode::Blend)
+            || (material && material->volume.volumeOnly
+                && HarmonicMIDI::grid::sceneVolumeActive(material->volume)))
             return true;
     }
     return false;
@@ -1792,6 +1814,7 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
         distinctGrating?NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders:NativeFixtureDiffractionConsumer::FiniteLobe,
         !distinctGrating)) return false;
     candidate.enabled = true;
+    candidate.cameraVisits = cameraVisitsFor(scene);
     output = std::move(candidate);
     return true;
 }
@@ -1834,7 +1857,8 @@ inline bool admitFrame(const Prepared& prepared, std::uint32_t width, std::uint3
         : rough ? kMaximumPixelRayQueries/kMaximumRoughFrameRayQueries
         : prepared.causticVolume.present ? kMaximumPixelRayQueries/kPairPixelRayQueries
         : prepared.transport == surfacematerial::TransportMode::ThinInterface
-        ? kMaximumThinPixelRayQueries/kThinPixelRayQueries : kMaximumClosedGlassFrameRayQueries/(3*kMaximumRayVisits+1);
+        ? kMaximumThinPixelRayQueries/kThinPixelRayQueries
+        : kMaximumClosedGlassFrameRayQueries/(3*std::uint64_t(std::max<std::uint32_t>(1u, prepared.cameraVisits))+1);
     const std::uint64_t pixels = std::uint64_t(width)*height;
     // Two distinct refusals. The budget message names the frame and the limit so
     // a refused starter shows how far over it is.
@@ -2156,10 +2180,13 @@ inline std::string multipleScatterShader();
 // water draw and the caustic volume draw each trace both dielectrics, named by
 // GU_GlassTransport and GU_GlassTransport2 (see cameraTransport/cameraPartner).
 // Without it the text is the released single-dielectric shader byte for byte.
+// cameraVisits is the visit setting of each channel walk (CameraWalkBudget::singleVisits).
 template<class String> inline String transportShaderRecipe(bool metal, bool imageSecondary = false, bool selectedPrimary = false,
-                                                           bool pairedVolume = false)
+                                                           bool pairedVolume = false,
+                                                           std::uint32_t cameraVisits = CameraWalkBudget{}.singleVisits)
 {
     String source = String("\n#define GLASS_INTERFACE_DEPTH ") + surfacesource::number<String>(kMaximumInterfaceDepth)
+        + "\n#define GLASS_CAMERA_VISITS " + surfacesource::number<String>(std::max<std::uint32_t>(1u, cameraVisits))
         + "\n#define GLASS_ROUGH_SAMPLES " + surfacesource::number<String>(kRoughInterfaceSamples)
         + "\n#define GLASS_ROUGH_VISITS " + surfacesource::number<String>(kMaximumRayVisits)
         + "\n#define GLASS_ROUGH_QUERY_LIMIT " + surfacesource::number<String>(kMaximumRoughClosestHitQueries)
@@ -2193,6 +2220,25 @@ vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool
 vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_ARGS);
 )shader";
     source += R"shader(
+// The medium hook. A program that draws material media defines them before
+// this text (shared/RasterMedium.h): GLASS_MEDIUM_TINT(distance) is the
+// transmittance of the shaded dielectric's medium over a segment inside it, and
+// GLASS_MEDIUM_DISCARDS is 0 when absorption, not truncation, thins a branch.
+// GLASS_PARTNER_MEDIUM_TINT is the paired walk's partner dielectric's, and
+// GLASS_WATER_EXIT(origin,direction) the path a branch that left the scene
+// below the water travels inside the water body.
+#ifndef GLASS_MEDIUM_TINT
+#define GLASS_MEDIUM_TINT(distance) vec3(1.0)
+#endif
+#ifndef GLASS_PARTNER_MEDIUM_TINT
+#define GLASS_PARTNER_MEDIUM_TINT(distance) vec3(1.0)
+#endif
+#ifndef GLASS_MEDIUM_DISCARDS
+#define GLASS_MEDIUM_DISCARDS 1.0
+#endif
+#ifndef GLASS_WATER_EXIT
+#define GLASS_WATER_EXIT(origin,direction) 0.0
+#endif
 vec3 baseSurfaceDirect(vec3 base,float metallic,float roughness,float dielectric,float transmission,
                        vec3 normal,vec3 toLight,vec3 toView);
 float glassBias(vec3 position) {
@@ -2370,7 +2416,7 @@ vec3 glassDirectSpecular(vec3 position,vec3 normal,vec3 toView,float roughness,
 }
 // One interface only. A secondary hit on the interface refuses recursive
 // transport rather than substituting a background or an unfinished path.
-vec3 thinInterfaceReceiver(vec3 origin,vec3 direction,uint water,out bool complete,out int status GX_ARGS) {
+vec3 thinInterfaceReceiver(vec3 origin,vec3 direction,uint water,bool medium,out bool complete,out int status GX_ARGS) {
     complete=false;status=GLASS_SMOOTH_STATUS_UNCLASSIFIED;
     GlassClosestHit hit=glassSceneClosestHit(origin,direction,0.0,3.402823e38,GU_GlassControl GX_QUERY);
     if(hit.status<0) {status=hit.status==-2?GLASS_SMOOTH_STATUS_QUERY_BUDGET:GLASS_SMOOTH_STATUS_QUERY_REFUSED;return vec3(0.0);}
@@ -2378,7 +2424,8 @@ vec3 thinInterfaceReceiver(vec3 origin,vec3 direction,uint water,out bool comple
     if(hit.status==0) { complete=true;return glassEnvironment(direction GX_PASS); }
     vec3 receiver=glassReceiver(hit,direction,complete GX_PASS);
     if(!complete) status=GLASS_SMOOTH_STATUS_THIN_RECEIVER;
-    return receiver;
+    // Under the water surface its medium absorbs along the way to the receiver.
+    return medium?receiver*GLASS_MEDIUM_TINT(hit.distance):receiver;
 }
 // Maps a RoughTransportStatus refusal (-1 to -10) into the shared reason range.
 // Other values, including complete and smooth, report as unclassified.
@@ -2453,13 +2500,13 @@ vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool
     vec3 radiance=vec3(0.0);
     if(reflection>0.0) {
         bool reflectedComplete;
-        vec3 reflected=thinInterfaceReceiver(entry+normal*bias,normalize(reflect(incoming,normal)),water,reflectedComplete,status GX_PASS);
+        vec3 reflected=thinInterfaceReceiver(entry+normal*bias,normalize(reflect(incoming,normal)),water,!entering,reflectedComplete,status GX_PASS);
         if(!reflectedComplete) return vec3(0.0);
         radiance+=reflection*reflected;
     }
     if(!tir && reflection<1.0) {
         bool transmittedComplete;
-        vec3 refracted=thinInterfaceReceiver(entry-normal*bias,transmitted,water,transmittedComplete,status GX_PASS);
+        vec3 refracted=thinInterfaceReceiver(entry-normal*bias,transmitted,water,entering,transmittedComplete,status GX_PASS);
         if(!transmittedComplete) return vec3(0.0);
         radiance+=(1.0-reflection)*refracted;
     }
@@ -2545,6 +2592,8 @@ vec3 roughThinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,
                 if(!owned) {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
             }
             terminal+=vec3(power);
+            // A branch on the water side crosses its medium to the receiver.
+            if(transmission==first.entering&&target.status==1) receiver*=GLASS_MEDIUM_TINT(target.distance);
             radiance+=power*(transmission?eta*eta:1.0)*receiver;
         }
     }
@@ -2584,7 +2633,7 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
         int pending=1;
         float discarded=0.0;
         origins[0]=camera;directions[0]=incoming;backs[0]=-incoming;weights[0]=1.0;depths[0]=0;media[0]=firstInside;seams[0]=0;
-        for(int visit=0;visit<64;++visit) {
+        for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {
             if(pending==0) break;
             --pending;
             vec3 origin=origins[pending],direction=directions[pending],back=backs[pending];
@@ -2665,14 +2714,15 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
                 radiance[channel]+=weight*receiver[channel];continue;
             }
             if(inside==hit.entering) {status=GLASS_SMOOTH_STATUS_ORIENTATION;return vec3(0.0);}
+            if(inside) weight*=GLASS_MEDIUM_TINT(hit.distance)[channel];
             if(depth>=GLASS_INTERFACE_DEPTH) {trapped=true;continue;}
             vec3 normal=hit.entering?hit.outwardNormal:-hit.outwardNormal;
             vec3 transmitted;bool tir;
             float reflection=glassFresnel(direction,normal,inside?ior:1.0,inside?1.0:ior,transmitted,tir);
             if(!glassSceneFinite(reflection)||!glassSceneFinite3(transmitted)) {status=GLASS_SMOOTH_STATUS_NONFINITE_SCATTER;return vec3(0.0);}
             float bias=glassBias(hit.position);
-            if(!tir&&weight*(1.0-reflection)<0.00001) discarded+=weight*(1.0-reflection);
-            if(weight*reflection<0.00001) discarded+=weight*reflection;
+            if(!tir&&weight*(1.0-reflection)<0.00001) discarded+=GLASS_MEDIUM_DISCARDS*weight*(1.0-reflection);
+            if(weight*reflection<0.00001) discarded+=GLASS_MEDIUM_DISCARDS*weight*reflection;
             if(discarded>0.0001) {status=GLASS_SMOOTH_STATUS_DISCARDED;return vec3(0.0);}
             if(!tir&&weight*(1.0-reflection)>=0.00001) {
                 if(pending>=16) {status=GLASS_SMOOTH_STATUS_PENDING;return vec3(0.0);}
@@ -2793,6 +2843,8 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                 }
                 if(hit.materialId!=first.materialId||hit.instanceId!=first.instanceId||inside==hit.entering)
                     {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
+                // The medium absorbs the radiance a path carries, not the receipt's power.
+                if(inside) throughput*=GLASS_MEDIUM_TINT(hit.distance)[channel];
                 // A path at the depth limit ends. Its tracked power goes in the receipt as absorbed,
                 // which this walk carries in masked.
                 if(depth>=GLASS_INTERFACE_DEPTH) {masked[channel]+=power;continue;}
@@ -2952,6 +3004,8 @@ vec3 roughGlassTransport(vec3 camera,vec3 entry,float roughness,bool receiptOnly
                 }
                 if(hit.materialId!=first.materialId||hit.instanceId!=first.instanceId||inside==hit.entering)
                     {status=GLASS_ROUGH_STATUS_IDENTITY;return vec3(0.0);}
+                // The medium absorbs the radiance a path carries, not the receipt's power.
+                if(inside) throughput*=GLASS_MEDIUM_TINT(hit.distance)[channel];
                 // A path at the depth limit ends. Its tracked power goes in the receipt as absorbed,
                 // which this walk carries in masked.
                 if(depth>=GLASS_INTERFACE_DEPTH) {masked[channel]+=power;continue;}
@@ -3047,6 +3101,17 @@ uint glassPairId(vec4 transport) {
 vec3 glassPairLeftover(vec3 direction,float weight,bool inside GX_ARGS) {
     return inside?vec3(0.0):weight*glassEnvironment(direction GX_PASS);
 }
+// The media over one walked segment: the volume's inside the volume, and the
+// water's below the water surface. Each body takes its own medium: the shaded
+// draw's (GLASS_MEDIUM_TINT) or its partner's (GLASS_PARTNER_MEDIUM_TINT).
+// Shared lanes take the mean over the channels they carry.
+float glassPairSegmentTint(bool inVolume,bool inWater,float distance,vec3 lanes,uint water,uint volume GX_ARGS) {
+    uint shaded=glassPairId(GU_GlassTransport);
+    vec3 tint=vec3(1.0);
+    if(inVolume) tint*=shaded==volume?GLASS_MEDIUM_TINT(distance):GLASS_PARTNER_MEDIUM_TINT(distance);
+    if(inWater) tint*=shaded==water?GLASS_MEDIUM_TINT(distance):GLASS_PARTNER_MEDIUM_TINT(distance);
+    return dot(lanes,tint)/dot(lanes,vec3(1.0));
+}
 // One bounded branch walk through the thin water and the closed caustic
 // volume. The water is one interface with no tracked medium, as in
 // thinInterfaceTransport. The volume tracks inside and outside, as in
@@ -3061,10 +3126,11 @@ vec3 glassPairLeftover(vec3 direction,float weight,bool inside GX_ARGS) {
 // it is the lightest, or when the visits run out. A walk whose truncated
 // weight passes GLASS_PAIR_TRUNCATED refuses. Water met inside the volume is
 // not a modelled interface and refuses as a medium mismatch. Seed B starts
-// outside the volume.
+// outside the volume. wetA and wetB say a seed starts below the water surface;
+// each branch keeps that side of the water while it crosses the volume.
 vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
                    vec3 originB,vec3 directionB,float weightB,
-                   uint water,float waterIor,uint volume,float volumeIor,float volumeDispersion,
+                   uint water,float waterIor,uint volume,float volumeIor,float volumeDispersion,bool wetA,bool wetB,
                    out bool complete,out int status GX_ARGS) {
     complete=false;status=GLASS_SMOOTH_STATUS_UNCLASSIFIED;
     vec3 radiance=vec3(0.0);
@@ -3079,21 +3145,22 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
         float ior=max(1.0,volumeIor+volumeDispersion*(1.0/(wavelength*wavelength)-1.0/(0.58756*0.58756)));
         // backs: where retry 3 looks (seamSpawnBack), -direction for a seed.
         vec3 origins[16],directions[16],backs[16];float weights[16];int depths[16];bool media[16];int seams[16];
+        bool wets[16];
         int pending=0;
         float discarded=0.0,truncated=0.0;
         bool spilled=false;
-        if(weightA>0.0) {origins[pending]=originA;directions[pending]=directionA;backs[pending]=-directionA;weights[pending]=weightA;depths[pending]=0;media[pending]=insideA;seams[pending]=0;++pending;}
-        if(weightB>0.0) {origins[pending]=originB;directions[pending]=directionB;backs[pending]=-directionB;weights[pending]=weightB;depths[pending]=0;media[pending]=false;seams[pending]=0;++pending;}
+        if(weightA>0.0) {origins[pending]=originA;directions[pending]=directionA;backs[pending]=-directionA;weights[pending]=weightA;depths[pending]=0;media[pending]=insideA;seams[pending]=0;wets[pending]=wetA;++pending;}
+        if(weightB>0.0) {origins[pending]=originB;directions[pending]=directionB;backs[pending]=-directionB;weights[pending]=weightB;depths[pending]=0;media[pending]=false;seams[pending]=0;wets[pending]=wetB;++pending;}
         for(int visit=0;visit<48;++visit) {
             if(visit>=visits||pending==0) break;
             int heaviest=0;
             for(int slot=1;slot<pending;++slot) if(weights[slot]>weights[heaviest]) heaviest=slot;
             vec3 rayOrigin=origins[heaviest],rayDirection=directions[heaviest],rayBack=backs[heaviest];
-            float weight=weights[heaviest];int depth=depths[heaviest];bool rayInside=media[heaviest];int seam=seams[heaviest];
+            float weight=weights[heaviest];int depth=depths[heaviest];bool rayInside=media[heaviest];int seam=seams[heaviest];bool rayWet=wets[heaviest];
             --pending;
             origins[heaviest]=origins[pending];directions[heaviest]=directions[pending];backs[heaviest]=backs[pending];
             weights[heaviest]=weights[pending];depths[heaviest]=depths[pending];media[heaviest]=media[pending];
-            seams[heaviest]=seams[pending];
+            seams[heaviest]=seams[pending];wets[heaviest]=wets[pending];
             // The seam retries of glassSingleTransport, each spending a visit.
             vec3 queryOrigin=rayOrigin,queryDirection=rayDirection;float nearest=0.0,farthest=3.402823e38;
             if(seam==1) {float seamBias=glassBias(rayOrigin);queryOrigin=rayOrigin-rayDirection*(4.0*seamBias);nearest=3.5*seamBias;farthest=4.5*seamBias;}
@@ -3109,7 +3176,7 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
             if(seam==6) {
                 if(hit.status==1&&hit.objectId!=volume&&hit.objectId!=water&&!hit.entering) {
                     origins[pending]=rayOrigin;directions[pending]=rayDirection;backs[pending]=rayBack;weights[pending]=weight;
-                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=7;++pending;continue;
+                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=7;wets[pending]=rayWet;++pending;continue;
                 }
                 seam=0;
             }
@@ -3121,12 +3188,12 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
                 if(glassSeamEscaped(hit,volume,rayOrigin,queryDirection)) hit.entering=false;
                 else {
                     origins[pending]=rayOrigin;directions[pending]=rayDirection;backs[pending]=rayBack;weights[pending]=weight;
-                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=4;++pending;continue;
+                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=4;wets[pending]=rayWet;++pending;continue;
                 }
             } else if(seam==4) {
                 if(hit.status==1&&hit.objectId!=volume&&hit.objectId!=water&&hit.entering) {
                     origins[pending]=hit.position;directions[pending]=rayDirection;backs[pending]=hit.outwardNormal;weights[pending]=weight;
-                    depths[pending]=int(hit.objectId);media[pending]=rayInside;seams[pending]=5;++pending;continue;
+                    depths[pending]=int(hit.objectId);media[pending]=rayInside;seams[pending]=5;wets[pending]=rayWet;++pending;continue;
                 }
                 hit.status=0;
             } else if(seam==5) {
@@ -3137,18 +3204,22 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
             } else if(seam==7) {
                 if(hit.status!=1||hit.objectId==volume||hit.objectId==water||!hit.entering) {
                     origins[pending]=rayOrigin;directions[pending]=rayDirection;backs[pending]=rayBack;weights[pending]=weight;
-                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=0;++pending;continue;
+                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=0;wets[pending]=rayWet;++pending;continue;
                 }
             } else {
                 bool seamed=seam==1?!volumeHit:rayInside?(!volumeHit||hit.entering):(volumeHit&&!hit.entering);
                 if(seamed&&seam==2&&rayInside&&glassSeamEscaped(hit,volume,rayOrigin,queryDirection)) {rayInside=false;seamed=false;}
                 if(seamed&&(seam<2||(rayInside&&!volumeHit))) {
                     origins[pending]=rayOrigin;directions[pending]=rayDirection;backs[pending]=rayBack;weights[pending]=weight;
-                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=seam+1;++pending;continue;
+                    depths[pending]=depth;media[pending]=rayInside;seams[pending]=seam+1;wets[pending]=rayWet;++pending;continue;
                 }
                 // The origin lies on that face to within half a bias: its side decides.
                 if(seam==1) rayInside=!hit.entering;
             }
+            // A miss below the water surface is tinted over its path through the
+            // water body (GLASS_WATER_EXIT), not left untinted.
+            if(hit.status==1) weight*=glassPairSegmentTint(rayInside,rayWet&&!rayInside,hit.distance,lanes,water,volume GX_PASS);
+            else if(hit.status==0&&rayWet&&!rayInside) weight*=glassPairSegmentTint(false,true,GLASS_WATER_EXIT(rayOrigin,rayDirection),lanes,water,volume GX_PASS);
             if(hit.status==0) {
                 if(rayInside) {status=GLASS_SMOOTH_STATUS_MEDIUM;return vec3(0.0);}
                 radiance+=lanes*weight*glassEnvironment(rayDirection GX_PASS);continue;
@@ -3177,8 +3248,8 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
             float reflection=glassFresnel(rayDirection,normal,fromIor,toIor,transmitted,tir);
             if(!glassSceneFinite(reflection)||!glassSceneFinite3(transmitted)) {status=GLASS_SMOOTH_STATUS_NONFINITE_SCATTER;return vec3(0.0);}
             float bias=glassBias(hit.position);
-            if(!tir&&weight*(1.0-reflection)<0.00001) discarded+=weight*(1.0-reflection);
-            if(weight*reflection<0.00001) discarded+=weight*reflection;
+            if(!tir&&weight*(1.0-reflection)<0.00001) discarded+=GLASS_MEDIUM_DISCARDS*weight*(1.0-reflection);
+            if(weight*reflection<0.00001) discarded+=GLASS_MEDIUM_DISCARDS*weight*reflection;
             if(discarded>0.0001) {status=GLASS_SMOOTH_STATUS_DISCARDED;return vec3(0.0);}
             for(int branch=0;branch<2;++branch) {
                 bool transmission=branch==0;
@@ -3201,12 +3272,14 @@ vec3 glassPairWalk(vec3 originA,vec3 directionA,float weightA,bool insideA,
                     --pending;
                     origins[lightest]=origins[pending];directions[lightest]=directions[pending];backs[lightest]=backs[pending];
                     weights[lightest]=weights[pending];depths[lightest]=depths[pending];media[lightest]=media[pending];
-                    seams[lightest]=seams[pending];
+                    seams[lightest]=seams[pending];wets[lightest]=wets[pending];
                 }
                 origins[pending]=hit.position+normal*(transmission?-bias:bias);directions[pending]=childDirection;
                 backs[pending]=transmission?normal:-normal;
                 weights[pending]=childWeight;depths[pending]=depth+1;media[pending]=childInside;
-                seams[pending]=transmission&&!thin&&rayInside?6:0;++pending;
+                seams[pending]=transmission&&!thin&&rayInside?6:0;
+                // Through the water a branch changes side; the volume keeps it.
+                wets[pending]=thin?(transmission?hit.entering:!hit.entering):rayWet;++pending;
             }
         }
         // Branches still pending after the last visit end without a query.
@@ -3248,7 +3321,7 @@ vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool
     if(entryStatus!=0&&first.status==1&&first.objectId==partner&&glassSceneFinite(first.distance)) {
         vec3 partnerRadiance=glassPairWalk(camera,incoming,1.0,first.status==1&&first.objectId==partner&&!first.entering,
             camera,incoming,0.0,
-            water,GU_SurfaceCoating.y,partner,GU_GlassTransport2.x,GU_GlassTransport2.y,complete,status GX_PASS);
+            water,GU_SurfaceCoating.y,partner,GU_GlassTransport2.x,GU_GlassTransport2.y,false,false,complete,status GX_PASS);
         if(!complete&&status==GLASS_SMOOTH_STATUS_UNCLASSIFIED) status=GLASS_SMOOTH_STATUS_THIN_RADIANCE;
         return partnerRadiance;
     }
@@ -3262,7 +3335,7 @@ vec3 thinInterfaceTransport(vec3 camera,vec3 entry,vec3 evaluatedNormal,out bool
     float bias=glassBias(entry);
     vec3 radiance=glassPairWalk(entry+normal*bias,normalize(reflect(incoming,normal)),reflection,false,
         entry-normal*bias,transmitted,tir?0.0:1.0-reflection,
-        water,ior,glassPairId(GU_GlassTransport2),GU_GlassTransport2.x,GU_GlassTransport2.y,complete,status GX_PASS);
+        water,ior,glassPairId(GU_GlassTransport2),GU_GlassTransport2.x,GU_GlassTransport2.y,!entering,entering,complete,status GX_PASS);
     if(!complete&&status==GLASS_SMOOTH_STATUS_UNCLASSIFIED) status=GLASS_SMOOTH_STATUS_THIN_RADIANCE;
     return radiance;
 }
@@ -3279,7 +3352,7 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
     // silhouette by a float sliver walks on in air.
     if(!thinEntryOwned(first,volume,camera,entry)) {status=GLASS_SMOOTH_STATUS_FIRST_HIT;return vec3(0.0);}
     return glassPairWalk(camera,incoming,1.0,first.status==1&&first.objectId==volume&&!first.entering,camera,incoming,0.0,
-        glassPairId(GU_GlassTransport2),GU_GlassTransport2.x,volume,GU_SurfaceCoating.y,GU_GlassTransport.y,complete,status GX_PASS);
+        glassPairId(GU_GlassTransport2),GU_GlassTransport2.x,volume,GU_SurfaceCoating.y,GU_GlassTransport.y,false,false,complete,status GX_PASS);
 }
 )shader";
     }
@@ -3371,8 +3444,9 @@ vec3 glassTransport(vec3 camera,vec3 entry,out bool complete,out int status GX_A
         "#define GLASS_EMISSION(o) sceneTableRead(4*uLightCount+2*uSceneTableObjects+(o))\n"
         "vec3 glassRotateQ(vec4 q,vec3 v) {return v+2.0*cross(q.xyz,cross(q.xyz,v)+q.w*v);}\n" + source;
 }
-inline std::string transportShader(bool metal,bool imageSecondary=false,bool selectedPrimary=false,bool pairedVolume=false)
-{ return transportShaderRecipe<std::string>(metal,imageSecondary,selectedPrimary,pairedVolume); }
+inline std::string transportShader(bool metal,bool imageSecondary=false,bool selectedPrimary=false,bool pairedVolume=false,
+                                   std::uint32_t cameraVisits=CameraWalkBudget{}.singleVisits)
+{ return transportShaderRecipe<std::string>(metal,imageSecondary,selectedPrimary,pairedVolume,cameraVisits); }
 // Heitz et al., SIGGRAPH 2016, equations 27/30 and algorithms 3/7, with
 // conditional continuation from section 9. Uniform symmetric height CDF q.
 // https://jo.dreggn.org/home/2016_microfacets.pdf

@@ -7,18 +7,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <new>
 #include <string>
 #include <vector>
 
 namespace videocontrol
 {
 
-inline constexpr std::size_t kMaxOperations = 512;
-inline constexpr std::size_t kMaxSlots = 2048;
-inline constexpr std::size_t kMaxInputsPerOperation = 16;
-inline constexpr std::size_t kMaxSourcesPerInput = 64;
-inline constexpr std::size_t kMaxParamsPerOperation = 32;
-inline constexpr std::size_t kMaxSinks = 128;
 
 struct Operation
 {
@@ -77,14 +72,9 @@ inline bool validatePlan(const Plan& plan, std::string& error)
         error = "unsupported video control plan version";
         return false;
     }
-    if (plan.numSlots < 0 || static_cast<std::size_t>(plan.numSlots) > kMaxSlots)
+    if (plan.numSlots < 0)
     {
-        error = "video control plan slot count exceeds capacity";
-        return false;
-    }
-    if (plan.operations.size() > kMaxOperations)
-    {
-        error = "video control plan operation count exceeds capacity";
+        error = "video control plan slot count is negative";
         return false;
     }
 
@@ -96,7 +86,6 @@ inline bool validatePlan(const Plan& plan, std::string& error)
     }
     std::size_t frameValues = 0;
     std::size_t windowOperations = 0;
-    std::size_t sinks = 0;
     std::vector<bool> produced(static_cast<std::size_t>(plan.numSlots), false);
     for (const auto& op : plan.operations)
     {
@@ -132,19 +121,8 @@ inline bool validatePlan(const Plan& plan, std::string& error)
             error = "frame values require a video Signal window operation";
             return false;
         }
-        if (op.inputs.size() > kMaxInputsPerOperation
-            || op.params.size() > kMaxParamsPerOperation)
-        {
-            error = "video control plan operation exceeds input or parameter capacity";
-            return false;
-        }
         for (const auto& fanIn : op.inputs)
         {
-            if (fanIn.size() > kMaxSourcesPerInput)
-            {
-                error = "video control plan fan-in exceeds capacity";
-                return false;
-            }
             for (const int slot : fanIn)
             {
                 if (slot < 0 || slot >= plan.numSlots)
@@ -179,11 +157,6 @@ inline bool validatePlan(const Plan& plan, std::string& error)
             }
             produced[static_cast<std::size_t>(slot)] = true;
         }
-        if (op.kind == "sink" && ++sinks > kMaxSinks)
-        {
-            error = "video control plan sink count exceeds capacity";
-            return false;
-        }
         if (!std::isfinite(op.depth) || !std::isfinite(op.smoothingBeats)
             || (op.kind == "sink" && op.destination.empty()))
         {
@@ -207,18 +180,36 @@ inline bool validatePlan(const Plan& plan, std::string& error)
     return true;
 }
 
+inline std::size_t sinkCount(const Plan& plan)
+{
+    return static_cast<std::size_t>(std::count_if(plan.operations.begin(), plan.operations.end(),
+        [](const Operation& op) { return op.kind == "sink"; }));
+}
+
 class Executor
 {
 public:
     bool bind(const Plan& plan, std::string& error)
     {
-        if (!validatePlan(plan, error))
+        // Slots, states and results are sized from the plan. Only a real
+        // allocation failure refuses it.
+        try
+        {
+            if (!validatePlan(plan, error))
+                return false;
+            plan_ = plan;
+            slots_.assign(static_cast<std::size_t>(plan_.numSlots), 0.0f);
+            available_.assign(static_cast<std::size_t>(plan_.numSlots), false);
+            states_.assign(plan_.operations.size(), {});
+            results_.reserve(sinkCount(plan_));
+        }
+        catch (const std::bad_alloc&)
+        {
+            error = "Video Control plan could not allocate memory for "
+                  + std::to_string(plan.operations.size()) + " operations and "
+                  + std::to_string(plan.numSlots) + " slots";
             return false;
-        plan_ = plan;
-        slots_.assign(static_cast<std::size_t>(plan_.numSlots), 0.0f);
-        available_.assign(static_cast<std::size_t>(plan_.numSlots), false);
-        states_.assign(plan_.operations.size(), {});
-        results_.reserve(kMaxSinks);
+        }
         reset();
         return true;
     }
@@ -336,7 +327,12 @@ public:
                     value = arbitmod::clamp01(state.value);
                 }
                 else
+                {
                     value = arbitmod::evaluateSource(op.source, score, clock, audio);
+                    if (op.source.type == arbitmod::SourceType::AudioEnvelope)
+                        value = arbitmod::envelopeFollow (state.follower, value, op.source.envAttack,
+                                                          op.source.envRelease, dtSeconds);
+                }
             }
             else if (op.kind == "control.const")
             {
@@ -569,6 +565,7 @@ private:
         int count = 0;
         double lastBeats = 0.0;
         double holdRemaining = 0.0;
+        arbitmod::EnvelopeState follower {};
         std::int64_t lastFrame = -1;
         float lastDtBeats = 0.0f;
     };

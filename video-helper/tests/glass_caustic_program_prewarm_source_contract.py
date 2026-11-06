@@ -47,7 +47,9 @@ render = region(backend, "NativeFixtureSceneSubmission renderOpenGlGlassCausticS
                 "bool readOpenGlGlassCausticReceiptForFixture(", "caustic render")
 for needle in ("linkCausticProgram(", "GL_LINK_STATUS", "GL_COMPILE_STATUS", "CompileShader", "LinkProgram"):
     forbid(render, needle, "caustic render")
-for needle in ("acquireOpenGlCausticProgramsUnlocked(multipleScatterQuery,roughQuery,true,programSet,programError)",
+# A Preview never blocks its frame on the dispatch compile (cd642cf49e).
+for needle in ("const bool wait = use!=OpenGlCausticRenderUse::Preview;",
+               "acquireOpenGlCausticProgramsUnlocked(multipleScatterQuery,roughQuery,wait,programSet,programError)",
                "openGlCausticQueryProgramForOwnerUnlocked(*programSet,querySources)",
                "querySources,result.error,linkedQuery)",
                "resources->causticProgramSet=programSet;",
@@ -86,7 +88,9 @@ pending_at = acquire.find("return OpenGlCausticProgramAcquire::Pending;")
 finish_at = acquire.find("finishCausticStage (gl, stage)")
 if poll_at < 0 or pending_at < 0 or finish_at < 0 or not (poll_at < pending_at < finish_at):
     errors.append("caustic acquire must poll completion and return Pending before finishing")
-for needle in ("arbitgl::hasParallelShaderCompile (gl)", "if (cache.parallelCompile != 1) wait = true;",
+# A pending Preview acquire is never escalated to a blocking wait (caab049b15).
+forbid(acquire, "wait = true;", "caustic acquire")
+for needle in ("arbitgl::hasParallelShaderCompile (gl)",
                "cache.inFlight.emplace (key, std::move (entry))",
                "binaryCache.store (openGlCausticStageDiskKey ((*sources)[index]), kCausticDiskKeySecond, program);",
                "contextEntry->second.ready[key] = set;"):
@@ -156,9 +160,13 @@ require(renderer, 'loopstep::Scope causticProgramScope ("advance:imported-scene:
         "renderer")
 require(renderer, "use == RenderUse::Preview ? arbitgpu::NativeFixturePrepareUse::Preview", "renderer")
 pending_block = renderer[pending_at:submit_at] if pending_at >= 0 and submit_at > pending_at else ""
-for needle in ("++previewPendingResults;", "if (use != RenderUse::Preview)", "output.pending = true;",
-               "return true;"):
+# Blocking use refuses pending programs. A Preview renders the base scene now and
+# counts no pending result, so the viewport gate does not hold it (b8c8ad9f36, 091f2ec0e2).
+for needle in ("if (use != RenderUse::Preview)",
+               'error = "native fixture GPU backend returned pending caustic programs for a blocking render";'):
     require(pending_block, needle, "renderer caustic pending")
+for needle in ("++previewPendingResults;", "output.pending = true;"):
+    forbid(pending_block, needle, "renderer caustic pending")
 
 # The caustic refusals come before the programs start, so a backend without a caustic
 # consumer still reports its own refusal.
@@ -371,7 +379,8 @@ for needle in ('smoothglass::replace(receiver,"complete=false;break;","return fa
 # Color readback. Preview skips all of these, flushes between stages and waits once on
 # the resolve. The plan, not the call site, decides each of them.
 plan = region(header, "inline OpenGlCausticRenderPlan openGlCausticRenderPlan(", "\n}\n", "caustic render plan")
-for needle in ("if(use!=OpenGlCausticRenderUse::Preview)return plan;",
+# A Fast export takes the Preview plan too; only export budgets keep the default (62551afabb).
+for needle in ("if(use!=OpenGlCausticRenderUse::Preview && previewbudget::exportBudgets())return plan;",
                "plan.scheduling.entrySubdivisions=kPreviewCausticEntrySubdivisions;",
                "plan.hostReceipt=false;plan.stageFences=false;"):
     require(plan, needle, "caustic render plan")
@@ -382,7 +391,7 @@ require(render, "const auto plan=openGlCausticRenderPlan(use,width,height,previe
 # never degrades; only a Fast Preview takes the coarser schedule, the ladder and the GL-limit
 # reduction. Both keep every Preview wait and readback rule.
 require(render, "const bool previewExportBudgets=preview&&previewbudget::exportBudgets();", "caustic render")
-require(render, "const bool previewDegrades=preview&&!previewExportBudgets;", "caustic render")
+require(render, "const bool previewDegrades=(preview||fastExportDraw)&&!previewExportBudgets;", "caustic render")
 require(plan, "if(!exportSchedule)plan.scheduling.entrySubdivisions=kPreviewCausticEntrySubdivisions;", "caustic render plan")
 require(render, "std::string previewBudgetReason;\n    if(previewDegrades)\n    {\n        const auto level=openGlPreviewCausticBudgetLevel(previewBudgetReason);", "caustic budget ladder")
 require(render, "job.splat=splat;job.exportBudgets=previewExportBudgets;", "caustic budget ladder")
@@ -506,7 +515,8 @@ require(cmake, "tests/glass_caustic_program_prewarm_source_contract.py", "CMakeL
 smooth = (root / "src/gpu_backend/fixture_smooth_glass.h").read_text()
 recipe = smooth[smooth.find("template<class String> inline String transportShaderRecipe"):]
 for needle in ("int walks=sharedPaths?1:3,visits=sharedPaths?48:16;", "bool sharedPaths=volumeDispersion==0.0;",
-               "        for(int visit=0;visit<64;++visit) {\n", "+ \"\\n#define GLASS_ROUGH_SAMPLES \" + surfacesource::number<String>(kRoughInterfaceSamples)",
+               "        for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit) {\n",
+               "+ \"\\n#define GLASS_CAMERA_VISITS \" + surfacesource::number<String>(std::max<std::uint32_t>(1u, cameraVisits))", "+ \"\\n#define GLASS_ROUGH_SAMPLES \" + surfacesource::number<String>(kRoughInterfaceSamples)",
                "+ \"\\n#define GLASS_ROUGH_VISITS \" + surfacesource::number<String>(kMaximumRayVisits)"):
     require(recipe, needle, "export transport text")
 forbid(recipe, "GLASS_PREVIEW", "export transport text")
@@ -533,9 +543,9 @@ query_rewrite = region(smooth, "inline std::string previewQueryShader(", "\n}\n"
 for needle in ("out int pushFirst,out int pushSecond ST_ARGS", "if(pushed>0) nodes[pending++]=pushFirst;",
                "if(pushed>1) meshNodes[meshPending++]=pushSecond;"):
     require(query_rewrite, needle, "preview query rewrite")
-require(smooth, "std::uint32_t pairVisits = 48, dispersivePairVisits = 16, singleVisits = 64, singleChannelWalks = 3;", "walk budget")
+require(smooth, "std::uint32_t pairVisits = 48, dispersivePairVisits = 16, singleVisits = std::uint32_t(kMaximumRayVisits), singleChannelWalks = 3;", "walk budget")
 require(smooth, "inline constexpr std::uint64_t kPreviewUnfencedGlassPixels = 2560ull*1440ull;", "walk budget")
-fragment = region(backend, "std::string fixtureFragmentShaderSource (unsigned features)", "void readFixtureUniformLocations (", "fragment source")
+fragment = region(backend, "std::string fixtureFragmentShaderSource (unsigned features,", "void readFixtureUniformLocations (", "fragment source")
 require(fragment, "if ((features & kFixtureFragmentGlassPreview) != 0)", "fragment source")
 require(fragment, "transport = smoothglass::previewCameraTransportShader (std::move (transport), fastPreviewGlassVisits());", "fragment source")
 require(fragment, "query = smoothglass::previewQueryShader (std::move (query));", "fragment source")
@@ -551,14 +561,16 @@ for needle in ("gl.CompileShader", "gl.LinkProgram", "glFinish"):
     forbid(variant, needle, "preview variant")
 if variant.find("finishFixtureProgram (entry)") < variant.find("if (linked != GL_TRUE) return nullptr;"):
     errors.append("the preview variant reads its link status only after the completion poll")
-draw = region(backend, "const bool previewGlassFrame = runtimeInputs.previewUse && resources->smoothGlass.enabled", "result.rendered = true;", "scene draw")
-for needle in ("&& !roughGlassFrame && !diffractionFrame;",
+draw = region(backend, "const bool previewGlassFrame = !previewbudget::exportBudgets()", "result.rendered = true;", "scene draw")
+for needle in ("&& resources->smoothGlass.enabled && !roughGlassFrame && !diffractionFrame;",
                "const bool previewGlassWalk = previewGlassFrame && !previewbudget::exportBudgets();",
                "const auto* previewGlassProgram = previewGlassWalk\n            ? advancePreviewGlassProgram (gl, resources->sharedProgram.get()) : nullptr;",
                "const unsigned sceneProgram = previewGlassProgram ? previewGlassProgram->previewId : resources->program;",
                "gl.UseProgram (sceneProgram);",
-               "const bool bandFinish = smoothglass::cameraWalkBudget(runtimeInputs.previewUse, width, height).bandFinish;",
-               "                if (bandFinish)\n                {\n                    loopstep::Scope bandFinishScope (\"gl:closed-glass-band-finish\");\n                    glFinish();\n                }\n                else glFlush();",
+               # Test runs also finish every band so they can yield after each (231b51c672).
+               "const bool bandFinish = smoothglass::cameraWalkBudget(runtimeInputs.previewUse, width, height).bandFinish\n                || testpacing::enabled();",
+               "                if (bandFinish)\n                {\n                    loopstep::Scope bandFinishScope (\"gl:closed-glass-band-finish\");\n                    glFinish();",
+               "                    testpacing::afterSubmission(held);\n                }\n                else glFlush();",
                "queryAvailable(glassTimer->glassTimer[1], GL_QUERY_RESULT_AVAILABLE, &available);",
                "if (!(runtimeInputs.previewUse && runtimeInputs.previewCallerWaits))",
                "if (resources->smoothGlass.enabled && !roughGlassFrame && !runtimeInputs.previewUse) {",

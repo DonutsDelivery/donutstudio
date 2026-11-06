@@ -241,7 +241,7 @@ public:
     bool publishDiffractionMaterial (
         const GlbNativeSceneAdmission& admission,
         const diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest& request,
-        std::string& error);
+        std::string& error, bool exactComposedTarget = false);
 
     void clearSurfaceMaterial (
         const GlbNativeSceneAdmission& admission) noexcept;

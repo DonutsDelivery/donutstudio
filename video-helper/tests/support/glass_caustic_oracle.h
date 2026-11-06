@@ -501,14 +501,14 @@ struct BranchArrival
 {
     Hit receiver;
     double fraction;
-    std::uint64_t history;
+    gc::CausticHistory history;
     std::size_t interfaces,reflections;
 };
 struct BranchInterface
 {
     Hit surface;
     double incident,reflected,transmitted;
-    std::uint64_t history;
+    gc::CausticHistory history;
     std::size_t depth;
     bool tir;
     D3 facet {};
@@ -542,7 +542,7 @@ inline BranchOracle branchOracle(const Fixture& fixture,const gc::EntrySample& e
     {
         D3 origin,direction;
         double weight;
-        std::uint64_t history;
+        gc::CausticHistory history;
         std::size_t depth,reflections;
         bool inside;
     };
@@ -583,7 +583,7 @@ inline BranchOracle branchOracle(const Fixture& fixture,const gc::EntrySample& e
             if(fraction==0)return;
             if(fraction<minimumFraction) {result.unresolved+=fraction;return;}
             queue.push_back({plus(hit.position,normal,reflected?1e-8:-1e-8),direction,fraction,
-                photon.history|(reflected?(std::uint64_t(1)<<photon.depth):0),photon.depth+1,
+                photon.history.with(photon.depth,reflected),photon.depth+1,
                 photon.reflections+(reflected?1:0),reflected?photon.inside:!photon.inside});
         };
         const double reflected=photon.weight*reflectedWeight;

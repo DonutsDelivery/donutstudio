@@ -727,6 +727,8 @@ struct NativeFixtureSceneStats
     bool smoothGlassTransportApplied = false;
     // The frame was drawn by the Realtime program, not the backend's raster one.
     bool realtimeProgramApplied = false;
+    // The draw shaded the preview with the solid viewport mode.
+    bool viewportSolidApplied = false;
     std::uint64_t smoothGlassQueryBytes = 0;
     // Successful native shader-program builds performed by this preparation.
     std::uint32_t shaderProgramBuildCount = 0;
@@ -1149,7 +1151,8 @@ inline bool validNativeFixtureDiffractionParameters (
                             kMaximumSubstrateRefractiveIndex)
              || ! bounded (value.coating.z, 0.0f, kMaximumExtinctionCoefficient))
         return false;
-    if (value.coating.w != 0.0f
+    // Coating lane w is the pressed-disc flag (PitStatistics::PressedDisc).
+    if ((value.coating.w != 0.0f && value.coating.w != 1.0f)
         || ! bounded (value.roughness.x, 0.0f, kMaximumRmsHeightNanometres)
         || ! bounded (value.roughness.y, 0.0f, kMaximumRmsSlope)
         || ! bounded (value.roughness.z, 0.0f, kMaximumStreakSlope)
@@ -1447,6 +1450,17 @@ inline bool nativeFixtureDimensionsWithinBounds (std::uint32_t width,
 }
 
 inline constexpr unsigned kNativeDiffractionSubdivisions = 2;
+// The rows of a table with this many that one Realtime pixel gathers: every Nth from a
+// per-pixel start, N = max(1, floor(sqrt(rows))), as the shader's receiverStride and
+// gratingStride. Zero rows gather none.
+inline std::size_t nativeFixtureRealtimeDiffractionGatherRows(std::size_t rows) noexcept
+{
+    if (rows == 0) return 0;
+    std::size_t stride = static_cast<std::size_t>(std::sqrt(static_cast<double>(rows)));
+    while (stride > 1 && stride * stride > rows) --stride;
+    stride = std::max<std::size_t>(1, stride);
+    return (rows + stride - 1) / stride;
+}
 // Closest-hit queries one covered pixel can run against the actual tables.
 // False only when the count does not fit 64 bits.
 inline bool nativeFixtureDiffractionPixelQueries(std::size_t receiverSamples, std::size_t gratingSamples,
@@ -1863,12 +1877,12 @@ struct NativeFixtureSceneSubmission
 // missing identity is a new instance and must produce neutral per-note Motion.
 struct NativeSceneNoteMotionTransforms final
 {
-    std::array<std::int64_t, visualnoteinstancing::kMaximumInstances> identities {};
-    std::array<std::array<float, 4>, visualnoteinstancing::kMaximumInstances> transforms {};
+    std::vector<std::int64_t> identities;
+    std::vector<std::array<float, 4>> transforms;
     std::size_t count = 0;
     std::optional<std::array<float, 4>> find(std::int64_t identity) const noexcept
     {
-        if (identity == 0 || count > identities.size()) return {};
+        if (identity == 0 || count > identities.size() || count > transforms.size()) return {};
         for (std::size_t i = 0; i < count; ++i)
             if (identities[i] == identity) return transforms[i];
         return {};
@@ -2041,6 +2055,8 @@ struct NativeSceneMotionSample final
     float cameraVerticalFovDegrees = 0.0f;
     // A predecessor is reused only with the same checked static-local worlds.
     std::shared_ptr<const NativeImportedObjectWorlds> objectWorlds {};
+    // Prior Vertex Control Parameter bank, read with the prior time and spectrum.
+    std::vector<float> vertexControls {};
 };
 
 inline bool validNativeCompositionWorldTable(
@@ -2101,17 +2117,19 @@ inline bool validNativeImportedLightOverrideList(
     return true;
 }
 
-// The target must be a directional or point light, and each flagged field must
-// apply to that kind. Position offsets are point-only; rotation offsets are directional-only.
+// The target must be a directional, point, spot or area light, and each flagged field
+// must apply to that kind. Position offsets need a placed light (point, spot, area);
+// rotation offsets an aimed one (directional, spot, area).
 inline bool validNativeImportedLightOverrideTarget(const NativeImportedLightOverride& o,
     const HarmonicMIDI::grid::SceneLightRecord& target) noexcept
 {
     using namespace HarmonicMIDI::grid;
     const bool directional = target.kind == SceneLightKind::Directional;
     const bool point = target.kind == SceneLightKind::Point;
-    if (!directional && !point) return false;
-    if (o.hasPositionOffset && !point) return false;
-    if (o.hasRotationOffset && !directional) return false;
+    const bool spotOrArea = target.kind == SceneLightKind::Spot || target.kind == SceneLightKind::Area;
+    if (!directional && !point && !spotOrArea) return false;
+    if (o.hasPositionOffset && directional) return false;
+    if (o.hasRotationOffset && point) return false;
     return true;
 }
 
@@ -2179,6 +2197,16 @@ inline bool sameNativeImportedLightOverrides(
         && std::equal(a.begin(),a.end(),b.begin(),sameNativeImportedLightOverride);
 }
 
+// Camera runtime parameters evaluated one frame earlier by the clip's own
+// parameter evaluator (keyframes and baked modulation). With no adjacent
+// predecessor sample, Motion and motion blur read the prior camera from it.
+struct NativeRuntimeCameraHistory final
+{
+    std::array<float, 3> translationOffset {};
+    std::array<float, 3> rotationDegrees {};
+    float verticalFovDegrees = 0.0f;
+};
+
 struct NativeImportedSceneRuntimeInputs final
 {
     // Explicit HDR export working representation. Ordinary preview stays SDR.
@@ -2193,6 +2221,8 @@ struct NativeImportedSceneRuntimeInputs final
     bool previewCallerWaits = false;
     // The Realtime engine's draw, with no ray walks and no caustic. Also in the padding.
     bool realtimeEngine = false;
+    // Render Mode Fast on a Realtime preview: the screen-space reflection pass is skipped.
+    bool realtimeSkipReflections = false;
     // Exact authored selection copied for this draw, never a native cache key.
     std::optional<visualimportedscenerender::GlassCausticSelection> glassCaustic;
     float timeSeconds = 0.0f;
@@ -2207,6 +2237,10 @@ struct NativeImportedSceneRuntimeInputs final
     std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> diffractionSourceProgram;
     std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> diffractionEvaluatedProgram;
     std::array<float, 64> vertexSpectrum {};
+    // The vertex control bank (shared/VertexControlBank.h), one value per Vertex
+    // Control Parameter slot. Empty when the program reads none. The prior-frame
+    // evaluation reads the same bank.
+    std::vector<float> vertexControls;
     float morphWeight = 1.0f;
     std::uint64_t objectNodeStableId = 0;
     std::array<float, 3> objectTranslationOffset {};
@@ -2215,9 +2249,11 @@ struct NativeImportedSceneRuntimeInputs final
     std::array<float, 3> cameraTranslationOffset {};
     // Runtime camera rotation in degrees, composed like the object rotation.
     std::array<float, 3> cameraRotationDegrees {};
-    // Zero keeps the authored vertical field of view; otherwise degrees up to 179,
-    // from kMinimumCameraVerticalFovDegrees.
+    // Zero keeps the authored projection; positive is a perspective field of view in
+    // degrees up to 179, negative an orthographic view height (validRuntimeCameraFov).
     float cameraVerticalFovDegrees = 0.0f;
+    // Live lens values (runtimeCameraRecord). All zero keeps the authored lens.
+    std::array<float, 4> cameraLens {};
     std::optional<HarmonicMIDI::grid::SceneCameraRecord> cameraOverride;
     std::optional<HarmonicMIDI::grid::SceneLightRecord> lightOverride;
     // Sampled imported records are subordinate to explicit graph overrides.
@@ -2226,6 +2262,12 @@ struct NativeImportedSceneRuntimeInputs final
     // Modulated fields of animatedLights, applied after sampling. Sorted by index.
     std::vector<NativeImportedLightOverride> lightOverrides;
     float emissionGain = 1.0f;
+    // Preview-only solid viewport shading, never set for export. All zero is off.
+    // x: 1 on; y: lighting, 0 studio or 1 matcap; z: matcap 0..3;
+    // w: colour, 0 material, 1 object, 2 random, 3 single grey.
+    std::array<float, 4> viewportSolid {};
+    // x: 1 cavity; y: 1 X-ray (front surfaces drawn see-through).
+    std::array<float, 4> viewportSolidEffects {};
     std::shared_ptr<const canonicalblockc::CanonicalBlockCFrame> canonicalBlockCFrame;
     // The scene a material was admitted on, when the draw is a copy of it with other vertices.
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> materialAdmittedScene;
@@ -2234,9 +2276,14 @@ struct NativeImportedSceneRuntimeInputs final
     std::uint32_t rawExportMask = 0;
     std::optional<renderpasscomposite::Parameters> passComposite;
     std::optional<renderpasscomposite::Program> passProgram;
-    // Previous adjacent timeline sample. Absence produces exactly zero motion.
+    // The Render node's motion blur shutter in frames around this one. Raster and
+    // Realtime blur the Color image along its Motion over it; Path Trace samples it.
+    visualimportedscenerender::ShutterInterval motionBlur {};
+    // Previous adjacent timeline sample. Absence with no previousCamera produces exactly zero motion.
     // Raw RG16F stores current minus previous pixel position, positive Y upwards.
     std::optional<NativeSceneMotionSample> previousMotion;
+    // Used only when previousMotion is absent: the camera one frame earlier.
+    std::optional<NativeRuntimeCameraHistory> previousCamera;
     std::shared_ptr<const NativeDeformationCompositionFrame> compositionFrame {};
     std::shared_ptr<const videohelper::modelpayload::NativeSceneAnimationCompositionFrame> localSceneFrame {};
     // Checked static-local worlds of the admitted scene, or null for authored
@@ -2255,6 +2302,7 @@ inline bool sceneUsesMotionPass(const NativeImportedSceneRuntimeInputs& inputs)
 {
     return inputs.imageOutput == renderpassoutput::Output::Motion
         || render3dimage::exports(inputs.rawExportMask, renderpassoutput::Output::Motion)
+        || inputs.motionBlur.active()
         || renderpasscomposite::usesMotion(scenePassProgram(inputs));
 }
 
@@ -2319,7 +2367,27 @@ inline NativeSceneMotionSample sceneMotionSample(const NativeImportedSceneRuntim
         std::move(deformation), inputs.morphWeight, sceneNoteMotionTransforms(inputs), owner,
         {}, inputs.compositionFrame, inputs.localSceneFrame, inputs.objectNodeStableId,
         inputs.timeSeconds, inputs.vertexSpectrum, {}, inputs.cameraRotationDegrees,
-        inputs.cameraVerticalFovDegrees, inputs.objectWorlds };
+        inputs.cameraVerticalFovDegrees, inputs.objectWorlds, inputs.vertexControls };
+}
+
+// The prior sample Motion reads: the adjacent predecessor, else the current
+// sample with the camera evaluated one frame earlier, else the current sample.
+inline bool hasPriorMotionSample(const NativeImportedSceneRuntimeInputs& inputs) noexcept
+{
+    return inputs.previousMotion.has_value() || inputs.previousCamera.has_value();
+}
+
+inline NativeSceneMotionSample priorMotionSample(const NativeImportedSceneRuntimeInputs& inputs)
+{
+    if (inputs.previousMotion) return *inputs.previousMotion;
+    auto sample = sceneMotionSample(inputs);
+    if (inputs.previousCamera)
+    {
+        sample.cameraTranslationOffset = inputs.previousCamera->translationOffset;
+        sample.cameraRotationDegrees = inputs.previousCamera->rotationDegrees;
+        sample.cameraVerticalFovDegrees = inputs.previousCamera->verticalFovDegrees;
+    }
+    return sample;
 }
 
 inline bool validSceneMotionPositions(
@@ -2396,8 +2464,9 @@ using NativeDeformationRuntimeInputs = NativeImportedSceneRuntimeInputs;
 
 // Solid bodies appended to a composed scene take ids above this base. Their
 // node bits would otherwise alias an authored node's range, so an object-targeted
-// transform node never reaches them.
-inline constexpr std::uint32_t kAppendedSolidObjectIdBase = 0xFFFF0000u;
+// transform node never reaches them. The range holds 33,554,431 bodies, past
+// the 16,777,216 Count a Particles node accepts.
+inline constexpr std::uint32_t kAppendedSolidObjectIdBase = 0xFE000000u;
 
 inline bool runtimeTargetsObject(const NativeImportedSceneRuntimeInputs& inputs,
                                 const HarmonicMIDI::grid::SceneObjectRecord& object) noexcept
@@ -2510,13 +2579,15 @@ inline bool validateMaterialFrameForDraw(
 
 struct NativeNoteInstanceBatch final
 {
-    std::array<std::array<float, 4>, visualnoteinstancing::kMaximumInstances> transforms {};
-    std::array<float, visualnoteinstancing::kMaximumInstances> appearanceValues {};
+    // One entry per instance, sized from the Block C frame. count equals
+    // every vector's size.
+    std::vector<std::array<float, 4>> transforms;
+    std::vector<float> appearanceValues;
     std::array<float, 4> appearanceLow { 1.0f, 1.0f, 1.0f, 0.0f };
     std::array<float, 4> appearanceHigh { 1.0f, 1.0f, 1.0f, 0.0f };
     float meshScale = 1.0f;
-    std::array<std::int64_t, visualnoteinstancing::kMaximumInstances> identities {};
-    std::array<std::uint16_t, visualnoteinstancing::kMaximumInstances> canonicalRows {};
+    std::vector<std::int64_t> identities;
+    std::vector<std::uint32_t> canonicalRows;
     std::size_t count = 0;
     bool admitted = false;
 };
@@ -2553,13 +2624,18 @@ inline float nativeNoteAxisValue(visualnoteinstancing::MappingAxis axis, const f
     return 0.0f;
 }
 
+// Throws std::bad_alloc when the instance vectors cannot be allocated; that is
+// the only thing that stops a frame here.
 inline NativeNoteInstanceBatch prepareNativeNoteInstances(
-    const NativeFixtureSceneRuntimeInputs& inputs) noexcept
+    const NativeFixtureSceneRuntimeInputs& inputs)
 {
     NativeNoteInstanceBatch batch;
     if (!inputs.canonicalBlockCFrame || !inputs.noteInstanceMapping)
     {
-        batch.transforms[0] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        batch.transforms.push_back({ 0.0f, 0.0f, 0.0f, 1.0f });
+        batch.appearanceValues.push_back(0.0f);
+        batch.identities.push_back(0);
+        batch.canonicalRows.push_back(0);
         batch.count = 1;
         return batch;
     }
@@ -2581,14 +2657,24 @@ inline NativeNoteInstanceBatch prepareNativeNoteInstances(
             frame.noteTextureValues.data() + row * arbitblockc::kTexelsPerNote * 4u,
             frame.rootFrequencyHz);
     };
-    const auto rowLimit = std::min<std::size_t>(
-        static_cast<std::size_t>(frame.noteRows()), visualnoteinstancing::kMaximumInstances);
+    const auto rowLimit = static_cast<std::size_t>(frame.noteRows());
+    batch.transforms.reserve(rowLimit);
+    batch.appearanceValues.reserve(rowLimit);
+    batch.identities.reserve(rowLimit);
+    batch.canonicalRows.reserve(rowLimit);
     for (std::size_t row = 0; row < rowLimit; ++row)
     {
         const auto identity = frame.noteIdentities[row];
         if (identity == 0)
             continue;
         if (frame.notationRows[row].muted && !mapping.includeMuted)
+            continue;
+        if (!visualnoteinstancing::defaultSelection(mapping)
+            && !visualnoteinstancing::selects(mapping,
+                axisValue(visualnoteinstancing::MappingAxis::NoteAgeBeats, row),
+                axisValue(visualnoteinstancing::MappingAxis::RemainingDurationBeats, row),
+                mapping.filterAxis == visualnoteinstancing::kNoFilterAxis ? 0.0f
+                    : axisValue(static_cast<visualnoteinstancing::MappingAxis>(mapping.filterAxis), row)))
             continue;
         float meshScale = mapping.meshScale;
         if (velocityScale)
@@ -2611,12 +2697,12 @@ inline NativeNoteInstanceBatch prepareNativeNoteInstances(
             for (std::size_t coordinate = 0; coordinate < 3; ++coordinate)
                 if (!std::isfinite(transform[coordinate]) || std::abs(transform[coordinate]) > 1000000.0f)
                     return {};
-        const auto index = batch.count++;
-        batch.transforms[index] = transform;
-        batch.identities[index] = identity;
-        batch.canonicalRows[index] = static_cast<std::uint16_t>(row);
-        batch.appearanceValues[index] = visualnoteinstancing::appearanceValue(
-            mapping, identity, axisValue(visualnoteinstancing::MappingAxis::Velocity, row));
+        batch.transforms.push_back(transform);
+        batch.identities.push_back(identity);
+        batch.canonicalRows.push_back(static_cast<std::uint32_t>(row));
+        batch.appearanceValues.push_back(visualnoteinstancing::appearanceValue(
+            mapping, identity, axisValue(visualnoteinstancing::MappingAxis::Velocity, row)));
+        ++batch.count;
     }
     return batch;
 }
@@ -2633,14 +2719,22 @@ inline std::shared_ptr<const NativeSceneNoteMotionTransforms> sceneNoteMotionTra
     return table;
 }
 
-inline auto noteInstanceShaderTransforms(const NativeNoteInstanceBatch& batch) noexcept
+// One texel per instance. Native consumers admit v1-v3, whose scale is shared
+// by the mapping, so w carries the appearance value instead of another array.
+inline std::vector<std::array<float, 4>> noteInstanceShaderTransforms(const NativeNoteInstanceBatch& batch)
 {
     auto packed = batch.transforms;
-    // Native consumers admit v1-v3, whose scale is shared by the mapping.
-    // Its uniform frees w for appearance without another 128-element array.
     for (std::size_t index = 0; index < batch.count; ++index)
         packed[index][3] = batch.appearanceValues[index];
     return packed;
+}
+
+// The note texel textures are 1024 texels wide, instance i at (i % 1024, i / 1024),
+// like the Block C links. An empty batch keeps one zeroed row.
+inline constexpr std::size_t kNoteInstanceTextureWidth = 1024;
+inline std::size_t noteInstanceTextureRows(std::size_t count) noexcept
+{
+    return count == 0 ? 1 : (count + kNoteInstanceTextureWidth - 1) / kNoteInstanceTextureWidth;
 }
 
 // World matrix of one scene object instance: the object's column-major world
@@ -2670,26 +2764,31 @@ inline std::array<float, 16> nativeObjectInstanceMatrix(
     return result;
 }
 
-// Prior world matrix of one instance for Motion, packed into the three
-// per-instance vectors that mode 2 draws leave unused (identity color, color
-// and emission). Columns 0 to 2 and the translation fill them in order:
-// (c0.xyz, c1.x), (c1.yz, c2.xy), (c2.z, t.xyz). The shader rebuilds the same
-// column-major matrix that the current instance uses, so equal transforms give
-// the same projected position. objectWorld is the current world of the
-// instanced object, runtime transform included. The Motion delta then maps the
-// current runtime transform to the prior one, as for every other object. An
-// instance without a prior transform repeats its current one.
+// A prior model matrix packed into the three per-instance Motion vectors of
+// an instanced draw (attributes 9 to 11). Columns 0 to 2 and the translation
+// fill them in order: (c0.xyz, c1.x), (c1.yz, c2.xy), (c2.z, t.xyz). The shader
+// rebuilds the full affine matrix, so any scale, shear or turn survives.
+inline std::array<std::array<float, 4>, 3> nativePreviousMatrixColumns(const std::array<float, 16>& m) noexcept
+{
+    return {{ { m[0], m[1], m[2], m[4] }, { m[5], m[6], m[8], m[9] },
+        { m[10], m[12], m[13], m[14] } }};
+}
+
+// Prior world matrix of one instance of a scene's instanced object, for
+// Motion. previousObjectWorld is the instanced object's world one frame
+// earlier, with the current runtime transform the draw applies. The Motion
+// frame step then maps the current runtime transform to the prior one, as for
+// every other object. An instance without a prior transform repeats its
+// current one.
 inline std::array<std::array<float, 4>, 3> nativeObjectInstancePreviousColumns(
-    const std::array<float, 16>& objectWorld,
+    const std::array<float, 16>& previousObjectWorld,
     const HarmonicMIDI::grid::Visual3DScene& scene, std::size_t index) noexcept
 {
     const bool prior = scene.previousObjectInstanceCount != 0
         && scene.previousObjectInstanceCount == scene.objectInstanceCount
         && index < scene.previousObjectInstanceCount;
-    const auto m = nativeObjectInstanceMatrix(objectWorld,
-        prior ? scene.previousObjectInstances[index] : scene.objectInstances[index]);
-    return {{ { m[0], m[1], m[2], m[4] }, { m[5], m[6], m[8], m[9] },
-        { m[10], m[12], m[13], m[14] } }};
+    return nativePreviousMatrixColumns(nativeObjectInstanceMatrix(previousObjectWorld,
+        prior ? scene.previousObjectInstances[index] : scene.objectInstances[index]));
 }
 
 // One native renderer path draws a scene's instanced object. It has no
@@ -2830,22 +2929,60 @@ inline bool animatedLightsOwnedByScene(const HarmonicMIDI::grid::Visual3DScene& 
     return true;
 }
 
-// Zero keeps the authored field of view. Other values match the camera lowering range.
+// Zero keeps the authored projection. Positive values are a perspective vertical
+// field of view in degrees, in the camera lowering range. Negative values make the
+// camera orthographic, with the magnitude as the full view height in world units.
+inline constexpr float kMaximumRuntimeOrthographicHeight = 10000000.0f;
 inline bool validRuntimeCameraFov(float degrees) noexcept
 {
     return std::isfinite(degrees)
-        && (degrees == 0.0f || (degrees >= HarmonicMIDI::grid::kMinimumCameraVerticalFovDegrees && degrees <= 179.0f));
+        && (degrees == 0.0f || (degrees >= HarmonicMIDI::grid::kMinimumCameraVerticalFovDegrees && degrees <= 179.0f)
+            || (degrees < 0.0f && -degrees <= kMaximumRuntimeOrthographicHeight));
+}
+
+// Live lens values, in kRuntimeCameraLens* order. Zero focus distance, f-stop or
+// aperture aspect keeps the authored value; blade rotation adds degrees.
+inline constexpr std::size_t kRuntimeCameraLensFocusDistance = 0;
+inline constexpr std::size_t kRuntimeCameraLensFStop = 1;
+inline constexpr std::size_t kRuntimeCameraLensBladeRotationDegrees = 2;
+inline constexpr std::size_t kRuntimeCameraLensApertureRatio = 3;
+
+inline bool validRuntimeCameraLens(const std::array<float, 4>& lens) noexcept
+{
+    const auto kept = [](float value, float minimum, float maximum)
+    { return std::isfinite(value) && (value == 0.0f || (value >= minimum && value <= maximum)); };
+    return kept(lens[kRuntimeCameraLensFocusDistance], 0.001f, 1000000.0f)
+        && kept(lens[kRuntimeCameraLensFStop], 0.1f, 128.0f)
+        && std::isfinite(lens[kRuntimeCameraLensBladeRotationDegrees])
+        && std::abs(lens[kRuntimeCameraLensBladeRotationDegrees]) <= 360.0f
+        && kept(lens[kRuntimeCameraLensApertureRatio], 0.01f, 100.0f);
 }
 
 // Runtime camera adjustments on an authored camera record. Translation is added
 // in world space. Rotation is composed on the left, as applyRuntimeObjectTransform
 // does for objects, and a zero rotation leaves the authored quaternion bit-exact.
-// A zero field of view keeps the authored vertical field of view.
+// A zero field of view keeps the authored projection; see validRuntimeCameraFov.
+// Lens values apply only to a camera whose Depth of field is on, so a pinhole stays a pinhole.
+// True when the frame views `scene` orthographically: the runtime camera value
+// (cameraVerticalFovDegrees) is an orthographic height, or it keeps the authored
+// projection and the active camera is orthographic.
+inline bool sceneViewIsOrthographic(const HarmonicMIDI::grid::Visual3DScene& scene,
+                                    float runtimeCameraValue) noexcept
+{
+    if (runtimeCameraValue != 0.0f)
+        return runtimeCameraValue < 0.0f;
+    for (std::size_t i = 0; i < scene.cameraCount; ++i)
+        if (scene.cameras[i].id == scene.activeCamera)
+            return scene.cameras[i].orthographic();
+    return false;
+}
+
 inline HarmonicMIDI::grid::SceneCameraRecord runtimeCameraRecord(
     HarmonicMIDI::grid::SceneCameraRecord camera,
     const std::array<float, 3>& translationOffset,
     const std::array<float, 3>& rotationDegrees,
-    float verticalFovDegrees) noexcept
+    float verticalFovDegrees,
+    const std::array<float, 4>& lens = {}) noexcept
 {
     camera.transform.translation.x += translationOffset[0];
     camera.transform.translation.y += translationOffset[1];
@@ -2853,7 +2990,22 @@ inline HarmonicMIDI::grid::SceneCameraRecord runtimeCameraRecord(
     camera.transform.rotation = multiplySceneQuaternion(
         runtimeEulerQuaternion(rotationDegrees), camera.transform.rotation);
     if (verticalFovDegrees > 0.0f)
+    {
         camera.verticalFovRadians = verticalFovDegrees * 0.01745329251994329577f;
+        camera.orthographicHeight = 0.0f;
+    }
+    else if (verticalFovDegrees < 0.0f)
+        camera.orthographicHeight = -verticalFovDegrees;
+    if (HarmonicMIDI::grid::sceneCameraHasLens(camera))
+    {
+        if (lens[kRuntimeCameraLensFocusDistance] > 0.0f)
+            camera.focusDistance = lens[kRuntimeCameraLensFocusDistance];
+        if (lens[kRuntimeCameraLensFStop] > 0.0f)
+            camera.fStop = lens[kRuntimeCameraLensFStop];
+        camera.bladeRotationRadians += lens[kRuntimeCameraLensBladeRotationDegrees] * 0.01745329251994329577f;
+        if (lens[kRuntimeCameraLensApertureRatio] > 0.0f)
+            camera.apertureRatio = lens[kRuntimeCameraLensApertureRatio];
+    }
     return camera;
 }
 
@@ -2986,11 +3138,43 @@ struct NativeSceneMotionUniforms final
     std::array<float, 4> viewport {};
 };
 
+// The authored camera Motion reads one frame earlier: the predecessor's override
+// or animated camera, else the scene record's previous camera when the frame
+// draws the scene's own active camera, else the current one.
+inline const HarmonicMIDI::grid::SceneCameraRecord& priorAuthoredCamera(
+    const NativeFixtureSceneRuntimeInputs& inputs,
+    const std::optional<HarmonicMIDI::grid::SceneCameraRecord>& previousOverride,
+    const std::optional<HarmonicMIDI::grid::SceneCameraRecord>& scenePrevious,
+    const HarmonicMIDI::grid::SceneCameraRecord& camera) noexcept
+{
+    if (previousOverride)
+        return *previousOverride;
+    if (scenePrevious && !inputs.cameraOverride && !inputs.animatedCamera)
+        return *scenePrevious;
+    return camera;
+}
+
+// The camera one frame earlier with that frame's runtime offsets: the one
+// prior camera that Motion, the Motion output and motion blur all read. Empty
+// when there is no prior frame, so the camera holds still.
+inline std::optional<HarmonicMIDI::grid::SceneCameraRecord> priorRuntimeCamera(
+    const NativeFixtureSceneRuntimeInputs& inputs, const HarmonicMIDI::grid::SceneCameraRecord& camera,
+    const std::optional<HarmonicMIDI::grid::SceneCameraRecord>& scenePrevious = std::nullopt)
+{
+    const auto previous = priorMotionSample(inputs);
+    const auto& authored = priorAuthoredCamera(inputs, previous.cameraOverride, scenePrevious, camera);
+    if (!hasPriorMotionSample(inputs) && &authored == &camera)
+        return std::nullopt;
+    return runtimeCameraRecord(authored, previous.cameraTranslationOffset,
+        previous.cameraRotationDegrees, previous.cameraVerticalFovDegrees);
+}
+
 inline NativeSceneMotionUniforms sceneMotionUniforms(const NativeFixtureSceneRuntimeInputs& inputs,
-    const HarmonicMIDI::grid::SceneCameraRecord& camera, std::uint32_t width, std::uint32_t height) noexcept
+    const HarmonicMIDI::grid::SceneCameraRecord& camera, std::uint32_t width, std::uint32_t height,
+    const std::optional<HarmonicMIDI::grid::SceneCameraRecord>& scenePrevious = std::nullopt) noexcept
 {
     NativeSceneMotionUniforms result;
-    const auto previous = inputs.previousMotion.value_or(sceneMotionSample(inputs));
+    const auto previous = priorMotionSample(inputs);
     const auto currentRotation = runtimeEulerQuaternion(inputs.objectRotationDegrees);
     const auto previousRotation = runtimeEulerQuaternion(previous.objectRotationDegrees);
     const auto delta = multiplySceneQuaternion(previousRotation,
@@ -3010,15 +3194,17 @@ inline NativeSceneMotionUniforms sceneMotionUniforms(const NativeFixtureSceneRun
         result.rotation = { 0.0f, 0.0f, 0.0f, 1.0f };
         result.translationScale = { 0.0f, 0.0f, 0.0f, 1.0f };
     }
-    const auto& authoredPriorCamera = previous.cameraOverride ? *previous.cameraOverride : camera;
-    const auto priorCamera = runtimeCameraRecord(authoredPriorCamera, previous.cameraTranslationOffset,
+    const auto priorCamera = priorRuntimeCamera(inputs, camera, scenePrevious);
+    const auto prior = priorCamera ? *priorCamera : runtimeCameraRecord(camera, previous.cameraTranslationOffset,
         previous.cameraRotationDegrees, previous.cameraVerticalFovDegrees);
-    const auto& q = priorCamera.transform.rotation;
-    const auto& p = priorCamera.transform.translation;
+    const auto& q = prior.transform.rotation;
+    const auto& p = prior.transform.translation;
     result.cameraRotation = { q.x, q.y, q.z, q.w };
     result.cameraTranslation = { p.x, p.y, p.z, 0 };
-    result.projection = { std::tan(priorCamera.verticalFovRadians * 0.5f), static_cast<float>(width) / height,
-        priorCamera.nearPlane, inputs.previousMotion ? 1.0f : 0.0f };
+    // A negative x is an orthographic camera's half height, as the current projection.
+    result.projection = { prior.orthographic() ? -0.5f * prior.orthographicHeight
+                              : std::tan(prior.verticalFovRadians * 0.5f), static_cast<float>(width) / height,
+        prior.nearPlane, priorCamera.has_value() ? 1.0f : 0.0f };
     result.viewport = { static_cast<float>(width), static_cast<float>(height), 0, 0 };
     return result;
 }
@@ -3082,6 +3268,71 @@ inline bool sceneObjectHasOwnPrior(const HarmonicMIDI::grid::Visual3DScene& scen
         && !sameSceneTransform(scene.previousObjectTransforms[index], scene.objects[index].transform);
 }
 
+// True when object index's own Motion step is a similarity the motion
+// uniforms can carry: the object's current and prior transforms and its
+// parents all scale uniformly. Any other step travels as a full prior model
+// matrix (nativePreviousObjectMatrix).
+inline bool sceneObjectStepIsSimilarity(const HarmonicMIDI::grid::Visual3DScene& scene, std::size_t index) noexcept
+{
+    const auto uniform = [](const HarmonicMIDI::grid::SceneTransform3D& transform) {
+        return transform.scale.x > 0.0f && transform.scale.x == transform.scale.y
+            && transform.scale.x == transform.scale.z;
+    };
+    const auto& object = scene.objects[index];
+    bool similar = uniform(object.transform)
+        && (scene.previousObjectTransformCount != scene.objectCount || uniform(scene.previousObjectTransforms[index]));
+    auto parent = object.parent;
+    for (std::size_t depth = 0; similar && parent.isValid() && depth < scene.objectCount; ++depth)
+    {
+        const auto* record = HarmonicMIDI::grid::visual3d_detail::findById(scene.objects, scene.objectCount, parent);
+        similar = record != nullptr && uniform(record->transform);
+        parent = record != nullptr ? record->parent : HarmonicMIDI::grid::SceneObjectId {};
+    }
+    return similar;
+}
+
+// Object index's world one frame earlier, column-major: its parents' current
+// transforms times its own prior transform, or its current one without a
+// prior. The parent walk stops at objectCount steps, as the raster's does.
+inline std::array<float, 16> nativePreviousSceneWorld(const HarmonicMIDI::grid::Visual3DScene& scene,
+                                                      std::size_t index) noexcept
+{
+    static constexpr std::array<float, 16> identity { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    const auto& object = scene.objects[index];
+    auto world = nativeObjectInstanceMatrix(identity,
+        scene.previousObjectTransformCount == scene.objectCount ? scene.previousObjectTransforms[index]
+                                                                : object.transform);
+    auto parent = object.parent;
+    for (std::size_t depth = 0; parent.isValid() && depth < scene.objectCount; ++depth)
+    {
+        const auto* record = HarmonicMIDI::grid::visual3d_detail::findById(scene.objects, scene.objectCount, parent);
+        if (record == nullptr) break;
+        const auto parentMatrix = nativeObjectInstanceMatrix(identity, record->transform);
+        std::array<float, 16> product {};
+        for (std::size_t column = 0; column < 4; ++column)
+            for (std::size_t row = 0; row < 4; ++row)
+                for (std::size_t inner = 0; inner < 4; ++inner)
+                    product[column * 4 + row] += parentMatrix[inner * 4 + row] * world[column * 4 + inner];
+        world = product;
+        parent = record->parent;
+    }
+    return world;
+}
+
+// The frame Motion uniforms of a draw without an own step: the frame's object
+// step when the runtime transform targets the draw, else identity, and the
+// camera step either way. Instanced draws use it; each instance carries its
+// own prior matrix.
+inline NativeSceneMotionUniforms sceneFrameMotionUniforms(NativeSceneMotionUniforms motion, bool targeted) noexcept
+{
+    if (!targeted)
+    {
+        motion.rotation = { 0, 0, 0, 1 };
+        motion.translationScale = { 0, 0, 0, 1 };
+    }
+    return motion;
+}
+
 // Retained prior positions cover a prefix of the scene vertices. A shorter
 // prefix leaves the vertices past it to objects that carry their own prior
 // transform and keep their current local positions, so no object may straddle
@@ -3094,39 +3345,6 @@ inline bool sceneMotionPositionsMatch(const HarmonicMIDI::grid::Visual3DScene& s
     {
         const auto& object = scene.objects[index];
         if (object.firstVertex < count && object.firstVertex + object.vertexCount > count) return false;
-    }
-    return true;
-}
-
-// An object's own prior reaches the shader through the Motion rotation, uniform
-// scale and translation. That holds only for an individually drawn object whose
-// current and prior transforms and every ancestor have uniform scale.
-inline bool nativeObjectPriorTransformsSupported(const HarmonicMIDI::grid::Visual3DScene& scene,
-    const NativeFixtureSceneRuntimeInputs& inputs, bool sharedInstances, std::string& error)
-{
-    if (scene.previousObjectTransformCount == 0 || !sceneUsesMotionPass(inputs)) return true;
-    const auto uniform = [](const HarmonicMIDI::grid::SceneTransform3D& transform) {
-        return transform.scale.x > 0.0f && transform.scale.x == transform.scale.y
-            && transform.scale.x == transform.scale.z;
-    };
-    for (std::size_t index = 0; index < scene.objectCount; ++index)
-    {
-        if (!sceneObjectHasOwnPrior(scene, index)) continue;
-        const auto& object = scene.objects[index];
-        bool valid = !sharedInstances && object.id != scene.instancedObject
-            && uniform(object.transform) && uniform(scene.previousObjectTransforms[index]);
-        auto parent = object.parent;
-        for (std::size_t depth = 0; valid && parent.isValid() && depth < scene.objectCount; ++depth)
-        {
-            const auto* record = findFixtureObject(scene, parent);
-            valid = record != nullptr && uniform(record->transform);
-            parent = record != nullptr ? record->parent : HarmonicMIDI::grid::SceneObjectId {};
-        }
-        if (!valid)
-        {
-            error = "Motion output for scene objects with their own prior transform requires individual draws with uniform scale";
-            return false;
-        }
     }
     return true;
 }
@@ -3160,12 +3378,9 @@ inline NativeSceneMotionUniforms sceneObjectMotionUniforms(NativeSceneMotionUnif
     const HarmonicMIDI::grid::Visual3DScene& scene, std::size_t index,
     const HarmonicMIDI::grid::SceneTransform3D& runtime, bool targeted) noexcept
 {
-    if (!targeted)
-    {
-        motion.rotation = { 0, 0, 0, 1 };
-        motion.translationScale = { 0, 0, 0, 1 };
-    }
-    if (!sceneObjectHasOwnPrior(scene, index)) return motion;
+    motion = sceneFrameMotionUniforms(motion, targeted);
+    // A step that is not a similarity travels in nativePreviousObjectMatrix.
+    if (!sceneObjectHasOwnPrior(scene, index) || !sceneObjectStepIsSimilarity(scene, index)) return motion;
     const auto& object = scene.objects[index];
     NativeSceneSimilarity parentWorld;
     auto parent = object.parent;
@@ -3193,6 +3408,34 @@ inline std::array<float, 16> nativeWorldProduct(const std::array<float, 16>& lef
             for (std::size_t inner = 0; inner < 4; ++inner)
                 result[column * 4 + row] += left[inner * 4 + row] * right[column * 4 + inner];
     return result;
+}
+
+// The frame object step of motion as a world matrix, p -> rotate(q, p) * s + t,
+// the map the shader applies after the prior model matrix.
+inline std::array<float, 16> sceneFrameStepMatrix(const NativeSceneMotionUniforms& motion) noexcept
+{
+    static constexpr std::array<float, 16> identity { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    HarmonicMIDI::grid::SceneTransform3D step;
+    step.translation = { motion.translationScale[0], motion.translationScale[1], motion.translationScale[2] };
+    step.rotation = { motion.rotation[0], motion.rotation[1], motion.rotation[2], motion.rotation[3] };
+    step.scale = { motion.translationScale[3], motion.translationScale[3], motion.translationScale[3] };
+    return nativeObjectInstanceMatrix(identity, step);
+}
+
+// The prior world of instance index in a shared Geometry Core draw, with the
+// runtime frame step folded in for that instance alone. The runtime transform
+// may target some instances and not others, so the draw's motion uniforms carry
+// the camera step only (sceneFrameMotionUniforms(motion, false)). A targeted
+// instance takes the runtime transform it applies now and then the frame step;
+// an untargeted one takes neither. currentMatrix is the instance's world now.
+inline std::array<float, 16> nativeSharedInstancePreviousWorld(const HarmonicMIDI::grid::Visual3DScene& scene,
+    std::size_t index, const NativeSceneMotionUniforms& motion, bool targeted,
+    const std::array<float, 16>& runtimeMatrix, const std::array<float, 16>& currentMatrix) noexcept
+{
+    static constexpr std::array<float, 16> identity { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    const auto prior = !sceneObjectHasOwnPrior(scene, index) ? currentMatrix
+        : nativeWorldProduct(targeted ? runtimeMatrix : identity, nativePreviousSceneWorld(scene, index));
+    return targeted ? nativeWorldProduct(sceneFrameStepMatrix(motion), prior) : prior;
 }
 
 // Inverse of a checked world. Empty when its linear part is singular.
@@ -3303,13 +3546,12 @@ inline NativeSceneMotionUniforms sceneObjectWorldMotionUniforms(NativeSceneMotio
     const auto* after = nativeObjectWorldEntry(current, object);
     if (before == nullptr || after == nullptr || before->world == after->world) return motion;
     NativeSceneSimilarity step;
-    // nativeObjectWorldMotionSupported refuses every changed world without a similarity.
+    // Any other step travels as the full prior matrix (nativePreviousObjectMatrix).
     if (!nativeObjectWorldStep(before->world, after->world, step)) return motion;
     return withSceneObjectOwnStep(motion, runtime, step);
 }
 
-// Motion output under checked static-local worlds. A changed world must differ from
-// its prior world by a similarity, the prior frame must name the same objects, and
+// Motion output under checked static-local worlds. The prior frame must name the same objects, and
 // no object may also carry a scene prior transform, because the worlds replace the
 // authored chain that such a transform builds on.
 inline bool nativeObjectWorldMotionSupported(const HarmonicMIDI::grid::Visual3DScene& scene,
@@ -3332,14 +3574,34 @@ inline bool nativeObjectWorldMotionSupported(const HarmonicMIDI::grid::Visual3DS
             error = "Motion output prior static local object worlds do not match the drawn scene objects";
             return false;
         }
-        NativeSceneSimilarity step;
-        if (before->world != entry.world && !nativeObjectWorldStep(before->world, entry.world, step))
-        {
-            error = "Motion output for static local object worlds requires each changed world to differ by a rotation, uniform scale and translation";
-            return false;
-        }
     }
     return true;
+}
+
+// The prior model matrix one draw's Motion reads before the frame step. A
+// similarity own step travels in the motion uniforms (sceneObjectMotionUniforms,
+// sceneObjectWorldMotionUniforms), so the draw repeats its current matrix.
+// Any other step, such as a turn under non-uniform scale or a changed shear,
+// travels here in full: runtimeMatrix, the runtime transform the draw applies
+// now (identity when untargeted), times the object's prior world.
+inline std::array<float, 16> nativePreviousObjectMatrix(const HarmonicMIDI::grid::Visual3DScene& scene,
+    std::size_t index, const NativeFixtureSceneRuntimeInputs& inputs, const std::array<float, 16>& runtimeMatrix,
+    const std::array<float, 16>& objectMatrix) noexcept
+{
+    const auto& object = scene.objects[index];
+    if (inputs.objectWorlds)
+    {
+        const auto* before = inputs.previousMotion
+            ? nativeObjectWorldEntry(inputs.previousMotion->objectWorlds.get(), object.id) : nullptr;
+        const auto* after = nativeObjectWorldEntry(inputs.objectWorlds.get(), object.id);
+        NativeSceneSimilarity step;
+        if (before == nullptr || after == nullptr || before->world == after->world
+            || nativeObjectWorldStep(before->world, after->world, step))
+            return objectMatrix;
+        return nativeWorldProduct(runtimeMatrix, before->world);
+    }
+    if (!sceneObjectHasOwnPrior(scene, index) || sceneObjectStepIsSimilarity(scene, index)) return objectMatrix;
+    return nativeWorldProduct(runtimeMatrix, nativePreviousSceneWorld(scene, index));
 }
 
 inline bool validFixtureLightOverride(
@@ -3350,7 +3612,14 @@ inline bool validFixtureLightOverride(
         || (light->id.isValid()
             && (light->kind == SceneLightKind::Directional
                 || light->kind == SceneLightKind::Point
+                || light->kind == SceneLightKind::Spot
+                || light->kind == SceneLightKind::Area
                 || light->kind == SceneLightKind::Environment)
+            && (light->kind != SceneLightKind::Spot
+                || (std::isfinite(light->innerConeAngle) && std::isfinite(light->outerConeAngle)
+                    && light->innerConeAngle >= 0.0f && light->outerConeAngle > light->innerConeAngle
+                    && light->outerConeAngle <= 1.5707964f))
+            && validSceneLightShapeFields(*light)
             && visual3d_detail::validTransform(light->transform)
             && visual3d_detail::finite(light->color)
             && visual3d_detail::nonNegative(light->color)
@@ -3372,12 +3641,15 @@ inline bool validFixtureRuntimeInputs(
     const auto validPreviousNotes = [](const auto& table)
     {
         if (!table) return true;
-        if (table->count > table->identities.size()) return false;
+        if (table->count > table->identities.size() || table->count > table->transforms.size()) return false;
+        // Sorted copy: the table is sized from the score, so duplicates are found
+        // without comparing every pair.
+        std::vector<std::int64_t> sorted(table->identities.begin(), table->identities.begin() + table->count);
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) return false;
         for (std::size_t i = 0; i < table->count; ++i)
         {
             if (table->identities[i] == 0) return false;
-            for (std::size_t j = 0; j < i; ++j)
-                if (table->identities[i] == table->identities[j]) return false;
             for (const auto value : table->transforms[i])
                 if (!std::isfinite(value)) return false;
             if (table->transforms[i][3] <= 0.0f || table->transforms[i][3] > 10000.0f) return false;
@@ -3398,6 +3670,9 @@ inline bool validFixtureRuntimeInputs(
             || inputs.imageOutput == renderpassoutput::Output::Emission)
         && std::all_of(inputs.vertexSpectrum.begin(), inputs.vertexSpectrum.end(), [](float value)
             { return std::isfinite(value) && value >= 0.0f && value <= 1.0f; })
+        && inputs.vertexControls.size() <= 4096
+        && std::all_of(inputs.vertexControls.begin(), inputs.vertexControls.end(), [](float value)
+            { return std::isfinite(value); })
         && (!inputs.previousMotion || (valid(inputs.previousMotion->objectTranslationOffset, 1000000.0f)
             && valid(inputs.previousMotion->objectRotationDegrees, 360.0f)
             && std::isfinite(inputs.previousMotion->objectScale)
@@ -3430,6 +3705,7 @@ inline bool validFixtureRuntimeInputs(
         && valid(inputs.cameraTranslationOffset, 1000000.0f)
         && valid(inputs.cameraRotationDegrees, 360.0f)
         && validRuntimeCameraFov(inputs.cameraVerticalFovDegrees)
+        && validRuntimeCameraLens(inputs.cameraLens)
         && validFixtureCameraOverride(inputs.animatedCamera)
         && HarmonicMIDI::grid::validSceneAnalyticSkySet(inputs.animatedLights.data(),inputs.animatedLights.size())
         && std::all_of(inputs.animatedLights.begin(), inputs.animatedLights.end(),
@@ -3438,6 +3714,13 @@ inline bool validFixtureRuntimeInputs(
                     if (!std::isfinite(light.innerConeAngle) || !std::isfinite(light.outerConeAngle)
                         || light.innerConeAngle < 0 || light.outerConeAngle <= light.innerConeAngle
                         || light.outerConeAngle > 1.5707964f) return false;
+                    light.kind = HarmonicMIDI::grid::SceneLightKind::Point;
+                }
+                // An animated area light carries its shape fields; check them, then the shared fields as a point.
+                if (light.kind == HarmonicMIDI::grid::SceneLightKind::Area) {
+                    if (!(light.areaSizeX > 0.0f) || !(light.areaSizeY > 0.0f) || !std::isfinite(light.areaSizeX)
+                        || !std::isfinite(light.areaSizeY) || !(light.spread > 0.0f) || !(light.spread <= 3.1415927f)
+                        || light.areaShape > HarmonicMIDI::grid::SceneAreaLightShape::Ellipse) return false;
                     light.kind = HarmonicMIDI::grid::SceneLightKind::Point;
                 }
                 return validFixtureLightOverride(light);
@@ -3450,6 +3733,10 @@ inline bool validFixtureRuntimeInputs(
         && (!inputs.objectWorlds || validNativeImportedObjectWorlds(*inputs.objectWorlds))
         && std::isfinite(inputs.emissionGain)
         && inputs.emissionGain >= 0.0f
+        && std::all_of(inputs.viewportSolid.begin(), inputs.viewportSolid.end(),
+            [](float value) { return std::isfinite(value); })
+        && std::all_of(inputs.viewportSolidEffects.begin(), inputs.viewportSolidEffects.end(),
+            [](float value) { return std::isfinite(value); })
         && (static_cast<bool>(inputs.canonicalBlockCFrame)
                 == inputs.noteInstanceMapping.has_value())
         && (!inputs.canonicalBlockCFrame
@@ -3512,12 +3799,14 @@ public:
     // when the admitted material makes the program key known, before the first
     // frame renders, so a cold link starts at admission instead of at the first
     // fixture prepare. Backends without an async link keep their own schedule.
+    // cameraVisits is the scene's smoothglass::cameraVisitsFor, part of the program key.
     virtual void startFixtureProgramLink (
         const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>&,
-        bool distinctGrating, bool causticVolume)
+        bool distinctGrating, bool causticVolume, std::uint32_t cameraVisits)
     {
         (void) distinctGrating;
         (void) causticVolume;
+        (void) cameraVisits;
     }
     virtual NativeFixtureScenePreparation prepare (
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
@@ -3583,8 +3872,10 @@ NativeFixtureSceneBackend& nativeFixtureSceneBackend();
 // only per-frame pose and weights.  The native backend must execute deformation
 // and the draw on the GPU.  There is no CPU image or CPU-deformed-vertex path.
 inline constexpr std::size_t kNativeDeformationMaxVertices = 4096;
-inline constexpr std::size_t kNativeDeformationMaxJoints = 64;
-inline constexpr std::size_t kNativeDeformationMaxMorphTargets = 8;
+// Joint and morph counts travel as uint32 uniforms; the palette and weights are
+// sized from the skin and mesh, so the uint32 range is the only bound.
+inline constexpr std::size_t kNativeDeformationMaxJoints = std::numeric_limits<std::uint32_t>::max();
+inline constexpr std::size_t kNativeDeformationMaxMorphTargets = std::numeric_limits<std::uint32_t>::max();
 
 struct NativeDeformationJointBaseTransform
 {
@@ -3633,8 +3924,9 @@ struct NativeDeformationScene
 
 struct NativeDeformationFrameData
 {
-    std::array<float, kNativeDeformationMaxJoints * 16> jointPalette {};
-    std::array<float, kNativeDeformationMaxMorphTargets> morphWeights {};
+    // max(1, jointCount) * 16 and max(1, morphTargetCount) floats, so GPU uploads never take zero bytes.
+    std::vector<float> jointPalette = std::vector<float> (16, 0.0f);
+    std::vector<float> morphWeights = std::vector<float> (1, 0.0f);
     std::uint32_t vertexCount = 0;
     std::uint32_t jointCount = 0;
     std::uint32_t morphTargetCount = 0;

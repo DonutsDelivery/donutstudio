@@ -731,8 +731,7 @@ int main()
         if (geometry)
         {
             const auto& mesh = std::get<videowire::geometry::GeometryData>(geometry->descriptor().data);
-            check(!mesh.positions.empty() && mesh.positions.size() <= videowire::geometry::scorefield::kMaximumElements,
-                  "bundled card mesh fits the score-field sample limit");
+            check(!mesh.positions.empty(), "bundled card mesh supplies score-field samples");
         }
     }
     {

@@ -405,8 +405,9 @@ void pairedShaderText()
         const auto walk = walkAt == std::string::npos || walkEnd == std::string::npos
             ? std::string {} : paired.substr(walkAt, walkEnd - walkAt);
         check(walk.find("visit<48") != std::string::npos && walk.find("visit<64") == std::string::npos
-                  && paired.find("for(int visit=0;visit<64;++visit)") != std::string::npos,
-              name + " only the paired walk takes the 48 visit loop; glassTransport keeps 64");
+                  && paired.find("for(int visit=0;visit<GLASS_CAMERA_VISITS;++visit)") != std::string::npos
+                  && paired.find("#define GLASS_CAMERA_VISITS 64\n") != std::string::npos,
+              name + " only the paired walk takes the 48 visit loop; glassTransport keeps the 64-visit setting");
         // Nondispersive glass walks once for three channels with 48 visits;
         // dispersive glass walks each channel with 16. Both stay within 48.
         check(walk.find("bool sharedPaths=volumeDispersion==0.0;") != std::string::npos
@@ -935,7 +936,7 @@ void starterSharedEdgeRaster()
         maximumVisits = std::max(maximumVisits, receipt.visits);
     }
     check(allComplete, "every starter lens walk completes within the 1e-4 tail policy: " + error);
-    check(maximumVisits < gc::kMaximumBranchVisits, "no starter walk reaches the visit cap");
+    check(maximumVisits < gc::kDefaultBranchVisits, "no starter walk reaches the visit cap");
 
     // The pixel-centre hit on the tower front face, next to the shared diagonal.
     const auto ray = gc::cameraRay(frame, 1580.5f, 861.5f);
@@ -1196,7 +1197,7 @@ void starterSphereFocus()
         }
     }
     check(allComplete, "every sphere lens walk completes within the 1e-4 tail policy: " + error);
-    check(maximumVisits < gc::kMaximumBranchVisits, "no sphere lens walk reaches the visit cap");
+    check(maximumVisits < gc::kDefaultBranchVisits, "no sphere lens walk reaches the visit cap");
     check(incident > 0 && focused >= 0.5 * incident,
           "the lens focuses at least half its power into the tower-front spot ("
           + std::to_string(incident > 0 ? focused / incident : 0.0) + ")");

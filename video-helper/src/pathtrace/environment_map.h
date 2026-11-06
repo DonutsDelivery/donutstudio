@@ -38,7 +38,9 @@
 
 #include "vec_math.h"
 #include "devices/device_interface.h"
+#if ! defined(PATHTRACE_DEVICE_METAL)
 #include "../../../shared/Visual3DScene.h"
+#endif
 
 #include <array>
 #include <cstdint>
@@ -48,6 +50,8 @@
 namespace videohelper::pathtrace
 {
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 // Linear RGB texels, row-major, row 0 at the zenith.
 using EnvironmentTexels = std::vector<std::array<float, 3>>;
 
@@ -73,6 +77,7 @@ EnvironmentPixels copyEnvironmentPixels (std::uint32_t width, std::uint32_t heig
 // (fixture_environment_image.h uniforms()).
 Vec3 environmentImageTint (const HarmonicMIDI::grid::SceneLightRecord& record) noexcept;
 float environmentImageOrientationRadians (const HarmonicMIDI::grid::SceneLightRecord& record) noexcept;
+#endif
 
 // The read side of a built map: plain data over borrowed buffers, so the same
 // lookup and sampling code runs on a device once the buffers are uploaded. An
@@ -140,6 +145,8 @@ private:
     PT_SHARED_ENTRY std::uint32_t columnOf (float u) const noexcept;
 };
 
+// Host only: the Metal kernel (device_metal.metal) leaves this out.
+#if ! defined(PATHTRACE_DEVICE_METAL)
 class EnvironmentMap : public EnvironmentMapView
 {
 public:
@@ -166,5 +173,6 @@ private:
     std::vector<float> ownedCellSolidAngle_;
     std::vector<double> ownedRowCos_;
 };
+#endif
 
 } // namespace videohelper::pathtrace

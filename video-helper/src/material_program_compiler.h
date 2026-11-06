@@ -32,7 +32,7 @@ inline constexpr std::size_t kMaximumSurfaceInstructions
 inline constexpr std::size_t kMaximumVertexInstructions = videowire::kMaterialProgramInvalidValueSlot;
 inline constexpr std::size_t kMaximumCombinedInstructions
     = kMaximumSurfaceInstructions + kMaximumVertexInstructions;
-inline constexpr std::size_t kMaximumControlParameterSlots = 4096;
+inline constexpr std::size_t kMaximumControlParameterSlots = 65535; // uint16 slot count
 inline constexpr std::size_t kMaximumAudioParameterSlots = 64;
 // The payload size is stored as 32 bits.
 inline constexpr std::size_t kMaximumCanonicalPayloadBytes = 0xffffffffu;
@@ -214,7 +214,7 @@ constexpr std::uint64_t vertexOperationMask() noexcept
     std::uint64_t result = 0;
     for (std::uint8_t value = 1;
          value <= static_cast<std::uint8_t>(
-             videowire::VertexModifierOperation::boundedDisplacementOutput);
+             videowire::kLastVertexModifierOperation);
          ++value)
         result |= operationBit(value);
     return result;
@@ -281,6 +281,9 @@ inline bool supported(videowire::VertexModifierOperation operation) noexcept
         case videowire::VertexModifierOperation::scalarNoise3d:
         case videowire::VertexModifierOperation::vec3Noise3d:
         case videowire::VertexModifierOperation::boundedDisplacementOutput:
+        case videowire::VertexModifierOperation::scalarSin:
+        case videowire::VertexModifierOperation::scalarCos:
+        case videowire::VertexModifierOperation::oceanWaves:
             return true;
         case videowire::VertexModifierOperation::invalid:
             break;
@@ -809,7 +812,7 @@ private:
 static_assert(static_cast<std::uint8_t>(surfacematerial::OperationKind::ComposeVec4) < 64,
               "surface operation capabilities use a 64-bit mask");
 static_assert(static_cast<std::uint8_t>(
-                  videowire::VertexModifierOperation::boundedDisplacementOutput) < 64,
+                  videowire::kLastVertexModifierOperation) < 64,
               "vertex operation capabilities use a 64-bit mask");
 static_assert(!kPerformsNativeShaderCompilation);
 static_assert(!kAuthorizesNativeGpuExecution);

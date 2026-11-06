@@ -20,6 +20,33 @@ inline Fixture nativeFixture(bool nonplanar=false,double move=0,int blocker=0,st
         f.scene->vertices[first].uv={0,0};f.scene->vertices[first+1].uv={1,0};
         f.scene->vertices[first+2].uv={1,1};f.scene->vertices[first+3].uv={0,1};
     }
+    // validateVisual3DScene refuses a scene with no active camera or with a zero
+    // vertex normal. Production scenes carry both, so the fixture does too: one
+    // default camera, and each vertex normal is the sum of its triangles' winding normals.
+    f.scene->cameras[0].id=HarmonicMIDI::grid::SceneCameraId{1};
+    f.scene->cameraCount=1;f.scene->activeCamera=f.scene->cameras[0].id;
+    for(std::size_t o=0;o<f.scene->objectCount;++o)
+    {
+        const auto& object=f.scene->objects[o];
+        std::vector<D3> sums(object.vertexCount,D3{0,0,0});
+        for(std::size_t i=0;i<object.indexCount;i+=3)
+        {
+            std::array<unsigned,3> corner{f.scene->indices[object.firstIndex+i],f.scene->indices[object.firstIndex+i+1],f.scene->indices[object.firstIndex+i+2]};
+            std::array<D3,3> p;
+            for(unsigned k=0;k<3;++k)
+            {
+                const auto& position=f.scene->vertices[object.firstVertex+corner[k]].position;
+                p[k]={position.x,position.y,position.z};
+            }
+            const auto n=exterior(difference(p[1],p[0]),difference(p[2],p[0]));
+            for(unsigned k=0;k<3;++k)for(unsigned a=0;a<3;++a)sums[corner[k]][a]+=n[a];
+        }
+        for(std::size_t v=0;v<object.vertexCount;++v)
+        {
+            const auto n=normalized(sums[v]);
+            f.scene->vertices[object.firstVertex+v].normal={float(n[0]),float(n[1]),float(n[2])};
+        }
+    }
     using P=arbitgpu::NativeFixtureSurfaceMaterialProgram;
     auto receiver=std::make_shared<P>(f.program);
     receiver->backend=arbitgpu::NativeFixtureMaterialBackend::OpenGl;

@@ -129,8 +129,17 @@ PT_SHARED_ENTRY Vec3 cosineHemisphere (Vec2 u) noexcept
 
 constexpr int kGgxTableSize = 32;
 
+// The bilinear lookup of one table at row r0 + tr, column c0 + tc.
+PT_SHARED_ENTRY float ggxBilinear (const PT_TABLE_SPACE float* table, int r0, int c0, float tr, float tc) noexcept
+{
+    const auto at = static_cast<std::size_t> (r0 * kGgxTableSize + c0);
+    const float top = table[at] * (1.0f - tc) + table[at + 1] * tc;
+    const float bottom = table[at + kGgxTableSize] * (1.0f - tc) + table[at + kGgxTableSize + 1] * tc;
+    return top * (1.0f - tr) + bottom * tr;
+}
+
 // Bilinear in (sqrt(alpha), cosO) over two kGgxTableSize^2 tables.
-PT_SHARED_ENTRY void ggxAlbedoLookup (const float* scaleTable, const float* biasTable, float cosO, float alpha, float& scale,
+PT_SHARED_ENTRY void ggxAlbedoLookup (const PT_TABLE_SPACE float* scaleTable, const PT_TABLE_SPACE float* biasTable, float cosO, float alpha, float& scale,
                       float& bias) noexcept
 {
     const float r = std::sqrt (clampUnit (alpha));
@@ -140,16 +149,8 @@ PT_SHARED_ENTRY void ggxAlbedoLookup (const float* scaleTable, const float* bias
     const int c0 = std::min (static_cast<int> (fc), kGgxTableSize - 2);
     const float tr = fr - static_cast<float> (r0);
     const float tc = fc - static_cast<float> (c0);
-    const auto at = [] (const float* table, int row, int column) {
-        return table[static_cast<std::size_t> (row * kGgxTableSize + column)];
-    };
-    const auto bilinear = [&] (const float* table) {
-        const float top = at (table, r0, c0) * (1.0f - tc) + at (table, r0, c0 + 1) * tc;
-        const float bottom = at (table, r0 + 1, c0) * (1.0f - tc) + at (table, r0 + 1, c0 + 1) * tc;
-        return top * (1.0f - tr) + bottom * tr;
-    };
-    scale = bilinear (scaleTable);
-    bias = bilinear (biasTable);
+    scale = ggxBilinear (scaleTable, r0, c0, tr, tc);
+    bias = ggxBilinear (biasTable, r0, c0, tr, tc);
 }
 
 #if ! defined(__CUDACC__)
@@ -240,7 +241,7 @@ PT_SHARED_ENTRY Color uniformColor (float x) noexcept;
 template <>
 PT_SHARED_ENTRY Vec3 uniformColor<Vec3> (float x) noexcept { return { x, x, x }; }
 template <>
-PT_SHARED_ENTRY Spectrum uniformColor<Spectrum> (float x) noexcept { return Spectrum::constant (x); }
+PT_SHARED_ENTRY Spectrum uniformColor<Spectrum> (float x) noexcept { return Spectrum::filled (x); }
 
 // Keeps a ratio of indices finite, inside [1/3, 3], and away from exactly 1
 // where the rough transmission half vector degenerates.
@@ -664,6 +665,38 @@ PT_SHARED_ENTRY Spectrum mediumAbsorption (const Material& material, const Wavel
     return sigma;
 }
 
+PT_SHARED_ENTRY bool materialHasVolume (const Material& material) noexcept
+{
+    return std::isfinite (material.volumeDensity) && material.volumeDensity > 0.0f;
+}
+
+PT_SHARED_ENTRY void volumeCoefficients (const Material& material, const Wavelengths& wavelengths, Spectrum& absorption,
+                                         Spectrum& scattering, Spectrum& emission) noexcept
+{
+    absorption = {};
+    scattering = {};
+    emission = {};
+    if (! materialHasVolume (material))
+        return;
+    const float density = material.volumeDensity;
+    const Vec3 colour = clampUnit (material.volumeColor);
+    const Vec3 absorptionColour = clampUnit (material.volumeAbsorptionColor);
+    const Vec3 absorbed { (1.0f - colour.x) * (1.0f - absorptionColour.x), (1.0f - colour.y) * (1.0f - absorptionColour.y),
+                          (1.0f - colour.z) * (1.0f - absorptionColour.z) };
+    scattering = reflectanceSpectrum (colour, wavelengths) * density;
+    absorption = reflectanceSpectrum (absorbed, wavelengths) * density;
+    const Vec3 e = material.volumeEmission;
+    if (std::isfinite (e.x) && std::isfinite (e.y) && std::isfinite (e.z))
+        emission = upsampleRgb ({ std::max (0.0f, e.x), std::max (0.0f, e.y), std::max (0.0f, e.z) }, wavelengths);
+    const int channels = wavelengths.spectral ? kSpectrumChannels : 3;
+    for (int c = channels; c < kSpectrumChannels; ++c)
+    {
+        absorption[c] = 0.0f;
+        scattering[c] = 0.0f;
+        emission[c] = 0.0f;
+    }
+}
+
 PT_SHARED_ENTRY Spectrum straightTransmittance (const Material& material, float cosine, float etaD,
                                 const Wavelengths& wavelengths) noexcept
 {
@@ -768,8 +801,19 @@ PT_SHARED_ENTRY void BasicBsdf<Color>::finalize() noexcept
     }
 }
 
+// The ray kind (sceneRayVisibility bit) of light reaching a lobe from wiLocal.
+PT_SHARED_ENTRY std::uint8_t lobeRayKind (LobeKind kind, Vec3 wiLocal) noexcept
+{
+    constexpr std::uint8_t diffuse = 4u, glossy = 8u, transmission = 16u;
+    if (kind == LobeKind::Lambert)
+        return diffuse;
+    if (kind == LobeKind::GgxReflection)
+        return glossy;
+    return wiLocal.z > 0.0f ? glossy : transmission;
+}
+
 template <class Color>
-PT_SHARED_ENTRY BasicBsdfEval<Color> BasicBsdf<Color>::evalLocal (Vec3 woLocal, Vec3 wiLocal) const noexcept
+PT_SHARED_ENTRY BasicBsdfEval<Color> BasicBsdf<Color>::evalLocal (Vec3 woLocal, Vec3 wiLocal, std::uint8_t rayKinds) const noexcept
 {
     BasicBsdfEval<Color> out;
     for (int i = 0; i < count_; ++i)
@@ -778,7 +822,8 @@ PT_SHARED_ENTRY BasicBsdfEval<Color> BasicBsdf<Color>::evalLocal (Vec3 woLocal, 
         if ((lobeKindFlags (lobes_[slot].kind) & kBsdfDelta) != 0)
             continue;
         const BasicBsdfEval<Color> e = evalLobeImpl (lobes_[slot], woLocal, wiLocal);
-        out.value = out.value + e.value;
+        if ((lobeRayKind (lobes_[slot].kind, wiLocal) & rayKinds) != 0)
+            out.value = out.value + e.value;
         out.pdf += probability_[slot] * e.pdf;
     }
     return out;
@@ -795,6 +840,19 @@ PT_SHARED_ENTRY BasicBsdfEval<Color> BasicBsdf<Color>::eval (Vec3 wo, Vec3 wi) c
     if (wiLocal.z > 0.0f ? ! (side > 0.0f) : ! (side < 0.0f))
         return {};
     return evalLocal (woLocal, wiLocal);
+}
+
+template <class Color>
+PT_SHARED_ENTRY BasicBsdfEval<Color> BasicBsdf<Color>::eval (Vec3 wo, Vec3 wi, std::uint8_t rayKinds) const noexcept
+{
+    const Vec3 woLocal = frame_.toLocal (wo);
+    const Vec3 wiLocal = frame_.toLocal (wi);
+    if (! (woLocal.z > 0.0f))
+        return {};
+    const float side = dot (geometricNormal_, wi);
+    if (wiLocal.z > 0.0f ? ! (side > 0.0f) : ! (side < 0.0f))
+        return {};
+    return evalLocal (woLocal, wiLocal, rayKinds);
 }
 
 template <class Color>
@@ -857,6 +915,19 @@ PT_SHARED_ENTRY bool BasicBsdf<Color>::sample (Vec3 wo, float uLobe, Vec2 uDirec
 template class BasicBsdf<Vec3>;
 template class BasicBsdf<Spectrum>;
 
+// buildBsdf's colour conversions: RGB as it is, or the reflectance spectrum at
+// the path's wavelengths. Function objects, as Metal has no lambdas.
+struct RgbColor
+{
+    PT_SHARED_FN Vec3 operator() (Vec3 rgb) const noexcept { return rgb; }
+};
+
+struct SpectralColor
+{
+    const Wavelengths& wavelengths;
+    PT_SHARED_FN Spectrum operator() (Vec3 rgb) const noexcept { return reflectanceSpectrum (rgb, wavelengths); }
+};
+
 PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
                         Vec3 wo, bool entering, Bsdf& out) noexcept
 {
@@ -868,7 +939,7 @@ PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNo
     for (float& channel : setup.eta)
         channel = eta;
     setup.etaD = eta;
-    buildBsdf (material, shadingNormal, geometricNormal, wo, setup, [] (Vec3 rgb) { return rgb; }, out);
+    buildBsdf (material, shadingNormal, geometricNormal, wo, setup, RgbColor {}, out);
 }
 
 PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNormal, Vec3 geometricNormal,
@@ -878,7 +949,7 @@ PT_SHARED_ENTRY void buildMaterialBsdf (const Material& material, Vec3 shadingNo
     DielectricSetup used = setup;
     used.dispersive = setup.dispersive && wavelengths.spectral;
     buildBsdf (material, shadingNormal, geometricNormal, wo, used,
-               [&wavelengths] (Vec3 rgb) { return reflectanceSpectrum (rgb, wavelengths); }, out);
+               SpectralColor { wavelengths }, out);
 }
 
 #if ! defined(__CUDACC__)

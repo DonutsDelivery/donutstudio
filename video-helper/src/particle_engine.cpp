@@ -4,12 +4,14 @@
 
 #include "particle_engine.h"
 #include "particle_body_replay.h"
+#include "particle_timeline_data.h"
 #include "gl_loader.h"
 #include "shader_generator.h"   // ShaderClock and canonical Block C frame
 #if defined (__APPLE__) && ARBIT_HAVE_METAL_BACKEND
  #include "gpu_backend/particle_engine_metal.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -35,9 +37,9 @@ namespace videorender
 
 ParticleEngine::ParticleEngine() = default;
 
-// uNotes texture geometry (block_c_packer.h: 128 rows x 4 texels, RGBA32F).
+// uNotes texture geometry (block_c_packer.h: one row per note, 4 texels, RGBA32F).
+// The height follows the frame's note rows.
 static constexpr int kNoteTexW = 4;
-static constexpr int kNoteTexH = 128;
 
 // One particle = 8 floats (std430): pos.xy, vel.xy, life, maxLife, hue, pad.
 static constexpr int kFloatsPerParticle = 8;
@@ -64,7 +66,7 @@ uniform float uDt;
 uniform int   uFrame;
 uniform int   uNoteCount;
 uniform float uAspect;        // width/height, keeps motion isotropic
-uniform sampler2D uNotes;     // 4 x 128 RGBA32F
+uniform sampler2D uNotes;     // 4 x noteRows RGBA32F
 
 )GLSL"
 #include "particle_timeline_glsl.inc"
@@ -97,7 +99,7 @@ void main()
     {
         // Count live notes on the spawn track (velocity > 0 ⇒ not a packer hole).
         int matchCount = 0;
-        int rows = min(uNoteCount, 128);
+        int rows = uNoteCount;
         for (int r = 0; r < rows; ++r)
         {
             vec4 t1 = texelFetch(uNotes, ivec2(1, r), 0);   // freq, cents, trackId, isRoot
@@ -234,7 +236,7 @@ uniform float uDt;
 uniform int   uFrame;
 uniform int   uNoteCount;
 uniform float uAspect;
-uniform sampler2D uNotes;     // 4 x 128 RGBA32F
+uniform sampler2D uNotes;     // 4 x noteRows RGBA32F
 uniform sampler2D uPosVel;    // prev pos.xy / vel.xy
 uniform sampler2D uLife;      // prev life / maxLife / hue / pad
 uniform int   uStateW;        // state-grid width (index = y*uStateW + x)
@@ -276,7 +278,7 @@ void main()
     if (life <= 0.0)
     {
         int matchCount = 0;
-        int rows = min(uNoteCount, 128);
+        int rows = uNoteCount;
         for (int r = 0; r < rows; ++r)
         {
             vec4 t1 = texelFetch(uNotes, ivec2(1, r), 0);   // freq, cents, trackId, isRoot
@@ -555,17 +557,17 @@ void ParticleEngine::uploadNotes (const arbitgl::GlFuncs* gl, const canonicalblo
         glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, kNoteTexH, 0,
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, 1, 0,
                       GL_RGBA, GL_FLOAT, nullptr);
     }
     // Only re-upload when there are notes; with uNoteCount 0 the kernel never
     // reads the texture, so a stale allocation is harmless (zero-feed contract).
-    if (notes != nullptr
-        && (int) notes->noteTexture().size() >= kNoteTexW * kNoteTexH * 4)
+    if (notes != nullptr && ! notes->noteTexture().empty())
     {
         glBindTexture (GL_TEXTURE_2D, notesTex_);
         const auto data = particleNoteUpload(notes, params.motionMode == 1, params.linkRatioInfluence);
-        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, kNoteTexH, 0,
+        const int height = static_cast<int> (data.size() / (kNoteTexW * 4));
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, kNoteTexW, height, 0,
                       GL_RGBA, GL_FLOAT, data.data());
     }
 }
@@ -588,11 +590,11 @@ void ParticleEngine::cacheTimelineUniforms(const arbitgl::GlFuncs* gl, unsigned 
     uAudioMotion_ = gl->GetUniformLocation(program, "uAudioMotion");
     uCollision_ = gl->GetUniformLocation(program, "uCollision");
     uGeometryCount_ = gl->GetUniformLocation(program, "uGeometryCount");
-    uGeometryAnchors_ = gl->GetUniformLocation(program, "uGeometryAnchors[0]");
-    uBodyReplay_ = gl->GetUniformLocation(program, "uBodyReplay[0]");
+    uBodyCount_ = gl->GetUniformLocation(program, "uBodyCount");
+    uTimelineData_ = gl->GetUniformLocation(program, "uTimelineData");
 }
 
-void ParticleEngine::uploadTimelineUniforms(const arbitgl::GlFuncs* gl,
+bool ParticleEngine::uploadTimelineUniforms(const arbitgl::GlFuncs* gl,
                                            const ShaderClock& clock, const ParticleParams& params,
                                            float aspect, const canonicalblockc::CanonicalBlockCFrame* notes)
 {
@@ -605,14 +607,34 @@ void ParticleEngine::uploadTimelineUniforms(const arbitgl::GlFuncs* gl,
         params.onsetGain * params.onset, params.onsetAge, params.linkSpring);
     gl->Uniform3f(uCollision_, static_cast<float>(params.collisionMode),
         params.bodyRadius, params.restitution);
-    gl->Uniform1i(uGeometryCount_,params.geometryCount);
-    if (params.geometryCount>0)
-        gl->Uniform4fv(uGeometryAnchors_,params.geometryCount,params.geometryAnchors[0].data());
-    if (params.motionMode == 2)
+    ParticleBodyState bodies;
+    if (params.motionMode == 2) bodies = replayParticleBodies(params, clock.timeSec, aspect, notes);
+    const auto data = packParticleTimelineData(params, params.motionMode == 2 ? &bodies : nullptr);
+    gl->Uniform1i(uGeometryCount_, data.anchors);
+    gl->Uniform1i(uBodyCount_, data.bodies);
+    // Unit 3 is free on both the compute and the fragment simulation paths.
+    if (timelineTex_ == 0)
     {
-        const auto bodies = replayParticleBodies(params, clock.timeSec, aspect, notes);
-        gl->Uniform4fv(uBodyReplay_, 64, bodies[0].data());
+        glGenTextures(1, &timelineTex_);
+        glBindTexture(GL_TEXTURE_2D, timelineTex_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     }
+    gl->ActiveTexture(GL_TEXTURE0 + 3);
+    glBindTexture(GL_TEXTURE_2D, timelineTex_);
+    for (int drained = 0; drained < 16 && glGetError() != GL_NO_ERROR; ++drained) {}
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, kParticleTimelineDataWidth, data.rows, 0,
+                 GL_RGBA, GL_FLOAT, data.values.data());
+    const bool allocated = glGetError() == GL_NO_ERROR;
+    gl->ActiveTexture(GL_TEXTURE0);
+    if (!allocated)
+    {
+        log_ = "OpenGL particle anchor/body texture allocation failed for "
+            + std::to_string(data.anchors) + " anchors and " + std::to_string(data.bodies) + " bodies";
+        return false;
+    }
+    gl->Uniform1i(uTimelineData_, 3);
+    return true;
 }
 
 int ParticleEngine::planSimSteps (const ShaderClock& clock, int& firstFrame)
@@ -716,7 +738,6 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
 
     int count = params.count;
     if (count < 1) count = 1;
-    if (count > kMaxParticles) count = kMaxParticles;
 
 #if defined (__APPLE__)
   #if ARBIT_HAVE_METAL_BACKEND
@@ -759,7 +780,7 @@ unsigned ParticleEngine::render (const arbitgl::GlFuncs* gl, const ShaderClock& 
     gl->Uniform1f (uGravity_, params.gravity);
     gl->Uniform1f (uForce_, params.force > 0.0f ? params.force : 0.0f);
     gl->Uniform1f (uLifetime_, params.lifetime);
-    uploadTimelineUniforms(gl, clock, params, float(width) / float(height), notes);
+    if (!uploadTimelineUniforms(gl, clock, params, float(width) / float(height), notes)) return 0;
     gl->Uniform1f (uDt_, clock.playing ? (float) clock.timeDelta : 0.0f);
     gl->Uniform1i (uNoteCount_, noteCount);
     gl->Uniform1f (uAspect_, height > 0 ? (float) width / (float) height : 1.0f);
@@ -846,7 +867,9 @@ bool ParticleEngine::ensureFallback (const arbitgl::GlFuncs* gl, int count)
     if (fbPoolCount_ != count || posVelTex_[0] == 0)
     {
         fbPoolCount_ = count;
-        stateTexW_ = 256;
+        // The grid grows square with the pool, so no particle count runs past
+        // the driver's texture size before its memory does.
+        stateTexW_ = std::max (256, static_cast<int> (std::ceil (std::sqrt (static_cast<double> (count)))));
         stateTexH_ = (count + stateTexW_ - 1) / stateTexW_;
         if (stateTexH_ < 1) stateTexH_ = 1;
         const std::vector<float> zeros ((size_t) stateTexW_ * (size_t) stateTexH_ * 4, 0.0f);
@@ -920,7 +943,7 @@ unsigned ParticleEngine::renderFallback (const arbitgl::GlFuncs* gl, const Shade
     gl->Uniform1f (sUGravity_, params.gravity);
     gl->Uniform1f (sUForce_, params.force > 0.0f ? params.force : 0.0f);
     gl->Uniform1f (sULifetime_, params.lifetime);
-    uploadTimelineUniforms(gl, clock, params, float(width) / float(height), notes);
+    if (!uploadTimelineUniforms(gl, clock, params, float(width) / float(height), notes)) return 0;
     gl->Uniform1f (sUDt_, clock.playing ? (float) clock.timeDelta : 0.0f);
     gl->Uniform1i (sUNoteCount_, noteCount);
     gl->Uniform1f (sUAspect_, height > 0 ? (float) width / (float) height : 1.0f);
@@ -1028,6 +1051,7 @@ void ParticleEngine::shutdown (const arbitgl::GlFuncs* gl)
     if (fbo_)         { gl->DeleteFramebuffers (1, &fbo_); fbo_ = 0; }
     if (outTex_)      { glDeleteTextures (1, &outTex_);   outTex_ = 0; }
     if (notesTex_)    { glDeleteTextures (1, &notesTex_); notesTex_ = 0; }
+    if (timelineTex_) { glDeleteTextures (1, &timelineTex_); timelineTex_ = 0; }
 #if defined (__APPLE__)
   #if ARBIT_HAVE_METAL_BACKEND
     if (metal_ != nullptr)
