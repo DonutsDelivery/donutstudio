@@ -17,9 +17,9 @@ Use it standalone or inside your DAW — then upgrade to DonutStudio Pro for sam
 
 ## Download
 
-DonutStudio 0.9.1 Beta is available for Windows, macOS and Linux.
+DonutStudio is available for Windows, macOS and Linux.
 
-[Download DonutStudio](https://donutsdelivery.online/donutstudio/download) · [Release details](https://github.com/DonutsDelivery/donutstudio/releases/tag/v0.9.1)
+[Download DonutStudio](https://donutsdelivery.online/donutstudio/download) · [Release details](https://github.com/DonutsDelivery/donutstudio/releases/latest)
 
 ---
 
