@@ -17,9 +17,9 @@ Use it standalone or inside your DAW — then upgrade to DonutStudio Pro for sam
 
 ## Download
 
-Binary downloads are temporarily unavailable. All previous downloadable versions have been withdrawn while the video helper's dependencies are replaced. Downloads will return after a new build is ready.
+DonutStudio 0.9.1 Beta is available for Windows, macOS and Linux.
 
-See the [DonutStudio website](https://donutsdelivery.online/donutstudio) for updates.
+[Download DonutStudio](https://donutsdelivery.online/donutstudio/download) · [Release details](https://github.com/DonutsDelivery/donutstudio/releases/tag/v0.9.1)
 
 ---
 
