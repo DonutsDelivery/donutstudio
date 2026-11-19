@@ -250,8 +250,17 @@ struct RenderScene
 
     // Built by commit().
     Bvh bvh;
-    // Host milliseconds commit() took to build bvh.
+    // Host milliseconds commit() took to build or refit bvh.
     double bvhBuildMs = 0.0;
+    // The last commit refit the hierarchy it had instead of building one.
+    bool bvhRefitted = false;
+    // Moves each time refitRenderScene replaces the geometry in place. A device
+    // that copied the scene copies it again (OptiX updates its GAS) when this
+    // moves; a new build is announced by SceneEngine::sceneBuilds instead.
+    std::uint64_t geometryRevision = 0;
+    // The geometry a refit replaced. The next refit ingests into it, so an
+    // advancing frame reuses its buffers instead of allocating the scene again.
+    IngestedScene previousGeometry;
     LightSet lights;
     bool anyPartialCoverage = false;
     bool anyThinSheet = false;
@@ -267,8 +276,10 @@ struct RenderScene
     Vec3 boundsCentre {};
     float boundsRadius = 0.0f;
 
-    // Rebuilds the BVH and the light set from the members above.
-    void commit();
+    // Rebuilds the BVH and the light set from the members above. refitBvh keeps
+    // the hierarchy and refits it to the moved triangles (Bvh::refit), and
+    // builds it afresh when that cannot apply.
+    void commit (bool refitBvh = false);
     const Material& materialOf (std::uint32_t triangle) const noexcept;
 };
 
@@ -288,6 +299,10 @@ struct ObjectGratingBinding
     std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR> material;
     // A spatial foil's corners (GratingBinding::field).
     std::optional<std::array<std::array<float, 4>, 4>> field {};
+    // A diffraction product's occupancy (GratingBinding::occupancy).
+    std::array<std::array<float, 4>, 5> occupancy {};
+    std::uint32_t occupancyCount = 0;
+    float maskCoverage = 1.0f;
 };
 
 struct PrepareOptions
@@ -310,6 +325,12 @@ struct PrepareOptions
     std::vector<AreaLightRecord> areaLights;
     // Multiplies every material's emission, like the raster's emission gain.
     float emissionGain = 1.0f;
+    // Per-note appearance, one (r, g, b, a) per IngestOptions::noteInstances entry,
+    // as the raster's mix (uNoteAppearanceLow, uNoteAppearanceHigh, value): the
+    // raster draws rgb * (shaded + a). Each instance's triangles get a copy of
+    // their material with rgb times the base colour and rgb * (emission + a) as
+    // the emission, after emissionGain. Empty, or (1, 1, 1, 0), leaves them.
+    const std::vector<std::array<float, 4>>* noteAppearance = nullptr;
     // The raster adds Visual3DScene::ambientColor to its ambient term; the
     // tracer treats it as extra constant environment radiance.
     bool ambientAsEnvironment = true;
@@ -326,6 +347,15 @@ void applySceneVolume (const HarmonicMIDI::grid::SceneVolume& volume, Material& 
 // Ingests the scene, converts its materials and lights, and commits.
 void prepareRenderScene (const HarmonicMIDI::grid::Visual3DScene& scene, RenderScene& out,
                          const PrepareOptions& options = {});
+// The advancing-frame path: ingests the scene again and, when every triangle is
+// the one out already holds (same object, instance, primitive, material and
+// visibility, in the same order, with motion on or off as before), replaces the
+// geometry, keeps out's materials, gratings and lights records, refits the BVH
+// and moves out.geometryRevision. Callers pass options that differ from out's
+// build only in placement: object worlds, instance transforms, vertex
+// positions and the earlier frame. False leaves out unchanged.
+bool refitRenderScene (const HarmonicMIDI::grid::Visual3DScene& scene, RenderScene& out,
+                       const PrepareOptions& options = {});
 #endif
 
 // Per-thread path counters, summed into RenderStats.

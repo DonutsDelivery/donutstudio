@@ -1,6 +1,8 @@
 #pragma once
 
 #include "timeline_scene_evaluation_inputs.h"
+#include "surface_wave_path_note.h"
+#include "loop_step_probe.h"
 #include <atomic>
 #include <cstring>
 
@@ -10,6 +12,7 @@
 #include "water_replay_source_budget.h"
 #include "timeline_coupled_water_replay.h"
 #include "../../shared/GeometryTimelineSceneBinding.h"
+#include "../../shared/GeometrySurfaceWave.h"
 
 namespace videohelper::geometry {
 // Names every zero owner field, so a refused owner points at the producer that
@@ -62,6 +65,9 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
   // The first frame of an authored scene checks the whole plan and mesh. Later frames
   // only change time, and on this mesh those checks cost several seconds each.
   auto admitted = runtime.reuseVerifiedTimelinePlan(owner, binding, authored, planPublication);
+  // A new plan revision of the same plan on the same scene takes the earlier revision's checks.
+  if (!admitted && runtime.adoptVerifiedTimelinePlan(owner, binding, authored, planPublication))
+    admitted = runtime.reuseVerifiedTimelinePlan(owner, binding, authored, planPublication);
   const bool verified = admitted.has_value();
   // A converging preview asks for the same frame once per sample. The result is a function of
   // these inputs and is never written after it is published, so the same inputs get the same
@@ -74,6 +80,9 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
   if (verified && !coupledWater && admitted->plan->value().descriptor().spectrumFields.empty())
     if (auto held = runtime.reuseEvaluatedTimelineScene(owner, inputs)) return held;
   if (!verified) {
+    // A first frame that verifies names why it took no earlier revision's checks.
+    if (const auto* reason = runtime.lastAdoptionMiss()) loopstep::addStage(reason, 0);
+    loopstep::Scope verifyScope ("geometry:timeline-verify");
     const auto value = videowire::geometry::decodeTimelineScenePlan(binding, error);
     if (!value || !videowire::geometry::validTimelineSceneBinding(binding, *authored, *value, error)) {
       if (error.empty()) error = "Timeline Scene3D binding does not match its authored mesh";
@@ -93,7 +102,10 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
     std::shared_ptr<const std::uint8_t> lease;
   };
   auto result = std::make_shared<OwnedScene>();
-  result->scene = *authored;
+  {
+    loopstep::Scope copyScope ("geometry:timeline-scene-copy");
+    result->scene = *authored;
+  }
   result->lease = admitted->ownerLease;
   const auto scoreFrame = canonicalFrame;
   auto evaluation = videorender::waterSurfaceFrameEvaluation(waterHistory, projectSeconds, seconds, std::move(canonicalFrame), coupledWater);
@@ -106,13 +118,191 @@ inline std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluateComposed
     if (error.empty()) error = "Composed audio spectrum requires the shared audio feature frame";
     return {};
   }
-  if (!videowire::geometry::replaceTimelineSceneMesh(binding,
-          admitted->plan->value(), seconds, result->scene, error, &evaluation, verified)) return {};
+  {
+    loopstep::Scope replayScope (verified ? "geometry:timeline-replay" : "geometry:timeline-replay-checked");
+    if (!videowire::geometry::replaceTimelineSceneMesh(binding,
+            admitted->plan->value(), seconds, result->scene, error, &evaluation, verified)) return {};
+  }
   if (!verified) runtime.markTimelinePlanVerified(owner, binding, authored);
   std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> evaluated(result, &result->scene);
   runtime.rememberEvaluatedTimelineScene(owner, inputs, coupledWater ? nullptr : evaluated);
   return evaluated;
 }
+
+// One Preview clip's open sea (shared/GeometrySurfaceWave.h) and the CPU frame it
+// was last replayed to. While the plan stays verified on its authored scene, a
+// later frame keeps that frame as its scene and the renderer moves the water on
+// the GPU, so no frame replays a million vertices. A backend that can't sets
+// refused, and the clip replays on the CPU from then on.
+struct SurfaceWaveHold final {
+  PlanOwnerIdentity owner;
+  std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> authored;
+  std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> scene;
+  bool recognized = false;
+  std::optional<videowire::geometry::SurfaceWaveProgram> program;
+  std::shared_ptr<std::atomic<bool>> refused = std::make_shared<std::atomic<bool>>(false);
+};
+
+// Per evaluating thread, like the geometry execution cache. A hold goes with its
+// authored scene.
+inline std::vector<SurfaceWaveHold>& surfaceWaveHolds() {
+  thread_local std::vector<SurfaceWaveHold> holds;
+  holds.erase(std::remove_if(holds.begin(), holds.end(), [](const auto& hold) { return hold.authored.expired(); }),
+              holds.end());
+  return holds;
+}
+
+inline bool surfaceWaveHoldFor(const PlanOwnerIdentity& owner,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored) {
+  for (const auto& hold : surfaceWaveHolds())
+    if (hold.owner == owner && hold.authored.lock() == authored) return true;
+  return false;
+}
+
+// The clip's hold when this frame can move its sea on the GPU, else null and the
+// caller replays the frame on the CPU and passes it to rememberSurfaceWaveScene.
+inline const SurfaceWaveHold* surfaceWaveHold(GeometryCorePlanRuntime& runtime, const PlanOwnerIdentity& owner,
+    const videowire::geometry::TimelineSceneBinding& binding,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored,
+    const std::shared_ptr<const void>& planPublication) {
+  for (const auto& hold : surfaceWaveHolds())
+    if (hold.owner == owner && hold.authored.lock() == authored) {
+      if (!hold.program || !hold.scene || hold.refused->load()
+          || !runtime.reuseVerifiedTimelinePlan(owner, binding, authored, planPublication))
+        return nullptr;
+      return &hold;
+    }
+  return nullptr;
+}
+
+// A graph edit that leaves the sea alone gives the clip a new plan revision with the same plan
+// text on the same authored scene. Its sea is the earlier revision's, so the hold moves to the
+// new owner with its scene and wave program, and the revision's first frame moves the water on
+// the GPU instead of replaying it. The runtime matches the plan text byte for byte before the
+// hold moves. An earlier revision asked again takes the hold back the same way. A plan
+// reinstall gives the clip a new project generation, which the hold crosses on the same terms.
+inline const SurfaceWaveHold* adoptSurfaceWaveHold(GeometryCorePlanRuntime& runtime, const PlanOwnerIdentity& owner,
+    const videowire::geometry::TimelineSceneBinding& binding,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored,
+    const std::shared_ptr<const void>& planPublication) {
+  auto& holds = surfaceWaveHolds();
+  const auto prior = std::find_if(holds.begin(), holds.end(), [&](const auto& hold) {
+    return !(hold.owner == owner)
+        && hold.owner.helperGeneration == owner.helperGeneration && hold.owner.deviceGeneration == owner.deviceGeneration
+        && hold.owner.clipIdentity == owner.clipIdentity && hold.owner.use == owner.use
+        && hold.authored.lock() == authored && hold.program && hold.scene && !hold.refused->load();
+  });
+  if (prior == holds.end()) return nullptr;
+  if (!runtime.reuseVerifiedTimelinePlan(owner, binding, authored, planPublication)
+      && !(runtime.adoptVerifiedTimelinePlan(owner, binding, authored, planPublication)
+          && runtime.reuseVerifiedTimelinePlan(owner, binding, authored, planPublication)))
+    return nullptr;
+  // The runtime only verifies this owner on the same plan text, so the prior program is this plan's.
+  prior->owner = owner;
+  return &*prior;
+}
+
+// With moveClipHold, a hold the clip made under another revision on this scene moves to this
+// owner instead of a second one being made, and its wave program is recognized again for this
+// owner's plan.
+inline void rememberSurfaceWaveScene(GeometryCorePlanRuntime& runtime, const PlanOwnerIdentity& owner,
+    const videowire::geometry::TimelineSceneBinding& binding,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored,
+    const std::shared_ptr<const void>& planPublication,
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> scene, bool moveClipHold = false) {
+  auto& holds = surfaceWaveHolds();
+  auto found = std::find_if(holds.begin(), holds.end(), [&](const auto& hold) {
+    return hold.owner == owner && hold.authored.lock() == authored;
+  });
+  if (found == holds.end() && moveClipHold) {
+    found = std::find_if(holds.begin(), holds.end(), [&](const auto& hold) {
+      return hold.owner.helperGeneration == owner.helperGeneration
+          && hold.owner.deviceGeneration == owner.deviceGeneration
+          && hold.owner.clipIdentity == owner.clipIdentity && hold.owner.use == owner.use
+          && hold.authored.lock() == authored;
+    });
+    if (found != holds.end()) {
+      found->owner = owner;
+      found->recognized = false;
+      found->program.reset();
+    }
+  }
+  if (found == holds.end()) {
+    holds.push_back({});
+    found = holds.end() - 1;
+    found->owner = owner;
+    found->authored = authored;
+  }
+  if (!found->recognized)
+    if (const auto admitted = runtime.reuseVerifiedTimelinePlan(owner, binding, authored, planPublication)) {
+      found->recognized = true;
+      found->program = videowire::geometry::recognizeSurfaceWaveProgram(admitted->plan->value().descriptor());
+    }
+  found->scene = std::move(scene);
+}
+
+// Why surfaceWaveHold gave no hold for a frame that could move its sea on the GPU.
+// "first-frame" is the one CPU replay the hold is made from.
+inline const char* surfaceWaveHoldMissReason(const PlanOwnerIdentity& owner,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored) {
+  for (const auto& hold : surfaceWaveHolds())
+    if (hold.owner == owner && hold.authored.lock() == authored) {
+      if (hold.refused->load()) return "backend-refused";
+      if (hold.recognized && !hold.program) return "not-a-wave-chain";
+      return "plan-not-verified";
+    }
+  return "first-frame";
+}
+
+// One frame of a clip's open sea, as the Preview takes it. With waves set, the scene
+// is the hold's and the renderer must move the water to this table; a renderer that
+// can't sets refused and has the frame asked again, and the retry replays. Every
+// other frame is a fresh CPU replay at this time. No frame keeps the hold's scene
+// without a wave table, so the water moves with time on either path.
+// The reason a Preview frame of the open sea replays only because its engine is Path Trace.
+inline constexpr const char* kPathTraceSeaReason = "path-trace";
+
+struct SurfaceWaveFrame final {
+  std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> scene;
+  std::optional<std::vector<std::array<float, 4>>> waves;
+  std::uint32_t columns = 0, rows = 0;
+  std::shared_ptr<std::atomic<bool>> refused;
+  // Why the frame replays on the CPU; null when waves is set.
+  const char* cpuReason = nullptr;
+};
+
+// cpuSeaReason names why this frame can't move its sea on the GPU, or is null.
+// replay() evaluates the frame on the CPU and returns null after setting an error.
+template <class Replay>
+inline bool surfaceWaveFrame(GeometryCorePlanRuntime& runtime, const PlanOwnerIdentity& owner,
+    const videowire::geometry::TimelineSceneBinding& binding,
+    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored,
+    const std::shared_ptr<const void>& planPublication, double seconds, const char* cpuSeaReason,
+    Replay&& replay, SurfaceWaveFrame& frame) {
+  frame = {};
+  const bool gpuWaveFrame = cpuSeaReason == nullptr;
+  const auto* hold = gpuWaveFrame ? surfaceWaveHold(runtime, owner, binding, authored, planPublication) : nullptr;
+  if (!hold && gpuWaveFrame && !surfaceWaveHoldFor(owner, authored))
+    hold = adoptSurfaceWaveHold(runtime, owner, binding, authored, planPublication);
+  if (hold) {
+    frame.scene = hold->scene;
+    frame.waves = videowire::geometry::surfaceWaveTable(*hold->program, seconds);
+    frame.columns = hold->program->columns;
+    frame.rows = hold->program->rows;
+    frame.refused = hold->refused;
+    return true;
+  }
+  frame.cpuReason = gpuWaveFrame ? surfaceWaveHoldMissReason(owner, authored) : cpuSeaReason;
+  frame.scene = replay();
+  if (!frame.scene) return false;
+  if (gpuWaveFrame) rememberSurfaceWaveScene(runtime, owner, binding, authored, planPublication, frame.scene);
+  // Path Trace replays the same sea a GPU frame starts from. Kept as the clip's hold, the first
+  // Realtime or Raster frame after an engine switch takes it instead of replaying the mesh again.
+  else if (std::strcmp(cpuSeaReason, kPathTraceSeaReason) == 0)
+    rememberSurfaceWaveScene(runtime, owner, binding, authored, planPublication, frame.scene, true);
+  return true;
+}
+
 } // namespace videohelper::geometry
 
 namespace videohelper::geometry::timelineevaluation {

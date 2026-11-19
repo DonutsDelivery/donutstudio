@@ -153,8 +153,11 @@ bool sameViewCamera (const EngineView& a, const EngineView& b) noexcept
     return ! a.previousCamera || sameCameraRecord (*a.previousCamera, *b.previousCamera);
 }
 
+// placement skips what only moves triangles: vertex records, object records and
+// instance transforms. refitRenderScene checks that the triangles stay the same.
 const char* sceneContentDifference (const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& a,
-                                    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& b) noexcept
+                                    const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& b,
+                                    bool placement = false) noexcept
 {
     if (a == b) return nullptr;
     if (a == nullptr || b == nullptr) return "scene snapshot";
@@ -185,66 +188,25 @@ const char* sceneContentDifference (const std::shared_ptr<const HarmonicMIDI::gr
         static_assert (std::is_trivially_copyable_v<std::decay_t<decltype (x[0])>>);
         return std::memcmp (x.data(), y.data(), count * sizeof (std::decay_t<decltype (x[0])>)) == 0;
     };
-    if (! same (a->vertices, b->vertices, a->vertexCount)) return "vertices";
+    if (! placement && ! same (a->vertices, b->vertices, a->vertexCount)) return "vertices";
     if (! same (a->indices, b->indices, a->indexCount)) return "indices";
-    if (! same (a->objects, b->objects, a->objectCount)) return "objects";
+    if (! placement && ! same (a->objects, b->objects, a->objectCount)) return "objects";
     if (! same (a->materials, b->materials, a->materialCount)) return "materials";
     if (! same (a->textures, b->textures, a->textureCount)) return "textures";
     for (std::size_t i = 0; i < a->lightCount; ++i)
         if (! sameLightRecord (a->lights[i], b->lights[i])) return "scene lights";
     if (! same (a->cameras, b->cameras, a->cameraCount)) return "cameras";
-    if (! same (a->objectInstances, b->objectInstances, a->objectInstanceCount)) return "object instances";
+    if (! placement && ! same (a->objectInstances, b->objectInstances, a->objectInstanceCount))
+        return "object instances";
     if (a->textureTexels.size() != b->textureTexels.size()
         || (! a->textureTexels.empty() && ! same (a->textureTexels, b->textureTexels, a->textureTexels.size())))
         return "texture texels";
     return nullptr;
 }
 
-// The first field two scene setups disagree on, or null when they are the same
-// scene. A Preview accumulation restarts whenever the setup changes, so a setup
-// that rebuilds itself identically every frame would hold the preview at one
-// sample per pixel for ever; this names the part that actually moved.
-const char* sceneSetupDifference (const EngineSceneSetup& a, const EngineSceneSetup& b) noexcept
+// The lights and materials of two setups whose counts already agree.
+const char* lightAndMaterialDifference (const EngineSceneSetup& a, const EngineSceneSetup& b) noexcept
 {
-    if (const char* sceneWhy = sceneContentDifference (a.scene, b.scene))
-        return sceneWhy;
-    if (! sameBits (a.emissionGain, b.emissionGain))
-        return "emission gain";
-    if (a.objectMaterials.size() != b.objectMaterials.size())
-        return "object material count";
-    if (a.objectGratings.size() != b.objectGratings.size())
-        return "object grating count";
-    if (a.objectFrames.size() != b.objectFrames.size())
-        return "object frame count";
-    for (std::size_t i = 0; i < a.objectFrames.size(); ++i)
-        if (a.objectFrames[i].objectId != b.objectFrames[i].objectId
-            || a.objectFrames[i].layer != b.objectFrames[i].layer)
-            return "object frame";
-    if (a.lights.size() != b.lights.size())
-        return "light count";
-    if (a.objectWorlds.size() != b.objectWorlds.size())
-        return "object world count";
-    if (a.lightShapes.size() != b.lightShapes.size())
-        return "light shape count";
-    if (a.areaLights.size() != b.areaLights.size())
-        return "area light count";
-    if (! sameBits (a.shutterOpen, b.shutterOpen) || ! sameBits (a.shutterClose, b.shutterClose))
-        return "motion blur shutter";
-    if (a.previousObjectWorlds.size() != b.previousObjectWorlds.size()
-        || a.previousInstances.size() != b.previousInstances.size())
-        return "previous frame count";
-    for (std::size_t i = 0; i < a.previousObjectWorlds.size(); ++i)
-        if (std::memcmp (a.previousObjectWorlds[i].m.data(), b.previousObjectWorlds[i].m.data(), sizeof (float) * 16) != 0)
-            return "previous object world";
-    for (std::size_t i = 0; i < a.previousInstances.size(); ++i)
-        if (std::memcmp (&a.previousInstances[i], &b.previousInstances[i], sizeof (a.previousInstances[i])) != 0)
-            return "previous instance";
-    if (a.previousPositions != b.previousPositions
-        && (a.previousPositions == nullptr || b.previousPositions == nullptr
-            || a.previousPositions->size() != b.previousPositions->size()
-            || std::memcmp (a.previousPositions->data(), b.previousPositions->data(),
-                            sizeof (HarmonicMIDI::grid::SceneVec3) * a.previousPositions->size()) != 0))
-        return "previous positions";
     for (std::size_t i = 0; i < a.lightShapes.size(); ++i)
         if (! sameLightShape (a.lightShapes[i], b.lightShapes[i]))
             return "light shape";
@@ -269,6 +231,74 @@ const char* sceneSetupDifference (const EngineSceneSetup& a, const EngineSceneSe
     for (std::size_t i = 0; i < a.lights.size(); ++i)
         if (! sameLightRecord (a.lights[i], b.lights[i]))
             return "light record";
+    return nullptr;
+}
+
+// The first field two scene setups disagree on, or null when they are the same
+// scene. A Preview accumulation restarts whenever the setup changes, so a setup
+// that rebuilds itself identically every frame would hold the preview at one
+// sample per pixel for ever; this names the part that actually moved.
+// placement leaves out what refitRenderScene can move (samePlacementTopology).
+const char* sceneSetupDifference (const EngineSceneSetup& a, const EngineSceneSetup& b, bool placement = false) noexcept
+{
+    if (const char* sceneWhy = sceneContentDifference (a.scene, b.scene, placement))
+        return sceneWhy;
+    if (a.noteInstanced != b.noteInstanced || a.noteInstances.size() != b.noteInstances.size())
+        return "note instance count";
+    if (a.noteAppearance.size() != b.noteAppearance.size()
+        || (! a.noteAppearance.empty()
+            && std::memcmp (a.noteAppearance.data(), b.noteAppearance.data(), sizeof (a.noteAppearance[0]) * a.noteAppearance.size()) != 0))
+        return "note appearance";
+    if (! sameBits (a.emissionGain, b.emissionGain))
+        return "emission gain";
+    if (a.objectMaterials.size() != b.objectMaterials.size())
+        return "object material count";
+    if (a.objectGratings.size() != b.objectGratings.size())
+        return "object grating count";
+    if (a.objectFrames.size() != b.objectFrames.size())
+        return "object frame count";
+    for (std::size_t i = 0; i < a.objectFrames.size(); ++i)
+        if (a.objectFrames[i].objectId != b.objectFrames[i].objectId
+            || a.objectFrames[i].layer != b.objectFrames[i].layer)
+            return "object frame";
+    if (a.lights.size() != b.lights.size())
+        return "light count";
+    if (a.objectWorlds.size() != b.objectWorlds.size())
+        return "object world count";
+    if (a.lightShapes.size() != b.lightShapes.size())
+        return "light shape count";
+    if (a.areaLights.size() != b.areaLights.size())
+        return "area light count";
+    if (! sameBits (a.shutterOpen, b.shutterOpen) || ! sameBits (a.shutterClose, b.shutterClose))
+        return "motion blur shutter";
+    if (a.previousObjectWorlds.size() != b.previousObjectWorlds.size()
+        || a.previousInstances.size() != b.previousInstances.size()
+        || a.previousNoteInstances.size() != b.previousNoteInstances.size())
+        return "previous frame count";
+    // Motion blur moves vertices only, so its earlier frame is placement too, as long
+    // as the shutter (compared above) and which arrays exist stay the same.
+    if (placement && ((a.previousPositions == nullptr) == (b.previousPositions == nullptr)))
+        return lightAndMaterialDifference (a, b);
+    for (std::size_t i = 0; i < a.noteInstances.size(); ++i)
+        if (std::memcmp (&a.noteInstances[i], &b.noteInstances[i], sizeof (a.noteInstances[i])) != 0)
+            return "note instance";
+    for (std::size_t i = 0; i < a.previousNoteInstances.size(); ++i)
+        if (std::memcmp (&a.previousNoteInstances[i], &b.previousNoteInstances[i], sizeof (a.previousNoteInstances[i])) != 0)
+            return "previous note instance";
+    for (std::size_t i = 0; i < a.previousObjectWorlds.size(); ++i)
+        if (std::memcmp (a.previousObjectWorlds[i].m.data(), b.previousObjectWorlds[i].m.data(), sizeof (float) * 16) != 0)
+            return "previous object world";
+    for (std::size_t i = 0; i < a.previousInstances.size(); ++i)
+        if (std::memcmp (&a.previousInstances[i], &b.previousInstances[i], sizeof (a.previousInstances[i])) != 0)
+            return "previous instance";
+    if (a.previousPositions != b.previousPositions
+        && (a.previousPositions == nullptr || b.previousPositions == nullptr
+            || a.previousPositions->size() != b.previousPositions->size()
+            || std::memcmp (a.previousPositions->data(), b.previousPositions->data(),
+                            sizeof (HarmonicMIDI::grid::SceneVec3) * a.previousPositions->size()) != 0))
+        return "previous positions";
+    if (const char* why = lightAndMaterialDifference (a, b))
+        return why;
     for (std::size_t i = 0; i < a.objectWorlds.size(); ++i)
         if (std::memcmp (a.objectWorlds[i].m.data(), b.objectWorlds[i].m.data(), sizeof (float) * 16) != 0)
             return "object world";
@@ -278,6 +308,11 @@ const char* sceneSetupDifference (const EngineSceneSetup& a, const EngineSceneSe
 bool sameSceneSetup (const EngineSceneSetup& a, const EngineSceneSetup& b) noexcept
 {
     return sceneSetupDifference (a, b) == nullptr;
+}
+
+bool samePlacementTopology (const EngineSceneSetup& a, const EngineSceneSetup& b) noexcept
+{
+    return sceneSetupDifference (a, b, true) == nullptr;
 }
 
 bool rasterDrawsSkyBackground (const std::vector<SceneLightRecord>& lights) noexcept
@@ -362,6 +397,7 @@ bool SceneEngine::prepare (const EngineSceneSetup& setup, const EngineView& view
     }
     if (view.previousCamera)
         setCameraShutter (camera, *view.previousCamera, setup.shutterOpen, setup.shutterClose);
+    lastRefitted_ = false;
     if (! sceneValid_ || ! sameSceneSetup (setup, cachedSetup_))
     {
         PrepareOptions options;
@@ -373,6 +409,13 @@ bool SceneEngine::prepare (const EngineSceneSetup& setup, const EngineView& view
         options.ingest.previousObjectWorldCount = setup.previousObjectWorlds.size();
         options.ingest.previousInstances = setup.previousInstances.empty() ? nullptr : setup.previousInstances.data();
         options.ingest.previousInstanceCount = setup.previousInstances.size();
+        options.ingest.noteInstanced = setup.noteInstanced;
+        options.ingest.noteInstances = setup.noteInstances.empty() ? nullptr : setup.noteInstances.data();
+        options.ingest.noteInstanceCount = setup.noteInstances.size();
+        options.ingest.previousNoteInstances = setup.previousNoteInstances.size() == setup.noteInstances.size()
+                                             && ! setup.previousNoteInstances.empty()
+                                             ? setup.previousNoteInstances.data() : nullptr;
+        options.noteAppearance = &setup.noteAppearance;
         if (setup.previousPositions != nullptr)
         {
             options.ingest.previousPositions = setup.previousPositions->data();
@@ -386,11 +429,23 @@ bool SceneEngine::prepare (const EngineSceneSetup& setup, const EngineView& view
         options.lightShapes = setup.lightShapes;
         options.areaLights = setup.areaLights;
         options.environmentImageSource = environmentImageSource;
+        // An advancing frame that only moved its triangles refits the scene in place.
+        if (sceneValid_ && samePlacementTopology (setup, cachedSetup_)
+            && refitRenderScene (*setup.scene, scene_, options))
+        {
+            cachedSetup_ = setup;
+            ++sceneRefits_;
+            lastRefitted_ = true;
+            rebuilt = true;
+            tracer_.settings.environmentVisibleToCamera = skyVisible_;
+            return true;
+        }
         sceneValid_ = false;
         prepareRenderScene (*setup.scene, scene_, options);
         cachedSetup_ = setup;
         skyVisible_ = rasterDrawsSkyBackground (setup.lights);
         cameraBackground_ = HarmonicMIDI::grid::sceneCameraBackground (setup.lights.data(), setup.lights.size());
+        environmentHidden_ = ! HarmonicMIDI::grid::sceneEnvironmentVisibleToCamera (setup.lights.data(), setup.lights.size());
         sceneValid_ = true;
         ++sceneBuilds_;
         rebuilt = true;
@@ -501,12 +556,17 @@ void SceneEngine::resolve (EngineColor color, EngineImage& image) const
     image.materialIdPass.assign (pixels, 0);
     image.objectIdPass.assign (pixels, 0);
     image.motionPass.assign (pixels * 2, 0);
+    image.backdropPass.assign (pixels, 0);
     const bool depthValid = depth_.size() == pixels && covered_.size() == pixels;
     const bool outputsValid = outputs_.size() == pixels;
     const std::uint16_t halfOne = halfBits (1.0f);
-    const float* background = color == EngineColor::LinearRgba16f ? kLinearRasterBackground : kRasterBackground;
-    // A camera background replaces the stage colour: a colour (sRGB encoded for the
-    // 8-bit image, as the stage colour is) or zero alpha.
+    // The raster's clear (backend_opengl.cpp): the stage colour, or opaque black
+    // when an Environment Light hides itself, with the same values in an 8-bit and
+    // a linear image.
+    static constexpr float kBlack[3] { 0.0f, 0.0f, 0.0f };
+    const float* background = environmentHidden_ ? kBlack : kRasterBackground;
+    // A camera background replaces it: a colour (sRGB encoded for the 8-bit image)
+    // or zero alpha.
     using BackgroundMode = HarmonicMIDI::grid::SceneCameraBackgroundMode;
     const auto encode = [&] (float linear) {
         if (color == EngineColor::LinearRgba16f) return linear;
@@ -529,6 +589,7 @@ void SceneEngine::resolve (EngineColor color, EngineImage& image) const
             float rgb[3] { mean.r, mean.g, mean.b };
             const bool covered = depthValid && covered_[source] != 0;
             const bool backdrop = ! skyVisible_ && ! covered;
+            image.backdropPass[target + x] = backdrop && mean.r == 0.0f && mean.g == 0.0f && mean.b == 0.0f ? 1 : 0;
             if (backdrop && ! transparentBackground)
                 for (int channel = 0; channel < 3; ++channel)
                     rgb[channel] += background[channel];
@@ -674,18 +735,27 @@ namespace
 // The pass's device phases plus the engine's own. A device that traces the CPU BVH
 // (the CPU, and the compute devices) leaves AccelBuild to this: that BVH's build,
 // when this call made a new scene.
-void notePassPhases (FramePhaseTimes& passPhases, const FramePhaseTimes& enginePhases, bool rebuilt, double bvhBuildMs)
+void notePassPhases (FramePhaseTimes& passPhases, const FramePhaseTimes& enginePhases, bool rebuilt, bool refitted,
+                     double bvhBuildMs)
 {
     FramePhaseTimes merged = enginePhases;
     merged.merge (passPhases);
     if (! merged.has (FramePhase::AccelBuild) && merged.absentReason (FramePhase::AccelBuild) == nullptr)
     {
         merged.set (FramePhase::AccelBuild, rebuilt ? bvhBuildMs : 0.0);
-        merged.accelBuild = rebuilt ? "build" : "reused";
+        merged.accelBuild = refitted ? "refit" : rebuilt ? "build" : "reused";
     }
     passPhases = merged;
 }
 } // namespace
+
+bool SceneEngine::primeScene (const EngineSceneSetup& setup, const EngineView& view, std::string& error)
+{
+    PinholeCamera camera;
+    bool rebuilt = false;
+    FramePhaseTimes phases;
+    return timedPrepare (setup, view, camera, rebuilt, phases, error);
+}
 
 bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView& view, EngineColor color,
                                  EngineImage& image, std::string& error)
@@ -749,7 +819,8 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
     else
         phases.set (FramePhase::DepthPass, 0.0);
     image.restarted = restart;
-    image.sceneRebuilt = rebuilt;
+    image.sceneRebuilt = rebuilt && ! lastRefitted_;
+    image.sceneRefitted = lastRefitted_;
     renderMode_ = playbackFrame ? EngineRenderMode::PlaybackFixed : EngineRenderMode::Converging;
     image.mode = renderMode_;
     const std::uint32_t goal = playbackFrame ? std::min (std::max (1u, playbackSamples), maximumPreviewSamples)
@@ -761,7 +832,7 @@ bool SceneEngine::renderPreview (const EngineSceneSetup& setup, const EngineView
         image.stats = tracer_.renderProgressive (scene_, camera, view.width, view.height, samples,
                                                  previewGeneration_, cancel_,
                                                  previewSeeded_ ? kExportGeneration : 0);
-        notePassPhases (image.stats.phases, phases, rebuilt, scene_.bvhBuildMs);
+        notePassPhases (image.stats.phases, phases, rebuilt, lastRefitted_, scene_.bvhBuildMs);
     if (image.stats.deviceFailed)
     {
         error = "Path Trace device failed: " + tracer_.deviceFailure();
@@ -877,7 +948,7 @@ bool SceneEngine::renderExport (const EngineSceneSetup& setup, const EngineView&
     phases.set (FramePhase::DepthPass, millisecondsSince (depthStart));
     image.stats = tracer_.renderFixed (scene_, camera, view.width, view.height, samplesPerPixel,
                                        kExportGeneration, cancel_);
-    notePassPhases (image.stats.phases, phases, rebuilt, scene_.bvhBuildMs);
+    notePassPhases (image.stats.phases, phases, rebuilt, lastRefitted_, scene_.bvhBuildMs);
     if (image.stats.deviceFailed)
     {
         error = "Path Trace device failed: " + tracer_.deviceFailure();
@@ -902,7 +973,8 @@ bool SceneEngine::renderExport (const EngineSceneSetup& setup, const EngineView&
     image.generation = kExportGeneration;
     image.samplesPerPixel = samplesPerPixel;
     image.restarted = true;
-    image.sceneRebuilt = rebuilt;
+    image.sceneRebuilt = rebuilt && ! lastRefitted_;
+    image.sceneRefitted = lastRefitted_;
     image.traced = true;
     // At most once a second, like the preview line: an export calls this per frame.
     {

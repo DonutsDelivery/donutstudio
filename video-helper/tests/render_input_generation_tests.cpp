@@ -35,7 +35,7 @@ void check (bool condition, const std::string& message)
 
 void methodTests()
 {
-    for (const char* method : { "graph_set_param", "graph_set_effects", "graph_set_lut", "text_set_image",
+    for (const char* method : { "graph_set_param", "graph_set_gen_params", "graph_set_effects", "graph_set_lut", "text_set_image",
                                 "viewport_set_timeline", "viewport_set_post", "viewport_set_mod_matrix" })
         check (renderinput::changesFrameInputs (method), std::string (method) + " changes a frame's inputs");
     for (const char* method : { "viewport_set_visible", "viewport_set_bounds", "graph_describe", "export",
@@ -117,6 +117,9 @@ void perClipTests()
            "a view parameter changes no frame");
     check (renderinput::editScope ("graph_set_param", "text4/size", std::nullopt).kind == Kind::All,
            "a text parameter reaches every clip");
+    scope = renderinput::editScope ("graph_set_gen_params", "", 9);
+    check (scope.kind == renderinput::EditScope::Kind::Clip && scope.clip == 9,
+           "generator replacement invalidates only its clip");
     scope = renderinput::editScope ("graph_set_effects", "", 9);
     check (scope.kind == Kind::Clip && scope.clip == 9, "an effect edit reaches its clip");
     scope = renderinput::editScope ("graph_set_lut", "", 9);

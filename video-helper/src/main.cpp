@@ -19,6 +19,7 @@
 #include "export_encoder_route.h"
 #include "render_input_generation.h"
 #include "pathtrace_fixture_engine.h"
+#include "pathtrace/devices/kernel_warmup.h"
 
 #include "composite_probe_contract.h"
 #include "composite_render_diagnostic.h"
@@ -47,6 +48,7 @@
 #include "lua_hook.h"         // P2 Scripts tab: script_compile validation (Lua hook)
 #include "js_hook.h"          // P2 Scripts tab: script_compile validation (JS hook)
 #include "programmable_admission.h"
+#include "surface_wave_path_note.h"
 #include "../../shared/PrivateInheritedPayload.h"
 #include "VideoFrameSharedMemory.h"
 
@@ -513,6 +515,26 @@ struct RenderCacheAsyncState
     std::mutex workerMutex;                 // guards join() callers
     videohelper::RenderThread worker;       // same FrameRenderer path as export
 } g_renderCache;
+
+// The background kernel warm-up for diagnostics. A live test reads it through viewport_info
+// and pathtrace_warmup; the user never sees it unless the viewport joins the compile.
+json kernelWarmupJson()
+{
+    const auto info = videorender::fixture3d::pathtracefixture::kernelWarmupInfo();
+    return json {
+        { "applies", info.applies },
+        { "state", info.state },
+        { "reason", info.reason },
+        { "armed", info.armed },
+        { "moduleHashPresent", info.moduleHashPresent },
+        { "joined", info.joined },
+        { "contextReleased", info.contextReleased },
+        { "busy", info.busy },
+        { "lowPriority", info.lowPriority },
+        { "elapsedSec", info.elapsedSeconds },
+        { "error", info.error },
+    };
+}
 struct StabilizationAsyncState
 {
     StabilizationProgress progress;
@@ -2402,10 +2424,34 @@ json handle (const std::string& method, const json& params, std::string& error)
         videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::snapshotAdmitted);
         CompositeFrameResult frame;
         videorender::fixture3d::clearPathTraceExportStats();
-        const auto firstFrameStart = std::chrono::steady_clock::now();
-        error = renderCompositeFrame (job, timelineSec, frame, &g_modelPayloads);
-        const auto firstFrameEnd = std::chrono::steady_clock::now();
-        if (! error.empty()) return {};
+        // All measured frames render in one GPU context and frame loop, as export and
+        // the viewport do, so a later frame pays only for what changes per frame.
+        // Frame 0's wall time covers the call's setup as well; each later one is the
+        // time since the previous frame finished.
+        json records = json::array();
+        json firstFrameStats = json::object();
+        auto frameStart = std::chrono::steady_clock::now();
+        const auto frameRendered = [&] (int64_t index)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            json stats;
+            videorender::fixture3d::appendLastExportStats (stats);
+            if (index == 0) firstFrameStats = stats;
+            if (measureFrames > 0)
+                records.push_back (videorender::speedstats::measuredFrameRecord (stats,
+                    timelineSec + static_cast<double> (index) / job.fps,
+                    std::chrono::duration<double, std::milli> (now - frameStart).count()));
+            videorender::fixture3d::clearPathTraceExportStats();
+            frameStart = now;
+        };
+        error = renderCompositeFrame (job, timelineSec, frame, &g_modelPayloads,
+                                      std::max (1, measureFrames), frameRendered);
+        if (! error.empty())
+        {
+            if (measureFrames > 1 && ! records.empty())
+                error = "measureFrames frame " + std::to_string (records.size()) + ": " + error;
+            return {};
+        }
         frame.harmonicProbe.scoreObjectPresent = params.contains("score") && params["score"].is_object();
         json result {
             { "width", frame.width }, { "height", frame.height },
@@ -2464,36 +2510,14 @@ json handle (const std::string& method, const json& params, std::string& error)
                 { "cpuMs", job.scriptCpuMs }, { "memoryMiB", job.scriptMemoryMiB } } }
 #endif
         };
-        videorender::fixture3d::appendPathTraceStats (
-            result, videorender::fixture3d::lastPathTraceStats (videorender::fixture3d::RenderUse::Export));
-        videorender::fixture3d::appendRealtimeStats (
-            result, videorender::fixture3d::lastRealtimeStats (videorender::fixture3d::RenderUse::Export));
+        for (const char* engine : { "pathTraceStats", "realtimeStats" })
+            if (firstFrameStats.contains (engine))
+                result[engine] = firstFrameStats[engine];
         if (measureFrames > 0)
         {
-            // Frame 0 is the one above. Each later frame advances one frame period; its
-            // wall time covers the whole composite call, the GPU context it makes per
-            // frame included, and the engine stats split out the 3D layer's own time.
-            json records = json::array();
-            records.push_back (videorender::speedstats::measuredFrameRecord (
-                result, timelineSec, std::chrono::duration<double, std::milli> (firstFrameEnd - firstFrameStart).count()));
-            for (int index = 1; index < measureFrames; ++index)
-            {
-                const double sec = timelineSec + index / job.fps;
-                CompositeFrameResult measured;
-                videorender::fixture3d::clearPathTraceExportStats();
-                const auto start = std::chrono::steady_clock::now();
-                error = renderCompositeFrame (job, sec, measured, &g_modelPayloads);
-                if (! error.empty())
-                {
-                    error = "measureFrames frame " + std::to_string (index) + ": " + error;
-                    return {};
-                }
-                const double wallMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - start).count();
-                json stats;
-                videorender::fixture3d::appendLastExportStats (stats);
-                records.push_back (videorender::speedstats::measuredFrameRecord (stats, sec, wallMs));
-            }
             result["measure"] = videorender::speedstats::measuredFramesReply (std::move (records));
+            result["measure"]["setup"] = { { "contextMs", frame.contextMs },
+                                           { "admissionMs", frame.admissionMs } };
         }
         if (params.value("artifact", false))
         {
@@ -3064,6 +3088,8 @@ json handle (const std::string& method, const json& params, std::string& error)
         std::string controlPlanError;
         if (!parsePlanJson(params, plan, controlPlanError))
         {
+            // This update replaces the current plan even when admission fails.
+            g_viewport.setControlPlan({});
             error = controlPlanError;
             return {};
         }
@@ -3142,6 +3168,29 @@ json handle (const std::string& method, const json& params, std::string& error)
         const auto runtimeRevision = params.value ("runtimeRevision", uint64_t { 0 });
         g_viewport.acceptRuntimeRevision (runtimeRevision);
         g_viewport.advanceEvaluation (runtimeRevision);
+        return json { { "ok", true } };
+    }
+
+    if (method == "graph_set_gen_params")
+    {
+        if (! params.contains ("clipId") || ! params.contains ("genParams")
+            || ! params["genParams"].is_object())
+        {
+            error = "missing clipId/genParams";
+            return {};
+        }
+        std::map<std::string, double> values;
+        for (auto it = params["genParams"].begin(); it != params["genParams"].end(); ++it)
+        {
+            if (! it.value().is_number())
+            {
+                error = "invalid generator parameter value";
+                return {};
+            }
+            values[it.key()] = it.value().get<double>();
+        }
+        error = g_viewport.setGenParams (params["clipId"].get<int>(), std::move (values));
+        if (! error.empty()) return {};
         return json { { "ok", true } };
     }
 
@@ -3243,6 +3292,7 @@ json handle (const std::string& method, const json& params, std::string& error)
             paramsOut.push_back ({ { "name", p.name },
                                    { "type", arbitshader::inputTypeToWire (p.type) },
                                    { "default", p.defaultScalar },
+                                   { "defaultVec", p.defaultVec },
                                    { "min", p.minScalar },
                                    { "max", p.maxScalar },
                                    { "importedPath", p.importedPath } });   // M7: IMPORTED image source ("" = a user INPUT)
@@ -3395,6 +3445,23 @@ json handle (const std::string& method, const json& params, std::string& error)
         return json { { "device", videorender::fixture3d::pathtracefixture::devicePreference() }, { "error", problem } };
     }
 
+    // The host's go for the background kernel warm-up, once its window has painted and the app
+    // is idle, and its transport state while a warm-up may run. "info" only reads.
+    if (method == "pathtrace_warmup")
+    {
+        const std::string action = params.value ("action", std::string ("info"));
+        if (action == "start")
+            videorender::fixture3d::pathtracefixture::armKernelWarmup();
+        else if (action == "transport")
+            videohelper::pathtrace::kernelcompile::activity().transportPlaying = params.value ("playing", false);
+        else if (action != "info")
+        {
+            error = "pathtrace_warmup: action must be start, transport or info";
+            return {};
+        }
+        return kernelWarmupJson();
+    }
+
     if (method == "renderer_preparation")
     {
         const std::string action = params.value ("action", std::string());
@@ -3470,11 +3537,20 @@ json handle (const std::string& method, const json& params, std::string& error)
             { "lastSlowStepMs", vi.lastSlowStepMs },
             { "lastSlowScope", vi.lastSlowScope },
             { "lastSlowScopeMs", vi.lastSlowScopeMs },
+            { "firstFrameStagesMs", [&vi] {
+                  auto stages = json::object();
+                  for (const auto& [label, ms] : vi.firstFrameStagesMs) stages[label] = ms;
+                  return stages; }() },
+            { "firstFrameWallMs", vi.firstFrameWallMs },
+            { "firstFrameFrames", vi.firstFrameFrames },
             { "stalledStep", vi.stalledStep },
             { "stalledStepMs", vi.stalledStepMs },
             { "kernelCompiling", vi.kernelCompiling },
             { "kernelCancellable", vi.kernelCancellable },
+            { "kernelStandIn", vi.kernelStandIn },
+            { "kernelCompileElapsedSec", vi.kernelCompileElapsedSec },
             { "kernelBuildStopped", vi.kernelBuildStopped },
+            { "kernelWarmup", kernelWarmupJson() },
             { "lastCloseWaitStep", vi.lastCloseWaitStep },
             { "lastCloseWaitMs", vi.lastCloseWaitMs },
             { "canvasWidth", vi.canvasWidth },
@@ -3503,6 +3579,19 @@ json handle (const std::string& method, const json& params, std::string& error)
             reply, videorender::fixture3d::lastPathTraceStats (videorender::fixture3d::RenderUse::Preview));
         videorender::fixture3d::appendRealtimeStats (
             reply, videorender::fixture3d::lastRealtimeStats (videorender::fixture3d::RenderUse::Preview));
+        // The engine whose frame waits for its GL program, so the header can name
+        // it before its first frame reports.
+        if (const auto preparing = videorender::fixture3d::previewPreparingEngine(); ! preparing.empty())
+            reply["previewPreparingEngine"] = preparing;
+        // The open sea's path on the last Preview frame that had one: "gpu" when the
+        // wave pass moved it, else "cpu-replay" and the reason the GPU path was not taken.
+        if (const auto sea = videohelper::geometry::surfaceWavePath())
+            reply["surfaceWave"] = {
+                { "path", sea->gpu ? "gpu" : "cpu-replay" },
+                { "reason", sea->reason ? sea->reason : "" },
+                { "gpuFrames", sea->gpuFrames },
+                { "cpuFrames", sea->cpuFrames }
+            };
         return reply;
     }
 
@@ -3683,6 +3772,9 @@ int main (int argc, char** argv)
     _setmode (_fileno (stdout), _O_BINARY);
 #endif
 
+#if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
+    bool exportContextProbeAllowed = true;
+#endif
     const auto processRequest = [&] (const char* lineData, size_t lineSize)
     {
         if (lineSize == 0) return;
@@ -3701,6 +3793,20 @@ int main (int argc, char** argv)
         const std::string method = req.value ("method", "");
         // A timeline request can run to hundreds of megabytes. Move it, don't copy it.
         json params = req.contains ("params") ? std::move (req["params"]) : json::object();
+#if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
+        if (method == "windows_cold_export_context")
+        {
+            // A fixed query on the private helper pipe. A used session may own
+            // handles, a viewport or work that outlives its admission reply.
+            const bool unavailable = exportContextProbeAllowed && params.is_object() && params.empty()
+                && windowsExportContextCreationFailed();
+            reply (idVal, json { { "contextCreationFailed", unavailable } });
+            return;
+        }
+        if (method != "ping" && method != "version" && method != "attach_shm"
+            && method != "probe" && method != "export_progress" && method != "export_cancel")
+            exportContextProbeAllowed = false;
+#endif
         if (method == "viewport_set_timeline")
         {
             std::string payloadError;
@@ -3797,6 +3903,11 @@ int main (int argc, char** argv)
     const auto refuseUnallocatedRequest = [] (size_t bytes)
     {
         replyError (nullptr, "could not allocate " + std::to_string (bytes) + " bytes for a helper request line");
+    };
+    // The warm-up holds while an export or an offline render runs (the host adds the transport).
+    videohelper::pathtrace::kernelcompile::activity().helperBusy = []
+    {
+        return g_export.active.load() || g_renderCache.active.load();
     };
     if (! requestedPathTraceDevice.empty())
         videorender::fixture3d::pathtracefixture::setDevicePreference (requestedPathTraceDevice);

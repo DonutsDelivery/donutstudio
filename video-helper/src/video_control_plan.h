@@ -165,8 +165,16 @@ inline bool validatePlan(const Plan& plan, std::string& error)
         }
         const bool anyStructuredTarget = op.targetClipId >= 0 || op.targetNodeId >= 0
             || !op.targetParamId.empty();
-        if (op.kind == "sink" && anyStructuredTarget
-            && (op.targetClipId < 0 || op.targetNodeId < 0 || op.targetParamId.empty()))
+        // Graphless generators use the actual scalar map key and no visual node.
+        // The consumer still requires that key to exist in the live clip params.
+        const bool graphlessGenerator = op.targetClipId >= 0 && op.targetNodeId == -1
+            && !op.targetParamId.empty() && op.targetParamId.find('/') == std::string::npos
+            && op.destination == "clip" + std::to_string(op.targetClipId) + "/gen/" + op.targetParamId;
+        if (op.kind == "sink"
+            && (op.targetClipId < -1 || op.targetNodeId < -1
+                || (anyStructuredTarget
+                    && (op.targetClipId < 0 || (op.targetNodeId < 0 && !graphlessGenerator)
+                        || op.targetParamId.empty()))))
         {
             error = "video control plan structured sink identity is incomplete";
             return false;
@@ -191,12 +199,15 @@ class Executor
 public:
     bool bind(const Plan& plan, std::string& error)
     {
-        // Slots, states and results are sized from the plan. Only a real
-        // allocation failure refuses it.
+        // Slots, states and results are sized from the plan. A rejected
+        // update must leave no previous plan for the next frame.
         try
         {
             if (!validatePlan(plan, error))
+            {
+                clearPlan();
                 return false;
+            }
             plan_ = plan;
             slots_.assign(static_cast<std::size_t>(plan_.numSlots), 0.0f);
             available_.assign(static_cast<std::size_t>(plan_.numSlots), false);
@@ -205,6 +216,7 @@ public:
         }
         catch (const std::bad_alloc&)
         {
+            clearPlan();
             error = "Video Control plan could not allocate memory for "
                   + std::to_string(plan.operations.size()) + " operations and "
                   + std::to_string(plan.numSlots) + " slots";
@@ -557,6 +569,15 @@ public:
     }
 
 private:
+    void clearPlan() noexcept
+    {
+        plan_ = {};
+        slots_.clear();
+        available_.clear();
+        states_.clear();
+        results_.clear();
+    }
+
     struct OperationState
     {
         float value = 0.0f;

@@ -4,6 +4,7 @@
 // call it. Exists only in a build with ARBIT_HAVE_OPTIX.
 
 #include "../integrator.h"
+#include "kernel_warmup.h"
 
 #include <cstdint>
 #include <string>
@@ -22,6 +23,12 @@ PathTracer::DevicePassFunction makeOptixDevicePass (std::function<std::uint64_t(
 // says whether a pass can run now. A failed build says true, so the pass reports it.
 bool optixPipelineReady();
 void startOptixPipelineBuild();
+// The driver's cache holds this kernel, so a build is the 0.1 s kind. False when it does not,
+// and when nothing can say (no driver, no OptiX, the cache turned off).
+bool optixModuleHashPresent();
+// The host's go for the background warm-up (kernel_warmup.h), and its state for diagnostics.
+void armOptixWarmup();
+kernelcompile::WarmupReading readOptixWarmup();
 // Stops a running build and returns when its thread has let go. For process exit.
 void cancelOptixPipelineBuild();
 // The user's Cancel and Start again. Cancel returns at once and is refused once the build is

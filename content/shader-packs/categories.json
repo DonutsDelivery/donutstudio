@@ -1,0 +1,30 @@
+{
+  "_comment": "Canonical curation themes for the shader browser. A shader's manifest \"category\" field must be one of these ids (case-insensitive); anything absent or unknown is grouped under \"uncategorized\". displayName / description are for contributor docs and store copy.",
+  "categories": [
+    {
+      "id": "psychedelic",
+      "displayName": "Psychedelic",
+      "description": "Warping, kaleidoscopic, feedback-heavy visuals — tunnels, swirls, plasmas and trails that melt and pulse with the music."
+    },
+    {
+      "id": "minimalist",
+      "displayName": "Minimalist",
+      "description": "Clean geometry and restrained motion — grids, gradients, single shapes and lattices that stay calm and legible."
+    },
+    {
+      "id": "retro",
+      "displayName": "Retro",
+      "description": "Vintage screen aesthetics — CRT scanlines, VHS glitch, film burn, synthwave grids and analog TV artifacts."
+    },
+    {
+      "id": "nature",
+      "displayName": "Nature",
+      "description": "Organic and atmospheric scenes — auroras, water, smoke, light rays and blooming forms."
+    },
+    {
+      "id": "uncategorized",
+      "displayName": "Uncategorized",
+      "description": "Shaders with no curation theme set. Add a \"category\" field to a shader's manifest entry to file it under a theme."
+    }
+  ]
+}

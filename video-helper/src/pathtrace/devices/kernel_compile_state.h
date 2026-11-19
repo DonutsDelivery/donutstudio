@@ -104,6 +104,29 @@ inline std::atomic<bool>& previewStopped() noexcept
     return stopped;
 }
 
+// When the kernel build that is running began, on steadyNowNs()'s clock, or 0 when none runs.
+// The build gate writes it, so a build started at helper startup, by a preview or by a
+// background warm-up reads the same. The viewport turns it into the notice's elapsed time.
+inline std::atomic<std::int64_t>& runningBuildStartNs() noexcept
+{
+    static std::atomic<std::int64_t> startNs { 0 };
+    return startNs;
+}
+
+// The last Path Trace preview frame was drawn by the Raster engine because the kernel is
+// not ready, and the viewport swaps to Path Trace once it is. The renderer sets it per frame.
+inline std::atomic<bool>& previewStandIn() noexcept
+{
+    static std::atomic<bool> standIn { false };
+    return standIn;
+}
+
+// Whole seconds a build that began at startNs has run by nowNs, 0 for no build.
+constexpr int buildElapsedSeconds (std::int64_t startNs, std::int64_t nowNs) noexcept
+{
+    return startNs > 0 && nowNs > startNs ? static_cast<int> ((nowNs - startNs) / 1000000000LL) : 0;
+}
+
 // An export is blocked on the compile, so Cancel can't be offered.
 inline std::atomic<int>& exportsWaiting() noexcept
 {

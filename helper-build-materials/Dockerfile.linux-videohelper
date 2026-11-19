@@ -1,0 +1,53 @@
+# Build environment for DonutStudio's video-helper sidecar, matching CI's
+# build-linux-video-helper job (ubuntu-24.04). It needs FFmpeg 6 — the new channel-
+# layout API (ch_layout / AVChannelLayout / swr_alloc_set_opts2 / AVFrame::duration) —
+# which Ubuntu 22.04's FFmpeg 4.4 does not provide. The video-helper therefore has a
+# higher glibc floor (2.39) than the plugin (2.35); CI ships it this way too.
+# Build with an empty context:  docker build -t arbit-videohelper-build - < Dockerfile.linux-videohelper
+FROM ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4
+ARG DONUTSTUDIO_FFMPEG_PROFILE=distro
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Mirror the apt packages from build-linux.yml's build-linux-video-helper job.
+# libvulkan-dev: ARBIT_NCNN_ZEROCOPY (default ON on Linux) builds ncnn with
+# NCNN_SIMPLEVK=OFF, which links the Vulkan loader (libvulkan.so) at build time and
+# makes it a runtime dependency. (Vulkan-Headers themselves are FetchContent'd.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      cmake ninja-build pkg-config build-essential git ca-certificates ccache \
+      curl desktop-file-utils file \
+      libasound2-dev libfreetype6-dev libx11-dev libxrandr-dev libxinerama-dev \
+      libxcursor-dev libgl-dev libglfw3-dev libcurl4-openssl-dev libwebkit2gtk-4.1-dev \
+      nlohmann-json3-dev \
+      libvulkan-dev \
+ && if [ "$DONUTSTUDIO_FFMPEG_PROFILE" = distro ]; then \
+      apt-get install -y --no-install-recommends \
+        libavformat-dev libavcodec-dev libavutil-dev libavdevice-dev \
+        libswscale-dev libswresample-dev libavfilter-dev; \
+    elif [ "$DONUTSTUDIO_FFMPEG_PROFILE" = lgpl-linux-v1 ]; then \
+      # Noble amd64 strace 6.8-0ubuntu2, pinned to the official package bytes. \
+      # Runtime readiness still requires the separate reviewed signed APT chain. \
+      test "$(dpkg --print-architecture)" = amd64 \
+      && mkdir -p /usr/local/share/donutstudio-candidate \
+      && cd /usr/local/share/donutstudio-candidate \
+      && apt-get -o Acquire::AllowInsecureRepositories=false \
+        -o APT::Get::AllowUnauthenticated=false download strace:amd64=6.8-0ubuntu2 \
+      && echo 'd588810ae26b06fee6678dc81e5b54f6efcde8e718e4589adb4d11d254b9820b  strace_6.8-0ubuntu2_amd64.deb' | sha256sum -c - \
+      && apt-get install -y --no-install-recommends ./strace_6.8-0ubuntu2_amd64.deb \
+      && echo '28f957c227012de0b18d1bd7fff2d396cb693ea60ed8013be68de071e84b5001  /usr/bin/strace' | sha256sum -c - \
+      && cd / \
+      && \
+      apt-get install -y --no-install-recommends \
+        python3 autoconf automake libtool nasm xz-utils gnupg dpkg-dev patchelf \
+        zlib1g-dev libbz2-dev liblzma-dev libva-dev libvdpau-dev \
+        libxcb1-dev libxcb-shm0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+      && \
+      sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources; \
+    else echo "Unknown FFmpeg profile: $DONUTSTUDIO_FFMPEG_PROFILE" >&2; exit 2; fi \
+ && rm -rf /var/lib/apt/lists/*
+
+# Staging needs source indexes for apt-get source --download-only. Runtime source
+# packages are captured at the installed binary version, never relabelled.
+RUN if [ "$DONUTSTUDIO_FFMPEG_PROFILE" = lgpl-linux-v1 ]; then apt-get update; fi
+
+ENV PATH="/usr/lib/ccache:${PATH}"

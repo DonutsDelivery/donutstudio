@@ -9,6 +9,8 @@
 //   scale, then rotation, then translation.
 // - The scene's instanced object draws once per objectInstances entry with
 //   matrix objectWorld * instanceLocal, and never at its bare world matrix.
+//   Per-note instancing (IngestOptions::noteInstanced) does the same for every
+//   object, once per note.
 // - A mirrored world matrix (negative determinant) keeps the authored front
 //   face. Ingest swaps the second and third vertex of such triangles so that
 //   counter-clockwise world winding is always the front face.
@@ -127,6 +129,16 @@ struct IngestOptions
     std::size_t previousPositionCount = 0;
     float shutterOpen = 0.0f;
     float shutterClose = 0.0f;
+
+    // Per-note instancing (the raster's uNoteInstanceTransforms): when set, every
+    // object draws once per entry at objectWorld * instanceLocal, the entry's
+    // index is the triangles' instanceIndex, and no object draws at its bare
+    // world matrix. Zero entries draw nothing. previousNoteInstances, when set,
+    // holds one earlier transform per entry for motion blur.
+    bool noteInstanced = false;
+    const HarmonicMIDI::grid::SceneTransform3D* noteInstances = nullptr;
+    std::size_t noteInstanceCount = 0;
+    const HarmonicMIDI::grid::SceneTransform3D* previousNoteInstances = nullptr;
 };
 
 Mat4 transformMatrix (const HarmonicMIDI::grid::SceneTransform3D& transform) noexcept;

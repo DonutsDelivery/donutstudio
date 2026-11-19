@@ -1,0 +1,9 @@
+{
+  "state": "PRIVATE_SOURCE_DRAFT",
+  "helperTreeSha256": "360e37df7be108d88a293038adff63d496de16da3bb4c62db67b071aa322d2b9",
+  "exactHelperFiles": 1022,
+  "sources": {
+    "linux": "d1e1b84281c4bae3f1eebc7719b51dbcf219c7df",
+    "macos": "29846807ab8ff0ceafd7e3c5cc4453865aacb6b7"
+  }
+}

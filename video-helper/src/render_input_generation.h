@@ -128,7 +128,7 @@ private:
 inline bool changesFrameInputs (std::string_view method) noexcept
 {
     constexpr std::string_view methods[] = {
-        "graph_set_param", "graph_set_effects", "graph_set_lut", "text_set_image",
+        "graph_set_param", "graph_set_gen_params", "graph_set_effects", "graph_set_lut", "text_set_image",
         "viewport_set_timeline", "viewport_set_full_canvas_scene", "viewport_set_canvas",
         "viewport_set_canvas_background", "viewport_set_post", "viewport_set_score",
         "viewport_set_beat_timeline", "viewport_set_mod_matrix", "viewport_set_control_plan",
@@ -181,7 +181,7 @@ inline EditScope editScope (std::string_view method, std::string_view paramId, s
             return { EditScope::Kind::Clip, *clip };
         return { EditScope::Kind::All, 0 };
     }
-    if ((method == "graph_set_effects" || method == "graph_set_lut") && clipId.has_value() && *clipId > 0)
+    if ((method == "graph_set_gen_params" || method == "graph_set_effects" || method == "graph_set_lut") && clipId.has_value() && *clipId > 0)
         return { EditScope::Kind::Clip, *clipId };
     return { EditScope::Kind::All, 0 };
 }

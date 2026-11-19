@@ -71,6 +71,7 @@ inline void appendRealtimeStats (nlohmann::json& reply, const std::optional<Real
         { "use", stats->use == RenderUse::Export ? "export" : "preview" },
         { "causticsNeedPathTrace", stats->causticsNeedPathTrace },
         { "reflectionsSkipped", stats->reflectionsSkipped },
+        { "surfaceWaveGpu", stats->surfaceWaveGpu },
         { "width", stats->width },
         { "height", stats->height }
     };

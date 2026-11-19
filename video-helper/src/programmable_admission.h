@@ -49,6 +49,18 @@ inline uint64_t nowMs()
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+// Windows supports the bounded generator templates through the inherited
+// session channel. Other programmable payloads remain disabled there.
+inline bool isWindowsBuiltinGenerator(const programmableruntime::Grant& grant,
+                                     programmableruntime::PayloadKind kind,
+                                     const std::string& payload)
+{
+    return kind == programmableruntime::PayloadKind::shader
+        && grant.verifiedBundledCurated
+        && grant.catalogPackId == builtingeneratorshader::catalogPackId
+        && builtingeneratorshader::validSource(grant.catalogProgramId, payload);
+}
+
 class SessionVerifier
 {
 public:
@@ -85,12 +97,16 @@ public:
                 const std::string& payload, programmableruntime::Grant& grant,
                 std::string& error, uint64_t now = nowMs())
     {
+        if (! parseGrant(wire, grant, error))
+            return false;
        #if defined(_WIN32)
-        error = "programmable runtime grants unsupported on Windows";
-        return false;
+        if (! isWindowsBuiltinGenerator(grant, authoritativeKind, payload))
+        {
+            error = "programmable runtime grants unsupported on Windows";
+            return false;
+        }
        #endif
-        if (! parseGrant(wire, grant, error)
-            || ! programmableruntime::admits(grant, authoritativeKind, payload, error))
+        if (! programmableruntime::admits(grant, authoritativeKind, payload, error))
             return false;
 
         const std::lock_guard<std::mutex> lock(mutex_);

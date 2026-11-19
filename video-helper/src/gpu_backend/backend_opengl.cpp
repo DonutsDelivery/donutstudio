@@ -6,6 +6,8 @@
 #include "backend.h"
 #include "cpu_scene_frame.h"
 #include "fixture_vertex_modifier_shader.h"
+#include "surface_wave_compute_source.h"
+#include "surface_wave_water_range.h"
 #include "fixture_texture_upload.h"
 #include "fixture_opaque_visibility.h"
 #include "fixture_smooth_glass.h"
@@ -17,7 +19,9 @@
 #include "realtime_diffraction_emitters.h"
 #include "realtime_diffraction_efficiency_table.h"
 #include "realtime_diffraction_gather.h"
+#include "realtime_emitter_shadow.h"
 #include "realtime_diffraction_mirror.h"
+#include "realtime_planar_mirror.h"
 #include "../../../shared/RasterMedium.h"
 #include "fixture_rough_glass_tiles_opengl.h"
 #include "fixture_rough_lane_slices.h"
@@ -2804,6 +2808,8 @@ uniform int uDiffractionInstanceCount;
 uniform vec4 uCameraRotation;
 uniform vec3 uCameraTranslation;
 uniform vec4 uProjection;
+// Realtime's planar mirror (realtime_planar_mirror.h): unit normal and offset, zero off.
+uniform vec4 uViewerMirror;
 // Clip depth spans this camera distance range, fitted to the scene's bounds
 // inside the authored planes. Unset (y <= x) uses the authored planes.
 uniform vec2 uClipDepthRange;
@@ -2887,7 +2893,9 @@ void main() {
         * vec4(modifiedPosition * uNoteMeshScale + noteInstance.xyz, 1.0)).xyz;
     vec3 worldNormal = normalize(transpose(inverse(mat3(objectMatrix))) * aNormal);
     vec4 inverseCamera = vec4(-uCameraRotation.xyz, uCameraRotation.w);
-    vec3 camera = rotateQ(inverseCamera, world - uCameraTranslation);
+    // A Realtime planar mirror draw places the point at its mirror image.
+    vec3 drawn = world - 2.0 * (dot(uViewerMirror.xyz, world) + uViewerMirror.w) * uViewerMirror.xyz;
+    vec3 camera = rotateQ(inverseCamera, drawn - uCameraTranslation);
     float distance = -camera.z;
     vec2 depthRange = uClipDepthRange.y > uClipDepthRange.x ? uClipDepthRange : uProjection.zw;
     if (uProjection.x < 0.0) {
@@ -2962,6 +2970,16 @@ in vec3 vLitBase;
 in vec3 vEmissive;
 in vec3 vWorldPosition;
 in vec3 vWorldNormal;
+// Path Trace shades an opaque surface from whichever side the ray arrives on. A two-sided
+// draw (uFaceForward 1) does the same: a back face's normal turns to the viewer. Every
+// later read of vWorldNormal, the shading and the shadow and sky ray origins, takes the
+// faced normal through the define below. fixtureFaceNormal() sets it at the start of main.
+uniform float uFaceForward;
+vec3 gFacedWorldNormal;
+void fixtureFaceNormal() {
+    gFacedWorldNormal = uFaceForward > 0.5 && !gl_FrontFacing ? -vWorldNormal : vWorldNormal;
+}
+#define vWorldNormal gFacedWorldNormal
 in vec3 vWorldTangent;
 flat in float vBitangentSign;
 in vec2 vMetallicRoughness;
@@ -3009,18 +3027,26 @@ uniform vec4 uLightRotation;
 uniform int uLightCount;
 uniform sampler2D uSceneTable;
 vec4 sceneTableRead(int record) { return texelFetch(uSceneTable, ivec2(record % 1024, record / 1024), 0); }
+// A Realtime planar mirror draw (realtime_planar_mirror.h) shades each point as the
+// camera's mirror image in this plane sees it: unit normal in xyz, offset in w, zero off.
+uniform vec4 uViewerMirror;
+vec3 fixtureMirrored(vec3 point) {
+    return point - 2.0 * (dot(uViewerMirror.xyz, point) + uViewerMirror.w) * uViewerMirror.xyz;
+}
+vec3 fixtureCameraPosition() { return fixtureMirrored(uCameraTranslation); }
 // From a surface point toward the viewer. An orthographic camera sees every point
 // straight back along its view axis, at the point's view depth.
 vec3 fixtureToViewer(vec3 world) {
-    if (uProjection.x >= 0.0) return uCameraTranslation - world;
+    if (uProjection.x >= 0.0) return fixtureCameraPosition() - world;
     vec3 q = uCameraRotation.xyz;
     vec3 back = vec3(0.0, 0.0, 1.0) + 2.0 * cross(q, cross(q, vec3(0.0, 0.0, 1.0)) + uCameraRotation.w * vec3(0.0, 0.0, 1.0));
-    return back * max(dot(uCameraTranslation - world, back), 1.0e-6);
+    back -= 2.0 * dot(uViewerMirror.xyz, back) * uViewerMirror.xyz;
+    return back * max(dot(fixtureCameraPosition() - world, back), 1.0e-6);
 }
 // Where the camera ray through `world` starts: the camera itself, or for an
 // orthographic camera the point on its plane straight behind `world`.
 vec3 fixtureViewerPosition(vec3 world) {
-    return uProjection.x >= 0.0 ? uCameraTranslation : world + fixtureToViewer(world);
+    return uProjection.x >= 0.0 ? fixtureCameraPosition() : world + fixtureToViewer(world);
 }
 #define fixtureLightRotation(i) sceneTableRead(4 * (i))
 #define fixtureLightColor(i) sceneTableRead(4 * (i) + 1)
@@ -3120,6 +3146,10 @@ uniform sampler2D uRealtimeGatherNormal;
 uniform usampler2D uRealtimeGatherObject;
 vec3 gRealtimeGatherTerm = vec3(0.0);
 bool gRealtimeGatherValid = false;
+// A receiver's unshadowed emitter light in the gather pass, which goes to the emission
+// attachment for the shadow pass (realtime_emitter_shadow.h) instead of the term.
+vec3 gRealtimeEmitterTerm = vec3(0.0);
+bool gRealtimeEmitterValid = false;
 // Set when the full pass took a receiver's term from the gather target.
 bool gRealtimeGatherReused = false;
 // The probe (uRealtimeGather.w 1, full pass): which gather pixels reused the term.
@@ -3840,17 +3870,20 @@ vec3 realtimeDiffractionEmitterChord(vec3 position, vec3 normal, vec3 d0, vec3 d
 }
 // The sky without its analytic sun disc, which realtimeDiffractionSunArc integrates
 // over each order's arc instead. The scene's ambient colour is environment radiance
-// from every direction, as Path Trace adds it (pathtrace/lights.h).
+// from every direction, as Path Trace adds it (pathtrace/lights.h). uAmbient also
+// carries a lone environment light's constant fill for vLitBase; with a sky or an
+// image that light is the sky itself, so the orders add only the scene's ambient.
+uniform vec3 uDiffractionSkyAmbient;
 vec3 realtimeDiffractionSkyRadiance(vec3 direction, float solidAngle) {
-    if (uSky[0].w > 1.5) return environmentImageFiltered(direction, uSky[0], uSky[1], solidAngle) + uAmbient;
+    if (uSky[0].w > 1.5) return environmentImageFiltered(direction, uSky[0], uSky[1], solidAngle) + uDiffractionSkyAmbient;
     if (uSky[0].w > 0.5) {
         vec3 d = normalize(direction);
         float cap = clamp((dot(d, uSky[4].xyz) - uSky[3].w) / (1.0 - uSky[3].w), 0.0, 1.0);
         vec3 disc = uSky[3].rgb * uSky[4].w * cap * cap * (3.0 - 2.0 * cap);
         return max(analyticSkyRadiance(d, uSky[0], uSky[1], uSky[2], uSky[3], uSky[4])
-            - (1.0 - analyticSkyCloudOpacity(d, uSky[1], uSky[2])) * disc, vec3(0.0)) + uAmbient;
+            - (1.0 - analyticSkyCloudOpacity(d, uSky[1], uSky[2])) * disc, vec3(0.0)) + uDiffractionSkyAmbient;
     }
-    vec3 flatSky = uAmbient;
+    vec3 flatSky = uDiffractionSkyAmbient;
     for (int i = 0; i < uLightCount; ++i)
         if (fixtureLightKind(i) == 2) flatSky += fixtureLightColor(i).rgb * fixtureLightColor(i).a;
     return flatSky;
@@ -3969,13 +4002,89 @@ float realtimePressedDiscEfficiency(int order, float stripeFraction, float phase
 // a Lorentzian along them, of half width lambda / (pi mean run). Realtime integrates the
 // lobe on fixed nodes (realtimediffraction::pitScatterNodes): three lines along at the
 // Lorentzian's sixths, each cut across into pieces weighted by sinc^2, and each piece
-// reads the emitters it crosses and the sky, so the lobe is smooth from pixel to pixel.
+// reads the sky, so the lobe is smooth from pixel to pixel. The emitters take the lobe's
+// mass on each of their triangles (realtimePitTriangleMass), and the sky the rest.
 // A piece past the horizon stays in the mirror, as Path Trace keeps it.
 const int kRealtimePitScatterPieces = 12;
 const float kRealtimePitScatterReach = 3.0;
 const float realtimediffractionMeanRun = 1354.0;
+// The sinc^2 mass inside the reach on the twelve pieces, what their weights sum to.
+const float kRealtimePitScatterAcrossMass = 0.9663037;
+// Six Gauss-Legendre nodes across a triangle's range; six midpoints read Grooved Disc's lamp 14% low.
+const int kRealtimePitScatterAcrossSteps = 6;
+const float kRealtimePitScatterAcrossNodes[6] = float[6](-0.9324695, -0.6612094, -0.2386192, 0.2386192, 0.6612094, 0.9324695);
+const float kRealtimePitScatterAcrossWeights[6] = float[6](0.1713245, 0.3607616, 0.4679139, 0.4679139, 0.3607616, 0.1713245);
+const int kRealtimePitScatterAlongPieces = 6;
 vec3 realtimePitScatterDirection(vec2 xy, vec3 tangent, vec3 bitangent, vec3 normal) {
     return xy.x * tangent + xy.y * bitangent + sqrt(max(0.0, 1.0 - dot(xy, xy))) * normal;
+}
+// The pit lobe's mass on emitter triangle abc from position, as a share of the whole lobe
+// (realtimediffraction::pitTriangleMass). Three lines along the tracks at the Lorentzian's
+// sixths reach only 0.58 half widths, so Grooved Disc's lamp, two half widths along the
+// track from the mirror where the Lorentzian keeps a fifth of its peak, fell between them
+// and the disc's sides went black. Each triangle is read on its own: Gauss-Legendre nodes
+// across its own range, weighted by sinc^2, and at each step the Lorentzian's exact mass over the share of
+// a chord along the tracks the triangle covers. aim is the heaviest covered piece's middle.
+float realtimePitTriangleMass(vec3 A, vec3 B, vec3 C, vec3 tangent, vec3 bitangent, vec3 normal,
+    vec2 mirror, vec2 across, float acrossWidth, float alongWidth, out vec3 aim) {
+    aim = vec3(0.0);
+    float det = dot(A, cross(B, C));
+    if (abs(det) <= 1.0e-12) return 0.0;
+    float orientation = det > 0.0 ? 1.0 : -1.0;
+    vec3 planes[3] = vec3[3](cross(B, C), cross(C, A), cross(A, B));
+    vec2 along = vec2(-across.y, across.x);
+    // The triangle's extent from its corners and edge middles, whose arcs bow outward.
+    vec3 points[6] = vec3[6](A, B, C, A + B, B + C, C + A);
+    float uLow = 3.4e38, uHigh = -3.4e38, yLow = 3.4e38, yHigh = -3.4e38;
+    for (int i = 0; i < 6; ++i) {
+        float size = length(points[i]);
+        if (!(size > 0.0)) continue;
+        vec2 offset = vec2(dot(points[i], tangent), dot(points[i], bitangent)) / size - mirror;
+        float u = dot(offset, across) / acrossWidth, y = dot(offset, along);
+        uLow = min(uLow, u); uHigh = max(uHigh, u);
+        yLow = min(yLow, y); yHigh = max(yHigh, y);
+    }
+    float uPad = 0.1 * (uHigh - uLow), yPad = 0.25 * (yHigh - yLow);
+    uLow = max(uLow - uPad, -kRealtimePitScatterReach);
+    uHigh = min(uHigh + uPad, kRealtimePitScatterReach);
+    yLow -= yPad; yHigh += yPad;
+    if (!(uHigh > uLow) || !(yHigh > yLow)) return 0.0;
+    float mass = 0.0, heaviest = 0.0;
+    float uMiddle = 0.5 * (uLow + uHigh), uHalf = 0.5 * (uHigh - uLow);
+    #pragma optionNV(unroll none)
+    for (int i = 0; i < kRealtimePitScatterAcrossSteps; ++i) {
+        float u = uMiddle + uHalf * kRealtimePitScatterAcrossNodes[i];
+        float argument = pi * u;
+        float sinc = abs(argument) > 1.0e-4 ? sin(argument) / argument : 1.0;
+        float weight = sinc * sinc * uHalf * kRealtimePitScatterAcrossWeights[i] / kRealtimePitScatterAcrossMass;
+        vec2 centre = mirror + across * (acrossWidth * u);
+        // The line's piece above the horizon, |centre + along y| < 1.
+        float middle = dot(centre, along);
+        float discriminant = middle * middle - (dot(centre, centre) - 1.0);
+        if (!(discriminant > 0.0)) continue;
+        float root = sqrt(discriminant);
+        float y0 = max(yLow, -middle - root), y1 = min(yHigh, -middle + root);
+        if (!(y1 > y0)) continue;
+        float yStep = (y1 - y0) / float(kRealtimePitScatterAlongPieces);
+        for (int j = 0; j < kRealtimePitScatterAlongPieces; ++j) {
+            float ya = y0 + float(j) * yStep;
+            vec3 d0 = realtimePitScatterDirection(centre + along * ya, tangent, bitangent, normal);
+            vec3 e = realtimePitScatterDirection(centre + along * (ya + yStep), tangent, bitangent, normal) - d0;
+            float low = 0.0, high = 1.0;
+            for (int k = 0; k < 3; ++k) {
+                float p = orientation * dot(planes[k], d0), q = orientation * dot(planes[k], e);
+                if (abs(q) <= 1.0e-12) { if (p < 0.0) high = -1.0; }
+                else if (q > 0.0) low = max(low, -p / q);
+                else high = min(high, -p / q);
+            }
+            if (!(high > low)) continue;
+            float piece = weight * (atan((ya + high * yStep) / alongWidth) - atan((ya + low * yStep) / alongWidth)) / pi;
+            mass += piece;
+            if (piece > heaviest) { heaviest = piece; aim = d0 + 0.5 * (low + high) * e; }
+        }
+    }
+    if (dot(aim, aim) > 0.0) aim = normalize(aim);
+    return mass;
 }
 void realtimePitScatter(int b, float wavelength, vec4 geometry, vec3 tangent, vec3 bitangent, vec3 normal,
     vec3 outgoing, vec3 origin, vec3 side, float visibility, float solidAngle, inout float deposits[8]) {
@@ -3989,8 +4098,30 @@ void realtimePitScatter(int b, float wavelength, vec4 geometry, vec3 tangent, ve
     float acrossWidth = wavelength / (duty * geometry.z / reciprocal);
     float alongWidth = wavelength / (pi * realtimediffractionMeanRun);
     vec3 mirror = realtimePitScatterDirection(-outgoing.xy, tangent, bitangent, normal);
-    vec3 light = vec3(0.0);
-    float total = 0.0;
+    // The emitters each triangle's share of the lobe sees, one shadow ray per triangle.
+    vec3 emitted = vec3(0.0);
+    float covered = 0.0;
+#ifndef REALTIME_ABLATE_CHORD
+    #pragma optionNV(unroll none)
+    for (int t = 0; t < uRealtimeEmitterTriangles; ++t) {
+        int record = uRealtimeEmitterFirst + 3 * t;
+        vec4 a = sceneTableRead(record), c1 = sceneTableRead(record + 1), c2 = sceneTableRead(record + 2);
+        vec3 aim;
+        float mass = realtimePitTriangleMass(a.xyz - origin, c1.xyz - origin, c2.xyz - origin, tangent, bitangent,
+            normal, -outgoing.xy, across, acrossWidth, alongWidth, aim);
+        if (!(mass > 1.0e-7)) continue;
+        vec3 n = cross(c1.xyz - a.xyz, c2.xyz - a.xyz);
+        float distance = dot(n, a.xyz - origin) / dot(n, aim);
+        if (!(distance > 1.0e-4)) continue;
+        if (opaqueVisibility(origin, side, aim, distance * (1.0 - 1.0e-3), uOpaqueControl) < 0.5) continue;
+        emitted += mass * vec3(a.w, c1.w, c2.w);
+        covered += mass;
+    }
+    // Overlapping emitters count once.
+    if (covered > 1.0) { emitted /= covered; covered = 1.0; }
+#endif
+    vec3 light = vec3(0.0), skyLight = vec3(0.0);
+    float total = 0.0, skyTotal = 0.0;
     #pragma optionNV(unroll none)
     for (int line = 0; line < 3; ++line) {
         // tan(pi (u - 1/2)) at u = 1/6, 1/2, 5/6.
@@ -4005,24 +4136,23 @@ void realtimePitScatter(int b, float wavelength, vec4 geometry, vec3 tangent, ve
             float sinc = abs(argument) > 1.0e-4 ? sin(argument) / argument : 1.0;
             float weight = sinc * sinc * pieceWidth;
             vec2 xy1 = base + across * (acrossWidth * x1);
-            vec3 arriving;
             if (dot(xy0, xy0) < 1.0 && dot(xy1, xy1) < 1.0) {
                 vec3 d0 = realtimePitScatterDirection(xy0, tangent, bitangent, normal);
                 vec3 d1 = realtimePitScatterDirection(xy1, tangent, bitangent, normal);
-                float covered;
-                arriving = realtimeDiffractionEmitterChord(origin, side, d0, d1, 0.0, covered)
-                    + (1.0 - covered) * visibility * realtimeDiffractionSkyRadiance(normalize(d0 + d1), solidAngle);
+                skyLight += weight * visibility * realtimeDiffractionSkyRadiance(normalize(d0 + d1), solidAngle);
+                skyTotal += weight;
             } else {
-                vec3 emitted;
-                arriving = realtimeDiffractionEmitter(origin, side, mirror, emitted)
-                    ? emitted : visibility * realtimeDiffractionSkyRadiance(mirror, solidAngle);
+                vec3 mirrored;
+                light += weight * (realtimeDiffractionEmitter(origin, side, mirror, mirrored)
+                    ? mirrored : visibility * realtimeDiffractionSkyRadiance(mirror, solidAngle));
             }
-            light += weight * arriving;
             total += weight;
             x0 = x1; xy0 = xy1;
         }
     }
-    if (total > 0.0) deposits[b] += power * realtimeDiffractionBandShare(b, light / total);
+    // The sky above the horizon shows where no emitter covers the lobe.
+    if (skyTotal > 0.0) light += skyLight * max(1.0 - covered * total / skyTotal, 0.0);
+    if (total > 0.0) deposits[b] += power * realtimeDiffractionBandShare(b, emitted + light / total);
 }
 // Sub-wavelengths per band (realtimediffraction::bandInterval). Each band's light is
 // read across its whole interval, so an order's colour moves smoothly along its arc.
@@ -4729,6 +4859,7 @@ void fixtureSceneMain() {
 #else
 void main() {
 #endif
+    fixtureFaceNormal();
     if(uSelectedRoughResolve>0.5) {
         ivec2 nativePixel=ivec2(floor(gl_FragCoord.xy));
         ivec2 pixel=ivec2(nativePixel.x,int(uRoughCameraControl.w)-1-nativePixel.y);
@@ -4769,10 +4900,9 @@ void main() {
         }
         vec3 radiance=uSky[0].w>1.5 ? environmentImageRadiance(vWorldPosition,uSky[0],uSky[1])
             : analyticSkyBackground(vWorldPosition,uSky[0],uSky[1],uSky[2],uSky[3],uSky[4]);
-#ifdef FIXTURE_REALTIME
-        // Path Trace's camera rays see the scene's ambient colour as environment too.
+        // Path Trace's camera rays see the scene's ambient colour as environment too,
+        // so Raster and Realtime add it to the sky they show.
         radiance+=uAmbient;
-#endif
         // Probe: name a nonfinite sky result so the whole-output readback can
         // attribute it to this branch before the branch bounds it to zero. The
         // payload is a literal because non-diffraction program variants compile
@@ -4885,14 +5015,15 @@ void main() {
 #ifdef FIXTURE_REALTIME
             // The receiver is lit by the room's glowing objects as well as the transport,
             // as in Path Trace. The light is diffuse and smooth, so it rides in the gather
-            // term: the gather pass adds it there, and a full-pass pixel that reused the
-            // term already holds it. A pixel that gathered itself lights itself.
+            // term: the gather pass hands it to the shadow pass (realtime_emitter_shadow.h),
+            // which adds its seen share to the term, and a full-pass pixel that reused the
+            // term already holds it. A pixel that gathered itself lights itself, unshadowed.
 #ifndef REALTIME_ABLATE_EMITTERPLATE
             if (!fixtureNonfiniteBits(vec4(color,1.0)) && (realtimeGatherMode() == 1 || !gRealtimeGatherReused)) {
                 vec3 coatLight = vec3(0.0);
                 vec3 light = realtimeEmitterDirect(vWorldPosition, normalize(vWorldNormal),
                     fixtureToViewer(vWorldPosition), vBaseColor, 0.0, 1.0, 0.04, 0.0, coatLight);
-                if (realtimeGatherMode() == 1) gRealtimeGatherTerm += light;
+                if (realtimeGatherMode() == 1) { gRealtimeEmitterTerm = light; gRealtimeEmitterValid = true; }
                 else outColor.rgb += light;
             }
 #endif
@@ -4930,6 +5061,13 @@ void main() {
         tangentNormal.xy *= uMaterialParams.z;
         normal = normalize(mat3(tangent, bitangent, normal) * tangentNormal);
     }
+#ifdef FIXTURE_REALTIME
+    // Taken here, in uniform control flow, for the thin water's footprint roughness
+    // and the side of the facet Realtime glass is seen from.
+    vec3 normalDx = dFdx(normal);
+    vec3 normalDy = dFdy(normal);
+    vec3 facet = cross(dFdx(vWorldPosition), dFdy(vWorldPosition));
+#endif
     vec3 emissive = vEmissive * (uEmissiveTexturePresence > 0.5
         ? srgbToLinear(texture(uEmissiveTexture, vUv).rgb) : vec3(1.0));
     outRawNormal = vec4(normal, 1.0);
@@ -5118,6 +5256,9 @@ void main() {
         return;
     }
 #endif
+#ifdef FIXTURE_REALTIME
+    if (uGlassTransport.x > 1.5) roughness = realtimeFootprintRoughness(roughness, normalDx, normalDy);
+#endif
     vec3 lighting = uAmbient;
     vec3 directBase = vec3(0.0);
     vec3 directCoat = vec3(0.0);
@@ -5231,7 +5372,7 @@ void main() {
         outColor = vec4(vInstanceIdentityColor.rgb, 1.0);
 #ifdef FIXTURE_REALTIME
     if (int(uRealtimeControl.x) == 2 && uGlassTransport.x > 0.5) {
-        outColor.rgb = realtimeGlass(vWorldPosition, normal, toView, vBaseColor * texel.rgb, roughness, dielectric,
+        outColor.rgb = realtimeGlass(vWorldPosition, normal, facet, toView, vBaseColor * texel.rgb, roughness, dielectric,
             outColor.rgb, directBase + emissive);
         outColor.a = 1.0;
     }
@@ -5252,14 +5393,31 @@ void main() {
 // The gather pass writes the gather term alone, alpha 1 where a grating or receiver
 // gathered and 0 elsewhere, so the full pass reads only gather surfaces.
 void main() {
+    fixtureFaceNormal();
+    // Phase 3 draws a closed glass object's back faces for its refraction in phase 2.
+    if (int(uRealtimeControl.x) == 3) {
+        outColor = vec4(normalize(vWorldNormal), vLinearDepth);
+        return;
+    }
+    if (dot(uViewerMirror.xyz, uViewerMirror.xyz) > 0.5 && !realtimeMirrorKeeps(vWorldPosition)) discard;
     gRealtimeGatherTerm = vec3(0.0);
     gRealtimeGatherValid = false;
     gRealtimeGatherReused = false;
     gRealtimeGatherProbe = 0;
+    gRealtimeEmitterTerm = vec3(0.0);
+    gRealtimeEmitterValid = false;
     fixtureSceneMain();
     if (realtimeGatherMode() == 1) {
         bool valid = gRealtimeGatherValid && !fixtureNonfiniteBits(vec4(gRealtimeGatherTerm, 1.0));
         outColor = vec4(valid ? gRealtimeGatherTerm : vec3(0.0), valid ? 1.0 : 0.0);
+        // The emitter shadow pass rebuilds the receiver's point from its view depth in
+        // alpha, taken here from the point the light was computed at: the gather target's
+        // linear depth put the plate's points below the floor.
+        vec3 back = rotateQ(uCameraRotation, vec3(0.0, 0.0, 1.0));
+        float viewDepth = dot(uCameraTranslation - vWorldPosition, back);
+        bool lit = valid && gRealtimeEmitterValid && viewDepth > 0.0
+            && !fixtureNonfiniteBits(vec4(gRealtimeEmitterTerm, viewDepth));
+        outRawEmission = lit ? vec4(gRealtimeEmitterTerm, viewDepth) : vec4(0.0);
     }
     // The probe's colour: red where a pixel gathered itself, green where it reused the term.
     if (realtimeGatherMode() == 2 && uRealtimeGather.w > 0.5)
@@ -5291,6 +5449,8 @@ uniform vec4 uPassReferences[8];
 uniform vec4 uPassTransforms[8];
 uniform vec4 uMotionViewport;
 uniform int uImageOutput;
+// 1 when a Realtime grating frame drew its sky into the accumulation.
+uniform float uResolveSky;
 layout(location=0) out vec4 outColor;
 float outLinearDepth;
 vec4 outRawNormal;
@@ -5305,6 +5465,11 @@ const char* kDiffractionResolveFragmentShaderTail = R"glsl(
 void main() {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     outRawMask = texelFetch(uRawMask, pixel, 0).r;
+    // The sky pass wrote these pixels already composited, as Metal's resolve keeps them.
+    if (outRawMask <= 0.0 && uResolveSky > 0.5) {
+        outColor = texelFetch(uAccumulatedColor, pixel, 0);
+        return;
+    }
     if (outRawMask <= 0.0) discard;
     outLinearDepth = texelFetch(uLinearDepth, pixel, 0).r;
     outRawNormal = texelFetch(uRawNormal, pixel, 0);
@@ -6112,6 +6277,7 @@ struct OpenGlFixtureUniformLocations final
     int texturePresence = -1;
     int emissiveTexturePresence = -1;
     int alphaModeCutoff = -1;
+    int faceForward = -1;
     int imageOutput = -1;
     int viewportSolid = -1, viewportSolidEffects = -1;
     int sceneTable = -1, sceneTableObjects = -1, rawObjectIndex = -1;
@@ -6535,6 +6701,9 @@ public:
         // built on the first gathered grating frame.
         unsigned mirrorId = 0;
         unsigned mirrorVao = 0;
+        // Its emitter shadow pass over the same target (realtime_emitter_shadow.h).
+        unsigned emitterShadowId = 0;
+        unsigned emitterShadowVao = 0;
         // The Preview glass variant of this program: the same text with the Preview
         // camera walk budget. Built after the first Preview draw, without a wait, from
         // the disk binary cache or an async compile. Until it is Ready, Preview draws
@@ -6577,6 +6746,8 @@ public:
                 if (velocityBlurVao != 0) gl.DeleteVertexArrays(1, &velocityBlurVao);
                 if (mirrorId != 0) gl.DeleteProgram(mirrorId);
                 if (mirrorVao != 0) gl.DeleteVertexArrays(1, &mirrorVao);
+                if (emitterShadowId != 0) gl.DeleteProgram(emitterShadowId);
+                if (emitterShadowVao != 0) gl.DeleteVertexArrays(1, &emitterShadowVao);
             }
         }
     };
@@ -6687,7 +6858,9 @@ public:
         residentEmptyTexture = 0;
         residentEmptyCharge.reset();
         if (residentRefit.program != 0) gl.DeleteProgram(residentRefit.program);
-        for (auto* buffer : {&residentRefit.cornerBuffer, &residentRefit.nodeBuffer, &residentRefit.worldBuffer})
+        if (residentRefit.waveProgram != 0) gl.DeleteProgram(residentRefit.waveProgram);
+        for (auto* buffer : {&residentRefit.cornerBuffer, &residentRefit.nodeBuffer, &residentRefit.worldBuffer,
+                             &residentRefit.waveBuffer})
             if (*buffer != 0) gl.DeleteBuffers(1, buffer);
         residentRefit = ResidentRefit{};
         if (residentCaustic.query.texture != 0) glDeleteTextures(1, &residentCaustic.query.texture);
@@ -7002,6 +7175,10 @@ public:
         std::vector<opaquevisibility::Matrix> worlds;
         // glBufferSubData, which arbitgl::GlFuncs does not load.
         GLFWglproc bufferSubData = nullptr;
+        // The surface wave pass (kSurfaceWaveComputeSource) and its wave table, made
+        // on the first GPU wave frame. uMode, uFirst, uColumns, uRows, uWaves, uBase.
+        unsigned waveProgram = 0, waveBuffer = 0;
+        std::array<int, 6> waveLocations {};
     };
     mutable ResidentRefit residentRefit;
     // The Preview glass caustic beside the refreshed water. Everything here
@@ -8085,6 +8262,26 @@ constexpr auto kFixtureResubmitWindow = std::chrono::seconds (2);
 // A scene program whose shaders and link were submitted without waiting for their
 // results. Its GL names belong to this entry until finishFixtureProgram succeeds or
 // the entry is dropped. Context release deletes them through deleteInFlightObjects.
+// A Realtime frame's extra full-size target with its own depth texture: a grating's
+// planar mirror image or a closed glass object's back faces. Each context keeps its
+// two across frames; a new frame size remakes one, and a frame that needs neither
+// frees it.
+struct OpenGlRealtimeTarget
+{
+    arbitgl::GlFuncs gl {};
+    unsigned framebuffer = 0, texture = 0, depth = 0;
+    std::uint32_t width = 0, height = 0;
+    // The context that made it must be current.
+    void release() noexcept
+    {
+        if (framebuffer != 0) gl.DeleteFramebuffers (1, &framebuffer);
+        if (texture != 0) glDeleteTextures (1, &texture);
+        if (depth != 0) glDeleteTextures (1, &depth);
+        framebuffer = texture = depth = 0;
+        width = height = 0;
+    }
+};
+
 struct OpenGlFixtureInFlightProgram
 {
     arbitgl::GlFuncs gl {};
@@ -8573,6 +8770,7 @@ void readFixtureUniformLocations (const arbitgl::GlFuncs& gl, unsigned program, 
     uniforms.texturePresence = location ("uTexturePresence");
     uniforms.emissiveTexturePresence = location ("uEmissiveTexturePresence");
     uniforms.alphaModeCutoff = location ("uAlphaModeCutoff");
+    uniforms.faceForward = location ("uFaceForward");
     uniforms.imageOutput = location ("uImageOutput");
     uniforms.viewportSolid = location ("uViewportSolid");
     uniforms.viewportSolidEffects = location ("uViewportSolidEffects");
@@ -9551,6 +9749,10 @@ bool residentSceneMatches(const HarmonicMIDI::grid::Visual3DScene& prepared,
 // each triangle (IDs, flags, rho) never change and are not written. Modes 0 and
 // 3 read each water position through finitePoint, which moves a NaN or infinite
 // vertex to the local origin, so no nonfinite value reaches the bounds or rows.
+// vertexData is the fixture vertex buffer, 18 floats per SceneVertex. It read 16
+// until the roughness lane grew the vertex, which moved every water corner but the
+// first onto a neighbour's bytes.
+static_assert(sizeof(HarmonicMIDI::grid::SceneVertex) == 18 * sizeof(float), "resident refit vertex stride changed");
 constexpr const char* kResidentRefitComputeSource =
     "#version 430\n"
     "layout(local_size_x=64) in;\n"
@@ -9581,7 +9783,7 @@ constexpr const char* kResidentRefitComputeSource =
     "    vec3 none=vec3(uintBitsToFloat(0x7f800000u));\n"
     "    if(uMode==0u){\n"
     "        if(i>=uCount)return;\n"
-    "        uvec2 c=corners[i];uint v=c.y*16u;\n"
+    "        uvec2 c=corners[i];uint v=c.y*18u;\n"
     "        imageStore(uQuery,at(c.x),vec4(finitePoint(v),imageLoad(uQuery,at(c.x)).w));\n"
     "        return;\n"
     "    }\n"
@@ -9601,7 +9803,7 @@ constexpr const char* kResidentRefitComputeSource =
     "        if(i>=uCount)return;\n"
     "        uvec4 c=triangleCorners[i];vec3 p[3];\n"
     "        for(int k=0;k<3;++k){\n"
-    "            vec3 q=finitePoint(c[k]*16u);\n"
+    "            vec3 q=finitePoint(c[k]*18u);\n"
     "            p[k]=uWorld[0].xyz*q.x+uWorld[1].xyz*q.y+uWorld[2].xyz*q.z+uWorld[3].xyz;\n"
     "        }\n"
     "        vec3 n=cross(p[1]-p[0],p[2]-p[0]);float l=length(n);float area=0.5*l;\n"
@@ -9912,6 +10114,71 @@ bool runResidentRefit(const arbitgl::GlFuncs& gl, OpenGlFixtureSceneResources::R
     return true;
 }
 
+// Moves the planned water to one NativeSurfaceWaveFrame in the vertex buffer: heights,
+// a barrier, then normals (kSurfaceWaveComputeSource). Makes the program and wave
+// table buffer on first use. The caller holds the fixture state guard.
+bool runSurfaceWave(const arbitgl::GlFuncs& gl, OpenGlFixtureSceneResources::ResidentRefit& plan,
+                    unsigned vertexBuffer, const NativeSurfaceWaveFrame& frame, std::string& error)
+{
+    if (!gl.DispatchCompute || !gl.MemoryBarrier || !gl.BindBufferBase || !gl.GetIntegeri_v || !plan.bufferSubData)
+    { error = "OpenGL surface waves require GL 4.3 compute"; return false; }
+    if (plan.waveProgram == 0)
+    {
+        const auto shader = compileFixtureShader(gl, GL_COMPUTE_SHADER, kSurfaceWaveComputeSource, error);
+        if (shader == 0) return false;
+        const auto program = gl.CreateProgram();
+        if (program == 0) { gl.DeleteShader(shader); error = "OpenGL surface wave program creation failed"; return false; }
+        gl.AttachShader(program, shader);
+        gl.LinkProgram(program);
+        gl.DeleteShader(shader);
+        int linked = 0;
+        gl.GetProgramiv(program, GL_LINK_STATUS, &linked);
+        const char* names[] {"uMode", "uFirst", "uColumns", "uRows", "uWaves", "uBase"};
+        bool located = linked == GL_TRUE;
+        for (std::size_t i = 0; located && i < plan.waveLocations.size(); ++i)
+            located = (plan.waveLocations[i] = gl.GetUniformLocation(program, names[i])) >= 0;
+        if (!located) { gl.DeleteProgram(program); error = "OpenGL surface wave program did not link"; return false; }
+        plan.waveProgram = program;
+    }
+    if (plan.waveBuffer == 0) gl.GenBuffers(1, &plan.waveBuffer);
+    if (plan.waveBuffer == 0) { error = "OpenGL surface wave table allocation failed"; return false; }
+    std::array<int, 2> previousBuffers {};
+    for (unsigned i = 0; i < 2; ++i) gl.GetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING, i, &previousBuffers[i]);
+    int previousProgram = 0, previousStorage = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
+    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING, &previousStorage);
+    // A sea with no waves is flat: one zero row keeps the binding valid.
+    const std::array<float, 4> none {};
+    const auto rows = std::max<std::size_t>(1, frame.waves.size());
+    gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, plan.waveBuffer);
+    gl.BufferData(GL_SHADER_STORAGE_BUFFER, std::ptrdiff_t(rows * sizeof(none)),
+        frame.waves.empty() ? none.data() : frame.waves.front().data(), GL_STREAM_DRAW);
+    gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, unsigned(previousStorage));
+    gl.UseProgram(plan.waveProgram);
+    gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, vertexBuffer);
+    gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, plan.waveBuffer);
+    const auto set = [&](std::size_t slot, std::size_t value) { gl.Uniform1ui(plan.waveLocations[slot], unsigned(value)); };
+    const std::size_t count = std::size_t(frame.columns) * frame.rows;
+    set(1, plan.firstVertex); set(2, frame.columns); set(3, frame.rows); set(4, frame.waves.size());
+    // GL guarantees 65535 groups on X, so a larger grid takes several dispatches.
+    constexpr std::size_t kGroup = 64, kChunk = 65535 * kGroup;
+    for (unsigned mode = 0; mode < 2; ++mode)
+    {
+        set(0, mode);
+        for (std::size_t base = 0; base < count; base += kChunk)
+        {
+            set(5, base);
+            gl.DispatchCompute(unsigned((std::min(kChunk, count - base) + kGroup - 1) / kGroup), 1, 1);
+        }
+        gl.MemoryBarrier(mode == 0 ? GL_SHADER_STORAGE_BARRIER_BIT
+            : GL_SHADER_STORAGE_BARRIER_BIT | GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    }
+    for (unsigned i = 0; i < 2; ++i) gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, i, unsigned(previousBuffers[i]));
+    gl.UseProgram(unsigned(previousProgram));
+    if (glGetError() != GL_NO_ERROR) { error = "OpenGL surface wave dispatch failed"; return false; }
+    return true;
+}
+
 // Rewrites the water rows of a resident caustic triangle table from the water
 // vertices the refresh already wrote to the vertex buffer. corners holds
 // {vertex, vertex, vertex, first texel} per water triangle. The caller holds
@@ -9963,7 +10230,10 @@ public:
         // In-flight programs hold GL names that no SharedProgram releases. Delete them
         // while their context is current, before the entry goes away.
         if(found!=programCache_.end())
+        {
             for(auto& flying:found->second.inFlight)deleteInFlightObjects(flying.second);
+            for(auto& target:found->second.realtimeTargets)target.release();
+        }
         programCache_.erase(context);
 #if !defined(__APPLE__)
         releaseOpenGlCausticProgramsForCurrentContextUnlocked();
@@ -10109,6 +10379,9 @@ public:
         FixtureProgramBinaryDriver binaryDriver (gl);
         arbitglprogramcache::ProgramBinaryCache binaryCache (binaryDriver,
             arbitglprogramcache::cacheDirectory());
+        // A stored binary loads in the preparation. Compiling it here would make that
+        // preparation wait for this compile instead.
+        if (binaryCache.contains (vertexSource, fragmentSource)) { previous.restore(); return; }
         OpenGlFixtureInFlightProgram entry;
         std::string submitError;
         {
@@ -10510,10 +10783,18 @@ public:
                 auto shared = std::make_shared<OpenGlFixtureSceneResources::SharedProgram>();
                 shared->context = glfwGetCurrentContext();
                 shared->gl = gl;
+                const auto loadStarted = std::chrono::steady_clock::now();
                 {
                     loopstep::Scope binaryLoadScope ("gl:fixture-scene-program-binary-load");
                     shared->id = binaryCache.load (vertexSource, fragmentSource);
                 }
+                // A hit or a miss, once per program: a miss is what costs the async compile.
+                std::fprintf (stderr, "[gl] fixture program disk cache %s after %lld ms fragmentBytes=%llu features=0x%x key=%08x\n",
+                    shared->id != 0 ? "hit" : binaryCache.enabled() ? "miss" : "off",
+                    static_cast<long long> (std::chrono::duration_cast<std::chrono::milliseconds> (
+                        std::chrono::steady_clock::now() - loadStarted).count()),
+                    static_cast<unsigned long long> (fragmentSource.size()), fragmentFeatures,
+                    static_cast<unsigned> (std::hash<std::string> {}(programCacheKey)));
                 if (shared->id != 0)
                 {
                     resources->sharedProgram = shared;
@@ -10927,28 +11208,19 @@ public:
         return result;
     }
 
-    // Preview structural cache hit. See NativeFixtureSceneBackend. It admits
-    // only a smooth thin-interface glass scene (the lighthouse water) with no
-    // HDR image, grating, instancing or retained deformation. It uploads the
-    // water's vertex range with glBufferSubData and leaves its BLAS refit to the
-    // next Preview render. Any refusal leaves the resources as they were.
-    bool refreshPreviewDeformedVertices (
-        const std::shared_ptr<const NativeFixtureSceneResources>& nativeResources,
+#if !defined(__APPLE__)
+    // The resident water admission shared by the two Preview refreshes: the prepared
+    // resources' glass, query and material must allow a water refit, the water must
+    // own its mesh and vertex range, and the refit is planned on the first call.
+    // Returns the resources with the water's object index, or null after naming the
+    // refusal once. The caller holds fixtureMutex().
+    static OpenGlFixtureSceneResources* admitResidentWater (
+        const std::shared_ptr<const OpenGlFixtureSceneResources>& shared,
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
-        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram) override
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram,
+        std::size_t& dynamic)
     {
-#if defined(__APPLE__)
-        (void) nativeResources;
-        (void) scene;
-        (void) materialProgram;
-        return false;
-#else
         using namespace HarmonicMIDI::grid;
-        std::lock_guard<std::mutex> lock (fixtureMutex());
-        const auto shared = std::dynamic_pointer_cast<const OpenGlFixtureSceneResources> (nativeResources);
-        if (shared == nullptr || scene == nullptr || materialProgram == nullptr || shared->snapshot == nullptr
-            || shared->snapshot == scene || shared->materialProgram == nullptr)
-            return false;
         auto& resources = const_cast<OpenGlFixtureSceneResources&> (*shared);
         const auto& glass = resources.smoothGlass;
         if (resources.ownerContext != glfwGetCurrentContext() || !resources.queryContext
@@ -11001,7 +11273,7 @@ public:
                 last = text;
                 std::fprintf (stderr, "[gl] caustic resident refresh refused: %s\n", text.c_str ());
             }
-            return false;
+            return nullptr;
         }
         const auto& prepared = *resources.snapshot;
         // Names the first refusal after the admission block, so one run says where the
@@ -11014,9 +11286,9 @@ public:
                 last = why;
                 std::fprintf (stderr, "[gl] resident refresh refused: %s\n", why);
             }
-            return false;
+            return static_cast<OpenGlFixtureSceneResources*> (nullptr);
         };
-        std::size_t dynamic = prepared.objectCount;
+        dynamic = prepared.objectCount;
         for (std::size_t o = 0; o < prepared.objectCount; ++o)
             if (prepared.objects[o].id == glass.object) dynamic = o;
         if (dynamic >= prepared.objectCount || resources.opaqueVisibility.objectMesh[dynamic] >= 0)
@@ -11069,6 +11341,44 @@ public:
         }
         if (refit.object != dynamic || refit.firstVertex != water.firstVertex || refit.vertexCount != water.vertexCount)
             return refusedNow ("water refit range changed");
+        return &resources;
+    }
+#endif
+
+    // Preview structural cache hit. See NativeFixtureSceneBackend. It admits
+    // only a smooth thin-interface glass scene (the lighthouse water) with no
+    // HDR image, grating, instancing or retained deformation. It uploads the
+    // water's vertex range with glBufferSubData and leaves its BLAS refit to the
+    // next Preview render. Any refusal leaves the resources as they were.
+    bool refreshPreviewDeformedVertices (
+        const std::shared_ptr<const NativeFixtureSceneResources>& nativeResources,
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram) override
+    {
+#if defined(__APPLE__)
+        (void) nativeResources;
+        (void) scene;
+        (void) materialProgram;
+        return false;
+#else
+        using namespace HarmonicMIDI::grid;
+        std::lock_guard<std::mutex> lock (fixtureMutex());
+        const auto shared = std::dynamic_pointer_cast<const OpenGlFixtureSceneResources> (nativeResources);
+        if (shared == nullptr || scene == nullptr || materialProgram == nullptr || shared->snapshot == nullptr
+            || shared->snapshot == scene || shared->materialProgram == nullptr)
+            return false;
+        std::size_t dynamic = 0;
+        auto* admitted = admitResidentWater (shared, scene, materialProgram, dynamic);
+        if (admitted == nullptr)
+            return false;
+        auto& resources = *admitted;
+        const auto& water = resources.snapshot->objects[dynamic];
+        auto& refit = resources.residentRefit;
+        auto& gl = resources.gl;
+        const auto refusedNow = [] (const char* why) {
+            std::fprintf (stderr, "[gl] resident refresh refused: %s\n", why);
+            return false;
+        };
         int previousArray = 0;
         glGetIntegerv (GL_ARRAY_BUFFER_BINDING, &previousArray);
         gl.BindBuffer (GL_ARRAY_BUFFER, resources.vertexBuffer);
@@ -11088,6 +11398,91 @@ public:
         resources.snapshot = scene;
         resources.smoothGlass.sourceScene = scene;
         ++refit.vertexRevision;
+        return true;
+#endif
+    }
+
+    // The GPU twin of the refresh above for a water the frame describes as waves:
+    // the same admission, then heights and normals written in place by the surface
+    // wave pass. The scene stays the prepared snapshot, so the CPU-side glass and
+    // caustic owners keep matching it; only the vertex buffer moves.
+    bool refreshPreviewSurfaceWave (
+        const std::shared_ptr<const NativeFixtureSceneResources>& nativeResources,
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram,
+        const NativeSurfaceWaveFrame& frame) override
+    {
+#if defined(__APPLE__)
+        (void) nativeResources;
+        (void) scene;
+        (void) materialProgram;
+        (void) frame;
+        return false;
+#else
+        std::lock_guard<std::mutex> lock (fixtureMutex());
+        const auto shared = std::dynamic_pointer_cast<const OpenGlFixtureSceneResources> (nativeResources);
+        if (shared == nullptr || scene == nullptr || materialProgram == nullptr || shared->snapshot != scene
+            || shared->materialProgram == nullptr)
+            return false;
+        const auto refused = [] (const std::string& why) {
+            static std::mutex mutex; static std::string last;
+            const std::lock_guard guard (mutex);
+            if (last != why)
+            {
+                last = why;
+                std::fprintf (stderr, "[gl] surface wave refused: %s\n", why.c_str());
+            }
+            return false;
+        };
+        std::size_t dynamic = 0;
+        OpenGlFixtureSceneResources* admitted = nullptr;
+        if (shared->smoothGlass.enabled)
+            admitted = admitResidentWater (shared, scene, materialProgram, dynamic);
+        else
+        {
+            // Realtime prepares no glass, so no query holds the water and nothing
+            // needs a refit: the pass only moves the water's vertex range.
+            auto& resources = const_cast<OpenGlFixtureSceneResources&> (*shared);
+            if (resources.ownerContext != glfwGetCurrentContext() || resources.vertexBuffer == 0
+                || resources.gratingLeaf || resources.instancedSharedGeometry || resources.usePreviousDeformation
+                || !resources.deformedWindings.empty()
+                || !residentSurfaceProgramMatches (*resources.materialProgram, *materialProgram))
+                return refused ("the prepared resources cannot take a water frame");
+            SurfaceWaveWaterRange range;
+            if (const char* why = surfaceWaveWaterRange (*scene, frame.object, frame.columns, frame.rows,
+                    resources.opaqueVisibility.objectMesh, range))
+                return refused (why);
+            auto& refit = resources.residentRefit;
+            if (refit.bufferSubData == nullptr) refit.bufferSubData = glfwGetProcAddress ("glBufferSubData");
+            refit.object = range.object;
+            refit.firstVertex = range.firstVertex;
+            refit.vertexCount = range.vertexCount;
+            dynamic = range.object;
+            admitted = &resources;
+        }
+        if (admitted == nullptr)
+            return false;
+        auto& resources = *admitted;
+        const auto& water = scene->objects[dynamic];
+        auto& refit = resources.residentRefit;
+        if (water.id != frame.object || frame.columns < 2 || frame.rows < 2
+            || std::size_t (frame.columns) * frame.rows != water.vertexCount)
+            return refused ("the water is not the frame's grid");
+        std::string error;
+        OpenGlFixtureState previous (resources.gl);
+        const bool ran = runSurfaceWave (resources.gl, refit, resources.vertexBuffer, frame, error);
+        previous.restore();
+        if (!ran)
+        {
+            // Part of the water may have moved, so the buffer no longer holds the
+            // prepared snapshot. Render refuses these resources and the next prepare
+            // replaces them.
+            resources.snapshot = nullptr;
+            return refused (error);
+        }
+        // The revision asks the glass query for a refit. Without glass no query
+        // holds the water, so there is nothing to refit.
+        if (resources.smoothGlass.enabled) ++refit.vertexRevision;
         return true;
 #endif
     }
@@ -12451,6 +12846,15 @@ public:
         gl.BindSampler(7,0);
         gl.Uniform1i(locations.environmentImage,7);
         gl.Uniform4fv(locations.sky,5,sky[0].data());
+        {
+            // The scene's ambient alone: a grating's orders read the sky above, so a lone
+            // environment light's fill in values.ambient would count that light twice.
+            std::array<float, 4> skyAmbient {};
+            storeFixtureVec3 (skyAmbient, scene->ambientColor);
+            arbitgpu::analyticsky::clipRasterRadiance (skyAmbient.data());
+            gl.Uniform3f (gl.GetUniformLocation (sceneProgram, "uDiffractionSkyAmbient"),
+                skyAmbient[0], skyAmbient[1], skyAmbient[2]);
+        }
         gl.Uniform1f(locations.skyBackground,0.0f);
         gl.Uniform1i (locations.baseTexture, 0);
         gl.Uniform1i (locations.metallicRoughnessTexture, 1);
@@ -12738,6 +13142,76 @@ public:
         const bool realtimePasses = realtimeFramePhases == arbitgpu::realtimeengine::FramePhases::kSurfaces;
         const bool realtimeGratingPasses = realtimeFramePhases == arbitgpu::realtimeengine::FramePhases::kAroundGrating;
         std::array<unsigned, 2> realtimeTextures {};
+        // Two more full-size targets with their own depth texture: a grating's planar mirror
+        // image (realtime_planar_mirror.h), read on unit 21 in phase 1, and a closed glass
+        // object's back faces, read on unit 22 in phase 2. A context with fewer units
+        // reflects and refracts as before. The context keeps them across frames; one this
+        // frame did not bind is freed when the frame ends.
+        auto& realtimeTargetCache = programCache_[glfwGetCurrentContext()].realtimeTargets;
+        auto& realtimeMirrorTarget = realtimeTargetCache[0];
+        auto& realtimeBackTarget = realtimeTargetCache[1];
+        struct RealtimeTargetUse
+        {
+            std::array<OpenGlRealtimeTarget,2>& targets;
+            std::array<bool,2> bound {};
+            ~RealtimeTargetUse()
+            {
+                for (std::size_t index = 0; index < targets.size(); ++index)
+                    if (! bound[index]) targets[index].release();
+            }
+        } realtimeTargetUse { realtimeTargetCache };
+        bool realtimeMirrorActive = false;
+        const bool realtimeTargetUnits = [&] {
+            GLint units = 0;
+            glGetIntegerv (GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+            return units >= 23;
+        }();
+        // Binds the target for drawing, remaking it when the frame size changed. False if it fails.
+        const auto bindRealtimeTarget = [&] (OpenGlRealtimeTarget& target, unsigned unit) -> bool {
+            realtimeTargetUse.bound[&target == &realtimeMirrorTarget ? 0 : 1] = true;
+            if (target.framebuffer != 0 && (target.width != width || target.height != height)) target.release();
+            if (target.framebuffer == 0)
+            {
+                target.gl = gl;
+                target.width = width;
+                target.height = height;
+                GLint savedFramebuffer = 0;
+                glGetIntegerv (GL_DRAW_FRAMEBUFFER_BINDING, &savedFramebuffer);
+                gl.ActiveTexture (GL_TEXTURE0 + unit);
+                gl.BindSampler (unit, 0);
+                glGenTextures (1, &target.texture);
+                glBindTexture (GL_TEXTURE_2D, target.texture);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, int (width), int (height), 0, GL_RGBA, GL_FLOAT, nullptr);
+                glGenTextures (1, &target.depth);
+                glBindTexture (GL_TEXTURE_2D, target.depth);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexImage2D (GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, int (width), int (height), 0, GL_DEPTH_COMPONENT,
+                              GL_UNSIGNED_INT, nullptr);
+                glBindTexture (GL_TEXTURE_2D, 0);
+                gl.ActiveTexture (GL_TEXTURE0);
+                gl.GenFramebuffers (1, &target.framebuffer);
+                gl.BindFramebuffer (GL_DRAW_FRAMEBUFFER, target.framebuffer);
+                gl.FramebufferTexture2D (GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture, 0);
+                gl.FramebufferTexture2D (GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, target.depth, 0);
+                const unsigned colorOnly[] { GL_COLOR_ATTACHMENT0 };
+                gl.DrawBuffers (1, colorOnly);
+                const bool complete = target.texture != 0 && target.depth != 0
+                    && gl.CheckFramebufferStatus (GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+                gl.BindFramebuffer (GL_DRAW_FRAMEBUFFER, GLuint (savedFramebuffer));
+                if (! complete) { target.release(); return false; }
+            }
+            gl.BindFramebuffer (GL_DRAW_FRAMEBUFFER, target.framebuffer);
+            const float none[4] {};
+            const float clearDepth = 1.0f;
+            gl.ClearBufferfv (GL_COLOR, 0, none);
+            gl.ClearBufferfv (GL_DEPTH, 0, &clearDepth);
+            return true;
+        };
         const auto realtimeSnapshot = [&] {
             for (unsigned index = 0; index < realtimeTextures.size(); ++index)
             {
@@ -12786,9 +13260,20 @@ public:
         const auto drawSurfaces = [&](int stage) {
             if (realtimeFrame)
             {
-                gl.Uniform4f(gl.GetUniformLocation(sceneProgram, "uRealtimeControl"), float(realtimePhase), 0.0f, 0.0f, 0.0f);
+                const bool mirrorRead = realtimePhase == 1 && realtimeMirrorActive;
+                gl.Uniform4f(gl.GetUniformLocation(sceneProgram, "uRealtimeControl"), float(realtimePhase),
+                    mirrorRead ? 1.0f : 0.0f, 0.0f, 0.0f);
                 gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uRealtimeColor"), 14);
                 gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uRealtimeDepth"), 15);
+                gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uRealtimeMirror"), 21);
+                gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uRealtimeBack"), 22);
+                if (mirrorRead)
+                {
+                    gl.ActiveTexture(GL_TEXTURE21);
+                    gl.BindSampler(21, 0);
+                    glBindTexture(GL_TEXTURE_2D, realtimeMirrorTarget.texture);
+                    gl.ActiveTexture(GL_TEXTURE0);
+                }
             }
             gl.Uniform1i(locations.materialKind, static_cast<int>(NativeFixtureMaterialKind::SurfacePbr));
             if (diffractionFrame) {
@@ -13222,8 +13707,11 @@ public:
                     medium = rastermedium::pack (drawMaterial->volume, low, high);
                 }
                 // The paired walk's partner dielectric tints its own segments.
-                rastermedium::packPartner (medium, *scene,
-                    rastermedium::partnerId (smoothglass::cameraPartner (resources->smoothGlass, drawObject.id)));
+                const auto mediumPartner = rastermedium::partnerId (smoothglass::cameraPartner (resources->smoothGlass, drawObject.id));
+                rastermedium::packPartner (medium, *scene, mediumPartner);
+                // Each prepared dielectric's base colour absorbs inside it, as in Path Trace.
+                rastermedium::addDielectricTint (medium, smoothglass::dielectricAbsorption (resources->smoothGlass, drawObject.id),
+                    smoothglass::dielectricAbsorption (resources->smoothGlass, mediumPartner));
                 medium[7] = waterBody[7];
                 medium[8] = waterBody[8];
                 medium[9] = waterBody[9];
@@ -13274,8 +13762,17 @@ public:
                 // A mixed palette has no single front face, so this draw keeps back faces. The scope
                 // restores the previous cull and front-face state when this member's draw ends.
                 const OpenGlCullStateScope cullScope (jointsMixed);
+                // An opaque Surface Material has two sides in Path Trace, which faces the normal to
+                // the ray. An open mesh seen from behind, such as a floor sweep cut from a cylinder
+                // and seen from inside, would otherwise lose its faces to culling here. Glass and
+                // water keep their own facing, and a mixed palette has no single front face.
+                const bool faceForward = drawProgram != nullptr && drawProgram->parameters.identifiers[1] == 0
+                    && alphaMode != SceneAlphaMode::Blend && ! jointsMixed && ! viewportXray;
+                if (locations.faceForward >= 0)
+                    gl.Uniform1f (locations.faceForward, faceForward ? 1.0f : 0.0f);
                 if ((drawMaterial != nullptr && drawMaterial->doubleSided)
-                    || (drawProgram && drawProgram->parameters.identifiers[1] != 0) || jointsMixed || viewportXray)
+                    || (drawProgram && drawProgram->parameters.identifiers[1] != 0) || jointsMixed || viewportXray
+                    || faceForward)
                     glDisable (GL_CULL_FACE);
                 else
                 {
@@ -13334,6 +13831,56 @@ public:
                 const auto indexOffset = reinterpret_cast<const void*> (
                     static_cast<std::uintptr_t> (drawObject.firstIndex)
                     * sizeof (std::uint32_t));
+                // A closed glass object's back faces, nearest first, into the back target
+                // for Realtime's refraction through both of its surfaces in phase 2.
+                if (realtimePhase == 2)
+                {
+                    bool backFaces = false;
+                    if (realtimeTargetUnits && !resources->instancedSharedGeometry && drawProgram != nullptr
+                        && drawProgram->parameters.identifiers[1]
+                            == static_cast<std::uint32_t> (surfacematerial::TransportMode::ClosedVolume))
+                    {
+                        GLint sceneFramebuffer = 0;
+                        glGetIntegerv (GL_DRAW_FRAMEBUFFER_BINDING, &sceneFramebuffer);
+                        if (bindRealtimeTarget (realtimeBackTarget, 22))
+                        {
+                            const GLboolean cull = glIsEnabled (GL_CULL_FACE);
+                            const GLboolean blend = glIsEnabled (GL_BLEND);
+                            const GLboolean depthTest = glIsEnabled (GL_DEPTH_TEST);
+                            GLint cullMode = GL_BACK, depthFunc = GL_LESS;
+                            GLboolean depthMask = GL_TRUE;
+                            glGetIntegerv (GL_CULL_FACE_MODE, &cullMode);
+                            glGetIntegerv (GL_DEPTH_FUNC, &depthFunc);
+                            glGetBooleanv (GL_DEPTH_WRITEMASK, &depthMask);
+                            // The nearest back face wins: it is where a ray entering here leaves.
+                            glDisable (GL_BLEND);
+                            glEnable (GL_DEPTH_TEST);
+                            glDepthMask (GL_TRUE);
+                            glDepthFunc (GL_LESS);
+                            glEnable (GL_CULL_FACE);
+                            glCullFace (GL_FRONT);
+                            gl.Uniform4f (gl.GetUniformLocation (sceneProgram, "uRealtimeControl"), 3.0f, 0.0f, 0.0f, 0.0f);
+                            gl.Uniform1i (locations.noteInstanceIndex, objectInstanceDraw ? 0 : -1);
+                            gl.DrawElementsInstanced (GL_TRIANGLES, static_cast<int> (drawObject.indexCount),
+                                GL_UNSIGNED_INT, indexOffset, static_cast<int> (objectInstanceDraw
+                                    ? scene->objectInstanceCount : noteInstances.count));
+                            glCullFace (GLenum (cullMode));
+                            if (! cull) glDisable (GL_CULL_FACE);
+                            if (blend) glEnable (GL_BLEND);
+                            if (! depthTest) glDisable (GL_DEPTH_TEST);
+                            glDepthMask (depthMask);
+                            glDepthFunc (GLenum (depthFunc));
+                            gl.ActiveTexture (GL_TEXTURE22);
+                            gl.BindSampler (22, 0);
+                            glBindTexture (GL_TEXTURE_2D, realtimeBackTarget.texture);
+                            gl.ActiveTexture (GL_TEXTURE0);
+                            backFaces = true;
+                        }
+                        gl.BindFramebuffer (GL_DRAW_FRAMEBUFFER, GLuint (sceneFramebuffer));
+                    }
+                    gl.Uniform4f (gl.GetUniformLocation (sceneProgram, "uRealtimeControl"), 2.0f, 0.0f,
+                                  backFaces ? 1.0f : 0.0f, 0.0f);
+                }
                 // Depth prepass for a walked glass draw in the closed-glass bands. The same
                 // program draws the object first with color writes off and Output::Mask in
                 // uImageOutput, which runs the alpha test and returns before the walk. It tests
@@ -13729,7 +14276,7 @@ public:
             }();
             if (gatherLocation >= 0) gl.Uniform4f(gatherLocation, 0.0f, 1.0f, 1.0f, 0.0f);
             unsigned gatherFramebuffer = 0;
-            std::array<unsigned, 5> gatherTextures {};
+            std::array<unsigned, 6> gatherTextures {};
             ScopeCleanup gatherCleanup { [&]
             {
                 if (gatherFramebuffer != 0) gl.DeleteFramebuffers(1, &gatherFramebuffer);
@@ -13743,18 +14290,19 @@ public:
             {
                 glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &savedDrawFramebuffer);
                 // Colour (the term, alpha marks a gather texel), linear depth, normal,
-                // object id, and the depth buffer the gather pass tests against.
-                const std::array<std::array<GLenum, 3>, 5> formats {{
+                // object id, the depth buffer the gather pass tests against, and a
+                // receiver's unshadowed emitter light for the shadow pass.
+                const std::array<std::array<GLenum, 3>, 6> formats {{
                     {GL_RGBA32F, GL_RGBA, GL_FLOAT}, {GL_R32F, GL_RED, GL_FLOAT},
                     {GL_RGBA16F, GL_RGBA, GL_FLOAT}, {GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT},
-                    {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT}}};
-                const std::array<GLenum, 5> attachmentsOf {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
-                    GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT6, GL_DEPTH_ATTACHMENT};
+                    {GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT}, {GL_RGBA32F, GL_RGBA, GL_FLOAT}}};
+                const std::array<GLenum, 6> attachmentsOf {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+                    GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT6, GL_DEPTH_ATTACHMENT, GL_COLOR_ATTACHMENT3};
                 gl.ActiveTexture(GL_TEXTURE0);
                 GLint savedTexture = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTexture);
                 gl.GenFramebuffers(1, &gatherFramebuffer);
                 gl.BindFramebuffer(GL_FRAMEBUFFER, gatherFramebuffer);
-                glGenTextures(5, gatherTextures.data());
+                glGenTextures(int(gatherTextures.size()), gatherTextures.data());
                 for (std::size_t i = 0; i < gatherTextures.size(); ++i) {
                     glBindTexture(GL_TEXTURE_2D, gatherTextures[i]);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -13768,7 +14316,7 @@ public:
                     gl.FramebufferTexture2D(GL_FRAMEBUFFER, attachmentsOf[i], GL_TEXTURE_2D, gatherTextures[i], 0);
                 }
                 glBindTexture(GL_TEXTURE_2D, GLuint(savedTexture));
-                if (gatherFramebuffer == 0 || gatherTextures[4] == 0 || glGetError() != GL_NO_ERROR
+                if (gatherFramebuffer == 0 || gatherTextures[5] == 0 || glGetError() != GL_NO_ERROR
                     || gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
                     return fail("OpenGL Realtime diffraction gather target allocation failed ("
                         + std::to_string(gatherWidth) + "x" + std::to_string(gatherHeight) + ")");
@@ -13930,6 +14478,177 @@ public:
                 gl.BindVertexArray (unsigned (previousArray));
                 return true;
             };
+            // The emitter shadow (realtime_emitter_shadow.h): after the gather round, one pass
+            // over the gather target adds each receiver texel's emitter light, times the share
+            // of its shadow rays that reach the glowing triangles, to its gather term.
+            namespace emittershadow = arbitgpu::realtimeemittershadow;
+            const auto realtimeEmitterShadow = [&]() -> bool {
+                if (emitterTexels.empty()) return true;
+                auto& shared = *resources->sharedProgram;
+                if (shared.emitterShadowId == 0)
+                {
+                    const std::string fragmentSource = std::string("#version 330 core\n#define SHADOW_RAYS ")
+                        + std::to_string (emittershadow::kRays) + "\n" + realtimeAblationDefines()
+                        + opaquevisibility::glslShader() + emittershadow::fragmentShader();
+                    const auto vertex = compileFixtureShader (gl, GL_VERTEX_SHADER, kVertexShader, result.error);
+                    const auto fragment = vertex == 0 ? 0u
+                        : compileFixtureShader (gl, GL_FRAGMENT_SHADER, fragmentSource.c_str(), result.error);
+                    if (vertex == 0 || fragment == 0)
+                    {
+                        if (vertex != 0) gl.DeleteShader (vertex);
+                        result.error = "OpenGL Realtime emitter shadow shader failed: " + result.error;
+                        return false;
+                    }
+                    const auto program = gl.CreateProgram();
+                    gl.AttachShader (program, vertex);
+                    gl.AttachShader (program, fragment);
+                    gl.LinkProgram (program);
+                    gl.DeleteShader (vertex);
+                    gl.DeleteShader (fragment);
+                    int linked = 0;
+                    gl.GetProgramiv (program, GL_LINK_STATUS, &linked);
+                    unsigned vao = 0;
+                    if (linked == GL_TRUE) gl.GenVertexArrays (1, &vao);
+                    if (linked != GL_TRUE || vao == 0)
+                    {
+                        gl.DeleteProgram (program);
+                        result.error = "OpenGL Realtime emitter shadow program link failed";
+                        return false;
+                    }
+                    shared.emitterShadowId = program;
+                    shared.emitterShadowVao = vao;
+                }
+                // The rays test the frame's opaque visibility query, the one direct light
+                // shadows with: a transmissive surface is not in it, so its light passes.
+                // A frame with no direct light uploads none, so the pass builds its own.
+                // The diagnostic EMITTERSHADOWQUERY ablation traces the transport's
+                // all-surface query instead.
+                const bool transportQuery = realtimeAblationDefines().find ("EMITTERSHADOWQUERY") != std::string::npos;
+                unsigned framebuffer = 0, ownOpaque = 0;
+                ScopeCleanup shadowCleanup { [&]
+                {
+                    if (framebuffer != 0) gl.DeleteFramebuffers (1, &framebuffer);
+                    if (ownOpaque != 0) glDeleteTextures (1, &ownOpaque);
+                } };
+                unsigned opaqueTexture = frame->opaqueTexture;
+                std::array<float, 4> opaqueControl = visibilityFrame.control;
+                if (! transportQuery && (opaqueTexture == 0 || opaqueControl[3] < 0.5f))
+                {
+                    // No opaque surface, or vertices the query cannot follow: the light stays unshadowed.
+                    if (resources->opaqueVisibility.meshes.empty() || result.stats.opaqueVisibilityUnsupportedVertexDeformation)
+                        return true;
+                    opaquevisibility::Frame own;
+                    if (! opaquevisibility::frame (resources->opaqueVisibility,
+                            opaquevisibility::sceneInstances (*scene, visibilityMatrices, noteInstances), own, result.error))
+                        return false;
+                    if (maximumTextureSize < static_cast<int> (own.height))
+                    {
+                        result.error = nativeTextureAxisError ("emitter shadow opaque query", own.height, maximumTextureSize);
+                        return false;
+                    }
+                    gl.ActiveTexture (GL_TEXTURE8);
+                    glGenTextures (1, &ownOpaque);
+                    glBindTexture (GL_TEXTURE_2D, ownOpaque);
+                    gl.BindSampler (8, 0);
+                    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+                    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                    glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA32F, static_cast<int> (opaquevisibility::kTextureWidth),
+                        static_cast<int> (own.height), 0, GL_RGBA, GL_FLOAT, own.texels.data());
+                    gl.ActiveTexture (GL_TEXTURE0);
+                    if (ownOpaque == 0 || glGetError() != GL_NO_ERROR)
+                    {
+                        result.error = "OpenGL Realtime emitter shadow opaque query upload failed";
+                        return false;
+                    }
+                    opaqueTexture = ownOpaque;
+                    opaqueControl = own.control;
+                }
+                if (transportQuery)
+                {
+                    opaqueTexture = frame->diffractionQueryTexture;
+                    opaqueControl = diffractionTransportFrame.query.control;
+                }
+                GLint previousProgram = 0, previousArray = 0, previousFramebuffer = 0;
+                GLint viewport[4] {};
+                glGetIntegerv (GL_CURRENT_PROGRAM, &previousProgram);
+                glGetIntegerv (GL_VERTEX_ARRAY_BINDING, &previousArray);
+                glGetIntegerv (GL_DRAW_FRAMEBUFFER_BINDING, &previousFramebuffer);
+                glGetIntegerv (GL_VIEWPORT, viewport);
+                const GLboolean depthTest = glIsEnabled (GL_DEPTH_TEST), blend = glIsEnabled (GL_BLEND),
+                    scissor = glIsEnabled (GL_SCISSOR_TEST);
+                // Only the gather Colour is attached, so the pass reads the other targets with
+                // no feedback loop.
+                gl.GenFramebuffers (1, &framebuffer);
+                gl.BindFramebuffer (GL_FRAMEBUFFER, framebuffer);
+                gl.FramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gatherTextures[0], 0);
+                const unsigned colorOnly[] { GL_COLOR_ATTACHMENT0 };
+                gl.DrawBuffers (1, colorOnly);
+                if (framebuffer == 0 || glGetError() != GL_NO_ERROR
+                    || gl.CheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                {
+                    gl.BindFramebuffer (GL_FRAMEBUFFER, GLuint (previousFramebuffer));
+                    result.error = "OpenGL Realtime emitter shadow target allocation failed ("
+                        + std::to_string (gatherWidth) + "x" + std::to_string (gatherHeight) + ")";
+                    return false;
+                }
+                const std::array<unsigned, 4> inputs { gatherTextures[1], gatherTextures[2], gatherTextures[3], gatherTextures[5] };
+                for (int i = 0; i < 4; ++i)
+                {
+                    gl.ActiveTexture (GLenum (GL_TEXTURE0 + 17 + i));
+                    gl.BindSampler (GLuint (17 + i), 0);
+                    glBindTexture (GL_TEXTURE_2D, inputs[std::size_t (i)]);
+                }
+                gl.ActiveTexture (GL_TEXTURE8);
+                gl.BindSampler (8, 0);
+                glBindTexture (GL_TEXTURE_2D, opaqueTexture);
+                gl.ActiveTexture (GL_TEXTURE11);
+                gl.BindSampler (11, 0);
+                glBindTexture (GL_TEXTURE_2D, resources->sceneTableTexture);
+                gl.ActiveTexture (GL_TEXTURE0);
+                glViewport (0, 0, int (gatherWidth), int (gatherHeight));
+                glDisable (GL_DEPTH_TEST);
+                glEnable (GL_SCISSOR_TEST);
+                glEnable (GL_BLEND);
+                gl.BlendFuncSeparate (GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+                const auto id = shared.emitterShadowId;
+                gl.UseProgram (id);
+                gl.BindVertexArray (shared.emitterShadowVao);
+                const auto at = [&] (const char* name) { return gl.GetUniformLocation (id, name); };
+                gl.Uniform1i (at ("uShadowNormal"), 18);
+                gl.Uniform1i (at ("uShadowObjectIds"), 19);
+                gl.Uniform1i (at ("uShadowLight"), 20);
+                gl.Uniform1i (at ("uOpaqueVisibility"), 8);
+                gl.Uniform1i (at ("uSceneTable"), 11);
+                gl.Uniform4fv (at ("uOpaqueControl"), 1, opaqueControl.data());
+                gl.Uniform2f (at ("uShadowExtent"), float (gatherWidth), float (gatherHeight));
+                gl.Uniform4fv (at ("uCameraRotation"), 1, gratingValues.cameraRotation.data());
+                gl.Uniform3f (at ("uCameraTranslation"), gratingValues.cameraTranslation[0],
+                    gratingValues.cameraTranslation[1], gratingValues.cameraTranslation[2]);
+                gl.Uniform4fv (at ("uProjection"), 1, gratingValues.projection.data());
+                gl.Uniform1i (at ("uShadowEmitterFirst"), int (emissionRecords + tableObjects));
+                gl.Uniform1i (at ("uShadowEmitterTriangles"), int (emitterTexels.size() / 3));
+                // Row bands, each its own submission.
+                const auto bands = emittershadow::bandCount (gatherHeight);
+                for (std::uint32_t band = 0; band < bands; ++band)
+                {
+                    const auto first = band * emittershadow::kBandRows;
+                    glScissor (0, int (first), int (gatherWidth),
+                        int (std::min (emittershadow::kBandRows, gatherHeight - first)));
+                    glDrawArrays (GL_TRIANGLES, 0, 3);
+                    glFlush();
+                    gratingClock.mark ("emitter shadow band " + std::to_string (band) + " gather");
+                }
+                gl.BindFramebuffer (GL_FRAMEBUFFER, GLuint (previousFramebuffer));
+                glViewport (viewport[0], viewport[1], viewport[2], viewport[3]);
+                if (depthTest) glEnable (GL_DEPTH_TEST);
+                if (!blend) glDisable (GL_BLEND);
+                if (!scissor) glDisable (GL_SCISSOR_TEST);
+                gl.UseProgram (unsigned (previousProgram));
+                gl.BindVertexArray (unsigned (previousArray));
+                return true;
+            };
             // Counters count the full pass's submissions once.
             const auto countersBefore = std::array<std::uint32_t, 8> {instanceBufferUploadCount, instancedDrawCount,
                 submittedInstanceCount, noteInstanceDrawCount, submittedNoteInstanceCount, objectInstanceDrawCount,
@@ -13942,7 +14661,7 @@ public:
             {
                 gl.BindFramebuffer(GL_FRAMEBUFFER, gatherFramebuffer);
                 const unsigned gatherAttachments[] {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
-                    GL_NONE, GL_NONE, GL_NONE, GL_COLOR_ATTACHMENT6, GL_NONE};
+                    GL_COLOR_ATTACHMENT3, GL_NONE, GL_NONE, GL_COLOR_ATTACHMENT6, GL_NONE};
                 gl.DrawBuffers(8, gatherAttachments);
                 glViewport(0, 0, int(gatherWidth), int(gatherHeight));
                 glDisable(GL_SCISSOR_TEST);
@@ -13953,6 +14672,7 @@ public:
                 gl.ClearBufferfv(GL_COLOR, 0, zero);
                 gl.ClearBufferfv(GL_COLOR, 1, zero);
                 gl.ClearBufferfv(GL_COLOR, 2, zero);
+                gl.ClearBufferfv(GL_COLOR, 3, zero);
                 gl.ClearBufferuiv(GL_COLOR, 6, noObject);
                 gl.ClearBufferfv(GL_DEPTH, 0, &one);
                 gl.DrawBuffers(8, allAttachments);
@@ -14003,6 +14723,7 @@ public:
             gl.Uniform4fv(locations.timeMixEndColorAndTime, 1, values.timeMixEndColorAndTime.data());
             gl.Uniform3f(locations.emissive, values.emissive[0], values.emissive[1], values.emissive[2]);
             gl.Uniform3f(locations.ambient, values.ambient[0], values.ambient[1], values.ambient[2]);
+            if (locations.faceForward >= 0) gl.Uniform1f(locations.faceForward, 0.0f);
             if (mixedMaterials) {
                 gl.Uniform4f(locations.imageOutput, 0.0f, 0.0f, 0.0f, 0.0f);
                 if (material.doubleSided || gratingJointsMixed) glDisable(GL_CULL_FACE);
@@ -14071,11 +14792,17 @@ public:
                     std::fprintf (stderr, "%s\n", text);
                 }
             }
-            for (std::uint32_t band = 0; band < gratingBands.bandCount; ++band)
+            // Every row band and lighting path of the grating. The planar mirror draws it again.
+            std::string gratingFailure;
+            // The planar mirror draws into its own target, which the readback does not see.
+            bool planarMirrorDraw = false;
+            const auto drawGratingBands = [&] (const NativeFixtureDiffractionBands& passBands) -> bool {
+            const bool passBanded = passBands.bandCount > 1;
+            for (std::uint32_t band = 0; band < passBands.bandCount; ++band)
             {
-            const auto bandOrigin = nativeFixtureDiffractionBandOrigin(gratingBands, band);
-            const auto bandRows = nativeFixtureDiffractionBandRows(gratingBands, band);
-            if (bandedDiffraction)
+            const auto bandOrigin = nativeFixtureDiffractionBandOrigin(passBands, band);
+            const auto bandRows = nativeFixtureDiffractionBandRows(passBands, band);
+            if (passBanded)
             {
                 if (band != 0)
                 {
@@ -14087,14 +14814,14 @@ public:
                     glDisable(GL_BLEND); glDepthMask(GL_TRUE); glDepthFunc(GL_LESS);
                 }
                 glEnable(GL_SCISSOR_TEST);
-                glScissor(0, static_cast<int>(bandOrigin), static_cast<int>(gratingBands.width), static_cast<int>(bandRows));
+                glScissor(0, static_cast<int>(bandOrigin), static_cast<int>(passBands.width), static_cast<int>(bandRows));
                 if (materialProgram->diffractionFoilMaximumEvaluations != 0
-                    && !diffractivefoil::makeEvaluationSchedule(gratingBands.maximumEvaluations,
-                        gratingBands.width, bandRows, gratingBands.pathCount, spatialSchedule))
-                    return fail ("OpenGL fixture diffraction workload exceeds backend limits");
+                    && !diffractivefoil::makeEvaluationSchedule(passBands.maximumEvaluations,
+                        passBands.width, bandRows, passBands.pathCount, spatialSchedule))
+                    { gratingFailure = "OpenGL fixture diffraction workload exceeds backend limits"; return false; }
             }
-            const auto bandEvaluationLimit = bandedDiffraction
-                ? nativeFixtureDiffractionBandEvaluationLimit(gratingBands, band)
+            const auto bandEvaluationLimit = passBanded
+                ? nativeFixtureDiffractionBandEvaluationLimit(passBands, band)
                 : spatialSchedule.maximumEvaluations;
             for (std::uint8_t pathIndex = 0; pathIndex < diffractionPathCount; ++pathIndex)
             {
@@ -14161,9 +14888,9 @@ public:
                                           static_cast<int>(noteInstances.count));
                 // A banded frame is read back once after its last band below: one whole-output
                 // readback and scan per band and path made the orb's 540 bands take minutes.
-                if (authoredDiffraction && !bandedDiffraction
+                if (authoredDiffraction && !passBanded && !planarMirrorDraw
                         && !validateDiffractionDraw(0, "banded-draw band 0/1 path " + std::to_string(pathIndex)))
-                    return fail(result.error);
+                    { gratingFailure = result.error; return false; }
                 if (noteInstances.admitted)
                 {
                     ++noteInstanceDrawCount;
@@ -14171,6 +14898,9 @@ public:
                 }
             }
             }
+            return true;
+            };
+            if (!drawGratingBands(gratingBands)) return fail(gratingFailure);
             gratingClock.mark((bandedDiffraction ? "grating band " + std::to_string(gratingBands.bandCount - 1)
                                                  : std::string("grating")) + (realtimeGatherRound == 1 ? " gather" : ""));
             if (bandedDiffraction) glDisable(GL_SCISSOR_TEST);
@@ -14179,8 +14909,108 @@ public:
                         + " bands of " + std::to_string(diffractionBands.bandHeight) + " rows, "
                         + std::to_string(diffractionPathCount) + " paths"))
                 return fail(result.error);
+            // The grating's mirror image in each flat glossy surface (realtime_planar_mirror.h),
+            // drawn once the frame holds its opaque surfaces and grating, for phase 1 to read.
+            if (realtimeGatherRound != 1 && realtimeGratingPasses && realtimeTargetUnits)
+            {
+                namespace planar = arbitgpu::realtimeplanarmirror;
+                const planar::Point viewer {gratingValues.cameraTranslation[0], gratingValues.cameraTranslation[1],
+                    gratingValues.cameraTranslation[2]};
+                const float span = std::max(gratingValues.projection[3] - gratingValues.projection[2], 1.0e-6f);
+                std::vector<planar::Plane> planes;
+                std::vector<planar::Point> points;
+                for (std::size_t index = 0; index < scene->objectCount; ++index)
+                {
+                    const auto& surface = scene->objects[index];
+                    if (surface.id == object.id || surface.vertexCount < 3
+                        || (surface.visibility & HarmonicMIDI::grid::sceneRayVisibility::Camera) == 0
+                        || realtimeGlassObject(surface.id) || resources->deformedWindingFor(surface.firstVertex) != nullptr)
+                        continue;
+                    const auto* surfaceProgram = nativeSurfaceForObject(materialProgram.get(), surface.id);
+                    const auto* surfaceMaterial = visual3d_detail::findById(scene->materials, scene->materialCount, surface.material);
+                    if (surfaceProgram != nullptr && (surfaceProgram->vertexProgram || nativeSurfaceRequiresBlend(surfaceProgram)))
+                        continue;
+                    if (surfaceMaterial != nullptr && surfaceMaterial->alphaMode == SceneAlphaMode::Blend) continue;
+                    const float roughness = surfaceProgram != nullptr ? surfaceProgram->parameters.emissionRoughness[3]
+                        : surfaceMaterial != nullptr ? surfaceMaterial->roughness : 1.0f;
+                    if (!(roughness < 1.0f)) continue;
+                    SceneTransform3D transform {};
+                    if (runtimeTargetsObject(runtimeInputs, surface))
+                    {
+                        transform.translation = {runtimeInputs.objectTranslationOffset[0],
+                            runtimeInputs.objectTranslationOffset[1], runtimeInputs.objectTranslationOffset[2]};
+                        transform = applyRuntimeObjectTransform(transform, runtimeInputs.objectRotationDegrees,
+                            runtimeInputs.objectScale);
+                    }
+                    const auto m = multiplyFixtureMatrices(fixtureTransformMatrix(transform),
+                        nativeObjectWorldMatrix(runtimeInputs.objectWorlds.get(), surface, fixtureWorldMatrix(*scene, surface)));
+                    points.clear();
+                    for (std::uint32_t v = 0; v < surface.vertexCount && surface.firstVertex + v < scene->vertexCount; ++v)
+                    {
+                        const auto& p = scene->vertices[surface.firstVertex + v].position;
+                        points.push_back({m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+                            m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13], m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]});
+                    }
+                    const auto plane = planar::plane(points, viewer);
+                    if (plane && std::none_of(planes.begin(), planes.end(),
+                            [&](const planar::Plane& known) { return planar::same(known, *plane, 1.0e-4f * span); }))
+                        planes.push_back(*plane);
+                }
+                if (!planes.empty())
+                {
+                    if (!ensureRealtimeTextures()) return fail("OpenGL Realtime snapshot allocation failed");
+                    GLint sceneFramebuffer = 0, readFramebuffer = 0, frontFace = GL_CCW;
+                    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &sceneFramebuffer);
+                    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
+                    glGetIntegerv(GL_FRONT_FACE, &frontFace);
+                    const GLboolean blend = glIsEnabled(GL_BLEND);
+                    GLint depthFunc = GL_LESS; GLboolean depthMask = GL_TRUE;
+                    glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+                    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+                    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(sceneFramebuffer));
+                    realtimeSnapshot();
+                    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, GLuint(readFramebuffer));
+                    if (!bindRealtimeTarget(realtimeMirrorTarget, 21))
+                    {
+                        gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(sceneFramebuffer));
+                        return fail("OpenGL Realtime planar mirror target allocation failed");
+                    }
+                    // Every mirror pixel gathers itself: the gather target holds the camera's view.
+                    if (gatherLocation >= 0) gl.Uniform4f(gatherLocation, 0.0f, 1.0f, 1.0f, 0.0f);
+                    gl.Uniform1i(gl.GetUniformLocation(sceneProgram, "uRealtimeDepth"), 15);
+                    const auto counters = std::array<std::uint32_t, 2> {noteInstanceDrawCount, submittedNoteInstanceCount};
+                    const int mirrorLocation = gl.GetUniformLocation(sceneProgram, "uViewerMirror");
+                    // The mirror image turns each triangle's winding.
+                    glFrontFace(frontFace == GL_CW ? GL_CCW : GL_CW);
+                    bool drawn = true;
+                    planarMirrorDraw = true;
+                    for (const auto& plane : planes)
+                    {
+                        glDisable(GL_BLEND); glDepthMask(GL_TRUE); glDepthFunc(GL_LESS);
+                        gl.Uniform4f(mirrorLocation, plane[0], plane[1], plane[2], plane[3]);
+                        if (!(drawn = drawGratingBands(diffractionBands))) break;
+                    }
+                    planarMirrorDraw = false;
+                    if (diffractionBands.bandCount > 1) glDisable(GL_SCISSOR_TEST);
+                    gl.Uniform4f(mirrorLocation, 0.0f, 0.0f, 0.0f, 0.0f);
+                    noteInstanceDrawCount = counters[0];
+                    submittedNoteInstanceCount = counters[1];
+                    glFrontFace(GLenum(frontFace));
+                    gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, GLuint(sceneFramebuffer));
+                    if (blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+                    glDepthFunc(GLenum(depthFunc));
+                    glDepthMask(depthMask);
+                    if (gatherLocation >= 0 && realtimeGatherRound == 2)
+                        gl.Uniform4f(gatherLocation, 2.0f, float(gatherWidth) / float(width),
+                            float(gatherHeight) / float(height), gatherProbe ? 1.0f : 0.0f);
+                    if (!drawn) return fail(gratingFailure);
+                    realtimeMirrorActive = true;
+                    gratingClock.mark("planar mirror");
+                }
+            }
             if (realtimeGatherRound != 1) break;
             if (!realtimeMirror()) return fail(result.error);
+            if (!realtimeEmitterShadow()) return fail(result.error);
             }
             if (gatherProbe && gatherScale > 1)
             {
@@ -14311,6 +15141,9 @@ public:
             gl.Uniform4fv(resolveLocation("uMotionViewport"), 1, motion.viewport.data());
             gl.Uniform1i(resolveLocation("uImageOutput"),
                 static_cast<int>(runtimeInputs.imageOutput));
+            // A Realtime grating frame drew the sky behind its grating; the clear above
+            // would replace it with the raster backdrop.
+            gl.Uniform1f(resolveLocation("uResolveSky"), skyDraw ? 1.0f : 0.0f);
             glDrawArrays(GL_TRIANGLES, 0, 3);
         }
         else if (roughGlassFrame)
@@ -14809,6 +15642,8 @@ private:
         std::chrono::steady_clock::time_point lastPendingLog {};
         // When each key last left inFlight, by finish or eviction. Read by the resubmit window.
         std::map<std::string,std::chrono::steady_clock::time_point> retiredAt;
+        // Realtime's planar mirror (0) and back-face (1) targets.
+        std::array<OpenGlRealtimeTarget,2> realtimeTargets;
     };
     std::map<GLFWwindow*,ContextPrograms> programCache_;
     std::uint64_t programUseSerial_ = 0;
@@ -16745,7 +17580,8 @@ bool OpenGlFixtureSceneFrame::reserveNativeAttempt(OpenGlNativeAttemptKind kind,
     after=before;
     OpenGlNativeAttempt attempt{kind,binding,cohort,this,ownerContext,rendererGeneration_,staticResources->queryContext->generation,
         nativeAttemptCount+1,gratingStagingBinding?gratingStagingSubmission.submissionSerial
-            :causticReadback?causticReadback->deposition.submission.submissionSerial:0,count,leaves,adjuncts};
+            :causticReadback?causticReadback->deposition.submission.submissionSerial:0,count,leaves,adjuncts,
+        {},{},terminal,{},{}};
     attempt.terminal=terminal;
     if(!openGlAddAttempt(*this,attempt,after,error)||after.bytes<before.bytes
         ||maximumBytes>renderpassoutput::kRepresentableTotalBytes||after.bytes-before.bytes>renderpassoutput::kRepresentableTotalBytes-maximumBytes)

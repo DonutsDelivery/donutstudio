@@ -21,6 +21,8 @@
 #include <cstring>
 #include <string>
 
+#include "IpcObjectName.h"
+
 #if defined(_WIN32)
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
@@ -108,7 +110,7 @@ public:
         // The name may reopen a section left by a crashed run.
         std::memset (base_, 0, size_);
 #else
-        const std::string posixName = "/" + name;
+        const std::string posixName = ipcname::posixObjectName (name);
         shm_unlink (posixName.c_str()); // stale region from a crashed run
         fd_ = shm_open (posixName.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd_ < 0) return false;
@@ -140,7 +142,7 @@ public:
         if (base_ == nullptr) { close(); return false; }
         // Read the header to learn the size (the view maps the whole section).
 #else
-        const std::string posixName = "/" + name;
+        const std::string posixName = ipcname::posixObjectName (name);
         fd_ = shm_open (posixName.c_str(), O_RDWR, 0600);
         if (fd_ < 0) return false;
         struct stat st {};
@@ -165,7 +167,7 @@ public:
 #else
         if (base_ != nullptr) munmap (base_, size_);
         if (fd_ >= 0) ::close (fd_);
-        if (owner_ && ! name_.empty()) shm_unlink (("/" + name_).c_str());
+        if (owner_ && ! name_.empty()) shm_unlink (ipcname::posixObjectName (name_).c_str());
         fd_ = -1;
         owner_ = false;
 #endif
@@ -348,7 +350,7 @@ public:
         base_ = MapViewOfFile (mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof (TransportBlock));
         if (base_ == nullptr) { close(); return false; }
 #else
-        const std::string posixName = "/" + name;
+        const std::string posixName = ipcname::posixObjectName (name);
         shm_unlink (posixName.c_str());
         fd_ = shm_open (posixName.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd_ < 0) return false;
@@ -374,7 +376,7 @@ public:
         base_ = MapViewOfFile (mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
         if (base_ == nullptr) { close(); return false; }
 #else
-        const std::string posixName = "/" + name;
+        const std::string posixName = ipcname::posixObjectName (name);
         fd_ = shm_open (posixName.c_str(), O_RDWR, 0600);
         if (fd_ < 0) return false;
         base_ = mmap (nullptr, sizeof (TransportBlock), PROT_READ | PROT_WRITE,
@@ -394,7 +396,7 @@ public:
 #else
         if (base_ != nullptr) munmap (base_, sizeof (TransportBlock));
         if (fd_ >= 0) ::close (fd_);
-        if (owner_ && ! name_.empty()) shm_unlink (("/" + name_).c_str());
+        if (owner_ && ! name_.empty()) shm_unlink (ipcname::posixObjectName (name_).c_str());
         fd_ = -1;
         owner_ = false;
 #endif
@@ -507,7 +509,7 @@ public:
         base_ = MapViewOfFile (mapping_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof (AudioRingBlock));
         if (base_ == nullptr) { close(); return false; }
 #else
-        const std::string posixName = "/" + name;
+        const std::string posixName = ipcname::posixObjectName (name);
         shm_unlink (posixName.c_str());
         fd_ = shm_open (posixName.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd_ < 0) return false;
@@ -534,7 +536,7 @@ public:
         base_ = MapViewOfFile (mapping_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
         if (base_ == nullptr) { close(); return false; }
 #else
-        const std::string posixName = "/" + name;
+        const std::string posixName = ipcname::posixObjectName (name);
         fd_ = shm_open (posixName.c_str(), O_RDWR, 0600);
         if (fd_ < 0) return false;
         base_ = mmap (nullptr, sizeof (AudioRingBlock), PROT_READ | PROT_WRITE,
@@ -554,7 +556,7 @@ public:
 #else
         if (base_ != nullptr) munmap (base_, sizeof (AudioRingBlock));
         if (fd_ >= 0) ::close (fd_);
-        if (owner_ && ! name_.empty()) shm_unlink (("/" + name_).c_str());
+        if (owner_ && ! name_.empty()) shm_unlink (ipcname::posixObjectName (name_).c_str());
         fd_ = -1;
         owner_ = false;
 #endif

@@ -915,6 +915,16 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         return VisualImportedScenePreparation::notApplicable;
     const bool geometryFamily = !compiled->importedSceneRender->timelineGeometryFamily.empty();
     const bool solidOverlay=compiled->importedParticleOverlay && compiled->particleParameters.simulationSpace==1;
+    // A Path Trace Preview whose device kernel is still building draws with the Raster
+    // engine (FixtureSceneRenderer). The inputs built below for that frame are Raster's
+    // too, so the stand-in is the frame Raster draws when Raster is selected. The scope
+    // holds the decision through the render. A scene with frame layers never waits for
+    // the device kernel, so it is no stand-in.
+    const videorender::fixture3d::PathTraceStandInScope pathTraceStandIn(
+        use == NativeImportedSceneRenderUse::Preview && !solidOverlay && !compiled->materialFrameSource
+        && compiled->importedSceneRender->renderEngine == visualimportedscenerender::RenderEngine::PathTrace);
+    const auto drawnEngine = pathTraceStandIn.standIn() ? visualimportedscenerender::RenderEngine::Raster
+                                                        : compiled->importedSceneRender->renderEngine;
     rollback.active=composedMaterialFrameResolver || solidOverlay || geometryFamily
         || compiled->importedSceneRender->importedParentIntent.has_value();
     std::optional<videorender::ParticleParams> preparedSolidParameters;
@@ -966,7 +976,7 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
     if ((compiled->importedSceneRender->imageOutput == renderpassoutput::Output::Color
             || compiled->importedSceneRender->imageOutput == renderpassoutput::Output::Emission)
         && !compiled->particleParameters.solidMotionView
-        && (compiled->importedSceneRender->renderEngine == visualimportedscenerender::RenderEngine::PathTrace
+        && (drawnEngine == visualimportedscenerender::RenderEngine::PathTrace
             || (!compiled->passComposite && !compiled->passProgram)))
     {
         if constexpr (!HasImportedTextureOwner<Layer>::value || !HasImportedLinearImage<Layer>::value)
@@ -1448,6 +1458,7 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
         const double frameSeconds = importedTimelineEvaluationSeconds(sourceSeconds, request.frame, solidOverlay);
         auto spectrumFrame = composedSpectrumHook(inputLayer, projectSeconds, frameSeconds,
                                                   use == NativeImportedSceneRenderUse::Export);
+        loopstep::Scope familyScope ("advance:imported-scene:timeline-family");
         if (preparedCoupledWater && preparedSolidParameters)
         {
             // A body-coupled Water child solves with its bodies inside the family, and
@@ -1485,11 +1496,54 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             waterHistory = inputLayer.particleHistory.get();
         auto spectrumFrame = composedSpectrumHook(inputLayer, projectSeconds, frameSeconds,
                                                   use == NativeImportedSceneRenderUse::Export);
-        request.sceneSnapshot = geometry::evaluateComposedTimelineGeometry(cache.runtime, owner,
-            *compiled->importedSceneRender->timelineGeometry, request.sceneSnapshot, frameSeconds, error,
-            waterHistory, projectSeconds, canonicalBlockCFrame, preparedCoupledWater.get(), staticIdentity.planPublication,
-            std::move(spectrumFrame));
-        if (!request.sceneSnapshot) return VisualImportedScenePreparation::rejected;
+        const auto& binding = *compiled->importedSceneRender->timelineGeometry;
+        // Realtime and Raster Previews of the open sea move it on the GPU: the scene
+        // stays the clip's last CPU frame and the draw takes this frame's wave table.
+        // Path Trace, Export, and any frame that reads the CPU water itself (coupled
+        // bodies, links, solids, an imported merge, Motion) replay. Metal has no GPU
+        // water refresh yet. The live viewport hands every layer a particle history,
+        // so its presence says nothing: only a Water op reads it, and the recognized
+        // wave chain (shared/GeometrySurfaceWave.h) has none, so a hold is only made
+        // for a plan that never reads it.
+#if defined(__APPLE__)
+        constexpr bool gpuWaveBackend = false;
+#else
+        constexpr bool gpuWaveBackend = true;
+#endif
+        const char* cpuSeaReason = !gpuWaveBackend ? "metal"
+            : use != NativeImportedSceneRenderUse::Preview ? "export"
+            : drawnEngine == visualimportedscenerender::RenderEngine::PathTrace ? geometry::kPathTraceSeaReason
+            : solidOverlay ? "solid-overlay"
+            : !compiled->importedSceneRender->harmonicLinks.empty() ? "harmonic-links"
+            : preparedCoupledWater ? "coupled-water"
+            : request.importedScene ? "imported-merge"
+            : (request.runtimeInputs.imageOutput == renderpassoutput::Output::Motion
+                || arbitgpu::sceneUsesMotionPass(request.runtimeInputs)) ? "motion"
+            : nullptr;
+        const auto authored = request.sceneSnapshot;
+        geometry::SurfaceWaveFrame sea;
+        loopstep::Scope timelineScope ("advance:imported-scene:timeline-geometry");
+        if (!geometry::surfaceWaveFrame(cache.runtime, owner, binding, authored,
+                staticIdentity.planPublication, frameSeconds, cpuSeaReason, [&] {
+                    return geometry::evaluateComposedTimelineGeometry(cache.runtime, owner,
+                        binding, authored, frameSeconds, error,
+                        waterHistory, projectSeconds, canonicalBlockCFrame, preparedCoupledWater.get(),
+                        staticIdentity.planPublication, std::move(spectrumFrame));
+                }, sea))
+            return VisualImportedScenePreparation::rejected;
+        if (use == NativeImportedSceneRenderUse::Preview)
+            geometry::noteSurfaceWavePath(clipId, sea.waves.has_value(), sea.cpuReason);
+        if (sea.waves)
+        {
+            auto wave = std::make_shared<arbitgpu::NativeSurfaceWaveFrame>();
+            wave->object = binding.object;
+            wave->columns = sea.columns;
+            wave->rows = sea.rows;
+            wave->waves = std::move(*sea.waves);
+            wave->refused = sea.refused;
+            request.runtimeInputs.surfaceWave = std::move(wave);
+        }
+        request.sceneSnapshot = std::move(sea.scene);
         if (request.material && !request.importedScene) request.material->sceneSnapshot = request.sceneSnapshot;
         for (auto& program : request.surfacePrograms)
             program.program.material.sceneSnapshot = request.sceneSnapshot;
@@ -1811,6 +1865,8 @@ VisualImportedScenePreparation prepareVisualImportedSceneLayerAtTime(
             layer.nativeTextureOwner = frame;
             layer.nativeLinearImage = frame;
             if constexpr (HasImportedViewTransform<Layer>::value)
+                // Every engine's radiance takes the same display step, so Raster and its
+                // stand-in for Path Trace show at the brightness Path Trace shows.
                 layer.nativeLinearViewTransform =
                     compiled->importedSceneRender->viewTransform == visualimportedscenerender::ViewTransform::AgX
                         ? colortransform::ToneMap::AgX : colortransform::ToneMap::None;

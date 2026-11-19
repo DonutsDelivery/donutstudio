@@ -423,10 +423,74 @@ inline bool validateQueries(const Prepared& prepared, const Frame& frame, std::s
     }
     error.clear();return true;
 }
+// The frame's query topology and sample counts fit this output size's work budget.
+inline bool frameWithinBudget(const Prepared& prepared,const Frame& frame,std::size_t receivers,std::size_t gratings,
+    std::uint32_t width,std::uint32_t height,std::string& error)
+{
+    const auto root=std::size_t(frame.query.control[0]);
+    if (!root || root>=frame.query.texels.size()) {error="Native diffraction query topology is empty";return false;}
+    const auto& allowance=frame.query.texels[root-1];
+    const auto work=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
+    std::uint64_t queries=0;
+    if (!nativeFixtureDiffractionFrameQueries(width,height,receivers,gratings,work,queries)
+        || !nativeFixtureDiffractionWorkWithinBudget(*prepared.program,width,height,std::max(receivers,gratings)))
+    {error="Native diffraction frame work does not fit 64 bits for "+std::to_string(receivers)+" receiver and "
+        +std::to_string(gratings)+" grating samples";return false;}
+    // Shaders read these counts as floats, so each must stay an exact integer.
+    if (receivers+gratings>=std::size_t(opaquevisibility::kExactFloatIndexRange))
+    {error="Native diffraction sample count "+std::to_string(receivers+gratings)+" has no exact float form";return false;}
+    return true;
+}
+// The last frame this thread built and the inputs it came from. The scene and program
+// are immutable snapshots held here, so equal pointers name equal contents. The query
+// table is a plain member a copy of the preparation could change, so it is compared too.
+struct BuiltFrame
+{
+    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> scene;
+    std::shared_ptr<const NativeFixtureSurfaceMaterialProgram> program;
+    std::uint64_t sceneRevision = 0;
+    std::string identity;
+    opaquevisibility::Prepared query;
+    std::vector<opaquevisibility::Instance> instances;
+    Frame frame;
+};
+inline bool sameTexels(const std::vector<Texel>& left, const std::vector<Texel>& right)
+{
+    return left.size()==right.size()
+        && (left.empty() || std::memcmp(left.data(),right.data(),left.size()*sizeof(Texel))==0);
+}
+inline bool sameQuery(const opaquevisibility::Prepared& left, const opaquevisibility::Prepared& right)
+{
+    return left.mode==right.mode && left.objectCount==right.objectCount && left.objectMesh==right.objectMesh
+        && left.meshes.size()==right.meshes.size() && sameTexels(left.identities,right.identities)
+        && sameTexels(left.texels,right.texels);
+}
+inline bool sameInstances(const std::vector<opaquevisibility::Instance>& left,
+    const std::vector<opaquevisibility::Instance>& right)
+{
+    if (left.size()!=right.size()) return false;
+    for (std::size_t i=0;i<left.size();++i)
+        if (left[i].object!=right[i].object
+            || std::memcmp(left[i].world.data(),right[i].world.data(),sizeof(left[i].world))!=0) return false;
+    return true;
+}
 inline bool buildFrame(const Prepared& prepared,const std::vector<opaquevisibility::Instance>& instances,
     std::uint32_t width,std::uint32_t height,Frame& output,std::string& error)
 {
     if (!prepared.scene || !prepared.program) {error="Native diffraction table is not prepared";return false;}
+    // The frame is a function of the prepared table and the instances alone; only the
+    // budget reads the output size. Validating its reciprocal endpoints traces every
+    // receiver against every grating sample on the CPU, 300 ms a frame for the
+    // Diffraction Orb, so an unchanged scene reuses the frame it validated.
+    thread_local BuiltFrame built;
+    if (built.scene==prepared.scene && built.program==prepared.program && built.sceneRevision==prepared.sceneRevision
+        && built.identity==prepared.identity && sameQuery(built.query,prepared.query)
+        && sameInstances(built.instances,instances))
+    {
+        if (!frameWithinBudget(prepared,built.frame,std::size_t(built.frame.sampleControl[0]),
+                std::size_t(built.frame.sampleControl[1]),width,height,error)) return false;
+        output=built.frame;error.clear();return true;
+    }
     std::vector<char> covered(prepared.scene->objectCount,0);
     for (const auto& instance:instances)
     {
@@ -446,18 +510,7 @@ inline bool buildFrame(const Prepared& prepared,const std::vector<opaquevisibili
     const auto receivers=candidate.samples.size();
     if (!appendSamples(prepared,instances,true,candidate.samples,error)) return false;
     const auto gratings=candidate.samples.size()-receivers;
-    const auto root=std::size_t(candidate.query.control[0]);
-    if (!root || root>=candidate.query.texels.size()) {error="Native diffraction query topology is empty";return false;}
-    const auto& allowance=candidate.query.texels[root-1];
-    const auto work=std::uint64_t(allowance[0])+(std::uint64_t(allowance[1])<<16);
-    std::uint64_t queries=0;
-    if (!nativeFixtureDiffractionFrameQueries(width,height,receivers,gratings,work,queries)
-        || !nativeFixtureDiffractionWorkWithinBudget(*prepared.program,width,height,std::max(receivers,gratings)))
-    {error="Native diffraction frame work does not fit 64 bits for "+std::to_string(receivers)+" receiver and "
-        +std::to_string(gratings)+" grating samples";return false;}
-    // Shaders read these counts as floats, so each must stay an exact integer.
-    if (receivers+gratings>=std::size_t(opaquevisibility::kExactFloatIndexRange))
-    {error="Native diffraction sample count "+std::to_string(receivers+gratings)+" has no exact float form";return false;}
+    if (!frameWithinBudget(prepared,candidate,receivers,gratings,width,height,error)) return false;
     candidate.sampleControl={float(receivers),float(gratings),float(kSampleStride),float(kTableVersion)};
     if (!validateQueries(prepared,candidate,error)) return false;
     // Each sample's view of the source, traced once here: 1 lit, 0 shadowed, -1 a query
@@ -490,6 +543,7 @@ inline bool buildFrame(const Prepared& prepared,const std::vector<opaquevisibili
         for (float v:candidate.query.texels[i]) bits(candidate.identity,v);
     candidate.height=std::max(std::size_t(1),(candidate.texels.size()+kTextureWidth-1)/kTextureWidth);
     candidate.texels.resize(kTextureWidth*candidate.height);
+    built={prepared.scene,prepared.program,prepared.sceneRevision,prepared.identity,prepared.query,instances,candidate};
     output=std::move(candidate);error.clear();return true;
 }
 } // namespace arbitgpu::diffractiontransportnative

@@ -325,6 +325,19 @@ void ingestScene (const Visual3DScene& scene, IngestedScene& out, const IngestOp
         ++out.stats.objectsWithGeometry;
         const Mat4 world = overrides ? options.objectWorlds[objectIndex] : objectWorldMatrix (scene, objectIndex);
         const Mat4 previous = previousWorlds ? options.previousObjectWorlds[objectIndex] : world;
+        if (options.noteInstanced)
+        {
+            for (std::size_t note = 0; note < options.noteInstanceCount; ++note)
+            {
+                const auto& current = options.noteInstances[note];
+                motion.previousWorld = previous * transformMatrix (options.previousNoteInstances != nullptr
+                    ? options.previousNoteInstances[note] : current);
+                appendObject (scene, objectIndex, world * transformMatrix (current), static_cast<std::uint32_t> (note),
+                              out, shutter ? &motion : nullptr);
+                ++out.stats.instancesExpanded;
+            }
+            continue;
+        }
         if (scene.instancedObject.isValid() && object.id == scene.instancedObject)
         {
             for (std::size_t instance = 0; instance < instanceCount; ++instance)

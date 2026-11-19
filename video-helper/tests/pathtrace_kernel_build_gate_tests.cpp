@@ -160,6 +160,29 @@ int main()
         exporter.join();
         check (gate.status() == kc::BuildGate::Status::Ready, "the export got its build");
     }
+    {
+        // Whoever starts the build, the process reads one start time: the viewport's elapsed
+        // clock. It clears when the build ends.
+        static kc::BuildGate gate;
+        std::atomic<bool> release { false };
+        check (kc::runningBuildStartNs().load() == 0, "no build, no start time");
+        gate.start ([&] (std::string&)
+        {
+            while (! release)
+                std::this_thread::sleep_for (std::chrono::milliseconds (1));
+            return true;
+        });
+        const auto began = kc::runningBuildStartNs().load();
+        check (began != 0 && began <= kc::steadyNowNs(), "a running build publishes when it began");
+        gate.start ([] (std::string&) { return true; });
+        check (kc::runningBuildStartNs().load() == began, "a second caller joining it doesn't move the start");
+        release = true;
+        std::string error;
+        gate.await (error);
+        for (int wait = 0; wait < 1000 && kc::runningBuildStartNs().load() != 0; ++wait)
+            std::this_thread::sleep_for (std::chrono::milliseconds (1));
+        check (kc::runningBuildStartNs().load() == 0, "a finished build clears the start time");
+    }
     std::printf (failures == 0 ? "PASS\n" : "FAILED\n");
     return failures == 0 ? 0 : 1;
 }

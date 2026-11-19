@@ -312,6 +312,8 @@ private:
     std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> materialScene_;
     std::shared_ptr<const videorender::fixture3d::AdmittedSurfaceMaterialBinding>
         lastGoodMaterial_;
+    // The request published for materialScene_, and its digest once a comparison made one.
+    std::shared_ptr<const visualimportedscenerender::Request> lastSurfaceProgramsRequest_;
     std::string lastSurfaceProgramsIdentity_;
     std::shared_ptr<const visualimportedscenerender::Request> lastIdentityRequest_;
     std::string lastIdentityDigest_;

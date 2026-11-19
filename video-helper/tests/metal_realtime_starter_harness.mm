@@ -12,6 +12,12 @@
 //          sphere, for the Grooved Disc starter's tiled frame.
 //   card   the Holographic Trading Card starter's GLB and diffraction binding through
 //          FixtureSceneRenderer, as the app's export probe draws it.
+//   replay:<dir>  a frame the Linux app dumped with ARBIT_GL_DUMP_REALTIME_SCENE
+//          (backend_opengl.cpp): its scene, lights and drawn programs, redrawn here at
+//          the dumped size. Prints both images' channel means, the mean and largest
+//          per-channel difference, and writes <name>.ppm and <name>-linux.ppm, so the
+//          Grooved Disc, Grooved Sphere and Diffraction Orb starters are judged on
+//          their own scenes against the OpenGL Realtime frame of the same scene.
 //
 // Usage: metal-realtime-starter-harness <outdir> [case...]. Prints one line per case with
 // its result, wall time and a coarse checksum of the image.
@@ -111,6 +117,222 @@ bool readColor (const std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>& 
     if (pixels.size() != std::size_t (kWidth) * kHeight * 4) { error = "unexpected Color format or extent"; return false; }
     return true;
 }
+
+// --- Replay of a frame the Linux app dumped (the receiver GL test's replay, for Metal) ---
+namespace replay
+{
+bool readFile (const std::string& path, std::vector<char>& bytes)
+{
+    std::FILE* file = std::fopen (path.c_str(), "rb");
+    if (file == nullptr) return false;
+    bytes.clear();
+    char buffer[65536];
+    for (;;)
+    {
+        const std::size_t n = std::fread (buffer, 1, sizeof (buffer), file);
+        if (n == 0) break;
+        bytes.insert (bytes.end(), buffer, buffer + n);
+    }
+    std::fclose (file);
+    return true;
+}
+template <typename Value>
+bool readBlock (const std::string& path, Value& value, std::string& error)
+{
+    std::vector<char> bytes;
+    if (! readFile (path, bytes)) { error = "missing " + path; return false; }
+    if (bytes.size() != sizeof (Value))
+    { error = path + " holds " + std::to_string (bytes.size()) + " bytes, not " + std::to_string (sizeof (Value)); return false; }
+    std::memcpy (static_cast<void*> (&value), bytes.data(), sizeof (Value));
+    return true;
+}
+template <typename Buffer>
+bool readRecords (const std::string& path, Buffer& buffer, std::size_t& count, std::string& error)
+{
+    using Record = typename Buffer::value_type;
+    std::vector<char> bytes;
+    if (! readFile (path, bytes)) { error = "missing " + path; return false; }
+    if (bytes.size() % sizeof (Record) != 0) { error = path + " is not whole records"; return false; }
+    count = bytes.size() / sizeof (Record);
+    buffer.resize (std::max<std::size_t> (count, 1));
+    if (count != 0) std::memcpy (static_cast<void*> (buffer.data()), bytes.data(), bytes.size());
+    return true;
+}
+template <typename... Values>
+bool after (const std::string& line, const char* keyword, const char* format, Values*... values)
+{
+    const auto at = line.find (std::string (" ") + keyword + " ");
+    if (at == std::string::npos) return false;
+    return std::sscanf (line.c_str() + at + std::strlen (keyword) + 2, format, values...) == int (sizeof... (Values));
+}
+std::vector<std::string> lines (const std::string& path)
+{
+    std::vector<char> bytes;
+    std::vector<std::string> out;
+    if (! readFile (path, bytes)) return out;
+    std::string line;
+    for (const char c : bytes)
+        if (c == '\n') { out.push_back (" " + line); line.clear(); }
+        else line += c;
+    return out;
+}
+
+struct Frame
+{
+    std::shared_ptr<Visual3DScene> scene;
+    std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> program;
+    std::uint32_t width = 0, height = 0;
+    bool linearColor = true, previewUse = false;
+    float emissionGain = 1.0f;
+    // The dumped OpenGL Color, scene-linear RGBA, flipped to top row first.
+    std::vector<float> opengl;
+};
+
+// The dumped scene and programs over the transport fixture's program, which supplies
+// only the binding digest, revisions and the fields the dump has no blocks for.
+bool load (const std::string& dir, Frame& frame, std::string& error)
+{
+    const auto sceneText = lines (dir + "/scene.txt");
+    const auto programText = lines (dir + "/program.txt");
+    if (sceneText.empty() || programText.empty()) { error = dir + " has no scene.txt or program.txt"; return false; }
+    int linearColor = 1, previewUse = 0;
+    after (sceneText[0], "size", "%ux%u", &frame.width, &frame.height);
+    after (sceneText[0], "linearColor", "%d", &linearColor);
+    after (sceneText[0], "previewUse", "%d", &previewUse);
+    after (sceneText[0], "emissionGain", "%f", &frame.emissionGain);
+    frame.linearColor = linearColor != 0;
+    frame.previewUse = previewUse != 0;
+    if (frame.width == 0 || frame.height == 0) { error = "no frame size in scene.txt"; return false; }
+
+    auto f = tt::nativeFixture (false, 0, 0);
+    auto scene = std::make_shared<Visual3DScene>();
+    scene->id = f.scene->id;
+    std::size_t lightTotal = 0;
+    if (! readRecords (dir + "/scene-vertices.bin", scene->vertices, scene->vertexCount, error)
+        || ! readRecords (dir + "/scene-indices.bin", scene->indices, scene->indexCount, error)
+        || ! readRecords (dir + "/scene-objects.bin", scene->objects, scene->objectCount, error)
+        || ! readRecords (dir + "/scene-materials.bin", scene->materials, scene->materialCount, error)
+        || ! readRecords (dir + "/scene-cameras.bin", scene->cameras, scene->cameraCount, error))
+        return false;
+    for (const auto& line : sceneText)
+    {
+        unsigned camera = 0;
+        if (line.rfind (" ambient ", 0) == 0)
+        {
+            std::sscanf (line.c_str(), " ambient %f %f %f", &scene->ambientColor.x, &scene->ambientColor.y, &scene->ambientColor.z);
+            if (after (line, "activeCamera", "%u", &camera)) scene->activeCamera = SceneCameraId { camera };
+        }
+        unsigned id = 0, kind = 0, shape = 0, visibility = 0, skyVersion = 0;
+        int cameraVisible = 1;
+        SceneLightRecord l;
+        auto& t = l.transform;
+        if (line.rfind (" light ", 0) == 0
+            && std::sscanf (line.c_str(), " light %u kind %u", &id, &kind) == 2
+            && after (line, "translation", "%f %f %f", &t.translation.x, &t.translation.y, &t.translation.z)
+            && after (line, "rotation", "%f %f %f %f", &t.rotation.x, &t.rotation.y, &t.rotation.z, &t.rotation.w)
+            && after (line, "color", "%f %f %f", &l.color.x, &l.color.y, &l.color.z)
+            && after (line, "intensity", "%f", &l.intensity) && after (line, "range", "%f", &l.range)
+            && after (line, "cone", "%f %f", &l.innerConeAngle, &l.outerConeAngle)
+            && after (line, "radius", "%f", &l.radius) && after (line, "angularRadius", "%f", &l.angularRadius)
+            && after (line, "area", "%f %f", &l.areaSizeX, &l.areaSizeY) && after (line, "shape", "%u", &shape)
+            && after (line, "spread", "%f", &l.spread) && after (line, "visibility", "%u", &visibility)
+            && after (line, "cameraVisible", "%d", &cameraVisible) && after (line, "sky", "%u", &skyVersion))
+        {
+            l.id = SceneLightId { id };
+            l.kind = SceneLightKind (kind);
+            l.areaShape = SceneAreaLightShape (shape);
+            l.visibility = std::uint8_t (visibility);
+            l.environmentCameraVisible = cameraVisible != 0;
+            const auto i = std::to_string (lightTotal);
+            if (! readBlock (dir + "/light-" + i + "-sky.bin", l.sky, error)
+                || ! readBlock (dir + "/light-" + i + "-spectral.bin", l.spectralSource, error)
+                || ! readBlock (dir + "/light-" + i + "-background.bin", l.cameraBackground, error))
+                return false;
+            scene->lights.resize (lightTotal + 1);
+            scene->lights[lightTotal++] = l;
+        }
+        if (line.find ("environmentImage version ") != std::string::npos
+            && line.find ("environmentImage version 0 ") == std::string::npos)
+        { error = "a light uses an environment image, which the dump does not carry"; return false; }
+    }
+    scene->lightCount = lightTotal;
+
+    std::vector<std::shared_ptr<arbitgpu::NativeFixtureSurfaceMaterialProgram>> programs;
+    std::shared_ptr<const diffractionmaterial::AdmittedLightingPlan> admission;
+    for (const auto& line : programText)
+    {
+        if (line.rfind (" program ", 0) != 0) continue;
+        std::size_t index = 0;
+        unsigned object = 0, kind = 0, source = 0, authored = 0, paths = 0, bounce = 0, mask = 0;
+        int reflectance = 0, layer = 0, lighting = 0;
+        float coverage = 1.0f;
+        if (std::sscanf (line.c_str(), " program %zu object %u kind %u baseColorSource %u authoredMaterial %u",
+                         &index, &object, &kind, &source, &authored) != 5
+            || ! after (line, "paths", "%u", &paths) || ! after (line, "bounce", "%u", &bounce)
+            || ! after (line, "patternMask", "%u", &mask) || ! after (line, "coverage", "%f", &coverage)
+            || ! after (line, "spectralReflectance", "%d", &reflectance)
+            || ! after (line, "diffractionLayer", "%d", &layer) || ! after (line, "lightingAdmission", "%d", &lighting))
+        { error = "unreadable program line: " + line; return false; }
+        if (source != 0 || layer != 0)
+        { error = "program " + std::to_string (index) + " uses a base colour texture or Stam layer, which the dump does not carry"; return false; }
+        const bool root = programs.empty();
+        auto p = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram> (
+            root ? f.program : *f.program.objectPrograms[0]);
+        p->backend = arbitgpu::NativeFixtureMaterialBackend::Metal;
+        p->objectPrograms.clear();
+        p->object = SceneObjectId { object };
+        p->kind = arbitgpu::NativeFixtureMaterialKind (kind);
+        p->authoredMaterial = SceneMaterialId { authored };
+        const auto prefix = dir + "/program-" + std::to_string (index) + "-";
+        if (! readBlock (prefix + "parameters.bin", p->parameters, error)
+            || ! readBlock (prefix + "paths.bin", p->diffractionPaths, error))
+            return false;
+        p->diffractionPathCount = std::uint8_t (paths);
+        p->diffractionMaximumBounceDepth = std::uint8_t (bounce);
+        p->diffractionPatternMask = std::uint8_t (mask);
+        p->diffractionMaskCoverage = coverage;
+        if (mask == 0) p->diffractionProductDigest.clear();
+        else if (p->diffractionProductDigest.empty()) p->diffractionProductDigest = "replay";
+        p->spectralReflectance.reset();
+        if (reflectance)
+        {
+            surfacematerial::SpectralReflectanceDescription rho;
+            if (! readBlock (prefix + "reflectance.bin", rho, error)) return false;
+            p->spectralReflectance = rho;
+        }
+        if (lighting)
+        {
+            diffractionmaterial::LightingDescription description;
+            if (! readBlock (prefix + "lighting.bin", description, error)) return false;
+            const auto admitted = diffractionmaterial::AdmittedLightingPlan::admit (description, error);
+            if (! admitted) { error = "dumped lighting: " + error; return false; }
+            p->diffractionLightingAdmission = std::make_shared<const diffractionmaterial::AdmittedLightingPlan> (*admitted);
+            if (root) admission = p->diffractionLightingAdmission;
+        }
+        else if (! root) p->diffractionLightingAdmission.reset();
+        programs.push_back (std::move (p));
+    }
+    if (programs.empty() || admission == nullptr) { error = "program.txt names no root program with lighting"; return false; }
+    auto& root = *programs[0];
+    for (std::size_t k = 1; k < programs.size(); ++k) root.objectPrograms.push_back (programs[k]);
+    root.programIdentity = arbitgpu::nativeFixtureDiffractionProgramIdentity (root.bindingDigest, *admission,
+        root.diffractionPatternMask, root.diffractionMaskCoverage, root.diffractionProductDigest, false, &root);
+    frame.scene = scene;
+    frame.program = programs[0];
+
+    std::vector<char> live;
+    const std::size_t floats = std::size_t (frame.width) * frame.height * 4;
+    if (readFile (dir + "/color.f32", live) && live.size() == floats * sizeof (float))
+    {
+        frame.opengl.resize (floats);
+        const std::size_t row = std::size_t (frame.width) * 4;
+        for (std::uint32_t y = 0; y < frame.height; ++y)
+            std::memcpy (frame.opengl.data() + y * row, live.data() + (frame.height - 1 - y) * row * sizeof (float),
+                         row * sizeof (float));
+    }
+    return true;
+}
+} // namespace replay
 
 // The ocean: a grid of 1025 x 1025 vertices (1,050,625) with low swell, a grey box for the
 // lighthouse, a sun and an analytic sky, seen from a camera standing above the water.
@@ -388,6 +610,7 @@ struct Outcome
     double seconds = 0.0;
     std::vector<float> pixels;
     bool realtimeApplied = false;
+    std::uint32_t draws = 0;
 };
 
 Outcome renderBackend (const std::shared_ptr<const Visual3DScene>& scene,
@@ -408,10 +631,167 @@ Outcome renderBackend (const std::shared_ptr<const Visual3DScene>& scene,
     const auto rendered = backend.render (scene, prepared.resources, kWidth, kHeight, runtime);
     if (! rendered.rendered || ! rendered.frame) { outcome.error = "render: " + rendered.error; return outcome; }
     outcome.realtimeApplied = rendered.stats.realtimeProgramApplied;
+    outcome.draws = rendered.stats.drawCount;
     if (! readColor (rendered.frame, outcome.pixels, outcome.error)) { outcome.error = "readback: " + outcome.error; return outcome; }
     outcome.seconds = std::chrono::duration<double> (std::chrono::steady_clock::now() - started).count();
     outcome.ok = true;
     return outcome;
+}
+
+Outcome renderReplay (const std::string& dir, replay::Frame& frame)
+{
+    Outcome outcome;
+    if (! replay::load (dir, frame, outcome.error)) { outcome.error = "replay: " + outcome.error; return outcome; }
+    kWidth = frame.width;
+    kHeight = frame.height;
+    // HARNESS_REPLAY_SIZE=WxH redraws the dumped scene at another size (no Linux compare).
+    if (const char* size = std::getenv ("HARNESS_REPLAY_SIZE")) std::sscanf (size, "%ux%u", &kWidth, &kHeight);
+    auto& backend = arbitgpu::nativeFixtureSceneBackend();
+    const auto started = std::chrono::steady_clock::now();
+    std::optional<arbitgpu::realtimeengine::Scope> scope;
+    if (gRealtime) scope.emplace();
+    const std::shared_ptr<const Visual3DScene> snapshot = frame.scene;
+    const auto prepared = backend.prepare (snapshot, frame.program);
+    if (! prepared.prepared) { outcome.error = "prepare: " + prepared.error; return outcome; }
+    arbitgpu::NativeFixtureSceneRuntimeInputs runtime;
+    runtime.linearColor = frame.linearColor;
+    runtime.realtimeEngine = gRealtime;
+    runtime.previewUse = frame.previewUse;
+    runtime.emissionGain = frame.emissionGain;
+    const auto rendered = backend.render (snapshot, prepared.resources, kWidth, kHeight, runtime);
+    if (! rendered.rendered || ! rendered.frame) { outcome.error = "render: " + rendered.error; return outcome; }
+    outcome.realtimeApplied = rendered.stats.realtimeProgramApplied;
+    outcome.draws = rendered.stats.drawCount;
+    if (! readColor (rendered.frame, outcome.pixels, outcome.error)) { outcome.error = "readback: " + outcome.error; return outcome; }
+    outcome.seconds = std::chrono::duration<double> (std::chrono::steady_clock::now() - started).count();
+    outcome.ok = true;
+    return outcome;
+}
+
+// The trading card as the app draws it. The Linux dump carries the card's three paths,
+// its floor and the Environment Light, but not the foil product, so the compiled card's
+// foil field, occupancy rectangles, pattern mask and work budget go over the dumped
+// program. Each size in HARNESS_SEQUENCE (default the app's preview and export sizes) is
+// one frame through the same backend, as the app renders them one after the other.
+Outcome renderSequence (const std::shared_ptr<const Visual3DScene>& snapshot,
+                        const std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram>& program,
+                        const replay::Frame& frame, const std::string& name, std::vector<std::string>& lines);
+
+Outcome renderCardApp (const std::string& dir, replay::Frame& frame, std::vector<std::string>& lines, bool foilOverlay)
+{
+    Outcome outcome;
+    if (! replay::load (dir, frame, outcome.error)) { outcome.error = "replay: " + outcome.error; return outcome; }
+    if (! foilOverlay) return renderSequence (frame.scene, frame.program, frame, "sequence", lines);
+    const auto card = videohelper::fixture3d::loadHolographicTradingCardScene (outcome.error);
+    if (! card) return outcome;
+    const auto binding = videorender::fixture3d::admitDiffractionMaterialBinding (
+        card->scene, *card->operation.diffractionMaterial, videohelper::materialprogram::BackendTarget::Metal, outcome.error);
+    if (! binding || ! binding->nativeProgram()) { outcome.error = "card binding: " + outcome.error; return outcome; }
+    const auto& foil = *binding->nativeProgram();
+    auto program = std::make_shared<arbitgpu::NativeFixtureSurfaceMaterialProgram> (*frame.program);
+    program->diffractionFoilField = foil.diffractionFoilField;
+    program->diffractionFoilMaximumEvaluations = foil.diffractionFoilMaximumEvaluations;
+    program->diffractionOccupancyRectangles = foil.diffractionOccupancyRectangles;
+    program->diffractionOccupancyRectangleCount = foil.diffractionOccupancyRectangleCount;
+    program->diffractionPatternMask = foil.diffractionPatternMask;
+    program->diffractionMaskCoverage = foil.diffractionMaskCoverage;
+    program->diffractionProductDigest = foil.diffractionProductDigest;
+    if (std::getenv ("HARNESS_CARD_FOILPATHS"))
+        for (std::size_t i = 0; i < program->diffractionPathCount && i < foil.diffractionPathCount; ++i)
+            program->diffractionPaths[i].material = foil.diffractionPaths[i].material;
+    for (std::size_t i = 0; i < program->diffractionPathCount; ++i)
+    {
+        program->diffractionPaths[i].kindBounceAndReserved[2] = program->diffractionPatternMask;
+        program->diffractionPaths[i].kindBounceAndReserved[3] = 0;
+        if (program->diffractionPatternMask)
+            std::memcpy (&program->diffractionPaths[i].kindBounceAndReserved[3], &program->diffractionMaskCoverage, sizeof (float));
+    }
+    program->bindingDigest = foil.bindingDigest;
+    program->programIdentity = arbitgpu::nativeFixtureDiffractionProgramIdentity (program->bindingDigest,
+        *program->diffractionLightingAdmission, program->diffractionPatternMask, program->diffractionMaskCoverage,
+        program->diffractionProductDigest, false, program.get());
+    char text[256];
+    std::snprintf (text, sizeof (text), "cardapp: paths %u foil evaluations %u occupancy %u pattern %u coverage %.3f",
+                   unsigned (program->diffractionPathCount), program->diffractionFoilMaximumEvaluations,
+                   unsigned (program->diffractionOccupancyRectangleCount), unsigned (program->diffractionPatternMask),
+                   program->diffractionMaskCoverage);
+    lines.push_back (text);
+    return renderSequence (frame.scene, program, frame, "cardapp", lines);
+}
+
+// One preparation drawn at each size in HARNESS_SEQUENCE, as the app draws a starter's
+// export and then its preview from the same prepared scene.
+Outcome renderSequence (const std::shared_ptr<const Visual3DScene>& snapshot,
+                        const std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram>& program,
+                        const replay::Frame& frame, const std::string& name, std::vector<std::string>& lines)
+{
+    Outcome outcome;
+    char text[512];
+    auto& backend = arbitgpu::nativeFixtureSceneBackend();
+    std::optional<arbitgpu::realtimeengine::Scope> scope;
+    if (gRealtime) scope.emplace();
+    const auto prepared = backend.prepare (snapshot, program);
+    if (! prepared.prepared) { outcome.error = "prepare: " + prepared.error; return outcome; }
+    std::string sequence = std::getenv ("HARNESS_SEQUENCE") ? std::getenv ("HARNESS_SEQUENCE") : "463x261,960x540";
+    for (std::size_t at = 0; at <= sequence.size();)
+    {
+        const auto end = std::min (sequence.find (',', at), sequence.size());
+        unsigned w = 0, h = 0;
+        if (std::sscanf (sequence.substr (at, end - at).c_str(), "%ux%u", &w, &h) != 2) break;
+        at = end + 1;
+        kWidth = w;
+        kHeight = h;
+        const auto started = std::chrono::steady_clock::now();
+        arbitgpu::NativeFixtureSceneRuntimeInputs runtime;
+        runtime.linearColor = frame.linearColor;
+        runtime.realtimeEngine = gRealtime;
+        runtime.emissionGain = frame.emissionGain;
+        runtime.previewUse = std::getenv ("HARNESS_PREVIEW_USE") != nullptr;
+        const auto rendered = backend.render (snapshot, prepared.resources, kWidth, kHeight, runtime);
+        outcome = {};
+        if (! rendered.rendered || ! rendered.frame) outcome.error = "render " + std::to_string (w) + "x" + std::to_string (h) + ": " + rendered.error;
+        else if (! readColor (rendered.frame, outcome.pixels, outcome.error)) outcome.error = "readback: " + outcome.error;
+        else outcome.ok = true;
+        outcome.realtimeApplied = rendered.stats.realtimeProgramApplied;
+        outcome.draws = rendered.stats.drawCount;
+        outcome.seconds = std::chrono::duration<double> (std::chrono::steady_clock::now() - started).count();
+        std::snprintf (text, sizeof (text), "%s %ux%u: %s %.3fs", name.c_str(), w, h, outcome.ok ? "OK" : "FAIL", outcome.seconds);
+        lines.push_back (text + (outcome.ok ? std::string() : " " + outcome.error));
+        if (! outcome.ok) return outcome;
+    }
+    return outcome;
+}
+
+// Channel means of both frames, and the mean and largest absolute per-channel
+// difference of the clamped display values (0..1 sRGB), with the share of pixels whose
+// largest channel differs by more than 0.1.
+void compare (const std::string& name, const std::vector<float>& metal, const std::vector<float>& opengl)
+{
+    if (opengl.size() != metal.size()) { std::printf ("%s: no dumped Linux colour to compare\n", name.c_str()); return; }
+    const auto display = [] (float v)
+    {
+        v = std::isfinite (v) ? std::clamp (v, 0.0f, 1.0f) : 0.0f;
+        return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow (v, 1.0f / 2.4f) - 0.055f;
+    };
+    double meanMetal[3] {}, meanOpenGl[3] {}, meanDifference = 0, largest = 0, far = 0;
+    const std::size_t pixels = metal.size() / 4;
+    for (std::size_t q = 0; q < pixels; ++q)
+    {
+        double worst = 0;
+        for (int c = 0; c < 3; ++c)
+        {
+            const double a = display (metal[q * 4 + c]), b = display (opengl[q * 4 + c]);
+            meanMetal[c] += a; meanOpenGl[c] += b;
+            meanDifference += std::abs (a - b);
+            worst = std::max (worst, std::abs (a - b));
+        }
+        largest = std::max (largest, worst);
+        far += worst > 0.1;
+    }
+    for (int c = 0; c < 3; ++c) { meanMetal[c] /= pixels; meanOpenGl[c] /= pixels; }
+    std::printf ("%s: display means metal %.4f %.4f %.4f linux %.4f %.4f %.4f; mean |diff| %.4f max %.4f; "
+                 "pixels off by >0.1 %.2f%%\n", name.c_str(), meanMetal[0], meanMetal[1], meanMetal[2], meanOpenGl[0],
+                 meanOpenGl[1], meanOpenGl[2], meanDifference / (3.0 * pixels), largest, 100.0 * far / pixels);
 }
 
 Outcome renderCard()
@@ -436,6 +816,7 @@ Outcome renderCard()
                                  videorender::fixture3d::kNativeGpuCapability, frame, outcome.error))
     { outcome.error = "renderExport: " + outcome.error; return outcome; }
     outcome.realtimeApplied = frame.stats.realtimeProgramApplied;
+    outcome.draws = frame.stats.drawCount;
     if (! readColor (frame.nativeFrame, outcome.pixels, outcome.error)) { outcome.error = "readback: " + outcome.error; return outcome; }
     outcome.seconds = std::chrono::duration<double> (std::chrono::steady_clock::now() - started).count();
     outcome.ok = true;
@@ -453,8 +834,8 @@ void report (const std::string& name, const std::string& directory, const Outcom
     std::size_t nonfinite = 0;
     const auto path = directory + "/" + name + ".ppm";
     const bool written = writePpm (path, outcome.pixels, kWidth, kHeight, mean, nonfinite);
-    std::printf ("%s: OK %.3fs realtime=%d mean=%.5f nonfinite=%zu %s\n", name.c_str(), outcome.seconds,
-                 int (outcome.realtimeApplied), mean, nonfinite, written ? path.c_str() : "(write failed)");
+    std::printf ("%s: OK %.3fs realtime=%d draws=%u mean=%.5f nonfinite=%zu %s\n", name.c_str(), outcome.seconds,
+                 int (outcome.realtimeApplied), outcome.draws, mean, nonfinite, written ? path.c_str() : "(write failed)");
 }
 } // namespace
 
@@ -491,6 +872,47 @@ int main (int argc, char** argv)
                     std::make_shared<const arbitgpu::NativeFixtureSurfaceMaterialProgram> (f.program), name == "orb-preview");
             }
             else if (name == "card") outcome = renderCard();
+            else if (name.rfind ("replay:", 0) == 0)
+            {
+                // replay:<dir>[=<label>] names the output by its label.
+                auto spec = name.substr (7);
+                std::string label = "replay";
+                if (const auto at = spec.find ('='); at != std::string::npos) { label = spec.substr (at + 1); spec.resize (at); }
+                // replay:<dir>@WxH redraws at that size, as HARNESS_REPLAY_SIZE does.
+                if (const auto at = spec.find ('@'); at != std::string::npos)
+                { setenv ("HARNESS_REPLAY_SIZE", spec.substr (at + 1).c_str(), 1); spec.resize (at); }
+                else if (const char* all = std::getenv ("HARNESS_REPLAY_SIZE_ALL")) setenv ("HARNESS_REPLAY_SIZE", all, 1);
+                else unsetenv ("HARNESS_REPLAY_SIZE");
+                replay::Frame frame;
+                outcome = renderReplay (spec, frame);
+                report (label, directory, outcome);
+                if (outcome.ok && kWidth == frame.width && kHeight == frame.height)
+                {
+                    compare (label, outcome.pixels, frame.opengl);
+                    double mean = 0;
+                    std::size_t nonfinite = 0;
+                    if (! frame.opengl.empty())
+                        writePpm (directory + "/" + label + "-linux.ppm", frame.opengl, kWidth, kHeight, mean, nonfinite);
+                }
+                if (! outcome.ok) ++failures;
+                continue;
+            }
+            else if (name.rfind ("cardapp:", 0) == 0 || name.rfind ("sequence:", 0) == 0)
+            {
+                // cardapp:<dir> overlays the compiled card's foil; sequence:<dir>[=<label>] does not.
+                const bool card = name.rfind ("cardapp:", 0) == 0;
+                auto spec = name.substr (card ? 8 : 9);
+                std::string label = card ? "cardapp" : "sequence";
+                if (const auto at = spec.find ('='); at != std::string::npos) { label = spec.substr (at + 1); spec.resize (at); }
+                replay::Frame frame;
+                std::vector<std::string> lines;
+                outcome = renderCardApp (spec, frame, lines, card);
+                for (const auto& line : lines) std::printf ("%s\n", line.c_str());
+                report (label, directory, outcome);
+                if (outcome.ok && kWidth == frame.width && kHeight == frame.height) compare (label, outcome.pixels, frame.opengl);
+                if (! outcome.ok) ++failures;
+                continue;
+            }
             else outcome.error = "unknown case";
             report (name, directory, outcome);
             if (! outcome.ok) ++failures;

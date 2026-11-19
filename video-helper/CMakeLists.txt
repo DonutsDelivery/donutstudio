@@ -799,6 +799,18 @@ else()
 endif()
 add_test(NAME geometry_ocean COMMAND arbit-geometry-ocean-tests)
 
+# The Lighthouse and Ocean sea's normals and a water shading sample. Header-only, no GL.
+add_executable(arbit-sea-water-normal-shading-tests tests/sea_water_normal_shading_tests.cpp)
+target_include_directories(arbit-sea-water-normal-shading-tests PRIVATE src ../shared
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source)
+target_compile_features(arbit-sea-water-normal-shading-tests PRIVATE cxx_std_17)
+if(MSVC)
+    target_compile_options(arbit-sea-water-normal-shading-tests PRIVATE /W4 /WX)
+else()
+    target_compile_options(arbit-sea-water-normal-shading-tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+add_test(NAME sea_water_normal_shading COMMAND arbit-sea-water-normal-shading-tests)
+
 add_executable(arbit-geometry-edge-selection-tests tests/geometry_edge_selection_tests.cpp)
 target_include_directories(arbit-geometry-edge-selection-tests PRIVATE src ../shared)
 target_compile_features(arbit-geometry-edge-selection-tests PRIVATE cxx_std_17)
@@ -1284,13 +1296,16 @@ add_test(NAME revision_ledger_lowering COMMAND arbit-revision-ledger-lowering-te
 add_executable(arbit-gltf-glb-tests
     tests/gltf_glb_tests.cpp
     src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp
     src/animation_clip.cpp
     src/animation_playback_control.cpp
     src/deformation_contract.cpp
     src/animation_deformation_evaluation.cpp
     src/animation_mix.cpp
     src/imported_animation_deformation_consumer.cpp)
-target_include_directories(arbit-gltf-glb-tests PRIVATE src)
+target_include_directories(arbit-gltf-glb-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
 target_link_libraries(arbit-gltf-glb-tests PRIVATE
     nlohmann_json::nlohmann_json
     PkgConfig::AV)
@@ -1635,6 +1650,18 @@ endif()
 add_test(NAME realtime_diffraction_emitters
     COMMAND arbit-realtime-diffraction-emitters-tests)
 
+add_executable(arbit-realtime-pit-scatter-tests
+    tests/realtime_pit_scatter_tests.cpp)
+target_include_directories(arbit-realtime-pit-scatter-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+if(NOT MSVC)
+    target_compile_options(arbit-realtime-pit-scatter-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME realtime_pit_scatter
+    COMMAND arbit-realtime-pit-scatter-tests)
+
 add_executable(arbit-realtime-diffraction-mirror-tests
     tests/realtime_diffraction_mirror_tests.cpp)
 target_include_directories(arbit-realtime-diffraction-mirror-tests PRIVATE
@@ -1905,6 +1932,19 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME lighthouse_caustic_volume COMMAND arbit-lighthouse-caustic-volume-tests)
+
+add_executable(arbit-lighthouse-open-sea-raster-admission-tests
+    tests/lighthouse_open_sea_raster_admission_tests.cpp
+    src/diffraction_order_bsdf.cpp)
+target_include_directories(arbit-lighthouse-open-sea-raster-admission-tests PRIVATE
+    src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_definitions(arbit-lighthouse-open-sea-raster-admission-tests PRIVATE
+    ARBIT_PLUGIN_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source")
+if(NOT MSVC)
+    target_compile_options(arbit-lighthouse-open-sea-raster-admission-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME lighthouse_open_sea_raster_admission COMMAND arbit-lighthouse-open-sea-raster-admission-tests)
 
 add_executable(arbit-lighthouse-glass-dome-sizing-tests
     tests/lighthouse_glass_dome_sizing_tests.cpp
@@ -2667,6 +2707,21 @@ if(NOT MSVC)
 endif()
 add_test(NAME timeline_verified_plan_reuse
     COMMAND arbit-timeline-verified-plan-reuse-tests)
+
+add_executable(arbit-timeline-plan-install-adoption-tests
+    tests/timeline_plan_install_adoption_tests.cpp)
+target_include_directories(arbit-timeline-plan-install-adoption-tests PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/Source)
+target_link_libraries(arbit-timeline-plan-install-adoption-tests PRIVATE
+    nlohmann_json::nlohmann_json)
+if(NOT MSVC)
+    target_compile_options(arbit-timeline-plan-install-adoption-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME timeline_plan_install_adoption
+    COMMAND arbit-timeline-plan-install-adoption-tests)
 
 # Lowered Geometry Core plans carry their material table slots' media.
 add_executable(arbit-geometry-core-slot-media-tests
@@ -3657,6 +3712,7 @@ add_test(NAME render_input_generation COMMAND arbit-render-input-generation-test
 add_executable(arbit-pathtrace-route-tests
     tests/pathtrace_route_tests.cpp
     tests/holographic_card_pathtrace_tests.cpp
+    tests/pathtrace_score_scene_tests.cpp
     tests/support/fixture_scene.cpp
     src/gltf_glb.cpp
     src/glb_scene_adapter.cpp
@@ -3694,6 +3750,49 @@ if(NOT MSVC)
         -Wall -Wextra -Werror)
 endif()
 add_test(NAME pathtrace_route COMMAND arbit-pathtrace-route-tests)
+
+# Geometry wired straight into Render 3D on Path Trace: the Geometry Core scene
+# evaluated each frame reaches the tracer, its BVH refits as transforms move, and
+# Raster is never asked to draw. The test supplies its own CPU frame upload.
+add_executable(arbit-geometry-engine-route-tests
+    tests/geometry_engine_route_tests.cpp
+    tests/support/fixture_scene.cpp
+    src/geometry_core_backend.cpp
+    src/gltf_glb.cpp
+    src/glb_scene_adapter.cpp
+    src/glb_native_render_seam.cpp
+    src/imported_scene_payload_execution.cpp
+    src/imported_animated_scene_payload_execution.cpp
+    src/animation_mix.cpp
+    src/imported_animation_deformation_consumer.cpp
+    src/fixture_scene_renderer.cpp
+    src/animation_clip.cpp
+    src/animation_playback_control.cpp
+    src/animation_deformation_evaluation.cpp
+    src/deformation_contract.cpp
+    src/native_animation_deformation.cpp
+    src/native_animation_deformation_renderer.cpp
+    src/gpu_backend/backend_stub.cpp
+    src/pathtrace_fixture_engine.cpp
+    src/pathtrace_oidn.cpp
+    src/pathtrace/environment_resident.cpp
+    src/pathtrace/devices/device_compute_host.cpp
+    src/pathtrace/devices/device_registry.cpp
+    ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+target_include_directories(arbit-geometry-engine-route-tests PRIVATE
+    src
+    tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+target_compile_features(arbit-geometry-engine-route-tests PRIVATE cxx_std_17)
+target_link_libraries(arbit-geometry-engine-route-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    PkgConfig::AV
+    Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-geometry-engine-route-tests PRIVATE
+        -Wall -Wextra -Werror)
+endif()
+add_test(NAME geometry_engine_route COMMAND arbit-geometry-engine-route-tests)
 
 # Path Trace denoisers (Plan 3, Denoising): the Render node's choice to the
 # denoiser that runs, the named fallbacks, the guide and flow layouts, and OIDN
@@ -3892,6 +3991,13 @@ if(NOT MSVC)
     target_compile_options(arbit-pathtrace-kernel-build-gate-tests PRIVATE -Wall -Wextra -Werror)
 endif()
 add_test(NAME pathtrace_kernel_build_gate COMMAND arbit-pathtrace-kernel-build-gate-tests)
+add_executable(arbit-pathtrace-kernel-warmup-tests tests/pathtrace_kernel_warmup_tests.cpp)
+target_include_directories(arbit-pathtrace-kernel-warmup-tests PRIVATE src)
+target_link_libraries(arbit-pathtrace-kernel-warmup-tests PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(arbit-pathtrace-kernel-warmup-tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME pathtrace_kernel_warmup COMMAND arbit-pathtrace-kernel-warmup-tests)
 add_test(NAME optix_sdk_discovery
     COMMAND ${CMAKE_COMMAND} -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/optix_sdk_discovery
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/optix_sdk_discovery_test.cmake)
@@ -3919,6 +4025,7 @@ add_test(NAME pathtrace_metal_kernel_source_contract
 # The device registry loads vendor runtimes at run time.
 target_link_libraries(arbit-video-helper PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(arbit-pathtrace-route-tests PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(arbit-geometry-engine-route-tests PRIVATE ${CMAKE_DL_LIBS})
 
 # The CUDA and HIP devices' kernel (device_compute_kernel.inl), compiled by nvcc
 # to PTX and by hipcc to a code object, and embedded in the helper. Each builds
@@ -3956,7 +4063,7 @@ if(ARBIT_CUDA_KERNEL_ENABLED)
             COMMENT "Compiling the CUDA kernel"
             VERBATIM)
         arbit_embed_compute_kernel("${arbit_cuda_ptx}" kArbitCudaKernel "${arbit_cuda_embed}")
-        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-pathtrace-compute-device-tests)
+        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-geometry-engine-route-tests arbit-pathtrace-compute-device-tests)
             target_sources(${target} PRIVATE "${arbit_cuda_embed}")
             target_compile_definitions(${target} PRIVATE ARBIT_HAVE_CUDA_KERNEL=1)
         endforeach()
@@ -3979,7 +4086,7 @@ if(ARBIT_HIP_KERNEL_ENABLED)
             COMMENT "Compiling the HIP kernel"
             VERBATIM)
         arbit_embed_compute_kernel("${arbit_hip_code}" kArbitHipKernel "${arbit_hip_embed}")
-        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-pathtrace-compute-device-tests)
+        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-geometry-engine-route-tests arbit-pathtrace-compute-device-tests)
             target_sources(${target} PRIVATE "${arbit_hip_embed}")
             target_compile_definitions(${target} PRIVATE ARBIT_HAVE_HIP_KERNEL=1)
         endforeach()
@@ -4018,7 +4125,7 @@ if(ARBIT_ONEAPI_DEVICE_ENABLED AND NOT APPLE AND NOT WIN32)
             COMMENT "Compiling the oneAPI device library"
             VERBATIM)
         add_custom_target(arbit-pathtrace-oneapi-device DEPENDS "${arbit_oneapi_library}")
-        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-pathtrace-compute-device-tests
+        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-geometry-engine-route-tests arbit-pathtrace-compute-device-tests
                        arbit-pathtrace-oneapi-device-tests)
             add_dependencies(${target} arbit-pathtrace-oneapi-device)
             target_compile_definitions(${target} PRIVATE ARBIT_HAVE_ONEAPI_DEVICE=1)
@@ -4102,6 +4209,7 @@ if(ARBIT_OPTIX_SDK_DIR)
     message(STATUS "OptiX device: building the host code, ${arbit_optix_detail}")
     arbit_add_optix_device(arbit-video-helper)
     arbit_add_optix_device(arbit-pathtrace-route-tests)
+    arbit_add_optix_device(arbit-geometry-engine-route-tests)
 else()
     message(STATUS "OptiX device: not built, ${arbit_optix_detail}. Path Trace reports OptiX as unavailable and Auto uses the next loadable device")
 endif()
@@ -4151,7 +4259,7 @@ if(ARBIT_OPTIX_KERNEL_ENABLED AND ARBIT_OPTIX_SDK_DIR)
         endif()
         arbit_add_optix_device(arbit-pathtrace-optix-preview-sequence-tests)
         add_test(NAME pathtrace_optix_preview_sequence COMMAND arbit-pathtrace-optix-preview-sequence-tests)
-        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-pathtrace-optix-preview-sequence-tests)
+        foreach(target arbit-video-helper arbit-pathtrace-route-tests arbit-geometry-engine-route-tests arbit-pathtrace-optix-preview-sequence-tests)
             target_sources(${target} PRIVATE "${arbit_optix_embed}")
             target_compile_definitions(${target} PRIVATE ARBIT_HAVE_OPTIX_KERNEL=1)
         endforeach()
@@ -4536,6 +4644,37 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE)
 
+    # The Realtime glass ring: a dispersive glass torus on a swept floor, with the
+    # planar mirror checks and a GPU frame drawn through the fixture backend.
+    add_executable(arbit-realtime-glass-ring-gl-tests
+        tests/realtime_glass_ring_gl_tests.cpp
+        tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/geometry_core_backend.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/diffraction_order_bsdf.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp)
+    target_include_directories(arbit-realtime-glass-ring-gl-tests PRIVATE
+        src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-realtime-glass-ring-gl-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-realtime-glass-ring-gl-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV)
+    target_compile_options(arbit-realtime-glass-ring-gl-tests PRIVATE
+        -Wall -Wextra -Werror)
+    add_test(NAME realtime_glass_ring_gl
+        COMMAND arbit-realtime-glass-ring-gl-tests)
+    set_tests_properties(realtime_glass_ring_gl PROPERTIES
+        LABELS "native-geometry-core-runtime"
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
     add_executable(arbit-opengl-fixture-scene-backend-tests
         tests/opengl_fixture_scene_backend_tests.cpp
         tests/support/fixture_scene.cpp
@@ -4618,6 +4757,203 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE)
 
+    # A Path Trace Preview whose kernel still builds is drawn by the Raster stand-in with
+    # the Raster-selected bytes, and swaps to Path Trace when a fake build gate completes.
+    add_executable(arbit-opengl-pathtrace-kernel-stand-in-tests
+        tests/pathtrace_kernel_stand_in_tests.cpp
+        tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/animation_mix.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/diffraction_order_bsdf.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gl_loader.cpp
+        src/color_transform_gl.cpp)
+    target_include_directories(arbit-opengl-pathtrace-kernel-stand-in-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-pathtrace-kernel-stand-in-tests PRIVATE
+        ARBIT_KERNEL_STAND_IN_GL=1
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-pathtrace-kernel-stand-in-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV Threads::Threads)
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-pathtrace-kernel-stand-in-tests PRIVATE
+            -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
+    endif()
+    add_test(NAME opengl_pathtrace_kernel_stand_in
+        COMMAND arbit-opengl-pathtrace-kernel-stand-in-tests)
+    set_tests_properties(opengl_pathtrace_kernel_stand_in PROPERTIES
+        LABELS "native-fixture-runtime"
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    # Raster, Realtime and Path Trace draw the same backdrop (slice ptbg), on an
+    # 8-bit and a linear Color target and under a camera-hidden environment, and a
+    # denoiser leaves it as the raster clears it.
+    add_executable(arbit-opengl-pathtrace-backdrop-tests
+        tests/pathtrace_backdrop_tests.cpp
+        tests/support/fixture_scene.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/glb_native_render_seam.cpp
+        src/imported_scene_payload_execution.cpp
+        src/imported_animated_scene_payload_execution.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/animation_mix.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/native_animation_deformation_renderer.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gpu_backend/cpu_scene_frame_opengl.cpp
+        src/gl_loader.cpp
+        src/color_transform_gl.cpp
+        src/pathtrace_fixture_engine.cpp
+        src/pathtrace_oidn.cpp
+        src/pathtrace/environment_resident.cpp
+        src/pathtrace/devices/device_compute_host.cpp
+        src/pathtrace/devices/device_registry.cpp
+        ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+    target_include_directories(arbit-opengl-pathtrace-backdrop-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-pathtrace-backdrop-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-pathtrace-backdrop-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV
+        Threads::Threads ${CMAKE_DL_LIBS})
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-pathtrace-backdrop-tests PRIVATE
+            -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
+    endif()
+    add_test(NAME opengl_pathtrace_backdrop
+        COMMAND arbit-opengl-pathtrace-backdrop-tests)
+    set_tests_properties(opengl_pathtrace_backdrop PROPERTIES
+        LABELS "native-fixture-runtime"
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    # Geometry wired straight into Render 3D, lit by Render 3D's Camera and Light
+    # (slice georoute): Raster, Realtime and Path Trace shade and shadow a cube on
+    # a floor, Path Trace bounces the floor, and an environment fills the shadow.
+    # The engines show that scene under a sky at one brightness (slice rasterexpo).
+    add_executable(arbit-opengl-geometry-route-lighting-tests
+        tests/geometry_route_lighting_gl_tests.cpp
+        tests/cross_engine_exposure_gl_tests.cpp
+        src/geometry_core_backend.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/glb_native_render_seam.cpp
+        src/imported_scene_payload_execution.cpp
+        src/imported_animated_scene_payload_execution.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/animation_mix.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/native_animation_deformation_renderer.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gpu_backend/cpu_scene_frame_opengl.cpp
+        src/gl_loader.cpp
+        src/color_transform_gl.cpp
+        src/pathtrace_fixture_engine.cpp
+        src/pathtrace_oidn.cpp
+        src/pathtrace/environment_resident.cpp
+        src/pathtrace/devices/device_compute_host.cpp
+        src/pathtrace/devices/device_registry.cpp
+        ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+    target_include_directories(arbit-opengl-geometry-route-lighting-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-geometry-route-lighting-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-geometry-route-lighting-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV
+        Threads::Threads ${CMAKE_DL_LIBS})
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-geometry-route-lighting-tests PRIVATE
+            -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
+    endif()
+    add_test(NAME opengl_geometry_route_lighting
+        COMMAND arbit-opengl-geometry-route-lighting-tests)
+    set_tests_properties(opengl_geometry_route_lighting PROPERTIES
+        LABELS "native-fixture-runtime"
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
+    # A Note Model Array copy is lit as the single model is, in Raster, Realtime
+    # and Path Trace (slice noteinst).
+    add_executable(arbit-opengl-note-instance-lighting-tests
+        tests/note_instance_lighting_tests.cpp
+        src/gltf_glb.cpp
+        src/glb_scene_adapter.cpp
+        src/glb_native_render_seam.cpp
+        src/imported_scene_payload_execution.cpp
+        src/imported_animated_scene_payload_execution.cpp
+        src/animation_clip.cpp
+        src/animation_playback_control.cpp
+        src/animation_deformation_evaluation.cpp
+        src/animation_mix.cpp
+        src/imported_animation_deformation_consumer.cpp
+        src/fixture_scene_renderer.cpp
+        src/deformation_contract.cpp
+        src/native_animation_deformation.cpp
+        src/native_animation_deformation_renderer.cpp
+        src/gpu_backend/backend_opengl.cpp
+        src/gpu_backend/cpu_scene_frame_opengl.cpp
+        src/gl_loader.cpp
+        src/color_transform_gl.cpp
+        src/pathtrace_fixture_engine.cpp
+        src/pathtrace_oidn.cpp
+        src/pathtrace/environment_resident.cpp
+        src/pathtrace/devices/device_compute_host.cpp
+        src/pathtrace/devices/device_registry.cpp
+        ${ARBIT_PATHTRACE_ENGINE_SOURCES})
+    target_include_directories(arbit-opengl-note-instance-lighting-tests PRIVATE
+        src
+        tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+    target_compile_definitions(arbit-opengl-note-instance-lighting-tests PRIVATE
+        ARBIT_HAVE_VIEWPORT=1 ARBIT_HAVE_METAL_BACKEND=0
+        ARBIT_HAVE_OPENGL_SDF_BACKEND=1)
+    target_link_libraries(arbit-opengl-note-instance-lighting-tests PRIVATE
+        PkgConfig::GLFW3 OpenGL::GL nlohmann_json::nlohmann_json PkgConfig::AV
+        Threads::Threads ${CMAKE_DL_LIBS})
+    if(NOT MSVC)
+        target_compile_options(arbit-opengl-note-instance-lighting-tests PRIVATE
+            -Wall -Wextra -Werror -Wno-error=maybe-uninitialized)
+    endif()
+    add_test(NAME opengl_note_instance_lighting
+        COMMAND arbit-opengl-note-instance-lighting-tests)
+    set_tests_properties(opengl_note_instance_lighting PROPERTIES
+        LABELS "native-fixture-runtime"
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE)
+
     add_executable(arbit-opengl-packaged-multi-object-acceptance
         tests/opengl_fixture_scene_backend_tests.cpp
         tests/support/fixture_scene.cpp
@@ -4628,7 +4964,8 @@ if(NOT APPLE AND GLFW3_FOUND AND OpenGL_FOUND)
         src/native_animation_deformation.cpp
         src/diffraction_order_bsdf.cpp
         src/gpu_backend/backend_opengl.cpp
-        src/gl_loader.cpp)
+        src/gl_loader.cpp
+        src/color_transform_gl.cpp)
     target_include_directories(arbit-opengl-packaged-multi-object-acceptance PRIVATE
         src tests ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
     target_compile_definitions(arbit-opengl-packaged-multi-object-acceptance PRIVATE
@@ -5270,10 +5607,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             list(GET ARBIT_HELPER_SHARED_TEST_SOURCES ${_index} _shared)
             string(MAKE_C_IDENTIFIER "${_shared}" _name)
             set(_library arbit-shared-test-object-${_name})
+            # Consumers that define different macros preprocess the source
+            # differently: arbit-harmony-uniform-tests compiles
+            # shader_generator.cpp without ARBIT_HAVE_VIEWPORT, the GL pixel
+            # tests with it. Each set of definitions gets its own object.
+            get_target_property(_definitions ${_target} COMPILE_DEFINITIONS)
+            if(NOT _definitions)
+                set(_definitions "")
+            endif()
+            if(TARGET ${_library})
+                get_target_property(_first_definitions ${_library} ARBIT_SHARED_DEFINITIONS)
+                if(NOT "${_first_definitions}" STREQUAL "${_definitions}")
+                    string(MD5 _definitions_hash "${_definitions}")
+                    string(SUBSTRING "${_definitions_hash}" 0 8 _definitions_hash)
+                    set(_library ${_library}-${_definitions_hash})
+                endif()
+            endif()
             if(NOT TARGET ${_library})
-                # Compile it as its first consumer did. Every consumer
-                # preprocessed it identically, so any of them would do.
+                # Compile it as its first consumer with these definitions did.
                 add_library(${_library} OBJECT EXCLUDE_FROM_ALL ${_shared})
+                set_property(TARGET ${_library} PROPERTY ARBIT_SHARED_DEFINITIONS "${_definitions}")
                 foreach(_property COMPILE_DEFINITIONS INCLUDE_DIRECTORIES COMPILE_OPTIONS
                                   CXX_STANDARD CXX_EXTENSIONS)
                     get_target_property(_value ${_target} ${_property})

@@ -1,0 +1,4194 @@
+{
+  "pack": {
+    "id": "vidvox-isf",
+    "name": "Vidvox ISF Originals",
+    "version": "1.0",
+    "author": "Vidvox (VIDVOX) + ISF community",
+    "license": "MIT",
+    "format": "isf",
+    "description": "The official Vidvox ISF-Files collection — 327 Interactive Shader Format (ISF 2.0) generators and filters: geometry, color, distortion, blur, glitch, halftone and more. Generators are standalone audio/clock-reactive visual sources; filters process an input clip. MIT-licensed; the bundled LICENSE notice is retained. Pinned to upstream commit 395072d."
+  },
+  "shaders": [
+    {
+      "id": "3d-rotate",
+      "file": "ISF/3d Rotate.fs",
+      "name": "3d Rotate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "performs a 3d rotation Categories: Geometry Adjustment, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "ascii-art",
+      "file": "ISF/ASCII Art.fs",
+      "name": "ASCII Art",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "ASCII Art Categories: Stylize, Retro. Filter (needs an input image). by VIDVOX (Ported from https://www.shadertoy.com/view/lssGDj)"
+    },
+    {
+      "id": "angular",
+      "file": "ISF/Angular.fs",
+      "name": "Angular",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/angular.glsl"
+    },
+    {
+      "id": "apply-alpha",
+      "file": "ISF/Apply Alpha.fs",
+      "name": "Apply Alpha",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment, Masking, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "audio-waveform-shape",
+      "file": "ISF/Audio Waveform Shape.fs",
+      "name": "Audio Waveform Shape",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Wraps an audio waveform around a shape and does video feedback. Categories: Audio Visualizer. Generator (standalone visual)."
+    },
+    {
+      "id": "auto-color-tone",
+      "file": "ISF/Auto Color Tone.fs",
+      "name": "Auto Color Tone",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Creates variations on a base color using a given algorithm. Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "auto-colors-histogram",
+      "file": "ISF/Auto Colors Histogram.fs",
+      "name": "Auto Colors Histogram",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment, Histogram. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "auto-levels",
+      "file": "ISF/Auto Levels.fs",
+      "name": "Auto Levels",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Auto Levels Categories: Color Effect. Filter (needs an input image). by Carter Rosenberg"
+    },
+    {
+      "id": "bad-tv",
+      "file": "ISF/Bad TV.fs",
+      "name": "Bad TV",
+      "category": "retro",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch, Retro. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "basic-shape",
+      "file": "ISF/Basic Shape.fs",
+      "name": "Basic Shape",
+      "category": "minimalist",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "bloom",
+      "file": "ISF/Bloom.fs",
+      "name": "Bloom",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur, Film. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "bordered-box",
+      "file": "ISF/Bordered Box.fs",
+      "name": "Bordered Box",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Draws a simple box with a border over a transparent background. Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "bounce",
+      "file": "ISF/Bounce.fs",
+      "name": "Bounce",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/Bounce.glsl"
+    },
+    {
+      "id": "bow-tie-horizontal",
+      "file": "ISF/Bow Tie Horizontal.fs",
+      "name": "Bow Tie Horizontal",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Automatically converted from https://gl-transitions.com/ Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/BowTieHorizontal.glsl"
+    },
+    {
+      "id": "bow-tie-vertical",
+      "file": "ISF/Bow Tie Vertical.fs",
+      "name": "Bow Tie Vertical",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/BowTieVertical.glsl"
+    },
+    {
+      "id": "boxinator",
+      "file": "ISF/Boxinator.fs",
+      "name": "Boxinator",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by mojovideotech"
+    },
+    {
+      "id": "brick-pattern",
+      "file": "ISF/Brick Pattern.fs",
+      "name": "Brick Pattern",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Generates a basic brick pattern Categories: Pattern, Color. Generator (standalone visual). by patriciogv"
+    },
+    {
+      "id": "bright",
+      "file": "ISF/Bright.fs",
+      "name": "Bright",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "broken-lcd",
+      "file": "ISF/Broken LCD.fs",
+      "name": "Broken LCD",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Broken LCD using value noise Categories: Glitch, Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "bump-distortion",
+      "file": "ISF/Bump Distortion.fs",
+      "name": "Bump Distortion",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Bends and distorts the image Categories: Distortion Effect. Filter (needs an input image). by carter rosenberg"
+    },
+    {
+      "id": "burn",
+      "file": "ISF/Burn.fs",
+      "name": "Burn",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/burn.glsl"
+    },
+    {
+      "id": "butterfly-wave-scrawler",
+      "file": "ISF/Butterfly Wave Scrawler.fs",
+      "name": "Butterfly Wave Scrawler",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/ButterflyWaveScrawler.glsl"
+    },
+    {
+      "id": "cmyk-halftone-lookaround",
+      "file": "ISF/CMYK Halftone-Lookaround.fs",
+      "name": "CMYK Halftone-Lookaround",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect, Retro. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "cmyk-halftone",
+      "file": "ISF/CMYK Halftone.fs",
+      "name": "CMYK Halftone",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect, Retro. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "channel-slide",
+      "file": "ISF/Channel Slide.fs",
+      "name": "Channel Slide",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "checkerboard",
+      "file": "ISF/Checkerboard.fs",
+      "name": "Checkerboard",
+      "category": "minimalist",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Pattern, Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "chroma-desaturation-mask",
+      "file": "ISF/Chroma Desaturation Mask.fs",
+      "name": "Chroma Desaturation Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Masking, Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "chroma-mask",
+      "file": "ISF/Chroma Mask.fs",
+      "name": "Chroma Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Masking, Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "chroma-zoom",
+      "file": "ISF/Chroma Zoom.fs",
+      "name": "Chroma Zoom",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Stylize. Filter (needs an input image). by toneburst"
+    },
+    {
+      "id": "chromatic-aberration",
+      "file": "ISF/Chromatic Aberration.fs",
+      "name": "Chromatic Aberration",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Radial lens-style chromatic aberration: red and blue channels are displaced along the line from a chromatic center. Categories: Color Effect, Distortion. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "circle-crop",
+      "file": "ISF/Circle Crop.fs",
+      "name": "Circle Crop",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/CircleCrop.glsl"
+    },
+    {
+      "id": "circle-open",
+      "file": "ISF/Circle Open.fs",
+      "name": "Circle Open",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/circleopen.glsl"
+    },
+    {
+      "id": "circle-splash-distortion",
+      "file": "ISF/Circle Splash Distortion.fs",
+      "name": "Circle Splash Distortion",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "circle-trails",
+      "file": "ISF/Circle Trails.fs",
+      "name": "Circle Trails",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Drawing. Generator (standalone visual)."
+    },
+    {
+      "id": "circle-warp",
+      "file": "ISF/Circle Warp.fs",
+      "name": "Circle Warp",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Warps an image to fit in a circle by fitting the height of the image to the height of a circle Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "circle-wrap-distortion",
+      "file": "ISF/Circle Wrap Distortion.fs",
+      "name": "Circle Wrap Distortion",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Wraps the video into a circular shape Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "circle",
+      "file": "ISF/Circle.fs",
+      "name": "Circle",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/circle.glsl"
+    },
+    {
+      "id": "circular-feedback-mask",
+      "file": "ISF/Circular Feedback Mask.fs",
+      "name": "Circular Feedback Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Feedback. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "circular-screen",
+      "file": "ISF/Circular Screen.fs",
+      "name": "Circular Screen",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "city-lights",
+      "file": "ISF/City Lights.fs",
+      "name": "City Lights",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "collage",
+      "file": "ISF/Collage.fs",
+      "name": "Collage",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "color-bars",
+      "file": "ISF/Color Bars.fs",
+      "name": "Color Bars",
+      "category": "retro",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Utility, Test Pattern. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "color-blowout",
+      "file": "ISF/Color Blowout.fs",
+      "name": "Color Blowout",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "color-controls",
+      "file": "ISF/Color Controls.fs",
+      "name": "Color Controls",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "color-history",
+      "file": "ISF/Color History.fs",
+      "name": "Color History",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Displays Data Over Time Categories: Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "color-invert",
+      "file": "ISF/Color Invert.fs",
+      "name": "Color Invert",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Inverts the RGB channels of the input Categories: Color Effect, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "color-levels",
+      "file": "ISF/Color Levels.fs",
+      "name": "Color Levels",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "color-monochrome",
+      "file": "ISF/Color Monochrome.fs",
+      "name": "Color Monochrome",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Retro. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "color-organ-polyphonic",
+      "file": "ISF/Color Organ Polyphonic.fs",
+      "name": "Color Organ Polyphonic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "color-phase",
+      "file": "ISF/Color Phase.fs",
+      "name": "Color Phase",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/colorphase.glsl"
+    },
+    {
+      "id": "color-posterize",
+      "file": "ISF/Color Posterize.fs",
+      "name": "Color Posterize",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Retro. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "color-relookup",
+      "file": "ISF/Color Relookup.fs",
+      "name": "Color Relookup",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "color-replacement",
+      "file": "ISF/Color Replacement.fs",
+      "name": "Color Replacement",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "color-scales",
+      "file": "ISF/Color Scales.fs",
+      "name": "Color Scales",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "color-schemes",
+      "file": "ISF/Color Schemes.fs",
+      "name": "Color Schemes",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Creates variations on a base color using a given algorithm. Categories: Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "color-test-grid",
+      "file": "ISF/Color Test Grid.fs",
+      "name": "Color Test Grid",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Color, Utility, Test Pattern. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "colour-distance",
+      "file": "ISF/Colour Distance.fs",
+      "name": "Colour Distance",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve, Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/ColourDistance.glsl"
+    },
+    {
+      "id": "comet-tails",
+      "file": "ISF/Comet Tails.fs",
+      "name": "Comet Tails",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "This does a feedback motion blur based on the brightness of pixels to create an analog recording comet trails effect Categories: Feedback, Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "constantalpha",
+      "file": "ISF/ConstantAlpha.fs",
+      "name": "ConstantAlpha",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Sets the alpha to a constant value Categories: Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "convergence",
+      "file": "ISF/Convergence.fs",
+      "name": "Convergence",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch, Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "corner-color-tint",
+      "file": "ISF/Corner Color Tint.fs",
+      "name": "Corner Color Tint",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Tints the corners of the image in different colors. Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "corner-colors",
+      "file": "ISF/Corner Colors.fs",
+      "name": "Corner Colors",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Generates a gradient that fades between four different colors. Categories: Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "crazy-parametric-fun",
+      "file": "ISF/Crazy Parametric Fun.fs",
+      "name": "Crazy Parametric Fun",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/CrazyParametricFun.glsl"
+    },
+    {
+      "id": "crop-and-feather",
+      "file": "ISF/Crop and Feather.fs",
+      "name": "Crop and Feather",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "ISF crop adjustment created to replace VIDVOX Quartz Composer FX, includes four sided feathering Categories: Geometry Adjustment. Filter (needs an input image). by ProjectileObjects modifed, based on VIDVOX crop"
+    },
+    {
+      "id": "crosszoom",
+      "file": "ISF/CrossZoom.fs",
+      "name": "CrossZoom",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/CrossZoom.glsl"
+    },
+    {
+      "id": "crosshatch",
+      "file": "ISF/Crosshatch.fs",
+      "name": "Crosshatch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/crosshatch.glsl"
+    },
+    {
+      "id": "crosswarp",
+      "file": "ISF/Crosswarp.fs",
+      "name": "Crosswarp",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/crosswarp.glsl"
+    },
+    {
+      "id": "cubic-warp",
+      "file": "ISF/Cubic Warp.fs",
+      "name": "Cubic Warp",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by carter rosenberg"
+    },
+    {
+      "id": "cursor-overlay",
+      "file": "ISF/Cursor Overlay.fs",
+      "name": "Cursor Overlay",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Draws a cursor on top of the input image. Categories: Overlay, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "cursor",
+      "file": "ISF/Cursor.fs",
+      "name": "Cursor",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Draws a cursor. Categories: Utility. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "deinterlace",
+      "file": "ISF/Deinterlace.fs",
+      "name": "Deinterlace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "diagonal-blur",
+      "file": "ISF/Diagonal Blur.fs",
+      "name": "Diagonal Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "diagonalize",
+      "file": "ISF/Diagonalize.fs",
+      "name": "Diagonalize",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "digital-clock",
+      "file": "ISF/Digital Clock.fs",
+      "name": "Digital Clock",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Shows the current time of day or time since the composition started Categories: Utility. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "dilate-fast",
+      "file": "ISF/Dilate-Fast.fs",
+      "name": "Dilate-Fast",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "dilate",
+      "file": "ISF/Dilate.fs",
+      "name": "Dilate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "directional-warp",
+      "file": "ISF/Directional Warp.fs",
+      "name": "Directional Warp",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/directionalwarp.glsl"
+    },
+    {
+      "id": "directional-wipe",
+      "file": "ISF/Directional Wipe.fs",
+      "name": "Directional Wipe",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/directionalwipe.glsl"
+    },
+    {
+      "id": "directional",
+      "file": "ISF/Directional.fs",
+      "name": "Directional",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/Directional.glsl"
+    },
+    {
+      "id": "dirty-lens",
+      "file": "ISF/Dirty Lens.fs",
+      "name": "Dirty Lens",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Value Noise Categories: Film, Masking. Filter (needs an input image). by Inigo Quilez ported by @colin_movecraft and VIDVOX"
+    },
+    {
+      "id": "displace",
+      "file": "ISF/Displace.fs",
+      "name": "Displace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Simple Displace Categories: Distortion Effect. Filter (needs an input image). by @colin_movecraft"
+    },
+    {
+      "id": "displacement",
+      "file": "ISF/Displacement.fs",
+      "name": "Displacement",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/displacement.glsl"
+    },
+    {
+      "id": "dither-bayer",
+      "file": "ISF/Dither-Bayer.fs",
+      "name": "Dither-Bayer",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Bayer style dithering Categories: Halftone Effect, Retro. Filter (needs an input image). by Hugh Kennedy, adapted by David Lublin"
+    },
+    {
+      "id": "doodler-overlay",
+      "file": "ISF/Doodler Overlay.fs",
+      "name": "Doodler Overlay",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Uses a virtual pen to draw colors on top of an image. Categories: Overlay. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "doodler",
+      "file": "ISF/Doodler.fs",
+      "name": "Doodler",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Uses a virtual pen to draw colors with a random walk. Categories: Drawing. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "doom-screen-transition",
+      "file": "ISF/Doom Screen Transition.fs",
+      "name": "Doom Screen Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/DoomScreenTransition.glsl"
+    },
+    {
+      "id": "doorway",
+      "file": "ISF/Doorway.fs",
+      "name": "Doorway",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/doorway.glsl"
+    },
+    {
+      "id": "dot-screen",
+      "file": "ISF/Dot Screen.fs",
+      "name": "Dot Screen",
+      "category": "retro",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect, Retro. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "double-vision",
+      "file": "ISF/Double Vision.fs",
+      "name": "Double Vision",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "dreamy-zoom",
+      "file": "ISF/Dreamy Zoom.fs",
+      "name": "Dreamy Zoom",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/DreamyZoom.glsl"
+    },
+    {
+      "id": "dreamy",
+      "file": "ISF/Dreamy.fs",
+      "name": "Dreamy",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Automatically converted from https://gl-transitions.com/ Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/Dreamy.glsl"
+    },
+    {
+      "id": "dual-side-scroller-and-flip",
+      "file": "ISF/Dual Side Scroller And Flip.fs",
+      "name": "Dual Side Scroller And Flip",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by Inspired by Side Scroller and Flip by BrianChasalow"
+    },
+    {
+      "id": "duotone-from-histogram",
+      "file": "ISF/Duotone From Histogram.fs",
+      "name": "Duotone From Histogram",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Adjusts an image to use colors determined from a histogram Categories: Color Effect, Histogram. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "duotone",
+      "file": "ISF/Duotone.fs",
+      "name": "Duotone",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "echo-trace",
+      "file": "ISF/Echo Trace.fs",
+      "name": "Echo Trace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Pixel with brightness levels below the threshold do not update. Categories: Feedback. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "edge-blowout",
+      "file": "ISF/Edge Blowout.fs",
+      "name": "Edge Blowout",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Stretches the edges out a region of the video Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "edge-blur",
+      "file": "ISF/Edge Blur.fs",
+      "name": "Edge Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "edge-distort",
+      "file": "ISF/Edge Distort.fs",
+      "name": "Edge Distort",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "edge-trace",
+      "file": "ISF/Edge Trace.fs",
+      "name": "Edge Trace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "edges",
+      "file": "ISF/Edges.fs",
+      "name": "Edges",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "emboss",
+      "file": "ISF/Emboss.fs",
+      "name": "Emboss",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "erode-fast",
+      "file": "ISF/Erode-Fast.fs",
+      "name": "Erode-Fast",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "erode",
+      "file": "ISF/Erode.fs",
+      "name": "Erode",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "etch-a-sketch",
+      "file": "ISF/Etch-a-Sketch.fs",
+      "name": "Etch-a-Sketch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Draw images one pixel at a time Categories: Drawing. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "exposure-adjust",
+      "file": "ISF/Exposure Adjust.fs",
+      "name": "Exposure Adjust",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment. Filter (needs an input image). by carter rosenberg"
+    },
+    {
+      "id": "fft-color-lines",
+      "file": "ISF/FFT Color Lines.fs",
+      "name": "FFT Color Lines",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Visualizes an FFT analysis image with custom set colors for frequency domain Categories: Audio Visualizer. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "fft-filled-waveform",
+      "file": "ISF/FFT Filled Waveform.fs",
+      "name": "FFT Filled Waveform",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Visualizes an FFT analysis image with custom set colors for frequency domain Categories: Audio Visualizer. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "fft-spectrogram",
+      "file": "ISF/FFT Spectrogram.fs",
+      "name": "FFT Spectrogram",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Buffers the incoming FFTs for timed display Categories: Audio Visualizer. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "fade-color",
+      "file": "ISF/Fade Color.fs",
+      "name": "Fade Color",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/fadecolor.glsl"
+    },
+    {
+      "id": "fade-gray-scale",
+      "file": "ISF/Fade Gray Scale.fs",
+      "name": "Fade Gray Scale",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/fadegrayscale.glsl"
+    },
+    {
+      "id": "fade",
+      "file": "ISF/Fade.fs",
+      "name": "Fade",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/fade.glsl"
+    },
+    {
+      "id": "false-color",
+      "file": "ISF/False Color.fs",
+      "name": "False Color",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "fast-blur",
+      "file": "ISF/Fast Blur.fs",
+      "name": "Fast Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by zoidberg WOOP WOOP WOOP WOOP WOOP"
+    },
+    {
+      "id": "fastmosh",
+      "file": "ISF/FastMosh.fs",
+      "name": "FastMosh",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Does a fast faked data-mosh style Categories: Feedback, Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "film-burn",
+      "file": "ISF/Film Burn.fs",
+      "name": "Film Burn",
+      "category": "retro",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/FilmBurn.glsl"
+    },
+    {
+      "id": "flip-h",
+      "file": "ISF/Flip H.fs",
+      "name": "Flip H",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "flip-v",
+      "file": "ISF/Flip V.fs",
+      "name": "Flip V",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "flipbook",
+      "file": "ISF/Flipbook.fs",
+      "name": "Flipbook",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Creates a flipbook like effect Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "fly-eye",
+      "file": "ISF/Fly Eye.fs",
+      "name": "Fly Eye",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/flyeye.glsl"
+    },
+    {
+      "id": "freeze-frame",
+      "file": "ISF/Freeze Frame.fs",
+      "name": "Freeze Frame",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Holds the output on the captured freeze frame Categories: Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "frosted-glass",
+      "file": "ISF/Frosted Glass.fs",
+      "name": "Frosted Glass",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Blur. Filter (needs an input image). by geeks3d"
+    },
+    {
+      "id": "gamma-correction",
+      "file": "ISF/Gamma Correction.fs",
+      "name": "Gamma Correction",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "ghosting",
+      "file": "ISF/Ghosting.fs",
+      "name": "Ghosting",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Feedback, Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "glitch-displace",
+      "file": "ISF/Glitch Displace.fs",
+      "name": "Glitch Displace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/GlitchDisplace.glsl"
+    },
+    {
+      "id": "glitch-memories",
+      "file": "ISF/Glitch Memories.fs",
+      "name": "Glitch Memories",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion, Glitch. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/GlitchMemories.glsl"
+    },
+    {
+      "id": "glitch-shifter",
+      "file": "ISF/Glitch Shifter.fs",
+      "name": "Glitch Shifter",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "gloom",
+      "file": "ISF/Gloom.fs",
+      "name": "Gloom",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur, Film. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "glow-fast",
+      "file": "ISF/Glow-Fast.fs",
+      "name": "Glow-Fast",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "glow",
+      "file": "ISF/Glow.fs",
+      "name": "Glow",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "god-rays",
+      "file": "ISF/God Rays.fs",
+      "name": "God Rays",
+      "category": "nature",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "adapted from https://github.com/neilmendoza/ofxPostProcessing/blob/master/src/GodRaysPass.cpp Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "graph-paper",
+      "file": "ISF/Graph Paper.fs",
+      "name": "Graph Paper",
+      "category": "minimalist",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Draws basic graph paper pattern Categories: Pattern, Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "grid-flip",
+      "file": "ISF/Grid Flip.fs",
+      "name": "Grid Flip",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/GridFlip.glsl"
+    },
+    {
+      "id": "grid-warp",
+      "file": "ISF/Grid Warp.fs",
+      "name": "Grid Warp",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "hsvtorgb",
+      "file": "ISF/HSVtoRGB.fs",
+      "name": "HSVtoRGB",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "swizzles RGBA to BGRA and vice versa Categories: Color Effect, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "hatch-blur",
+      "file": "ISF/Hatch Blur.fs",
+      "name": "Hatch Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "heart-transition",
+      "file": "ISF/Heart Transition.fs",
+      "name": "Heart Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe, Retro. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/heart.glsl"
+    },
+    {
+      "id": "heart",
+      "file": "ISF/Heart.fs",
+      "name": "Heart",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "hexagonalize",
+      "file": "ISF/Hexagonalize.fs",
+      "name": "Hexagonalize",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/hexagonalize.glsl"
+    },
+    {
+      "id": "highlighter-overlay",
+      "file": "ISF/Highlighter Overlay.fs",
+      "name": "Highlighter Overlay",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Draws a highlighting bounding box on top of the input image. Categories: Overlay, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "histogram-viewer",
+      "file": "ISF/Histogram Viewer.fs",
+      "name": "Histogram Viewer",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Draws an RGB histogram from a provided histogram image Categories: Histogram, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "horizverthold",
+      "file": "ISF/HorizVertHold.fs",
+      "name": "HorizVertHold",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "hyperspace",
+      "file": "ISF/Hyperspace.fs",
+      "name": "Hyperspace",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "interlace-mirror",
+      "file": "ISF/Interlace Mirror.fs",
+      "name": "Interlace Mirror",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch, Retro. Filter (needs an input image). by Carter Rosenberg"
+    },
+    {
+      "id": "interlace",
+      "file": "ISF/Interlace.fs",
+      "name": "Interlace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch, Retro. Filter (needs an input image). by Carter Rosenberg"
+    },
+    {
+      "id": "inverted-page-curl",
+      "file": "ISF/Inverted Page Curl.fs",
+      "name": "Inverted Page Curl",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Automatically converted from https://gl-transitions.com/ Categories: Wipe, Retro. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/InvertedPageCurl.glsl"
+    },
+    {
+      "id": "jpeg-block-corruption",
+      "file": "ISF/JPEG Block Corruption.fs",
+      "name": "JPEG Block Corruption",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Simulates the visual artifacts of an over-compressed or partially-corrupted JPEG. Categories: Glitch, Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "kaleidoscope-tile",
+      "file": "ISF/Kaleidoscope Tile.fs",
+      "name": "Kaleidoscope Tile",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Kaleidoscope, Tile Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "kaleidoscope-transition",
+      "file": "ISF/Kaleidoscope Transition.fs",
+      "name": "Kaleidoscope Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/kaleidoscope.glsl"
+    },
+    {
+      "id": "kaleidoscope",
+      "file": "ISF/Kaleidoscope.fs",
+      "name": "Kaleidoscope",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Kaleidoscope, Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "key-frame-artifacts",
+      "file": "ISF/Key Frame Artifacts.fs",
+      "name": "Key Frame Artifacts",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Keeps an accumulation of difference since a key frame Categories: Glitch. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "lgg",
+      "file": "ISF/LGG.fs",
+      "name": "LGG",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Performs a Lift Gamma Gain Saturation CDL Categories: Color Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "layer-mask",
+      "file": "ISF/Layer Mask.fs",
+      "name": "Layer Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Takes a mask image and applies it to the input image's alpha channel. Categories: Masking, Color Effect, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "layer-position",
+      "file": "ISF/Layer Position.fs",
+      "name": "Layer Position",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment, Utility. Filter (needs an input image)."
+    },
+    {
+      "id": "lens-flare",
+      "file": "ISF/Lens Flare.fs",
+      "name": "Lens Flare",
+      "category": "nature",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Film. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "life",
+      "file": "ISF/Life.fs",
+      "name": "Life",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Based on Conway Game of Life Categories: Noise. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "line-group",
+      "file": "ISF/Line Group.fs",
+      "name": "Line Group",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Draws a series of lines at different angles along a line. Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "line-screen",
+      "file": "ISF/Line Screen.fs",
+      "name": "Line Screen",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "linear-blur",
+      "file": "ISF/Linear Blur.fs",
+      "name": "Linear Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/LinearBlur.glsl"
+    },
+    {
+      "id": "linear-gradient",
+      "file": "ISF/Linear Gradient.fs",
+      "name": "Linear Gradient",
+      "category": "minimalist",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Color. Generator (standalone visual). by Carter Rosenberg"
+    },
+    {
+      "id": "lines",
+      "file": "ISF/Lines.fs",
+      "name": "Lines",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "long-exposure",
+      "file": "ISF/Long Exposure.fs",
+      "name": "Long Exposure",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Bright objects burn in and optionally decay Categories: Color Effect, Feedback, Film. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "luma-transition",
+      "file": "ISF/Luma Transition.fs",
+      "name": "Luma Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Automatically converted from https://gl-transitions.com/ Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/luma.glsl"
+    },
+    {
+      "id": "luminance-melt",
+      "file": "ISF/Luminance Melt.fs",
+      "name": "Luminance Melt",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/luminance_melt.glsl"
+    },
+    {
+      "id": "luminance-posterize",
+      "file": "ISF/Luminance Posterize.fs",
+      "name": "Luminance Posterize",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Retro. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "maximum-component",
+      "file": "ISF/Maximum Component.fs",
+      "name": "Maximum Component",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "median",
+      "file": "ISF/Median.fs",
+      "name": "Median",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "meta-image",
+      "file": "ISF/Meta Image.fs",
+      "name": "Meta Image",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Tile Effect. Filter (needs an input image). by Toneburst"
+    },
+    {
+      "id": "micro-buffer-rgb",
+      "file": "ISF/Micro Buffer RGB.fs",
+      "name": "Micro Buffer RGB",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Buffers 8 recent frames Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "micro-buffer",
+      "file": "ISF/Micro Buffer.fs",
+      "name": "Micro Buffer",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Buffers 8 recent frames Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "minimum-component",
+      "file": "ISF/Minimum Component.fs",
+      "name": "Minimum Component",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "mirror-edge",
+      "file": "ISF/Mirror Edge.fs",
+      "name": "Mirror Edge",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Tile Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "mirror",
+      "file": "ISF/Mirror.fs",
+      "name": "Mirror",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "morph",
+      "file": "ISF/Morph.fs",
+      "name": "Morph",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/morph.glsl"
+    },
+    {
+      "id": "mosaic",
+      "file": "ISF/Mosaic.fs",
+      "name": "Mosaic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/Mosaic.glsl"
+    },
+    {
+      "id": "motion-heat-map",
+      "file": "ISF/Motion Heat Map.fs",
+      "name": "Motion Heat Map",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Shows where there is motion between frames Categories: Color Effect, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "motion-mask",
+      "file": "ISF/Motion Mask.fs",
+      "name": "Motion Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Masks an image based on the amount of motion Categories: Masking. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "multi-gradient",
+      "file": "ISF/Multi Gradient.fs",
+      "name": "Multi Gradient",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color. Filter (needs an input image). by Carter Rosenberg"
+    },
+    {
+      "id": "multi-hue-shift",
+      "file": "ISF/Multi Hue Shift.fs",
+      "name": "Multi Hue Shift",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Performs hue shifts of different amounts depending on brightness levels Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "multi-pass-gaussian-blur",
+      "file": "ISF/Multi Pass Gaussian Blur.fs",
+      "name": "Multi Pass Gaussian Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Performs a deep blur Categories: Blur. Filter (needs an input image). by original implementation as v002.blur in QC by anton marini and tom butterworth, ported by zoidberg"
+    },
+    {
+      "id": "multi-pixellate",
+      "file": "ISF/Multi-Pixellate.fs",
+      "name": "Multi-Pixellate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "multiframe-2x2",
+      "file": "ISF/MultiFrame 2x2.fs",
+      "name": "MultiFrame 2x2",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "buffers the last 3 frames and draws a 2x2 grid of the 4 current frames available Categories: Tile Effect, Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "multiframe-3x3",
+      "file": "ISF/MultiFrame 3x3.fs",
+      "name": "MultiFrame 3x3",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "buffers the last 3 frames and draws a 2x2 grid of the 4 current frames available Categories: Tile Effect, Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "multiply-blend",
+      "file": "ISF/Multiply Blend.fs",
+      "name": "Multiply Blend",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/multiply_blend.glsl"
+    },
+    {
+      "id": "neon",
+      "file": "ISF/Neon.fs",
+      "name": "Neon",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "adapted from https://github.com/neilmendoza/ofxPostProcessing/blob/master/src/GodRaysPass.cpp Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "night-vision",
+      "file": "ISF/Night Vision.fs",
+      "name": "Night Vision",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "noise-adapt",
+      "file": "ISF/Noise Adapt.fs",
+      "name": "Noise Adapt",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Pixels that change become noise until they match the input again Categories: Noise. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "noise-displace",
+      "file": "ISF/Noise Displace.fs",
+      "name": "Noise Displace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Displaces image randomly Categories: Distortion Effect, Noise. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "noise-pixellate",
+      "file": "ISF/Noise Pixellate.fs",
+      "name": "Noise Pixellate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Noise. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "noise",
+      "file": "ISF/Noise.fs",
+      "name": "Noise",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Noise. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "optical-flow-distort",
+      "file": "ISF/Optical Flow Distort.fs",
+      "name": "Optical Flow Distort",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Uses an optical flow mask to create a distortion Categories: Distortion Effect, Stylize. Filter (needs an input image). by VIDVOX, based on original implementation by Andrew Benson and v002"
+    },
+    {
+      "id": "optical-flow-generator",
+      "file": "ISF/Optical Flow Generator.fs",
+      "name": "Optical Flow Generator",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Creates a raw optical flow mask from the input image Categories: Masking, Utility. Filter (needs an input image). by VIDVOX / v002 / Andrew Benson"
+    },
+    {
+      "id": "pattern-glitch",
+      "file": "ISF/Pattern Glitch.fs",
+      "name": "Pattern Glitch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Applies randomized effects to different parts of the image. Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "perlin-transition",
+      "file": "ISF/Perlin Transition.fs",
+      "name": "Perlin Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/perlin.glsl"
+    },
+    {
+      "id": "pinwheel",
+      "file": "ISF/Pinwheel.fs",
+      "name": "Pinwheel",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/pinwheel.glsl"
+    },
+    {
+      "id": "pixel-shifter",
+      "file": "ISF/Pixel Shifter.fs",
+      "name": "Pixel Shifter",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Shifts pixels up and down Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "pixelize",
+      "file": "ISF/Pixelize.fs",
+      "name": "Pixelize",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/pixelize.glsl"
+    },
+    {
+      "id": "pixellate",
+      "file": "ISF/Pixellate.fs",
+      "name": "Pixellate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "polar-function",
+      "file": "ISF/Polar Function.fs",
+      "name": "Polar Function",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/polar_function.glsl"
+    },
+    {
+      "id": "polka-dots-curtain",
+      "file": "ISF/Polka Dots Curtain.fs",
+      "name": "Polka Dots Curtain",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/PolkaDotsCurtain.glsl"
+    },
+    {
+      "id": "poly-glitch",
+      "file": "ISF/Poly Glitch.fs",
+      "name": "Poly Glitch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "poly-star",
+      "file": "ISF/Poly Star.fs",
+      "name": "Poly Star",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual)."
+    },
+    {
+      "id": "posterize",
+      "file": "ISF/Posterize.fs",
+      "name": "Posterize",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Posterizes an image Categories: Retro, Stylize, Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "power-warp",
+      "file": "ISF/Power Warp.fs",
+      "name": "Power Warp",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Power curves distortions with shifting Categories: Distortion Effect. Filter (needs an input image)."
+    },
+    {
+      "id": "quad-mask",
+      "file": "ISF/Quad Mask.fs",
+      "name": "Quad Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Masking, Geometry Adjustment. Filter (needs an input image)."
+    },
+    {
+      "id": "quad-tile",
+      "file": "ISF/Quad Tile.fs",
+      "name": "Quad Tile",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Tile Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "re-rgb-gradient-generator",
+      "file": "ISF/RE RGB Gradient Generator.fs",
+      "name": "RE RGB Gradient Generator",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color, Utility. Filter (needs an input image). by Carter Rosenberg"
+    },
+    {
+      "id": "rgb-eq",
+      "file": "ISF/RGB EQ.fs",
+      "name": "RGB EQ",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "rgb-halftone-lookaround",
+      "file": "ISF/RGB Halftone-lookaround.fs",
+      "name": "RGB Halftone-lookaround",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect, Retro. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "rgb-halftone",
+      "file": "ISF/RGB Halftone.fs",
+      "name": "RGB Halftone",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect, Retro. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "rgb-invert",
+      "file": "ISF/RGB Invert.fs",
+      "name": "RGB Invert",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "rgb-strobe",
+      "file": "ISF/RGB Strobe.fs",
+      "name": "RGB Strobe",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "rgb-trails-3-0",
+      "file": "ISF/RGB Trails 3.0.fs",
+      "name": "RGB Trails 3.0",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "a persistent buffer is used to maintain an image which is constantly updated.  Similar to VVMotionBlur, but each channel has its own weight Categories: Color Effect, Blur. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "rgba-swap",
+      "file": "ISF/RGBA Swap.fs",
+      "name": "RGBA Swap",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "rgbtohsv",
+      "file": "ISF/RGBtoHSV.fs",
+      "name": "RGBtoHSV",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "swizzles RGBA to BGRA and vice versa Categories: Color Effect, Utility. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "radial-gradient",
+      "file": "ISF/Radial Gradient.fs",
+      "name": "Radial Gradient",
+      "category": "minimalist",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Color. Generator (standalone visual). by Carter Rosenberg"
+    },
+    {
+      "id": "radial-replicate",
+      "file": "ISF/Radial Replicate.fs",
+      "name": "Radial Replicate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Repllcates a radial slice of an image Categories: Kaleidoscope. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "radial-spectrogram",
+      "file": "ISF/Radial Spectrogram.fs",
+      "name": "Radial Spectrogram",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Generates a radial audiospectrogram from fft-input Categories: Audio Visualizer. Generator (standalone visual). by icalvin102 (calvin@icalvin.de)"
+    },
+    {
+      "id": "radial",
+      "file": "ISF/Radial.fs",
+      "name": "Radial",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/Radial.glsl"
+    },
+    {
+      "id": "random-characters",
+      "file": "ISF/Random Characters.fs",
+      "name": "Random Characters",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Drawing random characters from a font encoded as an array. Categories: Pattern, Noise. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "random-checkerboard",
+      "file": "ISF/Random Checkerboard.fs",
+      "name": "Random Checkerboard",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Creates a checkerboard pattern with randomized colors Categories: Pattern, Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "random-freeze",
+      "file": "ISF/Random Freeze.fs",
+      "name": "Random Freeze",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Causes only part of an image to update Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "random-lines",
+      "file": "ISF/Random Lines.fs",
+      "name": "Random Lines",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "random-shape-blast",
+      "file": "ISF/Random Shape Blast.fs",
+      "name": "Random Shape Blast",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "random-shape",
+      "file": "ISF/Random Shape.fs",
+      "name": "Random Shape",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "random-squares-mask",
+      "file": "ISF/Random Squares Mask.fs",
+      "name": "Random Squares Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Masking. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "random-squares",
+      "file": "ISF/Random Squares.fs",
+      "name": "Random Squares",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/randomsquares.glsl"
+    },
+    {
+      "id": "random-stripes",
+      "file": "ISF/Random Stripes.fs",
+      "name": "Random Stripes",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Creates a stripe pattern with randomized colors Categories: Pattern, Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "replicate-random",
+      "file": "ISF/Replicate Random.fs",
+      "name": "Replicate Random",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Tile Effect. Filter (needs an input image)."
+    },
+    {
+      "id": "replicate",
+      "file": "ISF/Replicate.fs",
+      "name": "Replicate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Tile Effect. Filter (needs an input image)."
+    },
+    {
+      "id": "resize-glitch",
+      "file": "ISF/Resize Glitch.fs",
+      "name": "Resize Glitch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch, Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "ridgelines",
+      "file": "ISF/Ridgelines.fs",
+      "name": "Ridgelines",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Ridged multifractal noise — turns simplex noise's smooth zero-crossings into sharp ridgelines. Categories: Generator, Noise. Generator (standalone visual). by VIDVOX (simplex by Ashima Arts / Stefan Gustavson)"
+    },
+    {
+      "id": "ripple-transition",
+      "file": "ISF/Ripple Transition.fs",
+      "name": "Ripple Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion, Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/ripple.glsl"
+    },
+    {
+      "id": "ripples",
+      "file": "ISF/Ripples.fs",
+      "name": "Ripples",
+      "category": "nature",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by carter rosenberg"
+    },
+    {
+      "id": "rotate-scale-fade",
+      "file": "ISF/Rotate Scale Fade.fs",
+      "name": "Rotate Scale Fade",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/rotate_scale_fade.glsl"
+    },
+    {
+      "id": "rotate",
+      "file": "ISF/Rotate.fs",
+      "name": "Rotate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "saturation-bleed",
+      "file": "ISF/Saturation Bleed.fs",
+      "name": "Saturation Bleed",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Applies a blur to the saturation levels of pixels. Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "sepia-tone",
+      "file": "ISF/Sepia Tone.fs",
+      "name": "Sepia Tone",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect, Retro. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "set-alpha",
+      "file": "ISF/Set Alpha.fs",
+      "name": "Set Alpha",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Sets the alpha channel of the image Categories: Color Adjustment, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "shake",
+      "file": "ISF/Shake.fs",
+      "name": "Shake",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Noise, Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "shape-mask",
+      "file": "ISF/Shape Mask.fs",
+      "name": "Shape Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Masking. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "shape-morph-feedback-mask",
+      "file": "ISF/Shape Morph Feedback Mask.fs",
+      "name": "Shape Morph Feedback Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Feedback. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "shape-morph-wrap",
+      "file": "ISF/Shape Morph Wrap.fs",
+      "name": "Shape Morph Wrap",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Wraps an image into a shape that is created by morphing two primitive shapes together Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "sharpen-luminance",
+      "file": "ISF/Sharpen Luminance.fs",
+      "name": "Sharpen Luminance",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Sharpen. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "sharpen-rgb",
+      "file": "ISF/Sharpen RGB.fs",
+      "name": "Sharpen RGB",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Sharpen. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "shockwave-pulse",
+      "file": "ISF/Shockwave Pulse.fs",
+      "name": "Shockwave Pulse",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "shockwave",
+      "file": "ISF/Shockwave.fs",
+      "name": "Shockwave",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "show-alpha",
+      "file": "ISF/Show Alpha.fs",
+      "name": "Show Alpha",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Maps the alpha to grayscale Categories: Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "side-scroller-and-flip",
+      "file": "ISF/Side Scroller And Flip.fs",
+      "name": "Side Scroller And Flip",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by BrianChasalow"
+    },
+    {
+      "id": "simple-zoom-transition",
+      "file": "ISF/Simple Zoom Transition.fs",
+      "name": "Simple Zoom Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion, Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/SimpleZoom.glsl"
+    },
+    {
+      "id": "simplex-noise",
+      "file": "ISF/Simplex Noise.fs",
+      "name": "Simplex Noise",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "2D simplex noise generator with fractal-Brownian-motion octave summation. Categories: Generator, Noise. Generator (standalone visual). by VIDVOX (simplex by Ashima Arts / Stefan Gustavson)"
+    },
+    {
+      "id": "sine-warp-gradient",
+      "file": "ISF/Sine Warp Gradient.fs",
+      "name": "Sine Warp Gradient",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Color. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "sine-warp-tile",
+      "file": "ISF/Sine Warp Tile.fs",
+      "name": "Sine Warp Tile",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Kaleidoscope, Tile Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "sketch",
+      "file": "ISF/Sketch.fs",
+      "name": "Sketch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "sliding-strips",
+      "file": "ISF/Sliding Strips.fs",
+      "name": "Sliding Strips",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image)."
+    },
+    {
+      "id": "slit-scan-mask",
+      "file": "ISF/Slit Scan Mask.fs",
+      "name": "Slit Scan Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Pixels update only if within range of the specified lines to create a slit scan style Categories: Masking. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "slit-scan",
+      "file": "ISF/Slit Scan.fs",
+      "name": "Slit Scan",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Pixels update only if within range of the specified lines to create a slit scan style Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "smoke-screen",
+      "file": "ISF/Smoke Screen.fs",
+      "name": "Smoke Screen",
+      "category": "nature",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "A smoke screen overlay effect Categories: Stylize. Filter (needs an input image). by jackdavenport"
+    },
+    {
+      "id": "smudged-lens",
+      "file": "ISF/Smudged Lens.fs",
+      "name": "Smudged Lens",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Blurs parts of an image as if the lens is smudged Categories: Film, Blur. Filter (needs an input image). by Inigo Quilez ported by @colin_movecraft and VIDVOX"
+    },
+    {
+      "id": "soft-blur",
+      "file": "ISF/Soft Blur.fs",
+      "name": "Soft Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Blur. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "soft-flip",
+      "file": "ISF/Soft Flip.fs",
+      "name": "Soft Flip",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "solarize",
+      "file": "ISF/Solarize.fs",
+      "name": "Solarize",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Solarizes an image Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "solid-color",
+      "file": "ISF/Solid Color.fs",
+      "name": "Solid Color",
+      "category": "minimalist",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "demonstrates the use of color-type image inputs Categories: Color, Utility. Generator (standalone visual). by Carter Rosenberg"
+    },
+    {
+      "id": "sorting-smear",
+      "file": "ISF/Sorting Smear.fs",
+      "name": "Sorting Smear",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Glitch, Feedback. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "sphere-map",
+      "file": "ISF/Sphere Map.fs",
+      "name": "Sphere Map",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Maps video onto a sphere Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "spiral",
+      "file": "ISF/Spiral.fs",
+      "name": "Spiral",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "squares-wire",
+      "file": "ISF/Squares Wire.fs",
+      "name": "Squares Wire",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/squareswire.glsl"
+    },
+    {
+      "id": "squeeze",
+      "file": "ISF/Squeeze.fs",
+      "name": "Squeeze",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/squeeze.glsl"
+    },
+    {
+      "id": "star",
+      "file": "ISF/Star.fs",
+      "name": "Star",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "stereo-viewer",
+      "file": "ISF/Stereo Viewer.fs",
+      "name": "Stereo Viewer",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe, Retro. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/StereoViewer.glsl"
+    },
+    {
+      "id": "stripes",
+      "file": "ISF/Stripes.fs",
+      "name": "Stripes",
+      "category": "minimalist",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "strobe",
+      "file": "ISF/Strobe.fs",
+      "name": "Strobe",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "stylize-glitch",
+      "file": "ISF/Stylize Glitch.fs",
+      "name": "Stylize Glitch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Applies randomized effects to different parts of the image. Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "swap-transition",
+      "file": "ISF/Swap Transition.fs",
+      "name": "Swap Transition",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe, Retro. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/swap.glsl"
+    },
+    {
+      "id": "swirl",
+      "file": "ISF/Swirl.fs",
+      "name": "Swirl",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/Swirl.glsl"
+    },
+    {
+      "id": "tv-static",
+      "file": "ISF/TV Static.fs",
+      "name": "TV Static",
+      "category": "retro",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/TVStatic.glsl"
+    },
+    {
+      "id": "test-pattern-generator",
+      "file": "ISF/Test Pattern Generator.fs",
+      "name": "Test Pattern Generator",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Full-featured scope test shader with rotating patterns, animated luma, and time-controlled generative visuals Categories: Test Pattern, Utility. Generator (standalone visual). by Cornelius // ProjectileObjects"
+    },
+    {
+      "id": "thermal-camera",
+      "file": "ISF/Thermal Camera.fs",
+      "name": "Thermal Camera",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "time-glitch-rgb",
+      "file": "ISF/Time Glitch RGB.fs",
+      "name": "Time Glitch RGB",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Buffers 8 recent frames Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "tiny-date-time-overlay",
+      "file": "ISF/Tiny Date Time Overlay.fs",
+      "name": "Tiny Date Time Overlay",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Draws a small (80x48 pixel) time / date stamp. Categories: Overlay, Utility. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "toon",
+      "file": "ISF/Toon.fs",
+      "name": "Toon",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "trail-mask",
+      "file": "ISF/Trail Mask.fs",
+      "name": "Trail Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Pixels update only based on the masking image Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "trapezoid-distortion",
+      "file": "ISF/Trapezoid Distortion.fs",
+      "name": "Trapezoid Distortion",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Warps the video into a trapezoid shape Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "triangle-mosaic",
+      "file": "ISF/Triangle Mosaic.fs",
+      "name": "Triangle Mosaic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Renders the input as a mesh of jittered triangles and lines. Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "triangle-warp",
+      "file": "ISF/Triangle Warp.fs",
+      "name": "Triangle Warp",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Warps an image to fit in a triangle by fitting the height of the image to the height of a triangle Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "triangle",
+      "file": "ISF/Triangle.fs",
+      "name": "Triangle",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by Carter Rosenberg"
+    },
+    {
+      "id": "triangles",
+      "file": "ISF/Triangles.fs",
+      "name": "Triangles",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "trio-tone",
+      "file": "ISF/Trio Tone.fs",
+      "name": "Trio Tone",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "triple-rotate",
+      "file": "ISF/Triple Rotate.fs",
+      "name": "Triple Rotate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Performs three different rotations Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "truchet-tile",
+      "file": "ISF/Truchet Tile.fs",
+      "name": "Truchet Tile",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Creates a Truchet Tile pattern Categories: Geometry. Generator (standalone visual). by pjkarlik"
+    },
+    {
+      "id": "twirl",
+      "file": "ISF/Twirl.fs",
+      "name": "Twirl",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion Effect. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "undulating-burn-out",
+      "file": "ISF/Undulating Burn Out.fs",
+      "name": "Undulating Burn Out",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/undulatingBurnOut.glsl"
+    },
+    {
+      "id": "unsharp-mask",
+      "file": "ISF/Unsharp Mask.fs",
+      "name": "Unsharp Mask",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Sharpen. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "vhs-glitch",
+      "file": "ISF/VHS Glitch.fs",
+      "name": "VHS Glitch",
+      "category": "retro",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "VHS Glitch Style Categories: Glitch, Retro. Filter (needs an input image). by David Lublin, original by Staffan Widegarn Åhlvik"
+    },
+    {
+      "id": "vu-meter",
+      "file": "ISF/VU Meter.fs",
+      "name": "VU Meter",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Categories: Geometry. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "vvmotionblur-3-0",
+      "file": "ISF/VVMotionBlur 3.0.fs",
+      "name": "VVMotionBlur 3.0",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "this is basically identical to the demonstration of a persistent buffer Categories: Blur. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "vertex-manipulator",
+      "file": "ISF/Vertex Manipulator.fs",
+      "name": "Vertex Manipulator",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Moves the vertex points to the specified locations without correction Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "vertical-tearing",
+      "file": "ISF/Vertical Tearing.fs",
+      "name": "Vertical Tearing",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "This introduces a vertical tearing effect similar to when GL VBL sync is off. Categories: Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "vibrance",
+      "file": "ISF/Vibrance.fs",
+      "name": "Vibrance",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "video-bricks",
+      "file": "ISF/Video Bricks.fs",
+      "name": "Video Bricks",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Tiles the incoming image using a basic brick pattern Categories: Tile Effect. Filter (needs an input image). by adapted from patriciogv bricks.fs by vidvox"
+    },
+    {
+      "id": "video-snake",
+      "file": "ISF/Video Snake.fs",
+      "name": "Video Snake",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Makes a grid of frame delayed images Categories: Tile Effect, Stylize. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "water-drop",
+      "file": "ISF/Water Drop.fs",
+      "name": "Water Drop",
+      "category": "nature",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/WaterDrop.glsl"
+    },
+    {
+      "id": "waveform-displace",
+      "file": "ISF/Waveform Displace.fs",
+      "name": "Waveform Displace",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Displaces image with audio waveform Categories: Audio Visualizer, Distortion Effect. Filter (needs an input image). by icalvin102 (calvin@icalvin.de)"
+    },
+    {
+      "id": "white-point-adjust",
+      "file": "ISF/White Point Adjust.fs",
+      "name": "White Point Adjust",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Modifies the white point by multiplying the src pixel by the color value Categories: Color Adjustment. Filter (needs an input image). by zoidberg"
+    },
+    {
+      "id": "wind",
+      "file": "ISF/Wind.fs",
+      "name": "Wind",
+      "category": "nature",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/wind.glsl"
+    },
+    {
+      "id": "window-blinds",
+      "file": "ISF/Window Blinds.fs",
+      "name": "Window Blinds",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Dissolve. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/windowblinds.glsl"
+    },
+    {
+      "id": "window-slice",
+      "file": "ISF/Window Slice.fs",
+      "name": "Window Slice",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/windowslice.glsl"
+    },
+    {
+      "id": "wipe-down",
+      "file": "ISF/Wipe Down.fs",
+      "name": "Wipe Down",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Automatically converted from https://gl-transitions.com/ Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/wipeDown.glsl"
+    },
+    {
+      "id": "wipe-left",
+      "file": "ISF/Wipe Left.fs",
+      "name": "Wipe Left",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/wipeLeft.glsl"
+    },
+    {
+      "id": "wipe-right",
+      "file": "ISF/Wipe Right.fs",
+      "name": "Wipe Right",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/wipeRight.glsl"
+    },
+    {
+      "id": "wipe-up",
+      "file": "ISF/Wipe Up.fs",
+      "name": "Wipe Up",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/wipeUp.glsl"
+    },
+    {
+      "id": "worley-cells",
+      "file": "ISF/Worley Cells.fs",
+      "name": "Worley Cells",
+      "category": "nature",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [],
+      "kind": "generator",
+      "description": "Worley/Voronoi cellular noise generator. Categories: Generator, Geometry, Noise. Generator (standalone visual). by VIDVOX"
+    },
+    {
+      "id": "xyzoom",
+      "file": "ISF/XYZoom.fs",
+      "name": "XYZoom",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "y-c-time-blur",
+      "file": "ISF/Y-C Time Blur.fs",
+      "name": "Y-C Time Blur",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "This converts to YIQ and does separate feedback blur on the Y and C channels Categories: Blur, Glitch. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "zoom-in-circles",
+      "file": "ISF/Zoom In Circles.fs",
+      "name": "Zoom In Circles",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/ZoomInCircles.glsl"
+    },
+    {
+      "id": "zoom",
+      "file": "ISF/Zoom.fs",
+      "name": "Zoom",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Geometry Adjustment. Filter (needs an input image). by VIDVOX"
+    },
+    {
+      "id": "zooming-feedback",
+      "file": "ISF/Zooming Feedback.fs",
+      "name": "Zooming Feedback",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Creates a simple zooming feedback loop Categories: Retro, Feedback. Filter (needs an input image)."
+    },
+    {
+      "id": "cube",
+      "file": "ISF/cube.fs",
+      "name": "cube",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Wipe, Distortion. Filter (needs an input image). by Automatically converted from https://www.github.com/gl-transitions/gl-transitions/tree/master/cube.glsl"
+    },
+    {
+      "id": "v002-bleach-bypass",
+      "file": "ISF/v002 Bleach Bypass.fs",
+      "name": "v002 Bleach Bypass",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Color Adjustment, Film, v002. Filter (needs an input image). by v002"
+    },
+    {
+      "id": "v002-crosshatch",
+      "file": "ISF/v002 Crosshatch.fs",
+      "name": "v002 Crosshatch",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Halftone Effect, v002. Filter (needs an input image). by v002"
+    },
+    {
+      "id": "v002-dilate",
+      "file": "ISF/v002 Dilate.fs",
+      "name": "v002 Dilate",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "messed up version of v002 dilate Categories: Blur, v002. Filter (needs an input image). by carter rosenberg"
+    },
+    {
+      "id": "v002-erode",
+      "file": "ISF/v002 Erode.fs",
+      "name": "v002 Erode",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "messed up version of v002 erode Categories: Blur, v002. Filter (needs an input image). by carter rosenberg"
+    },
+    {
+      "id": "v002-glitch-analog",
+      "file": "ISF/v002 Glitch Analog.fs",
+      "name": "v002 Glitch Analog",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Emulates classic analog video interference, distortion and sync issues. Categories: Glitch, Distortion Effect, v002. Filter (needs an input image). by Vade / VIDVOX"
+    },
+    {
+      "id": "v002-light-leak",
+      "file": "ISF/v002 Light Leak.fs",
+      "name": "v002 Light Leak",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Film, Stylize, v002. Filter (needs an input image). by v002"
+    },
+    {
+      "id": "v002-technicolor",
+      "file": "ISF/v002 Technicolor.fs",
+      "name": "v002 Technicolor",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Stylize, Film, Color Effect, v002. Filter (needs an input image). by v002"
+    },
+    {
+      "id": "v002-vignette",
+      "file": "ISF/v002 Vignette.fs",
+      "name": "v002 Vignette",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "Categories: Film, v002. Filter (needs an input image). by v002"
+    },
+    {
+      "id": "v002-crt-displacement",
+      "file": "ISF/v002-CRT-Displacement.fs",
+      "name": "v002-CRT-Displacement",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "CRT Displacement, emulating the look of curved CRT Displays Categories: Distortion Effect, Retro, v002. Filter (needs an input image). by vade"
+    },
+    {
+      "id": "v002-crt-mask",
+      "file": "ISF/v002-CRT-Mask.fs",
+      "name": "v002-CRT-Mask",
+      "category": "retro",
+      "reactsTo": [
+        "clock"
+      ],
+      "needs": [
+        "an input image / clip"
+      ],
+      "kind": "filter",
+      "description": "CRT Mask, emulating the look of curved CRT Displays Categories: Retro, v002. Filter (needs an input image). by vade"
+    }
+  ]
+}

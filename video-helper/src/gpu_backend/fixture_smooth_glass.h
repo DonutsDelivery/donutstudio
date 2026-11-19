@@ -711,6 +711,8 @@ struct CausticVolume final
     // True when the slot came from a camera-only selection. Caustic preparation
     // refuses such a slot.
     bool cameraOnly = false;
+    // The volume's base colour as absorption per scene unit (baseAbsorption).
+    std::array<float, 3> absorption {};
 };
 struct Prepared final
 {
@@ -734,7 +736,46 @@ struct Prepared final
     // Visits of each camera channel walk, written into GLASS_CAMERA_VISITS and
     // sizing the closed-glass pixel work (cameraVisitsFor).
     std::uint32_t cameraVisits = std::uint32_t(kMaximumRayVisits);
+    // The camera dielectric's base colour as absorption per scene unit (baseAbsorption).
+    std::array<float, 3> absorption {};
 };
+// A refracting material's base colour is the light its medium leaves after
+// kBaseTintDistance scene units, as in Path Trace (kTintDistance in
+// pathtrace_fixture_engine.cpp) and Realtime's water body. The camera walks
+// take it through the medium hook beside the material's own medium, so a
+// white base colour absorbs nothing.
+inline constexpr float kBaseTintDistance = 1.0f;
+inline std::array<float, 3> baseAbsorption(const surfacematerial::SurfacePbrParameterBlock& p) noexcept
+{
+    std::array<float, 3> sigma {};
+    for (std::size_t c = 0; c < 3; ++c)
+        sigma[c] = -std::log(std::max(p.baseColorMetallic[c], 1.0e-4f)) / kBaseTintDistance;
+    return sigma;
+}
+// True when any dielectric program of the root has a base colour below white,
+// so the program text needs the medium hook to tint it.
+inline bool programHasBaseTint(const NativeFixtureSurfaceMaterialProgram* root) noexcept
+{
+    if (!root) return false;
+    const auto tinted = [](const NativeFixtureSurfaceMaterialProgram* program) {
+        if (!program || program->kind != NativeFixtureMaterialKind::SurfacePbr) return false;
+        const auto mode = program->parameters.identifiers[1];
+        if (mode != static_cast<std::uint32_t>(surfacematerial::TransportMode::ClosedVolume)
+            && mode != static_cast<std::uint32_t>(surfacematerial::TransportMode::ThinInterface)) return false;
+        const auto& base = program->parameters.baseColorMetallic;
+        return base[0] < 1 || base[1] < 1 || base[2] < 1;
+    };
+    return tinted(root) || std::any_of(root->objectPrograms.begin(), root->objectPrograms.end(),
+        [&](const auto& program) { return tinted(program.get()); });
+}
+// The base-colour absorption of a prepared dielectric draw: the camera
+// dielectric's or the volume slot's, and zero for any other object.
+inline std::array<float, 3> dielectricAbsorption(const Prepared& prepared, HarmonicMIDI::grid::SceneObjectId object) noexcept
+{
+    if (!prepared.enabled || !object.isValid()) return {};
+    if (prepared.causticVolume.present && object == prepared.causticVolume.object) return prepared.causticVolume.absorption;
+    return object == prepared.object ? prepared.absorption : std::array<float, 3> {};
+}
 // The camera walk visits of a scene's glass, authored on the Render 3D node and
 // carried on scene wire extension 19. Every program-text builder and program
 // key reads this one value, so text, key and work bounds agree. A scene that
@@ -1601,7 +1642,11 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
                     : "Glass caustic selection requires its exact authored closed-volume object and material";
                 return false;
             }
-            if (++(selected ? volumeCount : count) != 1 || p.baseColorMetallic[0] != 1 || p.baseColorMetallic[1] != 1 || p.baseColorMetallic[2] != 1
+            // The base colour is absorption inside the dielectric (baseAbsorption).
+            // The distinct grating's cell transport has no medium hook, so it keeps a white one.
+            const bool baseAdmitted = std::all_of(p.baseColorMetallic.begin(), p.baseColorMetallic.begin() + 3,
+                [&](float value) { return distinctGrating ? value == 1 : std::isfinite(value) && value >= 0 && value <= 1; });
+            if (++(selected ? volumeCount : count) != 1 || !baseAdmitted
                 || p.normalOpacity[0] != 0 || p.normalOpacity[1] != 0 || p.normalOpacity[2] != 1
                 || p.normalOpacity[3] != 1 || p.transmissionIorClearcoat[0] != 1
                 || p.baseColorMetallic[3] != 0 || p.transmissionIorClearcoat[2] != 0
@@ -1633,6 +1678,7 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
                 slot.ior = p.transmissionIorClearcoat[1];
                 slot.dispersion = p.transmissionIorClearcoat[3];
                 slot.roughness = p.emissionRoughness[3];
+                slot.absorption = baseAbsorption(p);
                 if (slot.roughness != 0) slot.roughConsumer = selectedConsumer;
                 slot.cameraOnly = causticVolume->cameraOnly;
                 return true;
@@ -1642,6 +1688,7 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
             candidate.object = object.id;
             candidate.material = object.material;
             candidate.roughness = p.emissionRoughness[3];
+            candidate.absorption = baseAbsorption(p);
             if (candidate.roughness != 0) {
                 candidate.roughConsumer = selectedConsumer;
             }
@@ -1737,6 +1784,7 @@ inline bool prepare(const HarmonicMIDI::grid::Visual3DScene& scene,
             candidate.material = slot.material;
             candidate.roughness = slot.roughness;
             candidate.roughConsumer = slot.roughConsumer;
+            candidate.absorption = slot.absorption;
             count = 1;
         }
         else if (candidate.transport != surfacematerial::TransportMode::ThinInterface)

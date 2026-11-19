@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -2207,6 +2208,21 @@ struct NativeRuntimeCameraHistory final
     float verticalFovDegrees = 0.0f;
 };
 
+// One Preview frame of a water mesh the GPU moves itself (shared/GeometrySurfaceWave.h):
+// a columns by rows grid in row-major vertex order, displaced along local Z by the
+// sum of waves[i].z * sin(waves[i].x * x + waves[i].y * y + waves[i].w) and smooth
+// shaded over its grid triangles. The scene snapshot keeps an earlier CPU frame of
+// the same mesh; only the vertex buffer holds this one.
+struct NativeSurfaceWaveFrame final
+{
+    HarmonicMIDI::grid::SceneObjectId object {};
+    std::uint32_t columns = 0, rows = 0;
+    std::vector<std::array<float, 4>> waves;
+    // Set by the renderer when the backend can't move this water, so the plan
+    // replays the sea on the CPU from then on.
+    std::shared_ptr<std::atomic<bool>> refused;
+};
+
 struct NativeImportedSceneRuntimeInputs final
 {
     // Explicit HDR export working representation. Ordinary preview stays SDR.
@@ -2289,6 +2305,8 @@ struct NativeImportedSceneRuntimeInputs final
     // Checked static-local worlds of the admitted scene, or null for authored
     // worlds. Only the single-leaf static candidate supplies them.
     std::shared_ptr<const NativeImportedObjectWorlds> objectWorlds {};
+    // Preview only: the frame's water waves, written to the vertex buffer on the GPU.
+    std::shared_ptr<const NativeSurfaceWaveFrame> surfaceWave {};
 };
 
 inline renderpasscomposite::Program scenePassProgram(const NativeImportedSceneRuntimeInputs& inputs)
@@ -3840,6 +3858,22 @@ public:
         (void) resources;
         (void) scene;
         (void) materialProgram;
+        return false;
+    }
+    // Preview only. Writes the frame's water heights and smooth normals into the
+    // prepared vertex buffer on the GPU and marks the water for the same refit, so
+    // no mesh crosses from the CPU. The resources must hold this scene's prepared
+    // snapshot, whose water is the frame's grid. False leaves the buffer as it was.
+    virtual bool refreshPreviewSurfaceWave (
+        const std::shared_ptr<const NativeFixtureSceneResources>& resources,
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
+        const std::shared_ptr<const NativeFixtureSurfaceMaterialProgram>& materialProgram,
+        const NativeSurfaceWaveFrame& frame)
+    {
+        (void) resources;
+        (void) scene;
+        (void) materialProgram;
+        (void) frame;
         return false;
     }
     // True once the backend has planned the resident water refit. A still preview

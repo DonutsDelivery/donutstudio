@@ -221,4 +221,46 @@ private:
     int64_t retryAtMs_ = 0;
 };
 
+// The end of a Path Trace kernel build is one more thing that can change a frame's outcome:
+// a Preview drawn by the Raster stand-in, or holding its frame for the build, swaps to Path
+// Trace. Nothing else moves when a build ends. A settled stand-in frame leaves PublishGate
+// quiet, and frames refused meanwhile leave the governor above holding, so nothing would
+// ever ask for the swap. The loop tells this watch, each tick, whether the Preview waits on
+// the build and which build runs (its start time, 0 for none, as kernel_compile_state.h's
+// runningBuildStartNs gives it). It answers true once when the build it saw ends, and the
+// loop then forgets the failures and produces one frame. A build the user cancelled leaves
+// the Preview with nothing to wait for, so it answers nothing for that one.
+class KernelBuildRetryWatch
+{
+public:
+    bool buildEnded (bool waiting, int64_t runningBuildStartNs, bool stopped)
+    {
+        if (waiting && runningBuildStartNs != 0)
+        {
+            seenBuildNs_ = runningBuildStartNs;
+            return false;
+        }
+        if (seenBuildNs_ == 0 || runningBuildStartNs == seenBuildNs_)
+            return false;
+        seenBuildNs_ = 0;
+        return ! stopped;
+    }
+
+private:
+    int64_t seenBuildNs_ = 0;
+};
+
+// One tick of the watch above, as the render loop runs it before the idle gate: when the
+// build the Preview waited on ends, the governor forgets the failures and the gate produces
+// one frame. True on that tick.
+inline bool wakeForKernelBuildEnd (KernelBuildRetryWatch& watch, FrameFailureGovernor& governor, PublishGate& gate,
+                                   bool waiting, int64_t runningBuildStartNs, bool stopped)
+{
+    if (! watch.buildEnded (waiting, runningBuildStartNs, stopped))
+        return false;
+    governor.noteSuccess();
+    gate.requestProduce();
+    return true;
+}
+
 } // namespace arbitviewport

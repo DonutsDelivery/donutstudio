@@ -75,6 +75,7 @@
 #include "pathtrace/environment_resident.h"
 #include "pathtrace/thread_pool.h"
 #include "pathtrace_denoiser.h"
+#include "loop_step_probe.h"
 #include "pathtrace_oidn.h"
 #include "pathtrace_preview_denoise.h"
 #include "render_input_generation.h"
@@ -82,6 +83,7 @@
 #include "vertex_program_motion.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -93,6 +95,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -178,8 +182,6 @@ bool admitInputs (const arbitgpu::NativeFixtureSceneRuntimeInputs& in, std::stri
 {
     if (! arbitgpu::validFixtureRuntimeInputs (in))
         return fail (error, "Path Trace runtime inputs are invalid");
-    if (in.compositionFrame || in.localSceneFrame || (in.canonicalBlockCFrame && ! in.noteInstanceMapping))
-        return fail (error, "Path Trace does not render deformed or composed animation frames yet; choose Raster");
     return true;
 }
 
@@ -189,33 +191,63 @@ bool readsRenderOutputs (const arbitgpu::NativeFixtureSceneRuntimeInputs& in) no
         || in.passProgram;
 }
 
-bool noteInstancedScene (const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& scene,
-                         const arbitgpu::NativeFixtureSceneRuntimeInputs& in,
-                         std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& out, std::string& error)
+bool bindNoteInstances (const HarmonicMIDI::grid::Visual3DScene& scene,
+                        const arbitgpu::NativeFixtureSceneRuntimeInputs& in, bool motionBlur,
+                        pt::EngineSceneSetup& setup, std::string& error)
 {
+    setup.noteInstanced = false;
+    setup.noteInstances.clear();
+    setup.previousNoteInstances.clear();
+    setup.noteAppearance.clear();
+    if (! in.noteInstanceMapping)
+        return true;
+    // The raster's own refusal for an instanced object under the mapping.
+    if (! arbitgpu::nativeObjectInstanceRuntimeSupported (scene, in, error))
+        return false;
     const auto batch = arbitgpu::prepareNativeNoteInstances (in);
     if (! batch.admitted)
         return fail (error, "Path Trace note instancing has no valid score frame or mapping");
-    const std::array<float, 4> plain { 1.0f, 1.0f, 1.0f, 0.0f };
-    if (batch.appearanceLow != plain || batch.appearanceHigh != plain)
-        return fail (error, "Path Trace does not render note appearance yet; choose Raster");
-    if (scene->objectCount != 1 || scene->instancedObject.isValid())
-        return fail (error, "Path Trace renders note instancing on one mesh object only; choose Raster");
-    auto instanced = std::make_shared<HarmonicMIDI::grid::Visual3DScene> (*scene);
-    instanced->instancedObject = instanced->objects[0].id;
-    instanced->objectInstances.resize (batch.count);
-    instanced->objectInstanceCount = batch.count;
-    instanced->previousObjectInstanceCount = 0;
     // As the raster: objectMatrix * (position * meshScale + note position).
-    for (std::size_t index = 0; index < batch.count; ++index)
-    {
-        const auto& note = batch.transforms[index];
+    const auto placement = [] (const std::array<float, 4>& note) {
         SceneTransform3D transform;
         transform.translation = { note[0], note[1], note[2] };
         transform.scale = { note[3], note[3], note[3] };
-        instanced->objectInstances[index] = transform;
+        return transform;
+    };
+    setup.noteInstanced = true;
+    setup.noteInstances.reserve (batch.count);
+    for (std::size_t index = 0; index < batch.count; ++index)
+        setup.noteInstances.push_back (placement (batch.transforms[index]));
+    // The raster's vNoteAppearance: mix (low, high, value), added to the shaded colour.
+    const std::array<float, 4> plain { 1.0f, 1.0f, 1.0f, 0.0f };
+    if (batch.appearanceLow != plain || batch.appearanceHigh != plain)
+    {
+        setup.noteAppearance.reserve (batch.count);
+        for (std::size_t index = 0; index < batch.count; ++index)
+        {
+            const float t = batch.appearanceValues[index];
+            std::array<float, 4> mixed;
+            for (std::size_t channel = 0; channel < 4; ++channel)
+                mixed[channel] = batch.appearanceLow[channel] + (batch.appearanceHigh[channel] - batch.appearanceLow[channel]) * t;
+            setup.noteAppearance.push_back (mixed);
+        }
     }
-    out = std::move (instanced);
+    // The shutter opens on each note's prior placement; a note that just started holds still.
+    const auto& prior = in.previousMotion ? in.previousMotion->noteTransforms : nullptr;
+    if (motionBlur && prior != nullptr)
+    {
+        std::unordered_map<std::int64_t, std::size_t> priorRow;
+        priorRow.reserve (prior->count);
+        for (std::size_t row = 0; row < prior->count; ++row)
+            priorRow.emplace (prior->identities[row], row);
+        setup.previousNoteInstances.reserve (batch.count);
+        for (std::size_t index = 0; index < batch.count; ++index)
+        {
+            const auto found = priorRow.find (batch.identities[index]);
+            setup.previousNoteInstances.push_back (found == priorRow.end() ? setup.noteInstances[index]
+                                                                             : placement (prior->transforms[found->second]));
+        }
+    }
     return true;
 }
 
@@ -223,8 +255,15 @@ bool noteInstancedScene (const std::shared_ptr<const HarmonicMIDI::grid::Visual3
 bool mapSurfaceProgram (const Program& program, const SceneMaterialRecord* record, float timeSeconds,
                         pt::Material& material, std::string& error)
 {
+    // A diffraction program scatters by its grating (buildSetup). Where its mask
+    // leaves the foil out, the raster shows litBase: the object's scene material.
+    if (program.kind == arbitgpu::NativeFixtureMaterialKind::DiffractionReflective)
+    {
+        material = record != nullptr ? pt::materialFromRecord (*record) : pt::Material {};
+        return true;
+    }
     if (program.kind != arbitgpu::NativeFixtureMaterialKind::SurfacePbr)
-        return fail (error, "Path Trace renders Surface materials only; choose Raster for diffraction materials");
+        return fail (error, "Path Trace surface material kind is invalid");
     if (! arbitgpu::validNativeFixtureSurfaceParameters (program.parameters))
         return fail (error, "Path Trace surface material parameters are invalid");
     const auto& pbr = program.parameters;
@@ -433,6 +472,8 @@ bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::E
         setup.objectWorlds.push_back (world);
     }
     bindShutter (draw, setup);
+    if (! pathtracefixture::bindNoteInstances (scene, in, draw.motionBlur.active(), setup, error))
+        return false;
 
     // Lights: the records the raster reads, overrides applied.
     if (! arbitgpu::validNativeImportedLightOverrideTargets (scene, in, error))
@@ -465,37 +506,70 @@ bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::E
                                    || in.diffractionEvaluatedProgram;
     if (diffractionInputs && draw.diffractionMaterial == nullptr)
         return fail (error, "Path Trace needs the admitted diffraction material of these diffraction inputs");
+    // Every object the raster draws with a diffraction program scatters by the
+    // draw's admitted material, with that program's product occupancy.
+    const auto bindGrating = [&] (HarmonicMIDI::grid::SceneObjectId object) {
+        pt::ObjectGratingBinding binding { object.value, draw.diffractionMaterial, draw.diffractionField };
+        const auto* program = arbitgpu::nativeSurfaceForObject (draw.material.get(), object);
+        if (program != nullptr && program->kind == arbitgpu::NativeFixtureMaterialKind::DiffractionReflective
+            && program->diffractionOccupancyRectangleCount != 0)
+        {
+            binding.occupancyCount = std::min<std::uint32_t> (program->diffractionOccupancyRectangleCount, 5u);
+            for (std::size_t index = 0; index < binding.occupancyCount; ++index)
+            {
+                const auto& rectangle = program->diffractionOccupancyRectangles[index];
+                binding.occupancy[index] = { rectangle.x, rectangle.y, rectangle.z, rectangle.w };
+            }
+            binding.maskCoverage = program->diffractionMaskCoverage;
+        }
+        const bool partial = binding.occupancyCount != 0;
+        setup.objectGratings.push_back (std::move (binding));
+        return partial;
+    };
+    std::vector<std::uint32_t> partialFoils;
     if (draw.diffractionMaterial != nullptr)
     {
         if (HarmonicMIDI::grid::visual3d_detail::findById (scene.objects, scene.objectCount,
                                                            draw.diffractionObject) == nullptr)
             return fail (error, "Path Trace diffraction material names no scene object");
-        setup.objectGratings.push_back ({ draw.diffractionObject.value, draw.diffractionMaterial, draw.diffractionField });
+        if (bindGrating (draw.diffractionObject))
+            partialFoils.push_back (draw.diffractionObject.value);
     }
 
     if (! bindFrameLayers (draw, setup, frames, error))
         return false;
 
-    // Materials: objects bound to a Surface program use its block. The
-    // diffraction object scatters by its grating instead.
+    // Materials: objects bound to a Surface program use its block. A grating
+    // object scatters by its grating instead.
     setup.objectMaterials.clear();
     if (draw.material != nullptr)
     {
+        // A mask shows the object's own material through the foil.
+        bool maskedField = false;
+        if (draw.diffractionField.has_value())
+            for (const auto& corner : *draw.diffractionField)
+                maskedField = maskedField || corner[3] < 1.0f;
         for (std::size_t index = 0; index < scene.objectCount; ++index)
         {
             const auto& object = scene.objects[index];
-            // A mask shows the object's own material through the foil.
-            bool maskedFoil = false;
-            if (draw.diffractionField.has_value())
-                for (const auto& corner : *draw.diffractionField)
-                    maskedFoil = maskedFoil || corner[3] < 1.0f;
-            const bool gratingObject = draw.diffractionMaterial != nullptr && object.id == draw.diffractionObject;
-            if (gratingObject && ! maskedFoil) continue;
             const auto* program = arbitgpu::nativeSurfaceForObject (draw.material.get(), object.id);
             if (program == nullptr) continue;
+            const bool diffractionProgram = program->kind == arbitgpu::NativeFixtureMaterialKind::DiffractionReflective;
+            bool gratingObject = draw.diffractionMaterial != nullptr && object.id == draw.diffractionObject;
+            if (diffractionProgram && ! gratingObject)
+            {
+                if (draw.diffractionMaterial == nullptr)
+                    return fail (error, "Path Trace needs the admitted diffraction material of a diffraction program");
+                if (bindGrating (object.id))
+                    partialFoils.push_back (object.id.value);
+                gratingObject = true;
+            }
+            const bool partial = maskedField
+                || std::find (partialFoils.begin(), partialFoils.end(), object.id.value) != partialFoils.end();
+            if (gratingObject && ! partial) continue;
             // The foil's own diffraction program is the grating above. Under its
             // mask the object keeps its scene material, as the raster's litBase.
-            if (gratingObject && program->kind != arbitgpu::NativeFixtureMaterialKind::SurfacePbr) continue;
+            if (gratingObject && diffractionProgram) continue;
             const auto* record = HarmonicMIDI::grid::visual3d_detail::findById (scene.materials, scene.materialCount,
                                                                                 object.material);
             pt::ObjectMaterialOverride entry;
@@ -508,9 +582,37 @@ bool buildSetup (const SceneEngineDraw& draw, pt::EngineSceneSetup& setup, pt::E
     return true;
 }
 
+// The selected device's own readiness call, the one the engine polls once a draw has been
+// lowered. Asking first lets the renderer draw the Raster picture meanwhile. An Auto
+// selection held on the CPU by an earlier device failure has no kernel to wait for.
+bool deviceKernelBuilding() noexcept
+{
+    const auto choice = pathTraceDeviceSelection();
+    const auto& selection = choice->selection;
+    if (! selection.ok)
+        return false;
+    if (std::strcmp (selection.requested, "Auto") == 0 && pt::device::autoDeviceLatch().failure() != nullptr)
+        return false;
+    switch (selection.device)
+    {
+#if defined(ARBIT_HAVE_OPTIX_KERNEL)
+        case pt::device::DeviceKind::OptiX: return ! pt::device::optixPipelineReady();
+#endif
+        case pt::device::DeviceKind::Cuda: return ! pt::device::cudaModuleReady();
+        case pt::device::DeviceKind::Hip: return ! pt::device::hipModuleReady();
+        case pt::device::DeviceKind::OneApi: return ! pt::device::oneApiModuleReady();
+#if defined(ARBIT_HAVE_METAL_PATHTRACE)
+        case pt::device::DeviceKind::Metal: return ! pt::device::metalPipelineReady();
+#endif
+        default: return false;
+    }
+}
+
 class PathTraceFixtureEngine final : public SceneRenderEngine
 {
 public:
+    ~PathTraceFixtureEngine() override { joinPrimer(); }
+
     explicit PathTraceFixtureEngine (pathtracefixture::CpuFrameUpload upload) : upload_ (upload)
     {
         engine_.samplesPerPass = 1;
@@ -519,8 +621,131 @@ public:
         };
     }
 
+    // The selected device's own readiness call, the one the engine polls once a draw has been
+    // lowered. Asking first lets the renderer draw the Raster picture meanwhile.
+    bool kernelBuilding() noexcept override
+    {
+        const bool building = ! fellBackToCpu_ && deviceKernelBuilding();
+        if (! building)
+            primedThisWait_ = false;
+        return building;
+    }
+
+    // Lowers a draw to the engine's scene setup (setup_) and view: the fog copy, the vertex
+    // programs' displaced scene and the object, material and light tables. Render thread only.
+    bool lower (const SceneEngineDraw& draw, pt::EngineView& view, std::string& error)
+    {
+        if (draw.snapshot == nullptr || draw.inputs == nullptr)
+            return fail (error, "Path Trace draw is incomplete");
+        if (! pathtracefixture::admitInputs (*draw.inputs, error))
+            return false;
+        auto drawn = draw;
+        // Fog from an imported scene's Environment Light replaces the scene's own.
+        // The copy is kept while the source and fog stay put, so accumulation holds.
+        if (draw.worldVolume && ! HarmonicMIDI::grid::sameSceneVolume (*draw.worldVolume, drawn.snapshot->worldVolume))
+        {
+            if (fogScene_ == nullptr || fogSceneSource_ != drawn.snapshot
+                || ! HarmonicMIDI::grid::sameSceneVolume (fogScene_->worldVolume, *draw.worldVolume))
+            {
+                auto fogged = std::make_shared<HarmonicMIDI::grid::Visual3DScene> (*drawn.snapshot);
+                fogged->worldVolume = *draw.worldVolume;
+                fogScene_ = std::move (fogged);
+                fogSceneSource_ = drawn.snapshot;
+            }
+            drawn.snapshot = fogScene_;
+        }
+        // Vertex programs displace the scene before the BVH. A program whose
+        // inputs did not change keeps the moved copy, and with it the accumulation.
+        std::shared_ptr<const std::vector<HarmonicMIDI::grid::SceneVec3>> displacedOpen;
+        if (draw.material != nullptr && hasVertexProgram (*draw.material))
+        {
+            // The shutter opens on the prior frame's displaced positions, so a
+            // program that moves its vertices over time blurs along the move.
+            if (draw.motionBlur.active())
+            {
+                const auto prior = videohelper::vertexprogramcpu::priorInputs (*draw.inputs);
+                const auto& positions = draw.inputs->previousMotion ? draw.inputs->previousMotion->scenePositions : nullptr;
+                if (displacedPrior_ == nullptr || displacedPriorSource_ != drawn.snapshot
+                    || displacedPriorProgram_ != draw.material || displacedPriorPositions_ != positions
+                    || displacedPriorTime_ != prior.timeSeconds || displacedPriorSpectrum_ != prior.spectrum
+                    || displacedPriorControls_ != prior.controls)
+                {
+                    if (! videohelper::vertexprogramcpu::priorDisplacedPositions (*drawn.snapshot, *draw.material, *draw.inputs,
+                                                                                  displacedPrior_, error))
+                        return false;
+                    displacedPriorSource_ = drawn.snapshot;
+                    displacedPriorProgram_ = draw.material;
+                    displacedPriorPositions_ = positions;
+                    displacedPriorTime_ = prior.timeSeconds;
+                    displacedPriorSpectrum_ = prior.spectrum;
+                    displacedPriorControls_ = prior.controls;
+                }
+                displacedOpen = displacedPrior_;
+            }
+            if (displacedScene_ == nullptr || displacedSource_ != drawn.snapshot || displacedProgram_ != draw.material
+                || displacedTime_ != draw.inputs->timeSeconds || displacedSpectrum_ != draw.inputs->vertexSpectrum
+                || displacedControls_ != draw.inputs->vertexControls)
+            {
+                if (! displacedScene (drawn.snapshot, *draw.material, *draw.inputs, displacedScene_, error))
+                    return false;
+                displacedSource_ = drawn.snapshot;
+                displacedProgram_ = draw.material;
+                displacedTime_ = draw.inputs->timeSeconds;
+                displacedSpectrum_ = draw.inputs->vertexSpectrum;
+                displacedControls_ = draw.inputs->vertexControls;
+            }
+            drawn.snapshot = displacedScene_;
+        }
+        if (! buildSetup (drawn, setup_, view, frames_, error))
+            return false;
+        // bindShutter read the undisplaced prior positions; a vertex program's
+        // shutter opens on its own prior evaluation instead.
+        if (displacedOpen != nullptr)
+            setup_.previousPositions = std::move (displacedOpen);
+        return true;
+    }
+
+    // While the device's kernel builds, the CPU scene for the first Path Trace frame is built on
+    // a worker, so the frame after the kernel is ready doesn't start with that wait. The draw is
+    // lowered here and only the engine's own prepare runs on the worker. It runs once per wait,
+    // as lowering every frame of an animated scene would cost the stand-in its frame rate.
+    // render() joins it first.
+    void primeWhileKernelBuilds (const SceneEngineDraw& draw) noexcept override try
+    {
+        if (primerRunning_.load())
+            return;
+        if (primer_.joinable())
+            primer_.join();
+        if (primedThisWait_ || fellBackToCpu_ || draw.snapshot == nullptr || draw.inputs == nullptr)
+            return;
+        pt::EngineView view;
+        std::string ignored;
+        if (! lower (draw, view, ignored))
+            return;
+        primedThisWait_ = true;
+        primerRunning_ = true;
+        primer_ = std::thread ([this, setup = setup_, view]
+        {
+            std::string error;
+            try { engine_.primeScene (setup, view, error); }
+            catch (...) {}
+            primerRunning_ = false;
+        });
+    }
+    catch (...)
+    {
+        primerRunning_ = false;
+    }
+
+    void joinPrimer() noexcept
+    {
+        if (primer_.joinable())
+            primer_.join();
+    }
+
     bool render (const SceneEngineDraw& draw, RenderedFrame& output, std::string& error) override try
     {
+        joinPrimer();
         const auto callStart = pt::PhaseClock::now();
         // A named device that does not load stops the frame by name. CPU, OptiX, CUDA
         // and HIP are the devices with a render path.
@@ -603,90 +828,9 @@ public:
         if (! fellBackToCpu_ && deviceReason_ == nullptr)
             if (auto reason = pt::device::autoPassedOverReason (selection); ! reason.empty())
                 deviceReason_ = std::make_shared<const std::string> (std::move (reason));
-        if (draw.snapshot == nullptr || draw.inputs == nullptr)
-            return fail (error, "Path Trace draw is incomplete");
-        if (! pathtracefixture::admitInputs (*draw.inputs, error))
-            return false;
-        // The engine reuses its scene while the setup holds the same snapshot, so a
-        // frame with the same notes keeps the instanced copy and its accumulation.
-        auto drawn = draw;
-        if (draw.inputs->noteInstanceMapping)
-        {
-            const auto batch = arbitgpu::prepareNativeNoteInstances (*draw.inputs);
-            if (noteScene_ == nullptr || noteSceneSource_ != draw.snapshot || noteSceneCount_ != batch.count
-                || ! std::equal (batch.transforms.begin(), batch.transforms.begin() + batch.count, noteSceneTransforms_.begin()))
-            {
-                if (! pathtracefixture::noteInstancedScene (draw.snapshot, *draw.inputs, noteScene_, error))
-                    return false;
-                noteSceneSource_ = draw.snapshot;
-                noteSceneCount_ = batch.count;
-                noteSceneTransforms_ = batch.transforms;
-            }
-            drawn.snapshot = noteScene_;
-        }
-        // Fog from an imported scene's Environment Light replaces the scene's own.
-        // The copy is kept while the source and fog stay put, so accumulation holds.
-        if (draw.worldVolume && ! HarmonicMIDI::grid::sameSceneVolume (*draw.worldVolume, drawn.snapshot->worldVolume))
-        {
-            if (fogScene_ == nullptr || fogSceneSource_ != drawn.snapshot
-                || ! HarmonicMIDI::grid::sameSceneVolume (fogScene_->worldVolume, *draw.worldVolume))
-            {
-                auto fogged = std::make_shared<HarmonicMIDI::grid::Visual3DScene> (*drawn.snapshot);
-                fogged->worldVolume = *draw.worldVolume;
-                fogScene_ = std::move (fogged);
-                fogSceneSource_ = drawn.snapshot;
-            }
-            drawn.snapshot = fogScene_;
-        }
-        // Vertex programs displace the scene before the BVH. A program whose
-        // inputs did not change keeps the moved copy, and with it the accumulation.
-        std::shared_ptr<const std::vector<HarmonicMIDI::grid::SceneVec3>> displacedOpen;
-        if (draw.material != nullptr && hasVertexProgram (*draw.material))
-        {
-            // The shutter opens on the prior frame's displaced positions, so a
-            // program that moves its vertices over time blurs along the move.
-            if (draw.motionBlur.active())
-            {
-                const auto prior = videohelper::vertexprogramcpu::priorInputs (*draw.inputs);
-                const auto& positions = draw.inputs->previousMotion ? draw.inputs->previousMotion->scenePositions : nullptr;
-                if (displacedPrior_ == nullptr || displacedPriorSource_ != drawn.snapshot
-                    || displacedPriorProgram_ != draw.material || displacedPriorPositions_ != positions
-                    || displacedPriorTime_ != prior.timeSeconds || displacedPriorSpectrum_ != prior.spectrum
-                    || displacedPriorControls_ != prior.controls)
-                {
-                    if (! videohelper::vertexprogramcpu::priorDisplacedPositions (*drawn.snapshot, *draw.material, *draw.inputs,
-                                                                                  displacedPrior_, error))
-                        return false;
-                    displacedPriorSource_ = drawn.snapshot;
-                    displacedPriorProgram_ = draw.material;
-                    displacedPriorPositions_ = positions;
-                    displacedPriorTime_ = prior.timeSeconds;
-                    displacedPriorSpectrum_ = prior.spectrum;
-                    displacedPriorControls_ = prior.controls;
-                }
-                displacedOpen = displacedPrior_;
-            }
-            if (displacedScene_ == nullptr || displacedSource_ != drawn.snapshot || displacedProgram_ != draw.material
-                || displacedTime_ != draw.inputs->timeSeconds || displacedSpectrum_ != draw.inputs->vertexSpectrum
-                || displacedControls_ != draw.inputs->vertexControls)
-            {
-                if (! displacedScene (drawn.snapshot, *draw.material, *draw.inputs, displacedScene_, error))
-                    return false;
-                displacedSource_ = drawn.snapshot;
-                displacedProgram_ = draw.material;
-                displacedTime_ = draw.inputs->timeSeconds;
-                displacedSpectrum_ = draw.inputs->vertexSpectrum;
-                displacedControls_ = draw.inputs->vertexControls;
-            }
-            drawn.snapshot = displacedScene_;
-        }
         pt::EngineView view;
-        if (! buildSetup (drawn, setup_, view, frames_, error))
+        if (! lower (draw, view, error))
             return false;
-        // bindShutter read the undisplaced prior positions; a vertex program's
-        // shutter opens on its own prior evaluation instead.
-        if (displacedOpen != nullptr)
-            setup_.previousPositions = std::move (displacedOpen);
         const auto color = draw.inputs->linearColor ? pt::EngineColor::LinearRgba16f : pt::EngineColor::DisplayRgba8;
         pt::EngineImage image;
         const bool preview = draw.use == RenderUse::Preview;
@@ -821,8 +965,7 @@ public:
             upload.frameLayers.push_back ({ frames_[index],
                 choice != pathtracedenoise::DenoiserChoice::Off ? &denoisedLayers_[index] : &last_.frameLayers[index].lightBytes,
                 &last_.frameLayers[index].uvCoverage });
-        const float* background = upload.linearColor ? pt::kLinearRasterBackground : pt::kRasterBackground;
-        std::copy (background, background + 3, upload.background);
+        std::copy (pt::kRasterBackground, pt::kRasterBackground + 3, upload.background);
         // The outputs travel only when something reads them. Denoising touched the
         // Image alone, so they are the centre ray's values either way.
         if (pathtracefixture::readsRenderOutputs (*draw.inputs))
@@ -847,6 +990,15 @@ public:
         {
             stats_.phases.set (pt::FramePhase::ImageUpload, pt::millisecondsBetween (imageUploadStart, uploaded));
             stats_.phases.set (pt::FramePhase::Total, pt::millisecondsBetween (callStart, uploaded));
+            // The viewport's first-frame stage totals take the same phases, in enum order.
+            static constexpr const char* kStageLabels[pt::kFramePhaseCount] = {
+                "pt:sceneLower", "pt:cpuBvhBuild", "pt:accelBuild", "pt:pipelineWait", "pt:upload",
+                "pt:depthPass", "pt:trace", "pt:readback", "pt:resolve", "pt:denoise", "pt:imageUpload",
+                "pt:total" };
+            for (std::size_t i = 0; i < pt::kFramePhaseCount; ++i)
+                if (stats_.phases.has (static_cast<pt::FramePhase> (i)))
+                    loopstep::addStage (kStageLabels[i], static_cast<std::int64_t> (
+                        stats_.phases.get (static_cast<pt::FramePhase> (i)) * 1e6));
         }
         noteConvergence (draw, restartedThisCall, tracedThisCall, callStart, uploaded);
         RenderedFrame result;
@@ -1036,8 +1188,23 @@ private:
         }
         if (! ran && plan.denoiser == dn::Denoiser::NativeFilter && ! nativeFilterLastImage (error))
             return false;
+        restoreBackdrop();
         reportDenoiser (plan.denoiser, dn::denoiserLabel (plan.denoiser, oidnUsed, temporal), reason);
         return true;
+    }
+
+    // The backdrop is the raster's clear, not traced light, and its albedo guide is
+    // zero, so a denoiser may darken it (round 31 showed (7, 10, 18) as (1, 3, 8)
+    // after denoising). Put the clear back where nothing but the backdrop is.
+    void restoreBackdrop() noexcept
+    {
+        const std::size_t pixels = static_cast<std::size_t> (last_.width) * last_.height;
+        if (pixels == 0 || last_.backdropPass.size() != pixels || denoised_.size() != last_.colorBytes.size())
+            return;
+        const std::size_t stride = last_.colorBytes.size() / pixels;
+        for (std::size_t pixel = 0; pixel < pixels; ++pixel)
+            if (last_.backdropPass[pixel] != 0)
+                std::memcpy (denoised_.data() + pixel * stride, last_.colorBytes.data() + pixel * stride, stride);
     }
 
     // OptiX AI (optix) or OIDN on last_'s colour and each frame layer, with its albedo
@@ -1207,6 +1374,9 @@ private:
 
     pathtracefixture::CpuFrameUpload upload_;
     pt::SceneEngine engine_;
+    std::thread primer_;
+    std::atomic<bool> primerRunning_ { false };
+    bool primedThisWait_ = false; // the scene for this kernel wait has been handed to the worker
     // The device selection this engine renders with; a newer generation resets it.
     std::shared_ptr<const DeviceChoice> choice_;
     bool devicePassSet_ = false;
@@ -1215,9 +1385,7 @@ private:
     bool sceneOnCpu_ = false;
     std::shared_ptr<const std::string> sceneReason_;
     pt::EngineSceneSetup setup_;  // reused so per-frame vectors keep their storage
-    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> noteScene_, noteSceneSource_;
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> fogScene_, fogSceneSource_;
-    std::size_t noteSceneCount_ = 0;
     std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> displacedScene_, displacedSource_;
     std::shared_ptr<const Program> displacedProgram_;
     float displacedTime_ = 0.0f;
@@ -1230,7 +1398,6 @@ private:
     double displacedPriorTime_ = 0.0;
     std::array<float, 64> displacedPriorSpectrum_ {};
     std::vector<float> displacedPriorControls_;
-    std::vector<std::array<float, 4>> noteSceneTransforms_;
     pt::EngineImage last_;
     std::vector<float> denoiseInput_;
     std::vector<float> denoiseFiltered_;
@@ -1279,7 +1446,11 @@ namespace
 {
 struct PathTraceEngineRegistration final
 {
-    PathTraceEngineRegistration() noexcept { setPathTraceSceneEngineFactory (&pathtracefixture::makeEngine); }
+    PathTraceEngineRegistration() noexcept
+    {
+        setPathTraceSceneEngineFactory (&pathtracefixture::makeEngine);
+        setPathTraceKernelBuildingProbe (&deviceKernelBuilding);
+    }
 };
 
 const PathTraceEngineRegistration registration;
@@ -1294,7 +1465,17 @@ void prepareDeviceAtStartup()
         return;
 #if defined(ARBIT_HAVE_OPTIX_KERNEL)
     if (selection.device == pt::device::DeviceKind::OptiX)
-        pt::device::startOptixPipelineBuild();
+    {
+        // A kernel the driver's cache holds builds in 0.1 s, so it starts as it always did. A
+        // miss is a compile of over a minute: it waits for the host's go (armKernelWarmup),
+        // which comes once the window has painted and the app is idle, and runs at low
+        // priority. The look at the cache loads the driver, so it stays off the caller's thread.
+        std::thread ([]
+        {
+            if (pt::device::optixModuleHashPresent())
+                pt::device::startOptixPipelineBuild();
+        }).detach();
+    }
 #endif
     if (pt::device::isComputeDevice (selection.device))
         pt::device::startComputeModuleBuild (selection.device);
@@ -1302,6 +1483,43 @@ void prepareDeviceAtStartup()
     if (selection.device == pt::device::DeviceKind::Metal)
         pt::device::startMetalPipelineBuild();
 #endif
+}
+
+void armKernelWarmup()
+{
+#if defined(ARBIT_HAVE_OPTIX_KERNEL)
+    const auto choice = pathTraceDeviceSelection();
+    if (choice->selection.ok && choice->selection.device == pt::device::DeviceKind::OptiX)
+        pt::device::armOptixWarmup();
+#endif
+}
+
+KernelWarmupInfo kernelWarmupInfo()
+{
+    KernelWarmupInfo info;
+    const auto choice = pathTraceDeviceSelection();
+#if defined(ARBIT_HAVE_OPTIX_KERNEL)
+    if (choice->selection.ok && choice->selection.device == pt::device::DeviceKind::OptiX)
+    {
+        const auto reading = pt::device::readOptixWarmup();
+        info.applies = true;
+        info.state = pt::kernelcompile::warmupStateName (reading.state);
+        info.reason = reading.reason;
+        info.armed = reading.armed;
+        info.moduleHashPresent = reading.moduleHashPresent;
+        info.joined = reading.joined;
+        info.contextReleased = reading.contextReleased;
+        info.busy = reading.busy;
+        info.lowPriority = reading.lowPriority;
+        info.elapsedSeconds = reading.elapsedSeconds;
+        info.error = reading.error;
+        return info;
+    }
+#endif
+    info.state = "idle";
+    info.reason = choice->selection.ok && choice->selection.device == pt::device::DeviceKind::OptiX
+        ? "this build has no OptiX kernel" : "the Path Trace device is not OptiX";
+    return info;
 }
 
 std::string setDevicePreference (const std::string& value)

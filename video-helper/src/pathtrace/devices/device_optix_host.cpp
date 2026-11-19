@@ -19,16 +19,25 @@ typedef unsigned long long CUdeviceptr;
 #include "setup_unwind.h"
 #include "kernel_build_gate.h"
 #include "kernel_compile_state.h"
+#include "kernel_module_stamp.h"
+#include "kernel_warmup.h"
 #include "device_optix_params.h"
+#include "../../loop_step_probe.h"
 
 #if defined(_WIN32)
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <pwd.h>
+#include <unistd.h>
 #endif
 
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -51,6 +60,9 @@ std::string optixInitProblem();
 // refuses when it is older than the SDK.
 std::string optixInitProblem()
 {
+    // The warm-up's check and the build's setup may both come here.
+    static std::mutex initLock;
+    const std::lock_guard<std::mutex> lock (initLock);
     const OptixResult result = optixInit();
     if (result == OPTIX_SUCCESS)
         return {};
@@ -154,6 +166,7 @@ public:
         if (cudaContext_ == nullptr || cu_.cuCtxSetCurrent (cudaContext_) != 0)
             return;
         freeScene();
+        freeAccel();
         for (const CUdeviceptr address : film_)
             cu_.cuMemFree (address);
     }
@@ -230,6 +243,16 @@ public:
 
     static void startBuild() { buildGate().start (buildBody()); }
 
+    // The kernel is in the driver's cache, so the build is the 0.1 s kind. False when it is
+    // not, or when nothing can say.
+    static bool moduleHashPresent()
+    {
+        return warmupSkipReason().empty() && kernelstamp::stampPresentIn (cacheDirectories(), moduleKey());
+    }
+
+    static void armWarmup() { warmup().arm(); }
+    static kernelcompile::WarmupReading readWarmup() { return warmup().read(); }
+
     // The compile stops about 2 s after this (measured), on its own thread. This doesn't wait.
     static bool stopBuildByUser()
     {
@@ -279,11 +302,153 @@ private:
         return *gate;
     }
 
+    static bool compileCancelled()
+    {
+        const std::lock_guard<std::mutex> lock (creatingLock_);
+        return cancelled_;
+    }
+
+    // Identity of the driver and the GPU that compile the kernel: a new driver or card
+    // compiles again. Resolved from libcuda on its own, as the build may be loading its own
+    // table on another thread. Empty when there is no driver.
+    static const std::string& driverIdentity()
+    {
+        static const std::string identity = []() -> std::string
+        {
+#if defined(_WIN32)
+            const auto library = LoadLibraryA ("nvcuda.dll");
+            const auto find = [library] (const char* name) { return reinterpret_cast<void*> (library ? GetProcAddress (library, name) : nullptr); };
+#else
+            void* const library = dlopen ("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+            const auto find = [library] (const char* name) { return library ? dlsym (library, name) : nullptr; };
+#endif
+            using Init = int (*) (unsigned int);
+            using Version = int (*) (int*);
+            using Get = int (*) (int*, int);
+            using Name = int (*) (char*, int, int);
+            const auto init = reinterpret_cast<Init> (find ("cuInit"));
+            const auto version = reinterpret_cast<Version> (find ("cuDriverGetVersion"));
+            const auto get = reinterpret_cast<Get> (find ("cuDeviceGet"));
+            const auto name = reinterpret_cast<Name> (find ("cuDeviceGetName"));
+            int driver = 0, gpu = 0;
+            char card[128] {};
+            if (init == nullptr || version == nullptr || get == nullptr || name == nullptr || init (0) != 0
+                || version (&driver) != 0 || get (&gpu, 0) != 0 || name (card, sizeof (card) - 1, gpu) != 0)
+                return {};
+            return "driver " + std::to_string (driver) + " on " + card;
+        }();
+        return identity;
+    }
+
+    // Names this kernel text, its compile options, the OptiX ABI and the driver and GPU.
+    static const std::string& moduleKey()
+    {
+        static const std::string key = []
+        {
+            kernelstamp::KeyHasher hasher;
+            for (std::size_t chunk = 0; chunk < kArbitOptixKernelPtxChunks; ++chunk)
+                hasher.add (kArbitOptixKernelPtx[chunk], std::strlen (kArbitOptixKernelPtx[chunk]));
+            OptixModuleCompileOptions moduleOptions {};
+            OptixPipelineCompileOptions pipelineOptions {};
+            compileOptions (moduleOptions, pipelineOptions);
+            hasher.addNumber ("registers", moduleOptions.maxRegisterCount);
+            hasher.addNumber ("optLevel", static_cast<int> (moduleOptions.optLevel));
+            hasher.addNumber ("debugLevel", static_cast<int> (moduleOptions.debugLevel));
+            hasher.addNumber ("graph", pipelineOptions.traversableGraphFlags);
+            hasher.addNumber ("payload", pipelineOptions.numPayloadValues);
+            hasher.addNumber ("attributes", pipelineOptions.numAttributeValues);
+            hasher.addNumber ("exceptions", pipelineOptions.exceptionFlags);
+            hasher.addNumber ("primitives", pipelineOptions.usesPrimitiveTypeFlags);
+            hasher.addNumber ("motion", pipelineOptions.usesMotionBlur);
+            hasher.add (std::string (pipelineOptions.pipelineLaunchParamsVariableName));
+            hasher.addNumber ("optixVersion", OPTIX_VERSION);
+            hasher.addNumber ("optixAbi", OPTIX_ABI_VERSION);
+            hasher.add (driverIdentity());
+            return hasher.hex();
+        }();
+        return key;
+    }
+
+    static std::vector<std::filesystem::path> cacheDirectories()
+    {
+        std::string owner;
+#if ! defined(_WIN32)
+        passwd entry {};
+        passwd* found = nullptr;
+        char buffer[1024];
+        if (getpwuid_r (geteuid(), &entry, buffer, sizeof (buffer), &found) == 0 && found != nullptr)
+            owner = entry.pw_name;
+#endif
+        return kernelstamp::cacheDirectories (std::getenv ("OPTIX_CACHE_PATH"), std::getenv ("HOME"), std::getenv ("LOCALAPPDATA"), owner);
+    }
+
+    // After a compile, leaves the stamp in the directory the driver says its cache is in.
+    void writeModuleStamp() const
+    {
+        char location[1024] {};
+        if (optixDeviceContextGetCacheLocation (context_, location, sizeof (location)) == OPTIX_SUCCESS)
+            kernelstamp::writeStamp (location, moduleKey());
+    }
+
+    void yield() const
+    {
+        if (yield_)
+            yield_();
+    }
+
+    // Why a warm-up can't help here, or empty: no driver, no OptiX, or the cache is turned off.
+    static std::string warmupSkipReason()
+    {
+        const char* size = std::getenv ("OPTIX_CACHE_MAXSIZE");
+        if (size != nullptr && std::strcmp (size, "0") == 0)
+            return "the OptiX cache is turned off (OPTIX_CACHE_MAXSIZE=0), so a compile would not be kept";
+        if (const std::string init = optixInitProblem(); ! init.empty())
+            return init;
+        if (driverIdentity().empty())
+            return "no CUDA driver or GPU to compile for";
+        return {};
+    }
+
+    static kernelcompile::Warmup& warmup()
+    {
+        static auto* warm = []
+        {
+            kernelcompile::WarmupHooks hooks;
+            hooks.moduleHashPresent = [] { return kernelstamp::stampPresentIn (cacheDirectories(), moduleKey()); };
+            hooks.skipReason = [] { return warmupSkipReason(); };
+            hooks.build = [] (std::string& error, const std::function<void()>& yield, const std::function<bool()>& keep)
+            {
+                // No renderer outlives this for certain, and setup uses only the shared objects.
+                OptixRenderer builder ({});
+                builder.yield_ = yield;
+                if (pipeline_ != nullptr)
+                    return true;
+                SetupUnwind undo;
+                if (! builder.buildPipeline (undo, error))
+                {
+                    if (deviceLost())
+                        undo.commit();
+                    return false;
+                }
+                // The driver's cache now holds the kernel. Unless Path Trace is in use by now,
+                // the unwind frees the pipeline, the OptiX context and the CUDA context here, on
+                // the thread that made them. The next use builds again from the cache.
+                if (keep() || deviceLost())
+                    undo.commit();
+                return true;
+            };
+            hooks.cancelled = [] { return compileCancelled(); };
+            return new kernelcompile::Warmup (buildGate(), std::move (hooks));
+        }();
+        return *warm;
+    }
+
     // One task holds nearly all the work, so this thread does what a pool would. Tasks
     // leave the module cancellable.
     bool compileModule (const OptixModuleCompileOptions& moduleOptions, const OptixPipelineCompileOptions& pipelineOptions,
                         const std::string& ptx, std::string& error)
     {
+        yield();
         logSize_ = sizeof (log_);
         OptixTask first = nullptr;
         if (! check (optixModuleCreateWithTasks (context_, &moduleOptions, &pipelineOptions, ptx.data(), ptx.size(),
@@ -299,6 +464,9 @@ private:
         OptixResult result = OPTIX_SUCCESS;
         while (! tasks.empty() && result == OPTIX_SUCCESS)
         {
+            // A warm-up holds here while the user plays, exports or renders. The first task
+            // holds nearly all the work, so the low thread priority does most of the yielding.
+            yield();
             OptixTask more[16] {};
             unsigned int added = 0;
             const OptixTask task = tasks.back();
@@ -354,6 +522,23 @@ private:
         return built;
     }
 
+    // The one definition of how the kernel compiles. The stamp key reads it too.
+    static void compileOptions (OptixModuleCompileOptions& moduleOptions, OptixPipelineCompileOptions& pipelineOptions)
+    {
+        moduleOptions.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
+        moduleOptions.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+        moduleOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
+        pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
+        pipelineOptions.numPayloadValues = 5;  // t, u, v, triangle, ignored triangle
+        pipelineOptions.numAttributeValues = 2;
+        pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
+        pipelineOptions.pipelineLaunchParamsVariableName = "params";
+        pipelineOptions.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
+        // Motion blur: a moving scene's GAS has two motion keys (shutter open and
+        // close) and rays carry their time. A still GAS traces the same in this pipeline.
+        pipelineOptions.usesMotionBlur = 1;
+    }
+
     bool buildPipeline (SetupUnwind& undo, std::string& error)
     {
         const std::string init = optixInitProblem();
@@ -389,19 +574,8 @@ private:
         });
 
         OptixModuleCompileOptions moduleOptions {};
-        moduleOptions.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
-        moduleOptions.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
-        moduleOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
         OptixPipelineCompileOptions pipelineOptions {};
-        pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-        pipelineOptions.numPayloadValues = 5;  // t, u, v, triangle, ignored triangle
-        pipelineOptions.numAttributeValues = 2;
-        pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
-        pipelineOptions.pipelineLaunchParamsVariableName = "params";
-        pipelineOptions.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
-        // Motion blur: a moving scene's GAS has two motion keys (shutter open and
-        // close) and rays carry their time. A still GAS traces the same in this pipeline.
-        pipelineOptions.usesMotionBlur = 1;
+        compileOptions (moduleOptions, pipelineOptions);
         std::string ptx;
         for (std::size_t chunk = 0; chunk < kArbitOptixKernelPtxChunks; ++chunk)
             ptx += kArbitOptixKernelPtx[chunk];
@@ -413,6 +587,7 @@ private:
         });
         if (! compileModule (moduleOptions, pipelineOptions, ptx, error))
             return false;
+        writeModuleStamp();
 
         OptixProgramGroupDesc descriptions[5] {};
         descriptions[0].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
@@ -491,6 +666,11 @@ private:
         if (! uploadTables (tables, error))
             return false;
         pipeline_ = pipeline;
+        // Added last, so a release runs it first: nothing sees a pipeline_ that is destroyed.
+        undo.add ([] {
+            pipeline_ = nullptr;
+            stackBytesPerThread_ = 0;
+        });
         return true;
     }
 
@@ -509,6 +689,7 @@ private:
     {
         if (stackReserved_)
             return true;
+        loopstep::Scope reserveScope ("pt:optix-stack-reserve");
         const unsigned int bytesPerThread = stackBytesPerThread_;
         std::size_t freeBefore = 0, freeAfter = 0, total = 0;
         if (cu_.cuMemGetInfo != nullptr)
@@ -564,6 +745,20 @@ private:
         scene_.clear();
     }
 
+    // The GAS outlives the scene's buffers, so a refit scene updates it in place.
+    void freeAccel()
+    {
+        for (CUdeviceptr* address : { &accelOutput_, &accelTemporary_ })
+        {
+            if (*address != 0)
+                cu_.cuMemFree (*address);
+            *address = 0;
+        }
+        accelOutputBytes_ = accelTemporaryBytes_ = 0;
+        accelVertices_ = 0;
+        accelHandle_ = 0;
+    }
+
     template <typename T>
     bool uploadView (BufferView<T> source, BufferView<T>& destination, std::string& error)
     {
@@ -579,7 +774,10 @@ private:
     {
         const std::uint64_t build = sceneBuild_();
         auto& phases = pass.stats.phases;
-        if (haveScene_ && build == sceneUploaded_ && &pass.scene == sceneAddress_)
+        // The same scene with its triangles moved (refitRenderScene) uploads again and
+        // updates the GAS instead of building it.
+        const bool sameTopology = haveScene_ && build == sceneUploaded_ && &pass.scene == sceneAddress_;
+        if (sameTopology && pass.scene.geometryRevision == revisionUploaded_)
         {
             phases.set (FramePhase::Upload, 0.0);
             phases.set (FramePhase::AccelBuild, 0.0);
@@ -635,25 +833,31 @@ private:
         // last copies may still be in flight; the build below queues behind them.
         phases.set (FramePhase::Upload, millisecondsSince (uploadStart));
         const auto accelStart = PhaseClock::now();
-        const bool accelBuilt = buildAccel (scene, error);
+        bool updated = false;
+        const bool accelBuilt = buildAccel (scene, sameTopology, updated, error);
         // optixAccelBuild only queues the build on the default stream. Its GPU time
         // finishes inside the first launch's parameter copy, so traceMs carries it.
         phases.set (FramePhase::AccelBuild, millisecondsSince (accelStart));
-        phases.accelBuild = "build";
+        phases.accelBuild = updated ? "update" : "build";
         if (! accelBuilt)
             return false;
         haveScene_ = true;
         sceneUploaded_ = build;
         sceneAddress_ = &pass.scene;
+        revisionUploaded_ = scene.geometryRevision;
         return true;
     }
 
-    bool buildAccel (const RenderScene& scene, std::string& error)
+    bool buildAccel (const RenderScene& scene, bool sameTopology, bool& updated, std::string& error)
     {
         view_.accel = 0;
+        updated = false;
         const auto vertexCount = static_cast<unsigned int> (scene.geometry.positions.size());
         if (vertexCount == 0)
+        {
+            freeAccel();
             return true;  // a scene of lights alone: rays miss a null handle
+        }
         // A moving scene builds a motion GAS from its shutter-open and shutter-close
         // vertices. Ingest has already expanded instances and deformations into
         // world-space triangles, so two linear keys move every vertex exactly as
@@ -671,9 +875,12 @@ private:
         input.triangleArray.vertexBuffers = vertices;
         input.triangleArray.flags = &flags;
         input.triangleArray.numSbtRecords = 1;
+        // Same triangles in the same order and the same motion keys: only the
+        // vertices moved, which OptiX refits without a rebuild.
+        const bool update = sameTopology && accelHandle_ != 0 && accelVertices_ == vertexCount && accelMoving_ == moving;
         OptixAccelBuildOptions options {};
-        options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
-        options.operation = OPTIX_BUILD_OPERATION_BUILD;
+        options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE | OPTIX_BUILD_FLAG_ALLOW_UPDATE;
+        options.operation = update ? OPTIX_BUILD_OPERATION_UPDATE : OPTIX_BUILD_OPERATION_BUILD;
         if (moving)
         {
             // Ray time runs 0 at shutter open to 1 at close, as Ray::time.
@@ -685,16 +892,34 @@ private:
         OptixAccelBufferSizes sizes {};
         if (! check (optixAccelComputeMemoryUsage (context_, &options, &input, 1, &sizes), "sizing the acceleration structure", error))
             return false;
-        CUdeviceptr temporary = 0, output = 0;
-        if (! cuda (cu_.cuMemAlloc (&temporary, sizes.tempSizeInBytes), "allocating the acceleration build", error))
-            return false;
-        scene_.push_back (temporary);
-        if (! cuda (cu_.cuMemAlloc (&output, sizes.outputSizeInBytes), "allocating the acceleration structure", error))
-            return false;
-        scene_.push_back (output);
+        if (! update)
+        {
+            freeAccel();
+            // The temporary buffer serves the build and every later update.
+            const std::size_t temporaryBytes = std::max (sizes.tempSizeInBytes, sizes.tempUpdateSizeInBytes);
+            if (! cuda (cu_.cuMemAlloc (&accelTemporary_, temporaryBytes), "allocating the acceleration build", error))
+                return false;
+            accelTemporaryBytes_ = temporaryBytes;
+            if (! cuda (cu_.cuMemAlloc (&accelOutput_, sizes.outputSizeInBytes), "allocating the acceleration structure", error))
+                return false;
+            accelOutputBytes_ = sizes.outputSizeInBytes;
+        }
         // No stream is the default one, and the launch that follows waits on it.
-        return check (optixAccelBuild (context_, nullptr, &options, &input, 1, temporary, sizes.tempSizeInBytes, output,
-                                       sizes.outputSizeInBytes, &view_.accel, nullptr, 0), "building the acceleration structure", error);
+        OptixTraversableHandle handle = update ? accelHandle_ : 0;
+        if (! check (optixAccelBuild (context_, nullptr, &options, &input, 1, accelTemporary_,
+                                      update ? sizes.tempUpdateSizeInBytes : sizes.tempSizeInBytes, accelOutput_,
+                                      accelOutputBytes_, &handle, nullptr, 0),
+                     update ? "updating the acceleration structure" : "building the acceleration structure", error))
+        {
+            freeAccel();
+            return false;
+        }
+        accelHandle_ = handle;
+        accelVertices_ = vertexCount;
+        accelMoving_ = moving;
+        view_.accel = handle;
+        updated = update;
+        return true;
     }
 
     bool ensureFilm (std::uint32_t width, std::uint32_t height, std::string& error)
@@ -1013,6 +1238,7 @@ private:
     inline static std::mutex creatingLock_;
     inline static OptixModule creating_ = nullptr;
     inline static bool cancelled_ = false;
+    std::function<void()> yield_;
     inline static OptixProgramGroup groups_[5] {};
     inline static OptixPipeline pipeline_ = nullptr;
     inline static unsigned int stackBytesPerThread_ = 0;
@@ -1030,7 +1256,13 @@ private:
     optix::SceneViewForLaunch view_;
     bool haveScene_ = false;
     std::uint64_t sceneUploaded_ = 0;
+    std::uint64_t revisionUploaded_ = 0;
     const RenderScene* sceneAddress_ = nullptr;
+    CUdeviceptr accelOutput_ = 0, accelTemporary_ = 0;
+    std::size_t accelOutputBytes_ = 0, accelTemporaryBytes_ = 0;
+    OptixTraversableHandle accelHandle_ = 0;
+    unsigned int accelVertices_ = 0;
+    bool accelMoving_ = false;
     std::uint32_t filmWidth_ = 0;
     std::uint32_t filmHeight_ = 0;
     CUdeviceptr pixels_ = 0, splats_ = 0, guideAlbedo_ = 0, guideNormal_ = 0, lightPaths_ = 0, totals_ = 0, paramsAddress_ = 0;
@@ -1050,6 +1282,9 @@ PathTracer::DevicePassFunction makeOptixDevicePass (std::function<std::uint64_t(
 
 bool optixPipelineReady() { return OptixRenderer::pipelineReady(); }
 void startOptixPipelineBuild() { OptixRenderer::startBuild(); }
+bool optixModuleHashPresent() { return OptixRenderer::moduleHashPresent(); }
+void armOptixWarmup() { OptixRenderer::armWarmup(); }
+kernelcompile::WarmupReading readOptixWarmup() { return OptixRenderer::readWarmup(); }
 void cancelOptixPipelineBuild() { OptixRenderer::cancelBuild(); }
 bool stopOptixPipelineBuildByUser() { return OptixRenderer::stopBuildByUser(); }
 void startOptixPipelineBuildByUser() { OptixRenderer::startBuildByUser(); }

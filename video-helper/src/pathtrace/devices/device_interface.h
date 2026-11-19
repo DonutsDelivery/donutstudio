@@ -79,8 +79,14 @@ struct GratingBinding
     // A spatial foil's corners in the order (0,0), (1,0), (0,1), (1,1) of uv, each
     // reciprocal direction u, v, period in nm and diffraction coverage.
     std::array<std::array<float, 4>, 4> field {};
+    // A diffraction product's occupancy (u0, v0, u1, v1): with occupancyCount above
+    // zero the foil covers uv inside any of the first occupancyCount rectangles, at
+    // maskCoverage. Raster's diffractionScatterCoverage multiplies this by the field's.
+    std::array<std::array<float, 4>, 5> occupancy {};
+    std::uint32_t occupancyCount = 0;
+    float maskCoverage = 1.0f;
     bool varied = false;  // the corners differ in direction or period
-    bool masked = false;  // a corner's coverage is below 1
+    bool masked = false;  // the foil leaves some of uv to the object's own material
 };
 static_assert (std::is_trivially_copyable_v<GratingBinding>);
 

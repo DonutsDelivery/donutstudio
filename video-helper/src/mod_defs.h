@@ -431,15 +431,16 @@ struct AdsrSpec
     float s    = 0.50f;   // sustain level 0..1
     float r    = 0.50f;   // release (beats)
     float bend = 0.0f;    // -1..1 per-segment exponential bulge (0 = linear)
+    float attackShape = -2, decayShape = -2, releaseShape = -2;
 };
 
 // Level immediately before release begins (continuity when gate < a+d).
 inline float adsrLevelBeforeRelease (float t, const AdsrSpec& e)
 {
     if (t <= 0.0f) return 0.0f;
-    if (t < e.a)  return lerpf (0.0f, 1.0f, segShape (e.a > 0 ? t / e.a : 1.0f, e.bend, true));
+    if (t < e.a)  return lerpf (0.0f, 1.0f, segShape (e.a > 0 ? t / e.a : 1.0f, (e.attackShape >= -1 && e.attackShape <= 1 ? e.attackShape : e.bend), true));
     if (t < e.a + e.d)
-        return lerpf (1.0f, e.s, segShape (e.d > 0 ? (t - e.a) / e.d : 1.0f, e.bend, false));
+        return lerpf (1.0f, e.s, segShape (e.d > 0 ? (t - e.a) / e.d : 1.0f, (e.decayShape >= -1 && e.decayShape <= 1 ? e.decayShape : e.bend), false));
     return e.s;
 }
 
@@ -454,7 +455,7 @@ inline float adsrAt (float t, float gateBeats, const AdsrSpec& e)
     const float relStart = adsrLevelBeforeRelease (gateBeats, e);
     const float tr = t - gateBeats;          // release
     if (e.r <= 0.0f || tr >= e.r) return 0.0f;
-    return lerpf (relStart, 0.0f, segShape (tr / e.r, e.bend, false));
+    return lerpf (relStart, 0.0f, segShape (tr / e.r, (e.releaseShape >= -1 && e.releaseShape <= 1 ? e.releaseShape : e.bend), false));
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 #include "flat_shader_bridge.h"
 #include "gl_loader.h"
 #include "renderer.h"
+#include "support/dense_note_score.h"
 #include "support/hlg_material_oracle.h"
 #include "media.h"
 #include "render_snapshot.h"
@@ -589,6 +590,49 @@ int main()
         // forward. The previous half-sized image plane produced only 11.7 degrees.
         ok &= check(pixelNear(cameraPixels, { 64, 128, 128, 255 }, 2),
                     "shader camera preserves its vertical field of view, eye, and unit ray");
+    }
+
+    {
+        // The sounding-row index reaches the shader: 40 sounding notes, half
+        // of them clip notes on three tracks, sit in rows 30 and up behind
+        // history rows. Pixel k reads index entries k, k+16 and k+32.
+        const auto dense = densenotescore::frame();
+        ok &= check(canonicalblockc::valid(dense), "dense score frame packs");
+        if (canonicalblockc::valid(dense))
+        {
+            const auto index = arbitblockc::soundingRowIndex(dense->noteTexture(), dense->noteRows());
+            const auto readIndex = operation(videowire::ShaderOperationKind::generator, 81, 81,
+                "void mainImage(out vec4 c,in vec2 p){ int k=int(p.y)*4+int(p.x);"
+                " int n=arbitSoundingCount();"
+                " float a=k<n?float(arbitSoundingRow(k)):0.0;"
+                " float b=k+16<n?float(arbitSoundingRow(k+16)):0.0;"
+                " float d=k+32<n?float(arbitSoundingRow(k+32)):0.0;"
+                " c=vec4(a/255.0,b/255.0,d/255.0,1.0);}", 81);
+            auto layer = layerFor(81, finishPlan({ readIndex }, 81));
+            layer.canonicalBlockCFrame = dense;
+            std::vector<std::uint8_t> indexPixels;
+            ok &= checkRender(preview, layer, indexPixels, error, "sounding-row index shader renders");
+            const auto count = static_cast<int>(index[0]);
+            ok &= check(count == densenotescore::kSoundingNotes, "every dense sounding note is indexed");
+            // Readback may list rows bottom-up or top-down; one orientation must hold throughout.
+            const auto matchesOrientation = [&](bool flipped)
+            {
+                if (indexPixels.size() != kWidth * kHeight * 4u) return false;
+                for (int k = 0; k < kWidth * kHeight; ++k)
+                    for (int channel = 0; channel < 3; ++channel)
+                    {
+                        const int entry = k + channel * 16;
+                        const int expected = entry < count
+                            ? static_cast<int>(index[static_cast<std::size_t>(entry + 1)]) : 0;
+                        const int pixel = flipped ? (kHeight - 1 - k / kWidth) * kWidth + k % kWidth : k;
+                        if (std::abs(indexPixels[static_cast<std::size_t>(pixel) * 4u + channel] - expected) > 1)
+                            return false;
+                    }
+                return true;
+            };
+            const bool matches = matchesOrientation(false) || matchesOrientation(true);
+            ok &= check(matches, "shader reads every sounding row from the index");
+        }
     }
 
 #if !defined(ARBIT_STRICT_METAL_FIXTURE)

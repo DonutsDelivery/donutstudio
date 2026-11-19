@@ -63,7 +63,7 @@ inline bool isSetter (const std::string& method)
         "viewport_set_score", "viewport_set_beat_timeline",
         "viewport_set_block_c_lifecycle", "viewport_set_mod_matrix",
         "viewport_set_control_plan", "viewport_set_visible", "graph_set_param",
-        "graph_set_effects", "text_remove", "scope_enable" };
+        "graph_set_effects", "graph_set_gen_params", "text_remove", "scope_enable" };
     return setters.count (method) != 0;
 }
 

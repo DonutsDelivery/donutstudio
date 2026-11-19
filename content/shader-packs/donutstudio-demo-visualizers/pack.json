@@ -1,0 +1,230 @@
+{
+  "pack": {
+    "id": "donutstudio-demo-visualizers-v1",
+    "name": "DonutStudio Demo Visualizers",
+    "version": "1.0",
+    "author": "DonutStudio",
+    "license": "CC0-1.0",
+    "format": "isf",
+    "description": "Eight selected first-party visualizers for abstract backgrounds, musical score views and 3D scenes."
+  },
+  "shaders": [
+    {
+      "id": "plasma",
+      "file": "shaders/plasma.fs",
+      "name": "Plasma",
+      "useCategory": "audio",
+      "category": "psychedelic",
+      "styleTags": [
+        "psychedelic",
+        "ambient"
+      ],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "audio",
+        "clock"
+      ],
+      "inputs": [
+        "scale",
+        "speed",
+        "hueShift",
+        "brightness"
+      ],
+      "showcases": [
+        "float INPUT"
+      ],
+      "description": "A flowing spectrum field: bass expands its cells, mids bend hue, treble writes fine ripples, and onsets flash intersections. scale/speed/hueShift/brightness remain editable INPUTS.",
+      "format": "isf"
+    },
+    {
+      "id": "warp_tunnel",
+      "file": "shaders/warp_tunnel.fs",
+      "name": "Warp Tunnel",
+      "useCategory": "audio",
+      "category": "retro",
+      "styleTags": [
+        "retro",
+        "neon",
+        "cinematic"
+      ],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "clock",
+        "audio"
+      ],
+      "inputs": [
+        "speed",
+        "twist",
+        "ribs",
+        "colorA",
+        "colorB"
+      ],
+      "showcases": [
+        "float INPUT",
+        "color INPUT"
+      ],
+      "description": "An endless ribbed tunnel that flies forward and flashes on the beat; the mix nudges the throttle. speed/twist/ribs and the two colours are INPUTS.",
+      "format": "isf"
+    },
+    {
+      "id": "kaleido",
+      "file": "shaders/kaleido.fs",
+      "name": "Kaleido",
+      "useCategory": "patterns",
+      "category": "psychedelic",
+      "styleTags": [
+        "psychedelic",
+        "geometric"
+      ],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "clock"
+      ],
+      "inputs": [
+        "segments",
+        "zoom",
+        "spin",
+        "tint"
+      ],
+      "showcases": [
+        "float INPUT",
+        "color INPUT",
+        "mod-matrix target (segments/zoom)"
+      ],
+      "description": "A mirror-kaleidoscope of a drifting field. Route a kick to 'segments' and a bassline to 'zoom' through the mod matrix to make it move with the music.",
+      "format": "isf"
+    },
+    {
+      "id": "neon-piano-roll",
+      "file": "shaders/falling_piano_roll.fs",
+      "name": "Neon Piano Roll",
+      "description": "Falling score notes strike a keyboard with track-aware neon color, exact-frequency positioning, impact glow, and sparks.",
+      "useCategory": "score-ji",
+      "styleTags": [
+        "neon",
+        "cinematic",
+        "geometric"
+      ],
+      "reactsTo": [
+        "score",
+        "clock"
+      ],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "parameterDefaults": {
+        "lookaheadBeats": 8.0,
+        "keyboardHeight": 0.18,
+        "noteWidth": 0.72,
+        "glowAmount": 1.0,
+        "sparkAmount": 0.55,
+        "lowColor.r": 0.05,
+        "lowColor.g": 0.55,
+        "lowColor.b": 1.0,
+        "lowColor.a": 1.0,
+        "highColor.r": 0.9,
+        "highColor.g": 0.16,
+        "highColor.b": 1.0,
+        "highColor.a": 1.0,
+        "rootColor.r": 1.0,
+        "rootColor.g": 0.7,
+        "rootColor.b": 0.12,
+        "rootColor.a": 1.0
+      },
+      "format": "isf"
+    },
+    {
+      "id": "pitch-ribbons",
+      "file": "shaders/pitch_ribbons.fs",
+      "name": "Pitch Ribbons",
+      "description": "Past and upcoming score notes become crisp horizontal voice-leading ribbons with exact-frequency pitch placement, harmonic-master connections, and transient punch.",
+      "useCategory": "score-ji",
+      "styleTags": [
+        "minimal",
+        "neon",
+        "microtonal"
+      ],
+      "reactsTo": [
+        "score",
+        "clock",
+        "audio"
+      ],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "parameterDefaults": {
+        "historyBeats": 4.0,
+        "lookaheadBeats": 8.0,
+        "ribbonWidth": 0.014,
+        "linkStrength": 0.55
+      },
+      "format": "isf"
+    },
+    {
+      "id": "resonant-strings",
+      "file": "shaders/resonant_strings.fs",
+      "name": "Resonant Strings",
+      "description": "Sounding pitch classes become vibrating ratio strings. With four root cycles, exact 5/4, 3/2, and 7/4 notes draw five, six, and seven spatial cycles, while frame-timed trails show their motion.",
+      "useCategory": "score-ji",
+      "styleTags": [
+        "strings",
+        "standing-wave",
+        "microtonal"
+      ],
+      "reactsTo": [
+        "score",
+        "clock",
+        "audio"
+      ],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "parameterDefaults": {
+        "amplitude": 0.085,
+        "spatialCycles": 4.0,
+        "vibrationRate": 5.7,
+        "motionTrails": 0.68,
+        "lineWidth": 0.0028,
+        "harmonicDetail": 0.48,
+        "verticalSpread": 0.82
+      },
+      "format": "isf"
+    },
+    {
+      "id": "resonance-ocean",
+      "file": "shaders/resonance_ocean.fs",
+      "name": "Resonance Ocean",
+      "category": "nature",
+      "reactsTo": [
+        "score",
+        "clock",
+        "audio"
+      ],
+      "needs": [],
+      "description": "A raymarched ocean where each note drives a wave train at its exact root-relative ratio: consonance locks into glassy interference patterns, dissonance whitens the water with foam. Bass burns the horizon.",
+      "format": "glsl"
+    },
+    {
+      "id": "beat-reactor",
+      "file": "shaders/beat_reactor.fs",
+      "name": "Beat Reactor",
+      "category": "psychedelic",
+      "reactsTo": [
+        "clock",
+        "audio"
+      ],
+      "needs": [],
+      "description": "A kinetic containment atom around a volatile plasma core. The camera orbits continuously while three field rings precess at independent audio-driven rates, bright electron carriages race around them, and every transient kicks the mechanism out of phase.",
+      "format": "glsl"
+    }
+  ]
+}

@@ -679,7 +679,7 @@ void verify(Check check) {
   auto second=reopenedEvaluator.evaluate(owner,reopenedFamily,authored->scene,0.5,{},error,&liveReceipt);
   check(second && liveReceipt.concurrentBytes>receipt.concurrentBytes,"escaped scene owner remains charged to its evaluator");
   second.reset();
-  timelineevaluation::Limits shortLimit{liveReceipt.concurrentBytes-1};
+  timelineevaluation::Limits shortLimit{}; shortLimit.maxAdditionalBytes=liveReceipt.concurrentBytes-1;
   check(!reopenedEvaluator.evaluate(owner,reopenedFamily,authored->scene,0.5,shortLimit,error)
       && fresh && literal(*fresh,*authored->scene,0,0.25,0.25),"one-byte short budget refuses before replay and preserves incumbent");
   fresh.reset();

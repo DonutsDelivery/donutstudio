@@ -192,6 +192,13 @@ public:
     // places each vertex at ray.time. close == nullptr is a static build.
     void buildMotion (const Vec3* open, const Vec3* close, std::size_t triangleCount,
                       const BvhBuildOptions& options = {});
+    // Keeps the hierarchy and moves its triangles: positions (and close, for a
+    // motion build) hold the same triangles in the caller's order the build saw,
+    // and every node's bounds grow or shrink to cover them. False, with nothing
+    // changed, when the count or the presence of motion differs from the build.
+    // A refit tree traces correctly at any vertex motion; it only slows as the
+    // triangles drift from where the split planes were chosen.
+    bool refit (const Vec3* open, const Vec3* close, std::size_t triangleCount) noexcept;
     void clear() noexcept;
     bool hasMotion() const noexcept { return ! orderedClose_.empty(); }
 

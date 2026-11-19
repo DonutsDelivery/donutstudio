@@ -1,5 +1,32 @@
 {
-  "donutStudioVersion": "0.9.1",
-  "privateSourceCommit": "46e2a516c44d1136db3d5afa1a98d53ddf3b3136",
-  "helperTreeSha256": "aa866feaa532da634f024cb91940c0a273f7320d45f68874cc983af6c8853e3c"
+  "donutStudioVersion": "1.0.0",
+  "privateSourceCommit": "d1e1b84281c4bae3f1eebc7719b51dbcf219c7df",
+  "helperTreeSha256": "360e37df7be108d88a293038adff63d496de16da3bb4c62db67b071aa322d2b9",
+  "linuxArtifacts": {
+    "zip": {
+      "sha256": "d23abde40513d75d4dc39b6b212ac82c703053520eb9ff7dd08fd4035da5df8f",
+      "helperSha256": "9b07201ac6b34c4d709d7f1d88c5aaf038f6ed08c2101f57c783e4a9520122f5"
+    },
+    "appimage": {
+      "sha256": "bbc81affb953ae68a16729be5ce99b2d426d40b3745cbbb532b598a5f146796b",
+      "helperSha256": "5f79a5950bcae89efdf8a8c7b4f35c3a3feeedda103ef71d26d956a94a38314b"
+    },
+    "installer": {
+      "sha256": "7b4298f1bd127d9dca70cb8c72f47545d36769be662d33808cffbc27df41e5dc",
+      "packagingSource": "69e21d28fb344645a15266c640af5576adbab894",
+      "payloadHelperSha256": "9b07201ac6b34c4d709d7f1d88c5aaf038f6ed08c2101f57c783e4a9520122f5"
+    }
+  },
+  "dependencySourceArchives": {
+    "linux": {
+      "filename": "DonutStudio-1.0.0-linux-helper-dependency-sources.tar",
+      "sha256": "60c8da9fc792c9ba81fcf4b411f6b95c3b562dfacb9585ad6abd18da914a6c91",
+      "bytes": 666603520
+    },
+    "macos": {
+      "filename": "DonutStudio-1.0.0-macos-helper-dependency-sources.tar",
+      "sha256": "4a5e8bce11eb29204409f1a8aa0fd1a713964e8033e1787df99a6d20d5a08340",
+      "bytes": 162600960
+    }
+  }
 }

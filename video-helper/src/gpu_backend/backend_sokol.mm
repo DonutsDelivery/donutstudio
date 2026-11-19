@@ -18,6 +18,9 @@
 #include "fixture_texture_upload.h"
 #include "fixture_opaque_visibility.h"
 #include "fixture_realtime_opengl.h"
+#include "realtime_diffraction_emitters.h"
+#include "realtime_diffraction_mirror.h"
+#include "fixture_depth_range.h"
 #include "fixture_viewport_solid.h"
 #include "fixture_smooth_glass.h"
 #include "metal_rough_glass_receipt.h"
@@ -453,6 +456,76 @@ void settleOpenSokolCommandBufferUnlocked()
 #endif
 }
 
+// Sokol's frame command buffer, held past sg_commit() so a frame can name the GPU's
+// verdict on its passes. A pass the GPU aborts (a hang, a fault) leaves its targets
+// with whatever it wrote, often NaN, and the readback blit after it still succeeds.
+// After two GPU restarts macOS ignores every later submission from the process
+// (kIOGPUCommandBufferCallbackErrorSubmissionsIgnored) until it exits; Metal has no
+// call that lifts it, and a new device or queue in the same process stays ignored.
+struct MetalSubmission
+{
+    id<MTLCommandBuffer> command = nil;
+    MetalSubmission() = default;
+    MetalSubmission(const MetalSubmission&) = delete;
+    MetalSubmission& operator=(const MetalSubmission&) = delete;
+    ~MetalSubmission() { reset(); }
+    void reset()
+    {
+#if ! __has_feature(objc_arc)
+        [command release];
+#endif
+        command = nil;
+    }
+};
+
+std::string metalCommandError(id<MTLCommandBuffer> command)
+{
+    if (command == nil || command.error == nil) return "no error reported";
+    std::string text = command.error.localizedDescription != nil
+        ? std::string(command.error.localizedDescription.UTF8String) : std::string("unnamed error");
+    text += " (code " + std::to_string(static_cast<long>(command.error.code)) + ")";
+    return text;
+}
+
+// Requires sokolMutex(). Commits Sokol's frame command buffer and keeps it in
+// submission. Every failure goes to stderr from the completion handler, so a frame
+// nothing waits on still reports its error.
+void commitSokolFrameWatched(MetalSubmission& submission, const char* owner)
+{
+    submission.reset();
+    id<MTLCommandBuffer> open = sg_isvalid() ? _sg.mtl.cmd_buffer : nil;
+    if (open != nil)
+    {
+#if ! __has_feature(objc_arc)
+        [open retain];
+#endif
+        submission.command = open;
+        const std::string name = owner;
+        [open addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (done.status == MTLCommandBufferStatusError)
+                std::fprintf(stderr, "[metal] %s command buffer failed on the GPU: %s\n", name.c_str(),
+                             metalCommandError(done).c_str());
+        }];
+    }
+    sg_commit();
+}
+
+// The submission's GPU verdict. wait blocks until it completes; otherwise a buffer
+// still running counts as no error yet.
+bool metalSubmissionSucceeded(const MetalSubmission& submission, bool wait, const char* owner, std::string& error)
+{
+    if (submission.command == nil) return true;
+    if (wait) [submission.command waitUntilCompleted];
+    if (submission.command.status != MTLCommandBufferStatusError) return true;
+    error = std::string(owner) + " failed on the GPU: " + metalCommandError(submission.command);
+    const auto code = submission.command.error != nil ? submission.command.error.code : 0;
+    if (code == MTLCommandBufferErrorTimeout)
+        error += "; macOS ignores all of a process's GPU work after its second GPU restart";
+    else if (code == MTLCommandBufferErrorAccessRevoked)
+        error += "; macOS now ignores this process's GPU work, and only restarting the video helper clears it";
+    return false;
+}
+
 // Requires sokolMutex(). Refuses by name instead of letting Sokol run out of
 // Metal id slots part way through a preparation.
 bool ensureMetalIdHeadroom (int required, std::string& error)
@@ -641,6 +714,9 @@ struct FixtureUniforms
     // similarity (nativePreviousObjectMatrix). Only the vertex text declares it,
     // and a zero [3][3] reads as this frame's objectMatrix.
     float previousObjectMatrix[16];
+    // The clip depth range in x and y (arbitgpu::fixturedepth::fitted), or zeros for the
+    // camera's own planes. Only the vertex text declares it.
+    float clipDepthRange[4];
 };
 static_assert (offsetof (FixtureUniforms, objectMatrix) == 0
                && offsetof (FixtureUniforms, materialKind) == 1472
@@ -688,7 +764,8 @@ static_assert (offsetof (FixtureUniforms, objectMatrix) == 0
                && offsetof (FixtureUniforms, medium) == 11712
                && offsetof (FixtureUniforms, worldFog) == 11872
                && offsetof (FixtureUniforms, previousObjectMatrix) == 11952
-               && sizeof (FixtureUniforms) == 12016,
+               && offsetof (FixtureUniforms, clipDepthRange) == 12016
+               && sizeof (FixtureUniforms) == 12032,
                "Metal fixture uniform layout changed");
 
 // Packs the draw's diffraction layer, or zeros (layer off) when it has none.
@@ -2047,6 +2124,7 @@ public:
             || depthStencilView.id != 0 || diffractionAccumulationImage.id != 0 || lensSnapshotImage.id != 0
             || opaqueImage.id != 0 || opaqueView.id != 0 || glassImage.id != 0 || glassView.id != 0
             || spectralQueryImage.id != 0 || spectralSampleImage.id != 0 || spectralDiagnostic != nil
+            || realtimeEmitters != nil
             || roughReceiptImages[0].id != 0 || roughReceiptPipelines[0].id != 0 || realtimeImages[0].id != 0 || caustic != nullptr || selectedRough != nullptr;
     }
 
@@ -2061,9 +2139,12 @@ public:
         roughTileDepthView={};roughTileDepthImage={};roughTileSchedule.reset();roughTilesComplete=false;
 #if ! __has_feature(objc_arc)
         [spectralDiagnostic release];
+        [realtimeEmitters release];
 #endif
         spectralDiagnostic = nil;
         spectralDiagnosticCharge.reset();
+        realtimeEmitters = nil;
+        realtimeEmittersCharge.reset();
         for (const auto pipeline : roughReceiptPipelines)
             if (pipeline.id) sg_destroy_pipeline(pipeline);
         for (std::size_t i = 0; i < roughReceiptImages.size(); ++i) {
@@ -2178,6 +2259,8 @@ public:
     sg_image opaqueImage = {};
     sg_view opaqueView = {};
     id<MTLBuffer> spectralDiagnostic = nil;
+    // The Realtime grating frame's glowing triangles, at fragment buffer 2.
+    id<MTLBuffer> realtimeEmitters = nil;
     sg_image spectralQueryImage = {}, spectralSampleImage = {};
     sg_view spectralQueryView = {}, spectralSampleView = {};
     sg_image glassImage = {};
@@ -2203,6 +2286,7 @@ public:
     arbitgpu::residency::ResidencyCharge colorImageCharge, depthImageCharge, depthStencilImageCharge;
     arbitgpu::residency::ResidencyCharge diffractionAccumulationImageCharge, opaqueImageCharge, glassImageCharge;
     arbitgpu::residency::ResidencyCharge spectralQueryImageCharge, spectralSampleImageCharge, spectralDiagnosticCharge;
+    arbitgpu::residency::ResidencyCharge realtimeEmittersCharge;
     std::array<arbitgpu::residency::ResidencyCharge, 6> rawImageCharges {};
     bool readRawPass(renderpassoutput::Output output, arbitgpu::NativeRawPassPixels& pixels,
                      std::string& error) const override
@@ -3331,6 +3415,7 @@ struct Uniforms {
     float4 vertexDisplacementLimits[16];
     float4 fragmentTail[26];
     float4x4 previousObjectMatrix;
+    float4 clipDepthRange;
 };
 struct VertexIn {
     float3 position [[attribute(0)]];
@@ -3431,14 +3516,18 @@ vertex VertexOut _main(VertexIn in [[stage_in]],
     const float aspect = u.projection.y;
     const float nearPlane = u.projection.z;
     const float farPlane = u.projection.w;
+    // The depth test spans the scene's camera distances when the host fitted them, as
+    // the OpenGL fixture's uClipDepthRange does; the authored planes otherwise.
+    const float2 depthRange = u.clipDepthRange.y > u.clipDepthRange.x
+        ? u.clipDepthRange.xy : float2(nearPlane, farPlane);
     // A negative x is an orthographic camera's half height (Metal depth runs 0 to 1).
     out.position = tanHalfFov < 0.0f
         ? float4(cameraPosition.x / (-tanHalfFov * aspect), cameraPosition.y / -tanHalfFov,
-                 (distance - nearPlane) / (farPlane - nearPlane), 1.0f)
+                 (distance - depthRange.x) / (depthRange.y - depthRange.x), 1.0f)
         : float4(cameraPosition.x / (tanHalfFov * aspect),
                  cameraPosition.y / tanHalfFov,
-                 distance * farPlane / (farPlane - nearPlane)
-                     - nearPlane * farPlane / (farPlane - nearPlane), distance);
+                 distance * depthRange.y / (depthRange.y - depthRange.x)
+                     - depthRange.x * depthRange.y / (depthRange.y - depthRange.x), distance);
     out.uv = in.uv;
     out.motionCurrentClip = out.position;
     const float4 previousNote = u.previousNoteInstanceTransforms[noteIndex];
@@ -4233,6 +4322,9 @@ fragment FragmentOut _main(VertexOut in [[stage_in]],
         const float scatterWeight = clamp(coverage * occupancy, 0.0f, 1.0f);
         out.color = float4((firstPath ? in.litBase * (1.0f - scatterWeight)
             : float3(0.0f)) + diffraction * scatterWeight, 1.0f);
+#ifdef REALTIME_ABLATE_GRATINGRED
+        out.color = float4(firstPath ? 4.0f : 0.0f, 0.0f, 0.0f, 1.0f);
+#endif
         if (u.materialKind.y & 16u) {
             const float2 frameUv = u.materialKind.y & 32u ? float2(in.uv.x, 1.0f - in.uv.y) : in.uv;
             float4 imagery = baseTexture.sample(baseSampler, frameUv);
@@ -4434,7 +4526,12 @@ fragment float4 _resolve(float4 position [[position]],
     const uint2 pixel = uint2(position.xy);
     FragmentOut value;
     value.rawMask = rawMask.read(pixel).r;
-    if (value.rawMask <= 0.0f) discard_fragment();
+    // A Realtime grating frame draws its sky into the accumulation first (skyBackground
+    // y), already composited, as the OpenGL Realtime program draws it behind the scene.
+    if (value.rawMask <= 0.0f) {
+        if (u.skyBackground.y > 0.5f) return accumulation.read(pixel);
+        discard_fragment();
+    }
     const float4 summed = accumulation.read(pixel);
     if (!all(isfinite(summed))) return summed;
     value.color = float4(summed.rgb, u.materialKind.y & 16u ? summed.a : 1.0f);
@@ -4478,7 +4575,36 @@ template<class String> String metalSpectralTransportShaderRecipe() {
     arbitgpu::smoothglass::replace(query, "glass", "spectralQuery");
     arbitgpu::smoothglass::replace(query, "Glass", "SpectralQuery");
     return query + R"metal(
-float spectralGratingBsdf(int band, float3 incident, float3 outgoing, float2 uv, constant Uniforms& u, device atomic_uint* diagnostic) {
+#ifdef FIXTURE_REALTIME
+// Realtime threads its per-frame buffer (fragment buffer 2) through the transport, for
+// the grating's order efficiency table.
+#define SPECTRAL_REALTIME_PARAM , const device float4* realtimeEmitters
+#define SPECTRAL_REALTIME_ARG , realtimeEmitters
+// The grating's order efficiencies (realtime_diffraction_efficiency_table.h), read as the
+// OpenGL Realtime's realtimeOrderEfficiency reads its table: bilinear between the nodes
+// of the tile for this band and order, at the incident direction's tangent xy. Element
+// 0's w of the buffer names a header element (order count, table width, grid, tiles a
+// row), and the table's floats follow it, four to an element. 0 means no table.
+bool realtimeEfficiencyTabled(const device float4* realtimeEmitters) { return realtimeEmitters[0].w > 0.0f; }
+float realtimeOrderEfficiency(const device float4* realtimeEmitters, int band, int order, float2 incident) {
+    const int header = int(realtimeEmitters[0].w);
+    const float4 shape = realtimeEmitters[header];
+    const int orders = int(shape.x), width = int(shape.y), grid = int(shape.z), perRow = int(shape.w);
+    const device float* table = (const device float*)(realtimeEmitters + header + 1);
+    const int tile = band * (orders + 1) + order;
+    const float2 node = clamp((incident * 0.5f + 0.5f) * float(grid - 1), float2(0.0f), float2(float(grid - 1)));
+    const int x0 = min(int(node.x), grid - 2), y0 = min(int(node.y), grid - 2);
+    const float fx = node.x - float(x0), fy = node.y - float(y0);
+    const int at = ((tile / perRow) * grid + y0) * width + (tile % perRow) * grid + x0;
+    return (1.0f - fy) * ((1.0f - fx) * table[at] + fx * table[at + 1])
+        + fy * ((1.0f - fx) * table[at + width] + fx * table[at + width + 1]);
+}
+#else
+#define SPECTRAL_REALTIME_PARAM
+#define SPECTRAL_REALTIME_ARG
+#endif
+float spectralGratingBsdf(int band, float3 incident, float3 outgoing, float2 uv, constant Uniforms& u, device atomic_uint* diagnostic
+                          SPECTRAL_REALTIME_PARAM) {
     if (incident.z <= 1.0e-6f || outgoing.z <= 0.0f) return 0.0f;
     const float duty = u.diffractionMicrostructure.x;
     const float substrateN = u.diffractionMicrostructure.y;
@@ -4520,6 +4646,43 @@ float spectralGratingBsdf(int band, float3 incident, float3 outgoing, float2 uv,
             localGeometry.xy, localGeometry.z, wavelength, lastOrder);
         firstPrimary = range.x; lastPrimary = range.y;
     }
+    bool tabled = false;
+#if defined(FIXTURE_REALTIME) && !defined(REALTIME_ABLATE_EFFICIENCYTABLE)
+    // Realtime reads each order's efficiency and the band's normalising sum from the
+    // grating's table, as diffractionTriangleBsdf in the OpenGL Realtime program does, and
+    // evaluates only the orders whose lobe reaches outgoing: past 87.5 lobe widths squared
+    // exp() is zero in float.
+    if (realtimeEfficiencyTabled(realtimeEmitters)) {
+        tabled = true;
+        const int orders = int(realtimeEmitters[int(realtimeEmitters[0].w)].x);
+        efficiencySum = realtimeOrderEfficiency(realtimeEmitters, band, orders, incident.xy);
+        const float reach = 175.0f * sigma * sigma;
+        if (sigma > 0.0f)
+        for (int primary = firstPrimary; primary <= lastPrimary; ++primary) {
+            if (primary != 0 && abs(primary) < firstOrder) continue;
+            const int limit = crossedTwoDimensional ? lastOrder : 0;
+            for (int secondary = -limit; secondary <= limit; ++secondary) {
+                if (secondary != 0 && abs(secondary) < firstOrder) continue;
+                float2 centre = -incident.xy + float(primary) * wavelength
+                    / localGeometry.z * localGeometry.xy;
+                if (crossedTwoDimensional) centre += float(secondary) * wavelength
+                    / localSecondaryGeometry.z * localSecondaryGeometry.xy;
+                const float square = dot(centre, centre);
+                const float2 delta = outgoing.xy - centre;
+                const float spread = dot(delta, delta);
+                if (square >= 1.0f || spread > reach) continue;
+                const float z = sqrt(max(0.0f, 1.0f - square));
+                const int order = crossedTwoDimensional
+                    ? (primary + lastOrder) * (2 * lastOrder + 1) + secondary + lastOrder : primary + lastOrder;
+                const float height = 2.0f * pi * u.diffractionRoughness.x * (incident.z + z) / wavelength;
+                const float efficiency = realtimeOrderEfficiency(realtimeEmitters, band, order, incident.xy)
+                    * exp(-height * height) * z / incident.z;
+                radiance += efficiency * exp(-spread / (2.0f * sigma * sigma)) / (2.0f * pi * sigma * sigma);
+            }
+        }
+    }
+#endif
+    if (!tabled)
     for (int primary = firstPrimary; primary <= lastPrimary; ++primary) {
         if (primary != 0 && abs(primary) < firstOrder) continue;
         const int limit = crossedTwoDimensional ? lastOrder : 0;
@@ -4608,7 +4771,8 @@ float spectralScatterWeight(float2 uv,constant Uniforms& u) {
     return clamp(coverage*occupancy,0.0f,1.0f);
 }
 float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Uniforms& u,
-                         texture2d<float> query,texture2d<float> table,device atomic_uint* diagnostic) {
+                         texture2d<float> query,texture2d<float> table,device atomic_uint* diagnostic
+                         SPECTRAL_REALTIME_PARAM) {
     if (!all(isfinite(u.spectralSampleControl))
         || u.spectralSampleControl.x<1.0f || u.spectralSampleControl.y<1.0f
         || floor(u.spectralSampleControl.x)!=u.spectralSampleControl.x
@@ -4658,6 +4822,15 @@ float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Unifo
 #endif
     float3 normal=normalize(cross(dfdx(in.worldPosition),dfdy(in.worldPosition)));
     if (dot(normal,in.worldNormal)<0.0f) normal=-normal;
+#if defined(FIXTURE_REALTIME) && !defined(REALTIME_ABLATE_SMOOTHNORMAL)
+    // Realtime's grating shades from the interpolated vertex normal on the face's side,
+    // as evaluateDiffraction in the OpenGL Realtime program does. The face's own normal
+    // held every order still across a facet, and the disc showed its triangles as blocks.
+    if (grating) {
+        const float3 smoothNormal=normalize(in.worldNormal);
+        normal=dot(smoothNormal,normal)<0.0f ? -smoothNormal : smoothNormal;
+    }
+#endif
     float3 tangent=float3(0.0f),bitangent=float3(0.0f);
     if (grating) {
         float3 dx=dfdx(in.worldPosition),dy=dfdy(in.worldPosition);
@@ -4665,6 +4838,12 @@ float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Unifo
         float det=ux.x*uy.y-ux.y*uy.x;
         if (!isfinite(det) || abs(det)<=1.0e-8f) return spectralFailure(diagnostic);
         tangent=normalize((dx*uy.y-dy*ux.y)/det);
+#if defined(FIXTURE_REALTIME) && !defined(REALTIME_ABLATE_SMOOTHTANGENT)
+        // The vertices' smooth groove direction, signed as this triangle's dP/du, where it
+        // agrees with it.
+        const float3 grooveTangent=in.worldTangent*(dot(in.worldTangent,tangent)<0.0f ? -1.0f : 1.0f);
+        if (dot(grooveTangent,tangent)>0.7f) tangent=grooveTangent;
+#endif
         normal=brushedReliefNormal(normal,tangent,in.uv,normalize(fixtureToViewer(in.worldPosition,u)),u.diffractionRoughness);
         tangent=normalize(tangent-normal*dot(normal,tangent));
         bitangent=normalize(cross(normal,tangent));
@@ -4687,7 +4866,7 @@ float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Unifo
     for (int b=0;b<8;++b) {
         float li=u.spectralSourceRadiance[b/4][b%4];
         float rho=grating ? 1.0f : spectralSample(own,4+b/4,table)[b%4];
-        bands[b]=li*sourceCosine*(grating ? spectralGratingBsdf(b,spectralLocal(light,tangent,bitangent,normal),outgoing,in.uv,u,diagnostic) : rho/pi);
+        bands[b]=li*sourceCosine*(grating ? spectralGratingBsdf(b,spectralLocal(light,tangent,bitangent,normal),outgoing,in.uv,u,diagnostic SPECTRAL_REALTIME_ARG) : rho/pi);
     }
     int first=grating?0:receivers,count=grating?receivers:gratings;
 #ifdef FIXTURE_REALTIME
@@ -4745,9 +4924,9 @@ float3 spectralTransport(VertexOut in,uint primitive,bool grating,constant Unifo
         for (int b=0;b<8;++b) {
             float li=u.spectralSourceRadiance[b/4][b%4];
             float rho=spectralSample(grating?i:own,4+b/4,table)[b%4];
-            float bsdf=grating ? spectralGratingBsdf(b,spectralLocal(direction,tangent,bitangent,normal),outgoing,in.uv,u,diagnostic)
+            float bsdf=grating ? spectralGratingBsdf(b,spectralLocal(direction,tangent,bitangent,normal),outgoing,in.uv,u,diagnostic SPECTRAL_REALTIME_ARG)
                 : spectralGratingBsdf(b,spectralLocal(light,st.xyz,sb.xyz,sampleNormal),
-                    spectralLocal(-direction,st.xyz,sb.xyz,sampleNormal),float2(st.w,sb.w),u,diagnostic)*spectralScatterWeight(float2(st.w,sb.w),u);
+                    spectralLocal(-direction,st.xyz,sb.xyz,sampleNormal),float2(st.w,sb.w),u,diagnostic SPECTRAL_REALTIME_ARG)*spectralScatterWeight(float2(st.w,sb.w),u);
             bands[b]+=li*sampleLight*rho/pi*weight*bsdf;
         }
     }
@@ -4932,6 +5111,23 @@ inline void declareViewportSolidFixtureUniform(std::string& fragment)
 // 1 reflections, 2 glass, -1 one draw with soft shadows and no snapshots. The two
 // snapshots hold the color and linear depth drawn so far. Metal textures put row 0 at
 // the top, so a projected point's v runs down where the OpenGL text's runs up.
+// ARBIT_METAL_REALTIME_ABLATE=SKY,CHORD,... removes those Realtime grating terms from the
+// fixture program, one #define REALTIME_ABLATE_<NAME> each, as ARBIT_GL_REALTIME_ABLATE
+// does on OpenGL. ORDERS drops the evaluated orders and transport, leaving the light
+// through the orders alone. A diagnostic only: the frame it draws is not the scene's.
+inline std::string metalRealtimeAblationDefines()
+{
+    std::string out, name;
+    const char* value = std::getenv("ARBIT_METAL_REALTIME_ABLATE");
+    for (const char* c = value ? value : ""; ; ++c)
+    {
+        if (*c >= 'A' && *c <= 'Z') { name += *c; continue; }
+        if (! name.empty()) out += "#define REALTIME_ABLATE_" + name + " 1\n";
+        name.clear();
+        if (*c == '\0') break;
+    }
+    return out;
+}
 constexpr char kFixtureRealtimeShader[] = R"metal(
 constant float kRealtimeLightRadius = 0.03f;
 constant float kRealtimeGoldenAngle = 2.39996323f;
@@ -5019,6 +5215,9 @@ float realtimeSkyVisibility(float3 position, float3 normal, float2 pixel, consta
 float4 realtimeReflection(float3 position, float3 normal, float3 toView, float3 base, float metallic, float roughness,
                           float dielectric, float2 pixel, constant Uniforms& u,
                           texture2d<float> realtimeColor, texture2d<float> realtimeDepth) {
+#ifdef REALTIME_ABLATE_REFLECT
+    return float4(0.0f);
+#endif
     const float3 view = normalize(toView);
     const float3 direction = reflect(-view, normal);
     const float gloss = (1.0f - roughness) * (1.0f - roughness);
@@ -5032,10 +5231,12 @@ float4 realtimeReflection(float3 position, float3 normal, float3 toView, float3 
 }
 float3 realtimeEnvironment(float3 normal, float3 toView, float roughness, float dielectric, constant Uniforms& u,
                            texture2d<float> environmentTexture) {
-    if (u.sky[0].w <= 0.5f) return float3(0.0f);
-    return u.sky[0].w > 1.5f
+    // The scene's ambient colour is environment radiance from every direction, as Path
+    // Trace adds it (pathtrace/lights.h).
+    if (u.sky[0].w <= 0.5f) return u.ambient.xyz;
+    return u.ambient.xyz + (u.sky[0].w > 1.5f
         ? environmentImageBase(float3(1.0f), 1.0f, roughness, dielectric, normal, toView, u.sky[0], u.sky[1], environmentTexture)
-        : analyticSkyBase(float3(1.0f), 1.0f, roughness, dielectric, normal, toView, u.sky[0], u.sky[1], u.sky[2], u.sky[3], u.sky[4]);
+        : analyticSkyBase(float3(1.0f), 1.0f, roughness, dielectric, normal, toView, u.sky[0], u.sky[1], u.sky[2], u.sky[3], u.sky[4]));
 }
 float3 realtimeRefraction(float3 position, float3 normal, float3 view, float roughness, float2 pixel, constant Uniforms& u,
                           texture2d<float> realtimeColor, texture2d<float> realtimeDepth) {
@@ -5045,7 +5246,10 @@ float3 realtimeRefraction(float3 position, float3 normal, float3 view, float rou
     const float ownDepth = realtimeDepth.sample(realtimeNearest, own.xy).r;
     const bool surface = realtimeSurfaceDepth(ownDepth) && ownDepth > own.z;
     // Over the sky, nothing gives a gap, so the bend is judged at the camera's distance.
-    const float gap = surface ? (ownDepth - own.z) * span : own.z * span + u.projection.z;
+    float gap = surface ? (ownDepth - own.z) * span : own.z * span + u.projection.z;
+#ifdef REALTIME_ABLATE_GLASSGAP
+    gap = 0.012f;
+#endif
     const float3 wavelengths = float3(0.6563f, 0.5461f, 0.4358f);
     const float blur = roughness * roughness * 0.05f;
     float angle = realtimeNoise(pixel) * 6.28318531f;
@@ -5055,6 +5259,9 @@ float3 realtimeRefraction(float3 position, float3 normal, float3 view, float rou
         const float ior = u.surfaceCoating.y + u.glassTransport.y * (1.0f / (wavelength * wavelength) - 1.0f / (0.58756f * 0.58756f));
         float3 bent = u.glassTransport.x > 1.5f ? -view : refract(-view, normal, 1.0f / max(ior, 1e-3f));
         if (dot(bent, bent) == 0.0f) bent = reflect(-view, normal);
+#ifdef REALTIME_ABLATE_GLASSSTRAIGHT
+        bent = -view;
+#endif
         float3 target = realtimeProject(position + bent * gap, u);
         // A second read follows the ray to the depth where it lands.
         if (target.x >= 0.0f) {
@@ -5087,7 +5294,13 @@ float3 realtimeGlass(float3 position, float3 shadedNormal, float3 toView, float3
     if (realtimeTrace(position + normal * 0.0005f * (u.projection.w - u.projection.z), reflect(-view, normal),
             hit, confidence, pixel, u, realtimeColor, realtimeDepth))
         reflected = mix(reflected, hit, confidence);
-    const float3 behind = realtimeRefraction(position, normal, view, roughness, pixel, u, realtimeColor, realtimeDepth) * base;
+    float3 behind = realtimeRefraction(position, normal, view, roughness, pixel, u, realtimeColor, realtimeDepth) * base;
+#ifdef REALTIME_ABLATE_GLASSBEHIND
+    behind = float3(0.0f);
+#endif
+#ifdef REALTIME_ABLATE_GLASSREFL
+    reflected = float3(0.0f);
+#endif
     return mix(shaded, (float3(1.0f) - fresnel) * behind + surface, transmitted) + fresnel * reflected;
 }
 // How much light reaches the air between the camera and this surface, as a factor
@@ -5123,18 +5336,80 @@ float3 realtimeFogLight(float3 position, float2 pixel, constant Uniforms& u, tex
     }
     return total > 0.0f ? float3(0.35f) + 0.65f * lit / total : float3(1.0f);
 }
-// A grating lit by the scene's environment through its orders, the Metal form of
-// realtimeDiffractionSky (backend_opengl.cpp, realtime_diffraction_environment.h).
+// A grating lit by the scene's light through its orders, the Metal form of
+// realtimeDiffractionSky (backend_opengl.cpp, realtime_diffraction_environment.h):
+// the sky and ambient, the analytic sun and the directional lights. The sky here is
+// without its sun disc, which realtimeDiffractionSunArc integrates over each order's
+// arc instead. The scene's ambient colour is environment radiance from every
+// direction, as Path Trace adds it (pathtrace/lights.h).
 float3 realtimeDiffractionSkyRadiance(float3 direction, float solidAngle, constant Uniforms& u,
                                       texture2d<float> environmentTexture) {
-    if (u.sky[0].w > 1.5f) return environmentImageFiltered(direction, u.sky[0], u.sky[1], solidAngle, environmentTexture);
-    if (u.sky[0].w > 0.5f) return analyticSkyRadiance(direction, u.sky[0], u.sky[1], u.sky[2], u.sky[3], u.sky[4]);
-    float3 flatSky = float3(0.0f);
+    if (u.sky[0].w > 1.5f) return environmentImageFiltered(direction, u.sky[0], u.sky[1], solidAngle, environmentTexture) + u.ambient.xyz;
+    if (u.sky[0].w > 0.5f) {
+        const float3 d = normalize(direction);
+        const float cap = clamp((dot(d, u.sky[4].xyz) - u.sky[3].w) / (1.0f - u.sky[3].w), 0.0f, 1.0f);
+        const float3 disc = u.sky[3].rgb * u.sky[4].w * cap * cap * (3.0f - 2.0f * cap);
+        return max(analyticSkyRadiance(d, u.sky[0], u.sky[1], u.sky[2], u.sky[3], u.sky[4])
+            - (1.0f - analyticSkyCloudOpacity(d, u.sky[1], u.sky[2])) * disc, float3(0.0f)) + u.ambient.xyz;
+    }
+    float3 flatSky = u.ambient.xyz;
     for (uint i = 0u; i < 16u; ++i) {
         if (i >= uint(u.ambient.w)) break;
         if (u.lightKinds[i].x == 2u) flatSky += u.lightColors[i].rgb * u.lightColors[i].a;
     }
     return flatSky;
+}
+// A rough grating spreads each order over a Gaussian lobe of per-axis width sigma, so a
+// small source seen through an order is its disc widened to the radius whose spread
+// matches, sqrt(r^2 + (2 sigma)^2), at the same power (realtimediffraction::lobeDisc).
+// x is the widened disc's edge cosine and y the radiance factor that keeps its power.
+float2 realtimeDiffractionLobeDisc(float cosRadius, float sigma) {
+    if (!(sigma > 0.0f)) return float2(cosRadius, 1.0f);
+    const float radius = acos(clamp(cosRadius, -1.0f, 1.0f));
+    const float cosWide = cos(min(sqrt(radius * radius + 4.0f * sigma * sigma), pi));
+    return float2(cosWide, (1.0f - cosRadius) / max(1.0f - cosWide, 1.0e-12f));
+}
+// The share of the straight piece from d0 to d1 inside a disc around unit axis whose
+// edge is at cosine cosRadius (realtimediffraction::sunArc), and its middle in z.
+float2 realtimeDiffractionDiscPiece(float3 d0, float3 d1, float3 axis, float cosRadius) {
+    const float3 e = d1 - d0, f = d0 - axis;
+    const float a = dot(e, e), b = dot(e, f), c = dot(f, f) - 2.0f * (1.0f - cosRadius);
+    if (!(a > 1.0e-12f)) return float2(c < 0.0f ? 1.0f : 0.0f, 0.5f);
+    const float discriminant = b * b - a * c;
+    if (!(discriminant > 0.0f)) return float2(0.0f);
+    const float root = sqrt(discriminant);
+    const float low = max((-b - root) / a, 0.0f), high = min((-b + root) / a, 1.0f);
+    return high > low ? float2(high - low, 0.5f * (low + high)) : float2(0.0f);
+}
+// The analytic sun disc seen along the straight piece from d0 to d1 of an order's arc:
+// the share of the piece inside the disc times the disc's radiance at its middle.
+float3 realtimeDiffractionSunArc(float3 d0, float3 d1, float sigma, constant Uniforms& u) {
+    if (!(u.sky[0].w > 0.5f && u.sky[0].w <= 1.5f) || !(u.sky[4].w > 0.0f)) return float3(0.0f);
+    const float2 disc = realtimeDiffractionLobeDisc(u.sky[3].w, sigma);
+    const float2 piece = realtimeDiffractionDiscPiece(d0, d1, u.sky[4].xyz, disc.x);
+    if (!(piece.x > 0.0f)) return float3(0.0f);
+    const float3 d = normalize(mix(d0, d1, piece.y));
+    const float cap = clamp((dot(d, u.sky[4].xyz) - disc.x) / (1.0f - disc.x), 0.0f, 1.0f);
+    return piece.x * (1.0f - analyticSkyCloudOpacity(d, u.sky[1], u.sky[2]))
+        * u.sky[3].rgb * u.sky[4].w * disc.y * cap * cap * (3.0f - 2.0f * cap);
+}
+// The scene's directional lights through the orders. A light of irradiance E and angular
+// radius r is a disc of radiance E / (pi r^2), so an order's arc that crosses it carries
+// the light's own colour. The Metal uniforms carry no light size, so every light has
+// the authored-without-a-size kRealtimeLightRadius.
+constant int kRealtimeDiffractionLights = 4;
+float3 realtimeDiffractionLightArcs(float3 d0, float3 d1, thread const float* lightVisible, float sigma,
+                                    constant Uniforms& u) {
+    float3 sum = float3(0.0f);
+    const float radius = min(sqrt(kRealtimeLightRadius * kRealtimeLightRadius + 4.0f * sigma * sigma), pi);
+    for (int i = 0; i < kRealtimeDiffractionLights; ++i) {
+        if (!(lightVisible[i] > 0.0f)) continue;
+        const float3 axis = rotateQuaternion(u.lightRotations[i], float3(0.0f, 0.0f, 1.0f));
+        const float share = realtimeDiffractionDiscPiece(d0, d1, axis, cos(radius)).x;
+        if (share > 0.0f)
+            sum += lightVisible[i] * share * u.lightColors[i].rgb * u.lightColors[i].a / (pi * radius * radius);
+    }
+    return sum;
 }
 float realtimeDiffractionBandShare(int band, float3 rgb, constant Uniforms& u) {
     const float3 xyz = float3(u.diffractionSpectral[band].z, u.diffractionSpectral[band].w, u.diffractionSpectralZ[band].x);
@@ -5143,21 +5418,456 @@ float realtimeDiffractionBandShare(int band, float3 rgb, constant Uniforms& u) {
     const float total = response.x + response.y + response.z;
     return total > 0.0f ? dot(rgb, response) / total : dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
 }
+// Lands light of one wavelength from band b's interval on the band centres either side
+// of it (realtimediffraction::tentBands), mixed by distance.
+void realtimeDiffractionDeposit(int b, float wavelength, float3 arriving, float amount, thread float* deposits,
+                                constant Uniforms& u) {
+    int lower = b, upper = b;
+    if (wavelength < u.diffractionSpectral[b].x && b > 0) lower = b - 1;
+    else if (wavelength > u.diffractionSpectral[b].x && b < 7) upper = b + 1;
+    const float span = u.diffractionSpectral[upper].x - u.diffractionSpectral[lower].x;
+    const float t = span > 0.0f ? clamp((wavelength - u.diffractionSpectral[lower].x) / span, 0.0f, 1.0f) : 0.0f;
+    const float share = mix(realtimeDiffractionBandShare(lower, arriving, u), realtimeDiffractionBandShare(upper, arriving, u), t);
+    deposits[lower] += amount * share * (1.0f - t);
+    deposits[upper] += amount * share * t;
+}
+// The world direction order (primary, secondary) of one wavelength arrives from, toward
+// outgoing. False when the order does not propagate at that wavelength.
+bool realtimeDiffractionOrderDirection(float4 geometry, float4 secondaryGeometry, bool crossed, int primary,
+    int secondary, float wavelength, float3 tangent, float3 bitangent, float3 normal, float3 outgoing,
+    thread float3& direction, thread float& z) {
+    float2 xy = -outgoing.xy + float(primary) * wavelength / geometry.z * geometry.xy;
+    if (crossed) xy += float(secondary) * wavelength / secondaryGeometry.z * secondaryGeometry.xy;
+    const float square = dot(xy, xy);
+    z = square < 1.0f ? sqrt(1.0f - square) : 0.0f;
+    direction = xy.x * tangent + xy.y * bitangent + z * normal;
+    return z > 1.0e-6f;
+}
+// The scene's glowing triangles (realtime_diffraction_emitters.h), in the frame's
+// emitter buffer: element 0 holds the count in x, then three corners per triangle with
+// the emission's channels in w, as the OpenGL scene table holds them.
+int realtimeEmitterCount(const device float4* emitters) { return int(emitters[0].x); }
+// The nearest emissive triangle along the ray, from either side, unless something
+// opaque stands in front of it. False when the ray reaches no emitter.
+bool realtimeDiffractionEmitter(float3 position, float3 normal, float3 direction, thread float3& radiance,
+                                const device float4* emitters, constant Uniforms& u, texture2d<float> opaqueTexture) {
+    radiance = float3(0.0f);
+#ifdef REALTIME_ABLATE_CHORD
+    return false;
+#endif
+    float nearest = 3.402823e38f;
+    bool found = false;
+    const int count = realtimeEmitterCount(emitters);
+    for (int t = 0; t < count; ++t) {
+        const float4 a = emitters[1 + 3 * t], b = emitters[2 + 3 * t], c = emitters[3 + 3 * t];
+        const float3 e1 = b.xyz - a.xyz, e2 = c.xyz - a.xyz;
+        const float3 p = cross(direction, e2);
+        const float det = dot(e1, p);
+        if (abs(det) <= 1.0e-12f) continue;
+        const float inverse = 1.0f / det;
+        const float3 s = position - a.xyz;
+        const float uu = dot(s, p) * inverse;
+        if (uu < 0.0f || uu > 1.0f) continue;
+        const float3 q = cross(s, e1);
+        const float v = dot(direction, q) * inverse;
+        if (v < 0.0f || uu + v > 1.0f) continue;
+        const float distance = dot(e2, q) * inverse;
+        if (!(distance > 1.0e-4f) || distance >= nearest) continue;
+        nearest = distance;
+        radiance = float3(a.w, b.w, c.w);
+        found = true;
+    }
+#ifndef REALTIME_ABLATE_EMITVIS
+    if (found && opaqueVisibility(position, normal, direction, nearest * (1.0f - 1.0e-3f), u.opaqueControl, opaqueTexture) < 0.5f)
+        radiance = float3(0.0f);
+#endif
+    return found;
+}
+// The normal distribution's CDF in the logistic form realtimediffraction::softEdge uses.
+float realtimeSoftEdge(float x) { return 1.0f / (1.0f + exp(-1.702f * x)); }
+// The emitters seen along the straight piece from d0 to d1 of an arc of directions
+// (realtimediffraction::chordTriangleShare): each triangle covers an exact share of the
+// piece, read with one shadow ray at the middle of its share. A rough grating's lobe of
+// per-axis width sigma softens each edge of a triangle's cone over sigma
+// (realtimediffraction::lobeTriangleShare). Returns the shares times each emitter's
+// radiance, and the covered share.
+// The emitter triangles whose centre shadow ray a pixel keeps (realtimeDiffractionEmitterChord);
+// later triangles trace theirs each time.
+constant int kRealtimeChordCentreCache = 64;
+float3 realtimeDiffractionEmitterChord(float3 position, float3 normal, float3 d0, float3 d1, float sigma,
+                                       thread float& covered, const device float4* emitters, constant Uniforms& u,
+                                       texture2d<float> opaqueTexture, thread uint* centreKnown, thread uint* centreVisible) {
+    float3 sum = float3(0.0f);
+    covered = 0.0f;
+#ifdef REALTIME_ABLATE_LOBE
+    sigma = 0.0f;
+#endif
+#ifdef REALTIME_ABLATE_CHORD
+    return sum;
+#endif
+    const float3 e = d1 - d0;
+    const int count = realtimeEmitterCount(emitters);
+    for (int t = 0; t < count; ++t) {
+        const float4 a = emitters[1 + 3 * t], b = emitters[2 + 3 * t], c = emitters[3 + 3 * t];
+        const float3 A = a.xyz - position, B = b.xyz - position, C = c.xyz - position;
+        const float det = dot(A, cross(B, C));
+        if (abs(det) <= 1.0e-12f) continue;
+        const float orientation = det > 0.0f ? 1.0f : -1.0f;
+        const float3 planes[3] = { cross(B, C), cross(C, A), cross(A, B) };
+        float share;
+        float3 direction;
+        bool inside = false;
+        if (sigma > 0.0f) {
+            const float3 middle = normalize(d0 + 0.5f * e);
+            share = 1.0f;
+            inside = true;
+            for (int k = 0; k < 3; ++k) {
+                const float signedSine = orientation * dot(planes[k], middle) / max(length(planes[k]), 1.0e-30f);
+                share *= realtimeSoftEdge(signedSine / sigma);
+                inside = inside && signedSine >= 0.0f;
+            }
+            if (!(share > 1.0e-4f)) continue;
+            // Only the lobe reaches a triangle the middle misses: its shadow ray aims at the centre.
+            direction = inside ? middle : normalize(A + B + C);
+        } else {
+            float low = 0.0f, high = 1.0f;
+            for (int k = 0; k < 3; ++k) {
+                const float p = orientation * dot(planes[k], d0), q = orientation * dot(planes[k], e);
+                if (abs(q) <= 1.0e-12f) { if (p < 0.0f) high = -1.0f; }
+                else if (q > 0.0f) low = max(low, -p / q);
+                else high = min(high, -p / q);
+            }
+            if (!(high > low)) continue;
+            share = high - low;
+            direction = normalize(d0 + 0.5f * (low + high) * e);
+        }
+        const float3 n = cross(B - A, C - A);
+        const float distance = dot(n, A) / dot(n, direction);
+        if (!(distance > 1.0e-4f)) continue;
+#ifndef REALTIME_ABLATE_EMITVIS
+        // A triangle only the lobe reaches is aimed at through its centre, the same ray
+        // from this pixel for every order and sub-wavelength, so the pixel traces it
+        // once. Tracing it for each of them made a few of the orb's pixels run for
+        // hundreds of milliseconds, long enough for the GPU to report a lockup.
+        bool visible;
+        if (sigma > 0.0f && !inside && t < kRealtimeChordCentreCache) {
+            const uint word = uint(t) >> 5u, bit = 1u << (uint(t) & 31u);
+            if ((centreKnown[word] & bit) == 0u) {
+                centreKnown[word] |= bit;
+                if (opaqueVisibility(position, normal, direction, distance * (1.0f - 1.0e-3f), u.opaqueControl, opaqueTexture) >= 0.5f)
+                    centreVisible[word] |= bit;
+            }
+            visible = (centreVisible[word] & bit) != 0u;
+        } else
+            visible = opaqueVisibility(position, normal, direction, distance * (1.0f - 1.0e-3f), u.opaqueControl, opaqueTexture) >= 0.5f;
+        if (!visible) continue;
+#endif
+        sum += share * float3(a.w, b.w, c.w);
+        covered += share;
+    }
+    // Overlapping emitters along one piece count once.
+    if (covered > 1.0f) { sum /= covered; covered = 1.0f; }
+    return sum;
+}
+// One edge's part of a polygon's vector irradiance (realtimediffraction::emitterIrradianceVector).
+float3 realtimeEdgeIrradiance(float3 p, float3 q) {
+    const float3 n = cross(p, q);
+    const float length2 = dot(n, n);
+    return length2 > 1.0e-24f ? 0.5f * acos(clamp(dot(p, q), -1.0f, 1.0f)) * n * rsqrt(length2) : float3(0.0f);
+}
+// Direct light from the scene's glowing triangles, the room lights Path Trace samples as
+// emitters. Each triangle's vector irradiance gives its power and mean direction, exact
+// for the diffuse term above the horizon. Unshadowed, as on OpenGL. coatLight gathers
+// the coat's share.
+float3 realtimeEmitterDirect(float3 position, float3 normal, float3 toView, float3 base, float metallic,
+                             float roughness, float dielectric, float transmission, thread float3& coatLight,
+                             const device float4* emitters) {
+    float3 sum = float3(0.0f);
+#ifdef REALTIME_ABLATE_EMITTERLIGHT
+    return sum;
+#endif
+    const int count = realtimeEmitterCount(emitters);
+    for (int t = 0; t < count; ++t) {
+        const float4 a = emitters[1 + 3 * t], b = emitters[2 + 3 * t], c = emitters[3 + 3 * t];
+        const float3 A = a.xyz - position, B = b.xyz - position, C = c.xyz - position;
+        const float3 plane = cross(B - A, C - A);
+        const float planeLength = length(plane);
+        // A point in the triangle's own plane is the emitter itself, which shows its emission.
+        if (!(planeLength > 0.0f) || abs(dot(plane, A)) <= 1.0e-6f * planeLength) continue;
+        const float3 va = normalize(A), vb = normalize(B), vc = normalize(C);
+        float3 vector = realtimeEdgeIrradiance(va, vb) + realtimeEdgeIrradiance(vb, vc) + realtimeEdgeIrradiance(vc, va);
+        if (dot(vector, va + vb + vc) < 0.0f) vector = -vector;
+        const float magnitude = length(vector);
+        if (!(magnitude > 0.0f)) continue;
+        const float3 toLight = vector / magnitude;
+        if (dot(normal, toLight) <= 0.0f) continue;
+        const float3 radiance = float3(a.w, b.w, c.w) * magnitude;
+        sum += radiance * baseSurfaceDirect(base, metallic, roughness, dielectric, transmission, normal, toLight, toView);
+        coatLight += radiance * max(dot(normal, toLight), 0.0f);
+    }
+    return sum;
+}
+// The grating's mirror (realtime_diffraction_mirror.h): the zero order's view of the lit
+// room. The orders read only the sky and the glowing triangles, so the orb's lower half,
+// which sees the floor, stayed black. The OpenGL Realtime adds the mirror in a pass over
+// its gather target; here each grating pixel traces its own mirror ray through the
+// transport's scene query. The emitter buffer's element 0 holds the weights' first
+// element in y and the object count in z, 0 when the frame has no mirror. The weights
+// take kWeightSamples elements over cos(theta), then one for the ambient, then two per
+// object: its id halves, metallic and glow, then its base colour.
+float3 realtimeGratingMirror(VertexOut in, constant Uniforms& u, texture2d<float> opaqueTexture,
+                             const device float4* emitters) {
+#ifdef REALTIME_ABLATE_MIRROR
+    return float3(0.0f);
+#endif
+    const int first = int(emitters[0].y), objects = int(emitters[0].z);
+    if (first <= 0 || objects <= 0) return float3(0.0f);
+    const float3 world = in.worldPosition, normal = normalize(in.worldNormal);
+    const float3 toView = normalize(fixtureToViewer(world, u));
+    const float cosine = dot(normal, toView);
+    if (!(cosine > 0.0f)) return float3(0.0f);
+    const float at = clamp(cosine, 0.0f, 1.0f) * 32.0f;
+    const int low = min(int(at), 31);
+    const float3 weight = mix(emitters[first + low].rgb, emitters[first + low + 1].rgb, at - float(low));
+    if (!(max(weight.r, max(weight.g, weight.b)) > 1.0e-4f)) return float3(0.0f);
+    const float3 direction = reflect(-toView, normal);
+    const float bias = max(1.0e-4f, 1.0e-4f * max(max(abs(world.x), abs(world.y)), abs(world.z)));
+    const uint grating = uint(in.rawIdentifiers.z) | (uint(in.rawIdentifiers.w) << 16u);
+    const SceneClosestHit hit = sceneClosestHit(world + normal * bias, direction, 0.0f, 3.402823e38f,
+        u.spectralQueryControl, 0u, grating, opaqueTexture);
+    // A miss sees the sky and a glowing hit an emitter, which the orders already read.
+    if (hit.status != 1) return float3(0.0f);
+    const int records = first + 34;
+    int found = -1;
+    for (int i = 0; i < objects; ++i) {
+        const float4 id = emitters[records + 2 * i];
+        if (uint(id.x) + uint(id.y) * 65536u == hit.objectId) { found = i; break; }
+    }
+    if (found < 0) return float3(0.0f);
+    const float4 record = emitters[records + 2 * found];
+    if (record.w > 0.5f) return float3(0.0f);
+    const float3 surfaceNormal = dot(hit.shadingNormal, direction) > 0.0f ? -hit.shadingNormal : hit.shadingNormal;
+    float3 irradiance = float3(0.0f);
+    const int count = realtimeEmitterCount(emitters);
+    for (int t = 0; t < count; ++t) {
+        const float4 a = emitters[1 + 3 * t], b = emitters[2 + 3 * t], c = emitters[3 + 3 * t];
+        const float3 A = a.xyz - hit.position, B = b.xyz - hit.position, C = c.xyz - hit.position;
+        const float3 plane = cross(B - A, C - A);
+        const float planeLength = length(plane);
+        if (!(planeLength > 0.0f) || abs(dot(plane, A)) <= 1.0e-6f * planeLength) continue;
+        const float3 va = normalize(A), vb = normalize(B), vc = normalize(C);
+        float3 vector = realtimeEdgeIrradiance(va, vb) + realtimeEdgeIrradiance(vb, vc) + realtimeEdgeIrradiance(vc, va);
+        if (dot(vector, va + vb + vc) < 0.0f) vector = -vector;
+        irradiance += float3(a.w, b.w, c.w) * max(dot(surfaceNormal, vector), 0.0f);
+    }
+    const float3 added = weight * emitters[records + 2 * found + 1].rgb
+        * ((1.0f - record.z) * irradiance / pi + emitters[first + 33].rgb);
+    return all(isfinite(added)) ? added : float3(0.0f);
+}
+// A pressed track's order efficiency (pressedDiscEfficiency in diffraction_order_core.h):
+// a pit stripe of the track's duty share, pit or land along it with mean one half.
+float realtimePressedDiscEfficiency(int order, float stripeFraction, float phase) {
+    const float2 step = float2(cos(phase) - 1.0f, sin(phase));
+    const float meanStripe = 0.5f * stripeFraction;
+    if (order == 0) return dot(float2(1.0f, 0.0f) + meanStripe * step, float2(1.0f, 0.0f) + meanStripe * step);
+    const float argument = pi * float(order) * stripeFraction;
+    const float amplitude = meanStripe * sin(argument) / argument;
+    return dot(step, step) * amplitude * amplitude;
+}
+// Pressed-disc pit scatter, Path Trace's lobe (integrator_body.inl), integrated on fixed
+// nodes as the OpenGL realtimePitScatter does (realtimediffraction::pitScatterNodes):
+// three lines along the tracks at the Lorentzian's sixths, each cut across into pieces
+// weighted by sinc^2, each piece reading the sky. The emitters take the lobe's mass on
+// each of their triangles (realtimePitTriangleMass), and the sky the rest. A piece past
+// the horizon stays in the mirror, as Path Trace keeps it.
+constant int kRealtimePitScatterPieces = 12;
+constant float kRealtimePitScatterReach = 3.0f;
+constant float realtimediffractionMeanRun = 1354.0f;
+// The sinc^2 mass inside the reach on the twelve pieces, what their weights sum to.
+constant float kRealtimePitScatterAcrossMass = 0.9663037f;
+// Six Gauss-Legendre nodes across a triangle's range; six midpoints read Grooved Disc's lamp 14% low.
+constant int kRealtimePitScatterAcrossSteps = 6;
+constant float kRealtimePitScatterAcrossNodes[6] = { -0.9324695f, -0.6612094f, -0.2386192f, 0.2386192f, 0.6612094f, 0.9324695f };
+constant float kRealtimePitScatterAcrossWeights[6] = { 0.1713245f, 0.3607616f, 0.4679139f, 0.4679139f, 0.3607616f, 0.1713245f };
+constant int kRealtimePitScatterAlongPieces = 6;
+float3 realtimePitScatterDirection(float2 xy, float3 tangent, float3 bitangent, float3 normal) {
+    return xy.x * tangent + xy.y * bitangent + sqrt(max(0.0f, 1.0f - dot(xy, xy))) * normal;
+}
+// The pit lobe's mass on emitter triangle abc from the grating, as a share of the whole
+// lobe (realtimediffraction::pitTriangleMass, the OpenGL realtimePitTriangleMass). Three
+// lines along the tracks reach only 0.58 half widths, so Grooved Disc's lamp two half
+// widths along the track fell between them. Each triangle is read on its own: Gauss-Legendre
+// nodes across its own range, weighted by sinc^2, and at each step the Lorentzian's exact mass over the
+// share of a chord along the tracks the triangle covers. aim is the heaviest piece's middle.
+float realtimePitTriangleMass(float3 A, float3 B, float3 C, float3 tangent, float3 bitangent, float3 normal,
+    float2 mirror, float2 across, float acrossWidth, float alongWidth, thread float3& aim) {
+    aim = float3(0.0f);
+    const float det = dot(A, cross(B, C));
+    if (abs(det) <= 1.0e-12f) return 0.0f;
+    const float orientation = det > 0.0f ? 1.0f : -1.0f;
+    const float3 planes[3] = { cross(B, C), cross(C, A), cross(A, B) };
+    const float2 along = float2(-across.y, across.x);
+    // The triangle's extent from its corners and edge middles, whose arcs bow outward.
+    const float3 points[6] = { A, B, C, A + B, B + C, C + A };
+    float uLow = 3.4e38f, uHigh = -3.4e38f, yLow = 3.4e38f, yHigh = -3.4e38f;
+    for (int i = 0; i < 6; ++i) {
+        const float size = length(points[i]);
+        if (!(size > 0.0f)) continue;
+        const float2 offset = float2(dot(points[i], tangent), dot(points[i], bitangent)) / size - mirror;
+        const float u = dot(offset, across) / acrossWidth, y = dot(offset, along);
+        uLow = min(uLow, u); uHigh = max(uHigh, u);
+        yLow = min(yLow, y); yHigh = max(yHigh, y);
+    }
+    const float uPad = 0.1f * (uHigh - uLow), yPad = 0.25f * (yHigh - yLow);
+    uLow = max(uLow - uPad, -kRealtimePitScatterReach);
+    uHigh = min(uHigh + uPad, kRealtimePitScatterReach);
+    yLow -= yPad; yHigh += yPad;
+    if (!(uHigh > uLow) || !(yHigh > yLow)) return 0.0f;
+    float mass = 0.0f, heaviest = 0.0f;
+    const float uMiddle = 0.5f * (uLow + uHigh), uHalf = 0.5f * (uHigh - uLow);
+    for (int i = 0; i < kRealtimePitScatterAcrossSteps; ++i) {
+        const float u = uMiddle + uHalf * kRealtimePitScatterAcrossNodes[i];
+        const float argument = pi * u;
+        const float sinc = abs(argument) > 1.0e-4f ? sin(argument) / argument : 1.0f;
+        const float weight = sinc * sinc * uHalf * kRealtimePitScatterAcrossWeights[i] / kRealtimePitScatterAcrossMass;
+        const float2 centre = mirror + across * (acrossWidth * u);
+        // The line's piece above the horizon, |centre + along y| < 1.
+        const float middle = dot(centre, along);
+        const float discriminant = middle * middle - (dot(centre, centre) - 1.0f);
+        if (!(discriminant > 0.0f)) continue;
+        const float root = sqrt(discriminant);
+        const float y0 = max(yLow, -middle - root), y1 = min(yHigh, -middle + root);
+        if (!(y1 > y0)) continue;
+        const float yStep = (y1 - y0) / float(kRealtimePitScatterAlongPieces);
+        for (int j = 0; j < kRealtimePitScatterAlongPieces; ++j) {
+            const float ya = y0 + float(j) * yStep;
+            const float3 d0 = realtimePitScatterDirection(centre + along * ya, tangent, bitangent, normal);
+            const float3 e = realtimePitScatterDirection(centre + along * (ya + yStep), tangent, bitangent, normal) - d0;
+            float low = 0.0f, high = 1.0f;
+            for (int k = 0; k < 3; ++k) {
+                const float p = orientation * dot(planes[k], d0), q = orientation * dot(planes[k], e);
+                if (abs(q) <= 1.0e-12f) { if (p < 0.0f) high = -1.0f; }
+                else if (q > 0.0f) low = max(low, -p / q);
+                else high = min(high, -p / q);
+            }
+            if (!(high > low)) continue;
+            const float piece = weight * (atan((ya + high * yStep) / alongWidth) - atan((ya + low * yStep) / alongWidth)) / pi;
+            mass += piece;
+            if (piece > heaviest) { heaviest = piece; aim = d0 + 0.5f * (low + high) * e; }
+        }
+    }
+    if (dot(aim, aim) > 0.0f) aim = normalize(aim);
+    return mass;
+}
+void realtimePitScatter(int b, float wavelength, float4 geometry, float3 tangent, float3 bitangent, float3 normal,
+    float3 outgoing, float3 origin, float3 side, float visibility, float solidAngle, thread float* deposits,
+    const device float4* emitters, constant Uniforms& u, texture2d<float> environmentTexture,
+    texture2d<float> opaqueTexture) {
+#ifdef REALTIME_ABLATE_PIT
+    return;
+#endif
+    const float duty = u.diffractionMicrostructure.x;
+    const float mirrorPhase = 2.0f * pi * geometry.w * 2.0f * outgoing.z / wavelength;
+    const float halfSine = sin(0.5f * mirrorPhase);
+    const float power = duty * halfSine * halfSine;
+    const float reciprocal = length(geometry.xy);
+    if (!(power > 0.0f) || !(reciprocal > 0.0f) || !(geometry.z > 0.0f)) return;
+    const float2 across = geometry.xy / reciprocal, along = float2(-across.y, across.x);
+    const float acrossWidth = wavelength / (duty * geometry.z / reciprocal);
+    const float alongWidth = wavelength / (pi * realtimediffractionMeanRun);
+    const float3 mirror = realtimePitScatterDirection(-outgoing.xy, tangent, bitangent, normal);
+    // The emitters each triangle's share of the lobe sees, one shadow ray per triangle.
+    float3 emitted = float3(0.0f);
+    float covered = 0.0f;
+#ifndef REALTIME_ABLATE_CHORD
+    const int count = realtimeEmitterCount(emitters);
+    for (int t = 0; t < count; ++t) {
+        const float4 a = emitters[1 + 3 * t], c1 = emitters[2 + 3 * t], c2 = emitters[3 + 3 * t];
+        float3 aim;
+        const float mass = realtimePitTriangleMass(a.xyz - origin, c1.xyz - origin, c2.xyz - origin, tangent, bitangent,
+            normal, -outgoing.xy, across, acrossWidth, alongWidth, aim);
+        if (!(mass > 1.0e-7f)) continue;
+        const float3 n = cross(c1.xyz - a.xyz, c2.xyz - a.xyz);
+        const float distance = dot(n, a.xyz - origin) / dot(n, aim);
+        if (!(distance > 1.0e-4f)) continue;
+#ifndef REALTIME_ABLATE_EMITVIS
+        if (opaqueVisibility(origin, side, aim, distance * (1.0f - 1.0e-3f), u.opaqueControl, opaqueTexture) < 0.5f) continue;
+#endif
+        emitted += mass * float3(a.w, c1.w, c2.w);
+        covered += mass;
+    }
+    // Overlapping emitters count once.
+    if (covered > 1.0f) { emitted /= covered; covered = 1.0f; }
+#endif
+    float3 light = float3(0.0f), skyLight = float3(0.0f);
+    float total = 0.0f, skyTotal = 0.0f;
+    for (int line = 0; line < 3; ++line) {
+        // tan(pi (u - 1/2)) at u = 1/6, 1/2, 5/6.
+        const float2 base = -outgoing.xy + along * (alongWidth * 0.57735027f * float(line - 1));
+        const float pieceWidth = 2.0f * kRealtimePitScatterReach / float(kRealtimePitScatterPieces);
+        float x0 = -kRealtimePitScatterReach;
+        float2 xy0 = base + across * (acrossWidth * x0);
+        for (int k = 0; k < kRealtimePitScatterPieces; ++k) {
+            const float x1 = x0 + pieceWidth, middle = 0.5f * (x0 + x1);
+            const float argument = pi * middle;
+            const float sinc = abs(argument) > 1.0e-4f ? sin(argument) / argument : 1.0f;
+            const float weight = sinc * sinc * pieceWidth;
+            const float2 xy1 = base + across * (acrossWidth * x1);
+            if (dot(xy0, xy0) < 1.0f && dot(xy1, xy1) < 1.0f) {
+                const float3 d0 = realtimePitScatterDirection(xy0, tangent, bitangent, normal);
+                const float3 d1 = realtimePitScatterDirection(xy1, tangent, bitangent, normal);
+                skyLight += weight * visibility * realtimeDiffractionSkyRadiance(normalize(d0 + d1), solidAngle, u, environmentTexture);
+                skyTotal += weight;
+            } else {
+                float3 mirrored;
+                light += weight * (realtimeDiffractionEmitter(origin, side, mirror, mirrored, emitters, u, opaqueTexture)
+                    ? mirrored : visibility * realtimeDiffractionSkyRadiance(mirror, solidAngle, u, environmentTexture));
+            }
+            total += weight;
+            x0 = x1; xy0 = xy1;
+        }
+    }
+    // The sky above the horizon shows where no emitter covers the lobe.
+    if (skyTotal > 0.0f) light += skyLight * max(1.0f - covered * total / skyTotal, 0.0f);
+    if (total > 0.0f) deposits[b] += power * realtimeDiffractionBandShare(b, emitted + light / total, u);
+}
+// The evaluated orders and transport, or nothing under the ORDERS ablation.
+float3 realtimeOrdersKept(float3 diffraction) {
+#ifdef REALTIME_ABLATE_ORDERS
+    return float3(0.0f);
+#endif
+    return diffraction;
+}
+// Sub-wavelengths per band (realtimediffraction::bandInterval). Each band's light is
+// read across its whole interval, so an order's colour moves smoothly along its arc.
+constant int kRealtimeDiffractionSubbands = 8;
 float3 realtimeDiffractionSky(VertexOut in, constant Uniforms& u, texture2d<float> environmentTexture,
-                              texture2d<float> opaqueTexture) {
+                              texture2d<float> opaqueTexture, const device float4* emitters) {
+#ifdef REALTIME_ABLATE_SKY
+    return float3(0.0f);
+#endif
     const bool transport = u.spectralSampleControl.w == 1.0f;
-    // A grating with an admitted environment path already integrates its environment.
-    if (!transport && u.diffractionEnvironment.x == 2.0f) return float3(0.0f);
+    // The grating shades from the interpolated vertex normal on the face's side, as Path
+    // Trace's shading normal and the OpenGL Realtime program do. The face's own normal
+    // held every order still across a facet, so the orb and the disc showed their
+    // triangles as flat blocks of one colour.
     float3 normal = normalize(in.worldNormal);
     if (transport) {
-        const float3 geometric = normalize(cross(dfdx(in.worldPosition), dfdy(in.worldPosition)));
-        normal = dot(geometric, in.worldNormal) < 0.0f ? -geometric : geometric;
+        float3 geometric = normalize(cross(dfdx(in.worldPosition), dfdy(in.worldPosition)));
+        geometric = dot(geometric, in.worldNormal) < 0.0f ? -geometric : geometric;
+        normal = dot(normal, geometric) < 0.0f ? -normal : normal;
     }
     const float3 dpdx = dfdx(in.worldPosition), dpdy = dfdy(in.worldPosition);
     const float2 duvdx = dfdx(in.uv), duvdy = dfdy(in.uv);
     const float determinant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
     if (!isfinite(determinant) || abs(determinant) <= 1.0e-8f) return float3(0.0f);
     float3 tangent = normalize((dpdx * duvdy.y - dpdy * duvdx.y) / determinant);
+    // The vertices' smooth groove direction, signed as this triangle's dP/du, where it
+    // agrees with it; a constant +X tangent on a polar cap does not, and keeps dP/du.
+    const float3 grooveTangent = in.worldTangent * (dot(in.worldTangent, tangent) < 0.0f ? -1.0f : 1.0f);
+#ifndef REALTIME_ABLATE_SMOOTHTANGENT
+    if (dot(grooveTangent, tangent) > 0.7f) tangent = grooveTangent;
+#endif
     const float3 toViewWorld = normalize(fixtureToViewer(in.worldPosition, u));
     normal = brushedReliefNormal(normal, tangent, in.uv, toViewWorld, u.diffractionRoughness);
     tangent = normalize(tangent - normal * dot(normal, tangent));
@@ -5165,8 +5875,30 @@ float3 realtimeDiffractionSky(VertexOut in, constant Uniforms& u, texture2d<floa
     if (dot(bitangent, (-dpdx * duvdy.x + dpdy * duvdx.x) / determinant) < 0.0f) bitangent = -bitangent;
     const float3 outgoing = float3(dot(toViewWorld, tangent), dot(toViewWorld, bitangent), dot(toViewWorld, normal));
     if (!(outgoing.z > 0.0f)) return float3(0.0f);
-    const float visibility = realtimeSkyVisibility(in.worldPosition, in.worldNormal, in.position.xy, u, opaqueTexture);
-    if (visibility <= 0.0f) return float3(0.0f);
+    // The shadow rays start just off the grating on the viewed side, so they do not find
+    // the grating's own triangles or a coplanar carrier at its own depth.
+    const float3 side = dot(in.worldNormal, normal) < 0.0f ? -normalize(in.worldNormal) : normalize(in.worldNormal);
+    const float3 origin = in.worldPosition + side * 1.0e-4f * max(1.0f, u.projection.w - u.projection.z);
+    const float visibility = realtimeSkyVisibility(origin, side, in.position.xy, u, opaqueTexture);
+    // The sun's own shadow is one ray, not the hemisphere estimate.
+    const float sunVisible = u.sky[0].w > 0.5f && u.sky[0].w <= 1.5f && u.sky[4].w > 0.0f
+        ? opaqueVisibility(origin, side, u.sky[4].xyz, 3.402823e38f, u.opaqueControl, opaqueTexture) : 0.0f;
+    // Each directional light's shadow is one ray as well. A grating with its own direct
+    // path or authored source already has its light, so only the environment route with
+    // no direct intensity reads the scene's lights here.
+    float lightVisible[kRealtimeDiffractionLights];
+    bool anyLight = false;
+    const bool sceneLights = u.diffractionEnvironment.x == 2.0f && !transport
+        && !(u.diffractionIncidentDirectionAndIntensity.w > 0.0f);
+    for (int i = 0; i < kRealtimeDiffractionLights; ++i) {
+        lightVisible[i] = 0.0f;
+        if (!sceneLights || i >= int(u.ambient.w) || u.lightKinds[i].x != 0u) continue;
+        const float3 toLight = rotateQuaternion(u.lightRotations[i], float3(0.0f, 0.0f, 1.0f));
+        lightVisible[i] = !(u.lightColors[i].a > 0.0f) ? 0.0f : u.lightCones[i].w < 0.0f ? 1.0f
+            : opaqueVisibility(origin, side, toLight, 3.402823e38f, u.opaqueControl, opaqueTexture);
+        anyLight = anyLight || lightVisible[i] > 0.0f;
+    }
+    if (visibility <= 0.0f && sunVisible <= 0.0f && !anyLight && realtimeEmitterCount(emitters) <= 0) return float3(0.0f);
     float4 geometry = u.diffractionGeometry, secondaryGeometry = u.diffractionSecondaryGeometry;
     if (u.diffractionSpatialCounts.x > 0u) {
         const float4 lower = mix(u.diffractionFoilField[0], u.diffractionFoilField[1], clamp(in.uv.x, 0.0f, 1.0f));
@@ -5191,44 +5923,111 @@ float3 realtimeDiffractionSky(VertexOut in, constant Uniforms& u, texture2d<floa
     const int profile = int(u.diffractionControl.y + 0.5f);
     const float sigma = 2.0f * u.diffractionRoughness.y;
     const float solidAngle = 2.0f * pi * max(sigma * sigma, 1.0e-6f);
-    float3 xyz = float3(0.0f);
-    float whiteY = 0.0f;
+    // A pressed disc's track (PitStatistics::PressedDisc, coating lane w): its orders
+    // and the pits' scatter, as Path Trace has them (diffraction_order_core.h).
+    const bool pressedDisc = u.diffractionCoating.w > 0.5f;
+    // Each sub-wavelength's light lands on the two band centres around it, by distance,
+    // so its colour is its own and not its band's.
+    float deposits[8];
+    for (int b = 0; b < 8; ++b) deposits[b] = 0.0f;
+    uint centreKnown[2] = { 0u, 0u }, centreVisible[2] = { 0u, 0u };
     for (int b = 0; b < 8; ++b) {
-        const float4 spectral = u.diffractionSpectral[b], spectralZ = u.diffractionSpectralZ[b];
-        whiteY += spectralZ.y * spectral.w;
-        const float wavelength = spectral.x;
-        const float reflectance = spectralReflectance(wavelength, int(u.diffractionControl.w + 0.5f),
-            u.diffractionMicrostructure.y, u.diffractionMicrostructure.z, u);
-        if (!(reflectance > 0.0f)) continue;
+        const float centre = u.diffractionSpectral[b].x;
+        const float below = b > 0 ? u.diffractionSpectral[max(b - 1, 0)].x : 2.0f * centre - u.diffractionSpectral[1].x;
+        const float above = b < 7 ? u.diffractionSpectral[min(b + 1, 7)].x : 2.0f * centre - u.diffractionSpectral[6].x;
+        const float low = 0.5f * (below + centre), width = 0.5f * (above + centre) - low;
+        if (!(width > 0.0f)) continue;
+        // Orders that propagate anywhere in the band: the shortest wavelength has the
+        // widest range.
         int firstPrimary = -lastOrder, lastPrimary = lastOrder;
         if (!crossed) {
-            const int2 range = propagatingOneDimensionalOrders(outgoing.xy, geometry.xy, geometry.z, wavelength, lastOrder);
+            const int2 range = propagatingOneDimensionalOrders(outgoing.xy, geometry.xy, geometry.z, low, lastOrder);
             firstPrimary = range.x; lastPrimary = range.y;
         }
-        float radiance = 0.0f;
         for (int primary = firstPrimary; primary <= lastPrimary; ++primary) {
             if (primary != 0 && abs(primary) < firstOrder) continue;
             const int limit = crossed ? lastOrder : 0;
             for (int secondary = -limit; secondary <= limit; ++secondary) {
                 if (secondary != 0 && abs(secondary) < firstOrder) continue;
-                float2 xy = -outgoing.xy + float(primary) * wavelength / geometry.z * geometry.xy;
-                if (crossed) xy += float(secondary) * wavelength / secondaryGeometry.z * secondaryGeometry.xy;
-                const float square = dot(xy, xy);
-                if (square >= 1.0f) continue;
-                const float z = sqrt(1.0f - square);
-                if (z <= 1.0e-6f) continue;
-                const float phase = 2.0f * pi * geometry.w * (z + outgoing.z) / wavelength;
-                float efficiency = latticeEfficiency(profile, primary, secondary, crossed,
-                    u.diffractionControl.z > 0.5f, u.diffractionMicrostructure.x, phase, float2(cos(phase), sin(phase)));
-                const float height = 2.0f * pi * u.diffractionRoughness.x * (z + outgoing.z) / wavelength;
-                efficiency *= exp(-height * height) * outgoing.z / z;
-                if (!isfinite(efficiency)) continue;
-                const float3 direction = xy.x * tangent + xy.y * bitangent + z * normal;
-                radiance += clamp(efficiency, 0.0f, 1.0f)
-                    * realtimeDiffractionBandShare(b, realtimeDiffractionSkyRadiance(direction, solidAngle, u, environmentTexture), u);
+                float3 edge, direction;
+                float z;
+                // An order propagates for wavelengths from 0 up to one root, so an order
+                // dead at the band's shortest wavelength is dead across it.
+                bool edgeLive = realtimeDiffractionOrderDirection(geometry, secondaryGeometry, crossed, primary,
+                    secondary, low, tangent, bitangent, normal, outgoing, edge, z);
+                if (!edgeLive) continue;
+                const float stride = width / float(kRealtimeDiffractionSubbands);
+                for (int k = 0; k < kRealtimeDiffractionSubbands; ++k) {
+                    const float wavelength = low + (float(k) + 0.5f) * stride;
+                    float3 next;
+                    float nextZ;
+                    const bool nextLive = realtimeDiffractionOrderDirection(geometry, secondaryGeometry, crossed,
+                        primary, secondary, low + float(k + 1) * stride, tangent, bitangent, normal, outgoing, next, nextZ);
+                    if (realtimeDiffractionOrderDirection(geometry, secondaryGeometry, crossed, primary, secondary,
+                            wavelength, tangent, bitangent, normal, outgoing, direction, z)) {
+                        const float phase = 2.0f * pi * geometry.w * (z + outgoing.z) / wavelength;
+                        float efficiency;
+#ifndef REALTIME_ABLATE_EFFICIENCYTABLE
+                        if (!pressedDisc && realtimeEfficiencyTabled(emitters)) {
+                            // The table's band tiles hold the order at each band centre;
+                            // a sub-wavelength reads the two centres around it.
+                            const int order = crossed ? (primary + lastOrder) * (2 * lastOrder + 1) + secondary + lastOrder
+                                                      : primary + lastOrder;
+                            const int other = clamp(wavelength < centre ? b - 1 : b + 1, 0, 7);
+                            const float span = u.diffractionSpectral[other].x - centre;
+                            const float t = other == b || abs(span) < 1.0e-3f ? 0.0f
+                                : clamp((wavelength - centre) / span, 0.0f, 1.0f);
+                            efficiency = mix(realtimeOrderEfficiency(emitters, b, order, outgoing.xy),
+                                realtimeOrderEfficiency(emitters, other, order, outgoing.xy), t);
+                        } else
+#endif
+                        efficiency = pressedDisc
+                            ? realtimePressedDiscEfficiency(primary, u.diffractionMicrostructure.x, phase)
+                            : latticeEfficiency(profile, primary, secondary, crossed,
+                                u.diffractionControl.z > 0.5f, u.diffractionMicrostructure.x, phase, float2(cos(phase), sin(phase)));
+                        const float height = 2.0f * pi * u.diffractionRoughness.x * (z + outgoing.z) / wavelength;
+                        efficiency *= exp(-height * height) * outgoing.z / z;
+                        if (isfinite(efficiency)) {
+                            // The piece of the order's arc this sub-wavelength spans reads the
+                            // share of it each emitter covers, so a fan's edge across a panel
+                            // moves smoothly instead of in sub-wavelength steps.
+                            float3 arriving;
+                            if (nextLive) {
+                                float covered;
+                                arriving = realtimeDiffractionEmitterChord(origin, side, edge, next, sigma, covered, emitters, u, opaqueTexture,
+                                    centreKnown, centreVisible)
+                                    + (1.0f - covered) * visibility * realtimeDiffractionSkyRadiance(direction, solidAngle, u, environmentTexture);
+                            } else {
+                                float3 emitted;
+                                arriving = realtimeDiffractionEmitter(origin, side, direction, emitted, emitters, u, opaqueTexture)
+                                    ? emitted : visibility * realtimeDiffractionSkyRadiance(direction, solidAngle, u, environmentTexture);
+                            }
+                            if (nextLive && sunVisible > 0.0f)
+                                arriving += sunVisible * realtimeDiffractionSunArc(edge, next, sigma, u);
+                            if (nextLive && anyLight)
+                                arriving += realtimeDiffractionLightArcs(edge, next, lightVisible, sigma, u);
+                            realtimeDiffractionDeposit(b, wavelength, arriving,
+                                clamp(efficiency, 0.0f, 1.0f) / float(kRealtimeDiffractionSubbands), deposits, u);
+                        }
+                    }
+                    edge = next;
+                    if (!nextLive) break;
+                }
             }
         }
-        xyz += visibility * reflectance * radiance * spectralZ.y * float3(spectral.z, spectral.w, spectralZ.x);
+        if (pressedDisc)
+            realtimePitScatter(b, centre, geometry, tangent, bitangent, normal, outgoing, origin, side,
+                visibility, solidAngle, deposits, emitters, u, environmentTexture, opaqueTexture);
+    }
+    float3 xyz = float3(0.0f);
+    float whiteY = 0.0f;
+    for (int b = 0; b < 8; ++b) {
+        const float4 spectral = u.diffractionSpectral[b], spectralZ = u.diffractionSpectralZ[b];
+        whiteY += spectralZ.y * spectral.w;
+        const float reflectance = spectralReflectance(spectral.x, int(u.diffractionControl.w + 0.5f),
+            u.diffractionMicrostructure.y, u.diffractionMicrostructure.z, u);
+        if (reflectance > 0.0f)
+            xyz += reflectance * deposits[b] * spectralZ.y * float3(spectral.z, spectral.w, spectralZ.x);
     }
     xyz /= max(whiteY, 1.0e-8f);
     return max(float3(3.2406f*xyz.x-1.5372f*xyz.y-0.4986f*xyz.z,
@@ -5266,6 +6065,8 @@ inline bool composeRealtimeFixtureMain(std::string& fragment)
         {"        const float diffuseWeight = (1.0f - metallic) * (1.0f - 0.5f * roughness) * (1.0f - transmission);\n",
          "        if (u.sky[0].w > 0.5f && u.materialKind.z == 0u && transmission == 0.0f && alpha >= 1.0f)\n"
          "            skyBase *= realtimeSkyVisibility(in.worldPosition, in.worldNormal, in.position.xy, u, opaqueTexture);\n"
+         "        directBase += realtimeEmitterDirect(in.worldPosition, normal, toView, in.baseColor * baseTexel.rgb,\n"
+         "            metallic, roughness, dielectric, transmission, directCoat, realtimeEmitters);\n"
          "        const float diffuseWeight = (1.0f - metallic) * (1.0f - 0.5f * roughness) * (1.0f - transmission);\n"},
         {"            + (lighting + directCoat) * coat + emissive) / max(coverage, 0.000001f), alpha);\n",
          "            + (lighting + directCoat) * coat + emissive) / max(coverage, 0.000001f), alpha);\n"
@@ -5276,13 +6077,48 @@ inline bool composeRealtimeFixtureMain(std::string& fragment)
          "        realtimeFog = realtimeFogLight(in.worldPosition, in.position.xy, u, opaqueTexture);\n"},
         {"    if (u.materialKind.x != materialDiffractionReflective)\n        out.color = compositePass(out, u);\n",
          "    if (u.materialKind.x != materialDiffractionReflective)\n        out.color = compositePass(out, u, realtimeFog);\n"},
+        // Path Trace's camera rays see the scene's ambient colour as environment too.
+        {"            : analyticSkyBackground(in.worldPosition,u.sky[0],u.sky[1],u.sky[2],u.sky[3],u.sky[4]);\n",
+         "            : analyticSkyBackground(in.worldPosition,u.sky[0],u.sky[1],u.sky[2],u.sky[3],u.sky[4]);\n"
+         "        radiance+=u.ambient.xyz;\n"},
+        // An environment-path grating takes the scene's light through its orders alone,
+        // which realtimeDiffractionSky adds on the first path, as Path Trace lights it.
+        // The admitted environment and diffuse-plane paths are Raster's analytic
+        // stand-in for that light: a grey dome the scene does not have, whose green
+        // peaked spectrum turned the Grooved Sphere, Disc and Trading Card olive.
+        {"        return integrateDiffractionEnvironment(outgoing, tangent, bitangent, normal, in, u);\n",
+         "        return float3(0.0f);\n"},
         // The grating takes the environment through its orders on the first path of
         // each pixel it evaluated, as the OpenGL Realtime program does.
         {"            : float3(0.0f)) + diffraction * scatterWeight, 1.0f);\n",
-         "            : float3(0.0f)) + (diffraction + (firstPath && all(isfinite(diffraction))\n"
+         "            : float3(0.0f)) + (realtimeOrdersKept(diffraction) + (firstPath && all(isfinite(diffraction))\n"
          "                && (u.spectralSampleControl.w == 1.0f || u.diffractionSpatialCounts.x == 0u\n"
          "                    || evaluationIndex < u.diffractionEvaluationSchedule.z)\n"
-         "                ? realtimeDiffractionSky(in, u, environmentTexture, opaqueTexture) : float3(0.0f))) * scatterWeight, 1.0f);\n"}};
+         "                ? realtimeDiffractionSky(in, u, environmentTexture, opaqueTexture, realtimeEmitters)\n"
+         "                    + (u.spectralSampleControl.w == 1.0f\n"
+         "                        ? realtimeGratingMirror(in, u, spectralQueryTexture, realtimeEmitters) : float3(0.0f))\n"
+         "                : float3(0.0f))) * scatterWeight, 1.0f);\n"},
+        // The scene's glowing objects light every surface and the transport's receivers,
+        // as Path Trace's emitters do (realtime_diffraction_emitters.h). Their triangles
+        // sit in fragment buffer 2, which only a grating frame fills.
+        {"            ? spectralTransport(in, primitive, true, u, spectralQueryTexture, spectralSampleTexture, spectralDiagnostic)\n",
+         "            ? spectralTransport(in, primitive, true, u, spectralQueryTexture, spectralSampleTexture, spectralDiagnostic,\n"
+         "                realtimeEmitters)\n"},
+        {"            float3 spectral = spectralTransport(in, primitive, false, u, spectralQueryTexture, spectralSampleTexture, spectralDiagnostic);\n",
+         "            float3 spectral = spectralTransport(in, primitive, false, u, spectralQueryTexture, spectralSampleTexture, spectralDiagnostic,\n"
+         "                realtimeEmitters);\n"},
+        {"                           device atomic_uint* spectralDiagnostic [[buffer(1)]]) {\n",
+         "                           device atomic_uint* spectralDiagnostic [[buffer(1)]],\n"
+         "                           const device float4* realtimeEmitters [[buffer(2)]]) {\n"},
+        {"                out.color = float4(spectral + emissive, alpha);\n",
+         "            {\n"
+         "                out.color = float4(spectral + emissive, alpha);\n"
+         "                float3 coatLight = float3(0.0f);\n"
+         "                if (all(isfinite(spectral)))\n"
+         "                    out.color.rgb += realtimeEmitterDirect(in.worldPosition, normalize(in.worldNormal),\n"
+         "                        fixtureToViewer(in.worldPosition, u), in.baseColor, 0.0f, 1.0f, 0.04f, 0.0f, coatLight,\n"
+         "                        realtimeEmitters);\n"
+         "            }\n"}};
     for(const auto& [anchor,replacement] : edits) {
         const auto at=fragment.find(anchor);
         if(at==std::string::npos || fragment.find(anchor,at+1)!=std::string::npos) return false;
@@ -8829,6 +9665,7 @@ bool completeMetalCaustic(MetalFixtureSceneFrame& frame,std::string& error)
                 }
             }
             if(owner.spectralDiagnostic!=nil&&!charge(owner.spectralDiagnostic,owner.spectralDiagnostic.length))return false;
+            if(owner.realtimeEmitters!=nil&&!charge(owner.realtimeEmitters,owner.realtimeEmitters.length))return false;
             for(auto image:{owner.colorImage,owner.depthImage,owner.depthStencilImage,owner.opaqueImage,owner.glassImage,
                 owner.spectralQueryImage,owner.spectralSampleImage,owner.diffractionAccumulationImage,owner.roughTileDepthImage,
                 owner.staticResources->environmentTexture})if(!chargeImage(image))return false;
@@ -9282,7 +10119,8 @@ public:
         // so they take the general source too.
         const bool media=std::any_of(scene->materials.data(),scene->materials.data()+scene->materialCount,
             [](const auto& material){return rastermedium::modeOf(material.volume)!=rastermedium::Mode::None;})
-            || rastermedium::worldFogOn(rastermedium::currentWorldFog());
+            || rastermedium::worldFogOn(rastermedium::currentWorldFog())
+            || smoothglass::programHasBaseTint(materialProgram.get());
         const bool admittedNullSurface=(!materialProgram || !materialProgram->vertexProgram)
             && (!materialProgram || materialProgram->kind==NativeFixtureMaterialKind::SurfacePbr) && !layered && !media;
         // A caustic volume preparation composes the paired camera transport. Without one
@@ -9327,7 +10165,7 @@ public:
             if(media) declareMediumFixtureUniform(fragmentSource);
             fragmentSource.insert(fragmentSource.find("fragment FragmentOut _main"),opaquevisibility::metalShader()
                 +(media ? rastermedium::metalShader() : std::string())+analyticsky::shader(true)+environmentimage::shader(true)+smoothglass::queryShader(true)+smoothglass::transportShader(true,true,false,pairedVolume,cameraVisits)
-                +(viewportSolidProgram ? std::string("#define FIXTURE_REALTIME 1\n") : std::string())+metalSpectralTransportShader()
+                +(viewportSolidProgram ? std::string("#define FIXTURE_REALTIME 1\n")+metalRealtimeAblationDefines() : std::string())+metalSpectralTransportShader()
                 +(layered ? arbitgpu::stamlayer::metalShader() : std::string())
                 +(viewportSolidProgram ? std::string(kFixtureRealtimeShader+1) : std::string()));
             vertexSource=fixtureVertexModifierShader(kFixtureVertexShader,
@@ -9450,11 +10288,37 @@ public:
                            "fixture texel upload layout changed");
 
             const auto vertexBytes = scene->vertexCount * sizeof (SceneVertex);
+            // The grating's vertices carry the smooth groove direction in their tangent, as
+            // the OpenGL upload and Path Trace give it (realtimediffraction::smoothGrooveTangents).
+            // With the generated meshes' constant +X tangent the disc's grating frame snapped
+            // to X near the top and bottom, and its rainbow fans flattened into one colour.
+            const SceneVertex* uploadVertices = scene->vertices.data();
+            std::vector<SceneVertex> grooveVertices;
+            if (materialProgram && materialProgram->kind == NativeFixtureMaterialKind::DiffractionReflective)
+                if (const auto* grating = visual3d_detail::findById (scene->objects, scene->objectCount, materialProgram->object))
+                {
+                    std::vector<std::array<float, 3>> positions;
+                    std::vector<std::array<float, 2>> uvs;
+                    for (std::size_t v = 0; v < grating->vertexCount; ++v)
+                    {
+                        const auto& vertex = scene->vertices[grating->firstVertex + v];
+                        positions.push_back ({ vertex.position.x, vertex.position.y, vertex.position.z });
+                        uvs.push_back ({ vertex.uv.x, vertex.uv.y });
+                    }
+                    const std::vector<std::uint32_t> local (scene->indices.begin() + grating->firstIndex,
+                        scene->indices.begin() + grating->firstIndex + grating->indexCount);
+                    const auto grooves = realtimediffraction::smoothGrooveTangents (positions, uvs, local);
+                    grooveVertices.assign (scene->vertices.begin(), scene->vertices.begin() + scene->vertexCount);
+                    for (std::size_t v = 0; v < grooves.size(); ++v)
+                        if (grooves[v][0] != 0.0f || grooves[v][1] != 0.0f || grooves[v][2] != 0.0f)
+                            for (int i = 0; i < 3; ++i) grooveVertices[grating->firstVertex + v].tangent[i] = grooves[v][i];
+                    uploadVertices = grooveVertices.data();
+                }
             sg_buffer_desc vertexDesc = {};
             vertexDesc.usage.vertex_buffer = true;
             vertexDesc.usage.storage_buffer = true;
             vertexDesc.data = {
-                scene->vertices.data(),
+                uploadVertices,
                 vertexBytes
             };
             vertexDesc.label = "arbit-metal-fixture-vertices";
@@ -9893,6 +10757,23 @@ fragment RoughReceiptOut roughReceiptMain(VertexOut in [[stage_in]],
                         resources->mixedGratingPipelines[winding] = sg_make_pipeline(&mixedDesc);
                         if (!resourceValid(sg_query_pipeline_state(resources->mixedGratingPipelines[winding])))
                             return fail("Metal mixed grating pipeline creation failed: " + lastSokolLog());
+                    }
+                    if (blend == 0 && winding == 0 && viewportSolidProgram) {
+                        // The Realtime grating frame's sky, into the accumulation before
+                        // anything else, keeping the raw attachments' clear values.
+                        auto skyDesc = mixedDesc;
+                        skyDesc.index_type = SG_INDEXTYPE_NONE;
+                        skyDesc.depth.compare = SG_COMPAREFUNC_ALWAYS;
+                        skyDesc.depth.write_enabled = false;
+                        skyDesc.colors[0].blend.enabled = false;
+                        for (int attachment = 1; attachment < 8; ++attachment)
+                            skyDesc.colors[attachment].write_mask = SG_COLORMASK_NONE;
+                        skyDesc.label = "arbit-metal-realtime-grating-sky-pipeline";
+                        for (auto& sky : resources->skyPipelines) {
+                            sky = sg_make_pipeline(&skyDesc);
+                            if (!resourceValid(sg_query_pipeline_state(sky)))
+                                return fail("Metal Realtime grating sky pipeline creation failed: " + lastSokolLog());
+                        }
                     }
                     if (blend == 0 && viewportSolidProgram) {
                         // Realtime reflections over the grating frame: equal depth, added
@@ -10869,6 +11750,51 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
             uniforms.projection[1] = static_cast<float> (width) / static_cast<float> (height);
             uniforms.projection[2] = evaluatedCamera.nearPlane;
             uniforms.projection[3] = evaluatedCamera.farPlane;
+            // The depth test spans the scene's camera distances, not the authored planes,
+            // as the OpenGL fixture's clipDepthRange does: a far camera with a small near
+            // plane otherwise loses millimetre layers, such as a disc's grating over its
+            // lacquer. Instances, note instances, vertex programs and deformation move
+            // vertices on the GPU, so those frames keep the authored planes.
+            {
+                bool gpuMovesVertices = noteInstances.admitted || resources->instancedSharedGeometry
+                    || scene->instancedObject.isValid() || resources->previousVertexBuffer.id != 0
+                    || !resources->deformedWindings.empty();
+                if (materialProgram != nullptr) {
+                    gpuMovesVertices = gpuMovesVertices || materialProgram->vertexProgram != nullptr;
+                    for (const auto& program : materialProgram->objectPrograms)
+                        gpuMovesVertices = gpuMovesVertices || (program && program->vertexProgram != nullptr);
+                }
+                uniforms.clipDepthRange[0] = uniforms.clipDepthRange[1] = 0.0f;
+                if (!gpuMovesVertices) {
+                    namespace fd = arbitgpu::fixturedepth;
+                    fd::Range range;
+                    const std::array<float, 4> rotation {uniforms.cameraRotation[0], uniforms.cameraRotation[1],
+                                                         uniforms.cameraRotation[2], uniforms.cameraRotation[3]};
+                    const std::array<float, 3> eye {uniforms.cameraTranslation[0], uniforms.cameraTranslation[1],
+                                                    uniforms.cameraTranslation[2]};
+                    for (std::size_t o = 0; o < scene->objectCount && o < visibilityMatrices.size(); ++o) {
+                        const auto& drawn = scene->objects[o];
+                        if (drawn.vertexCount == 0 || std::size_t(drawn.firstVertex) + drawn.vertexCount > scene->vertexCount)
+                            continue;
+                        std::array<float, 3> low {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                                                  std::numeric_limits<float>::max()};
+                        std::array<float, 3> high {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
+                                                   std::numeric_limits<float>::lowest()};
+                        for (std::uint32_t v = 0; v < drawn.vertexCount; ++v) {
+                            const auto& position = scene->vertices[drawn.firstVertex + v].position;
+                            low = {std::min(low[0], position.x), std::min(low[1], position.y), std::min(low[2], position.z)};
+                            high = {std::max(high[0], position.x), std::max(high[1], position.y), std::max(high[2], position.z)};
+                        }
+                        fd::includeBox(range, visibilityMatrices[o], low, high, rotation, eye);
+                        // The grating's own draw in a mixed frame takes the scene matrix alone.
+                        if (runtimeInputs.objectWorlds)
+                            fd::includeBox(range, metalFixtureWorldMatrix(*scene, drawn), low, high, rotation, eye);
+                    }
+                    const auto fitted = fd::fitted(range, evaluatedCamera.nearPlane, evaluatedCamera.farPlane);
+                    uniforms.clipDepthRange[0] = fitted[0];
+                    uniforms.clipDepthRange[1] = fitted[1];
+                }
+            }
             const auto frameMotion = sceneMotionUniforms(runtimeInputs, camera, width, height, scene->previousCamera);
             uniforms.motion = frameMotion;
             if (materialProgram != nullptr)
@@ -11292,8 +12218,135 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
                 pass.action.depth.store_action = SG_STOREACTION_STORE;
                 pass.action.stencil.store_action = SG_STOREACTION_STORE;
             }
+            // A Realtime grating casts its orders at the scene's glowing objects, and they
+            // light the room and the grating's receivers (realtime_diffraction_emitters.h),
+            // as the OpenGL scene table carries them. Element 0 holds the triangle count in x;
+            // its y, z and w place the grating's mirror and efficiency table, which follow.
+            // A Realtime frame without a grating keeps the one empty element.
+            if (resources->viewportSolidProgram)
+            {
+                std::vector<realtimediffraction::EmitterTexel> emitterTexels(1, realtimediffraction::EmitterTexel {});
+                // Each object's id, base colour and glow, for the grating's mirror.
+                std::vector<realtimediffractionmirror::Texel> mirrorObjects;
+                if (diffractionDraw)
+                    for (std::size_t i = 0; i < scene->objectCount; ++i)
+                    {
+                        const auto& object = scene->objects[i];
+                        std::array<float, 4> emission {};
+                        std::array<float, 3> base { 1.0f, 1.0f, 1.0f };
+                        float metallic = 0.0f;
+                        if (const auto* program = nativeSurfaceForObject(materialProgram.get(), object.id))
+                        {
+                            emission = { program->parameters.emissionRoughness[0], program->parameters.emissionRoughness[1],
+                                         program->parameters.emissionRoughness[2], 0.0f };
+                            base = { program->parameters.baseColorMetallic[0], program->parameters.baseColorMetallic[1],
+                                     program->parameters.baseColorMetallic[2] };
+                            metallic = program->parameters.baseColorMetallic[3];
+                        }
+                        else if (const auto* material = visual3d_detail::findById(scene->materials, scene->materialCount, object.material))
+                        {
+                            emission = { material->emissive.x, material->emissive.y, material->emissive.z, 0.0f };
+                            base = { material->baseColor.x, material->baseColor.y, material->baseColor.z };
+                            metallic = material->metallic;
+                        }
+                        arbitgpu::analyticsky::clipRasterRadiance(emission.data(), runtimeInputs.emissionGain);
+                        const bool glows = realtimediffraction::emits({ emission[0], emission[1], emission[2] });
+                        realtimediffractionmirror::appendObject(mirrorObjects, object.id.value, base, metallic, glows);
+                        if (!glows) continue;
+                        SceneTransform3D runtimeTransform {};
+                        if (runtimeTargetsObject(runtimeInputs, object))
+                        {
+                            runtimeTransform.translation = { runtimeInputs.objectTranslationOffset[0],
+                                runtimeInputs.objectTranslationOffset[1], runtimeInputs.objectTranslationOffset[2] };
+                            runtimeTransform = applyRuntimeObjectTransform(
+                                runtimeTransform, runtimeInputs.objectRotationDegrees, runtimeInputs.objectScale);
+                        }
+                        const auto world = multiplyMetalFixtureMatrices(metalFixtureTransformMatrix(runtimeTransform),
+                            nativeObjectWorldMatrix(runtimeInputs.objectWorlds.get(), object, metalFixtureWorldMatrix(*scene, object)));
+                        std::vector<std::array<float, 3>> positions(object.vertexCount);
+                        for (std::size_t v = 0; v < positions.size(); ++v)
+                        {
+                            const auto& position = scene->vertices[object.firstVertex + v].position;
+                            positions[v] = { position.x, position.y, position.z };
+                        }
+                        std::vector<std::uint32_t> indices(object.indexCount);
+                        for (std::size_t n = 0; n < indices.size(); ++n) indices[n] = scene->indices[object.firstIndex + n];
+                        realtimediffraction::EmitterMatrix matrix {};
+                        std::copy(world.begin(), world.end(), matrix.begin());
+                        if (!realtimediffraction::appendEmitter(emitterTexels, matrix, positions, indices,
+                                { emission[0], emission[1], emission[2] }))
+                            return fail("Metal Realtime grating emitter object has an index past its vertices");
+                    }
+                emitterTexels[0][0] = float((emitterTexels.size() - 1) / 3);
+                // The grating's order efficiencies come from a table, as in the OpenGL Realtime
+                // (realtime_diffraction_efficiency_table.h), for a groove field uniform over
+                // the grating. Element 0's w names its header element; the floats follow.
+                namespace efficiency = arbitgpu::realtimediffractionefficiency;
+                std::shared_ptr<const efficiency::Table> efficiencyTable;
+                if (diffractionDraw && materialProgram->diffractionPathCount >= 1
+                    && efficiency::uniformGrooveField(materialProgram->diffractionPaths[0].material,
+                        materialProgram->diffractionFoilMaximumEvaluations > 0))
+                    efficiencyTable = efficiency::cached(materialProgram->diffractionPaths[0].material);
+                // The grating's mirror weights come from that table, as on OpenGL, so a frame
+                // without one, or with more than one path or no receiver transport, has no mirror.
+                if (efficiencyTable && !mirrorObjects.empty() && resources->spectralTransport.scene
+                    && materialProgram->diffractionPathCount == 1)
+                {
+                    namespace mirror = arbitgpu::realtimediffractionmirror;
+                    const auto& source = materialProgram->diffractionPaths[0].material;
+                    const auto weights = mirror::weights(*efficiencyTable, source);
+                    // The ambient the OpenGL grating draw carries: the scene's, and a lone
+                    // environment light's constant fill.
+                    std::array<float, 4> ambient { scene->ambientColor.x, scene->ambientColor.y, scene->ambientColor.z, 0.0f };
+                    arbitgpu::analyticsky::clipRasterRadiance(ambient.data());
+                    const auto lights = runtimeInputs.lightOverride ? std::size_t { 1 }
+                        : effectiveNativeLightCount(*scene, runtimeInputs);
+                    if (lights == 1)
+                    {
+                        const auto light = effectiveNativeLightRecord(*scene, runtimeInputs, 0);
+                        if (light.kind == SceneLightKind::Environment)
+                        {
+                            ambient[0] += light.color.x * light.intensity;
+                            ambient[1] += light.color.y * light.intensity;
+                            ambient[2] += light.color.z * light.intensity;
+                            arbitgpu::analyticsky::clipRasterRadiance(ambient.data());
+                        }
+                    }
+                    emitterTexels[0][1] = float(emitterTexels.size());
+                    emitterTexels[0][2] = float(mirrorObjects.size() / 2);
+                    emitterTexels.insert(emitterTexels.end(), weights.begin(), weights.end());
+                    emitterTexels.push_back(ambient);
+                    emitterTexels.insert(emitterTexels.end(), mirrorObjects.begin(), mirrorObjects.end());
+                }
+                if (efficiencyTable)
+                {
+                    emitterTexels[0][3] = float(emitterTexels.size());
+                    emitterTexels.push_back({ float(efficiencyTable->orders), float(efficiencyTable->width),
+                        float(efficiency::kGrid), float(efficiency::kTilesPerRow) });
+                    const auto first = emitterTexels.size();
+                    emitterTexels.resize(first + (efficiencyTable->texels.size() + 3) / 4, realtimediffraction::EmitterTexel {});
+                    std::memcpy(emitterTexels[first].data(), efficiencyTable->texels.data(),
+                        efficiencyTable->texels.size() * sizeof(float));
+                }
+                const auto bytes = emitterTexels.size() * sizeof(realtimediffraction::EmitterTexel);
+                if (frame->realtimeEmitters == nil || frame->realtimeEmitters.length < bytes)
+                {
+#if ! __has_feature(objc_arc)
+                    [frame->realtimeEmitters release];
+#endif
+                    frame->realtimeEmitters = [gMetalDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+                    if (frame->realtimeEmitters == nil || frame->realtimeEmitters.contents == nullptr)
+                        return fail("Metal Realtime emitter buffer allocation failed");
+                    frame->realtimeEmittersCharge = arbitgpu::residency::ResidencyCharge(
+                        arbitgpu::residency::BackingClass::fixtureScene,
+                        arbitgpu::residency::nominalBufferBytes(bytes));
+                }
+                std::memcpy(frame->realtimeEmitters.contents, emitterTexels.data(), bytes);
+            }
             int realtimePhase = -1;
             uniforms.realtimeControl[0] = -1.0f;
+            // Each job's command buffer, so its readbacks report what the GPU did with it.
+            MetalSubmission submitted;
             for(std::size_t job=0;job<jobCount;++job) {
                 uniforms=frameUniforms;
                 const auto tileIndex=reverseRoughTiles?jobCount-1-job:job;
@@ -11316,6 +12369,8 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
             id<MTLRenderCommandEncoder> diagnosticEncoder=(__bridge id<MTLRenderCommandEncoder>)sg_mtl_render_command_encoder();
             if (diagnosticEncoder == nil) { sg_end_pass(); return fail("Metal diffraction diagnostic encoder is unavailable"); }
             [diagnosticEncoder setFragmentBuffer:frame->spectralDiagnostic offset:0 atIndex:1];
+            if (frame->realtimeEmitters != nil)
+                [diagnosticEncoder setFragmentBuffer:frame->realtimeEmitters offset:0 atIndex:2];
             sg_bindings bindings = {};
             bindings.vertex_buffers[0] = resources->vertexBuffer;
             bindings.vertex_buffers[1] = resources->geometryInstanceBuffer;
@@ -11359,8 +12414,14 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
                 sg_begin_pass(&pass);
                 id<MTLRenderCommandEncoder> resumed = (__bridge id<MTLRenderCommandEncoder>)sg_mtl_render_command_encoder();
                 if (resumed != nil) [resumed setFragmentBuffer:frame->spectralDiagnostic offset:0 atIndex:1];
+                if (resumed != nil && frame->realtimeEmitters != nil)
+                    [resumed setFragmentBuffer:frame->realtimeEmitters offset:0 atIndex:2];
             };
-            if (uniforms.sky[0][3]>0.5f && skyCameraVisible && !diffractionDraw
+            // A Realtime grating frame draws the sky as well, as the OpenGL Realtime program
+            // does, and its resolve keeps it (skyBackground y).
+            const bool gratingSky = diffractionDraw && realtimeGratingPasses && resources->skyPipelines[0].id != 0;
+            uniforms.skyBackground[1] = 0.0f;
+            if (uniforms.sky[0][3]>0.5f && skyCameraVisible && (!diffractionDraw || gratingSky)
                 && runtimeInputs.imageOutput==renderpassoutput::Output::Color
                 && (!runtimeInputs.passComposite || !runtimeInputs.passComposite->inspectionImage))
             {
@@ -11378,6 +12439,7 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
                 sg_apply_uniforms(0,&range); sg_apply_uniforms(1,&range);
                 sg_draw(0,3,1);
                 uniforms.skyBackground[0]=0.0f;
+                if (diffractionDraw) uniforms.skyBackground[1]=1.0f;
             }
             // With no sky draw the world fog still covers the backdrop: the backdrop
             // pass (skyBackground 2) fogs the clear colour over the far distance. A
@@ -11653,8 +12715,11 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
                         medium = rastermedium::pack (drawMaterial->volume, low, high);
                     }
                     // The paired walk's partner dielectric tints its own segments.
-                    rastermedium::packPartner (medium, *scene,
-                        rastermedium::partnerId (smoothglass::cameraPartner (resources->smoothGlass, drawObject.id)));
+                    const auto mediumPartner = rastermedium::partnerId (smoothglass::cameraPartner (resources->smoothGlass, drawObject.id));
+                    rastermedium::packPartner (medium, *scene, mediumPartner);
+                    // Each prepared dielectric's base colour absorbs inside it, as in Path Trace.
+                    rastermedium::addDielectricTint (medium, smoothglass::dielectricAbsorption (resources->smoothGlass, drawObject.id),
+                        smoothglass::dielectricAbsorption (resources->smoothGlass, mediumPartner));
                     medium[7] = waterBody[7];
                     medium[8] = waterBody[8];
                     medium[9] = waterBody[9];
@@ -12031,7 +13096,9 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
                 sg_end_pass();
                 if(!encodeMetalRasterHistory(*frame,job,result.error))return fail(result.error);
             }
-            sg_commit();
+            commitSokolFrameWatched(submitted,"Metal fixture frame");
+            if((tile||roughReceiptBytes)&&!metalSubmissionSucceeded(submitted,true,"Metal fixture frame",result.error))
+                return fail(result.error);
             if(frame->caustic&&!completeMetalRasterHistory(*frame,job,result.error))return fail(result.error);
             if(tile) {
                 if(!completeMetalRoughTile(*frame,*tile,tileCompletion,result.error)) return fail(result.error);
@@ -12047,6 +13114,11 @@ fragment SnapshotOut _main(float4 position [[position]], texture2d<float> color 
                 frame->roughReceiptValidated = true;
             }
             } // Every tile's native work and completed readback finished.
+            // A frame read back below waits for its passes anyway; any other frame reports
+            // an error only once the GPU has already returned it.
+            if(!metalSubmissionSucceeded(submitted,frame->caustic||resources->smoothGlass.enabled
+                    ||resources->spectralTransport.scene!=nullptr,"Metal fixture frame",result.error))
+                return fail(result.error);
             if(frame->caustic&&!sealMetalRasterCapture(*frame,result.error))return fail(result.error);
             if(roughTiles) {
                 if(!tileCompletion.publish(roughTiles->key(),result.stats,frame->roughTileAggregate,result.error))

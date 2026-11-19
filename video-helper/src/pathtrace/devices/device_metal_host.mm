@@ -292,7 +292,9 @@ private:
     {
         const std::uint64_t build = sceneBuild_();
         auto& phases = pass.stats.phases;
-        if (haveScene_ && build == sceneUploaded_ && &pass.scene == sceneAddress_)
+        // A refit scene (geometryRevision) moved its triangles and its BVH: upload again.
+        if (haveScene_ && build == sceneUploaded_ && &pass.scene == sceneAddress_
+            && pass.scene.geometryRevision == revisionUploaded_)
         {
             phases.set (FramePhase::Upload, 0.0);
             phases.set (FramePhase::AccelBuild, 0.0);
@@ -343,6 +345,7 @@ private:
             return false;
         haveScene_ = true;
         sceneUploaded_ = build;
+        revisionUploaded_ = pass.scene.geometryRevision;
         sceneAddress_ = &pass.scene;
         return true;
     }
@@ -590,6 +593,7 @@ private:
     SceneView<metal::AccelSlot> view_;
     bool haveScene_ = false;
     std::uint64_t sceneUploaded_ = 0;
+    std::uint64_t revisionUploaded_ = 0;
     const RenderScene* sceneAddress_ = nullptr;
     std::uint32_t filmWidth_ = 0;
     std::uint32_t filmHeight_ = 0;

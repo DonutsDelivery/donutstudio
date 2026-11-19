@@ -345,9 +345,8 @@ void glassMappingTests()
     auto diffraction = closed;
     diffraction.kind = arbitgpu::NativeFixtureMaterialKind::DiffractionReflective;
     error.clear();
-    check (! ptfixture::mapSurfaceProgram (diffraction, nullptr, 0.0f, material, error)
-               && error == "Path Trace renders Surface materials only; choose Raster for diffraction materials",
-           "a diffraction material is refused by name");
+    check (ptfixture::mapSurfaceProgram (diffraction, nullptr, 0.0f, material, error) && error.empty(),
+           "a diffraction program maps to the object's own material, which shows outside the foil");
     auto frameTexture = closed;
     frameTexture.baseColorSource = Program::BaseColorSource::GraphFrameSrgbTexture;
     error.clear();
@@ -451,11 +450,6 @@ void thinSurfaceCoverageRenderTests()
 
 void inputRefusalTests()
 {
-    const auto refused = [] (const arbitgpu::NativeFixtureSceneRuntimeInputs& inputs, const char* expected) {
-        std::string error;
-        return ! ptfixture::admitInputs (inputs, error) && error == expected;
-    };
-
     arbitgpu::NativeFixtureSceneRuntimeInputs plain;
     std::string error;
     check (ptfixture::admitInputs (plain, error), "plain Color inputs are admitted");
@@ -528,16 +522,16 @@ void inputRefusalTests()
 
     auto mesh = std::make_shared<HarmonicMIDI::grid::Visual3DScene> (videohelper::fixture3d::makeScene());
     mesh->objectCount = 1;
-    std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> scene (mesh), instanced;
-    check (ptfixture::noteInstancedScene (scene, notes, instanced, error) && instanced != nullptr
-               && instanced->instancedObject == instanced->objects[0].id && instanced->objectInstanceCount == 2,
+    pt::EngineSceneSetup setup;
+    check (ptfixture::bindNoteInstances (*mesh, notes, false, setup, error) && setup.noteInstanced
+               && setup.noteInstances.size() == 2,
            "one mesh object is instanced once per sounding note");
-    if (instanced != nullptr && instanced->objectInstanceCount == 2)
+    if (setup.noteInstances.size() == 2)
     {
         const auto batch = arbitgpu::prepareNativeNoteInstances (notes);
         for (std::size_t index = 0; index < 2u; ++index)
         {
-            const auto& placed = instanced->objectInstances[index];
+            const auto& placed = setup.noteInstances[index];
             check (std::abs (placed.translation.x - batch.transforms[index][0]) < 1.0e-5f
                        && std::abs (placed.translation.x / 2.0f - static_cast<float> (-batch.identities[index])) < 1.0e-3f
                        && placed.translation.y == 0.0f && placed.scale.x == 0.5f,
@@ -546,13 +540,13 @@ void inputRefusalTests()
     }
     auto tinted = notes;
     tinted.noteInstanceMapping->appearanceHigh = { 1.0f, 0.0f, 0.0f, 0.0f };
-    check (! ptfixture::noteInstancedScene (scene, tinted, instanced, error)
-               && error == "Path Trace does not render note appearance yet; choose Raster",
-           "note appearance is refused by name");
+    check (ptfixture::admitInputs (tinted, error) && ptfixture::bindNoteInstances (*mesh, tinted, false, setup, error)
+               && setup.noteAppearance.size() == 2,
+           "note appearance is admitted and carried per note");
     auto scoreOnly = plain;
     scoreOnly.canonicalBlockCFrame = notes.canonicalBlockCFrame;
-    check (refused (scoreOnly, "Path Trace does not render deformed or composed animation frames yet; choose Raster"),
-           "a score frame without a note mapping stays refused by name");
+    check (! ptfixture::admitInputs (scoreOnly, error) && error == "Path Trace runtime inputs are invalid",
+           "a score frame without a note mapping fails only the validity check the raster shares");
 }
 
 // ---------------------------------------------------------------- FixtureSceneRenderer engine branch
@@ -2030,6 +2024,7 @@ void importedRouteTests()
 
 // holographic_card_pathtrace_tests.cpp: the card's committed request in the real engine.
 int holographicCardPathTraceTests();
+int scoreScenePathTraceTests();
 
 int main()
 {
@@ -2046,6 +2041,7 @@ int main()
     causticDrawTests();
     importedRouteTests();
     const int cardFailures = holographicCardPathTraceTests();
+    const int scoreFailures = scoreScenePathTraceTests();
     std::printf ("%d checks, %d failures\n", checks, failures);
-    return failures == 0 && cardFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return failures == 0 && cardFailures == 0 && scoreFailures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

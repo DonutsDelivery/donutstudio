@@ -989,6 +989,21 @@ struct InterpGraph
 
 #if ARBIT_HAVE_VIEWPORT
 
+#if defined(_WIN32)
+GLFWwindow* createWindowsExportWindow()
+{
+    glfwWindowHint (GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint (GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint (GLFW_CONTEXT_ROBUSTNESS, GLFW_LOSE_CONTEXT_ON_RESET);
+    glfwWindowHint (GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint (GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    glfwWindowHint (GLFW_VISIBLE, GLFW_FALSE);
+    auto* window = glfwCreateWindow (64, 64, "Arbit Export", nullptr, nullptr);
+    glfwDefaultWindowHints();
+    return window;
+}
+#endif
+
 // ----------------------------------------- GPU-composited export path (WP6)
 
 // macOS renders through the same strict Metal compositor as the viewport into
@@ -1274,6 +1289,12 @@ struct GlExportContext
             errorOut = "glfwInit failed (no display?)";
             return false;
         }
+#if defined(_WIN32)
+        eglContextProblem.clear();
+        if (eglContext)
+            eglContextProblem = "this build has no EGL, so VA-API frames are uploaded";
+        win = createWindowsExportWindow();
+#else
         // GL 4.3 core (4.1 on macOS); see viewport.cpp for the rationale. The
         // #version 330 shaders compile unchanged; the bump exposes compute.
 #if defined (__APPLE__)
@@ -1307,6 +1328,7 @@ struct GlExportContext
         if (win == nullptr)
             win = glfwCreateWindow (64, 64, "Arbit Export", nullptr, nullptr);
         glfwDefaultWindowHints(); // don't leak VISIBLE=false to a later viewport_open
+#endif
         if (win == nullptr)
         {
             errorOut = "glfwCreateWindow failed (GL 4.3 core unavailable?)";
@@ -1924,7 +1946,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                             videohelper::rawexport::Session* rawPassExport = nullptr,
                             videohelper::harmonicprobe::Receipt* harmonicProbe = nullptr,
                             videohelper::importedsceneprobe::Receipt* importedSceneProbe = nullptr,
-                            const std::function<std::string(AVFrame*)>& hdrMovieWrite = {})
+                            const std::function<std::string(AVFrame*)>& hdrMovieWrite = {},
+                            const std::function<void(int64_t)>& frameRendered = {})
 {
     (void) rife; // unused when built without ONNX
     if (admittedSnapshot == nullptr)
@@ -3903,9 +3926,10 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
             && (n == 0 || n == 1 || n == job.traceRgbaFrameIndex);
         videohelper::importedsceneprobe::Receipt sceneReceipt;
         {
-            videohelper::harmonicprobe::ScopedCapture capture(harmonicProbe);
+            // A multi-frame probe reports its first frame's receipts.
+            videohelper::harmonicprobe::ScopedCapture capture(n == 0 ? harmonicProbe : nullptr);
             videohelper::importedsceneprobe::ScopedCapture sceneCapture(
-                traceScene ? &sceneReceipt : importedSceneProbe);
+                traceScene ? &sceneReceipt : n == 0 ? importedSceneProbe : nullptr);
             videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::preparationBegin);
             buildFrame (rangeStartSec + (double) n / job.fps, frameTransaction);
             videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::preparationEnd);
@@ -4036,7 +4060,8 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                 error = "injected temporal export capture failure";
                 break;
             }
-            *capturedPixels = rgba;
+            // A multi-frame probe keeps its first frame; the caller's buffer starts empty.
+            if (capturedPixels->empty()) *capturedPixels = rgba;
         }
         else if (havePrev && hdrPixels())
         {
@@ -4094,6 +4119,7 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
         pendingReadbackTransaction.emplace(std::move(frameTransaction));
         pendingRendererPublication = std::move(rendererPublication);
         fpsClock.update (progress, n + 1);
+        if (frameRendered) frameRendered (n);
     }
 
     // The pipeline lags by one frame: collect and encode the final readback.
@@ -4132,7 +4158,9 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
                     return encodeError;
             }
             else if (capturedPixels != nullptr)
-                *capturedPixels = rgba;
+            {
+                if (capturedPixels->empty()) *capturedPixels = rgba;
+            }
             else
             {
                 if (const auto traceError = traceFrame(); !traceError.empty())
@@ -4217,6 +4245,20 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
 
 } // namespace
 
+#if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
+bool windowsExportContextCreationFailed()
+{
+    if (!initializeHelperGlfw())
+        return false;
+    auto* window = createWindowsExportWindow();
+    const bool failed = window == nullptr;
+    if (window != nullptr)
+        glfwDestroyWindow (window);
+    glfwTerminate();
+    return failed;
+}
+#endif
+
 #if ARBIT_HAVE_VIEWPORT
 // Shared decode + offline Block B analysis (declared in mix_analyze.h). Reuses
 // the file-local decodeWavToMonoFloat + the analyzer above so the LIVE viewport
@@ -4263,16 +4305,20 @@ std::shared_ptr<const AnalysisSources> analyzeSourceMixes(
 
 std::string renderCompositeFrame (const ExportJob& input, double timelineSec,
                                   CompositeFrameResult& result,
-                                  videohelper::modelpayload::Store* modelPayloadStore)
+                                  videohelper::modelpayload::Store* modelPayloadStore,
+                                  int frameCount,
+                                  const std::function<void(int64_t)>& frameRendered)
 {
 #if ! ARBIT_HAVE_VIEWPORT
-    (void) input; (void) timelineSec; (void) result;
+    (void) input; (void) timelineSec; (void) result; (void) frameCount; (void) frameRendered;
     return "helper built without production viewport compositor support";
 #else
     if (! std::isfinite (timelineSec) || timelineSec < 0.0)
         return "timelineSec must be finite and non-negative";
     if (input.width < 1 || input.height < 1 || input.fps <= 0.0)
         return "invalid fps/width/height";
+    if (frameCount < 1)
+        return "composite frame count must be at least one";
 
     ExportJob job = input;
     job.width &= ~1;
@@ -4280,7 +4326,7 @@ std::string renderCompositeFrame (const ExportJob& input, double timelineSec,
     if (job.width <= 0 || job.height <= 0)
         return "composite dimensions normalize below the minimum even extent";
     job.startSec = timelineSec;
-    job.endSec = timelineSec + 1.0 / job.fps;
+    job.endSec = timelineSec + frameCount / job.fps;
     job.durationSec = job.endSec;
 
     videohelper::compositediagnostic::dimensions(job.width, job.height);
@@ -4299,10 +4345,15 @@ std::string renderCompositeFrame (const ExportJob& input, double timelineSec,
     videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::sourceAdmitted);
     GlExportContext context;
     std::string error;
+    const auto msSince = [] (std::chrono::steady_clock::time_point start)
+    { return std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - start).count(); };
+    auto setupStart = std::chrono::steady_clock::now();
     videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::contextBegin);
     if (! context.init (job.width, job.height, job.visualLayerPlans, error))
         return "native GPU composite probe unavailable: " + error;
     videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::contextReady);
+    result.contextMs = msSince (setupStart);
+    setupStart = std::chrono::steady_clock::now();
 
     videowire::VisualBackendResourceLimits::Capabilities capabilities;
     if (! context.resourceCapabilities(capabilities, error))
@@ -4313,6 +4364,7 @@ std::string renderCompositeFrame (const ExportJob& input, double timelineSec,
     if (! executionOwner.admit(job.visualLayerPlans, error, nullptr,
                                job.width, job.height, &limits))
         return error;
+    result.admissionMs = msSince (setupStart);
     const auto backend = capabilities.backendProfile.rfind("metal", 0) == 0
         ? videowire::VisualBackend::metal : videowire::VisualBackend::openGL;
     videowire::ExportTelemetryOwner<> telemetryOwner(
@@ -4338,10 +4390,11 @@ std::string renderCompositeFrame (const ExportJob& input, double timelineSec,
             ++result.harmonicProbe.plannedHarmonicLayerCount;
     videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::frameLoopBegin);
     error = runGlFrameLoop (job, context, nullptr, nullptr, &dimensions,
-                            timelineSec, 1.0 / job.fps, nullptr, nullptr,
+                            timelineSec, frameCount / job.fps, nullptr, nullptr,
                             modelPayloadStore, &telemetryOwner,
                             executionOwner.get(), &result.rgba, nullptr, nullptr,
-                            &result.harmonicProbe, &result.importedSceneProbe);
+                            &result.harmonicProbe, &result.importedSceneProbe,
+                            {}, frameRendered);
     videohelper::compositediagnostic::emit(videohelper::compositediagnostic::Phase::frameLoopEnd);
     result.width = job.width;
     result.height = job.height;

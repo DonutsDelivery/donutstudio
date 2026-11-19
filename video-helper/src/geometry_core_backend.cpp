@@ -1,4 +1,5 @@
 #include "geometry_core_backend.h"
+#include "pathtrace/devices/auto_device_latch.h"
 #include "../../shared/VertexControlBank.h"
 #include "../../shared/GeometryAudioDeformer.h"
 #include "../../shared/GeometryCoreScene.h"
@@ -9,6 +10,7 @@
 #include "particle_points_body_frame.h"
 
 #include <algorithm>
+#include <mutex>
 #include <limits>
 #include <cmath>
 
@@ -186,6 +188,161 @@ void noteGeometryCorePreviewPendingOnThisThread() noexcept {
   ++geometryCorePreviewPendingResults;
 }
 
+namespace {
+// Each plan owner keeps one fixture renderer per use, so a Path Trace preview
+// keeps its accumulated samples and refits its BVH from frame to frame, as a
+// retained scene's preview owner does.
+struct EngineOwner final {
+  std::weak_ptr<const std::uint8_t> owner;
+  const void* key=nullptr;
+  arbitgpu::NativeFixtureSceneBackend* backend=nullptr;
+  videorender::fixture3d::RenderUse use=videorender::fixture3d::RenderUse::Preview;
+  std::shared_ptr<videorender::fixture3d::FixtureSceneRenderer> renderer;
+  // Held for a whole draw: two threads drawing one owner take turns.
+  std::shared_ptr<std::mutex> drawing;
+};
+EngineOwner engineRenderer(
+    arbitgpu::NativeFixtureSceneBackend& backend,const std::shared_ptr<const std::uint8_t>& owner,
+    videorender::fixture3d::RenderUse use) {
+  if (!owner) return {{},nullptr,&backend,use,std::make_shared<videorender::fixture3d::FixtureSceneRenderer>(backend),
+                      std::make_shared<std::mutex>()};
+  static std::mutex mutex;
+  static std::vector<EngineOwner> owners;
+  std::lock_guard<std::mutex> lock(mutex);
+  // Renderers are destroyed only on their own backend's thread and GL context, so prune only this backend's entries.
+  owners.erase(std::remove_if(owners.begin(),owners.end(),[&backend](const auto& entry){return entry.backend==&backend && entry.owner.expired();}),owners.end());
+  for (const auto& entry : owners)
+    if (entry.key==owner.get() && entry.backend==&backend && entry.use==use) return entry;
+  owners.push_back({owner,owner.get(),&backend,use,std::make_shared<videorender::fixture3d::FixtureSceneRenderer>(backend),
+                    std::make_shared<std::mutex>()});
+  return owners.back();
+}
+
+videorender::fixture3d::SceneEngineSelection engineSelection(const videowire::geometry::RenderSettings& settings,
+                                                             int clipId,int renderNodeId) {
+  namespace render=visualimportedscenerender;
+  using videorender::fixture3d::SceneEngineKind;
+  videohelper::pathtrace::device::autoDeviceLatch().noteEngine(clipId,static_cast<std::uint64_t>(renderNodeId),
+      settings.engine==render::RenderEngine::PathTrace);
+  videorender::fixture3d::SceneEngineSelection selection;
+  selection.engine=settings.engine==render::RenderEngine::PathTrace ? SceneEngineKind::PathTrace
+      : settings.engine==render::RenderEngine::Realtime ? SceneEngineKind::Realtime : SceneEngineKind::Raster;
+  selection.mode=settings.mode==render::RenderMode::Fast ? videorender::fixture3d::SceneEngineMode::Fast
+                                                          : videorender::fixture3d::SceneEngineMode::Accurate;
+  selection.exportSamples=settings.exportSamples;
+  selection.previewSamples=settings.previewSamples;
+  selection.denoise=settings.denoise;
+  selection.denoiser=static_cast<videorender::fixture3d::pathtracedenoise::DenoiserChoice>(settings.denoise.denoiser);
+  selection.maxBounces=settings.maxBounces;
+  const auto volumeBounces=render::pathTraceVolumeBounces(settings.volume);
+  selection.maxVolumeBounces=volumeBounces ? *volumeBounces : videorender::fixture3d::kUnlimitedVolumeBounces;
+  selection.volumesVisibleToCamera=render::pathTraceVolumesVisibleToCamera(settings.volume);
+  selection.lightPaths=settings.lightPaths;
+  selection.motionBlur=render::shutterInterval(settings.motionBlurShutter,settings.motionBlurPosition);
+  return selection;
+}
+
+// Without a Surface program or material table, instance Color, Emission,
+// Opacity, Metallic and Roughness become material variants, as Geometry
+// Scene composition gives them (appendGeometryToScene).
+bool applyInstanceMaterials(HarmonicMIDI::grid::Visual3DScene& scene,
+                            const std::vector<videowire::geometry::AttributeData>& attributes,
+                            const videowire::geometry::InstancesData& instances,std::string& error) {
+  using namespace HarmonicMIDI::grid;
+  using videowire::geometry::InstanceAppearance;
+  const auto base=scene.materials[0];
+  std::vector<InstanceAppearance> variants;
+  std::vector<SceneMaterialRecord> records;
+  std::vector<SceneMaterialId> assigned(instances.instances.size(),base.id);
+  std::uint32_t next=1;
+  for (std::size_t i=0;i<scene.materialCount;++i) next=std::max(next,scene.materials[i].id.value);
+  for (std::size_t i=0;i<instances.instances.size();++i) {
+    const auto appearance=videowire::geometry::instanceAppearance(attributes,i);
+    if (appearance.color==InstanceAppearance{}.color && appearance.emission==InstanceAppearance{}.emission
+        && appearance.metallic<0 && appearance.roughness<0) continue;
+    const auto existing=std::find_if(variants.begin(),variants.end(),[&](const auto& candidate) {
+      return candidate.color==appearance.color && candidate.emission==appearance.emission
+          && candidate.metallic==appearance.metallic && candidate.roughness==appearance.roughness;
+    });
+    if (existing!=variants.end()) { assigned[i]=records[static_cast<std::size_t>(existing-variants.begin())].id; continue; }
+    if (next==std::numeric_limits<std::uint32_t>::max()) { error="Geometry Core instance materials exhaust native identities"; return false; }
+    auto variant=base;
+    variant.id={++next};
+    variant.baseColor={base.baseColor.x*appearance.color[0],base.baseColor.y*appearance.color[1],base.baseColor.z*appearance.color[2]};
+    variant.emissive={std::min(base.emissive.x+appearance.emission[0],std::numeric_limits<float>::max()),
+                      std::min(base.emissive.y+appearance.emission[1],std::numeric_limits<float>::max()),
+                      std::min(base.emissive.z+appearance.emission[2],std::numeric_limits<float>::max())};
+    variant.opacity*=appearance.color[3];
+    if (appearance.metallic>=0) variant.metallic=appearance.metallic;
+    if (appearance.roughness>=0) variant.roughness=appearance.roughness;
+    if (variant.opacity<1) variant.alphaMode=SceneAlphaMode::Blend;
+    assigned[i]=variant.id;
+    variants.push_back(appearance); records.push_back(variant);
+  }
+  if (records.empty()) return true;
+  Visual3DSceneGrowth growth;
+  growth.materials=records.size();
+  if (!growVisual3DScene(scene,growth,error)) return false;
+  for (const auto& record : records) scene.materials[scene.materialCount++]=record;
+  for (std::size_t i=0;i<instances.instances.size() && i<scene.objectCount;++i) scene.objects[i].material=assigned[i];
+  return true;
+}
+
+struct EngineGeometryFrame final {
+  std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame> frame;
+  arbitgpu::NativeFixtureSceneStats stats {};
+  std::optional<GeometryMotionRecord> motion;
+};
+
+// Render 3D's engine route: the scene this frame evaluated goes to the fixture
+// scene renderer, which draws Path Trace through the tracer (OptiX where it is
+// the device) and Realtime through the Realtime program.
+std::optional<EngineGeometryFrame> renderGeometryWithEngine(
+    arbitgpu::NativeFixtureSceneBackend& backend,const RuntimeAdmission& admission,
+    const std::shared_ptr<HarmonicMIDI::grid::Visual3DScene>& scene,
+    const std::shared_ptr<arbitgpu::NativeFixtureSurfaceMaterialProgram>& surfaceProgram,
+    const std::vector<videowire::geometry::AttributeData>& attributes,
+    const videowire::geometry::InstancesData* instances,bool hasTable,
+    const videowire::geometry::RenderSettings& settings,int clipId,int renderNodeId,
+    arbitgpu::NativeFixturePrepareUse prepareUse,std::uint32_t width,std::uint32_t height,
+    arbitgpu::NativeFixtureSceneRuntimeInputs runtimeInputs,
+    const visualdeformation::RationalFrameTime* motionFrame,bool instancedMotion,std::string& error) {
+  using videorender::fixture3d::RenderUse;
+  if (instances && !instances->instances.empty() && !hasTable && !surfaceProgram
+      && !applyInstanceMaterials(*scene,attributes,*instances,error)) return std::nullopt;
+  // Static objects composed beside the Geometry Scene (a floor) join after the
+  // instance materials, so those and any Surface program stay on the geometry.
+  if (settings.lighting && !videowire::geometry::appendStage(*settings.lighting,*scene,error)) return std::nullopt;
+  if (!runtimeInputs.noteInstanceMapping) runtimeInputs.canonicalBlockCFrame.reset();
+  const bool motionPass=arbitgpu::sceneUsesMotionPass(runtimeInputs);
+  if (!motionPass || (runtimeInputs.previousMotion && (!runtimeInputs.previousMotion->scenePositions
+          || runtimeInputs.previousMotion->scenePositions->size()!=scene->vertexCount)))
+    runtimeInputs.previousMotion.reset();
+  std::optional<GeometryMotionRecord> motion;
+  if (motionPass && motionFrame!=nullptr)
+    motion=geometryMotionRecord(runtimeInputs,*scene,*motionFrame,width,height,instancedMotion);
+  const auto use=prepareUse==arbitgpu::NativeFixturePrepareUse::Preview ? RenderUse::Preview : RenderUse::Export;
+  const auto owner=engineRenderer(backend,admission.ownerLease,use);
+  std::lock_guard<std::mutex> drawing(*owner.drawing);
+  owner.renderer->selectEngine(engineSelection(settings,clipId,renderNodeId));
+  videorender::fixture3d::RenderedFrame rendered;
+  if (!owner.renderer->renderGeometry(scene,surfaceProgram,std::move(runtimeInputs),{width,height},use,
+                                videorender::fixture3d::kNativeGpuCapability,rendered,error)) {
+    if (error.empty()) error="Geometry Core engine draw failed";
+    return std::nullopt;
+  }
+  if (rendered.pending) {
+    // A Preview whose program is still compiling defers without an error, as
+    // the raster prepare does.
+    ++geometryCorePreviewPendingResults;
+    error.clear();
+    return std::nullopt;
+  }
+  if (!rendered.nativeFrame) { error="Geometry Core engine draw returned no frame"; return std::nullopt; }
+  return EngineGeometryFrame{std::move(rendered.nativeFrame),rendered.stats,std::move(motion)};
+}
+} // namespace
+
 std::optional<NativeGeometryExecution>
 executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
                       const RuntimeAdmission &admission, std::uint32_t width,
@@ -202,7 +359,9 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
                       arbitgpu::NativeFixturePrepareUse prepareUse,
                       const std::map<std::string, double>* runtimeParameters,
                       const visualdeformation::RationalFrameTime* motionFrame,
-                      const GeometryMotionRecord* motionPredecessor) {
+                      const GeometryMotionRecord* motionPredecessor,
+                      const videowire::geometry::RenderSettings* renderSettings,
+                      int clipId, int renderNodeId) {
   using namespace HarmonicMIDI::grid;
   error.clear();
   try {
@@ -789,8 +948,6 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
       : videowire::geometry::retainedMaterialIdentity(descriptor);
   auto scene = std::make_shared<Visual3DScene>();
   scene->id = {1};
-  scene->activeCamera = {1};
-  scene->ambientColor = {0.12f, 0.12f, 0.12f};
   Visual3DSceneGrowth sceneGrowth;
   sceneGrowth.vertices = mesh->positions.size();
   sceneGrowth.indices = mesh->indices.size();
@@ -917,21 +1074,12 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
   const bool instancedMotion = motionPass && instances != nullptr && !instances->instances.empty();
   if (instancedMotion)
     geometryPriorInstanceTransforms(*scene, runtimeInputs.previousMotion ? motionPredecessor : nullptr);
-  scene->lights[0].id = {1};
-  scene->lights[0].kind = SceneLightKind::Directional;
-  // Camera-facing key light: toLight = (-0.299, 0.399, 0.867), up and toward the viewer. Every
-  // camera-facing starter surface then gets a positive NdotL whatever its tilt, so displaced
-  // slopes shade instead of staying at the flat ambient-plus-emission floor. The previous
-  // direction raked from the upper right and left most front faces unlit.
-  scene->lights[0].transform.rotation = {-0.2064f, -0.1548f, 0.0f, 0.9661f};
-  scene->lights[0].intensity = 1.5f;
-  scene->lightCount = 1;
-  scene->cameras[0].id = {1};
-  scene->cameras[0].transform.translation = {0.0f, 0.0f, 5.0f};
-  scene->cameras[0].verticalFovRadians = 0.7853981634f;
-  scene->cameras[0].nearPlane = 0.1f;
-  scene->cameras[0].farPlane = 1000.0f;
-  scene->cameraCount = 1;
+  // Render 3D's Camera and Light replace the default key light and camera, as
+  // they replace a retained Geometry Scene object's own.
+  videowire::geometry::defaultLighting(*scene);
+  if (renderSettings != nullptr && renderSettings->lighting
+      && !videowire::geometry::applyLighting(*renderSettings->lighting, *scene, error))
+    return std::nullopt;
   auto frameDescriptor=descriptor;
   if (orderedAudio || runtimeFields) frameDescriptor.attributes=materialized.terminalAttributes;
   geometrysurfacematerial::ProgramSet authoredSurfaces;
@@ -991,9 +1139,9 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
         if (!surfacematerialfield::evaluate(field,evaluation,instanceIndex,native->parameters,native->timeMixEndColor,error,
                 native->diffractionLayer ? &*native->diffractionLayer : nullptr))
           return std::nullopt;
-      // Table batching uses ordinary retained-scene draws; apply the same
-      // canonical instance appearance once, after material Field modulation.
-      if (hasTable && instances) {
+      // Table batching and the engine route use ordinary retained-scene draws;
+      // apply the same canonical instance appearance once, after material Field modulation.
+      if ((hasTable || renderSettings) && instances) {
         const auto appearance=videowire::geometry::instanceAppearance(frameDescriptor.attributes,instanceIndex);
         for (std::size_t channel=0;channel<3;++channel) {
           native->parameters.baseColorMetallic[channel]*=appearance.color[channel];
@@ -1037,6 +1185,30 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
     if (!videowire::vertexcontrol::bank(controls,runtimeParameters,runtimeInputs.vertexControls,error)) {
       error="Geometry Surface: "+error; return std::nullopt;
     }
+  }
+  if (renderSettings != nullptr) {
+    auto rendered=renderGeometryWithEngine(backend,admission,scene,surfaceProgram,frameDescriptor.attributes,
+        instances,hasTable,*renderSettings,clipId,renderNodeId,prepareUse,width,height,
+        std::move(runtimeInputs),motionFrame,instancedMotion,error);
+    if (!rendered) return std::nullopt;
+    std::vector<videowire::geometry::StableId> drawnInstanceIds;
+    if (instances != nullptr) {
+      drawnInstanceIds.reserve(instances->instances.size());
+      for (const auto &instance : instances->instances)
+        drawnInstanceIds.push_back(instance.stableId);
+    }
+    auto frame=std::move(rendered->frame);
+    if (pairedFrame) {
+      auto payload=std::make_shared<const PointsBodyNativePayload>(PointsBodyNativePayload{
+          std::move(bodyFrameLease),std::move(pairedFrame),admission.ownerLease,framePlan,scene,frame,nullptr});
+      frame=std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>(payload,payload->frame.get());
+    } else if (ordinaryNativeResidency) {
+      auto payload=std::make_shared<const OrdinaryNativePayload>(OrdinaryNativePayload{
+          std::move(ordinaryNativeResidency),admission.ownerLease,framePlan,scene,frame,nullptr});
+      frame=std::shared_ptr<const arbitgpu::NativeFixtureSceneFrame>(payload,payload->frame.get());
+    }
+    return NativeGeometryExecution{nullptr,std::move(frame),admission.ownerLease,std::move(drawnInstanceIds),
+                                   rendered->stats,framePlan->receipt().backendBinding,std::move(rendered->motion)};
   }
   auto prepared = instances != nullptr && !instances->instances.empty() && !videowire::geometry::hasMaterialTable(descriptor,materialized)
       ? backend.prepareGeometryInstances(scene, surfaceProgram, framePlan,

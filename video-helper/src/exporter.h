@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -339,6 +340,11 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
                        ExportProgress* progress = nullptr,
                        videohelper::modelpayload::Store* modelPayloadStore = nullptr);
 
+#if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
+// Call only in an unused helper, before any viewport or render work.
+bool windowsExportContextCreationFailed();
+#endif
+
 struct CompositeFrameResult
 {
     std::vector<uint8_t> rgba;
@@ -348,13 +354,21 @@ struct CompositeFrameResult
     int height = 0;
     std::string compositorBackend;
     std::string presentationBackend;
+    // Wall time of the call's one-time setup: GPU context creation and plan admission.
+    double contextMs = 0.0;
+    double admissionMs = 0.0;
 };
 
 // Render one exact display-timeline frame through the production offscreen
 // compositor used by export. No output path is accepted or created.
+// frameCount > 1 renders that many consecutive frames from timelineSec in the same
+// context and frame loop, as export does; result keeps the first frame's pixels and
+// receipts, and frameRendered (when set) runs after each frame with its index.
 std::string renderCompositeFrame (const ExportJob& job, double timelineSec,
                                   CompositeFrameResult& result,
-                                  videohelper::modelpayload::Store* modelPayloadStore = nullptr);
+                                  videohelper::modelpayload::Store* modelPayloadStore = nullptr,
+                                  int frameCount = 1,
+                                  const std::function<void(int64_t)>& frameRendered = {});
 
 // RecorderSession — push-frame video-only encode session, for the live
 // piano-roll recorder (record_open / record_push_frame / record_close RPCs).

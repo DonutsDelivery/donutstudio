@@ -1,0 +1,97 @@
+{
+  "pack": {
+    "id": "arbit-essentials-shaders-v1",
+    "name": "Arbit Essentials — Generative Shaders",
+    "version": "1.0",
+    "author": "Arbit",
+    "license": "CC0-1.0",
+    "format": "glsl",
+    "description": "Five original, dependency-free generative shaders for the Arbit Media Machine, covering every reactivity source: the Block A clock, Block B audio analysis, and the Block C symbolic score / JI lattice. Drop a .fs into a shader generator clip (or import it) and it animates in the viewport and exports identically. Public domain (CC0)."
+  },
+  "shaders": [
+    {
+      "id": "aurora_drift",
+      "file": "shaders/aurora_drift.fs",
+      "name": "Aurora Drift",
+      "useCategory": "audio",
+      "category": "nature",
+      "styleTags": ["nature", "ambient", "cinematic"],
+      "featured": true,
+      "reactsTo": [
+        "clock",
+        "audio"
+      ],
+      "needs": [],
+      "description": "Flowing aurora curtains that scroll with the beat and bloom with the low end, over a twinkling star field. Works with no notes — pure clock + audio."
+    },
+    {
+      "id": "prime_lattice",
+      "file": "shaders/prime_lattice.fs",
+      "name": "Prime Lattice",
+      "useCategory": "score-ji",
+      "category": "minimalist",
+      "styleTags": ["minimal", "geometric", "microtonal"],
+      "featured": true,
+      "reactsTo": [
+        "score",
+        "clock",
+        "audio"
+      ],
+      "legacySourceSha256": ["be55c3b49a732813d1c6ced108fe3c86f0f3f4b8f48a65597ba5bb97b6801c9a"],
+      "needs": [
+        "harmonic links / JI tuning"
+      ],
+      "description": "Plots every sounding note on the just-intonation lattice by its 3-limit / 5-limit prime exponents, drawing harmonic links as crisp luminous edges. Roots glow gold and mix transients flare the active notes."
+    },
+    {
+      "id": "spectrum_rings",
+      "file": "shaders/spectrum_rings.fs",
+      "name": "Spectrum Rings",
+      "useCategory": "audio",
+      "category": "psychedelic",
+      "styleTags": ["psychedelic", "neon"],
+      "reactsTo": [
+        "audio",
+        "clock"
+      ],
+      "legacySourceSha256": ["f5bc7509a036665e9a822c938c1168f8bab2e21ffd9b45eb2a167d62e3452435"],
+      "needs": [],
+      "description": "A radial spectrum analyzer: bass lights the core, treble the rim, and a moving ring traces the loudest band. Rotates slowly with the beat."
+    },
+    {
+      "id": "pulse_grid",
+      "file": "shaders/pulse_grid.fs",
+      "name": "Pulse Grid",
+      "useCategory": "patterns",
+      "category": "retro",
+      "styleTags": ["retro", "synthwave", "geometric"],
+      "reactsTo": [
+        "clock",
+        "audio"
+      ],
+      "legacySourceSha256": [
+        "b5b91bd1e7e7775aa62e1a548c2f40d447e7983e5e7ada865cc1049cad28aa67",
+        "c4aa96c7924c613e636711a36a8a4631a2dff5541610f326f13f4bd58a9c7dc7"
+      ],
+      "needs": [],
+      "description": "A synthwave perspective grid that flashes on every beat, accents each bar's downbeat, and runs a timeline sweep. Pure clock reactivity with an optional loudness lift."
+    },
+    {
+      "id": "harmonic_bloom",
+      "file": "shaders/harmonic_bloom.fs",
+      "name": "Harmonic Bloom",
+      "useCategory": "score-ji",
+      "category": "nature",
+      "styleTags": ["nature", "organic", "microtonal"],
+      "featured": true,
+      "reactsTo": [
+        "score",
+        "audio",
+        "clock"
+      ],
+      "legacySourceSha256": ["df4a938a126980d544c89e1ac378154f02b6a8a90a5501730456f9a31c386c01"],
+      "needs": [],
+      "description": "Each sounding note opens a petal at its exact frequency ratio to the project root. JI commas reshape and recolor the flower; velocity and transients control brightness while the bloom rotates with the beat."
+    }
+  ]
+}

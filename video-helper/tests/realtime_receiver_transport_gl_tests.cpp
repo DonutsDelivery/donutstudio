@@ -26,6 +26,8 @@
 //
 // ARBIT_ORB_REPLAY=<dir> redraws a frame the app dumped with ARBIT_GL_DUMP_REALTIME_SCENE
 // and compares it with the dumped Color, so the live frame is judged, not a stand-in.
+// ARBIT_ORB_REPLAY_CARD=1 lays the Holographic Trading Card's compiled foil over a card
+// dump, which does not carry it, as the Metal starter harness's cardapp case does.
 //
 // The host half checks the readback's naming: a half-float target keeps no NaN payload
 // bits, so the probes also write minus the reason in alpha.
@@ -34,6 +36,8 @@
 #include "gpu_backend/fixture_realtime_opengl.h"
 #include "gpu_backend/grating_submission_clock.h"
 #include "support/diffraction_opengl_transport_fixture.h"
+#include "fixture_scene_renderer.h"
+#include "support/fixture_scene.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -41,6 +45,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -514,6 +519,50 @@ void liveOrbChecks (arbitgpu::NativeFixtureSceneBackend& backend)
     check (regions.upperOrb > 1.0e-3 && regions.lowerOrb > 1.0e-3, name + " lights both halves of the ball");
     check (regions.hardEdges < 0.08, name + " shows the orders without hard-edged blocks");
 }
+// ARBIT_ORB_FRAMES=N with ARBIT_ORB_MEASURE renders the prepared live view N more times
+// and prints each frame's wall and GPU time, the per-frame cost a playing viewport pays.
+// The last frame's Color goes to ARBIT_ORB_DUMP when it is set.
+int orbWarmFrames (unsigned width, unsigned height, int frames)
+{
+    auto& backend = arbitgpu::nativeFixtureSceneBackend();
+    auto f = tg::scene (false);
+    makeLiveOrb (f);
+    const auto orbMaterial = orbGrating();
+    std::string error;
+    if (! tg::publishPhysics (f, error, &orbMaterial)) { std::printf ("orb frames: publish: %s\n", error.c_str()); return 1; }
+    const auto program = std::make_shared<const arbitgpu::NativeFixtureSurfaceMaterialProgram> (f.program);
+    arbitgpu::realtimeengine::Scope scope;
+    const auto prepared = backend.prepare (f.scene, program);
+    if (! prepared.prepared) { std::printf ("orb frames: prepare: %s\n", prepared.error.c_str()); return 1; }
+    arbitgpu::NativeFixtureSceneRuntimeInputs runtime;
+    runtime.linearColor = true;
+    runtime.previewUse = std::getenv ("ARBIT_ORB_PREVIEW") != nullptr;
+    std::vector<float> pixels;
+    for (int frame = 0; frame <= frames; ++frame)
+    {
+        const auto started = std::chrono::steady_clock::now();
+        const auto rendered = backend.render (f.scene, prepared.resources, width, height, runtime);
+        const std::chrono::duration<double, std::milli> wall = std::chrono::steady_clock::now() - started;
+        if (! rendered.rendered || ! rendered.frame) { std::printf ("orb frames: render: %s\n", rendered.error.c_str()); return 1; }
+        double gpu = 0.0;
+        for (const auto& span : arbitgpu::lastGratingSubmissions()) gpu += span.milliseconds;
+        std::printf ("orb frame %d %ux%u: wall %.1f ms, GPU %.1f ms over %zu submissions\n", frame, width, height,
+                     wall.count(), gpu, arbitgpu::lastGratingSubmissions().size());
+        if (frame == frames && std::getenv ("ARBIT_ORB_DUMP"))
+        {
+            glBindTexture (GL_TEXTURE_2D, static_cast<GLuint> (rendered.frame->colorImageHandle()));
+            pixels.assign (std::size_t (width) * height * 4, 0.0f);
+            glGetTexImage (GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, pixels.data());
+            std::FILE* file = std::fopen (std::getenv ("ARBIT_ORB_DUMP"), "wb");
+            if (file == nullptr) return 1;
+            std::fprintf (file, "%u %u\n", width, height);
+            std::fwrite (pixels.data(), sizeof (float), pixels.size(), file);
+            std::fclose (file);
+        }
+    }
+    return 0;
+}
+
 // ARBIT_ORB_MEASURE=WxH renders only the orb case at that size and prints its GPU time
 // by submission kind, for ablation runs (ARBIT_GL_REALTIME_ABLATE) that draw no real frame.
 int orbMeasure (const char* size)
@@ -524,6 +573,8 @@ int orbMeasure (const char* size)
         std::fprintf (stderr, "ARBIT_ORB_MEASURE wants WxH, not %s\n", size);
         return 2;
     }
+    if (const char* frames = std::getenv ("ARBIT_ORB_FRAMES"))
+        return orbWarmFrames (width, height, std::atoi (frames));
     std::vector<float> pixels;
     std::string error;
     // ARBIT_ORB_LIVE=1 measures the live starter's view (makeLiveOrb) instead.
@@ -771,6 +822,35 @@ int run (const std::string& dir)
     { std::printf ("orb replay: refused: program.txt names no root program with lighting\n"); return 1; }
     auto& root = *programs[0];
     for (std::size_t k = 1; k < programs.size(); ++k) root.objectPrograms.push_back (programs[k]);
+    // The dump has no foil field, occupancy, pattern mask or work budget, so without
+    // them a card draws the orb fixture's, and its face is not the app's.
+    if (std::getenv ("ARBIT_ORB_REPLAY_CARD") != nullptr)
+    {
+        const auto card = videohelper::fixture3d::loadHolographicTradingCardScene (error);
+        if (! card) { std::printf ("orb replay: refused: card: %s\n", error.c_str()); return 1; }
+        const auto binding = videorender::fixture3d::admitDiffractionMaterialBinding (
+            card->scene, *card->operation.diffractionMaterial, videohelper::materialprogram::BackendTarget::OpenGl, error);
+        if (! binding || ! binding->nativeProgram()) { std::printf ("orb replay: refused: card binding: %s\n", error.c_str()); return 1; }
+        const auto& foil = *binding->nativeProgram();
+        root.diffractionFoilField = foil.diffractionFoilField;
+        root.diffractionFoilMaximumEvaluations = foil.diffractionFoilMaximumEvaluations;
+        root.diffractionOccupancyRectangles = foil.diffractionOccupancyRectangles;
+        root.diffractionOccupancyRectangleCount = foil.diffractionOccupancyRectangleCount;
+        root.diffractionPatternMask = foil.diffractionPatternMask;
+        root.diffractionMaskCoverage = foil.diffractionMaskCoverage;
+        root.diffractionProductDigest = foil.diffractionProductDigest;
+        for (std::size_t i = 0; i < root.diffractionPathCount; ++i)
+        {
+            root.diffractionPaths[i].kindBounceAndReserved[2] = root.diffractionPatternMask;
+            root.diffractionPaths[i].kindBounceAndReserved[3] = 0;
+            if (root.diffractionPatternMask)
+                std::memcpy (&root.diffractionPaths[i].kindBounceAndReserved[3], &root.diffractionMaskCoverage, sizeof (float));
+        }
+        root.bindingDigest = foil.bindingDigest;
+        std::printf ("orb replay: card foil: evaluations %u occupancy %u pattern %u coverage %.3f\n",
+                     foil.diffractionFoilMaximumEvaluations, unsigned (foil.diffractionOccupancyRectangleCount),
+                     unsigned (foil.diffractionPatternMask), foil.diffractionMaskCoverage);
+    }
     root.programIdentity = arbitgpu::nativeFixtureDiffractionProgramIdentity (root.bindingDigest, *admission,
         root.diffractionPatternMask, root.diffractionMaskCoverage, root.diffractionProductDigest, false, &root);
     const auto program = std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> (programs[0]);

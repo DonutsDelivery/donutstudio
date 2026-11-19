@@ -80,6 +80,29 @@ inline std::uint64_t textureValueBound (std::uint64_t notes, std::uint64_t links
     return notes * kTexelsPerNote * 4u + linkRows * kLinkTextureWidth * 4u;
 }
 
+// Sounding-row index. The uNotes texture on the GPU carries it in the rows
+// after its uNoteCount note rows, so a shader visits every sounding note
+// without scanning the history and lookahead rows (arbitSoundingCount and
+// arbitSoundingRow in the shader prelude). Slot 0 holds the count and slot
+// k + 1 the k-th sounding row, rows ascending, 16 slots per texture row.
+// Sounding matches arbitNoteActive: velocity > 0, age >= 0, remain > 0.
+constexpr int kSoundingSlotsPerRow = kTexelsPerNote * 4;
+
+inline std::vector<float> soundingRowIndex (const std::vector<float>& notesTex, int noteRows)
+{
+    std::vector<float> slots (1, 0.0f);
+    const auto rows = static_cast<std::size_t> (std::max (0, noteRows));
+    for (std::size_t row = 0; row < rows && (row + 1) * kSoundingSlotsPerRow <= notesTex.size(); ++row)
+    {
+        const float* texel0 = notesTex.data() + row * kSoundingSlotsPerRow;
+        if (texel0[1] > 0.0f && texel0[2] >= 0.0f && texel0[3] > 0.0f)
+            slots.push_back (static_cast<float> (row));
+    }
+    slots[0] = static_cast<float> (slots.size() - 1);
+    slots.resize ((slots.size() + kSoundingSlotsPerRow - 1) / kSoundingSlotsPerRow * kSoundingSlotsPerRow, 0.0f);
+    return slots;
+}
+
 struct PackResult
 {
     // noteTextureRows(noteCount) * 4 texels * 4 channels, row-major (row, texel, channel).

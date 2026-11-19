@@ -415,7 +415,7 @@ namespace detail
             "arbitNoteLength","arbitNoteStartOffset","arbitNoteEndOffset",
             "arbitNoteFreq","arbitNoteCents","arbitNoteTrack","arbitNoteIsRoot","arbitNotePrimesLo",
             "arbitNotePrimesHi","arbitNoteMasterRow","arbitNotePitch","arbitNoteBend",
-            "arbitNoteActive","arbitLink","arbitLinkRatio",
+            "arbitNoteActive","arbitSoundingCount","arbitSoundingRow","arbitLink","arbitLinkRatio",
             "arbitLinkTexel","arbitNote","lattice2","ArbitNote","ArbitLink",
             // ISF auto-var macro targets / Shadertoy alias targets
             "TIME","TIMEDELTA","FRAMEINDEX","RENDERSIZE","DATE","isf_FragNormCoord",
@@ -989,6 +989,11 @@ inline std::string arbitPrelude (Dialect dialect, const IsfHeader* isf, bool inc
     p += "float arbitNoteBend(int row){ return arbitNoteTexel(row,3).a; }\n";        // frame-resolved pitch bend in semitones
     p += "float arbitNotePitch(int row){ return 69.0+12.0*log2(max(arbitNoteFreq(row),0.001)/440.0); }\n";
     p += "float arbitNoteActive(int row){ return (arbitNoteVel(row)>0.0 && arbitNoteAge(row)>=0.0 && arbitNoteRemain(row)>0.0) ? 1.0 : 0.0; }\n";
+    // Every sounding note (arbitNoteActive) without scanning history and
+    // lookahead rows: `for(int k=0;k<arbitSoundingCount();k++){ int i=arbitSoundingRow(k); ... }`.
+    // The index sits in the uNotes rows after the note rows (block_c_packer.h).
+    p += "int   arbitSoundingCount(){ return int(texelFetch(uNotes, ivec2(0,uNoteCount), 0).r); }\n";
+    p += "int   arbitSoundingRow(int k){ int s=k+1; return int(texelFetch(uNotes, ivec2((s/4)%4,uNoteCount+s/16), 0)[s%4]); }\n";
     p += "vec4  arbitLinkTexel(int edge){ int w=textureSize(uLinks,0).x; return texelFetch(uLinks, ivec2(edge%w,edge/w), 0); }\n";   // (slaveRow, masterRow, num, den)
     p += "float arbitLinkRatio(int edge){ vec4 l=arbitLinkTexel(edge); return l.w!=0.0 ? l.z/l.w : 1.0; }\n";
     // Struct view (M5 house shaders — Harmonic Strings / lattice_orbit / etc.):

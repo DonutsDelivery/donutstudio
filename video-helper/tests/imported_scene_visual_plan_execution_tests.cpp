@@ -4246,7 +4246,7 @@ void testProductionMaterialFrameResolver()
         if (!compiled.geometryFrameSchedule) continue;
         const auto admittedPlan=plan;
         const auto admittedExecution=compiled;
-        for (const auto timing : {std::pair<double,double>{12.125,24}, {12.13,24}, {11.125,29.97}, {12.13,29.97}, {12.125,24}})
+        for (const auto& timing : {std::pair<double,double>{12.125,24}, {12.13,24}, {11.125,29.97}, {12.13,29.97}, {12.125,24}})
         for (const int fault : mode == 0 ? std::vector<int>{0,3,4,5,6,8,9,10,11,28,29}
             : mode == 5 ? std::vector<int>{0,1,2,7,26,27}
             : mode == 2 ? std::vector<int>{0,13,14,18}
@@ -6583,8 +6583,8 @@ void testTimelineFamilyWaterProductionDispatch()
         && geometryCache.familyEvaluationLimits.maxWaterRestPositionVisits == unlimitedVisits
         && geometryCache.familyEvaluationLimits.maxWaterMemoCopyElements == unlimitedVisits
         && geometryCache.familyEvaluationLimits.maxWaterColumnDiscoveryVisits == unlimitedVisits
-        && std::all_of(waterSourceLimits.work.begin(), waterSourceLimits.work.end(), [] (auto limit) { return limit == unlimitedWork; })
-        && std::all_of(waterSourceLimits.logicalBytes.begin(), waterSourceLimits.logicalBytes.end(), [] (auto limit) { return limit == unlimitedWork; }),
+        && std::all_of(waterSourceLimits.work.begin(), waterSourceLimits.work.end(), [unlimitedWork] (auto limit) { return limit == unlimitedWork; })
+        && std::all_of(waterSourceLimits.logicalBytes.begin(), waterSourceLimits.logicalBytes.end(), [unlimitedWork] (auto limit) { return limit == unlimitedWork; }),
         "production sets no Water visit, source work or source byte ceiling");
     const std::pair<std::size_t timelineevaluation::Limits::*,std::size_t> shortages[] = {
         {&timelineevaluation::Limits::maxWaterIdentityVisits,99},

@@ -7057,8 +7057,15 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
             // A modulated Vertex Control Parameter changes the draw every frame.
             const bool dynamicControls=geometrySurface
                 && videohelper::geometry::geometryControlsModulated(*geometrySurface,runtimeParameters);
+            // Render 3D's engine and Image Output. Raster Image/Color plans carry none.
+            const auto renderSettings=videowire::geometry::decodeRenderSettings(lowered->renderSettings,error);
+            if (!renderSettings) return false;
+            const bool engineRoute=videowire::geometry::engineRoute(*renderSettings);
+            // A Path Trace preview accumulates samples on every frame, so even a
+            // static plan draws again instead of keeping its first frame.
             const bool dynamicGeometry=sourceExecution.particlePoints || dynamicSpectrum || dynamicScore || dynamicImported || hasFrame
                 || dynamicControls
+                || renderSettings->engine==visualimportedscenerender::RenderEngine::PathTrace
                 || videowire::geometry::hasRuntimeFields(admitted->plan->value().descriptor())
                 || (geometrySurface && geometrysurfacematerial::timeDependent(*geometrySurface));
             arbitgpu::NativeFixtureSceneRuntimeInputs scoreInputs;
@@ -7069,7 +7076,11 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                     static_cast<float>(static_cast<int>(renderpassoutput::Output::Count)-1),imageOutput)
                 || std::floor(imageOutput)!=imageOutput)
             { error="Render 3D Image Output must be a whole selection"; return false; }
-            scoreInputs.imageOutput=static_cast<renderpassoutput::Output>(static_cast<int>(imageOutput));
+            scoreInputs.imageOutput=engineRoute ? renderSettings->imageOutput
+                : static_cast<renderpassoutput::Output>(static_cast<int>(imageOutput));
+            if (engineRoute)
+                scoreInputs.motionBlur=visualimportedscenerender::shutterInterval(
+                    renderSettings->motionBlurShutter,renderSettings->motionBlurPosition);
             if (linearColor && scoreInputs.imageOutput!=renderpassoutput::Output::Color
                 && scoreInputs.imageOutput!=renderpassoutput::Output::Emission)
             { error="HDR Geometry3D requires Image/Color or Emission, not a data-pass visualization"; return false; }
@@ -7245,7 +7256,8 @@ inline bool admitGeometryCoreOperations(const CompiledVisualLayerPlan& plan,
                         plan.structuralRevision,use==videohelper::geometry::PlanUse::exportRender,diagnostic);
                 },evaluationTimeSec,pointsEvaluator,waterHistory,waterProjectSeconds,coupledWater,
                 {},{},evaluationContext->geometryPrepareUse,runtimeParameters,
-                motionFrame ? &*motionFrame : nullptr, motionPredecessor ? &*motionPredecessor : nullptr);
+                motionFrame ? &*motionFrame : nullptr, motionPredecessor ? &*motionPredecessor : nullptr,
+                engineRoute ? &*renderSettings : nullptr, plan.clipId, geometryOperation->nodeId);
             if(!execution)
             {
                 const bool previewDeferred=

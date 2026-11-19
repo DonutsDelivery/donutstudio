@@ -490,7 +490,9 @@ private:
         // This device traces the CPU's BVH, so it builds no structure of its own and
         // the engine reports that BVH's build as AccelBuild.
         const std::uint64_t build = sceneBuild_();
-        if (haveScene_ && build == sceneUploaded_ && &pass.scene == sceneAddress_)
+        // A refit scene (geometryRevision) moved its triangles and its BVH: upload again.
+        if (haveScene_ && build == sceneUploaded_ && &pass.scene == sceneAddress_
+            && pass.scene.geometryRevision == revisionUploaded_)
         {
             pass.stats.phases.set (FramePhase::Upload, 0.0);
             return true;
@@ -552,6 +554,7 @@ private:
         pass.stats.phases.set (FramePhase::Upload, millisecondsSince (uploadStart));
         haveScene_ = true;
         sceneUploaded_ = build;
+        revisionUploaded_ = pass.scene.geometryRevision;
         sceneAddress_ = &pass.scene;
         return true;
     }
@@ -700,6 +703,7 @@ private:
     compute::SceneViewForLaunch view_;
     bool haveScene_ = false;
     std::uint64_t sceneUploaded_ = 0;
+    std::uint64_t revisionUploaded_ = 0;
     const RenderScene* sceneAddress_ = nullptr;
     std::uint32_t filmWidth_ = 0;
     std::uint32_t filmHeight_ = 0;

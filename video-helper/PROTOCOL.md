@@ -287,6 +287,10 @@ translateY, visible, zOrder}` once registered via `text_set_image`.
 - `graph_set_effects {clipId, effects:[{slot, type, enabled, params:{name:value}}]}`
   — bulk (re)configure a clip's whole rack in one call (add/remove/reorder).
   Individual sliders and automation use per-param `graph_set_param`.
+- `graph_set_gen_params {clipId, genParams:{name:value}}` replaces only that
+  clip's complete static generator override map. An empty object restores ISF
+  defaults. Dotted component keys remain scalar values. Sliders, automation and
+  modulation retain the existing `graph_set_param` route.
 - `graph_set_lut {clipId, path}` — attach a `.cube` 3D LUT to a clip
   (path-carrying RPC: the helper parses the file on the RPC thread and the
   render thread uploads a `GL_RGB32F` 3D texture, sampled trilinearly with
@@ -422,7 +426,7 @@ Every RPC that can change a rendered frame moves the content revision after its
 handler has applied the change. Read-only polls never move it: `viewport_info`,
 `get_av_offset`, `viewport_describe_inspection`, `graph_describe`, `scope_data`,
 the `*_progress` polls, and the recorder sinks. An idempotent setter (the
-`viewport_set_*` state setters, `graph_set_param`, `graph_set_effects`,
+`viewport_set_*` state setters, `graph_set_param`, `graph_set_effects`, `graph_set_gen_params`,
 `text_remove`, and `scope_enable`) moves it only when its params differ from the
 immediately preceding setter.
 The canvas pair (`viewport_set_canvas`, `viewport_set_canvas_background`) and
@@ -1074,11 +1078,13 @@ reactive — all on texture units from TEXTURE4 up).
 All are wrapped to one `#version 330 core` shader against the contract prelude.
 
 **`shader_compile {source, lang?}`** → `{ok, dialect, acceptedLang, cacheHit,
-outputGuarded, diagnostics:[{level, message}], params:[{name, type, default,
+outputGuarded, diagnostics:[{level, message}], params:[{name, type, default, defaultVec,
 min, max}]}` — the **GL-free** front door: it detects the dialect and reports
 authoring errors (missing/ambiguous entry point, `#extension`, ISF
 header/INPUT problems) and the discovered generator params WITHOUT a GL
 context, so an agent can validate a shader before it ever reaches the renderer.
+`defaultVec` contains the four declared vector/color default components; scalar
+clients retain `default`.
 `dialect` ∈ `glsl | shadertoy | isf | unknown`. GL-level compile errors (e.g. an
 undeclared identifier that passes the textual wrap) surface when the shader is
 actually run.

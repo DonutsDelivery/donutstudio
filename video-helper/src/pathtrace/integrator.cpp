@@ -3,6 +3,7 @@
 #include "devices/device_cpu.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <limits>
 #include <utility>
 #include <array>
@@ -41,12 +42,16 @@ PathCounters& PathCounters::operator+= (const PathCounters& other) noexcept
     return *this;
 }
 
-void RenderScene::commit()
+void RenderScene::commit (bool refitBvh)
 {
     const auto bvhStart = PhaseClock::now();
-    if (geometry.motionOpen.empty())
+    const bool moving = ! geometry.motionOpen.empty();
+    bvhRefitted = refitBvh
+        && bvh.refit (moving ? geometry.motionOpen.data() : geometry.positions.data(),
+                      moving ? geometry.motionClose.data() : nullptr, geometry.triangleCount());
+    if (! bvhRefitted && ! moving)
         bvh.build (geometry.positions);
-    else
+    else if (! bvhRefitted)
         bvh.buildMotion (geometry.motionOpen.data(), geometry.motionClose.data(), geometry.triangleCount());
     bvhBuildMs = millisecondsSince (bvhStart);
     // Every authored size lights the scene (LightSet::build reads the records).
@@ -171,8 +176,82 @@ void applySceneVolume (const SceneVolume& volume, Material& material) noexcept
     material.volumeOnly = volume.volumeOnly && material.volumeDensity > 0.0f;
 }
 
+namespace
+{
+// PrepareOptions::noteAppearance. A grating slot keeps its orders untinted: the
+// binding names one material slot, and a copy per note would leave it.
+void applyNoteAppearance (RenderScene& out, const std::vector<std::array<float, 4>>* appearance)
+{
+    if (appearance == nullptr || appearance->empty())
+        return;
+    const auto fit = [] (double x, double y, double z) noexcept {
+        const double peak = std::max ({ x, y, z }), limit = std::numeric_limits<float>::max();
+        const double scale = peak > limit ? limit / peak : 1.0;
+        return Vec3 { static_cast<float> (x * scale), static_cast<float> (y * scale), static_cast<float> (z * scale) };
+    };
+    std::unordered_map<std::uint64_t, std::uint32_t> copies;
+    for (TriangleAttributes& triangle : out.geometry.triangles)
+    {
+        if (triangle.instanceIndex == kNoInstance || triangle.instanceIndex >= appearance->size())
+            continue;
+        const auto& tint = (*appearance)[triangle.instanceIndex];
+        if (tint[0] == 1.0f && tint[1] == 1.0f && tint[2] == 1.0f && tint[3] == 0.0f)
+            continue;
+        const std::uint32_t slot = triangle.materialIndex;
+        if (std::any_of (out.gratings.begin(), out.gratings.end(),
+                         [slot] (const device::GratingBinding& binding) { return binding.materialIndex == slot; }))
+            continue;
+        const std::uint64_t key = (std::uint64_t { slot } << 32) | triangle.instanceIndex;
+        const auto found = copies.find (key);
+        if (found != copies.end())
+        {
+            triangle.materialIndex = found->second;
+            continue;
+        }
+        Material material = slot < out.materials.size() ? out.materials[slot] : out.fallbackMaterial;
+        const auto r = static_cast<double> (tint[0]), g = static_cast<double> (tint[1]), b = static_cast<double> (tint[2]);
+        const auto a = static_cast<double> (tint[3]);
+        material.baseColor = { material.baseColor.x * tint[0], material.baseColor.y * tint[1], material.baseColor.z * tint[2] };
+        material.emission = fit (r * (material.emission.x + a), g * (material.emission.y + a), b * (material.emission.z + a));
+        const auto index = static_cast<std::uint32_t> (out.materials.size());
+        out.materials.push_back (material);
+        copies.emplace (key, index);
+        triangle.materialIndex = index;
+    }
+}
+
+bool sameTriangle (const TriangleAttributes& a, const TriangleAttributes& b) noexcept
+{
+    return a.objectIndex == b.objectIndex && a.objectId == b.objectId && a.instanceIndex == b.instanceIndex
+        && a.primitiveIndex == b.primitiveIndex && a.materialId == b.materialId && a.visibility == b.visibility;
+}
+} // namespace
+
+bool refitRenderScene (const Visual3DScene& scene, RenderScene& out, const PrepareOptions& options)
+{
+    IngestedScene& fresh = out.previousGeometry;
+    ingestScene (scene, fresh, options.ingest);
+    if (! fresh.refusal.empty() || ! out.geometry.refusal.empty()
+        || fresh.triangles.size() != out.geometry.triangles.size()
+        || fresh.motionOpen.empty() != out.geometry.motionOpen.empty())
+        return false;
+    for (std::size_t i = 0; i < fresh.triangles.size(); ++i)
+        if (! sameTriangle (fresh.triangles[i], out.geometry.triangles[i]))
+            return false;
+    // Materials depend on object, material and instance alone, so each triangle
+    // keeps the slot the build gave it.
+    for (std::size_t i = 0; i < fresh.triangles.size(); ++i)
+        fresh.triangles[i].materialIndex = out.geometry.triangles[i].materialIndex;
+    std::swap (out.geometry, fresh);
+    out.commit (true);
+    ++out.geometryRevision;
+    return true;
+}
+
 void prepareRenderScene (const Visual3DScene& scene, RenderScene& out, const PrepareOptions& options)
 {
+    // A scene that builds again need not hold a second copy until it refits.
+    out.previousGeometry = IngestedScene {};
     ingestScene (scene, out.geometry, options.ingest);
     out.materials.clear();
     const std::size_t materialCount = std::min (scene.materialCount, scene.materials.size());
@@ -206,6 +285,13 @@ void prepareRenderScene (const Visual3DScene& scene, RenderScene& out, const Pre
         if (entry.material == nullptr)
             continue;
         device::GratingBinding binding { 0u, entry.material->description() };
+        // Without a foil the field covers every uv; only its coverage is read then.
+        for (auto& corner : binding.field)
+            corner[3] = 1.0f;
+        binding.occupancy = entry.occupancy;
+        binding.occupancyCount = std::min<std::uint32_t> (entry.occupancyCount, 5u);
+        binding.maskCoverage = entry.maskCoverage;
+        binding.masked = binding.occupancyCount != 0;
         if (entry.field.has_value())
         {
             binding.field = *entry.field;
@@ -264,6 +350,7 @@ void prepareRenderScene (const Visual3DScene& scene, RenderScene& out, const Pre
             material.emission = gained (material.emission);
         out.fallbackMaterial.emission = gained (out.fallbackMaterial.emission);
     }
+    applyNoteAppearance (out, options.noteAppearance);
     if (options.lightRecords != nullptr)
         out.lightRecords = *options.lightRecords;
     else

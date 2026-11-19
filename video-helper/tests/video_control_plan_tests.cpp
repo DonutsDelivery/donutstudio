@@ -216,6 +216,65 @@ int main()
     }
 
     {
+        videocontrol::Plan plan;
+        plan.numSlots = 1;
+        plan.operations.push_back(valueOp(1, 0.5f, 0));
+        auto sink = sinkOp(2, 0);
+        sink.targetClipId = 1;
+        sink.targetNodeId = -1;
+        sink.targetParamId = "level";
+        plan.operations.push_back(sink);
+        videocontrol::Executor executor;
+        std::string error;
+        check(executor.bind(plan, error), "canonical graphless generator identity binds");
+        const auto values = executor.evaluate(score, clock, audio, 0.1f, 0.05f);
+        check(values.size() == 1 && values[0].destination == "clip1/gen/level",
+              "graphless sink reaches the exact legacy consumer alias");
+        auto& target = plan.operations.back();
+        target.targetParamId = "wrong";
+        check(!executor.bind(plan, error), "graphless wrong parameter rejects");
+        target.targetParamId = "level";
+        target.targetClipId = 1;
+        check(executor.bind(plan, error), "valid plan rebinds before contradictory update");
+        check(!executor.evaluate(score, clock, audio, 0.1f, 0.05f).empty(),
+              "previous owned plan is active before contradictory update");
+        target.targetClipId = 2;
+        target.enabled = false;
+        check(!executor.bind(plan, error), "graphless wrong owner rejects even with disabled sink");
+        check(executor.empty(), "rejected current plan clears previous owned plan");
+        check(executor.evaluate(score, clock, audio, 0.1f, 0.05f).empty(),
+              "next frame cannot evaluate previous owned modulation after rejection");
+        executor.reset();
+        check(executor.evaluate(score, clock, audio, 0.1f, 0.05f).empty(),
+              "frame reset cannot revive rejected modulation");
+        target.enabled = true;
+        plan.operations.front().params = { 0.75f };
+        target.destination = "clip3/gen/level";
+        target.targetClipId = 3;
+        check(executor.bind(plan, error), "later valid owned plan recovers after rejection");
+        const auto recovered = executor.evaluate(score, clock, audio, 0.1f, 0.05f);
+        check(recovered.size() == 1 && recovered[0].enabled
+              && recovered[0].destination == "clip3/gen/level" && recovered[0].value == 0.75f,
+              "recovery emits only new plan destination and value");
+        target.targetClipId = 1;
+        target.destination = "clip1/visual7/level";
+        check(!executor.bind(plan, error), "no-node graph target rejects");
+        target.destination = "clip1/gen/level";
+        target.targetNodeId = -2;
+        check(!executor.bind(plan, error), "malformed negative node rejects");
+        target.targetNodeId = -1;
+        target.targetClipId = -2;
+        target.targetParamId.clear();
+        check(!executor.bind(plan, error), "malformed negative owner is not absent identity");
+        target.targetClipId = -1;
+        check(executor.bind(plan, error), "legacy absent identity remains supported");
+        target.targetClipId = 1;
+        target.targetParamId = "level/component";
+        target.destination = "clip1/gen/level/component";
+        check(!executor.bind(plan, error), "graphless nested parameter path rejects");
+    }
+
+    {
         audio.rms = 0.9f;
         audio.sourceCount = 1;
         audio.sources[0] = { 42, 1, 0.35f, 0.6f, 1.0f };

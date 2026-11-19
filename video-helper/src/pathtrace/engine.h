@@ -92,6 +92,14 @@ struct EngineSceneSetup
     std::vector<Mat4> previousObjectWorlds;
     std::vector<HarmonicMIDI::grid::SceneTransform3D> previousInstances;
     std::shared_ptr<const std::vector<HarmonicMIDI::grid::SceneVec3>> previousPositions;
+    // Per-note instancing (IngestOptions::noteInstanced): every object draws once
+    // per noteInstances entry. previousNoteInstances is empty or lists every
+    // note; noteAppearance is empty or one (r, g, b, a) per note
+    // (PrepareOptions::noteAppearance).
+    bool noteInstanced = false;
+    std::vector<HarmonicMIDI::grid::SceneTransform3D> noteInstances;
+    std::vector<HarmonicMIDI::grid::SceneTransform3D> previousNoteInstances;
+    std::vector<std::array<float, 4>> noteAppearance;
 };
 
 // Everything that, when it changes, restarts accumulation.
@@ -148,6 +156,10 @@ struct EngineImage
     std::vector<float> albedo;
     std::vector<float> normal;
     std::vector<EngineFrameLayer> frameLayers;  // by ObjectFrameBinding::layer
+    // 1 where the pixel is the backdrop alone, bottom row first: the centre ray
+    // missed, no sample added light, and colorBytes holds the raster's clear
+    // there. A denoiser leaves these pixels as they are.
+    std::vector<std::uint8_t> backdropPass;
     // Render outputs (render_outputs.h), bottom row first, in the raster's raw
     // pass formats: RGBA16F half bits for normal and emission, R8 mask, R32UI
     // ids and RG16F motion. They come from the centre ray, so the denoiser never
@@ -162,6 +174,7 @@ struct EngineImage
     std::uint32_t samplesPerPixel = 0;     // accumulated in this generation
     bool restarted = false;                // this call started a new generation
     bool sceneRebuilt = false;             // this call rebuilt the RenderScene and BVH
+    bool sceneRefitted = false;            // this call moved the geometry and refit the BVH
     bool traced = false;                   // this call added samples
     // The image blends earlier playback frames. A playback frame without history
     // yet, a converging frame and an export are the accumulation alone.
@@ -175,11 +188,11 @@ struct EngineImage
     RenderStats stats {};                  // of the pass this call ran, if any
 };
 
-// Raster clear colour behind a scene without a visible sky (backend_opengl.cpp).
+// Raster clear colour behind a scene without a visible sky (backend_opengl.cpp,
+// rastermedium::backdropRow). The raster clears these values into whatever
+// target it draws, so an 8-bit frame shows (7, 10, 18) and a linear frame, once
+// the compositor encodes it, slate (46, 56, 75). Path Trace writes the same.
 constexpr float kRasterBackground[3] { 7.0f / 255.0f, 10.0f / 255.0f, 18.0f / 255.0f };
-// The same colour as linear sRGB. Writing the values above into a linear image
-// encodes them twice and shows slate (46, 56, 75).
-constexpr float kLinearRasterBackground[3] { 0.00212469f, 0.00303527f, 0.00604883f };
 // Accumulation generation used by every export, so exports are reproducible.
 constexpr std::uint64_t kExportGeneration = 1;
 // Samples per pixel of one playback frame, four times the cost of the one-sample
@@ -266,6 +279,9 @@ public:
         tracer_.setDevicePass (std::move (pass));
         deviceReady_ = std::move (ready);
     }
+    // Builds the CPU scene for a setup now, as the next preview would, without tracing.
+    // A preview that finds the same setup reuses it. Not safe to run with a render call.
+    bool primeScene (const EngineSceneSetup& setup, const EngineView& view, std::string& error);
     void setDeviceSceneFallback (bool allowed) noexcept { tracer_.setDeviceSceneFallback (allowed); }
     // The next preview starts a new generation on an empty film at sample 0.
     void restartPreview() noexcept
@@ -276,6 +292,8 @@ public:
     }
 
     std::uint64_t sceneBuilds() const noexcept { return sceneBuilds_; }
+    // Setups that moved geometry only and refit the scene in place (refitRenderScene).
+    std::uint64_t sceneRefits() const noexcept { return sceneRefits_; }
     std::uint64_t previewGeneration() const noexcept { return previewGeneration_; }
     // True while a Preview accumulation is live and not at maximumPreviewSamples:
     // below it the image keeps converging, and above it (the target was lowered) the
@@ -293,6 +311,7 @@ public:
 
 private:
     std::function<bool()> deviceReady_;
+    // rebuilt: the scene changed, by a build or a refit; refitted says which.
     bool prepare (const EngineSceneSetup& setup, const EngineView& view, PinholeCamera& camera,
                   bool& rebuilt, std::string& error);
     // prepare, timed as SceneLower and CpuBvhBuild.
@@ -311,10 +330,15 @@ private:
     RenderScene scene_;
     bool sceneValid_ = false;
     bool skyVisible_ = false;
+    // An Environment Light hides itself from the camera. The raster then clears
+    // the backdrop to opaque black, not to the stage colour.
+    bool environmentHidden_ = false;
     // What camera misses show when the world is hidden from the camera.
     HarmonicMIDI::grid::SceneCameraBackground cameraBackground_ {};
     EngineSceneSetup cachedSetup_;
     std::uint64_t sceneBuilds_ = 0;
+    std::uint64_t sceneRefits_ = 0;
+    bool lastRefitted_ = false;
 
     bool previewValid_ = false;
     // The light-path settings the live accumulation was drawn with.
@@ -351,6 +375,10 @@ bool sameAreaLight (const AreaLightRecord& a, const AreaLightRecord& b) noexcept
 bool sameCameraRecord (const HarmonicMIDI::grid::SceneCameraRecord& a,
                        const HarmonicMIDI::grid::SceneCameraRecord& b) noexcept;
 bool sameSceneSetup (const EngineSceneSetup& a, const EngineSceneSetup& b) noexcept;
+// True when a and b differ at most in placement: object worlds, scene vertices,
+// object records and instance transforms, note transforms and the earlier
+// frame. Such a change can refit the scene instead of rebuilding it.
+bool samePlacementTopology (const EngineSceneSetup& a, const EngineSceneSetup& b) noexcept;
 
 // True when the raster draws an analytic sky or environment image behind the
 // scene for these lights, so camera rays that miss show the environment.

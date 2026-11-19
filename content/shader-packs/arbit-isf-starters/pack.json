@@ -1,0 +1,163 @@
+{
+  "pack": {
+    "id": "arbit-isf-starters-v1",
+    "name": "Arbit ISF Starters",
+    "version": "1.0",
+    "author": "Arbit",
+    "license": "CC0-1.0",
+    "format": "isf",
+    "description": "Five original ISF generators for DonutStudio. Every declared INPUT becomes an editable clip parameter and modulation target. The worked examples cover project score, harmonic links, spectrum bands, musical clock, ISF input types, and a multipass persistent feedback buffer. Import with video_import_shader. Public domain (CC0)."
+  },
+  "shaders": [
+    {
+      "id": "warp_tunnel",
+      "file": "shaders/warp_tunnel.fs",
+      "name": "Warp Tunnel",
+      "useCategory": "audio",
+      "category": "retro",
+      "styleTags": ["retro", "neon", "cinematic"],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "clock",
+        "audio"
+      ],
+      "inputs": [
+        "speed",
+        "twist",
+        "ribs",
+        "colorA",
+        "colorB"
+      ],
+      "showcases": [
+        "float INPUT",
+        "color INPUT"
+      ],
+      "description": "An endless ribbed tunnel that flies forward and flashes on the beat; the mix nudges the throttle. speed/twist/ribs and the two colours are INPUTS."
+    },
+    {
+      "id": "kaleido",
+      "file": "shaders/kaleido.fs",
+      "name": "Kaleido",
+      "useCategory": "patterns",
+      "category": "psychedelic",
+      "styleTags": ["psychedelic", "geometric"],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "clock"
+      ],
+      "inputs": [
+        "segments",
+        "zoom",
+        "spin",
+        "tint"
+      ],
+      "showcases": [
+        "float INPUT",
+        "color INPUT",
+        "mod-matrix target (segments/zoom)"
+      ],
+      "description": "A mirror-kaleidoscope of a drifting field. Route a kick to 'segments' and a bassline to 'zoom' through the mod matrix to make it move with the music."
+    },
+    {
+      "id": "plasma",
+      "file": "shaders/plasma.fs",
+      "name": "Plasma",
+      "useCategory": "audio",
+      "category": "psychedelic",
+      "styleTags": ["psychedelic", "ambient"],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "audio",
+        "clock"
+      ],
+      "legacySourceSha256": [
+        "a5119b44780ce00b5f22df936fc0f8da809fab3896fdaf2c42dde4ef3283a8ec",
+        "83cfdbda623093f0b53bd143dc7b7eb52e7e18600fbc01c3543c131177069d96"
+      ],
+      "inputs": [
+        "scale",
+        "speed",
+        "hueShift",
+        "brightness"
+      ],
+      "showcases": [
+        "float INPUT"
+      ],
+      "description": "A flowing spectrum field: bass expands its cells, mids bend hue, treble writes fine ripples, and onsets flash intersections. scale/speed/hueShift/brightness remain editable INPUTS."
+    },
+    {
+      "id": "orbit",
+      "file": "shaders/orbit.fs",
+      "name": "Orbit",
+      "useCategory": "score-ji",
+      "category": "minimalist",
+      "styleTags": ["minimal", "geometric", "microtonal"],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "audio",
+        "clock",
+        "score"
+      ],
+      "legacySourceSha256": [
+        "997f87395c129b8f44a57fa1be177a364adb87a76fdc4cf56f9b5c8d87629004",
+        "de621a0f52c0b334130c0b97487f171b2b75c79dcf6ba8350b88774e2f450546",
+        "c626b3a14af2b861b581a7297fbd7c98ceca37abf622e3b3c20eae00d806783d"
+      ],
+      "inputs": [
+        "center",
+        "count",
+        "size",
+        "spread",
+        "color"
+      ],
+      "showcases": [
+        "point2D INPUT",
+        "long INPUT",
+        "color INPUT"
+      ],
+      "description": "Saturated glowing bodies orbit with project notes: pitch chooses phase and hue, velocity controls energy, roots burn gold, and harmonic links connect related notes. Spectrum bands drive the fallback system."
+    },
+    {
+      "id": "light_trails",
+      "file": "shaders/light_trails.fs",
+      "name": "Light Trails",
+      "useCategory": "drawing",
+      "category": "psychedelic",
+      "styleTags": ["psychedelic", "neon"],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "reactsTo": [
+        "clock",
+        "audio"
+      ],
+      "legacySourceSha256": ["bfd5906a85fd493672b8bfd4c32a4ee9bc933b33b6ebc0efc60fbfdd42ad8112"],
+      "parameterDefaults": {
+        "decay": 0.985,
+        "spin": 0.04,
+        "zoom": 0.985
+      },
+      "inputs": [
+        "decay",
+        "spin",
+        "zoom",
+        "tint"
+      ],
+      "showcases": [
+        "ISF multipass (PASSES)",
+        "PERSISTENT feedback buffer",
+        "float INPUT",
+        "color INPUT"
+      ],
+      "description": "Persistent feedback trails hold exactly while paused. Bass expands one orbit, treble expands the other, onsets flare both sources, and beat-locked motion writes a longer frame-rate-aware history."
+    }
+  ]
+}

@@ -20,6 +20,7 @@
 #include "../../shared/WorldVolumeDepthFog.h"
 #include "../../shared/RasterMedium.h"
 #include "loop_step_probe.h"
+#include "pathtrace/devices/kernel_compile_state.h"
 
 #include <limits>
 #include <algorithm>
@@ -27,6 +28,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <optional>
@@ -63,6 +66,17 @@ std::uint32_t realtimeGpuWindowWidth = 0;
 std::uint32_t realtimeGpuWindowHeight = 0;
 // Counts the Preview reports published, so a finished render knows whether it left one.
 std::uint64_t previewStatsPublications = 0;
+// The engine of a Preview render that is waiting for its prepare, and how many
+// times one was noted, so a finished render knows whether it was one of them.
+std::string previewPreparing;
+std::uint64_t previewPreparingNotes = 0;
+
+void notePreviewPreparing (bool realtime) noexcept
+{
+    const std::lock_guard<std::mutex> lock (pathTraceStatsMutex);
+    previewPreparing = realtime ? "realtime" : "raster";
+    ++previewPreparingNotes;
+}
 
 void retirePathTracePreviewStats() noexcept
 {
@@ -81,15 +95,22 @@ public:
     {
         const std::lock_guard<std::mutex> lock (pathTraceStatsMutex);
         publicationsAtStart_ = previewStatsPublications;
+        preparingNotesAtStart_ = previewPreparingNotes;
     }
 
     ~PreviewStatsTurnover()
     {
         const std::lock_guard<std::mutex> lock (pathTraceStatsMutex);
         if (previewStatsPublications != publicationsAtStart_)
+        {
+            previewPreparing.clear();
             return;
+        }
         pathTracePreviewStats.reset();
         realtimePreviewStats.reset();
+        // A render that drew nothing and waited for nothing ends the wait it inherited.
+        if (previewPreparingNotes == preparingNotesAtStart_)
+            previewPreparing.clear();
     }
 
     PreviewStatsTurnover (const PreviewStatsTurnover&) = delete;
@@ -97,6 +118,7 @@ public:
 
 private:
     std::uint64_t publicationsAtStart_ = 0;
+    std::uint64_t preparingNotesAtStart_ = 0;
 };
 
 void publishRealtimeStats (const RealtimeFrameStats& published) noexcept
@@ -1101,11 +1123,54 @@ std::atomic<SceneRenderEngineFactory>& pathTraceFactory() noexcept
     static std::atomic<SceneRenderEngineFactory> factory { nullptr };
     return factory;
 }
+
+std::atomic<PathTraceKernelProbe>& pathTraceKernelProbe() noexcept
+{
+    static std::atomic<PathTraceKernelProbe> probe { nullptr };
+    return probe;
+}
+
+// On by default: Raster admits the tinted open sea of Lighthouse and Ocean, whose refusal held
+// the stand-in off on 7 Nov. ARBIT_PATH_TRACE_RASTER_STAND_IN=0 turns it off, so a compiling
+// kernel holds the frame under the notice instead. ARBIT_GLASS_ADMISSION_AUDIT=1 names every
+// object the glass admission refuses.
+std::atomic<bool> rasterStandInEnabled { [] {
+    const char* value = std::getenv ("ARBIT_PATH_TRACE_RASTER_STAND_IN");
+    return value == nullptr || std::strcmp (value, "0") != 0;
+}() };
+
+// The stand-in decision of the innermost PathTraceStandInScope on this thread:
+// -1 outside any scope, else 0 or 1.
+thread_local int standInDecision = -1;
 } // namespace
 
 void setPathTraceSceneEngineFactory (SceneRenderEngineFactory factory) noexcept
 {
     pathTraceFactory().store (factory, std::memory_order_release);
+}
+
+void setPathTraceKernelBuildingProbe (PathTraceKernelProbe probe) noexcept
+{
+    pathTraceKernelProbe().store (probe, std::memory_order_release);
+}
+
+void setPathTraceRasterStandIn (bool enabled) noexcept
+{
+    rasterStandInEnabled.store (enabled, std::memory_order_release);
+}
+
+PathTraceStandInScope::PathTraceStandInScope (bool standInEligible) noexcept
+    : previous_ (standInDecision)
+{
+    if (standInEligible && rasterStandInEnabled.load (std::memory_order_acquire))
+        if (const auto probe = pathTraceKernelProbe().load (std::memory_order_acquire); probe != nullptr)
+            standIn_ = probe();
+    standInDecision = standIn_ ? 1 : 0;
+}
+
+PathTraceStandInScope::~PathTraceStandInScope()
+{
+    standInDecision = previous_;
 }
 
 FixtureSceneRenderer::FixtureSceneRenderer (arbitgpu::NativeFixtureSceneBackend& backend) noexcept
@@ -1136,7 +1201,7 @@ bool FixtureSceneRenderer::renderWithEngine (
     std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR> diffractionMaterial,
     std::optional<diffractionmaterial::LightingDescription> diffractionLighting,
     std::optional<std::array<std::array<float, 4>, 4>> diffractionField,
-    RenderedFrame& output, std::string& error)
+    RenderedFrame& output, std::string& error, bool primeOnly)
 {
     if (pathTraceEngine_ == nullptr)
     {
@@ -1175,6 +1240,11 @@ bool FixtureSceneRenderer::renderWithEngine (
     {
         draw.inputClip = videohelper::renderinput::activeClip();
         draw.inputGeneration = videohelper::renderinput::current (draw.inputClip);
+    }
+    if (primeOnly)
+    {
+        pathTraceEngine_->primeWhileKernelBuilds (draw);
+        return true;
     }
     RenderedFrame rendered;
     if (! pathTraceEngine_->render (draw, rendered, error))
@@ -1343,6 +1413,24 @@ bool FixtureSceneRenderer::renderMixed (
     return render(snapshot, dimensions, backendCapability, use, surfaces, diffraction, inputs, sceneInputs, output, error);
 }
 
+bool FixtureSceneRenderer::renderGeometry (
+    const std::shared_ptr<const Visual3DScene>& snapshot,
+    const std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram>& program,
+    arbitgpu::NativeFixtureSceneRuntimeInputs sceneInputs,
+    RenderDimensions dimensions, RenderUse use, std::string_view backendCapability,
+    RenderedFrame& output, std::string& error)
+{
+    // The Geometry Core admitted the program against this exact snapshot, so it
+    // binds as one admission whose object programs cover the scene.
+    std::shared_ptr<const AdmittedSurfaceMaterialBinding> binding;
+    if (program != nullptr && snapshot != nullptr && snapshot->objectCount > 0)
+        binding.reset (new AdmittedSurfaceMaterialBinding (snapshot->id, snapshot->objects[0].id, 0, 0, 0, 0, {},
+                                                           snapshot, program));
+    surfacematerial::MaterialEvaluationInputs inputs;
+    inputs.timeSeconds = sceneInputs.timeSeconds;
+    return render (snapshot, dimensions, backendCapability, use, binding, {}, inputs, sceneInputs, output, error);
+}
+
 bool FixtureSceneRenderer::render (
     const std::shared_ptr<const Visual3DScene>& snapshot,
     RenderDimensions dimensions, std::string_view backendCapability,
@@ -1419,7 +1507,30 @@ bool FixtureSceneRenderer::renderAttempt (
         sceneInputs.viewportSolid = {};
         sceneInputs.viewportSolidEffects = {};
     }
-    const auto engine = viewportSolid ? SceneEngineKind::Realtime : engineSelection_.engine;
+    // With the stand-in on (setPathTraceRasterStandIn), a Path Trace Preview whose device kernel
+    // is still compiling draws with the Raster engine, the picture the user would get with
+    // Raster selected, and swaps to Path Trace when the
+    // kernel is ready. The setting stays Path Trace. A scene with frame layers never reaches
+    // the device, so it has no kernel to wait for. Export keeps waiting for the kernel.
+    // Inside a PathTraceStandInScope the caller built this frame's inputs for the engine it
+    // decided on, so that decision stands even when the kernel finished in between: this
+    // frame is still Raster's, and the next one is Path Trace's. The engine is asked
+    // either way, as its readiness call keeps the build and the notice moving.
+    bool standIn = false;
+    if (use == RenderUse::Preview && ! viewportSolid && engineSelection_.engine == SceneEngineKind::PathTrace
+        && ! sceneInputs.materialFrameTexture && sceneInputs.materialFrameTextures.empty())
+    {
+        if (pathTraceEngine_ == nullptr)
+            if (const auto factory = pathTraceFactory().load (std::memory_order_acquire); factory != nullptr)
+                pathTraceEngine_ = factory();
+        const bool building = pathTraceEngine_ != nullptr && pathTraceEngine_->kernelBuilding();
+        standIn = pathTraceEngine_ != nullptr && rasterStandInEnabled.load (std::memory_order_acquire)
+            && (standInDecision >= 0 ? standInDecision == 1 : building);
+    }
+    if (use == RenderUse::Preview)
+        videohelper::pathtrace::kernelcompile::previewStandIn().store (standIn);
+    const auto engine = viewportSolid ? SceneEngineKind::Realtime
+                      : standIn ? SceneEngineKind::Raster : engineSelection_.engine;
     const bool realtimeEngine = engine == SceneEngineKind::Realtime;
     const bool realtimeDroppedCaustic = realtimeEngine && ! viewportSolid && sceneInputs.glassCaustic.has_value();
     if (realtimeEngine)
@@ -1433,7 +1544,7 @@ bool FixtureSceneRenderer::renderAttempt (
     // from the camera that single scatters every light with the raster's shadow
     // visibility (RasterMedium.h), so it casts light shafts. It replaces the
     // Depth Fog approximation. An authored pass composite wins.
-    const bool rasterEngine = engineSelection_.engine == SceneEngineKind::Raster;
+    const bool rasterEngine = engineSelection_.engine == SceneEngineKind::Raster || standIn;
     std::optional<rastermedium::WorldFogScope> worldFogScope;
     if ((realtimeEngine || rasterEngine) && snapshot && ! sceneInputs.passComposite && ! sceneInputs.passProgram
         && sceneInputs.imageOutput == renderpassoutput::Output::Color)
@@ -1498,13 +1609,17 @@ bool FixtureSceneRenderer::renderAttempt (
         return false;
     }
 
-    const auto validation = validateVisual3DScene (*snapshot);
-    if (! validation.valid())
+    if (validatedSnapshot_.lock() != snapshot)
     {
-        error = "Visual3DScene validation failed with code "
-            + std::to_string (static_cast<unsigned> (validation.code))
-            + " at record " + std::to_string (validation.recordIndex);
-        return false;
+        const auto validation = validateVisual3DScene (*snapshot);
+        if (! validation.valid())
+        {
+            error = "Visual3DScene validation failed with code "
+                + std::to_string (static_cast<unsigned> (validation.code))
+                + " at record " + std::to_string (validation.recordIndex);
+            return false;
+        }
+        validatedSnapshot_ = snapshot;
     }
     if (! admitFixtureSubset (*snapshot, error))
         return false;
@@ -1597,7 +1712,7 @@ bool FixtureSceneRenderer::renderAttempt (
     }
 
     // Raster's shader has one isotropic slope, so it would drop this one.
-    if (engine != SceneEngineKind::PathTrace && ! viewportSolid && diffractionMaterial
+    if (engine != SceneEngineKind::PathTrace && ! viewportSolid && ! standIn && diffractionMaterial
         && diffractionMaterial->authoredRequest_
         && diffractionMaterial->authoredRequest_->material.roughness.acrossGrooveSlope > 0.0f)
     {
@@ -1607,7 +1722,7 @@ bool FixtureSceneRenderer::renderAttempt (
     // Realtime has no form of the relief yet: the frame renders without it and says so.
     const bool authoredRelief = diffractionMaterial && diffractionMaterial->authoredRequest_
         && diffractionMaterial->authoredRequest_->material.roughness.reliefRmsHeightNanometres > 0.0f;
-    if (engine == SceneEngineKind::Raster && authoredRelief)
+    if (engine == SceneEngineKind::Raster && authoredRelief && ! standIn)
     {
         error = "Relief Height doesn't render in Raster; choose Path Trace or set it to 0";
         return false;
@@ -1673,7 +1788,7 @@ bool FixtureSceneRenderer::renderAttempt (
     }
 
     sceneInputs.timeSeconds = runtimeInputs.timeSeconds;
-    if (engine == SceneEngineKind::PathTrace)
+    if (engine == SceneEngineKind::PathTrace || standIn)
     {
         // Path Trace renders glass caustics by light tracing, and a diffraction
         // material by the discrete orders of its admitted physical material
@@ -1699,22 +1814,18 @@ bool FixtureSceneRenderer::renderAttempt (
                                            sample.grooveSpacingNanometres, sample.diffractionCoverage };
                 }
             }
-            gratingMaterial = evaluatedDiffraction != nullptr ? evaluatedDiffraction : diffractionMaterial->materialIR_;
-            if (gratingMaterial == nullptr && diffractionMaterial->authoredRequest_)
-            {
-                const auto physical = diffractionmaterial::admit (diffractionMaterial->authoredRequest_->material, error);
-                if (!physical) return false;
-                gratingMaterial = std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR> (*physical);
-            }
-            if (gratingMaterial == nullptr)
-            {
-                error = "Path Trace renders authored physical diffraction materials only; choose Raster for diffraction products";
-                return false;
-            }
+            gratingMaterial = evaluatedDiffraction != nullptr ? evaluatedDiffraction : diffractionMaterial->physicalMaterial_;
         }
-        return renderWithEngine (snapshot, nativeMaterial, sceneInputs, dimensions, use, info.backend,
-                                 gratingObject, std::move (gratingMaterial), std::move (gratingLighting),
-                                 gratingField, output, error);
+        if (! standIn)
+            return renderWithEngine (snapshot, nativeMaterial, sceneInputs, dimensions, use, info.backend,
+                                     gratingObject, std::move (gratingMaterial), std::move (gratingLighting),
+                                     gratingField, output, error);
+        // The Raster picture below is this frame. The engine builds its scene meanwhile.
+        RenderedFrame unused;
+        std::string primeError;
+        renderWithEngine (snapshot, nativeMaterial, sceneInputs, dimensions, use, info.backend,
+                          gratingObject, std::move (gratingMaterial), std::move (gratingLighting),
+                          gratingField, unused, primeError, true);
     }
     std::optional<arbitgpu::glasscaustics::AdmittedBranchPolicy> causticPolicy;
     std::optional<arbitgpu::glasscaustics::MultipleScatterPolicy> multipleScatterPolicy;
@@ -1955,6 +2066,7 @@ bool FixtureSceneRenderer::renderAttempt (
                 error = "native fixture GPU backend returned pending for a blocking prepare";
                 return false;
             }
+            notePreviewPreparing (realtimeEngine);
             output = {};
             output.use = use;
             output.pending = true;
@@ -1985,6 +2097,28 @@ bool FixtureSceneRenderer::renderAttempt (
         cache_.worldFog = worldFogProgram;
         cache_.cameraVolumeOnly = requestedCameraOnly;
         cache_.residentRefreshed = false;
+    }
+
+    // A Preview wave frame moves the water on the GPU. The snapshot is the earlier
+    // CPU frame the plan holds; only the vertex buffer takes this frame's waves. A
+    // backend that can't is told to the plan, which replays this frame on the CPU
+    // when the Preview asks again, so no frame draws the wrong water.
+    bool surfaceWaveGpu = false;
+    if (use == RenderUse::Preview && sceneInputs.surfaceWave)
+    {
+        loopstep::Scope waveScope ("advance:imported-scene:fixture-surface-wave");
+        if (! backend_.refreshPreviewSurfaceWave (cache_.native, snapshot, nativeMaterial, *sceneInputs.surfaceWave))
+        {
+            if (sceneInputs.surfaceWave->refused)
+                sceneInputs.surfaceWave->refused->store (true);
+            ++previewPendingResults;
+            output = {};
+            output.use = use;
+            output.pending = true;
+            error.clear();
+            return true;
+        }
+        surfaceWaveGpu = true;
     }
 
     if (causticProgramsPending)
@@ -2234,6 +2368,7 @@ bool FixtureSceneRenderer::renderAttempt (
                                       realtimeDroppedCaustic, sceneInputs.realtimeSkipReflections,
                                       dimensions.width, dimensions.height,
                                       viewportSolid, rendered.stats.viewportSolidApplied };
+        realtime.surfaceWaveGpu = surfaceWaveGpu;
         realtime.times.cpuMs = submitCpuMs;
 #if ! ARBIT_HAVE_METAL_BACKEND && ARBIT_HAVE_OPENGL_SDF_BACKEND && ! defined(__APPLE__)
         // An export reads the frame back next, so waiting here costs it nothing extra.
@@ -2273,6 +2408,11 @@ bool takePendingCausticProgramCompletionOnThisThread() noexcept
 #else
     return false;
 #endif
+}
+
+bool pathTraceStandInOnThisThread() noexcept
+{
+    return videohelper::pathtrace::kernelcompile::previewStandIn().load();
 }
 
 bool pathTracePreviewProgressingOnThisThread() noexcept
@@ -2330,6 +2470,12 @@ std::optional<PathTraceFrameStats> lastPathTraceStats (RenderUse use)
 {
     const std::lock_guard<std::mutex> lock (pathTraceStatsMutex);
     return use == RenderUse::Preview ? pathTracePreviewStats : pathTraceExportStats;
+}
+
+std::string previewPreparingEngine()
+{
+    const std::lock_guard<std::mutex> lock (pathTraceStatsMutex);
+    return previewPreparing;
 }
 
 std::optional<RealtimeFrameStats> lastRealtimeStats (RenderUse use)

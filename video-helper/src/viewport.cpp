@@ -632,6 +632,15 @@ struct Viewport::Impl
     std::atomic<int64_t> lastSlowStepMs { 0 };
     std::atomic<const char*> lastSlowScope { "" };
     std::atomic<int64_t> lastSlowScopeMs { 0 };
+    // When the last plan install finished (steady-clock ns) and its admission ms,
+    // written by the install, read by the render thread's first-frame window.
+    std::atomic<int64_t> planInstalledNs { 0 };
+    std::atomic<double> planInstallAdmitMs { 0.0 };
+    // The scoped calls of the frames from a plan install to the first imported scene
+    // frame it rendered, summed by label, with that wait and frame count. Under mutex.
+    std::vector<std::pair<std::string, double>> firstFrameStagesMs;
+    double firstFrameWallMs = 0.0;
+    int firstFrameFrames = 0;
     std::atomic<uint64_t> loopTicks { 0 };
     std::atomic<uint64_t> sharedReleasesReceived { 0 };
     std::atomic<uint64_t> sharedReleasesInvalid { 0 };
@@ -1275,6 +1284,8 @@ std::string Viewport::setTimeline (videowire::ResolvedVisualSnapshot snapshot)
     impl_->lastPlanLoweringError.clear();
     noteContainedPlanRefusals(*impl_, containedRefusals);
     ++impl_->timelineGeneration;
+    impl_->planInstallAdmitMs.store (phaseMs (phaseAdmitStart, phaseAdmitted), std::memory_order_relaxed);
+    impl_->planInstalledNs.store (nowNs(), std::memory_order_relaxed);
     std::fprintf (stderr, "[diagnostic] viewport_set_timeline install phases opticalMs=%.1f canvasWaitMs=%.1f admitMs=%.1f "
                           "invalidateMs=%.1f stateLockWaitMs=%.1f publishMs=%.1f\n",
                   phaseMs (phaseStarted, phaseCanvasWait), phaseMs (phaseCanvasWait, phaseAdmitStart),
@@ -1859,6 +1870,15 @@ std::string Viewport::removeText (int textId)
     return {};
 }
 
+std::string Viewport::setGenParams (int clipId, std::map<std::string, double> values)
+{
+    if (impl_ == nullptr) return "viewport not open";
+    std::lock_guard<std::mutex> lock (impl_->mutex);
+    // Replace only this clip's overrides. Absent keys use the shader defaults.
+    impl_->paramsFor (clipId)->genParams = std::move (values);
+    return {};
+}
+
 std::string Viewport::setEffects (int clipId, const std::vector<EffectSlotSpec>& slots)
 {
     if (impl_ == nullptr) return "viewport not open";
@@ -2225,6 +2245,9 @@ ViewportInfo Viewport::info() const
         vi.lastSlowStepMs = (double) impl_->lastSlowStepMs.load (std::memory_order_relaxed);
         vi.lastSlowScope = impl_->lastSlowScope.load (std::memory_order_relaxed);
         vi.lastSlowScopeMs = (double) impl_->lastSlowScopeMs.load (std::memory_order_relaxed);
+        vi.firstFrameStagesMs = impl_->firstFrameStagesMs;
+        vi.firstFrameWallMs = impl_->firstFrameWallMs;
+        vi.firstFrameFrames = impl_->firstFrameFrames;
         // A frame-work step that has not returned blocks every later present,
         // seek and close. Name it as a renderer error instead of a silent hang. A
         // compile is named from its first moment, as the device marks it.
@@ -2248,6 +2271,15 @@ ViewportInfo Viewport::info() const
         vi.kernelCompiling = true;
     vi.kernelCancellable = vi.kernelCompiling && videohelper::pathtrace::kernelcompile::exportsWaiting().load() == 0;
     vi.kernelBuildStopped = vi.open && videohelper::pathtrace::kernelcompile::previewStopped().load();
+    // The stand-in flag is set per frame, so one left over from a finished build is no stand-in.
+    // A cancelled build keeps the stand-in on screen with nothing running.
+    vi.kernelStandIn = vi.open && videohelper::pathtrace::kernelcompile::previewStandIn().load()
+        && (videohelper::pathtrace::kernelcompile::runningBuildStartNs().load() != 0 || vi.kernelBuildStopped);
+    vi.kernelCompileElapsedSec = vi.kernelCompiling || vi.kernelStandIn
+        ? videohelper::pathtrace::kernelcompile::buildElapsedSeconds (
+              videohelper::pathtrace::kernelcompile::runningBuildStartNs().load(),
+              videohelper::pathtrace::kernelcompile::steadyNowNs())
+        : 0;
     vi.dmabufCapable = impl_->dmabufCapable.load();
     vi.sharedFramesSent = impl_->sharedFramesSent.load();
     vi.sharedFramesDroppedNoBuffer = impl_->sharedFramesDroppedNoBuffer.load();
@@ -2387,7 +2419,43 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     // the inner call there. The guard restores the previous sink on every return.
     loopstep::Sink loopSink { &im.loopStep, &im.loopStepEnterNs,
                               &im.lastSlowScope, &im.lastSlowScopeMs };
+    // From a plan install to the first imported scene frame it renders, every scope's
+    // time is summed by label. An engine switch is such an install, so viewport_info's
+    // firstFrameStagesMs says what the switch's first frame waited on.
+    loopstep::StageTotals frameStages;
+    loopSink.stages = &frameStages;
     loopstep::SinkInstall loopSinkInstall (&loopSink);
+    const void* firstFramePlans = nullptr;
+    bool firstFrameOpen = false;
+    int64_t firstFrameInstalledNs = 0;
+    int firstFrameFrames = 0;
+    const auto closeFirstFrameWindow = [&] (int clipId)
+    {
+        if (! firstFrameOpen) return;
+        firstFrameOpen = false;
+        const double wallMs = (double) (nowNs() - firstFrameInstalledNs) * 1e-6;
+        std::vector<std::pair<std::string, double>> stages;
+        stages.reserve ((std::size_t) frameStages.count + 1);
+        stages.emplace_back ("install:admit", im.planInstallAdmitMs.load (std::memory_order_relaxed));
+        for (int i = 0; i < frameStages.count; ++i)
+            stages.emplace_back (frameStages.labels[i], (double) frameStages.ns[i] * 1e-6);
+        std::sort (stages.begin() + 1, stages.end(), [] (const auto& a, const auto& b) { return a.second > b.second; });
+        std::string line;
+        // An adoption miss takes no time of its own, and it is why the frame verified.
+        for (const auto& [label, ms] : stages)
+            if (ms >= 1.0 || label.rfind ("geometry:adopt-miss:", 0) == 0)
+            {
+                char item[160];
+                std::snprintf (item, sizeof item, " %s=%.0f", label.c_str(), ms);
+                line += item;
+            }
+        std::fprintf (stderr, "[viewport] first frame after plan install clip=%d wallMs=%.0f frames=%d stagesMs:%s\n",
+                      clipId, wallMs, firstFrameFrames, line.c_str());
+        std::lock_guard<std::mutex> lock (im.mutex);
+        im.firstFrameStagesMs = std::move (stages);
+        im.firstFrameWallMs = wallMs;
+        im.firstFrameFrames = firstFrameFrames;
+    };
     const bool shared = im.sharedMode;
     const bool shm = im.shmMode;
     const bool offscreen = shared || shm; // hidden window, no swapchain pacing
@@ -3617,6 +3685,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
     // delay, then left alone until the revision, playhead or size changes. While
     // playing, the playhead counts as changed only when the active clips change.
     arbitviewport::FrameFailureGovernor planFailureGovernor;
+    arbitviewport::KernelBuildRetryWatch kernelBuildRetry;
     const auto steadyMs = [] {
         return static_cast<int64_t> (std::chrono::duration_cast<std::chrono::milliseconds> (
             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -3911,6 +3980,21 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             frameVisualPlans = im.visualPlanPublication.shared();
             frameVisualScheduleBindings = im.visualEventSchedules;
             eventFrameTimelineGeneration = im.timelineGeneration;
+            // A window already open keeps its start: a small install before the first
+            // frame does not hide the wait of the install that started it.
+            if (frameVisualPlans.get() != firstFramePlans)
+            {
+                firstFramePlans = frameVisualPlans.get();
+                if (! firstFrameOpen && frameVisualPlans != nullptr)
+                {
+                    firstFrameOpen = true;
+                    firstFrameInstalledNs = im.planInstalledNs.load (std::memory_order_relaxed);
+                    if (firstFrameInstalledNs <= 0) firstFrameInstalledNs = nowNs();
+                    firstFrameFrames = 0;
+                    frameStages.clear();
+                }
+            }
+            if (firstFrameOpen) ++firstFrameFrames;
             const auto relevantClip = [&] (int clipId, double at)
             {
                 for (const auto& segment : im.segments)
@@ -4089,6 +4173,18 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                 liveAud.sources[(size_t) i] = { source.trackId, (int) source.tapPoint,
                                                 source.rms, source.peak, source.onset };
             }
+        }
+
+        // --- A Preview that waited on the Path Trace kernel build, under the Raster stand-in or
+        // holding its frame, is drawn again when that build ends, so it swaps to Path Trace. Its
+        // last frame may have settled, so the idle gate below would skip every later tick, or
+        // been refused, so the plan governor would hold it. Nothing else changes when a build
+        // ends, and the device's readiness call that clears the notice runs only in a frame.
+        {
+            namespace kernelcompile = videohelper::pathtrace::kernelcompile;
+            arbitviewport::wakeForKernelBuildEnd (kernelBuildRetry, planFailureGovernor, publishGate,
+                kernelcompile::previewStandIn().load() || kernelcompile::previewWaiting().load(),
+                kernelcompile::runningBuildStartNs().load(), kernelcompile::previewStopped().load());
         }
 
         // --- Idle production gate (viewport_publish_gate.h). A skipped tick
@@ -5444,6 +5540,7 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             }
             adoptAdmittedImportedScene (segment.clipId);
             enterLoopStep ("advance:imported-scene-exec");
+            std::optional<loopstep::Scope> prepareScope (std::in_place, "advance:imported-scene:prepare");
             std::optional<std::uint64_t> importedSceneRenderNs;
             videohelper::previewextent::Extent importedSceneRenderedExtent;
             std::string importedSceneCausticDegradation;
@@ -5460,6 +5557,12 @@ void Viewport::renderLoop (int width, int height, int x, int y,
                     importedFrameResolver ? &*importedFrameResolver : nullptr, &importedSceneRenderNs,
                     &previewSceneExtent, &importedSceneRenderedExtent,
                     &importedSceneCausticDegradation);
+            prepareScope.reset();
+            // The first Path Trace sample, or the first frame of another engine, ends the
+            // window; a Raster stand-in for a compiling kernel does not.
+            if (importedSceneResult == videohelper::importedscene::VisualImportedScenePreparation::rendered
+                && ! videorender::fixture3d::pathTraceStandInOnThisThread())
+                closeFirstFrameWindow (segment.clipId);
             if (importedSceneRenderNs)
             {
                 im.visualTelemetry.recordImportedSceneRender (*importedSceneRenderNs);
@@ -5495,6 +5598,10 @@ void Viewport::renderLoop (int width, int height, int x, int y,
             // caustic adoption wake. Holding here makes the render progress on
             // screen instead of freezing after one pass, and the counter bounds
             // the hold like the wake bounds itself.
+            // A Raster stand-in for a kernel that is still compiling holds until the kernel
+            // is ready, with no stall count: the picture must swap to Path Trace by itself.
+            if (videorender::fixture3d::pathTraceStandInOnThisThread())
+                frameSettled = false;
             if (videorender::fixture3d::pathTracePreviewProgressingOnThisThread())
             {
                 const auto samples = videorender::fixture3d::pathTracePreviewSamplesOnThisThread();

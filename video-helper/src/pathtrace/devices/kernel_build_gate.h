@@ -5,6 +5,15 @@
 // status() and holds its last frame, and an export blocks in await(). Two builds of the
 // same kernel would each compile it from nothing, as the driver's cache fills only when
 // one ends. It lives for the process, as its thread may outlast any one renderer.
+//
+// A background warm-up (kernel_warmup.h) starts the build on nobody's behalf. The first
+// caller of any other kind to start, join or await it claims it: the build is then theirs
+// (a failure reaches them, and the warm-up's low priority is lifted), and it is still the
+// one build, with the elapsed time counted from the warm-up's start.
+//
+// A warm-up only fills the driver's cache. When it ends unclaimed, its build releases what
+// it made (keepWarmUp() says no) and the gate goes back to idle, so the next real use builds
+// again from the cache in about 0.1 s and holds no GPU context until then.
 
 #include <chrono>
 #include <condition_variable>
@@ -15,6 +24,9 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
+
+#include "kernel_compile_state.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -68,18 +80,36 @@ class BuildGate
 public:
     // Stopped: the user cancelled, and nothing builds until they start again or an export asks.
     enum class Status { Idle, Running, Ready, Failed, Stopped };
+    // Who asked for the build. A warm-up that fails unclaimed leaves the gate idle, so the
+    // next caller builds from nothing and reports its own failure.
+    enum class Origin { Caller, WarmUp };
 
     // Starts the build unless one has run, is running, was stopped, or waits for a caller
     // to read its failure. A failure read in await() or join() lets the next caller try again.
-    void start (std::function<bool (std::string&)> build)
+    // onClaim runs once, on the claiming caller's thread, when a warm-up's build is claimed.
+    void start (std::function<bool (std::string&)> build, Origin origin = Origin::Caller,
+                std::function<void()> onClaim = {})
     {
+        std::function<void()> claimed;
+        bool launches = false;
         {
             const std::lock_guard<std::mutex> lock (mutex_);
             if (status_ != Status::Idle)
-                return;
-            markRunning();
+            {
+                if (origin == Origin::Caller)
+                    claimed = claimLocked();
+            }
+            else
+            {
+                markRunning (origin);
+                onClaim_ = std::move (onClaim);
+                launches = true;
+            }
         }
-        launch (std::move (build));
+        if (claimed)
+            claimed();
+        if (launches)
+            launch (std::move (build));
     }
 
     // Starts the build if nothing runs and blocks until it ends, for an export. A stop
@@ -93,11 +123,17 @@ public:
             status_ = Status::Idle;
         ++joined_;
         const auto leave = [this] { --joined_; };
+        if (const auto claimed = claimLocked())
+        {
+            lock.unlock();
+            claimed();
+            lock.lock();
+        }
         for (;;)
         {
             if (status_ == Status::Idle)
             {
-                markRunning();
+                markRunning (Origin::Caller);
                 lock.unlock();
                 launch (build);
                 lock.lock();
@@ -168,10 +204,51 @@ public:
             ? std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - started_).count() : 0.0;
     }
 
+    // A warm-up's build that a caller has since joined.
+    bool claimed() const
+    {
+        const std::lock_guard<std::mutex> lock (mutex_);
+        return claimed_;
+    }
+
+    // The last warm-up failed unclaimed: the gate went back to idle and said nothing. Empty
+    // when none did since the last build began.
+    // The build calls this when it has finished and holds its result: false means nobody
+    // claimed it, so release what it made and return true. From then on a caller can't claim
+    // it; the gate goes idle when the build returns, and the caller builds again.
+    bool keepWarmUp()
+    {
+        const std::lock_guard<std::mutex> lock (mutex_);
+        if (claimed_)
+            return true;
+        releasing_ = true;
+        return false;
+    }
+
+    // The last warm-up ended unclaimed and released what it made.
+    bool released() const
+    {
+        const std::lock_guard<std::mutex> lock (mutex_);
+        return released_;
+    }
+
+    bool silentFailure (std::string& error) const
+    {
+        const std::lock_guard<std::mutex> lock (mutex_);
+        error = silentError_;
+        return silentFailed_;
+    }
+
     // Blocks while the build runs. True when it succeeded.
     bool await (std::string& error)
     {
         std::unique_lock<std::mutex> lock (mutex_);
+        if (const auto claimed = claimLocked())
+        {
+            lock.unlock();
+            claimed();
+            lock.lock();
+        }
         changed_.wait (lock, [this] { return status_ != Status::Running; });
         if (status_ == Status::Ready)
             return true;
@@ -182,11 +259,29 @@ public:
     }
 
 private:
-    void markRunning()
+    // The claim hook for the first caller to join a running warm-up, or empty.
+    std::function<void()> claimLocked()
+    {
+        if (status_ != Status::Running || ! warmUp_ || claimed_ || releasing_)
+            return {};
+        claimed_ = true;
+        return std::exchange (onClaim_, {});
+    }
+
+    void markRunning (Origin origin)
     {
         status_ = Status::Running;
         stopping_ = false;
+        warmUp_ = origin == Origin::WarmUp;
+        claimed_ = false;
+        releasing_ = false;
+        released_ = false;
+        silentFailed_ = false;
+        silentError_.clear();
+        onClaim_ = {};
         started_ = std::chrono::steady_clock::now();
+        startedNs_ = steadyNowNs();
+        runningBuildStartNs() = startedNs_;
     }
 
     void launch (std::function<bool (std::string&)> build)
@@ -196,15 +291,29 @@ private:
             std::string error;
             const bool built = build (error);
             const std::lock_guard<std::mutex> lock (mutex_);
+            auto mine = startedNs_;
+            runningBuildStartNs().compare_exchange_strong (mine, 0);
             // A compile that ends failed after a Cancel, even one taken back since, is that
             // Cancel's doing and no failure to report.
-            if (built)
+            if (built && releasing_)
+            {
+                status_ = Status::Idle;
+                released_ = true;
+                releasing_ = false;
+            }
+            else if (built)
             {
                 status_ = Status::Ready;
                 stopRequested_ = false;
             }
             else if (stopRequested_ || stopping_)
                 status_ = stopRequested_ ? Status::Stopped : Status::Idle;
+            else if (warmUp_ && ! claimed_)
+            {
+                silentFailed_ = true;
+                silentError_ = std::move (error);
+                status_ = Status::Idle;
+            }
             else
             {
                 status_ = Status::Failed;
@@ -228,8 +337,16 @@ private:
     bool stopRequested_ = false;
     bool stopping_ = false;
     int joined_ = 0;
+    bool warmUp_ = false;
+    bool claimed_ = false;
+    bool releasing_ = false;
+    bool released_ = false;
+    bool silentFailed_ = false;
+    std::string silentError_;
+    std::function<void()> onClaim_;
     std::string error_;
     std::chrono::steady_clock::time_point started_ {};
+    std::int64_t startedNs_ = 0;
 };
 
 } // namespace videohelper::pathtrace::kernelcompile

@@ -3818,7 +3818,7 @@ void schedulesAndPower()
 void stableDeposition()
 {
     std::string error;
-    for(const auto extent:{std::pair<std::uint32_t,std::uint32_t>{1920,1080},{3840,2160}})
+    for(const auto& extent:{std::pair<std::uint32_t,std::uint32_t>{1920,1080},{3840,2160}})
     {
         gc::DepositionSchedule schedule;
         check(gc::calculateDepositionSchedule(extent.first,extent.second,16384,schedule,error),error);
@@ -3845,7 +3845,7 @@ void stableDeposition()
     auto fixture=gt::ordinaryFixture();fixture.scene->cameras[0].transform.translation.x=6;
     fixture.scene->cameras[0].verticalFovRadians=2;
     const bool ready=fixture.prepare(error);check(ready,error);if(!ready)return;
-    for(const auto extent:{std::pair<std::uint32_t,std::uint32_t>{1920,1080},{3840,2160}})
+    for(const auto& extent:{std::pair<std::uint32_t,std::uint32_t>{1920,1080},{3840,2160}})
     {
         gc::Frame full;
         const bool admitted=gc::buildScheduledFrame(fixture.prepared,fixture.frame.instances,nullptr,

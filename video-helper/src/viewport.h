@@ -177,6 +177,12 @@ struct ViewportInfo
     double lastSlowStepMs = 0.0;
     std::string lastSlowScope;
     double lastSlowScopeMs = 0.0;
+    // From the last plan install (an engine switch is one) to the first imported scene
+    // frame it rendered: each scoped call's summed ms by label, inclusive of the calls
+    // nested in it, plus install:admit; the wall ms from the install's end; the frames.
+    std::vector<std::pair<std::string, double>> firstFrameStagesMs;
+    double firstFrameWallMs = 0.0;
+    int firstFrameFrames = 0;
     // Set while the render thread has stayed in one frame-work step for 5 s or
     // more: that step and its age. rendererError carries the same stall.
     std::string stalledStep;
@@ -185,6 +191,11 @@ struct ViewportInfo
     bool kernelCompiling = false;
     bool kernelCancellable = false;
     bool kernelBuildStopped = false;
+    // The Path Trace preview is showing the Raster engine's picture while the kernel
+    // compiles, and swaps to Path Trace when it is ready. kernelCompileElapsedSec is how
+    // long the running build has gone, 0 when none runs.
+    bool kernelStandIn = false;
+    int kernelCompileElapsedSec = 0;
     // How long the last close waited for the render thread to stop, and the
     // step it was in when the close began. A long wait delays the next open,
     // because RPCs run one at a time.
@@ -401,6 +412,7 @@ public:
     std::string removeText (int textId);
 
     // Bulk (re)configure a clip's whole effects rack (graph_set_effects).
+    std::string setGenParams (int clipId, std::map<std::string, double> values);
     std::string setEffects (int clipId, const std::vector<EffectSlotSpec>& slots);
 
     // Per-clip .cube 3D LUT (graph_set_lut). The file is parsed on the

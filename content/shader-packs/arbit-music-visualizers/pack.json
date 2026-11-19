@@ -1,0 +1,205 @@
+{
+  "pack": {
+    "id": "donutstudio-music-visualizers-v1",
+    "name": "DonutStudio Music Visualizer Templates",
+    "version": "1.0",
+    "author": "DonutStudio",
+    "license": "CC0-1.0",
+    "format": "isf",
+    "description": "Editable music visualizer templates driven by DonutStudio score, exact tuning, harmonic links, clock, and audio analysis. Exposed inputs are ordinary clip parameters that can be automated and modulated."
+  },
+  "shaders": [
+    {
+      "id": "neon-piano-roll",
+      "file": "shaders/falling_piano_roll.fs",
+      "name": "Neon Piano Roll",
+      "description": "Falling score notes strike a keyboard with track-aware neon color, exact-frequency positioning, impact glow, and sparks.",
+      "useCategory": "score-ji",
+      "styleTags": ["neon", "cinematic", "geometric"],
+      "reactsTo": ["score", "clock"],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "legacySourceSha256": [
+        "f0e1459e566646076ca274275bbe41063388db5defb263bd63e0ed6ae54cbab3",
+        "15772262d8b5e6453b92e6f4dafd6dad3fde36e569813f03bbd64c3258131716"
+      ],
+      "parameterDefaults": {
+        "lookaheadBeats": 8.0,
+        "keyboardHeight": 0.18,
+        "noteWidth": 0.72,
+        "glowAmount": 1.0,
+        "sparkAmount": 0.55,
+        "lowColor.r": 0.05,
+        "lowColor.g": 0.55,
+        "lowColor.b": 1.0,
+        "lowColor.a": 1.0,
+        "highColor.r": 0.90,
+        "highColor.g": 0.16,
+        "highColor.b": 1.0,
+        "highColor.a": 1.0,
+        "rootColor.r": 1.0,
+        "rootColor.g": 0.70,
+        "rootColor.b": 0.12,
+        "rootColor.a": 1.0
+      }
+    },
+    {
+      "id": "ember-piano-roll",
+      "file": "shaders/falling_piano_roll.fs",
+      "name": "Ember Piano Roll",
+      "description": "A warm falling piano roll with stronger impact sparks and fire-colored note lanes, ready for piano performance videos.",
+      "useCategory": "score-ji",
+      "styleTags": ["ember", "cinematic", "warm"],
+      "reactsTo": ["score", "clock"],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "parameterDefaults": {
+        "lookaheadBeats": 7.0,
+        "keyboardHeight": 0.20,
+        "noteWidth": 0.66,
+        "glowAmount": 1.35,
+        "sparkAmount": 1.25,
+        "lowColor.r": 0.30,
+        "lowColor.g": 0.18,
+        "lowColor.b": 1.0,
+        "lowColor.a": 1.0,
+        "highColor.r": 1.0,
+        "highColor.g": 0.45,
+        "highColor.b": 0.04,
+        "highColor.a": 1.0,
+        "rootColor.r": 1.0,
+        "rootColor.g": 0.82,
+        "rootColor.b": 0.20,
+        "rootColor.a": 1.0
+      }
+    },
+    {
+      "id": "spectral-history-ribbon",
+      "file": "shaders/spectral_history_ribbon.fs",
+      "name": "Spectral History Ribbon",
+      "description": "A mirrored audio spectrum written into a scrolling persistent history, with low frequencies at the center and upper bands at the outer peaks.",
+      "useCategory": "audio",
+      "styleTags": ["minimal", "neon", "cinematic"],
+      "reactsTo": ["audio", "clock"],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "legacySourceSha256": [
+        "b30327b593e125c2931e66370ef8c3e56e13170f0eb0c36b50907c76fa7262ea",
+        "31d74879d23e3228184d15581f6ca1054eee07f7bd97d5b4edba145a394f0ab5"
+      ],
+      "parameterDefaults": {
+        "gain": 1.35,
+        "scrollSpeed": 1.0,
+        "decay": 0.985,
+        "lineWidth": 0.012
+      }
+    },
+    {
+      "id": "harmonic-constellation",
+      "file": "shaders/harmonic_constellation.fs",
+      "name": "Harmonic Constellation",
+      "description": "Exact-ratio notes and harmonic links form a luminous prime-lattice constellation; roots become gold anchors and upcoming notes fade into place.",
+      "useCategory": "score-ji",
+      "styleTags": ["microtonal", "geometric", "neon"],
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": ["harmonic links / JI tuning"],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "legacySourceSha256": ["dc0a1f6a955a364b182ac3427caf2471d106cdca572826db9f85f2728ad90f21", "d6e79d1ceff75a2ebfa9cc733b19efb48969a9c3ee164c58ee33eb1feeb956ed"],
+      "parameterDefaults": {
+        "latticeScale": 0.16,
+        "nodeSize": 0.018,
+        "linkWidth": 0.008,
+        "lookaheadFade": 0.45
+      }
+    },
+    {
+      "id": "pitch-ribbons",
+      "file": "shaders/pitch_ribbons.fs",
+      "name": "Pitch Ribbons",
+      "description": "Past and upcoming score notes become crisp horizontal voice-leading ribbons with exact-frequency pitch placement, harmonic-master connections, and transient punch.",
+      "useCategory": "score-ji",
+      "styleTags": ["minimal", "neon", "microtonal"],
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "legacySourceSha256": [
+        "f4f09e0832adba6fc5b11e410400d70c135c1211f0af6fe7d75329a838add4b2",
+        "f2b218baca1fb15012d7798dfb79014a22c2582a3c7414d372d4f5b79f89679b"
+      ],
+      "parameterDefaults": {
+        "historyBeats": 4.0,
+        "lookaheadBeats": 8.0,
+        "ribbonWidth": 0.014,
+        "linkStrength": 0.55
+      }
+    },
+    {
+      "id": "harmonic-oscilloscope",
+      "file": "shaders/harmonic_oscilloscope.fs",
+      "name": "Harmonic Oscilloscope",
+      "description": "A root-locked phosphor oscilloscope combines sounding notes into one sampled trace. Exact root-relative ratios determine its repeating waveform; optional drift releases the trigger lock.",
+      "useCategory": "score-ji",
+      "styleTags": ["oscilloscope", "neon", "microtonal"],
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "legacySourceSha256": [
+        "36fece802c65ae970b8278701691ec6ed22bec1a2fbcf4bc10dec5ce843a5d06",
+        "cddab8b30e464cc853122669cf6b3f6c0b6c0e523fb36ea4a127fc8e0b181060"
+      ],
+      "parameterDefaults": {
+        "windowCycles": 4.0,
+        "amplitude": 0.78,
+        "traceWidth": 0.0024,
+        "glowAmount": 0.72,
+        "waveShape": 0.66,
+        "phaseDrift": 0.0,
+        "sampleCount": 320.0,
+        "showComponents": false
+      }
+    },
+    {
+      "id": "resonant-strings",
+      "file": "shaders/resonant_strings.fs",
+      "name": "Resonant Strings",
+      "description": "Sounding pitch classes become vibrating ratio strings. With four root cycles, exact 5/4, 3/2, and 7/4 notes draw five, six, and seven spatial cycles, while frame-timed trails show their motion.",
+      "useCategory": "score-ji",
+      "styleTags": ["strings", "standing-wave", "microtonal"],
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "template": true,
+      "featured": true,
+      "useProjectLength": true,
+      "legacySourceSha256": [
+        "1be15073107ab9ed1e68ce176d77bfd5de8b6ece67345f6ad3ba946e336c5227",
+        "57e648d72aa7d093758aeab41ef7f5f13fae40b9fe52bee24de9f7d7c6c2ac77",
+        "3f4c5b242ccb270a315e8a80250337edd983a409e1604c1a83df5edca98db709",
+        "b9ddea5399347391d9f4948bc992a639db2fd17b52f53d83dec4bb986f6ab545",
+        "ef426325407c34003dfeda79665dd38ae7465e862e0f789f77f44fb604f7ec26",
+        "2d19fab13b6edb10996ef1e6bcc548c8e280c4ea8cbadf4703150461740fa21a",
+        "82eaa565f8446dc86ee027073a199a16ef819cc379be931694d963668934690e"
+      ],
+      "parameterDefaults": {
+        "amplitude": 0.085,
+        "spatialCycles": 4.0,
+        "vibrationRate": 5.7,
+        "motionTrails": 0.68,
+        "lineWidth": 0.0028,
+        "harmonicDetail": 0.48,
+        "verticalSpread": 0.82
+      }
+    }
+  ]
+}

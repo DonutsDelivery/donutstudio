@@ -672,6 +672,7 @@ bool GlbNativeRenderSeam::publishSurfaceMaterial (
     materialScene_ = admission.scene;
     lastGoodMaterial_ = std::move (candidate);
     lastSurfaceProgramsIdentity_.clear();
+    lastSurfaceProgramsRequest_.reset();
     lastGoodDiffractionMaterial_.reset();
     lastGoodMaterialRevision_ = request.programRevision;
     rejectedMaterialRevision_ = 0;
@@ -721,21 +722,33 @@ bool GlbNativeRenderSeam::publishSurfacePrograms (
     // and this runs on every published sample.
     if (!unchangedRequest)
     {
-        lastIdentityDigest_ = videohelper::sha256Text(visualimportedscenerender::encode(operation));
+        lastIdentityDigest_.clear();
         lastIdentityRequest_ = std::make_shared<const visualimportedscenerender::Request>(operation);
     }
-    const auto& identity = lastIdentityDigest_;
     const bool sameScene = materialScene_.lock() == admission.scene;
+    // The digest is compared only with one published for this same immutable scene, so a
+    // new scene snapshot, one per advancing frame, encodes nothing here. Both digests are
+    // made on first comparison; the same request object needs neither.
+    const auto sameIdentity = [this]
+    {
+        if (lastSurfaceProgramsRequest_ == nullptr) return false;
+        if (lastSurfaceProgramsRequest_ == lastIdentityRequest_) return true;
+        if (lastIdentityDigest_.empty())
+            lastIdentityDigest_ = videohelper::sha256Text(visualimportedscenerender::encode(*lastIdentityRequest_));
+        if (lastSurfaceProgramsIdentity_.empty())
+            lastSurfaceProgramsIdentity_ = videohelper::sha256Text(visualimportedscenerender::encode(*lastSurfaceProgramsRequest_));
+        return lastIdentityDigest_ == lastSurfaceProgramsIdentity_;
+    };
     if (sameScene && lastGoodMaterial_ && request.programRevision == lastGoodMaterialRevision_
         && (request.evaluationRevision < lastGoodMaterial_->evaluationRevision()
             || (request.evaluationRevision == lastGoodMaterial_->evaluationRevision()
-                && identity != lastSurfaceProgramsIdentity_)))
+                && !sameIdentity())))
         return fail(error, "native Surface collection publication rejected", "revision names a different immutable object collection");
     // A converging preview publishes the same material once per sample, and each admission
     // validates the whole scene several times. Anything else that replaced the published
     // material changes these owners.
     if (unchangedRequest && sameScene && lastGoodMaterial_ && materialInputs && publishedMaterialInputs_
-        && *publishedMaterialInputs_ == *materialInputs && identity == lastSurfaceProgramsIdentity_
+        && *publishedMaterialInputs_ == *materialInputs && sameIdentity()
         && publishedMaterial_.lock() == lastGoodMaterial_
         && publishedDiffraction_.lock() == lastGoodDiffractionMaterial_)
     { error.clear(); return true; }
@@ -832,13 +845,14 @@ bool GlbNativeRenderSeam::publishSurfacePrograms (
 #endif
     }
     warmScope.reset ();
-    if (sameScene && lastGoodMaterial_ && identity == lastSurfaceProgramsIdentity_
+    if (sameScene && lastGoodMaterial_ && sameIdentity()
         && candidate->bindingDigest() == lastGoodMaterial_->bindingDigest())
     { rememberPublication(); error.clear(); return true; }
     materialScene_ = admission.scene;
     lastGoodMaterial_ = std::move(candidate);
     lastGoodDiffractionMaterial_ = std::move(grating);
-    lastSurfaceProgramsIdentity_ = identity;
+    lastSurfaceProgramsRequest_ = lastIdentityRequest_;
+    lastSurfaceProgramsIdentity_ = lastIdentityDigest_;
     lastGoodMaterialRevision_ = request.programRevision;
     rejectedMaterialRevision_ = 0;
     rememberPublication();
@@ -852,6 +866,7 @@ void GlbNativeRenderSeam::clearSurfaceMaterial (
         return;
     lastGoodMaterial_.reset();
     lastSurfaceProgramsIdentity_.clear();
+    lastSurfaceProgramsRequest_.reset();
     if (lastGoodDiffractionMaterial_ == nullptr)
     {
         materialScene_.reset();

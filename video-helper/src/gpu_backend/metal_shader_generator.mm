@@ -553,9 +553,13 @@ uint32_t MetalShaderGenerator::renderViewUnlocked (
     const bool haveNotes = notes != nullptr && ! notes->noteTexture().empty();
     if (haveNotes)
     {
-        // Same layout as the GL generator: uNotes is 4 x noteRows, uLinks is
+        // Same layout as the GL generator: uNotes is 4 x noteRows followed by
+        // the sounding-row index (block_c_packer.h), uLinks is
         // kLinkTextureWidth x ceil(links / width). Recreate when a height changes.
-        const int noteHeight = notes->noteTextureHeight();
+        const int noteRows = notes->noteRows();
+        const auto sounding = arbitblockc::soundingRowIndex (notes->noteTexture(), noteRows);
+        const int soundingHeight = static_cast<int> (sounding.size() / (4u * 4u));
+        const int noteHeight = noteRows + soundingHeight;
         const int linkHeight = notes->linkTextureHeight();
         constexpr int linkWidth = arbitblockc::kLinkTextureWidth;
         if (impl_->notesTexture == nil || impl_->notesHeight != noteHeight)
@@ -572,9 +576,14 @@ uint32_t MetalShaderGenerator::renderViewUnlocked (
                                                 MTLTextureType2D, linkWidth, linkHeight);
             impl_->linksHeight = linkHeight;
         }
-        if (notes->noteTexture().size() >= 4u * 4u * static_cast<std::size_t> (noteHeight))
-            [impl_->notesTexture replaceRegion:MTLRegionMake2D (0, 0, 4, noteHeight) mipmapLevel:0
-                                       withBytes:notes->noteTexture().data() bytesPerRow:4 * 4 * sizeof (float)];
+        if (notes->noteTexture().size() >= 4u * 4u * static_cast<std::size_t> (noteRows))
+        {
+            if (noteRows > 0)
+                [impl_->notesTexture replaceRegion:MTLRegionMake2D (0, 0, 4, noteRows) mipmapLevel:0
+                                           withBytes:notes->noteTexture().data() bytesPerRow:4 * 4 * sizeof (float)];
+            [impl_->notesTexture replaceRegion:MTLRegionMake2D (0, noteRows, 4, soundingHeight) mipmapLevel:0
+                                       withBytes:sounding.data() bytesPerRow:4 * 4 * sizeof (float)];
+        }
         if (notes->linkTexture().size() >= 4u * static_cast<std::size_t> (linkWidth) * static_cast<std::size_t> (linkHeight))
             [impl_->linksTexture replaceRegion:MTLRegionMake2D (0, 0, linkWidth, linkHeight) mipmapLevel:0
                                        withBytes:notes->linkTexture().data() bytesPerRow:linkWidth * 4 * sizeof (float)];

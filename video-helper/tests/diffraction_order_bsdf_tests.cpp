@@ -548,7 +548,7 @@ void pressedDiscPitTests()
     check(std::abs(pits.pitScatterPower / pits.substrateReflectedPower - 0.1882) < 1.0e-3, "that noise is the pit scatter");
     // The track orders and the pit scatter are one budget, so the lobe's power is not
     // counted twice. The orders past 20000 hold about 5e-6.
-    for (const auto [nanometres, n] : { std::pair<double, double> { 450.0, 1.6074 }, { 550.0, index }, { 650.0, 1.5792 } })
+    for (const auto& [nanometres, n] : { std::pair<double, double> { 450.0, 1.6074 }, { 550.0, index }, { 650.0, 1.5792 } })
     {
         DiffractionOrderDistribution at;
         check(evaluateDiffractionOrders(*admitted, nanometres, frame, incident, { 0.5, 0.5 }, at, error, n), error);

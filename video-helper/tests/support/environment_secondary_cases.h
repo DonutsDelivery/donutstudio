@@ -294,7 +294,7 @@ inline bool run(arbitgpu::NativeFixtureSceneBackend& backend,std::string& error)
         allPixels.push_back(pixels.bytes);
         std::cout<<"environment-secondary-pixels backend="<<backend.info().backend<<" row="<<row<<'\n';
     }
-    for(const auto pair: {std::pair<std::size_t,std::size_t>{0,1},{0,2},{0,3},{0,4},{0,5},{6,7},{7,8},{6,9},
+    for(const auto& pair: {std::pair<std::size_t,std::size_t>{0,1},{0,2},{0,3},{0,4},{0,5},{6,7},{7,8},{6,9},
         {10,11},{10,12},{10,13},{10,14},{10,15},{16,17},{17,18},{16,19}})
         if(allPixels[pair.first]==allPixels[pair.second])
         {error="HDR secondary authored control or blocker failed native pixel causality";return false;}

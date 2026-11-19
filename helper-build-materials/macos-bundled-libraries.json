@@ -1,0 +1,222 @@
+[
+  {
+    "formula": "mpg123",
+    "version": "1.33.7",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libmpg123.0.dylib",
+    "originalName": "libmpg123.0.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "x265",
+    "version": "4.2",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libx265.216.dylib",
+    "originalName": "libx265.216.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "x264",
+    "version": "r3222",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libx264.165.dylib",
+    "originalName": "libx264.165.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "svt-av1",
+    "version": "4.2.0",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libSvtAv1Enc.4.2.0.dylib",
+    "originalName": "libSvtAv1Enc.4.2.0.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "opus",
+    "version": "1.6.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libopus.0.dylib",
+    "originalName": "libopus.0.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "lame",
+    "version": "4.0",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libmp3lame.0.dylib",
+    "originalName": "libmp3lame.0.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "dav1d",
+    "version": "1.5.4",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libdav1d.7.dylib",
+    "originalName": "libdav1d.7.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "xz",
+    "version": "5.8.3",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "liblzma.5.dylib",
+    "originalName": "liblzma.5.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "libvpx",
+    "version": "1.16.0",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libvpx.12.dylib",
+    "originalName": "libvpx.12.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "openssl@3",
+    "version": "3.6.4",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libcrypto.3.dylib",
+    "originalName": "libcrypto.3.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "openssl@3",
+    "version": "3.6.4",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libssl.3.dylib",
+    "originalName": "libssl.3.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "libvmaf",
+    "version": "3.2.0",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libvmaf.3.dylib",
+    "originalName": "libvmaf.3.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "lua",
+    "version": "5.5.0",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "liblua.5.5.0.dylib",
+    "originalName": "liblua.5.5.0.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libavutil.61.1.101.dylib",
+    "originalName": "libavutil.61.1.101.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libswresample.7.1.101.dylib",
+    "originalName": "libswresample.7.1.101.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libavcodec.63.1.101.dylib",
+    "originalName": "libavcodec.63.1.101.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libavformat.63.1.101.dylib",
+    "originalName": "libavformat.63.1.101.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libswscale.10.1.101.dylib",
+    "originalName": "libswscale.10.1.101.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libavfilter.12.1.101.dylib",
+    "originalName": "libavfilter.12.1.101.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libavdevice.63.1.101.dylib",
+    "originalName": "libavdevice.63.1.101.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "molten-vk",
+    "version": "1.4.2",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libMoltenVK.dylib",
+    "originalName": "libMoltenVK.dylib",
+    "originalExists": true
+  },
+  {
+    "formula": "glfw",
+    "version": "3.5.1",
+    "tap": "homebrew/core",
+    "tapGitHead": null,
+    "pouredFromBottle": true,
+    "shippedName": "libglfw.3.5.dylib",
+    "originalName": "libglfw.3.5.dylib",
+    "originalExists": true
+  }
+]

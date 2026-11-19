@@ -183,6 +183,9 @@ void testStoreThenLoad()
 
     FakeDriver reader;
     cache::ProgramBinaryCache loading (reader, directory);
+    check (loading.contains ("vertex", "fragment") && ! loading.contains ("vertex", "fragment changed")
+               && reader.loads == 0,
+           "contains names a stored pair without reaching the driver");
     const auto program = loading.load ("vertex", "fragment");
     check (program != 0, "an identical pair loads a program");
     check (reader.loads == 1 && reader.loadedFormat == writer.retrieveFormat && reader.loadedBytes == writer.retrieveBytes,
@@ -363,6 +366,10 @@ void testEvictionByCount()
     check (fs::exists (cache::entryPath (directory, "ccc")) && fs::exists (cache::entryPath (directory, "ddd")),
            "the two newest entries remain after a write");
     removeTree (directory);
+
+    // A session writes several programs and every build shares the directory, so
+    // the default count keeps far more than one session's programs.
+    check (cache::Limits {}.maximumEntries >= 512, "the default count limit outlasts many sessions");
 }
 
 void testEvictionByBytes()

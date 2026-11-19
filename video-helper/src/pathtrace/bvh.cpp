@@ -264,6 +264,54 @@ void Bvh::buildMotion (const Vec3* open, const Vec3* close, std::size_t triangle
         }
 }
 
+bool Bvh::refit (const Vec3* open, const Vec3* close, std::size_t triangleCount) noexcept
+{
+    if (open == nullptr || triangleCount != triangleIndices_.size() || (close != nullptr) != hasMotion()
+        || nodes_.empty())
+        return false;
+    for (std::size_t i = 0; i < triangleIndices_.size(); ++i)
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            const std::size_t source = 3 * std::size_t { triangleIndices_[i] } + k;
+            orderedPositions_[3 * i + k] = open[source];
+            if (close != nullptr)
+                orderedClose_[3 * i + k] = close[source];
+        }
+    // The build pushes both children after their parent, so walking the nodes
+    // backwards meets every child before its parent.
+    const auto store = [] (BvhNode& node, const Bounds& b) noexcept {
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            node.boundsMin[axis] = b.lo[axis];
+            node.boundsMax[axis] = b.hi[axis];
+        }
+    };
+    const auto load = [] (const BvhNode& node) noexcept {
+        Bounds b;
+        b.grow (Vec3 { node.boundsMin[0], node.boundsMin[1], node.boundsMin[2] });
+        b.grow (Vec3 { node.boundsMax[0], node.boundsMax[1], node.boundsMax[2] });
+        return b;
+    };
+    const Vec3* ordered = orderedPositions_.data();
+    const Vec3* orderedClose = close != nullptr ? orderedClose_.data() : nullptr;
+    for (std::size_t n = nodes_.size(); n-- > 0;)
+    {
+        BvhNode& node = nodes_[n];
+        Bounds b;
+        if (node.count > 0)
+            for (std::uint32_t t = node.firstOrLeft; t < node.firstOrLeft + node.count; ++t)
+                b.grow (motionTriangleBounds (ordered + 3 * std::size_t { t },
+                                              orderedClose != nullptr ? orderedClose + 3 * std::size_t { t } : nullptr));
+        else
+        {
+            b.grow (load (nodes_[node.firstOrLeft]));
+            b.grow (load (nodes_[node.firstOrLeft + 1]));
+        }
+        store (node, b);
+    }
+    return true;
+}
+
 void Bvh::clear() noexcept
 {
     nodes_.clear();

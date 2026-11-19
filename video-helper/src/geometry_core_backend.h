@@ -3,6 +3,7 @@
 #include "geometry_core_admission.h"
 #include "geometry_core_motion.h"
 #include "gpu_backend/backend.h"
+#include "../../shared/GeometryCoreRenderSettings.h"
 #include <functional>
 #include <limits>
 #include <map>
@@ -76,7 +77,14 @@ executeNativeGeometry(arbitgpu::NativeFixtureSceneBackend &backend,
                       arbitgpu::NativeFixturePrepareUse prepareUse = arbitgpu::NativeFixturePrepareUse::Blocking,
                       const std::map<std::string, double>* runtimeParameters = nullptr,
                       const visualdeformation::RationalFrameTime* motionFrame = nullptr,
-                      const GeometryMotionRecord* motionPredecessor = nullptr);
+                      const GeometryMotionRecord* motionPredecessor = nullptr,
+                      // Render 3D's engine route. Null draws Raster Image/Color with
+                      // the Geometry Core raster backend; otherwise the evaluated scene
+                      // goes to the fixture scene renderer's engine, as a retained
+                      // scene's draw does. clipId and renderNodeId name the draw for
+                      // the Path Trace device latch.
+                      const videowire::geometry::RenderSettings* renderSettings = nullptr,
+                      int clipId = -1, int renderNodeId = 0);
 // Counts the Preview prepares that returned pending on this thread. A pending
 // result carries no value and no error, so a caller compares two readings of
 // this count to tell a deferral from a failure.

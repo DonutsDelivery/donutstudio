@@ -1,9 +1,12 @@
 #include "canonical_block_c_frame.h"
 #include "particle_parameters.h"
+#include "support/dense_note_score.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <vector>
 
 namespace
 {
@@ -95,12 +98,69 @@ void longScorePacks()
     const auto upload = videorender::particleNoteUpload (frame.get(), true);
     check (upload.size() == frame->noteTextureValues.size(), "the particle upload carries every note row");
 }
+
+// Every sounding note reaches the shader's sounding-row index: a dense chord
+// of 40 notes on three tracks, half of them clip notes with negative ids,
+// sitting in rows after 30 history rows. The index spans several texture
+// rows, so it also covers more than 16 simultaneous notes.
+void soundingIndexCoversEveryNote()
+{
+    const auto frame = densenotescore::frame();
+    check (canonicalblockc::valid (frame), "the dense score packs into a valid frame");
+    if (! canonicalblockc::valid (frame)) return;
+    const auto index = arbitblockc::soundingRowIndex (frame->noteTextureValues, frame->noteRows());
+    check (index.size() % arbitblockc::kSoundingSlotsPerRow == 0, "the index fills whole texture rows");
+    check (index.size() >= static_cast<std::size_t> (densenotescore::kSoundingNotes + 1),
+           "the index has a slot for every sounding note");
+    if (index.empty()) return;
+    check (static_cast<int> (index[0]) == densenotescore::kSoundingNotes,
+           "the index counts all 40 sounding notes");
+    std::vector<bool> listed (static_cast<std::size_t> (frame->noteRows()), false);
+    int lowestRow = frame->noteRows();
+    int previous = -1;
+    const int count = std::min (static_cast<int> (index[0]), static_cast<int> (index.size()) - 1);
+    for (int slot = 1; slot <= count; ++slot)
+    {
+        const int row = static_cast<int> (index[static_cast<std::size_t> (slot)]);
+        check (row > previous && row < frame->noteRows(), "index rows ascend inside the note rows");
+        if (row <= previous || row >= frame->noteRows()) return;
+        previous = row;
+        lowestRow = std::min (lowestRow, row);
+        listed[static_cast<std::size_t> (row)] = true;
+    }
+    check (lowestRow >= densenotescore::kHistoryNotes, "history notes hold the low rows");
+    int soundingFound = 0, clipNotes = 0;
+    std::vector<bool> tracks (4, false);
+    for (int row = 0; row < frame->noteRows(); ++row)
+    {
+        const auto id = static_cast<int> (frame->noteIdentities[static_cast<std::size_t> (row)]);
+        const bool sounding = densenotescore::soundingId (id);
+        check (listed[static_cast<std::size_t> (row)] == sounding,
+               "a row is in the index exactly when its note sounds");
+        if (! sounding) continue;
+        ++soundingFound;
+        clipNotes += id < 0 ? 1 : 0;
+        tracks[static_cast<std::size_t> (frame->notationRows[static_cast<std::size_t> (row)].trackId)] = true;
+    }
+    check (soundingFound == densenotescore::kSoundingNotes, "every sounding note has a row");
+    check (clipNotes == densenotescore::kSoundingNotes / 2, "clip notes with negative ids are indexed");
+    check (tracks[1] && tracks[2] && tracks[3], "sounding notes on all three tracks are indexed");
+
+    const auto silent = densenotescore::frame (-1);
+    check (canonicalblockc::valid (silent)
+               && arbitblockc::soundingRowIndex (silent->noteTextureValues, silent->noteRows())
+                      == std::vector<float> (arbitblockc::kSoundingSlotsPerRow, 0.0f),
+           "with nothing sounding the index is one zero row");
+    check (arbitblockc::soundingRowIndex ({}, 0) == std::vector<float> (arbitblockc::kSoundingSlotsPerRow, 0.0f),
+           "an empty score has a zero count");
+}
 }
 
 int main()
 {
     textureShapes();
     longScorePacks();
+    soundingIndexCoversEveryNote();
     if (failures == 0) std::puts ("block_c_content_sized: all passed");
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

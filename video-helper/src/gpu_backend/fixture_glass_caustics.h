@@ -1017,7 +1017,12 @@ inline bool prepareScene(const smoothglass::Prepared& glass, std::string identit
         view.transport=surfacematerial::TransportMode::ClosedVolume;
         view.object=volume.object;view.material=volume.material;
         view.roughness=volume.roughness;view.roughConsumer=volume.roughConsumer;
+        view.absorption=volume.absorption;
     }
+    // The photon walk carries no medium, so a tinted caustic glass would deposit
+    // untinted light. The camera walks take the tint (smoothglass::baseAbsorption).
+    if (std::any_of(candidate.glass.absorption.begin(),candidate.glass.absorption.end(),[](float a){return a!=0.0f;}))
+        return refuse("Glass caustics require a white glass base colour");
     candidate.identity=std::move(identity);
     const auto& sceneRoot=*candidate.glass.sourceMaterial;
     if (!sceneRoot.sceneRevision || !sceneRoot.structuralRevision || !sceneRoot.evaluationRevision)

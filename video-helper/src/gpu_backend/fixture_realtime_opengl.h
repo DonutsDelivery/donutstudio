@@ -13,6 +13,10 @@
 // Only the receiver transport approximates, in backend_opengl.cpp, with a gather
 // whose size is the square root of the scene's sample rows.
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+
 namespace arbitgpu::realtimeengine
 {
 inline bool& currentlyActive() noexcept
@@ -62,6 +66,59 @@ inline FramePhases framePhases (bool phased, bool grating, bool gratingWithSurfa
     return gratingWithSurfaces ? FramePhases::kAroundGrating : FramePhases::kSingle;
 }
 
+// A thin water interface's roughness for one Realtime shading sample. Far off, the
+// open sea's triangles shrink below a pixel and its normal turns across the pixel,
+// but one sample reads a single mirror direction from that spread, sky in one pixel
+// and cloud or horizon in the next: a speckle Path Trace does not show, because its
+// samples average the spread. dx and dy are the normal's screen derivatives. Their
+// variance widens the GGX lobe (alpha squared, Kaplanyan, Hill, Patney and Lefohn
+// 2016, "Filtering Distributions of Normals for Shading Antialiasing", with their
+// 0.18 bound), so the sample reads the pixel's average. Near water, whose normal
+// barely turns over a pixel, keeps its own roughness. A non-finite derivative takes
+// the bound instead of reaching the shading.
+inline float footprintRoughness (float roughness, const std::array<float, 3>& dx, const std::array<float, 3>& dy) noexcept
+{
+    const float variance = 0.25f * (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]
+                                    + dy[0] * dy[0] + dy[1] * dy[1] + dy[2] * dy[2]);
+    const float kernel = variance == variance ? std::min (2.0f * variance, 0.18f) : 0.18f;
+    const float alpha = roughness * roughness;
+    return std::sqrt (std::sqrt (std::clamp (alpha * alpha + kernel, 0.0f, 1.0f)));
+}
+
+// A glass sample's shading normal, as Path Trace's faceViewer chooses it. An
+// interpolated normal can turn away from the camera on a facet the camera sees: on
+// the far slope of each wave the open sea's normals do so, for about half the water
+// in view. Negating it there pointed the normal into the sea, so its Fresnel fell
+// to almost nothing and its reflection read the ground under the horizon, while the
+// next pixel read the bright grazing sky. The facet the camera sees decides the
+// side instead, and a normal that still turns away tilts just far enough to face
+// the camera. facet is the triangle's normal with either sign (zero when unknown,
+// which falls back to the view's side), and view the unit direction to the camera.
+inline std::array<float, 3> viewerNormal (std::array<float, 3> shaded, std::array<float, 3> facet,
+                                          const std::array<float, 3>& view) noexcept
+{
+    const auto dot = [] (const std::array<float, 3>& a, const std::array<float, 3>& b)
+        { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    const float facetLength = std::sqrt (dot (facet, facet));
+    std::array<float, 3> seen {};
+    if (facetLength > 0.0f)
+        for (int c = 0; c < 3; ++c) seen[c] = facet[c] / facetLength;
+    if (dot (seen, view) < 0.0f)
+        for (auto& c : seen) c = -c;
+    if (facetLength > 0.0f ? dot (shaded, seen) < 0.0f : dot (shaded, view) < 0.0f)
+        for (auto& c : shaded) c = -c;
+    if (dot (shaded, view) > 1.0e-4f) return shaded;
+    const float lift = 1.0e-3f - dot (shaded, view);
+    std::array<float, 3> tilted {shaded[0] + view[0] * lift, shaded[1] + view[1] * lift, shaded[2] + view[2] * lift};
+    const float tiltedLength = std::sqrt (dot (tilted, tilted));
+    if (tiltedLength > 0.0f && dot (tilted, view) > 1.0e-4f * tiltedLength)
+    {
+        for (auto& c : tilted) c /= tiltedLength;
+        return tilted;
+    }
+    return facetLength > 0.0f ? seen : view;
+}
+
 // Follows the opaque visibility, sky, environment and pass composite text, and
 // comes before the tail, which defines rotateQ and calls these from main.
 inline const char* glslShader() noexcept
@@ -70,6 +127,12 @@ inline const char* glslShader() noexcept
 uniform vec4 uRealtimeControl;
 uniform sampler2D uRealtimeColor;
 uniform sampler2D uRealtimeDepth;
+// The planar mirror target (realtime_planar_mirror.h), read in phase 1 when
+// uRealtimeControl.y is 1: a grating's mirror image, alpha 1 where it has one.
+uniform sampler2D uRealtimeMirror;
+// A closed glass object's back faces, drawn just before it in phase 2 when
+// uRealtimeControl.z is 1: world normal in xyz, linear depth in w, zero where none.
+uniform sampler2D uRealtimeBack;
 // uCameraRotation, uCameraTranslation and uProjection come from the fragment head.
 // A second declaration here is an error on NVIDIA (C1038), though Mesa accepts it.
 vec3 rotateQ(vec4 q, vec3 v);
@@ -103,11 +166,32 @@ bool realtimeOnScreen(vec3 position) {
 
 bool realtimeSurfaceDepth(float depth) { return depth > 0.0 && depth < 1.0; }
 
-// Marches the depth snapshot in steps that grow with distance. On a hit, the
-// snapshot's color and a confidence that fades at the frame's edge come back.
-bool realtimeTrace(vec3 origin, vec3 direction, out vec3 color, out float confidence) {
-    color = vec3(0.0);
-    confidence = 0.0;
+// The world point the depth snapshot holds at texture position uv and linear depth.
+vec3 realtimeUnproject(vec2 uv, float depth) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    float distance = uProjection.z + depth * (uProjection.w - uProjection.z);
+    vec3 camera = uProjection.x < 0.0
+        ? vec3(ndc.x * -uProjection.x * uProjection.y, ndc.y * -uProjection.x, -distance)
+        : vec3(ndc.x * uProjection.x * uProjection.y, ndc.y * uProjection.x, -1.0) * distance;
+    return rotateQ(uCameraRotation, camera) + uCameraTranslation;
+}
+
+// A planar mirror draw keeps a grating fragment only where the frame's visible surface
+// lies on the mirror plane and the grating point is on the camera's side of it.
+bool realtimeMirrorKeeps(vec3 world) {
+    float span = max(uProjection.w - uProjection.z, 1e-6);
+    if (dot(uViewerMirror.xyz, world) + uViewerMirror.w < -1e-4 * span) return false;
+    vec2 size = vec2(textureSize(uRealtimeDepth, 0));
+    float depth = texelFetch(uRealtimeDepth, ivec2(gl_FragCoord.xy), 0).r;
+    if (!realtimeSurfaceDepth(depth)) return false;
+    vec3 surface = realtimeUnproject(gl_FragCoord.xy / size, depth);
+    return abs(dot(uViewerMirror.xyz, surface) + uViewerMirror.w) <= 1e-3 * span;
+}
+
+// Marches the depth snapshot in steps that grow with distance. On a hit, true and the
+// hit's texture position and depth.
+bool realtimeTraceHit(vec3 origin, vec3 direction, out vec3 hit) {
+    hit = vec3(-1.0);
     float span = max(uProjection.w - uProjection.z, 1e-6);
     float previous = 0.0;
     float travel = span * 0.001 * (0.5 + realtimeNoise());
@@ -125,10 +209,7 @@ bool realtimeTrace(vec3 origin, vec3 direction, out vec3 color, out float confid
                 if (candidate.z > texture(uRealtimeDepth, candidate.xy).r) high = middle;
                 else low = middle;
             }
-            position = realtimeProject(origin + direction * high);
-            color = texture(uRealtimeColor, position.xy).rgb;
-            vec2 edge = min(position.xy, 1.0 - position.xy);
-            confidence = clamp(min(edge.x, edge.y) * 12.0, 0.0, 1.0);
+            hit = realtimeProject(origin + direction * high);
             return true;
         }
         previous = travel;
@@ -137,8 +218,47 @@ bool realtimeTrace(vec3 origin, vec3 direction, out vec3 color, out float confid
     return false;
 }
 
+// Confidence in a hit that fades at the frame's edge.
+float realtimeEdgeConfidence(vec2 position) {
+    vec2 edge = min(position, 1.0 - position);
+    return clamp(min(edge.x, edge.y) * 12.0, 0.0, 1.0);
+}
+
+// On a hit, the snapshot's color and the hit's edge confidence come back.
+bool realtimeTrace(vec3 origin, vec3 direction, out vec3 color, out float confidence) {
+    color = vec3(0.0);
+    confidence = 0.0;
+    vec3 hit;
+    if (!realtimeTraceHit(origin, direction, hit)) return false;
+    color = texture(uRealtimeColor, hit.xy).rgb;
+    confidence = realtimeEdgeConfidence(hit.xy);
+    return true;
+}
+
 vec3 realtimeFresnel(vec3 f0, vec3 normal, vec3 view) {
     return f0 + (vec3(1.0) - f0) * pow(1.0 - clamp(dot(normal, view), 0.0, 1.0), 5.0);
+}
+
+// viewerNormal in C++ is the same choice.
+vec3 realtimeViewerNormal(vec3 shadedNormal, vec3 facet, vec3 view) {
+    float facetLength = length(facet);
+    vec3 seen = facetLength > 0.0 ? facet / facetLength : vec3(0.0);
+    if (dot(seen, view) < 0.0) seen = -seen;
+    vec3 normal = shadedNormal;
+    if (facetLength > 0.0 ? dot(normal, seen) < 0.0 : dot(normal, view) < 0.0) normal = -normal;
+    if (dot(normal, view) > 1.0e-4) return normal;
+    vec3 tilted = normal + view * (1.0e-3 - dot(normal, view));
+    float tiltedLength = length(tilted);
+    if (tiltedLength > 0.0 && dot(tilted, view) > 1.0e-4 * tiltedLength) return tilted / tiltedLength;
+    return facetLength > 0.0 ? seen : view;
+}
+
+// footprintRoughness in C++ is the same formula.
+float realtimeFootprintRoughness(float roughness, vec3 dx, vec3 dy) {
+    float variance = 0.25 * (dot(dx, dx) + dot(dy, dy));
+    float kernel = variance == variance ? min(2.0 * variance, 0.18) : 0.18;
+    float alpha = roughness * roughness;
+    return sqrt(sqrt(clamp(alpha * alpha + kernel, 0.0, 1.0)));
 }
 
 // Rays from position toward points spread over area light i: record 3's w holds
@@ -213,8 +333,12 @@ vec4 realtimeReflection(vec3 position, vec3 normal, vec3 toView, vec3 base, floa
     vec3 direction = reflect(-view, normal);
     float gloss = (1.0 - roughness) * (1.0 - roughness);
     vec3 color;
-    float confidence;
-    if (gloss <= 0.0 || !realtimeTrace(position + normal * 0.0005 * (uProjection.w - uProjection.z), direction, color, confidence))
+    float confidence = 1.0;
+    // A grating's planar mirror image, where the mirror target holds one, else the march.
+    vec4 mirrored = uRealtimeControl.y > 0.5 ? texelFetch(uRealtimeMirror, ivec2(gl_FragCoord.xy), 0) : vec4(0.0);
+    if (gloss <= 0.0) return vec4(0.0);
+    if (mirrored.a > 0.0) color = mirrored.rgb;
+    else if (!realtimeTrace(position + normal * 0.0005 * (uProjection.w - uProjection.z), direction, color, confidence))
         return vec4(0.0);
     vec3 fresnel = realtimeFresnel(mix(vec3(dielectric), base, metallic), normal, view) * gloss * confidence;
     return vec4(fresnel * color, max(max(fresnel.r, fresnel.g), fresnel.b));
@@ -230,12 +354,97 @@ vec3 realtimeEnvironment(vec3 normal, vec3 toView, float roughness, float dielec
         : analyticSkyBase(vec3(1.0), 1.0, roughness, dielectric, normal, toView, uSky[0], uSky[1], uSky[2], uSky[3], uSky[4]));
 }
 
+// Where a ray bent into a closed glass object at position leaves it: the march follows
+// it over the object's back-face depth (uRealtimeBack) to the first texel it passes,
+// with a first step from the object's own depth there. True with the exit point and
+// the back face's outward normal; false when the pixel has no back face.
+bool realtimeBackExit(vec3 position, vec3 inside, out vec3 exitPoint, out vec3 exitNormal) {
+    exitPoint = position;
+    exitNormal = vec3(0.0);
+    float span = max(uProjection.w - uProjection.z, 1e-6);
+    vec4 here = texelFetch(uRealtimeBack, ivec2(gl_FragCoord.xy), 0);
+    vec3 own = realtimeProject(position);
+    if (here.w <= 0.0 || own.x < 0.0 || here.w <= own.z) return false;
+    // How fast the ray deepens, from the camera's forward axis.
+    vec3 forward = uProjection.x < 0.0 ? rotateQ(uCameraRotation, vec3(0.0, 0.0, -1.0))
+                                       : normalize(position - uCameraTranslation);
+    float estimate = (here.w - own.z) * span / max(dot(inside, forward), 0.2);
+    vec2 size = vec2(textureSize(uRealtimeBack, 0));
+    float low = 0.0;
+    float high = -1.0;
+    exitNormal = here.xyz;
+    for (int step = 1; step <= 12; ++step) {
+        float travel = estimate * 3.0 * float(step) / 12.0;
+        vec3 at = realtimeProject(position + inside * travel);
+        if (!realtimeOnScreen(at)) { high = travel; break; }
+        vec4 back = texelFetch(uRealtimeBack, ivec2(at.xy * size), 0);
+        // Past the object's outline the ray has left it.
+        if (back.w <= 0.0 || at.z >= back.w) { high = travel; break; }
+        low = travel;
+        exitNormal = back.xyz;
+    }
+    if (high < 0.0) high = estimate * 3.0;
+    for (int refine = 0; refine < 5; ++refine) {
+        float middle = 0.5 * (low + high);
+        vec3 at = realtimeProject(position + inside * middle);
+        vec4 back = realtimeOnScreen(at) ? texelFetch(uRealtimeBack, ivec2(at.xy * size), 0) : vec4(0.0);
+        if (back.w <= 0.0 || at.z >= back.w) high = middle;
+        else { low = middle; exitNormal = back.xyz; }
+    }
+    exitPoint = position + inside * high;
+    exitNormal = normalize(exitNormal);
+    return true;
+}
+
+// What lies along a ray leaving glass: the snapshot where the march meets a surface,
+// else the environment in its direction. The taps blur a rough surface's hit.
+vec3 realtimeBeyond(vec3 origin, vec3 direction, float blur, inout float angle) {
+    vec3 environment = uAmbient;
+    if (uSky[0].w > 0.5)
+        environment += uSky[0].w > 1.5 ? environmentImageRadiance(direction, uSky[0], uSky[1])
+            : analyticSkyRadiance(direction, uSky[0], uSky[1], uSky[2], uSky[3], uSky[4]);
+    vec3 hit;
+    if (!realtimeTraceHit(origin, direction, hit)) return environment;
+    vec3 sum = vec3(0.0);
+    for (int tap = 0; tap < 4; ++tap) {
+        angle += kRealtimeGoldenAngle;
+        float radius = blur * sqrt((float(tap) + 0.5) / 4.0);
+        sum += texture(uRealtimeColor, hit.xy + vec2(cos(angle), sin(angle)) * radius).rgb;
+    }
+    return mix(environment, sum * 0.25, realtimeEdgeConfidence(hit.xy));
+}
+
 // One refracted direction per wavelength, each landing on the snapshot where the
 // scene behind the glass lies. The depth gap sets how far the bent ray travels.
+// A closed object with its back faces drawn refracts through both surfaces instead:
+// in at this point, out where the ray meets the back face, and a ray the back face
+// reflects totally leaves along the reflection.
 vec3 realtimeRefraction(vec3 position, vec3 normal, vec3 view, float roughness) {
     float span = max(uProjection.w - uProjection.z, 1e-6);
     vec3 own = realtimeProject(position);
     if (own.x < 0.0) return vec3(0.0);
+    if (uRealtimeControl.z > 0.5 && uGlassTransport.x <= 1.5
+        && texelFetch(uRealtimeBack, ivec2(gl_FragCoord.xy), 0).w > own.z) {
+        const vec3 thickWavelengths = vec3(0.6563, 0.5461, 0.4358);
+        float thickBlur = roughness * roughness * 0.05;
+        float thickAngle = realtimeNoise() * 6.28318531;
+        vec3 thick = vec3(0.0);
+        for (int channel = 0; channel < 3; ++channel) {
+            float wavelength = thickWavelengths[channel];
+            float ior = max(uSurfaceCoating.y + uGlassTransport.y * (1.0 / (wavelength * wavelength) - 1.0 / (0.58756 * 0.58756)), 1e-3);
+            vec3 inside = refract(-view, normal, 1.0 / ior);
+            if (dot(inside, inside) == 0.0) inside = -view;
+            vec3 exitPoint, exitNormal;
+            vec3 leaving = inside;
+            if (realtimeBackExit(position, inside, exitPoint, exitNormal)) {
+                vec3 facing = dot(inside, exitNormal) > 0.0 ? -exitNormal : exitNormal;
+                leaving = refract(inside, facing, ior);
+                if (dot(leaving, leaving) == 0.0) leaving = reflect(inside, facing);
+            }
+            thick[channel] = realtimeBeyond(exitPoint + leaving * 0.0005 * span, leaving, thickBlur, thickAngle)[channel];
+        }
+        return thick;
+    }
     float ownDepth = texture(uRealtimeDepth, own.xy).r;
     bool surface = realtimeSurfaceDepth(ownDepth) && ownDepth > own.z;
     // Over the sky, nothing gives a gap, so the bend is judged at the camera's distance.
@@ -269,11 +478,51 @@ vec3 realtimeRefraction(vec3 position, vec3 normal, vec3 view, float roughness) 
     return result;
 }
 
+// What a thin water interface passes up from below. Path Trace gives the interface a
+// medium under it that absorbs by the base colour per scene unit (kTintDistance in
+// pathtrace_fixture_engine.cpp) and by the material's own medium, so the scene behind
+// fades over its depth, and an open sea with nothing behind passes none of the sky
+// below the horizon. What it shows instead is the light its body scatters back up:
+// the sky above it, cosine weighted, times the share of the phase function that turns
+// back, fading as both the light and the view ray go deeper. Lights other than the
+// sky reach a viewer above the water only by the same back-scatter, and are left out.
+vec3 realtimeWaterBody(vec3 position, vec3 normal, vec3 view, vec3 base, vec3 behind) {
+    float span = max(uProjection.w - uProjection.z, 1e-6);
+    vec3 own = realtimeProject(position);
+    float ownDepth = own.x >= 0.0 ? texture(uRealtimeDepth, own.xy).r : 0.0;
+    float depth = own.x >= 0.0 && realtimeSurfaceDepth(ownDepth) && ownDepth > own.z
+        ? (ownDepth - own.z) * span : 1.0e30;
+    vec3 sigmaT = -log(clamp(base, vec3(1.0e-4), vec3(1.0)));
+    vec3 sigmaS = vec3(0.0);
+    float g = 0.0;
+    if (int(uMedium[0].w) == 1) {
+        sigmaT += uMedium[0].xyz + uMedium[1].xyz;
+        sigmaS = uMedium[1].xyz;
+        g = uMedium[1].w;
+    }
+    vec3 transmitted = behind * exp(-sigmaT * depth);
+    if (uSky[0].w <= 0.5 || dot(sigmaS, sigmaS) <= 0.0) return transmitted;
+    const vec3 up = vec3(0.0, 1.0, 0.0);
+    vec3 sky = uSky[0].w > 1.5
+        ? environmentImageBase(vec3(1.0), 0.0, 1.0, 0.0, up, up, uSky[0], uSky[1])
+        : analyticSkyBase(vec3(1.0), 0.0, 1.0, 0.0, up, up, uSky[0], uSky[1], uSky[2], uSky[3], uSky[4]);
+    // Henyey-Greenstein's mass in the backward hemisphere.
+    float back = abs(g) < 1.0e-3 ? 0.5
+        : (1.0 - g * g) / (2.0 * g) * (1.0 / sqrt(1.0 + g * g) - 1.0 / (1.0 + g));
+    vec3 inside = refract(-view, normal, 1.0 / max(uSurfaceCoating.y, 1.0));
+    float deepening = dot(inside, inside) > 0.0 ? max(-inside.y, 0.0) : 1.0;
+    vec3 sigmaPath = sigmaT * (1.0 + deepening);
+    vec3 body = sigmaS * back * sky * (vec3(1.0) - exp(-sigmaPath * depth)) / max(sigmaPath, vec3(1.0e-6));
+    return transmitted + body;
+}
+
 // What a glass surface shows: the scene behind it, its own shaded layer where it
 // does not transmit, and a Fresnel reflection of nearby objects and the environment.
-vec3 realtimeGlass(vec3 position, vec3 shadedNormal, vec3 toView, vec3 base, float roughness, float dielectric, vec3 shaded, vec3 surface) {
+vec3 realtimeGlass(vec3 position, vec3 shadedNormal, vec3 facet, vec3 toView, vec3 base, float roughness, float dielectric, vec3 shaded, vec3 surface) {
     vec3 view = normalize(toView);
-    vec3 normal = dot(shadedNormal, view) < 0.0 ? -shadedNormal : shadedNormal;
+    // Closed glass keeps the view's side; its silhouettes have the same turn.
+    vec3 normal = uGlassTransport.x > 1.5 ? realtimeViewerNormal(shadedNormal, facet, view)
+        : dot(shadedNormal, view) < 0.0 ? -shadedNormal : shadedNormal;
     float transmitted = uSurfaceCoating.w > 0.5 ? uSurfaceCoating.x : 1.0;
     vec3 fresnel = realtimeFresnel(vec3(dielectric), normal, view);
     vec3 reflected = realtimeEnvironment(normal, toView, roughness, dielectric);
@@ -282,8 +531,10 @@ vec3 realtimeGlass(vec3 position, vec3 shadedNormal, vec3 toView, vec3 base, flo
     if (realtimeTrace(position + normal * 0.0005 * (uProjection.w - uProjection.z), reflect(-view, normal), hit, confidence))
         reflected = mix(reflected, hit, confidence);
     // A medium inside tints what it transmits over the refracted path through its bounds.
-    vec3 behind = realtimeRefraction(position, normal, view, roughness) * base
-        * mediumBoxTint(position, refract(-view, normal, 1.0 / max(uSurfaceCoating.y, 1.0)));
+    // A thin water interface has its body below it instead.
+    vec3 refracted = realtimeRefraction(position, normal, view, roughness);
+    vec3 behind = uGlassTransport.x > 1.5 ? realtimeWaterBody(position, normal, view, base, refracted)
+        : refracted * base * mediumBoxTint(position, refract(-view, normal, 1.0 / max(uSurfaceCoating.y, 1.0)));
     return mix(shaded, (vec3(1.0) - fresnel) * behind + surface, transmitted) + fresnel * reflected;
 }
 

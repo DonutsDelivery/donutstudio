@@ -14,8 +14,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace loopstep {
+
+struct StageTotals;
 
 // The atomics that the viewport's advance sub-step probe reads. Only the thread
 // that installed the sink writes them.
@@ -27,6 +30,41 @@ struct Sink
     // milliseconds. Null pointers leave the record off.
     std::atomic<const char*>* slowLabel = nullptr;
     std::atomic<std::int64_t>* slowMs = nullptr;
+    // Null leaves the per-label totals off.
+    StageTotals* stages = nullptr;
+};
+
+// Each scope's duration summed by label while a sink holds this. Scopes nest,
+// so a label's total includes the scopes inside it. The slots are fixed: a label
+// past the last one is added to the last slot, renamed "other". Labels are
+// string literals, compared by text because one literal may have several copies.
+struct StageTotals
+{
+    static constexpr int kSlots = 48;
+    const char* labels[kSlots] {};
+    std::int64_t ns[kSlots] {};
+    int count = 0;
+
+    void clear() noexcept { count = 0; }
+
+    void add (const char* label, std::int64_t elapsedNs) noexcept
+    {
+        for (int i = 0; i < count; ++i)
+            if (labels[i] == label || std::strcmp (labels[i], label) == 0)
+            {
+                ns[i] += elapsedNs;
+                return;
+            }
+        if (count == kSlots)
+        {
+            labels[kSlots - 1] = "other";
+            ns[kSlots - 1] += elapsedNs;
+            return;
+        }
+        labels[count] = label;
+        ns[count] = elapsedNs;
+        ++count;
+    }
 };
 
 // Stores one slow-call record in the sink, when the sink keeps one. The two
@@ -43,6 +81,14 @@ inline void recordSlow (Sink* sink, const char* label, std::int64_t elapsedMs) n
 // The sink for the current thread. Null means no sink is installed here, and
 // scopes then only time and print.
 inline thread_local Sink* currentSink = nullptr;
+
+// Adds a duration measured some other way, such as a Path Trace frame phase, to
+// the current thread's totals. The label must outlive the totals' reader.
+inline void addStage (const char* label, std::int64_t elapsedNs) noexcept
+{
+    if (currentSink != nullptr && currentSink->stages != nullptr)
+        currentSink->stages->add (label, elapsedNs);
+}
 
 // Installs a sink for the current thread and restores the previous one on exit.
 class SinkInstall final
@@ -94,6 +140,8 @@ public:
             sink_->enterNs->store (previousEnterNs_, std::memory_order_relaxed);
         }
         const std::int64_t elapsedNs = toNs (end) - toNs (start_);
+        if (sink_ != nullptr && sink_->stages != nullptr)
+            sink_->stages->add (label_, elapsedNs);
         if (elapsedNs >= reportNs())
         {
             std::fprintf (stderr, "[viewport] step %s took %lld ms\n", label_,

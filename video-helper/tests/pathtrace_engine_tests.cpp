@@ -1114,19 +1114,13 @@ void formatTests()
     for (std::size_t i = 0; i < pixels; ++i)
         halfAlpha = halfAlpha && halfAt (image.colorBytes, i, 3) == 0x3c00;
     check (halfAlpha, "linear alpha is half 1.0");
-    check (halfAt (image.colorBytes, top + 8, 0) == pt::halfBits (pt::kLinearRasterBackground[0])
-               && halfAt (image.colorBytes, top + 8, 2) == pt::halfBits (pt::kLinearRasterBackground[2]),
-           "a linear miss carries the clear colour in linear values");
-    // The compositor encodes a linear scene as sRGB. The miss must come out as
-    // the clear colour, not as that colour encoded a second time (46, 56, 75).
-    const auto displayByte = [] (float linear) {
-        const float encoded = linear <= 0.0031308f ? 12.92f * linear
-                                                   : 1.055f * std::pow (linear, 1.0f / 2.4f) - 0.055f;
-        return static_cast<int> (encoded * 255.0f + 0.5f);
-    };
-    check (displayByte (pt::kLinearRasterBackground[0]) == 7 && displayByte (pt::kLinearRasterBackground[1]) == 10
-               && displayByte (pt::kLinearRasterBackground[2]) == 18,
-           "the linear clear colour displays as (7, 10, 18)");
+    // The raster clears the same values into a linear target, so the compositor
+    // shows slate (46, 56, 75) for both engines.
+    check (halfAt (image.colorBytes, top + 8, 0) == pt::halfBits (pt::kRasterBackground[0])
+               && halfAt (image.colorBytes, top + 8, 2) == pt::halfBits (pt::kRasterBackground[2]),
+           "a linear miss carries the raster's clear values");
+    check (image.backdropPass.size() == pixels && image.backdropPass[top + 8] == 1 && image.backdropPass[bottom + 8] == 0,
+           "the backdrop pass marks the miss and not the floor");
 
     // With the analytic sky the raster draws the sky, and so does the tracer.
     auto skySetup = glass::makeSetup (frozen);
@@ -1193,11 +1187,10 @@ void environmentCameraTests()
     }
     check (blank.depth[skyPixel] == 1.0f && blank.depth[floorPixel] < 1.0f,
            "the top row misses and the bottom row hits the mirror floor");
-    check (halfAt (blank.colorBytes, skyPixel, 0) == pt::halfBits (pt::kLinearRasterBackground[0])
-               && halfAt (blank.colorBytes, skyPixel, 1) == pt::halfBits (pt::kLinearRasterBackground[1])
-               && halfAt (blank.colorBytes, skyPixel, 2) == pt::halfBits (pt::kLinearRasterBackground[2]),
-           "a camera miss under a hidden environment is the raster clear colour");
-    check (halfAt (shown.colorBytes, skyPixel, 2) != pt::halfBits (pt::kLinearRasterBackground[2]),
+    check (halfAt (blank.colorBytes, skyPixel, 0) == 0 && halfAt (blank.colorBytes, skyPixel, 1) == 0
+               && halfAt (blank.colorBytes, skyPixel, 2) == 0 && halfAt (blank.colorBytes, skyPixel, 3) == 0x3c00,
+           "a camera miss under a hidden environment is opaque black, as the raster clears it");
+    check (halfAt (shown.colorBytes, skyPixel, 2) != 0,
            "a camera miss under a visible environment is the sky");
     // This view's floor reaches only the bottom row, whose pixels all cross the floor's far
     // edge, and a sample that misses there sees what hiding changes. So hiding is judged on a

@@ -755,8 +755,17 @@ PT_DEVICE_FN bool foilCoversHit (const PT_GLOBAL GratingBinding& bound, const Sc
     PT_GLOBAL_READ (GratingBinding) grating = bound;
     const PT_GLOBAL TriangleAttributes& attributes = view.triangles[hit.triangle];
     const float w = 1.0f - hit.u - hit.v;
-    const float coverage = grooveFieldAt (grating, attributes.uvs[0].x * w + attributes.uvs[1].x * hit.u + attributes.uvs[2].x * hit.v,
-                                          attributes.uvs[0].y * w + attributes.uvs[1].y * hit.u + attributes.uvs[2].y * hit.v)[3];
+    const float u = attributes.uvs[0].x * w + attributes.uvs[1].x * hit.u + attributes.uvs[2].x * hit.v;
+    const float v = attributes.uvs[0].y * w + attributes.uvs[1].y * hit.u + attributes.uvs[2].y * hit.v;
+    float coverage = grooveFieldAt (grating, u, v)[3];
+    if (grating.occupancyCount != 0)
+    {
+        bool inside = false;
+        for (std::uint32_t i = 0; i < grating.occupancyCount && i < 5u; ++i)
+            inside = inside || (u >= grating.occupancy[i][0] && v >= grating.occupancy[i][1]
+                                && u <= grating.occupancy[i][2] && v <= grating.occupancy[i][3]);
+        coverage = inside ? coverage * grating.maskCoverage : 0.0f;
+    }
     return choice < coverage;
 }
 
@@ -1734,9 +1743,17 @@ PT_DEVICE_ENTRY bool tracePathAt (const SceneView& view, const IntegratorSetting
             continue;
         }
 
+        // A masked foil covers part of its object: this path meets either the foil or
+        // the object's own material. Only the material emits, as the raster draws no
+        // emission where the foil lies.
+        const PT_GLOBAL GratingBinding* hitGrating = gratingOf (view, hit.triangle);
+        if (hitGrating != nullptr && hitGrating->masked
+            && ! foilCoversHit (*hitGrating, view, hit, sampler.get1D (dimensionOf (vertex, kSlotCoverage))))
+            hitGrating = nullptr;
+
         // Emission from either face. An emitter the light set holds is the
         // light tracer's at the end of a caustic path.
-        if (coverage > 0.0f && (material.emission.x != 0.0f || material.emission.y != 0.0f || material.emission.z != 0.0f)
+        if (coverage > 0.0f && hitGrating == nullptr && (material.emission.x != 0.0f || material.emission.y != 0.0f || material.emission.z != 0.0f)
             && ! (causticPath (excludeCausticPaths, firstScatterReceiver, deltaSinceFirst, depth) && lights.trianglePdf (hit.triangle, 1.0f, 1.0f) > 0.0f))
         {
             float weight = 1.0f;
@@ -1835,10 +1852,7 @@ PT_DEVICE_ENTRY bool tracePathAt (const SceneView& view, const IntegratorSetting
         // torn into specks, more so the longer the arm spreads the same light.
         // Orders depend on wavelength, so a spectral path keeps the hero alone
         // from here on.
-        const PT_GLOBAL GratingBinding* grating = gratingOf (view, hit.triangle);
-        if (grating != nullptr && grating->masked
-            && ! foilCoversHit (*grating, view, hit, sampler.get1D (dimensionOf (vertex, kSlotCoverage))))
-            grating = nullptr;
+        const PT_GLOBAL GratingBinding* grating = hitGrating;
         SpectralBsdf bsdf;
         if (grating != nullptr)
         {

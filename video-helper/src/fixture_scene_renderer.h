@@ -78,6 +78,12 @@ bool takePendingCausticProgramCompletionOnThisThread() noexcept;
 // next render is not a progressing Path Trace Preview.
 bool pathTracePreviewProgressingOnThisThread() noexcept;
 
+// True when the last fixture render on this thread was a Path Trace Preview drawn by the
+// Raster engine because the device's kernel was still building. While it holds, the
+// caller's idle gate must keep producing frames, so the picture swaps to Path Trace the
+// moment the kernel is ready. The next render that is not such a stand-in clears it.
+bool pathTraceStandInOnThisThread() noexcept;
+
 // The preview sample target of the last fixture render on this thread, zero
 // when it was not a Path Trace Preview.
 unsigned pathTracePreviewTargetOnThisThread() noexcept;
@@ -250,7 +256,9 @@ private:
           nativeProgram_ (std::move (nativeProgram)), productPlan_ (std::move (productPlan)),
           productDigest_ (std::move (productDigest)), authoredRequest_ (std::move(authoredRequest)), consumer_ (consumer),
           materialIR_ (consumer == arbitgpu::NativeFixtureDiffractionConsumer::SmoothGlassDiscreteOrders
-              ? std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR>(admitted.material()) : nullptr)
+              ? std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR>(admitted.material()) : nullptr),
+          physicalMaterial_ (materialIR_ ? materialIR_
+              : std::make_shared<const diffractionmaterial::AdmittedDiffractionMaterialIR>(admitted.material()))
     {
     }
 
@@ -266,7 +274,8 @@ private:
           bindingDigest_ (admitted.bindingDigest_), sceneSnapshot_ (admitted.sceneSnapshot_),
           nativeProgram_ (admitted.nativeProgram_), productPlan_ (std::move (productPlan)),
           productDigest_ (std::move (productDigest)), authoredRequest_ (admitted.authoredRequest_),
-          consumer_ (admitted.consumer_), materialIR_ (admitted.materialIR_)
+          consumer_ (admitted.consumer_), materialIR_ (admitted.materialIR_),
+          physicalMaterial_ (admitted.physicalMaterial_)
     {
     }
 
@@ -281,7 +290,8 @@ private:
           bindingDigest_ (admitted.bindingDigest_), sceneSnapshot_ (admitted.sceneSnapshot_),
           nativeProgram_ (std::move (nativeProgram)), productPlan_ (admitted.productPlan_),
           productDigest_ (admitted.productDigest_), authoredRequest_ (admitted.authoredRequest_),
-          consumer_ (admitted.consumer_), materialIR_ (admitted.materialIR_)
+          consumer_ (admitted.consumer_), materialIR_ (admitted.materialIR_),
+          physicalMaterial_ (admitted.physicalMaterial_)
     {
     }
 
@@ -299,6 +309,8 @@ private:
     const std::optional<diffractionmaterialbinding::ImportedSceneDiffractionMaterialRequest> authoredRequest_;
     const arbitgpu::NativeFixtureDiffractionConsumer consumer_;
     const std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR> materialIR_;
+    // The admitted physical material for every consumer; Path Trace scatters by it.
+    const std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR> physicalMaterial_;
 };
 
 // The discrete consumer admits the strict compiler-owned grating prerequisite.
@@ -510,6 +522,15 @@ public:
     virtual bool pathTraceStats (PathTraceFrameStats&) const noexcept { return false; }
     // The name of the denoiser that ran on the last frame, "none" when none did.
     virtual const char* denoiserRan() const noexcept { return "none"; }
+    // True while the device this engine renders on is still building its kernel, so a
+    // Preview render would only wait. The renderer draws that Preview with the Raster
+    // engine instead. Cheap, called before the frame's other work, and it may start
+    // the build. Engines without a device kernel keep the default.
+    virtual bool kernelBuilding() noexcept { return false; }
+    // Called each Preview frame drawn by that stand-in. The engine may build the scene it
+    // will trace meanwhile, so the first Path Trace frame after the kernel is ready doesn't
+    // start with that wait. Render thread. Its draw is not kept past the call.
+    virtual void primeWhileKernelBuilds (const SceneEngineDraw&) noexcept {}
 };
 
 // Counters of the Path Trace renders behind the latest frame of one use, or
@@ -540,12 +561,19 @@ struct RealtimeFrameStats
     // The preview asked for solid viewport shading, and whether the backend drew it.
     bool viewportSolidRequested = false;
     bool viewportSolidApplied = false;
+    // The GPU wave pass moved this frame's open sea in the resident vertex buffer.
+    bool surfaceWaveGpu = false;
     // gpuMs: GL timestamps around the frame's submission. cpuMs: host wall time from
     // the start of that submission to its end, waits the path does itself included.
     // A Preview's window is the last 120 GPU times at this size.
     videorender::speedstats::RealtimeFrameTimes times {};
 };
 std::optional<RealtimeFrameStats> lastRealtimeStats (RenderUse use);
+// The engine whose Preview frame is waiting for its GL program, set by a Preview
+// render that returned pending while preparing and kept until a later Preview
+// render publishes a report or ends without being pending. Empty when nothing waits.
+// The viewer header names it, since no frame of that engine has reported yet.
+std::string previewPreparingEngine();
 
 // The path tracer lives in the helper executable only. It registers its
 // factory at static initialisation, so the fixture renderer's other link
@@ -553,6 +581,38 @@ std::optional<RealtimeFrameStats> lastRealtimeStats (RenderUse use);
 // draw fails with a clear error.
 using SceneRenderEngineFactory = std::shared_ptr<SceneRenderEngine> (*)();
 void setPathTraceSceneEngineFactory (SceneRenderEngineFactory factory) noexcept;
+
+// True while the selected Path Trace device is still building its kernel, the device check
+// SceneRenderEngine::kernelBuilding makes, without an engine. It may start the build. The
+// path tracer registers it with its factory; without one nothing builds.
+using PathTraceKernelProbe = bool (*)() noexcept;
+void setPathTraceKernelBuildingProbe (PathTraceKernelProbe probe) noexcept;
+
+// Whether a Path Trace Preview whose kernel is still building is drawn by the Raster stand-in.
+// On by default. ARBIT_PATH_TRACE_RASTER_STAND_IN=0 in the helper's environment turns it off
+// at startup; the frame then waits for the kernel under the notice, as an export does.
+void setPathTraceRasterStandIn (bool enabled) noexcept;
+
+// A Path Trace Preview whose kernel is still building is drawn by the Raster stand-in, and
+// that frame must be the one Raster draws. The caller builds some inputs per engine (the
+// sea's GPU wave hold, the view transform), so it decides before building them and holds
+// the decision in this scope. Fixture renders on this thread inside the scope take it
+// instead of asking the device again, so inputs and engine agree for the frame. Scopes
+// nest; the inner one wins until it ends.
+class PathTraceStandInScope
+{
+public:
+    // Asks the probe when standInEligible holds. Without eligibility the frame is no stand-in.
+    explicit PathTraceStandInScope (bool standInEligible) noexcept;
+    ~PathTraceStandInScope();
+    PathTraceStandInScope (const PathTraceStandInScope&) = delete;
+    PathTraceStandInScope& operator= (const PathTraceStandInScope&) = delete;
+    bool standIn() const noexcept { return standIn_; }
+
+private:
+    bool standIn_ = false;
+    int previous_ = -1;
+};
 
 class FixtureSceneRenderer
 {
@@ -661,6 +721,16 @@ public:
         RenderDimensions dimensions, RenderUse use,
         std::string_view backendCapability, RenderedFrame& output, std::string& error);
 
+    // Geometry wired straight into Render 3D: the scene the Geometry Core
+    // evaluated this frame, with its Surface programs (or none) bound to the
+    // scene's objects, drawn by the selected engine like any admitted draw.
+    bool renderGeometry (
+        const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& snapshot,
+        const std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram>& program,
+        arbitgpu::NativeFixtureSceneRuntimeInputs sceneInputs,
+        RenderDimensions dimensions, RenderUse use,
+        std::string_view backendCapability, RenderedFrame& output, std::string& error);
+
     // The prepared static GPU resources behind a preview render. An animated
     // imported scene takes a new snapshot every frame, so the preview owner that
     // holds this renderer is rebuilt every frame too; carrying the cache across
@@ -732,7 +802,7 @@ private:
         std::shared_ptr<const diffractionmaterial::AdmittedDiffractionMaterialIR> diffractionMaterial,
         std::optional<diffractionmaterial::LightingDescription> diffractionLighting,
         std::optional<std::array<std::array<float, 4>, 4>> diffractionField,
-        RenderedFrame& output, std::string& error);
+        RenderedFrame& output, std::string& error, bool primeOnly = false);
 
     bool renderAttempt (
         const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& snapshot,
@@ -751,6 +821,9 @@ private:
     arbitgpu::smoothglass::RoughV1Fallback roughV1Fallback_;
     std::shared_ptr<const arbitgpu::NativeFixtureSurfaceMaterialProgram> roughV2Source_, roughV2Program_;
     bool roughV2Attempt_ = false, roughV2Ran_ = false;
+    // The last snapshot that passed validateVisual3DScene. Snapshots are immutable,
+    // so a Preview that holds one across frames validates its million vertices once.
+    std::weak_ptr<const HarmonicMIDI::grid::Visual3DScene> validatedSnapshot_;
     SceneEngineSelection engineSelection_ {};
     std::shared_ptr<SceneRenderEngine> pathTraceEngine_;
 };

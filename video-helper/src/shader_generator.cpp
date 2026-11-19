@@ -724,18 +724,27 @@ unsigned ShaderGenerator::render (const arbitgl::GlFuncs* gl, const ShaderClock&
     // Block C note/link textures (M5): when `notes` carries a packed score,
     // size the float textures from its rows and upload it; otherwise bind
     // black so reads return 0 (the M3/M4 zero-feed).
-    const int noteTexH = haveNotes ? notes->noteTextureHeight() : 0;
+    // uNotes carries the sounding-row index (block_c_packer.h) in the rows
+    // after the note rows.
+    const int noteRows = haveNotes ? notes->noteRows() : 0;
+    const auto sounding = haveNotes ? arbitblockc::soundingRowIndex (notes->noteTexture(), noteRows)
+                                    : std::vector<float> {};
+    const int soundingTexH = static_cast<int> (sounding.size() / (kNoteTexW * 4u));
+    const int noteTexH = noteRows + soundingTexH;
     const int linkTexH = haveNotes ? notes->linkTextureHeight() : 0;
     if (haveNotes && (locs_.uNotes >= 0 || locs_.uLinks >= 0))
         ensureNotesTex (gl, noteTexH, linkTexH);
     if (locs_.uNotes >= 0)
     {
         gl->ActiveTexture (GL_TEXTURE2);
-        if (haveNotes && notes->noteTexture().size() >= (size_t) kNoteTexW * (size_t) noteTexH * 4u)
+        if (haveNotes && notes->noteTexture().size() >= (size_t) kNoteTexW * (size_t) noteRows * 4u)
         {
             glBindTexture (GL_TEXTURE_2D, notesTex2D_);
-            glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kNoteTexW, noteTexH,
-                             GL_RGBA, GL_FLOAT, notes->noteTexture().data());
+            if (noteRows > 0)
+                glTexSubImage2D (GL_TEXTURE_2D, 0, 0, 0, kNoteTexW, noteRows,
+                                 GL_RGBA, GL_FLOAT, notes->noteTexture().data());
+            glTexSubImage2D (GL_TEXTURE_2D, 0, 0, noteRows, kNoteTexW, soundingTexH,
+                             GL_RGBA, GL_FLOAT, sounding.data());
         }
         else
         {

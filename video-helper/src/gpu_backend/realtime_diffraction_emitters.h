@@ -220,6 +220,132 @@ inline float pitScatterPower (float stripeFraction, float phase) noexcept
     const float halfSine = std::sin (0.5f * phase);
     return stripeFraction * halfSine * halfSine;
 }
+// The pit lobe on one glowing triangle, the host form of realtimePitTriangleMass in
+// backend_opengl.cpp. The lobe lies in the plane of tangents around the mirror: sinc^2
+// across the tracks (offset u in widths, out to kPitScatterReach as the sky nodes go) and
+// a Lorentzian along them, half width alongWidth, as Path Trace's pitScatterDensity has it.
+// Three lines along the tracks at the Lorentzian's sixths reach only 0.58 half widths, so
+// a lamp two half widths along the track from the mirror, where the Lorentzian keeps a
+// fifth of its peak, fell between them and a pressed disc went black there. Here each
+// triangle is read on its own: Gauss-Legendre nodes across its own u range, and at each node the
+// Lorentzian's exact mass, atan's difference, over the share of a chord along the tracks
+// the triangle covers (chordTriangleShare). Its mass is a fraction of the whole lobe.
+// direction aims the triangle's shadow ray at its heaviest covered piece.
+constexpr float kPitScatterReach = 3.0f;
+// The sinc^2 mass inside the reach on the sky nodes' twelve pieces, which is what their
+// weights sum to.
+constexpr float kPitScatterAcrossMass = 0.9663037f;
+// Six Gauss-Legendre nodes across the triangle's range: six midpoints read Grooved Disc's
+// lamp 14% low, these within 1%.
+constexpr int kPitScatterAcrossSteps = 6;
+constexpr std::array<float, 6> kPitScatterAcrossNodes { -0.9324695f, -0.6612094f, -0.2386192f, 0.2386192f, 0.6612094f, 0.9324695f };
+constexpr std::array<float, 6> kPitScatterAcrossWeights { 0.1713245f, 0.3607616f, 0.4679139f, 0.4679139f, 0.3607616f, 0.1713245f };
+constexpr int kPitScatterAlongPieces = 6;
+struct PitLobe
+{
+    std::array<float, 3> tangent {}, bitangent {}, normal {};
+    std::array<float, 2> mirror {};  // -outgoing.xy
+    std::array<float, 2> across {};  // unit, in the tangent plane
+    float acrossWidth = 0.0f, alongWidth = 0.0f;
+};
+struct PitTriangleMass
+{
+    float mass = 0.0f;
+    std::array<float, 3> direction {};
+};
+inline PitTriangleMass pitTriangleMass (const std::array<float, 3>& position, const PitLobe& lobe,
+    const std::array<float, 3>& a, const std::array<float, 3>& b, const std::array<float, 3>& c) noexcept
+{
+    using V = std::array<float, 3>;
+    constexpr float pi = 3.14159265358979f;
+    const auto sub = [] (const V& x, const V& y) { return V { x[0] - y[0], x[1] - y[1], x[2] - y[2] }; };
+    const auto cross = [] (const V& x, const V& y)
+    { return V { x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0] }; };
+    const auto dot = [] (const V& x, const V& y) { return x[0] * y[0] + x[1] * y[1] + x[2] * y[2]; };
+    PitTriangleMass result;
+    if (! (lobe.acrossWidth > 0.0f) || ! (lobe.alongWidth > 0.0f)) return result;
+    const V A = sub (a, position), B = sub (b, position), C = sub (c, position);
+    const float det = dot (A, cross (B, C));
+    if (std::abs (det) <= 1.0e-12f) return result;
+    const float orientation = det > 0.0f ? 1.0f : -1.0f;
+    const std::array<V, 3> planes { cross (B, C), cross (C, A), cross (A, B) };
+    const std::array<float, 2> along { -lobe.across[1], lobe.across[0] };
+    // The triangle's extent in the lobe's coordinates, from its corners and the middles
+    // of its edges, whose arcs bow out past the corners.
+    float uLow = 3.4e38f, uHigh = -3.4e38f, yLow = 3.4e38f, yHigh = -3.4e38f;
+    const std::array<V, 6> points { A, B, C, V { A[0] + B[0], A[1] + B[1], A[2] + B[2] },
+        V { B[0] + C[0], B[1] + C[1], B[2] + C[2] }, V { C[0] + A[0], C[1] + A[1], C[2] + A[2] } };
+    for (const auto& point : points)
+    {
+        const float length = std::sqrt (dot (point, point));
+        if (! (length > 0.0f)) continue;
+        const float x = dot (point, lobe.tangent) / length - lobe.mirror[0];
+        const float y = dot (point, lobe.bitangent) / length - lobe.mirror[1];
+        const float u = (x * lobe.across[0] + y * lobe.across[1]) / lobe.acrossWidth;
+        const float v = x * along[0] + y * along[1];
+        uLow = std::min (uLow, u); uHigh = std::max (uHigh, u);
+        yLow = std::min (yLow, v); yHigh = std::max (yHigh, v);
+    }
+    const float uPad = 0.1f * (uHigh - uLow), yPad = 0.25f * (yHigh - yLow);
+    uLow = std::max (uLow - uPad, -kPitScatterReach);
+    uHigh = std::min (uHigh + uPad, kPitScatterReach);
+    yLow -= yPad; yHigh += yPad;
+    if (! (uHigh > uLow) || ! (yHigh > yLow)) return result;
+    const auto direction = [&] (float x, float y)
+    {
+        const float z = std::sqrt (std::max (0.0f, 1.0f - x * x - y * y));
+        V d {};
+        for (int k = 0; k < 3; ++k) d[k] = x * lobe.tangent[k] + y * lobe.bitangent[k] + z * lobe.normal[k];
+        return d;
+    };
+    float heaviest = 0.0f;
+    const float uMiddle = 0.5f * (uLow + uHigh), uHalf = 0.5f * (uHigh - uLow);
+    for (int i = 0; i < kPitScatterAcrossSteps; ++i)
+    {
+        const float u = uMiddle + uHalf * kPitScatterAcrossNodes[std::size_t (i)];
+        const float argument = pi * u;
+        const float sinc = std::abs (argument) > 1.0e-4f ? std::sin (argument) / argument : 1.0f;
+        const float weight = sinc * sinc * uHalf * kPitScatterAcrossWeights[std::size_t (i)] / kPitScatterAcrossMass;
+        const float cx = lobe.mirror[0] + lobe.across[0] * lobe.acrossWidth * u;
+        const float cy = lobe.mirror[1] + lobe.across[1] * lobe.acrossWidth * u;
+        // The line's piece above the horizon, |c + along y| < 1.
+        const float middle = cx * along[0] + cy * along[1];
+        const float discriminant = middle * middle - (cx * cx + cy * cy - 1.0f);
+        if (! (discriminant > 0.0f)) continue;
+        const float root = std::sqrt (discriminant);
+        const float y0 = std::max (yLow, -middle - root), y1 = std::min (yHigh, -middle + root);
+        if (! (y1 > y0)) continue;
+        const float yStep = (y1 - y0) / float (kPitScatterAlongPieces);
+        for (int j = 0; j < kPitScatterAlongPieces; ++j)
+        {
+            const float ya = y0 + float (j) * yStep, yb = ya + yStep;
+            const V d0 = direction (cx + along[0] * ya, cy + along[1] * ya);
+            const V d1 = direction (cx + along[0] * yb, cy + along[1] * yb);
+            const V e = sub (d1, d0);
+            float low = 0.0f, high = 1.0f;
+            for (const auto& plane : planes)
+            {
+                const float p = orientation * dot (plane, d0), q = orientation * dot (plane, e);
+                if (std::abs (q) <= 1.0e-12f) { if (p < 0.0f) high = -1.0f; }
+                else if (q > 0.0f) low = std::max (low, -p / q);
+                else high = std::min (high, -p / q);
+            }
+            if (! (high > low)) continue;
+            const float mass = weight * (std::atan ((ya + high * yStep) / lobe.alongWidth)
+                                         - std::atan ((ya + low * yStep) / lobe.alongWidth)) / pi;
+            result.mass += mass;
+            if (mass > heaviest)
+            {
+                heaviest = mass;
+                const float t = 0.5f * (low + high);
+                for (int k = 0; k < 3; ++k) result.direction[k] = d0[k] + t * e[k];
+            }
+        }
+    }
+    const float length = std::sqrt (dot (result.direction, result.direction));
+    if (length > 0.0f) for (auto& value : result.direction) value /= length;
+    return result;
+}
 // A directional light of irradiance E seen through an order as a disc of angular
 // radius r and radiance E / (pi r^2), so the arc that crosses it carries E.
 inline float directionalDiscRadiance (float irradiance, float radius) noexcept

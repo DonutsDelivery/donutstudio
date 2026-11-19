@@ -60,6 +60,12 @@ int main()
     check (kc::processState().read().activeStartNs == 0 && kc::processState().read().lastEndNs != 0,
            "leaving the scope ends it, on a failed compile's early return too");
 
+    check (kc::buildElapsedSeconds (0, 50 * second) == 0, "no build running has no elapsed time");
+    check (kc::buildElapsedSeconds (10 * second, 10 * second) == 0, "a build that just began is at 0 s");
+    check (kc::buildElapsedSeconds (10 * second, 10 * second + 999999999) == 0, "elapsed counts whole seconds");
+    check (kc::buildElapsedSeconds (10 * second, 112 * second) == 102, "102 s into a build reads 1:42");
+    check (kc::buildElapsedSeconds (20 * second, 10 * second) == 0, "a start after the clock reading is not negative");
+
     std::printf ("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

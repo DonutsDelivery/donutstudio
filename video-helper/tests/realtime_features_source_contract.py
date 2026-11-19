@@ -139,7 +139,8 @@ need(backend, "if (uDiffractionEnvironment.x == 2.0 && uDiffractionPathKindAndBo
      "the environment-path grating takes the sky and emitters through its orders")
 if "return integrateDiffractionEnvironment(outgoing, tangent, bitangent, normal)\n            + realtimeDiffractionSkyRgb(" in backend:
     failures.append("Realtime must not add Raster's environment stand-in to the scene's light through the orders")
-need(backend, "vec3 flatSky = uAmbient;", "the orders read the scene's ambient as environment")
+need(backend, "vec3 flatSky = uDiffractionSkyAmbient;",
+     "the orders add only the scene's ambient via uDiffractionSkyAmbient, not the environment light again")
 need(backend, "&& (materialKind!=NativeFixtureMaterialKind::DiffractionReflective || realtimeFrame)",
      "a Realtime grating frame draws its sky")
 # Each band is read across its wavelength interval, and the analytic sun is integrated
@@ -201,8 +202,18 @@ need((root / "video-helper/src/gpu_backend/fixture_diffraction_transport.h").rea
      "the readback names a payload lost to a half-float target by its alpha")
 metal = (root / "video-helper/src/gpu_backend/backend_sokol.mm").read_text()
 need(metal, "float3 realtimeDiffractionSky(VertexOut in, constant Uniforms& u,", "the Metal environment-through-orders term")
-need(metal, "? realtimeDiffractionSky(in, u, environmentTexture, opaqueTexture) : float3(0.0f))) * scatterWeight",
-     "the Metal grating adds the environment term")
+need(metal, "? realtimeDiffractionSky(in, u, environmentTexture, opaqueTexture, realtimeEmitters)",
+     "the Metal grating adds the environment term through its orders, with the room's emitters")
+# The Metal Realtime grating drops Raster's grey environment dome and takes the scene's
+# light, ambient included, through its orders, as the GL Realtime does (d39510c35f,
+# c1c0c98f7a). With the dome the Grooved Sphere, Disc and Trading Card came out olive.
+need(metal, '"        return integrateDiffractionEnvironment(outgoing, tangent, bitangent, normal, in, u);\\n",\n'
+     '         "        return float3(0.0f);\\n"},',
+     "the Metal Realtime environment-path grating drops the dome")
+if "already integrates its environment" in metal:
+    failures.append("the Metal Realtime environment term must not skip an environment-path grating")
+need(metal, "    float3 flatSky = u.ambient.xyz;", "the Metal orders read the scene's ambient as environment")
+need(metal, '"        radiance+=u.ambient.xyz;\\n"', "the Metal Realtime sky backdrop adds the ambient")
 
 # Caustics stay Path Trace only.
 # Solid viewport shading draws through the Realtime engine but is not a Realtime

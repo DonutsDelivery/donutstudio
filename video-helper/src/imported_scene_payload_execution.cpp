@@ -2066,9 +2066,16 @@ bool ImportedScenePayloadExecution::execute(
         evaluation.scoreAt = [&](const auto& operation, const auto& positions, auto& result, auto& diagnostic) {
             return scorefield::evaluateSampleField(operation, positions, request.runtimeInputs.canonicalBlockCFrame, result, diagnostic);
         };
+        // The collection reads this evaluation only through its programs' Fields. With
+        // none, every frame admits the same material, so its publication key leaves out
+        // the time and frame and steady playback reuses the published material.
+        const bool fieldFree = std::all_of(programs.begin(), programs.end(),
+            [](const auto& object) { return object.program.fields.empty(); });
         const auto* materialFrame = request.runtimeInputs.canonicalBlockCFrame.get();
-        const auto materialInputs = geometry::timelineSceneEvaluationInputs(evaluation.timelineSeconds, 0.0, false,
-            materialFrame ? &materialFrame->key : nullptr);
+        const auto materialInputs = fieldFree
+            ? geometry::timelineSceneEvaluationInputs(0.0, 0.0, false, nullptr)
+            : geometry::timelineSceneEvaluationInputs(evaluation.timelineSeconds, 0.0, false,
+                materialFrame ? &materialFrame->key : nullptr);
         if (!seam.publishSurfacePrograms(admission, programs, evaluation, error,
                 diffraction ? &*diffraction : nullptr,
                 request.glassCaustic ? &*request.glassCaustic : nullptr, &materialInputs)) return false;

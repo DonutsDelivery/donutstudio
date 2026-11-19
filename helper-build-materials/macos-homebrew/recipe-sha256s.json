@@ -1,0 +1,92 @@
+[
+  {
+    "formula": "dav1d",
+    "version": "1.5.4",
+    "filename": "dav1d.rb",
+    "sha256": "3364a5bd9c26e4c9b73d756f8b99944fe3bf74e59e9ded813235c8aeaec63984"
+  },
+  {
+    "formula": "ffmpeg",
+    "version": "9.0.1",
+    "filename": "ffmpeg.rb",
+    "sha256": "c350685d70db3a93a983062d28db5e677f7dc7651ba391a269ad6620b589073f"
+  },
+  {
+    "formula": "glfw",
+    "version": "3.5.1",
+    "filename": "glfw.rb",
+    "sha256": "a3a0763106fb9d0c64c3bcdfa9a017999566764a7b204c8eee9dfc77a8881c4f"
+  },
+  {
+    "formula": "lame",
+    "version": "4.0",
+    "filename": "lame.rb",
+    "sha256": "54e93fd2d82f830c4a53f56f61afb352c465ea96d37f7e34db48257c78bb5478"
+  },
+  {
+    "formula": "libvmaf",
+    "version": "3.2.0",
+    "filename": "libvmaf.rb",
+    "sha256": "be78fefc186b3d539e7e3b20c6bbdb0fb12b50a039b15da274101cc0f34a9f79"
+  },
+  {
+    "formula": "libvpx",
+    "version": "1.16.0",
+    "filename": "libvpx.rb",
+    "sha256": "c221276a228e690c9e97e857e2573e7b4ce4c840b13befdb4283ee22b5c6aefd"
+  },
+  {
+    "formula": "lua",
+    "version": "5.5.0",
+    "filename": "lua.rb",
+    "sha256": "d80b99303f4ec4358efd048b72c16b0542cf86ea6cb93e8d3dcd2993925a449d"
+  },
+  {
+    "formula": "molten-vk",
+    "version": "1.4.2",
+    "filename": "molten-vk.rb",
+    "sha256": "c109376454791a1ad41068ddce1a6d301a93a30a5c3eff685309175be9a28c40"
+  },
+  {
+    "formula": "mpg123",
+    "version": "1.33.7",
+    "filename": "mpg123.rb",
+    "sha256": "5ad4b706de97c4879ce5f4971acd1ed6acc2045974fdbc3b29f6feaffe3398be"
+  },
+  {
+    "formula": "openssl@3",
+    "version": "3.6.4",
+    "filename": "openssl@3.rb",
+    "sha256": "df9c2b56e0d961d3c22eb60f5c2e41112be1901a8ee85de1c7472955f6da391a"
+  },
+  {
+    "formula": "opus",
+    "version": "1.6.1",
+    "filename": "opus.rb",
+    "sha256": "7ebe72e9352ceb9236cfb49c8ba7134556295ca330ea9054135b1401257f03c4"
+  },
+  {
+    "formula": "svt-av1",
+    "version": "4.2.0",
+    "filename": "svt-av1.rb",
+    "sha256": "41c026d8329602ecc9de6f581524359836611cab34efa89c2d81ca8b02cf266a"
+  },
+  {
+    "formula": "x264",
+    "version": "r3222",
+    "filename": "x264.rb",
+    "sha256": "9165e288b689999b374401c1045a1904102ff279fb534f514d6569fcb608e264"
+  },
+  {
+    "formula": "x265",
+    "version": "4.2",
+    "filename": "x265.rb",
+    "sha256": "ade84e50acc434797a5902cfb186f5ce65eff5bb7c02d9318739d3b0ca9d175c"
+  },
+  {
+    "formula": "xz",
+    "version": "5.8.3",
+    "filename": "xz.rb",
+    "sha256": "0812ffeca3c6631a261e87c76ff26368eee0df6ecedfe0f458d67494fdf6e9cc"
+  }
+]

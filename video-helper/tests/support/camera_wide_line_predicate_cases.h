@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace videohelper::tests::camerawidelinecases
@@ -21,7 +22,7 @@ using Line=std::array<Integer,3>;
 inline Integer number(std::int32_t n)
 {
     auto a=cr::integer(static_cast<std::uint32_t>(n<0?-static_cast<std::int64_t>(n):n));
-    if(n<0)a=bits::negative(a);
+    if(n<0)a=bits::negative(std::move(a));
     return a;
 }
 inline void storeInteger(std::uint32_t* at,const Integer& a,unsigned limbs)

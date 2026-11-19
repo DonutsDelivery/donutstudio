@@ -65,9 +65,12 @@ inline constexpr std::size_t kHeaderBytes = 8 + 4 + 4 + 8 + kDigestHexLength;
 inline constexpr char kEntrySuffix[] = ".glpb";
 inline constexpr char kTemporarySuffix[] = ".tmp";
 
+// Every DonutStudio build on the machine shares the directory, and one session
+// writes several programs, so a 64-entry cap evicted live programs between two
+// runs of one build. The byte cap is what bounds the disk.
 struct Limits
 {
-    std::size_t maximumEntries = 64;
+    std::size_t maximumEntries = 1024;
     std::uintmax_t maximumBytes = 256ull * 1024ull * 1024ull;
 };
 
@@ -440,6 +443,16 @@ public:
         }
         touchEntry (path);
         return program;
+    }
+
+    // True when an entry for this exact pair is on disk. It reads nothing, so a
+    // load can still miss on a damaged entry or a driver that refuses it.
+    bool contains (const std::string& vertexSource, const std::string& fragmentSource) const
+    {
+        if (! enabled())
+            return false;
+        std::error_code ec;
+        return std::filesystem::exists (entryPath (*directory_, keyFor (vertexSource, fragmentSource)), ec);
     }
 
     // Call before linking a program that store() may keep.

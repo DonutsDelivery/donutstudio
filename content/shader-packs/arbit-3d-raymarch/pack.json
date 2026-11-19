@@ -1,0 +1,154 @@
+{
+  "pack": {
+    "id": "donutstudio-3d-raymarch-v1",
+    "name": "DonutStudio 3D Raymarch Worlds",
+    "version": "1.0",
+    "author": "DonutStudio",
+    "license": "CC0-1.0",
+    "format": "glsl",
+    "description": "Raymarched 3D worlds for music videos: a note-built cathedral, a bass-driven nebula, a beat-folding fractal temple, a tuning-mapped spiral galaxy, a spectrum tunnel, an interference ocean, a pitch crystal cluster, a score monolith, a neural garden of harmonic links, a liquid depth pool, and a mix-powered fusion reactor. Every scene is driven by the score, exact JI tuning, harmonic links, clock, and audio analysis through the Block D camera contract."
+  },
+  "shaders": [
+    {
+      "id": "harmonic-cathedral",
+      "file": "shaders/harmonic_cathedral.fs",
+      "name": "Harmonic Cathedral",
+      "category": "minimalist",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "Every sounding note raises a glowing pillar in an orbiting 3D hall; pillar height follows pitch and the floor lattice lights up beneath each one. Transients kick light through the nave."
+    },
+    {
+      "id": "bass-nebula",
+      "file": "shaders/bass_nebula.fs",
+      "name": "Bass Nebula",
+      "category": "nature",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "A volumetric nebula pumped by the low end: the camera drifts through fractal gas while each sounding note ignites a star placed by its exact cents offset from the root. Onsets detonate shockwave rings."
+    },
+    {
+      "id": "fractal-bass-temple",
+      "file": "shaders/fractal_bass_temple.fs",
+      "name": "Fractal Bass Temple",
+      "category": "psychedelic",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "An infinite Menger-style temple that folds open on the beat: bass carves the holes deeper, transients flood the central shaft with light, and sounding notes orbit as glowing runes."
+    },
+    {
+      "id": "pitch-galaxy",
+      "file": "shaders/pitch_galaxy.fs",
+      "name": "Pitch Galaxy",
+      "category": "minimalist",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": ["harmonic links / JI tuning"],
+      "description": "A raymarched spiral galaxy whose arms wind with the bar phase and spin at the song tempo. Each note becomes a star lifted out of the disc plane by its exact tuning; roots burn gold."
+    },
+    {
+      "id": "chromatic-wormhole",
+      "file": "shaders/chromatic_wormhole.fs",
+      "name": "Chromatic Wormhole",
+      "category": "psychedelic",
+      "reactsTo": ["clock", "audio"],
+      "needs": [],
+      "description": "An endless twisted tunnel whose walls are living equalizer ribs — 64 bands mapped around the circumference. The twist tightens with loudness and every onset fires a shockwave ring past the camera."
+    },
+    {
+      "id": "resonance-ocean",
+      "file": "shaders/resonance_ocean.fs",
+      "name": "Resonance Ocean",
+      "category": "nature",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "A raymarched ocean where each note drives a wave train at its exact root-relative ratio: consonance locks into glassy interference patterns, dissonance whitens the water with foam. Bass burns the horizon."
+    },
+    {
+      "id": "beat-crystal-bloom",
+      "file": "shaders/beat_crystal_bloom.fs",
+      "name": "Beat Crystal Bloom",
+      "category": "minimalist",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "A crystal cluster grows from a mirror-black floor on every downbeat — one shard per note, tinted by pitch class, growing while sustained, all doubled in the obsidian below."
+    },
+    {
+      "id": "harmonic-wave-sculpture",
+      "file": "shaders/harmonic_wave_sculpture.fs",
+      "name": "Harmonic Wave Sculpture",
+      "category": "minimalist",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "A kinetic gallery sculpture of helix strands — one per sounding note, twisted at its exact root-relative ratio so consonant chords braid into locked ribbons while the pedestal mirror-polish doubles the piece."
+    },
+    {
+      "id": "neon-bass-canyon",
+      "file": "shaders/neon_bass_canyon.fs",
+      "name": "Neon Bass Canyon",
+      "category": "psychedelic",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "A flight through a procedurally carved canyon striped with glowing equalizer veins; bass squeezes the walls together, beat lanterns drift upward, and notes hang as neon signs over the rim."
+    },
+    {
+      "id": "score-monolith",
+      "file": "shaders/score_monolith.fs",
+      "name": "Score Monolith",
+      "category": "minimalist",
+      "reactsTo": ["score", "clock", "audio"],
+      "legacySourceSha256": ["c43e4add4e4e181a4ac5e25a454c9744776c1c441d0b31f50ed3b8083a660d69"],
+      "needs": ["harmonic links / JI tuning"],
+      "description": "A glossy slab on a mirrored plane under a dusk sky, whose face is the score: a bar-phase clock sweep, one glowing edge per sounding note flaring at attack, and laser beams drawn between harmonic links."
+    },
+    {
+      "id": "synaptic-bloom",
+      "file": "shaders/synaptic_bloom.fs",
+      "name": "Synaptic Bloom",
+      "category": "psychedelic",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": ["harmonic links / JI tuning"],
+      "description": "Notes sprout as glowing neurons drifting like plankton; harmonic links fire synapse pulses master to slave in beat-locked rhythm. Dissonant webs look tangled, consonant ones organized."
+    },
+    {
+      "id": "chromatic-depth-pool",
+      "file": "shaders/chromatic_depth_pool.fs",
+      "name": "Chromatic Depth Pool",
+      "category": "nature",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "A pool of liquid color whose level breathes with loudness. Notes ripple outward at their exact pitch rate; refraction tints deepen with distance so low notes stain deep layers and high notes shimmer on top."
+    },
+    {
+      "id": "gravity-well",
+      "file": "shaders/gravity_well.fs",
+      "name": "Gravity Well",
+      "category": "psychedelic",
+      "reactsTo": ["score", "clock", "audio"],
+      "needs": [],
+      "description": "A black hole with an accretion disc that is literally the mix: spectrum bands map across its radius with a Doppler-bright approach side. Notes orbit as particles — high notes whip around, bass crawls."
+    },
+    {
+      "id": "beat-reactor",
+      "file": "shaders/beat_reactor.fs",
+      "name": "Beat Reactor",
+      "category": "psychedelic",
+      "reactsTo": ["clock", "audio"],
+      "legacySourceSha256": [
+        "98bd0ce86c14a13a033ce2351e7c044e49759090bec3e843fa0df77e8c226a39",
+        "c7db49fe89a0bf43b4bd150eab8c8b2c25525229c815596d3d0c6f84e41d2b04",
+        "47afc18c618244ff7eaa629eb1eae70abe5bf02a11c6b83b6fe31982dfe7566f"
+      ],
+      "needs": [],
+      "description": "A kinetic containment atom around a volatile plasma core. The camera orbits continuously while three field rings precess at independent audio-driven rates, bright electron carriages race around them, and every transient kicks the mechanism out of phase."
+    },
+    {
+      "id": "holo-foil",
+      "file": "shaders/holo_foil.fs",
+      "name": "Holo Foil",
+      "category": "psychedelic",
+      "reactsTo": ["clock", "audio"],
+      "needs": [],
+      "description": "An embossed trading card with an animated rainbow foil. Approximate: not a physical diffraction model yet."
+    }
+  ]
+}

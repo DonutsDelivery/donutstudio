@@ -1,0 +1,24 @@
+{
+  "name": "nlohmann-json3",
+  "version": "3.11.3-1",
+  "files": [
+    {
+      "name": "nlohmann-json3_3.11.3-1.dsc",
+      "sha256": "5118bdb46f9d704dafd0d3ebf7857a7a79e6284515f5697cc1ed6c0ff4f106a0",
+      "size": 2061,
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/nlohmann-json3/nlohmann-json3_3.11.3-1.dsc"
+    },
+    {
+      "name": "nlohmann-json3_3.11.3.orig.tar.gz",
+      "sha256": "0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406",
+      "size": 8053705,
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/nlohmann-json3/nlohmann-json3_3.11.3.orig.tar.gz"
+    },
+    {
+      "name": "nlohmann-json3_3.11.3-1.debian.tar.xz",
+      "sha256": "b34b12aad8b78ca96ec3590da379c2687152d7d6e1c634094c970b3c9569e6ad",
+      "size": 4756,
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/nlohmann-json3/nlohmann-json3_3.11.3-1.debian.tar.xz"
+    }
+  ]
+}

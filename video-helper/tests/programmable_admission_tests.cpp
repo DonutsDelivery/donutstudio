@@ -120,6 +120,18 @@ int main()
         approved.catalogProgramId = builtin.first;
         approved.verifiedBundledCurated = true;
         approved.mac = sign(secret, approved, PayloadKind::shader);
+        assert(programmableadmission::isWindowsBuiltinGenerator(
+            approved, PayloadKind::shader, builtin.second));
+        assert(!programmableadmission::isWindowsBuiltinGenerator(
+            approved, PayloadKind::lua, builtin.second));
+        auto uncurated = approved;
+        uncurated.verifiedBundledCurated = false;
+        assert(!programmableadmission::isWindowsBuiltinGenerator(
+            uncurated, PayloadKind::shader, builtin.second));
+        assert(!programmableadmission::isWindowsBuiltinGenerator(
+            g, PayloadKind::shader, builtin.second));
+        assert(!programmableadmission::isWindowsBuiltinGenerator(
+            approved, PayloadKind::shader, builtin.second + "\nvoid extra() {}"));
         const auto admitBuiltin = [&](const Grant& candidate, const std::string& bytes)
         {
             programmableadmission::SessionVerifier session(secret, generation);

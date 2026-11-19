@@ -14,6 +14,7 @@
 #include <new>
 #include <stdexcept>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -529,6 +530,12 @@ public:
       return false;
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    reconcileGenerationLocked(projectGeneration, helperGeneration, deviceGeneration);
+    return true;
+  }
+  void reconcileGenerationLocked(std::uint64_t projectGeneration,
+                                 std::uint64_t helperGeneration,
+                                 std::uint64_t deviceGeneration) {
     const bool changed = activeProjectGeneration_ != projectGeneration ||
                          activeHelperGeneration_ != helperGeneration ||
                          activeDeviceGeneration_ != deviceGeneration;
@@ -548,7 +555,6 @@ public:
       clock_ = 0;
       admissionsInGeneration_ = 0;
     }
-    return true;
   }
   std::uint64_t admissionsInGeneration() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -650,9 +656,92 @@ public:
     found->second.verifiedScene=authored;
     found->second.verifiedObject=binding.object;
     found->second.verifiedPlan=timelinePlanDigest(binding);
+    found->second.verifiedPlanBytes=std::make_shared<const std::string>(binding.loweredPlan);
     found->second.verifiedPlanText.clear();
     found->second.evaluatedScene.reset();
   }
+  // A graph edit elsewhere gives the clip a new plan revision with the same timeline plan,
+  // object and authored scene. Verification is a function of those three alone, so the new
+  // owner takes the verification and the immutable admitted value of the revision that did the
+  // work, and its first frame runs no admission, binding check or identity replay. The plan text
+  // must be equal byte for byte. The new owner gets its own lease and native resources. False
+  // means no such revision, and the caller admits and verifies as before.
+  // Every plan install bumps the viewport's project generation, so a reinstall of the same graph
+  // asks with a new project generation. The revision it takes may be from an earlier one; the
+  // adoption then makes the owner's generation active, as the verifying path would. A helper or
+  // device generation change is another process or GPU context, and always verifies again.
+  bool adoptVerifiedTimelinePlan(const PlanOwnerIdentity& owner,
+      const videowire::geometry::TimelineSceneBinding& binding,
+      const std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene>& authored,
+      const std::shared_ptr<const void>& planPublication = {}) {
+    std::string error;
+    const auto miss=[this](const char* reason) { lastAdoptionMiss_.store(reason); return false; };
+    if (!owner.valid() || !authored || !residency_->mutationAllowed(error)) return miss("geometry:adopt-miss:invalid");
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Before any generation is active nothing has been verified, and the search names that.
+    if (activeHelperGeneration_ && (owner.helperGeneration!=activeHelperGeneration_
+        || owner.deviceGeneration!=activeDeviceGeneration_)) return miss("geometry:adopt-miss:generation");
+    if (cache_.count(owner)) return miss("geometry:adopt-miss:owner-admitted");
+    auto source=cache_.end();
+    // The closest revision found, named when none matches: the reason a live first frame verified.
+    const char* closest="geometry:adopt-miss:no-verified-revision";
+    for (auto it=cache_.begin();it!=cache_.end();++it) {
+      const auto& other=it->first;
+      const auto& entry=it->second;
+      if (other.helperGeneration!=owner.helperGeneration
+          || other.deviceGeneration!=owner.deviceGeneration || other.clipIdentity!=owner.clipIdentity
+          || other.use!=owner.use || entry.family || entry.bodySource || !entry.surfaceMaterial.empty()
+          || !entry.verifiedPlanBytes) continue;
+      if (!(entry.verifiedObject==binding.object) || *entry.verifiedPlanBytes!=binding.loweredPlan) {
+        closest="geometry:adopt-miss:plan-differs"; continue;
+      }
+      if (entry.verifiedScene.lock()!=authored) { closest="geometry:adopt-miss:scene-differs"; continue; }
+      source=it; break;
+    }
+    if (source==cache_.end()) return miss(closest);
+    Entry adopted;
+    adopted.planDigest=source->second.planDigest;
+    adopted.plan=source->second.plan;
+    adopted.slotMedia=source->second.slotMedia;
+    adopted.verifiedPlan=source->second.verifiedPlan;
+    adopted.verifiedPlanBytes=source->second.verifiedPlanBytes;
+    // The admitted value holds the residency of the revision that admitted it, so retiring
+    // that revision's unused owner here frees nothing the adopted owner reads.
+    if (owner.projectGeneration!=activeProjectGeneration_) {
+      reconcileGenerationLocked(owner.projectGeneration, owner.helperGeneration, owner.deviceGeneration);
+      source=cache_.end();
+    }
+    auto victim=cache_.end();
+    if (cache_.size() >= maximumOwners_) {
+      for (auto it=cache_.begin();it!=cache_.end();++it)
+        if (it!=source && entryUnused(it->second)
+            && (victim==cache_.end() || it->second.lastUse<victim->second.lastUse)) victim=it;
+      if (victim==cache_.end()) return miss("geometry:adopt-miss:owners-in-use");
+    }
+    // The value stays charged to the token that admitted it; this one holds the owner's own records.
+    std::size_t bytes=0;
+    if (!videowire::geometry::checkedAdd(sizeof(Entry)+4*sizeof(void*)+3*RuntimeResidency::controlBytes,
+            3*RuntimeResidency::aliasBytes,bytes)) return miss("geometry:adopt-miss:residency");
+    const auto limit=adopted.plan->receipt().effectiveLimits.maxBufferBytes;
+    const auto token=residency_->registerOwner(bytes,bytes,limit,error);
+    if (!token) return miss("geometry:adopt-miss:residency");
+    adopted.lastUse=++clock_;
+    adopted.ownerLease=RuntimeResidency::alias(token,std::make_shared<const std::uint8_t>(0));
+    adopted.nativeResources=RuntimeResidency::alias(token,std::make_shared<RuntimeAdmission::NativeResources>());
+    adopted.verifiedScene=authored;
+    adopted.verifiedObject=binding.object;
+    adopted.verifiedPlanText.remember(planPublication,&binding);
+    if (victim!=cache_.end()) cache_.erase(victim);
+    cache_.emplace(owner,std::move(adopted));
+    ++adoptedTimelinePlans_;
+    return true;
+  }
+  std::uint64_t adoptedTimelinePlans() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return adoptedTimelinePlans_;
+  }
+  // Why the last adoption that found no revision to take refused, as a step label. Null until one does.
+  const char* lastAdoptionMiss() const noexcept { return lastAdoptionMiss_.load(); }
   // Weak: the static owner keeps the snapshot it renders, and this adds no retention of its own.
   std::shared_ptr<const HarmonicMIDI::grid::Visual3DScene> reuseEvaluatedTimelineScene(
       const PlanOwnerIdentity& owner, const TimelineSceneEvaluationInputs& inputs) {
@@ -1192,6 +1281,8 @@ private:
     TimelineSceneEvaluationInputs evaluatedInputs {};
     HarmonicMIDI::grid::SceneObjectId verifiedObject {};
     std::uint64_t verifiedPlan = 0;
+    // The exact text verifiedPlan digests, so another revision can match it byte for byte.
+    std::shared_ptr<const std::string> verifiedPlanBytes {};
     PublishedPlanMemo verifiedPlanText {};
     std::string slotMedia {};
   };
@@ -1222,6 +1313,8 @@ private:
   std::uint64_t activeDeviceGeneration_ = 0;
   std::uint64_t admissionsInGeneration_ = 0;
   std::uint64_t verifiedTimelineReuses_ = 0;
+  std::uint64_t adoptedTimelinePlans_ = 0;
+  std::atomic<const char*> lastAdoptionMiss_{nullptr};
   std::uint64_t timelinePlanDigests_=0;
   std::uint64_t evaluatedTimelineReuses_ = 0;
   std::uint64_t timelineSceneEvaluations_ = 0;

@@ -2484,7 +2484,7 @@ void audioEffectorFeatureInputs() {
                               const spectrum::Scalars& scalars, spectrum::Bands& out) {
     auto controls=gate; controls.input=input;
     spectrum::Follower state;
-    return spectrum::evaluate(controls,bands,1.0,noBands,state,out,error,spectrum::ScalarInput{&scalars,{}});
+    return spectrum::evaluate(controls,bands,1.0,noBands,state,out,error,spectrum::ScalarInput{&scalars,{}, {}});
   };
   spectrum::Bands out {};
   check(evaluateWith(spectrum::EffectorInput::bandRange,quiet,features,out) && out[0]==0.0f,
@@ -2517,9 +2517,9 @@ void audioEffectorFeatureInputs() {
       return true;
     };
     spectrum::Follower heldState, releasedState;
-    check(spectrum::evaluate(controls,quiet,0.6,silentBands,heldState,out,error,spectrum::ScalarInput{nullptr,pulse})
+    check(spectrum::evaluate(controls,quiet,0.6,silentBands,heldState,out,error,spectrum::ScalarInput{nullptr,pulse, {}})
           && out[0]==1.0f,"baked onset input holds its peak through the replay");
-    check(spectrum::evaluate(controls,quiet,1.0,silentBands,releasedState,out,error,spectrum::ScalarInput{nullptr,pulse})
+    check(spectrum::evaluate(controls,quiet,1.0,silentBands,releasedState,out,error,spectrum::ScalarInput{nullptr,pulse, {}})
           && out[0]==0.0f,"baked onset input releases after the hold expires");
     check(!spectrum::evaluate(controls,quiet,0.6,silentBands,heldState,out,error,spectrum::ScalarInput{})
           && error.find("RMS")!=std::string::npos,
