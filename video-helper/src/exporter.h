@@ -342,7 +342,7 @@ std::string runExport (const ExportJob& job, std::string& usedEncoderOut,
 
 #if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
 // Call only in an unused helper, before any viewport or render work.
-bool windowsExportContextCreationFailed();
+bool windowsExportContextCreationFailed(const char*& outcome);
 #endif
 
 struct CompositeFrameResult

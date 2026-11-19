@@ -1,6 +1,6 @@
 # Video helper notices
 
-DonutStudio 1.0.0 uses the GPL-linked video helper on Linux and macOS. The GPL text is in `COPYING`. The private distribution conditions in `FIRST_PARTY_LICENSE.txt` describe the profile with an audited non-GPL dependency closure. Third-party copyrights and licenses listed below apply to their respective files and libraries.
+DonutStudio 1.0.0 uses the GPL-linked video helper on Linux, Windows, and macOS. The GPL text is in `COPYING`. The private distribution conditions in `FIRST_PARTY_LICENSE.txt` describe the profile with an audited non-GPL dependency closure. Third-party copyrights and licenses listed below apply to their respective files and libraries.
 
 ## Source used by the helper
 
@@ -18,3 +18,7 @@ The bundled Ubuntu FFmpeg libraries come from source package `ffmpeg` version `7
 ## macOS
 
 The arm64 Homebrew FFmpeg libraries come from FFmpeg 9.0.1. The formula enables GPL and version 3 code and reports GPL-3.0-or-later. The recorded Homebrew formulas and the source lock give the upstream sources, patches and reference revisions for the bundled dylibs. Packaging rewrites dylib install names and signs the copies it distributes. The dependency source archive contains the matching source and recipes.
+
+## Windows
+
+The MSYS2 MINGW64 FFmpeg libraries come from version 8.1.2-2. Their configuration enables GPL and version 3 code. The dependency source lock gives the matching source archive and SHA-256 for every shipped MSYS2 helper DLL. The original package notices remain in those archives. The separate Mesa source record names the verified runtime release and upstream code. The GPL version 3 text is in `helper-build-materials/COPYING.GPLv3`.

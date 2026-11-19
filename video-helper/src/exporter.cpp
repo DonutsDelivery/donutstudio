@@ -4246,15 +4246,19 @@ std::string runGlFrameLoop (const ExportJob& job, GlExportContext& glctx,
 } // namespace
 
 #if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
-bool windowsExportContextCreationFailed()
+bool windowsExportContextCreationFailed(const char*& outcome)
 {
     if (!initializeHelperGlfw())
+    {
+        outcome = "glfw-init-failed";
         return false;
+    }
     auto* window = createWindowsExportWindow();
     const bool failed = window == nullptr;
     if (window != nullptr)
         glfwDestroyWindow (window);
     glfwTerminate();
+    outcome = failed ? "window-creation-failed" : "context-created";
     return failed;
 }
 #endif

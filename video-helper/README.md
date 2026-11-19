@@ -4,7 +4,7 @@ The standalone application starts `arbit-video-helper` as a separate process for
 
 ## Release correspondence
 
-DonutStudio 1.0.0 uses the helper source in this tree for Linux and macOS. The matching application commits are `d1e1b84281c4bae3f1eebc7719b51dbcf219c7df` and `29846807ab8ff0ceafd7e3c5cc4453865aacb6b7`. The Linux self-extractor packaging change leaves the helper executable and its dependency files intact. Per-package binary hashes belong in the release correspondence receipt.
+The Windows and macOS builds of DonutStudio 1.0.0 use the helper source in this tree. The application source commit is `d68179880f3306eb3c2159b922ace07d356936f4`. The Linux build has its own correspondence at public commit `b821eabe893e7fdbac237956a70e3dd29d8a0ff5`.
 
 The files under `shared`, `plugin/Source`, `content/shader-packs` and `tools` are inputs to this helper. The renderer check reads the registration in `plugin/CMakeLists.txt`. The two contract test sources keep the helper project configurable. The commands build only the helper executable.
 
@@ -38,3 +38,24 @@ cmake --build video-helper/build-macos --target arbit-video-helper
 ```
 
 CMake pins its fetched dependency sources in `video-helper/CMakeLists.txt` and `video-helper/cmake`. See `NOTICE.md` for distribution notices.
+
+## Windows x86-64
+
+Build the helper from the repository root in the cross-toolchain environment in `helper-build-materials/Dockerfile.windows-videohelper`. Restore the exact MSYS2 MINGW64 dependency packages to the MinGW sysroot. The source lock lists the package versions, library filenames, and source archive hashes. MSYS2 source archives include the corresponding build recipes, patches and upstream inputs.
+
+```sh
+sysroot="$PWD/video-helper/win-mingw-sysroot"
+export ARBIT_MINGW_SYSROOT="$sysroot"
+export PKG_CONFIG_LIBDIR="$sysroot/mingw64/lib/pkgconfig"
+export PKG_CONFIG_SYSROOT_DIR="$sysroot"
+export PKG_CONFIG_PATH=""
+export CXXFLAGS="-I/usr/include/freetype2"
+cmake -S video-helper -B video-helper/build-win-mingw -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  '-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -g1' \
+  '-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -g1' \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/helper-build-materials/mingw-w64-x86_64.cmake"
+cmake --build video-helper/build-win-mingw --target arbit-video-helper
+```
+
+The Windows installer ships the helper with its MinGW DLL closure. The software-renderer folder contains a copy of the helper and the Mesa 26.1.3 MSVC libraries listed in `helper-build-materials/windows-mesa.json`. Keeping those Mesa files in that folder lets the normal helper select the native OpenGL driver. See `NOTICE.md` for dependency license details.

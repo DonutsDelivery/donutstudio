@@ -10,6 +10,9 @@
 // index instead of pixel data.
 
 #include "../../shared/VisualImportedAnimationOperationContract.h"
+#if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
+#include "WindowsColdExportDiagnostic.h"
+#endif
 #include "media.h"
 #include "stabilization.h"
 #include "software_h264_encoder.h"
@@ -3774,6 +3777,9 @@ int main (int argc, char** argv)
 
 #if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
     bool exportContextProbeAllowed = true;
+    const char* firstNonExemptRequest = nullptr;
+    const char* firstOpenCaller = nullptr;
+    bool firstOpenSucceeded = false;
 #endif
     const auto processRequest = [&] (const char* lineData, size_t lineSize)
     {
@@ -3798,14 +3804,40 @@ int main (int argc, char** argv)
         {
             // A fixed query on the private helper pipe. A used session may own
             // handles, a viewport or work that outlives its admission reply.
+            const char* outcome = exportContextProbeAllowed ? "invalid-parameters" : "session-used";
             const bool unavailable = exportContextProbeAllowed && params.is_object() && params.empty()
-                && windowsExportContextCreationFailed();
-            reply (idVal, json { { "contextCreationFailed", unavailable } });
+                && windowsExportContextCreationFailed(outcome);
+            json result { { "contextCreationFailed", unavailable }, { "outcome", outcome },
+                          { "liveMedia", !g_media.empty() } };
+            if (firstNonExemptRequest != nullptr)
+                result["firstNonExemptRequest"] = firstNonExemptRequest;
+            if (firstOpenCaller != nullptr)
+            {
+                result["firstOpenCaller"] = firstOpenCaller;
+                result["firstOpenSucceeded"] = firstOpenSucceeded;
+            }
+            reply (idVal, result);
             return;
         }
-        if (method != "ping" && method != "version" && method != "attach_shm"
+        const char* openCaller = nullptr;
+        if (method == "open")
+        {
+            const auto caller = params.find ("coldExportOpenCaller");
+            openCaller = caller != params.end() && caller->is_string()
+                ? windowscoldexport::openCallerLabel (caller->get_ref<const std::string&>()) : "other";
+        }
+        const bool mayKeepColdExport = exportContextProbeAllowed && openCaller != nullptr
+            && std::string_view (openCaller) == "thumbnail-cache" && g_media.empty();
+        if (exportContextProbeAllowed && method != "ping" && method != "version" && method != "attach_shm"
             && method != "probe" && method != "export_progress" && method != "export_cancel")
+        {
+            if (firstNonExemptRequest == nullptr)
+                firstNonExemptRequest = windowscoldexport::requestLabel (method);
             exportContextProbeAllowed = false;
+        }
+        const bool isFirstOpen = openCaller != nullptr && firstOpenCaller == nullptr;
+        if (isFirstOpen)
+            firstOpenCaller = openCaller;
 #endif
         if (method == "viewport_set_timeline")
         {
@@ -3862,6 +3894,12 @@ int main (int argc, char** argv)
         try
         {
             result = handle (method, params, error);
+#if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
+            // A normal open refusal returns after destroying its local MediaContext.
+            // Keep exceptions and any open that published a handle disqualified.
+            if (mayKeepColdExport && !error.empty() && g_media.empty())
+                exportContextProbeAllowed = true;
+#endif
         }
         catch (const std::bad_alloc&)
         {
@@ -3871,6 +3909,10 @@ int main (int argc, char** argv)
         {
             error = "Helper could not allocate memory for " + method;
         }
+#if defined(_WIN32) && ARBIT_HAVE_VIEWPORT
+        if (isFirstOpen)
+            firstOpenSucceeded = error.empty() && result.contains ("mediaId");
+#endif
         // The edit has landed: preview passes still rendering the old inputs are
         // obsolete and stop at their next sample-loop poll.
         if (error.empty() && videohelper::renderinput::changesFrameInputs (method))

@@ -1,0 +1,10 @@
+{
+  "source": "https://github.com/pal1000/mesa-dist-win/tree/26.1.3",
+  "release": "https://github.com/pal1000/mesa-dist-win/releases/tag/26.1.3",
+  "version": "26.1.3",
+  "binaryArchiveSha256": "6dd431f4620cea73970b13e3ffa94f721f2a3924306b8a4283c97648cdb6eb9c",
+  "dllHashes": {
+    "libgallium_wgl.dll": "1895f8c19ede5efd0497f9dfab463b19bf4377e3af7c06c2d4d073e4680c5f69",
+    "opengl32.dll": "12499866437a161d2b250d5105188ae00732dd74b4bebbcdf972e6145af00f9e"
+  }
+}

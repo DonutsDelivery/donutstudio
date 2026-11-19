@@ -1,32 +1,199 @@
 {
   "donutStudioVersion": "1.0.0",
-  "privateSourceCommit": "d1e1b84281c4bae3f1eebc7719b51dbcf219c7df",
-  "helperTreeSha256": "360e37df7be108d88a293038adff63d496de16da3bb4c62db67b071aa322d2b9",
-  "linuxArtifacts": {
-    "zip": {
-      "sha256": "d23abde40513d75d4dc39b6b212ac82c703053520eb9ff7dd08fd4035da5df8f",
-      "helperSha256": "9b07201ac6b34c4d709d7f1d88c5aaf038f6ed08c2101f57c783e4a9520122f5"
-    },
-    "appimage": {
-      "sha256": "bbc81affb953ae68a16729be5ce99b2d426d40b3745cbbb532b598a5f146796b",
-      "helperSha256": "5f79a5950bcae89efdf8a8c7b4f35c3a3feeedda103ef71d26d956a94a38314b"
-    },
-    "installer": {
-      "sha256": "7b4298f1bd127d9dca70cb8c72f47545d36769be662d33808cffbc27df41e5dc",
-      "packagingSource": "69e21d28fb344645a15266c640af5576adbab894",
-      "payloadHelperSha256": "9b07201ac6b34c4d709d7f1d88c5aaf038f6ed08c2101f57c783e4a9520122f5"
-    }
-  },
+  "privateSourceCommit": "d68179880f3306eb3c2159b922ace07d356936f4",
+  "helperTreeSha256": "c046b250335f098334f4d9310beed385f9443677739f746626900d6ce6f99397",
   "dependencySourceArchives": {
-    "linux": {
-      "filename": "DonutStudio-1.0.0-linux-helper-dependency-sources.tar",
-      "sha256": "60c8da9fc792c9ba81fcf4b411f6b95c3b562dfacb9585ad6abd18da914a6c91",
-      "bytes": 666603520
-    },
     "macos": {
       "filename": "DonutStudio-1.0.0-macos-helper-dependency-sources.tar",
       "sha256": "4a5e8bce11eb29204409f1a8aa0fd1a713964e8033e1787df99a6d20d5a08340",
       "bytes": 162600960
+    },
+    "windows": {
+      "filename": "DonutStudio-1.0.0-windows-helper-dependency-sources.tar",
+      "bytes": 1329694720,
+      "sha256": "3b311144c6267f803ec76436e4481ddee40e9e31c42f172256ff3e614bbdf091"
     }
+  },
+  "macosArtifacts": [
+    {
+      "filename": "DonutStudio-macOS.dmg",
+      "bytes": 754748823,
+      "sha256": "8431c533b91a832b34edf151494b194dcd49e3276adfdc663193f923f983a3ca"
+    },
+    {
+      "filename": "DonutStudio-macOS.zip",
+      "bytes": 726143286,
+      "sha256": "139d18a2356b772af87ce4ae0d8f8d229123c87d3f9daf6047a9194c48eaa675"
+    }
+  ],
+  "macosVideoHelper": {
+    "sha256": "a936eb014fd4a9ed22ca67eedc67dde02db590d4bacc902415ddb88ec2e72203",
+    "bundledLibraries": [
+      {
+        "name": "libmpg123.0.dylib",
+        "sha256": "ae11ecca2131d018e5ad026e7e2a0e72830ed591e155da5ec0c7da81dfaaafdc",
+        "uuids": [
+          "21659F3B-CE86-33D5-867E-4DC095D7C6A9"
+        ]
+      },
+      {
+        "name": "libvmaf.3.dylib",
+        "sha256": "f8665ecd9ac574e7d1483a971297cba52139bd8ba3181006506ea4550bb835b0",
+        "uuids": [
+          "9F5EFAE1-F330-3D5A-81F0-9523278DCF84"
+        ]
+      },
+      {
+        "name": "libSvtAv1Enc.4.2.0.dylib",
+        "sha256": "8bb5f21986cd5678ebca1272fc313dd0a54dcab1dd8f6e5416ae444723217dcc",
+        "uuids": [
+          "627DF8E1-C186-3361-90D3-BBF625C57FED"
+        ]
+      },
+      {
+        "name": "libavdevice.63.1.101.dylib",
+        "sha256": "3ae7d0a3e3315997714ce58b87a8313c1183aad0e9ee80ab31af4dce54dea4d1",
+        "uuids": [
+          "CAA9FEA7-3882-3FA1-88CE-E118C0C221A0"
+        ]
+      },
+      {
+        "name": "liblua.5.5.0.dylib",
+        "sha256": "4e71f49314b708c42f1ce35eb72c44468daab9cfb77be3e84b4943b32bef7f56",
+        "uuids": [
+          "DE09CEB6-C8AD-35BF-A286-C0C1D39CF9A8"
+        ]
+      },
+      {
+        "name": "libavfilter.12.1.101.dylib",
+        "sha256": "02b7bdb3c86f26f1cc1d54b30dd8dca94b1bb4e087d3958aca5aa700b1bcf166",
+        "uuids": [
+          "F8B1305A-AEFD-3E5B-91C3-788580B755D1"
+        ]
+      },
+      {
+        "name": "libdav1d.7.dylib",
+        "sha256": "29a355c65a3e66baff0be0f448e0462091f968fa6f2638143fb3fbebcd40116f",
+        "uuids": [
+          "E336E884-375F-383E-B9A1-5E9685FC5555"
+        ]
+      },
+      {
+        "name": "libssl.3.dylib",
+        "sha256": "9e580dc9b2320831d9d14dfd41b633228345e7d0d5ff558c667e8ed9046c26d4",
+        "uuids": [
+          "1B8AB7A7-AD95-3B41-85F2-FB21B66B6423"
+        ]
+      },
+      {
+        "name": "libx264.165.dylib",
+        "sha256": "4c64a7d196b02b97135ade66b1f807bcb58eac76f4d7b3143dd9f0f875f01e22",
+        "uuids": [
+          "B916484F-5239-335B-B9FE-4E71261DA16B"
+        ]
+      },
+      {
+        "name": "libmp3lame.0.dylib",
+        "sha256": "2e6955bc58dfff1b2ce9733da76e8c016ca621b5e76f70f658770f972bc2c38b",
+        "uuids": [
+          "6D9587EC-205A-3573-8A72-CEC524E533A2"
+        ]
+      },
+      {
+        "name": "libcrypto.3.dylib",
+        "sha256": "0cadcdeea16d08858f9765aa419139b648dcc0423385421681dc91daa2282d45",
+        "uuids": [
+          "B5FB28DB-1AC6-383C-9DDD-585812A35CE8"
+        ]
+      },
+      {
+        "name": "libswresample.7.1.101.dylib",
+        "sha256": "e2392f2a7dab29d23898332c33420abfdc7016bcd297415bbd1988a966b49b83",
+        "uuids": [
+          "CA04539A-7E40-3E72-B81D-F960B2AEAC14"
+        ]
+      },
+      {
+        "name": "libswscale.10.1.101.dylib",
+        "sha256": "3677f4f8bd28205cce04d78c475a0ae4a6ff96dbadb4595efea536f23dee2f82",
+        "uuids": [
+          "CAA4BC8B-1BF5-327C-A9A0-7C541C654FB9"
+        ]
+      },
+      {
+        "name": "libMoltenVK.dylib",
+        "sha256": "54ae5b861f9407c2485d79f6732e556753d65cc164bff62a61f4f54a8044960a",
+        "uuids": [
+          "FE3617CB-216E-3BAD-BCD8-414A0CE3C77E"
+        ]
+      },
+      {
+        "name": "libavutil.61.1.101.dylib",
+        "sha256": "741d2634e54bae9a939bb855df3df31a00deb35bb045318b0006f0429f108cfb",
+        "uuids": [
+          "914A8CBA-CA6A-310B-BFE5-5C901773EF92"
+        ]
+      },
+      {
+        "name": "libavcodec.63.1.101.dylib",
+        "sha256": "a1f34b332560c34cca912bb75418b8419bfd054b8e7dbda4d17e725175355b9a",
+        "uuids": [
+          "B69F1ABF-7F62-3085-9228-BFEF48732AF1"
+        ]
+      },
+      {
+        "name": "liblzma.5.dylib",
+        "sha256": "f28421c0b2313a448cb0565f12828b610ab543e0edcbcfecd7a0b89caa21c72b",
+        "uuids": [
+          "43C01AFF-C040-33FF-BB38-5E1EC42D9E75"
+        ]
+      },
+      {
+        "name": "libglfw.3.5.dylib",
+        "sha256": "4ba8a844d72e5d6c63f9c3aaebfb4fe80727916c4c8aef26836254130d59f3c8",
+        "uuids": [
+          "67A00FEC-9321-3C07-896E-63AC77A33D0D"
+        ]
+      },
+      {
+        "name": "libvpx.12.dylib",
+        "sha256": "91e38f75b72ba26282d501cf3c2435337e5ff4df684444eb21c4f998ad70a346",
+        "uuids": [
+          "ABEF3286-0A7B-3E10-8825-81C8A863EFA8"
+        ]
+      },
+      {
+        "name": "libavformat.63.1.101.dylib",
+        "sha256": "56ba9398267217a6aaca2b0e321b60f5efa4dcf343427c47427cad33db6e740c",
+        "uuids": [
+          "CBA4B5D2-C128-3701-8718-A12043F18C8F"
+        ]
+      },
+      {
+        "name": "libx265.216.dylib",
+        "sha256": "4f728aaa4c7f31df9056162423d5a810c57f2fc408a1378e4a82f3a756f29f02",
+        "uuids": [
+          "710DC56C-1D6C-3B7B-BBA6-157396DDC818"
+        ]
+      },
+      {
+        "name": "libopus.0.dylib",
+        "sha256": "1a4010276f862ad7c70c5560ed9c3bbba7770097113fb30b2d6097033a64b145",
+        "uuids": [
+          "1C7445F6-FB0E-33EA-8AA8-18597A9443AC"
+        ]
+      }
+    ]
+  },
+  "windowsArtifacts": [
+    {
+      "filename": "DonutStudio-Windows-Setup.exe",
+      "bytes": 533996903,
+      "sha256": "bb0cd56dc7ca4a1670433d61793e6c79fe828ac107f6fe1dcee48b9185b97e0f"
+    }
+  ],
+  "windowsVideoHelpers": {
+    "arbit-video-helper.exe": "0e139476a7683874d765b3bef35c2b91ae684982923713d2e87d0c5418994141",
+    "software-renderer/arbit-video-helper.exe": "0e139476a7683874d765b3bef35c2b91ae684982923713d2e87d0c5418994141"
   }
 }
